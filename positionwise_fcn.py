@@ -4,21 +4,29 @@ import sparse_moe
 import transformer_utils
 
 class PositionWiseFCNetwork(nn.Module):
-    def __init__(self, args, norm=nn.LayerNorm):
+    def __init__(self, model_config, ffn_config):
         super(PositionWiseFCNetwork, self).__init__()
 
-        self.args = args
+        self.d_model = model_config.d_model
+        self.dropout = model_config.dropout
+        self.norm = model_config.norm
+        self.norm_eps = model_config.norm_eps
 
-        self.layer_norm = norm(args.d_model, args.norm_eps)
-        self.activation = transformer_utils.create_activation_function(args.d_inner, args.activation_function)
-        self.dropout = nn.Dropout(args.dropout)
+        self.ffn_type = ffn_config.ffn_type
+        self.d_inner = ffn_config.d_inner
+        self.activation_function = ffn_config.activation_function
+        self.ffn_bias = ffn_config.ffn_bias
+
+        self.layer_norm = self.norm(self.d_model, self.norm_eps)
+        self.activation = transformer_utils.create_activation_function(self.d_inner, self.activation_function)
+        self.dropout = nn.Dropout(self.dropout)
         
-        if args.fcn_type == 'simple':
-            self.expand = sparse_moe.SparseMoE(args)
+        if self.ffn_type == 'sparse':
+            self.expand = sparse_moe.SparseMoE(ffn_config)
         else:
-            self.expand = nn.Linear(args.d_model, args.d_inner, bias=bool(args.fcn_bias))
+            self.expand = nn.Linear(self.d_model, self.d_inner, bias=self.ffn_bias)
 
-        self.condense = nn.Linear(args.d_inner, args.d_model, bias=bool(args.fcn_bias))
+        self.condense = nn.Linear(self.d_inner, self.d_model, bias=self.ffn_bias)
 
     def forward(self, sequences, *args):
         sequences = self.layer_norm(sequences)

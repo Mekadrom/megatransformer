@@ -3,18 +3,23 @@ from torch import nn
 import torch
 
 class SparseMoE(nn.Module):
-    def __init__(self, args):
+    def __init__(self, model_config, ffn_config):
         super(SparseMoE, self).__init__()
 
-        self.args = args
+        self.d_model = model_config.d_model
 
-        self.expert_weights = nn.ModuleList([nn.Linear(args.d_model, args.d_inner, bias=bool(args.fcn_bias)) for _ in range(args.moe_n_experts)])
-        self.gating = nn.Linear(args.d_model, args.moe_n_experts, bias=bool(args.fcn_bias))
+        self.d_inner = ffn_config.d_inner
+        self.n_experts = ffn_config.moe_n_experts
+        self.top_k = ffn_config.moe_top_k
+        self.ffn_bias = ffn_config.ffn_bias
+
+        self.expert_weights = nn.ModuleList([nn.Linear(self.d_model, self.d_inner, bias=self.ffn_bias) for _ in range(self.n_experts)])
+        self.gating = nn.Linear(self.d_model, self.n_experts, bias=self.ffn_bias)
         self.softmax = nn.Softmax(dim=-1)
         
-        self.reset_parameters()
+        self.init_weights()
 
-    def reset_parameters(self):
+    def init_weights(self):
         for expert in self.expert_weights:
             nn.init.xavier_uniform_(expert.weight)
             nn.init.zeros_(expert.bias)
@@ -26,7 +31,7 @@ class SparseMoE(nn.Module):
         flat_sequences = sequences.view(-1, D) # (N * pad_length, d_model)
         gating_scores = self.softmax(self.gating(flat_sequences))
 
-        top_k_indices = torch.topk(gating_scores, self.args.moe_top_k, dim=1).indices
+        top_k_indices = torch.topk(gating_scores, self.top_k, dim=1).indices
 
         output = torch.zeros(N*P, self.expert_weights[0].out_features, device=sequences.device)
 
@@ -44,6 +49,6 @@ class SparseMoE(nn.Module):
             gating_variances = None
 
         # normalize
-        output /= self.args.moe_top_k
+        output /= self.top_k
 
         return output.view(N, P, -1), gating_variances
