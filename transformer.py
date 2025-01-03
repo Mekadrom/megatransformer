@@ -67,7 +67,7 @@ class EncoderLayer(nn.Module):
         self.ffn_type = ffn_config.ffn_type
         self.moe_replace = ffn_config.moe_replace
 
-        self.self_attn: multihead_attn.MultiHeadAttention = multihead_attn.MultiHeadAttention(device, self_attn_config, self_attn=True, in_decoder=False)
+        self.self_attn: multihead_attn.MultiHeadAttention = multihead_attn.MultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
 
         self.self_attn_residual: nn.Module
         self.ffn_residual: nn.Module
@@ -339,7 +339,7 @@ class Decoder(nn.Module):
 
         self.decoder_dropout = nn.Dropout(self.dropout)
         self.post_decoder_norm = self.norm(self.d_model, self.norm_eps)
-        self.decoder_layers = self.make_decoder_layers(self.n_layers, self.param_sharing_type, self.m_independent_layers, norm=self.norm)
+        self.decoder_layers = self.make_decoder_layers(self.n_layers, self.param_sharing_type, self.m_independent_layers)
 
         self.lm_head: nn.Module
         if self.embedding_compression_dim != 0:
@@ -354,7 +354,7 @@ class Decoder(nn.Module):
         if self.positional_encoding_type != 'rotary':
             self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(self.decoder_device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
 
-    def make_decoder_layers(self, n_layers, param_sharing_type, m_independent_layers, norm=nn.LayerNorm) -> list[DecoderLayer]:
+    def make_decoder_layers(self, n_layers, param_sharing_type, m_independent_layers) -> nn.ModuleList[DecoderLayer]:
         def new_decoder_layer():
             return DecoderLayer(self.device, self.model_config, self.decoder_config)
         
@@ -481,8 +481,8 @@ class Transformer(nn.Module):
         self.encoder_config = model_config.encoder_config
         self.decoder_config = model_config.decoder_config
 
-        self.encoder: Encoder = Encoder(encoder_config.device, model_config, encoder_config)
-        self.decoder: Decoder = Decoder(decoder_config.device, model_config, decoder_config)
+        self.encoder: Encoder = Encoder(self.encoder_config.device, model_config, self.encoder_config)
+        self.decoder: Decoder = Decoder(self.decoder_config.device, model_config, self.decoder_config)
 
         init_weights(self, model_config.tie_embeddings)
 

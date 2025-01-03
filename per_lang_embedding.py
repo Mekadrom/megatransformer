@@ -1,5 +1,6 @@
+from torch import nn
+
 import torch
-import torch.nn as nn
 
 class PerLangEmbedding(nn.Module):
     def __init__(self, vocab_size, d_model, per_lang_embedding_layers, embedding_activation):
@@ -13,7 +14,7 @@ class PerLangEmbedding(nn.Module):
         self.embeddings = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(per_lang_embedding_layers)])
         self.activation = embedding_activation
 
-    def forward(self, sequences):
+    def forward(self, sequences: torch.Tensor) -> torch.Tensor:
         N, P, D = sequences.shape
 
         lang_indices = sequences[:, 0]

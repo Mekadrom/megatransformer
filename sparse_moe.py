@@ -24,7 +24,7 @@ class SparseMoE(nn.Module):
             nn.init.xavier_uniform_(expert.weight)
             nn.init.zeros_(expert.bias)
 
-    def forward(self, sequences):
+    def forward(self, sequences: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         N, P, D = sequences.shape
 
         # merge batch and sequence dimensions

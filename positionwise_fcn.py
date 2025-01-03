@@ -21,6 +21,7 @@ class PositionWiseFCNetwork(nn.Module):
         self.activation = transformer_utils.create_activation_function(self.d_inner, self.activation_function)
         self.dropout = nn.Dropout(self.dropout)
         
+        self.expand: nn.Module
         if self.ffn_type == 'sparse':
             self.expand = sparse_moe.SparseMoE(ffn_config)
         else:

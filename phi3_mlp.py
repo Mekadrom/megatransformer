@@ -1,5 +1,6 @@
+from torch import nn
+
 import torch
-import torch.nn as nn
 import transformer_utils
 
 class Phi3MLP(nn.Module):
@@ -15,7 +16,7 @@ class Phi3MLP(nn.Module):
 
         self.activation_fn = transformer_utils.create_activation_function(self.d_inner, self.activation_function)
 
-    def forward(self, hidden_states: torch.FloatTensor) -> torch.FloatTensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         up_states = self.gate_up_proj(hidden_states)
 
         gate, up_states = up_states.chunk(2, dim=-1)

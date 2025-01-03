@@ -1,6 +1,5 @@
+from torch import nn
 from typing import Literal, Optional
-
-import torch.nn as nn
 
 class AttentionConfig:
     def __init__(self,

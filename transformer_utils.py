@@ -1,9 +1,9 @@
 from positional_encodings.torch_encodings import PositionalEncoding2D
 from swiglu import SwiGLU
+from torch import nn
 
 import math
 import torch
-import torch.nn as nn
 
 def get_activation_function(activation_function_name):
     if activation_function_name == 'relu':
