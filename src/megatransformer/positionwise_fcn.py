@@ -1,11 +1,12 @@
 from torch import nn
 
-import sparse_moe
-import transformer_utils
+from . import sparse_moe, transformer_utils
 
 class PositionWiseFCNetwork(nn.Module):
-    def __init__(self, model_config, ffn_config):
+    def __init__(self, model_config):
         super(PositionWiseFCNetwork, self).__init__()
+
+        ffn_config = model_config.ffn_config
 
         self.d_model = model_config.d_model
         self.dropout = model_config.dropout
@@ -23,7 +24,7 @@ class PositionWiseFCNetwork(nn.Module):
         
         self.expand: nn.Module
         if self.ffn_type == 'sparse':
-            self.expand = sparse_moe.SparseMoE(ffn_config)
+            self.expand = sparse_moe.SparseMoE(model_config)
         else:
             self.expand = nn.Linear(self.d_model, self.d_inner, bias=self.ffn_bias)
 

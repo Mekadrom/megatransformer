@@ -1,14 +1,17 @@
 from torch import nn
 from typing import Optional
 
+from . import transformer_utils
+
 import math
 import numpy as np
 import torch
 import torch.nn.functional as F
-import transformer_utils
 
 """
-Adapted from https://github.com/facebookresearch/XLM/blob/main/PKM-layer.ipynb and https://web3.arxiv.org/abs/2407.04153
+Adapted from https://github.com/facebookresearch/XLM/blob/main/PKM-layer.ipynb and https://arxiv.org/abs/2407.04153
+
+TODO: DOES NOT WORK YET AFAIK
 """
 
 def get_uniform_keys(n_keys, dim, seed):
@@ -21,11 +24,11 @@ def get_uniform_keys(n_keys, dim, seed):
     return keys.astype(np.float32)
 
 class MillionsMoE(nn.Module):
-    def __init__(self, model_config, ffn_config):
+    def __init__(self, model_config):
         super(MillionsMoE, self).__init__()
 
-        self.model_config = model_config
-        self.ffn_config = ffn_config
+        model_config = model_config
+        ffn_config = model_config.ffn_config
 
         self.d_model = model_config.d_model
 

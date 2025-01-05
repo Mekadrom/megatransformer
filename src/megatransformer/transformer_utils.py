@@ -1,6 +1,7 @@
 from positional_encodings.torch_encodings import PositionalEncoding2D
-from swiglu import SwiGLU
 from torch import nn
+
+from . import swiglu
 
 import math
 import torch
@@ -27,7 +28,7 @@ def get_activation_function(activation_function_name):
 
 def create_activation_function(d_in, activation_function_name):
     if activation_function_name == 'swiglu':
-        return SwiGLU(d_in)
+        return swiglu.SwiGLU(d_in)
     return get_activation_function(activation_function_name)()
 
 def get_buffered_positional_encoding(device, d_model, positional_encoding_dim: int, maxlen=100, num_dims=1):

@@ -1,11 +1,14 @@
 from torch import nn
 
+from . import transformer_utils
+
 import torch
-import transformer_utils
 
 class Phi3MLP(nn.Module):
-    def __init__(self, model_config, ffn_config):
+    def __init__(self, model_config):
         super().__init__()
+
+        ffn_config = model_config.ffn_config
 
         self.d_model = model_config.d_model
         self.d_inner = ffn_config.d_inner

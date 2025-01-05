@@ -3,8 +3,10 @@ from torch import nn
 import torch
 
 class SparseMoE(nn.Module):
-    def __init__(self, model_config, ffn_config):
+    def __init__(self, model_config):
         super(SparseMoE, self).__init__()
+
+        ffn_config = model_config.ffn_config
 
         self.d_model = model_config.d_model
 
@@ -24,7 +26,7 @@ class SparseMoE(nn.Module):
             nn.init.xavier_uniform_(expert.weight)
             nn.init.zeros_(expert.bias)
 
-    def forward(self, sequences: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    def forward(self, sequences: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         N, P, D = sequences.shape
 
         # merge batch and sequence dimensions

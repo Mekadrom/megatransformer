@@ -1,11 +1,11 @@
 from torch import nn
 from typing import Optional, Union
 
+from . import embedding_mlp, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, transformer_utils
+
 import admin_torch
-import embedding_mlp, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum
 import math
 import torch
-import transformer_utils
 
 def init_weights(model: nn.Module,
                  d_model: int,
@@ -29,7 +29,7 @@ def init_weights(model: nn.Module,
                 raise Exception(f"Unknown weight initialization method: {init_weights_from}")
 
     # share weights between the embedding layers and the logit layer
-    if isinstance(model, Transformer):
+    if isinstance(model, MegaTransformer):
         encoder: Encoder = model.encoder
         decoder: Decoder = model.decoder
         if isinstance(encoder.embed_tokens, nn.Embedding) and isinstance(decoder.embed_tokens, nn.Embedding):
@@ -53,11 +53,13 @@ def init_weights(model: nn.Module,
     print("Model initialized.")
 
 class EncoderLayer(nn.Module):
-    def __init__(self, device, model_config, encoder_config):
+    def __init__(self, device, model_config):
         super(EncoderLayer, self).__init__()
 
+        encoder_config = model_config.encoder_config
+
         self_attn_config = encoder_config.self_attn_config
-        ffn_config = encoder_config.ffn_config
+        ffn_config = model_config.ffn_config
 
         self.use_admin = model_config.use_admin
         self.norm = model_config.norm
@@ -81,11 +83,11 @@ class EncoderLayer(nn.Module):
         moe: Optional[nn.Module] = None
         self.ffn: nn.Module
         if self.ffn_type == 'millions':
-            moe = millions_moe.MillionsMoE(model_config, ffn_config)
+            moe = millions_moe.MillionsMoE(model_config)
         elif self.ffn_type == "phi3":
-            self.ffn = phi3_mlp.Phi3MLP(model_config, ffn_config)
+            self.ffn = phi3_mlp.Phi3MLP(model_config)
         else:
-            self.ffn = positionwise_fcn.PositionWiseFCNetwork(model_config, ffn_config)
+            self.ffn = positionwise_fcn.PositionWiseFCNetwork(model_config)
 
         if moe is not None and bool(self.moe_replace):
             self.ffn = moe
@@ -96,19 +98,19 @@ class EncoderLayer(nn.Module):
         self_attn, _ = self.self_attn(encoder_sequences, encoder_sequences, encoder_sequences, key_padding_mask)
 
         encoder_sequences = self.self_attn_residual(encoder_sequences, self_attn)
-        fcn, gating_variances = self.ffn(encoder_sequences)
-        encoder_sequences = self.ffn_residual(encoder_sequences, fcn)
+        ffn, gating_variances = self.ffn(encoder_sequences)
+        encoder_sequences = self.ffn_residual(encoder_sequences, ffn)
             
         return encoder_sequences, gating_variances
 
 class Encoder(nn.Module):
-    def __init__(self, device, model_config, encoder_config):
+    def __init__(self, device, model_config):
         super(Encoder, self).__init__()
 
         self.device = device
 
         self.model_config = model_config
-        self.encoder_config = encoder_config
+        encoder_config = model_config.encoder_config
 
         self.maxlen = model_config.maxlen
         self.d_model = model_config.d_model
@@ -142,9 +144,9 @@ class Encoder(nn.Module):
         if self.positional_encoding_type != 'rotary':
             self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
 
-    def make_encoder_layers(self, n_layers, param_sharing_type, m_independent_layers) -> nn.ModuleList[EncoderLayer]:
+    def make_encoder_layers(self, n_layers, param_sharing_type, m_independent_layers) -> nn.ModuleList:
         def new_encoder_layer():
-            return EncoderLayer(self.device, self.model_config, self.encoder_config)
+            return EncoderLayer(self.device, self.model_config)
 
         layers = []
         for i in range(n_layers):
@@ -177,15 +179,13 @@ class Encoder(nn.Module):
                     res_idx = ((i - 1) % m_independent_layers) + 1
                     new_layer = new_encoder_layer()
                     new_layer.ffn = layers[res_idx].fcn
-                    if hasattr(layers[res_idx], 'fcn_residual'):
-                        new_layer.ffn_residual = layers[res_idx].fcn_residual
+                    new_layer.ffn_residual = layers[res_idx].fcn_residual
                     layers.append(new_layer)
                 else:
                     res_idx = m_independent_layers - ((i - 1) % m_independent_layers)
                     new_layer = new_encoder_layer()
                     new_layer.ffn = layers[res_idx].fcn
-                    if hasattr(layers[res_idx], 'fcn_residual'):
-                        new_layer.ffn_residual = layers[res_idx].fcn_residual
+                    new_layer.ffn_residual = layers[res_idx].fcn_residual
                     layers.append(new_layer)
             elif param_sharing_type == 'heads-cycle-rev':
                 if i <= m_independent_layers:
@@ -194,15 +194,13 @@ class Encoder(nn.Module):
                     res_idx = ((i - 1) % m_independent_layers) + 1
                     new_layer = new_encoder_layer()
                     new_layer.self_attn = layers[res_idx].self_attn
-                    if hasattr(layers[res_idx], 'self_attn_residual'):
-                        new_layer.self_attn_residual = layers[res_idx].self_attn_residual
+                    new_layer.self_attn_residual = layers[res_idx].self_attn_residual
                     layers.append(new_layer)
                 else:
                     res_idx = m_independent_layers - ((i - 1) % m_independent_layers)
                     new_layer = new_encoder_layer()
                     new_layer.self_attn = layers[res_idx].self_attn
-                    if hasattr(layers[res_idx], 'self_attn_residual'):
-                        new_layer.self_attn_residual = layers[res_idx].self_attn_residual
+                    new_layer.self_attn_residual = layers[res_idx].self_attn_residual
                     layers.append(new_layer)
             elif param_sharing_type == 'all':
                 layers.append(layers[0])
@@ -244,13 +242,15 @@ class Encoder(nn.Module):
         return encoder_sequences, gating_variances
 
 class DecoderLayer(nn.Module):
-    def __init__(self, device, model_config, decoder_config):
+    def __init__(self, device, model_config):
         super(DecoderLayer, self).__init__()
+
+        decoder_config = model_config.decoder_config
 
         self_attn_config = decoder_config.self_attn_config
         cross_attn_config = decoder_config.cross_attn_config
         use_cross_attn = cross_attn_config is not None
-        ffn_config = decoder_config.ffn_config
+        ffn_config = model_config.ffn_config
         
         self.use_admin = model_config.use_admin
 
@@ -270,47 +270,52 @@ class DecoderLayer(nn.Module):
         if self.use_admin:
             self.self_attn_residual = admin_torch.as_module(self.n_layers)
             self.cross_attn_residual = admin_torch.as_module(self.n_layers)
-            self.fcn_residual = admin_torch.as_module(self.n_layers)
+            self.ffn_residual = admin_torch.as_module(self.n_layers)
         else:
             self.self_attn_residual = sum.Sum()
             self.cross_attn_residual = sum.Sum()
-            self.fcn_residual = sum.Sum()
+            self.ffn_residual = sum.Sum()
 
         self.ffn: nn.Module
         moe: Optional[nn.Module] = None
         if self.ffn_type == 'millions':
-            moe = millions_moe.MillionsMoE(model_config, ffn_config)
+            moe = millions_moe.MillionsMoE(model_config)
         elif self.ffn_type == "phi3":
-            self.ffn = phi3_mlp.Phi3MLP(model_config, ffn_config)
+            self.ffn = phi3_mlp.Phi3MLP(model_config)
         else:
-            self.ffn = positionwise_fcn.PositionWiseFCNetwork(model_config, ffn_config)
+            self.ffn = positionwise_fcn.PositionWiseFCNetwork(model_config)
 
         if moe is not None and self.moe_replace:
             self.ffn = moe
         elif moe is not None:
             self.ffn = nn.Sequential(moe, self.ffn)
 
-    def forward(self, decoder_sequences: torch.Tensor, encoder_sequences: torch.Tensor, src_key_padding_mask: torch.Tensor, tgt_key_padding_mask: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        self_attn, _ = self.self_attn(decoder_sequences, decoder_sequences, decoder_sequences, tgt_key_padding_mask)
-        decoder_sequences = self.self_attn_residual(decoder_sequences, self_attn)
+    def forward(self, decoder_sequence: torch.Tensor, encoder_sequence: Optional[torch.Tensor], attention_mask: Optional[torch.Tensor], decoder_attention_mask: Optional[torch.Tensor]) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # print(f"decoder_sequences before self attn shape: {decoder_sequence.shape}, min: {decoder_sequence.min()}, max: {decoder_sequence.max()}, mean: {decoder_sequence.mean()}, std: {decoder_sequence.std()}, norm: {decoder_sequence.norm()}")
 
-        if self.cross_attn is not None and encoder_sequences is not None and src_key_padding_mask is not None:
-            cross_attn, _ = self.cross_attn(decoder_sequences, encoder_sequences, encoder_sequences, src_key_padding_mask)
-            decoder_sequences = self.cross_attn_residual(decoder_sequences, cross_attn)
+        self_attn, _ = self.self_attn(decoder_sequence, decoder_sequence, decoder_sequence, decoder_attention_mask)
+        decoder_sequence = self.self_attn_residual(decoder_sequence, self_attn)
 
-        fcn, gating_variances = self.ffn(decoder_sequences)
-        decoder_sequences = self.fcn_residual(decoder_sequences, fcn)
+        # print(f"decoder_sequences before cross attn shape: {decoder_sequence.shape}, min: {decoder_sequence.min()}, max: {decoder_sequence.max()}, mean: {decoder_sequence.mean()}, std: {decoder_sequence.std()}, norm: {decoder_sequence.norm()}")
 
-        return decoder_sequences, gating_variances
+        if self.cross_attn is not None and encoder_sequence is not None and attention_mask is not None:
+            cross_attn, _ = self.cross_attn(decoder_sequence, encoder_sequence, encoder_sequence, attention_mask)
+            decoder_sequence = self.cross_attn_residual(decoder_sequence, cross_attn)
+
+        ffn, gating_variances = self.ffn(decoder_sequence)
+
+        decoder_sequence = self.ffn_residual(decoder_sequence, ffn)
+
+        return decoder_sequence, gating_variances
 
 class Decoder(nn.Module):
-    def __init__(self, device, model_config, decoder_config):
+    def __init__(self, device, model_config):
         super(Decoder, self).__init__()
 
         self.device = device
 
         self.model_config = model_config
-        self.decoder_config = decoder_config
+        decoder_config = model_config.decoder_config
 
         self.maxlen = model_config.maxlen
         self.d_model = model_config.d_model
@@ -354,9 +359,9 @@ class Decoder(nn.Module):
         if self.positional_encoding_type != 'rotary':
             self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(self.decoder_device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
 
-    def make_decoder_layers(self, n_layers, param_sharing_type, m_independent_layers) -> nn.ModuleList[DecoderLayer]:
+    def make_decoder_layers(self, n_layers, param_sharing_type, m_independent_layers) -> nn.ModuleList:
         def new_decoder_layer():
-            return DecoderLayer(self.device, self.model_config, self.decoder_config)
+            return DecoderLayer(self.device, self.model_config)
         
         layers = []
         for i in range(n_layers):
@@ -389,15 +394,13 @@ class Decoder(nn.Module):
                     res_idx = ((i - 1) % m_independent_layers) + 1
                     new_layer = new_decoder_layer()
                     new_layer.ffn = layers[res_idx].fcn
-                    if hasattr(layers[res_idx], 'fcn_residual'):
-                        new_layer.fcn_residual = layers[res_idx].fcn_residual
+                    new_layer.ffn_residual = layers[res_idx].fcn_residual
                     layers.append(new_layer)
                 else:
                     res_idx = m_independent_layers - ((i - 1) % m_independent_layers)
                     new_layer = new_decoder_layer()
                     new_layer.ffn = layers[res_idx].fcn
-                    if hasattr(layers[res_idx], 'fcn_residual'):
-                        new_layer.fcn_residual = layers[res_idx].fcn_residual
+                    new_layer.ffn_residual = layers[res_idx].fcn_residual
                     layers.append(new_layer)
             elif param_sharing_type == 'heads-cycle-rev':
                 if i <= m_independent_layers:
@@ -406,21 +409,17 @@ class Decoder(nn.Module):
                     res_idx = ((i - 1) % m_independent_layers) + 1
                     new_layer = new_decoder_layer()
                     new_layer.self_attn = layers[res_idx].self_attn
+                    new_layer.self_attn_residual = layers[res_idx].self_attn_residual
                     new_layer.cross_attn = layers[res_idx].cross_attn
-                    if hasattr(layers[res_idx], 'self_attn_residual'):
-                        new_layer.self_attn_residual = layers[res_idx].self_attn_residual
-                    if hasattr(layers[res_idx], 'cross_attn_residual'):
-                        new_layer.cross_attn_residual = layers[res_idx].cross_attn_residual
+                    new_layer.cross_attn_residual = layers[res_idx].cross_attn_residual
                     layers.append(new_layer)
                 else:
                     res_idx = m_independent_layers - ((i - 1) % m_independent_layers)
                     new_layer = new_decoder_layer()
                     new_layer.self_attn = layers[res_idx].self_attn
+                    new_layer.self_attn_residual = layers[res_idx].self_attn_residual
                     new_layer.cross_attn = layers[res_idx].cross_attn
-                    if hasattr(layers[res_idx], 'self_attn_residual'):
-                        new_layer.self_attn_residual = layers[res_idx].self_attn_residual
-                    if hasattr(layers[res_idx], 'cross_attn_residual'):
-                        new_layer.cross_attn_residual = layers[res_idx].cross_attn_residual
+                    new_layer.cross_attn_residual = layers[res_idx].cross_attn_residual
                     layers.append(new_layer)
             elif param_sharing_type == 'all':
                 layers.append(layers[0])
@@ -431,75 +430,81 @@ class Decoder(nn.Module):
     def apply_embedding_transformation(self, decoder_sequences: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(decoder_sequences) * math.sqrt(self.d_model)
     
-    def apply_positional_embedding(self, decoder_sequences: torch.Tensor) -> torch.Tensor:
+    def apply_positional_embedding(self, labels: torch.Tensor) -> torch.Tensor:
         # 1D buffer/sinusoidal encoding is applied here. 2D buffer/sinusoidal encoding and rotary encoding are applied in the MultiHeadAttention layer(s)
         if hasattr(self, 'tensor_positional_encoding'):
-            return decoder_sequences + self.tensor_positional_encoding[:, :decoder_sequences.size(1), :]
-        return decoder_sequences
+            return labels + self.tensor_positional_encoding[:, :labels.size(1), :]
+        return labels
     
-    def apply_decoder_layer(self, decoder_sequences: torch.Tensor, encoder_sequences: torch.Tensor, src_key_padding_mask: torch.Tensor, tgt_key_padding_mask: torch.Tensor, decoder_layer: nn.Module) -> torch.Tensor:
-        return decoder_layer(decoder_sequences, encoder_sequences, src_key_padding_mask, tgt_key_padding_mask)
+    def apply_decoder_layer(self, decoder_sequences: torch.Tensor, encoder_sequences: Optional[torch.Tensor], attention_mask: Optional[torch.Tensor], decoder_attention_mask: Optional[torch.Tensor], decoder_layer: nn.Module) -> torch.Tensor:
+        return decoder_layer(decoder_sequences, encoder_sequences, attention_mask, decoder_attention_mask)
 
-    def forward(self, decoder_sequences: torch.Tensor, encoder_sequences: torch.Tensor, src_key_padding_mask: torch.Tensor, tgt_key_padding_mask: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        assert torch.all(encoder_sequences < self.vocab_size), f"Encoder input is out of bounds: {torch.max(encoder_sequences)} >= {self.vocab_size}"
-        assert torch.all(decoder_sequences < self.vocab_size), f"Decoder input is out of bounds: {torch.max(decoder_sequences)} >= {self.vocab_size}"
+    def forward(self, decoder_sequence: torch.Tensor, encoder_sequence: Optional[torch.Tensor] = None, attention_mask: Optional[torch.Tensor] = None, decoder_attention_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        assert torch.all(decoder_sequence < self.vocab_size), f"Decoder input is out of bounds: {torch.max(decoder_sequence)} >= {self.vocab_size}"
 
-        decoder_sequences = decoder_sequences.to(self.device)
-        if encoder_sequences is not None:
-            encoder_sequences = encoder_sequences.to(self.device)
-
-        if src_key_padding_mask is not None:
-            src_key_padding_mask = src_key_padding_mask.to(self.device)
-        elif encoder_sequences is not None:
-            src_key_padding_mask = encoder_sequences == 0
-
-        if tgt_key_padding_mask is not None:
-            tgt_key_padding_mask = tgt_key_padding_mask.to(self.device)
-        else:
-            tgt_key_padding_mask = decoder_sequences == 0
+        decoder_sequence = decoder_sequence.to(self.device)
+        if encoder_sequence is not None:
+            encoder_sequence = encoder_sequence.to(self.device)
 
         if self.embed_tokens is not None:
-            decoder_sequences = self.apply_embedding_transformation(decoder_sequences)
-        decoder_sequences = self.apply_positional_embedding(decoder_sequences)
-        decoder_sequences = self.decoder_dropout(decoder_sequences)
+            decoder_sequence = self.apply_embedding_transformation(decoder_sequence)
+        decoder_sequence = self.apply_positional_embedding(decoder_sequence)
+        decoder_sequence = self.decoder_dropout(decoder_sequence)
 
         gating_variances = []
         for decoder_layer in self.decoder_layers:
-            decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, src_key_padding_mask, tgt_key_padding_mask, decoder_layer)
+            decoder_sequence, gating_variance = self.apply_decoder_layer(decoder_sequence, encoder_sequence, attention_mask, decoder_attention_mask, decoder_layer)
             if gating_variance is not None:
                 gating_variances.append(gating_variance)
 
-        decoder_sequences = self.post_decoder_norm(decoder_sequences)
-        decoder_sequences = self.lm_head(decoder_sequences)
+        decoder_sequence = self.post_decoder_norm(decoder_sequence)
+        decoder_sequence = self.lm_head(decoder_sequence)
 
-        return decoder_sequences, gating_variances
+        return decoder_sequence, gating_variances
 
-class Transformer(nn.Module):
+class MegaTransformer(nn.Module):
     def __init__(self, model_config):
-        super(Transformer, self).__init__()
+        super(MegaTransformer, self).__init__()
 
         self.encoder_config = model_config.encoder_config
         self.decoder_config = model_config.decoder_config
 
-        self.encoder: Encoder = Encoder(self.encoder_config.device, model_config, self.encoder_config)
-        self.decoder: Decoder = Decoder(self.decoder_config.device, model_config, self.decoder_config)
+        self.padding_value = model_config.padding_value
 
-        init_weights(self, model_config.tie_embeddings)
+        self.encoder: Encoder = Encoder(self.encoder_config.device, model_config)
+        self.decoder: Decoder = Decoder(self.decoder_config.device, model_config)
 
-    def forward(self, encoder_sequences: torch.Tensor, decoder_sequences: torch.Tensor, src_key_padding_mask: torch.Tensor, tgt_key_padding_mask: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
-        encoder_sequences = encoder_sequences.to(self.encoder_config.device)
-        decoder_sequences = decoder_sequences.to(self.decoder_config.device)
-        src_key_padding_mask = src_key_padding_mask.to(self.encoder_config.device)
-        tgt_key_padding_mask = tgt_key_padding_mask.to(self.decoder_config.device)
+        init_weights(self, model_config.d_model, model_config.init_weights_from, model_config.init_weights_gain, model_config.tie_embeddings)
+
+    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, decoder_attention_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+        if self.padding_value is not None:
+            if attention_mask is None and input_ids is not None:
+                attention_mask = input_ids == self.padding_value
+            if decoder_attention_mask is None and labels is not None:
+                decoder_attention_mask = labels == self.padding_value
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.encoder_config.device)
+
+        if decoder_attention_mask is not None:
+            decoder_attention_mask = decoder_attention_mask.to(self.decoder_config.device)
+
+        input_ids = input_ids.to(self.encoder_config.device)
+        labels = labels.to(self.decoder_config.device)
         self.encoder.embed_tokens = self.encoder.embed_tokens.to(self.encoder_config.device)
 
-        encoder_sequences, encoder_gating_variances = self.encoder(encoder_sequences, src_key_padding_mask)
+        input_ids, encoder_gating_variances = self.encoder(input_ids, attention_mask)
 
-        encoder_sequences = encoder_sequences.to(self.decoder_config.device)
-        src_key_padding_mask = src_key_padding_mask.to(self.decoder_config.device)
+        # print(f"input_ids shape: {input_ids.shape}, min: {input_ids.min()}, max: {input_ids.max()}, mean: {input_ids.mean()}, std: {input_ids.std()}, norm: {input_ids.norm()}")
+        # print(f"labels shape: {labels.shape}, min: {labels.min()}, max: {labels.max()}")
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.decoder_config.device)
+
+        input_ids = input_ids.to(self.decoder_config.device)
         self.decoder.embed_tokens = self.decoder.embed_tokens.to(self.decoder_config.device)
         self.decoder.lm_head = self.decoder.lm_head.to(self.decoder_config.device)
         
-        decoder_sequences, decoder_gating_variances = self.decoder(decoder_sequences, encoder_sequences, src_key_padding_mask, tgt_key_padding_mask)
+        labels, decoder_gating_variances = self.decoder(labels, input_ids, attention_mask, decoder_attention_mask)
 
-        return decoder_sequences, encoder_gating_variances, decoder_gating_variances
+        return labels, encoder_gating_variances, decoder_gating_variances

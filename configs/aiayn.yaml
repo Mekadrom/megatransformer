@@ -1,0 +1,39 @@
+maxlen: 150
+d_model: 512
+dropout: 0.1
+
+tokenizer: bert-base-multilingual-cased
+
+positional_encoding: sinusoidal
+tie_embeddings: True
+padding_value: 0
+
+encoder_config:
+  device: cuda:0
+  self_attn_config:
+    n_heads: 8
+    n_gqa_groups: 1
+    d_queries: 64
+    d_values: 64
+  n_layers: 6
+  vocab_size: 119547
+
+decoder_config:
+  device: cuda:0
+  self_attn_config:
+    n_heads: 8
+    n_gqa_groups: 1
+    d_queries: 64
+    d_values: 64
+  cross_attn_config:
+    n_heads: 8
+    n_gqa_groups: 1
+    d_queries: 64
+    d_values: 64
+  n_layers: 6
+  vocab_size: 119547
+
+ffn_config:
+  ffn_type: simple
+  d_inner: 2048
+  activation_function: relu
