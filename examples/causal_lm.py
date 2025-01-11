@@ -1,6 +1,6 @@
 from datasets import load_dataset
 from megatransformer import config, custom_trainers, lr_scheduler, megatransformer, visualization_helper
-from transformers import AutoTokenizer, DataCollatorForSeq2Seq, set_seed, Seq2SeqTrainingArguments
+from transformers import AutoTokenizer, DataCollatorForLanguageModeling, set_seed, TrainingArguments
 
 import argparse
 import evaluate
@@ -8,7 +8,6 @@ import numpy as np
 import os
 import torch
 import torch.nn.functional as F
-import transformers
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--run_name', type=str, required=True)
@@ -32,43 +31,41 @@ moe_diversity_loss_coefficient = 0.0
 moe_diversity_inclusion_epoch = 0
 warmup_steps = 8000
 label_smoothing = 0.1
-device = 'cpu'
+device = 'cuda:0'
 
 tokenizer = AutoTokenizer.from_pretrained(model_config.tokenizer)
-model = megatransformer.MegaTransformer(model_config).to(device)
+model = megatransformer.Decoder(model_config).to(device)
 
 print(model)
 print(f"params: {sum(p.numel() for p in model.parameters()):,}")
 
 def preprocess_function(examples):
-    sources, targets = zip(*[(example["en"], example["de"]) for example in examples["translation"]])
+    targets = zip(*[example['text'] for example in examples["translation"]])
     model_inputs = tokenizer(
-        sources,
-        text_target=targets,
+        targets,
         max_length=model_config.maxlen,
         truncation=True,
-        padding=True,
-        return_tensors=None,
+        padding="max_length",
+        return_tensors="pt",
         return_attention_mask=False,
+        return_token_type_ids=False
     )
     return model_inputs
 
-dataset = load_dataset('wmt/wmt14', 'de-en')
+dataset = load_dataset("HuggingFaceFW/fineweb", "default")
 tokenized_dataset = dataset.map(
     preprocess_function,
     batched=True,
-    remove_columns=dataset["train"].column_names,
+    remove_columns=dataset["train"].column_names
 )
 
-data_collator = DataCollatorForSeq2Seq(
+data_collator = DataCollatorForLanguageModeling(
     tokenizer=tokenizer,
-    model=model,
-    padding=True,
-    return_tensors="pt",
-    label_pad_token_id=tokenizer.pad_token_id
+    mlm=False,
+    return_tensors="pt"
 )
 
-training_args = Seq2SeqTrainingArguments(
+training_args = TrainingArguments(
     output_dir=run_dir,
     logging_dir=run_dir,
     report_to=["tensorboard"],
@@ -85,16 +82,11 @@ training_args = Seq2SeqTrainingArguments(
     learning_rate=5e-5,
     dataloader_pin_memory=False,
     num_train_epochs=n_epochs,
-
-    gradient_accumulation_steps=4,
-    per_device_train_batch_size=32,
-    save_safetensors=True,
-    no_cuda=device == 'cpu'
 )
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate)
 scheduler = lr_scheduler.get_noam_scheduler(optimizer=optimizer, warmup_steps=warmup_steps, d_model=model_config.d_model)
-trainer = custom_trainers.CompositeMoESeq2SeqTrainer(
+trainer = custom_trainers.CompositeMoECausalTrainer(
     moe_diversity_loss_coefficient=moe_diversity_loss_coefficient,
     moe_diversity_inclusion_epoch=moe_diversity_inclusion_epoch,
     model=model,
@@ -146,6 +138,6 @@ if __name__ == "__main__":
 
 """
 Example Usage:
-`python -m examples.wmt14ende --config configs/seq2seq/aiayn.yaml --run_name my_seq2seq_run`
+`python -m examples.causal_lm --config configs/causal/aiayn.yaml --run_name my_causal_run`
 from the root of the repository.
 """
