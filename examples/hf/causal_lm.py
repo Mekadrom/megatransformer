@@ -1,13 +1,12 @@
 from datasets import load_dataset
 from megatransformer import config, custom_trainers, lr_scheduler, megatransformer, visualization_helper
-from transformers import AutoTokenizer, DataCollatorForSeq2Seq, set_seed, Seq2SeqTrainingArguments
+from transformers import AutoTokenizer, DataCollatorForLanguageModeling, set_seed, TrainingArguments
 
 import argparse
 import evaluate
 import numpy as np
 import os
 import torch
-import torch.nn.functional as F
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--run_name', type=str, required=True)
@@ -34,16 +33,15 @@ label_smoothing = 0.1
 device = 'cuda:0'
 
 tokenizer = AutoTokenizer.from_pretrained(model_config.tokenizer)
-model = megatransformer.MegaTransformer(model_config).to(device)
+model = megatransformer.Decoder(model_config).to(device)
 
 print(model)
 print(f"params: {sum(p.numel() for p in model.parameters()):,}")
 
 def preprocess_function(examples):
-    sources, targets = zip(*[(ex["en"], ex["de"]) for ex in examples["translation"]])
+    targets = zip(*[example['text'] for example in examples["translation"]])
     model_inputs = tokenizer(
-        sources,
-        text_target=targets,
+        targets,
         max_length=model_config.maxlen,
         truncation=True,
         padding="max_length",
@@ -51,32 +49,29 @@ def preprocess_function(examples):
         return_attention_mask=False,
         return_token_type_ids=False
     )
-    if torch.any(torch.isnan(model_inputs["input_ids"])):
-        raise ValueError("NaNs in input_ids")
     return model_inputs
 
-dataset = load_dataset('wmt/wmt14', 'de-en')
+dataset = load_dataset("HuggingFaceFW/fineweb", "default")
 tokenized_dataset = dataset.map(
     preprocess_function,
     batched=True,
     remove_columns=dataset["train"].column_names
 )
 
-data_collator = DataCollatorForSeq2Seq(
+data_collator = DataCollatorForLanguageModeling(
     tokenizer=tokenizer,
-    model=model,
-    padding=True,
-    return_tensors="pt",
+    mlm=False,
+    return_tensors="pt"
 )
 
-training_args = Seq2SeqTrainingArguments(
+training_args = TrainingArguments(
     output_dir=run_dir,
     logging_dir=run_dir,
     report_to=["tensorboard"],
     save_total_limit=3,
 
     logging_strategy="steps",
-    logging_steps=1,
+    logging_steps=100,
     
     evaluation_strategy="epoch",
     save_strategy="epoch",
@@ -90,7 +85,7 @@ training_args = Seq2SeqTrainingArguments(
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate)
 scheduler = lr_scheduler.get_noam_scheduler(optimizer=optimizer, warmup_steps=warmup_steps, d_model=model_config.d_model)
-trainer = custom_trainers.CompositeMoETrainer(
+trainer = custom_trainers.CompositeMoECausalTrainer(
     moe_diversity_loss_coefficient=moe_diversity_loss_coefficient,
     moe_diversity_inclusion_epoch=moe_diversity_inclusion_epoch,
     model=model,
@@ -142,6 +137,6 @@ if __name__ == "__main__":
 
 """
 Example Usage:
-`python -m examples.wmt14ende --config configs/aiayn.yaml --run_name my_aiayn_run`
+`python -m examples.hf.causal_lm --config configs/causal/aiayn.yaml --run_name my_causal_run`
 from the root of the repository.
 """

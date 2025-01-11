@@ -118,42 +118,18 @@ class MultiHeadAttention(nn.Module):
             q_heads = self.rotary_embedding.rotate_queries_or_keys(q_heads, seq_dim=-2)
             k_heads = self.rotary_embedding.rotate_queries_or_keys(k_heads.unsqueeze(0), seq_dim=-2).squeeze(0) # adds a singleton dimension for the rotation operation and then removes it for the torch compiler
 
-        if self.debug:
-            print(f"q_heads shape: {q_heads.shape}, min: {q_heads.min()}, max: {q_heads.max()}, mean: {q_heads.mean()}, std: {q_heads.std()}, norm: {q_heads.norm()}")
-            print(f"k_heads shape: {k_heads.shape}, min: {k_heads.min()}, max: {k_heads.max()}, mean: {k_heads.mean()}, std: {k_heads.std()}, norm: {k_heads.norm()}")
-            print(f"v_heads shape: {v_heads.shape}, min: {v_heads.min()}, max: {v_heads.max()}, mean: {v_heads.mean()}, std: {v_heads.std()}, norm: {v_heads.norm()}")
-
-        # regular attention
         # generate attention weights by taking the dot product of queries and keys
         attention_weights = torch.einsum('...ghtq,...hTq->...htT', q_heads, k_heads)
 
-        if self.debug:
-            print(f"attention_weights shape: {attention_weights.shape}, min: {attention_weights.min()}, max: {attention_weights.max()}, mean: {attention_weights.mean()}, std: {attention_weights.std()}, norm: {attention_weights.norm()}")
-
-        # scaled attention
         attention_weights = (1.0 / (self.d_queries ** 0.5)) * attention_weights
         if bool(self.use_grok_scaled_attn):
             attention_weights = 30.0 * torch.tanh(attention_weights / 30.0) # grok version of scaled attention
 
-        if self.debug:
-            print(f"attention_weights after scale shape: {attention_weights.shape}, min: {attention_weights.min()}, max: {attention_weights.max()}, mean: {attention_weights.mean()}, std: {attention_weights.std()}, norm: {attention_weights.norm()}")
-
         attention_weights = self.mask_attention(attention_weights, attention_mask)
-
-        if self.debug:
-            print(f"attention_weights after mask shape: {attention_weights.shape}, min: {attention_weights.min()}, max: {attention_weights.max()}, mean: {attention_weights.mean()}, std: {attention_weights.std()}, norm: {attention_weights.norm()}")
-
         attention_weights = self.attn_softmax(attention_weights)
-
-        if self.debug:
-            print(f"attention_weights after softmax shape: {attention_weights.shape}, min: {attention_weights.min()}, max: {attention_weights.max()}, mean: {attention_weights.mean()}, std: {attention_weights.std()}, norm: {attention_weights.norm()}")
-
         attention_weights_for_visualization = [attention_weights.clone().detach()]
 
         attention_weights = self.attn_dropout(attention_weights)
-
-        if self.debug:
-            print(f"attention_weights after dropout shape: {attention_weights.shape}, min: {attention_weights.min()}, max: {attention_weights.max()}, mean: {attention_weights.mean()}, std: {attention_weights.std()}, norm: {attention_weights.norm()}")
 
         # Calculate sequences as the weighted sums of values based on these softmax weights
         sequences = torch.einsum('...htT,...hTv->...htv', attention_weights, v_heads)
@@ -164,13 +140,6 @@ class MultiHeadAttention(nn.Module):
         sequences = sequences.contiguous().view(N, t, -1)
 
         sequences = self.attn_dropout(sequences)
-
-        if self.debug:
-            print(f"sequences shape: {sequences.shape}, min: {sequences.min()}, max: {sequences.max()}, mean: {sequences.mean()}, std: {sequences.std()}, norm: {sequences.norm()}")
-
         sequences = self.o_proj(sequences)
-
-        if self.debug:
-            print(f"sequences after o_proj shape: {sequences.shape}, min: {sequences.min()}, max: {sequences.max()}, mean: {sequences.mean()}, std: {sequences.std()}, norm: {sequences.norm()}")
 
         return sequences, attention_weights_for_visualization

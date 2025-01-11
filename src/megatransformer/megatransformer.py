@@ -220,15 +220,22 @@ class Encoder(nn.Module):
     def apply_encoder_layer(self, encoder_sequences: torch.Tensor, key_padding_mask: torch.Tensor, encoder_layer: nn.Module) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         return encoder_layer(encoder_sequences, key_padding_mask)
 
-    def forward(self, encoder_sequences: torch.Tensor, key_padding_mask: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        assert torch.all(encoder_sequences < self.vocab_size), f"Encoder input is out of bounds: {torch.max(encoder_sequences)} >= {self.vocab_size}"
+    def forward(self, input_ids: torch.Tensor, key_padding_mask: torch.Tensor, inputs_embeds: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if inputs_embeds is None:
+            assert torch.all(input_ids < self.vocab_size), f"Encoder input is out of bounds: {torch.max(input_ids)} >= {self.vocab_size}"
+            input_ids = input_ids.to(self.device)
+            if self.embed_tokens is not None:
+                encoder_sequences = self.apply_embedding_transformation(input_ids)
+            else:
+                encoder_sequences = input_ids
+        else:
+            inputs_embeds = inputs_embeds.to(self.device)
+            encoder_sequences = inputs_embeds
 
-        encoder_sequences = encoder_sequences.to(self.device)
-        key_padding_mask = key_padding_mask.to(self.device)
-
-        encoder_sequences = self.apply_embedding_transformation(encoder_sequences)
         encoder_sequences = self.apply_positional_embedding(encoder_sequences)
         encoder_sequences = self.encoder_dropout(encoder_sequences)
+
+        key_padding_mask = key_padding_mask.to(self.device)
 
         gating_variances: list[torch.Tensor] = []
         for encoder_layer in self.encoder_layers:
@@ -357,7 +364,7 @@ class Decoder(nn.Module):
             self.lm_head = nn.Linear(self.d_model, self.vocab_size)
 
         if self.positional_encoding_type != 'rotary':
-            self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(self.decoder_device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
+            self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(self.device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
 
     def make_decoder_layers(self, n_layers, param_sharing_type, m_independent_layers) -> nn.ModuleList:
         def new_decoder_layer():
@@ -439,28 +446,40 @@ class Decoder(nn.Module):
     def apply_decoder_layer(self, decoder_sequences: torch.Tensor, encoder_sequences: Optional[torch.Tensor], attention_mask: Optional[torch.Tensor], decoder_attention_mask: Optional[torch.Tensor], decoder_layer: nn.Module) -> torch.Tensor:
         return decoder_layer(decoder_sequences, encoder_sequences, attention_mask, decoder_attention_mask)
 
-    def forward(self, decoder_sequence: torch.Tensor, encoder_sequence: Optional[torch.Tensor] = None, attention_mask: Optional[torch.Tensor] = None, decoder_attention_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        assert torch.all(decoder_sequence < self.vocab_size), f"Decoder input is out of bounds: {torch.max(decoder_sequence)} >= {self.vocab_size}"
+    def forward(self,
+                target_ids: torch.Tensor,
+                encoder_sequences: Optional[torch.Tensor] = None,
+                targets_embeds: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                decoder_attention_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if targets_embeds is None:
+            assert torch.all(target_ids < self.vocab_size), f"Decoder input is out of bounds: {torch.max(target_ids)} >= {self.vocab_size}"
 
-        decoder_sequence = decoder_sequence.to(self.device)
-        if encoder_sequence is not None:
-            encoder_sequence = encoder_sequence.to(self.device)
+            target_ids = target_ids.to(self.device)
+            if self.embed_tokens is not None:
+                decoder_sequences = self.apply_embedding_transformation(target_ids)
+            else:
+                decoder_sequences = target_ids
+        else:
+            targets_embeds = targets_embeds.to(self.device)
+            decoder_sequences = targets_embeds
 
-        if self.embed_tokens is not None:
-            decoder_sequence = self.apply_embedding_transformation(decoder_sequence)
-        decoder_sequence = self.apply_positional_embedding(decoder_sequence)
-        decoder_sequence = self.decoder_dropout(decoder_sequence)
+        if encoder_sequences is not None:
+            encoder_sequences = encoder_sequences.to(self.device)
+
+        decoder_sequences = self.apply_positional_embedding(decoder_sequences)
+        decoder_sequences = self.decoder_dropout(decoder_sequences)
 
         gating_variances = []
         for decoder_layer in self.decoder_layers:
-            decoder_sequence, gating_variance = self.apply_decoder_layer(decoder_sequence, encoder_sequence, attention_mask, decoder_attention_mask, decoder_layer)
+            decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, attention_mask, decoder_attention_mask, decoder_layer)
             if gating_variance is not None:
                 gating_variances.append(gating_variance)
 
-        decoder_sequence = self.post_decoder_norm(decoder_sequence)
-        decoder_sequence = self.lm_head(decoder_sequence)
+        decoder_sequences = self.post_decoder_norm(decoder_sequences)
+        logits = self.lm_head(decoder_sequences)
 
-        return decoder_sequence, gating_variances
+        return logits, gating_variances
 
 class MegaTransformer(nn.Module):
     def __init__(self, model_config):
@@ -476,7 +495,7 @@ class MegaTransformer(nn.Module):
 
         init_weights(self, model_config.d_model, model_config.init_weights_from, model_config.init_weights_gain, model_config.tie_embeddings)
 
-    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, decoder_attention_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor, inputs_embeds: Optional[torch.Tensor] = None, attention_mask: Optional[torch.Tensor] = None, decoder_attention_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
         if self.padding_value is not None:
             if attention_mask is None and input_ids is not None:
                 attention_mask = input_ids == self.padding_value
@@ -493,18 +512,15 @@ class MegaTransformer(nn.Module):
         labels = labels.to(self.decoder_config.device)
         self.encoder.embed_tokens = self.encoder.embed_tokens.to(self.encoder_config.device)
 
-        input_ids, encoder_gating_variances = self.encoder(input_ids, attention_mask)
-
-        # print(f"input_ids shape: {input_ids.shape}, min: {input_ids.min()}, max: {input_ids.max()}, mean: {input_ids.mean()}, std: {input_ids.std()}, norm: {input_ids.norm()}")
-        # print(f"labels shape: {labels.shape}, min: {labels.min()}, max: {labels.max()}")
+        encoder_sequences, encoder_gating_variances = self.encoder(input_ids=input_ids, key_padding_mask=attention_mask, inputs_embeds=inputs_embeds)
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.decoder_config.device)
 
-        input_ids = input_ids.to(self.decoder_config.device)
+        encoder_sequences = encoder_sequences.to(self.decoder_config.device)
         self.decoder.embed_tokens = self.decoder.embed_tokens.to(self.decoder_config.device)
         self.decoder.lm_head = self.decoder.lm_head.to(self.decoder_config.device)
         
-        labels, decoder_gating_variances = self.decoder(labels, input_ids, attention_mask, decoder_attention_mask)
+        labels, decoder_gating_variances = self.decoder(labels, encoder_sequences, attention_mask=attention_mask, decoder_attention_mask=decoder_attention_mask)
 
         return labels, encoder_gating_variances, decoder_gating_variances

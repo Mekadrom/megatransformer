@@ -9,7 +9,7 @@ tie_embeddings: True
 padding_value: 0
 
 encoder_config:
-  device: cuda:0
+  device: cpu
   self_attn_config:
     n_heads: 8
     n_gqa_groups: 1
@@ -19,7 +19,7 @@ encoder_config:
   vocab_size: 119547
 
 decoder_config:
-  device: cuda:0
+  device: cpu
   self_attn_config:
     n_heads: 8
     n_gqa_groups: 1
