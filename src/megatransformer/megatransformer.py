@@ -1,11 +1,20 @@
 from torch import nn
 from typing import Optional, Union
 
-from . import embedding_mlp, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, transformer_utils
+from . import embedding_mlp, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, transformer_utils, criteria, grouped_query_attn, infini_multihead_attn
 
 import admin_torch
 import math
 import torch
+
+class MegaTransformerOutput:
+    def __init__(self, logits: torch.Tensor, loss: torch.Tensor, prediction_loss: torch.Tensor, moe_loss: torch.Tensor, decoder_gating_variances: list[torch.Tensor], encoder_gating_variances: Optional[list[torch.Tensor]]=None):
+        self.logits = logits
+        self.loss = loss
+        self.prediction_loss = prediction_loss
+        self.moe_loss = moe_loss
+        self.decoder_gating_variances = decoder_gating_variances
+        self.encoder_gating_variances = encoder_gating_variances
 
 def init_weights(model: nn.Module,
                  d_model: int,
@@ -69,7 +78,12 @@ class EncoderLayer(nn.Module):
         self.ffn_type = ffn_config.ffn_type
         self.moe_replace = ffn_config.moe_replace
 
-        self.self_attn: multihead_attn.MultiHeadAttention = multihead_attn.MultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
+        if self_attn_config.attn_impl == 'gqa':
+            self.self_attn: nn.Module = grouped_query_attn.GroupedQueryMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
+        elif self_attn_config.attn_impl == 'infini':
+            self.self_attn: nn.Module = infini_multihead_attn.InfiniMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
+        else:
+            self.self_attn: nn.Module = multihead_attn.MultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
 
         self.self_attn_residual: nn.Module
         self.ffn_residual: nn.Module
@@ -266,11 +280,20 @@ class DecoderLayer(nn.Module):
         self.ffn_type = ffn_config.ffn_type
         self.moe_replace = ffn_config.moe_replace
 
-        self.self_attn = multihead_attn.MultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
+        if self_attn_config.attn_impl == 'gqa':
+            self.self_attn: nn.Module = grouped_query_attn.GroupedQueryMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
+        elif self_attn_config.attn_impl == 'infini':
+            self.self_attn: nn.Module = infini_multihead_attn.InfiniMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
+        else:
+            self.self_attn: nn.Module = multihead_attn.MultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
 
-        self.cross_attn: Optional[multihead_attn.MultiHeadAttention]
         if use_cross_attn:
-            self.cross_attn = multihead_attn.MultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)
+            if cross_attn_config.attn_impl == 'gqa':
+                self.cross_attn: nn.Module = grouped_query_attn.GroupedQueryMultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)
+            elif cross_attn_config.attn_impl == 'infini':
+                self.cross_attn: nn.Module = infini_multihead_attn.InfiniMultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)
+            else:
+                self.cross_attn: nn.Module = multihead_attn.MultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)
         else:
             self.cross_attn = None
 
@@ -297,7 +320,12 @@ class DecoderLayer(nn.Module):
         elif moe is not None:
             self.ffn = nn.Sequential(moe, self.ffn)
 
-    def forward(self, decoder_sequence: torch.Tensor, encoder_sequence: Optional[torch.Tensor], attention_mask: Optional[torch.Tensor], decoder_attention_mask: Optional[torch.Tensor]) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self,
+                decoder_sequence: torch.Tensor,
+                encoder_sequence: Optional[torch.Tensor],
+                decoder_attention_mask: Optional[torch.Tensor],
+                encoder_attention_mask: Optional[torch.Tensor]=None,
+                kv_cache: Optional[list[torch.Tensor]]=None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # print(f"decoder_sequences before self attn shape: {decoder_sequence.shape}, min: {decoder_sequence.min()}, max: {decoder_sequence.max()}, mean: {decoder_sequence.mean()}, std: {decoder_sequence.std()}, norm: {decoder_sequence.norm()}")
 
         self_attn, _ = self.self_attn(decoder_sequence, decoder_sequence, decoder_sequence, decoder_attention_mask)
@@ -305,8 +333,8 @@ class DecoderLayer(nn.Module):
 
         # print(f"decoder_sequences before cross attn shape: {decoder_sequence.shape}, min: {decoder_sequence.min()}, max: {decoder_sequence.max()}, mean: {decoder_sequence.mean()}, std: {decoder_sequence.std()}, norm: {decoder_sequence.norm()}")
 
-        if self.cross_attn is not None and encoder_sequence is not None and attention_mask is not None:
-            cross_attn, _ = self.cross_attn(decoder_sequence, encoder_sequence, encoder_sequence, attention_mask)
+        if self.cross_attn is not None and encoder_sequence is not None:
+            cross_attn, _ = self.cross_attn(decoder_sequence, encoder_sequence, encoder_sequence, encoder_attention_mask, kv_cache=kv_cache)
             decoder_sequence = self.cross_attn_residual(decoder_sequence, cross_attn)
 
         ffn, gating_variances = self.ffn(decoder_sequence)
@@ -365,6 +393,9 @@ class Decoder(nn.Module):
 
         if self.positional_encoding_type != 'rotary':
             self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(self.device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
+
+        self.moe_criteria = criteria.DecoderOnlyMoELoss(decoder_config.moe_diversity_loss_coefficient)
+        self.main_criteria = criteria.LMLoss(ignore_index=model_config.padding_value, eps=model_config.label_smoothing)
 
     def make_decoder_layers(self, n_layers, param_sharing_type, m_independent_layers) -> nn.ModuleList:
         def new_decoder_layer():
@@ -443,23 +474,31 @@ class Decoder(nn.Module):
             return labels + self.tensor_positional_encoding[:, :labels.size(1), :]
         return labels
     
-    def apply_decoder_layer(self, decoder_sequences: torch.Tensor, encoder_sequences: Optional[torch.Tensor], attention_mask: Optional[torch.Tensor], decoder_attention_mask: Optional[torch.Tensor], decoder_layer: nn.Module) -> torch.Tensor:
-        return decoder_layer(decoder_sequences, encoder_sequences, attention_mask, decoder_attention_mask)
+    def apply_decoder_layer(self,
+                            decoder_sequences: torch.Tensor,
+                            encoder_sequences: Optional[torch.Tensor],
+                            decoder_attention_mask: Optional[torch.Tensor],
+                            decoder_layer: nn.Module,
+                            encoder_attention_mask: Optional[torch.Tensor]=None,
+                            kv_cache: Optional[list[torch.Tensor]]=None) -> torch.Tensor:
+        return decoder_layer(decoder_sequences, encoder_sequences, decoder_attention_mask, encoder_attention_mask=encoder_attention_mask, kv_cache=kv_cache)
 
     def forward(self,
-                target_ids: torch.Tensor,
-                encoder_sequences: Optional[torch.Tensor] = None,
-                targets_embeds: Optional[torch.Tensor] = None,
-                attention_mask: Optional[torch.Tensor] = None,
-                decoder_attention_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+                input_ids: torch.Tensor,
+                labels: Optional[torch.Tensor]=None,
+                encoder_sequences: Optional[torch.Tensor]=None,
+                targets_embeds: Optional[torch.Tensor]=None,
+                decoder_attention_mask: Optional[torch.Tensor]=None,
+                return_dict: bool=False,
+                kv_caches: Optional[list[list[torch.Tensor]]]=None) -> Union[tuple[torch.Tensor, list[torch.Tensor]], MegaTransformerOutput]:
         if targets_embeds is None:
-            assert torch.all(target_ids < self.vocab_size), f"Decoder input is out of bounds: {torch.max(target_ids)} >= {self.vocab_size}"
+            assert torch.all(input_ids < self.vocab_size), f"Decoder input is out of bounds: {torch.max(input_ids)} >= {self.vocab_size}"
 
-            target_ids = target_ids.to(self.device)
+            input_ids = input_ids.to(self.device)
             if self.embed_tokens is not None:
-                decoder_sequences = self.apply_embedding_transformation(target_ids)
+                decoder_sequences = self.apply_embedding_transformation(input_ids)
             else:
-                decoder_sequences = target_ids
+                decoder_sequences = input_ids
         else:
             targets_embeds = targets_embeds.to(self.device)
             decoder_sequences = targets_embeds
@@ -471,14 +510,36 @@ class Decoder(nn.Module):
         decoder_sequences = self.decoder_dropout(decoder_sequences)
 
         gating_variances = []
-        for decoder_layer in self.decoder_layers:
-            decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, attention_mask, decoder_attention_mask, decoder_layer)
-            if gating_variance is not None:
-                gating_variances.append(gating_variance)
+        if kv_caches:
+            for decoder_layer, kv_cache in zip(self.decoder_layers, kv_caches):
+                decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, decoder_attention_mask, decoder_layer, kv_cache=kv_cache)
+                if gating_variance is not None:
+                    gating_variances.append(gating_variance)
+        else:
+            for decoder_layer in self.decoder_layers:
+                decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, decoder_attention_mask, decoder_layer)
+                if gating_variance is not None:
+                    gating_variances.append(gating_variance)
 
         decoder_sequences = self.post_decoder_norm(decoder_sequences)
         logits = self.lm_head(decoder_sequences)
 
+        if labels is not None:
+            main_loss = self.main_criteria(logits, labels)
+            moe_loss, gating_variances_tensor = self.moe_criteria(gating_variances)
+        else:
+            main_loss = None
+            moe_loss = None
+            gating_variances_tensor = None
+
+        if return_dict:
+            return MegaTransformerOutput(
+                logits=logits,
+                loss=main_loss + moe_loss,
+                prediction_loss=main_loss,
+                moe_loss=moe_loss,
+                decoder_gating_variances=gating_variances_tensor
+            )
         return logits, gating_variances
 
 class MegaTransformer(nn.Module):
@@ -493,9 +554,22 @@ class MegaTransformer(nn.Module):
         self.encoder: Encoder = Encoder(self.encoder_config.device, model_config)
         self.decoder: Decoder = Decoder(self.decoder_config.device, model_config)
 
+        self.main_criteria = criteria.LMLoss(ignore_index=model_config.padding_value, eps=model_config.label_smoothing)
+        self.moe_criteria = criteria.TransformerMoELoss(model_config.moe_diversity_loss_coefficient)
+
         init_weights(self, model_config.d_model, model_config.init_weights_from, model_config.init_weights_gain, model_config.tie_embeddings)
 
-    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor, inputs_embeds: Optional[torch.Tensor] = None, attention_mask: Optional[torch.Tensor] = None, decoder_attention_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+    def forward(
+            self,
+            input_ids: torch.Tensor,
+            labels: torch.Tensor,
+            inputs_embeds: Optional[torch.Tensor]=None,
+            attention_mask: Optional[torch.Tensor]=None,
+            decoder_attention_mask: Optional[torch.Tensor]=None,
+            return_dict: bool=False) -> Union[tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]], MegaTransformerOutput]:
+        """
+        Full encoder-decoder transformer forward pass function, with device cast handling if necessary (training does not support this but inference should)
+        """
         if self.padding_value is not None:
             if attention_mask is None and input_ids is not None:
                 attention_mask = input_ids == self.padding_value
@@ -521,6 +595,20 @@ class MegaTransformer(nn.Module):
         self.decoder.embed_tokens = self.decoder.embed_tokens.to(self.decoder_config.device)
         self.decoder.lm_head = self.decoder.lm_head.to(self.decoder_config.device)
         
-        labels, decoder_gating_variances = self.decoder(labels, encoder_sequences, attention_mask=attention_mask, decoder_attention_mask=decoder_attention_mask)
+        logits, decoder_gating_variances = self.decoder(labels, encoder_sequences, attention_mask=attention_mask, decoder_attention_mask=decoder_attention_mask)
 
-        return labels, encoder_gating_variances, decoder_gating_variances
+        main_loss = self.main_criteria(logits, labels)
+        moe_loss, encoder_gating_variances_tensor, decoder_gating_variances_tensor = self.moe_criteria(encoder_gating_variances, decoder_gating_variances)
+
+        total_loss = main_loss + moe_loss
+
+        if return_dict:
+            return MegaTransformerOutput(
+                logits=logits,
+                loss=total_loss,
+                prediction_loss=main_loss,
+                moe_loss=moe_loss,
+                encoder_gating_variances=encoder_gating_variances_tensor,
+                decoder_gating_variances=decoder_gating_variances_tensor
+            )
+        return logits, encoder_gating_variances, decoder_gating_variances

@@ -7,9 +7,9 @@ from . import transformer_utils
 import torch
 import torch.nn.functional as F
 
-class MultiHeadAttention(nn.Module):
+class GroupedQueryMultiHeadAttention(nn.Module):
     def __init__(self, device, model_config, attn_config, self_attn, in_decoder=False):
-        super(MultiHeadAttention, self).__init__()
+        super(GroupedQueryMultiHeadAttention, self).__init__()
 
         self.debug = False
 
@@ -27,6 +27,7 @@ class MultiHeadAttention(nn.Module):
         self.norm = model_config.norm
         self.norm_eps = model_config.norm_eps
 
+        self.n_gqa_groups = attn_config.n_gqa_groups
         self.n_heads = attn_config.n_heads
         self.d_queries = attn_config.d_queries
         self.d_values = attn_config.d_values
@@ -43,8 +44,10 @@ class MultiHeadAttention(nn.Module):
         if self.positional_encoding_type == 'rotary':
             self.rotary_embedding = RotaryEmbedding(dim=self.positional_encoding_dim, learned_freq=self.learnable_positional_encoding).to(device)
 
+        self.n_q_heads = self.n_gqa_groups * self.n_heads
+
         # A linear projection to cast (n_kv_heads sets of) queries from the input query sequences
-        self.q_proj = nn.Linear(self.d_model, self.n_heads * self.d_queries, bias=self.q_bias) # (N, query_sequence_pad_length, n_kv_heads * d_queries)
+        self.q_proj = nn.Linear(self.d_model, self.n_q_heads * self.d_queries, bias=self.q_bias) # (N, query_sequence_pad_length, n_kv_heads * d_queries)
         # A linear projection to cast (n_kv_heads sets of) keys and values from the input reference sequences
         self.k_proj = nn.Linear(self.d_model, self.n_heads * self.d_queries, bias=self.k_bias) # (N, key_value_sequence_pad_length, n_kv_heads * d_queries)
         self.v_proj = nn.Linear(self.d_model, self.n_heads * self.d_values, bias=self.v_bias) # (N, key_value_sequence_pad_length, n_kv_heads * d_values)
@@ -89,8 +92,7 @@ class MultiHeadAttention(nn.Module):
                 value_sequences: torch.Tensor,
                 attention_mask: Optional[torch.Tensor]=None,
                 k_cache: Optional[list[torch.Tensor]]=None,
-                v_cache: Optional[list[torch.Tensor]]=None,
-                return_attn_values: Optional[bool]=False) -> tuple[torch.Tensor, list[torch.Tensor]]:
+                v_cache: Optional[list[torch.Tensor]]=None) -> tuple[torch.Tensor, list[torch.Tensor]]:
         query_sequences = self.qkv_norm(query_sequences)
 
         # if this isn't self-attention, they will already have been normed in the last layer of the Encoder (from whence they came)
@@ -123,11 +125,11 @@ class MultiHeadAttention(nn.Module):
         N, T, _ = k_heads.shape
 
         # Split the last dimension by the n_kv_heads subspaces
-        q_heads = q_heads.contiguous().view(N, t, self.n_heads, self.d_queries) # (N, query_sequence_pad_length, n_heads, d_queries)
+        q_heads = q_heads.contiguous().view(N, t, self.n_gqa_groups, self.n_heads, self.d_queries) # (N, query_sequence_pad_length, n_gqa_groups, n_heads, d_queries)
         k_heads = k_heads.contiguous().view(N, T, self.n_heads, self.d_queries) # (N, key_value_sequence_pad_length, n_heads, d_queries)
         v_heads = v_heads.contiguous().view(N, T, self.n_heads, self.d_values) # (N, key_value_sequence_pad_length, n_heads, d_values)
 
-        q_heads = q_heads.permute(0, 2, 1, 3) # Nhtd
+        q_heads = q_heads.permute(0, 2, 3, 1, 4) # Nghtd
         k_heads = k_heads.permute(0, 2, 1, 3) # NhTd
         v_heads = v_heads.permute(0, 2, 1, 3) # NhTv
 
@@ -135,30 +137,21 @@ class MultiHeadAttention(nn.Module):
             q_heads = self.rotary_embedding.rotate_queries_or_keys(q_heads, seq_dim=-2)
             k_heads = self.rotary_embedding.rotate_queries_or_keys(k_heads.unsqueeze(0), seq_dim=-2).squeeze(0) # adds a singleton dimension for the rotation operation and then removes it for the torch compiler
 
-        if return_attn_values:
-            attention_weights = torch.einsum('...htq,...hTq->...htT', q_heads, k_heads)
+        # generate attention weights by taking the dot product of queries and keys
+        attention_weights = torch.einsum('...ghtq,...hTq->...htT', q_heads, k_heads)
 
-            attention_weights = (1.0 / (self.d_queries ** 0.5)) * attention_weights
-            if bool(self.use_grok_scaled_attn):
-                attention_weights = 30.0 * torch.tanh(attention_weights / 30.0) # grok version of scaled attention
+        attention_weights = (1.0 / (self.d_queries ** 0.5)) * attention_weights
+        if bool(self.use_grok_scaled_attn):
+            attention_weights = 30.0 * torch.tanh(attention_weights / 30.0) # grok version of scaled attention
 
-            attention_weights = self.mask_attention(attention_weights, attention_mask)
-            attention_weights = self.attn_softmax(attention_weights)
-            attention_weights_for_visualization = [attention_weights.clone().detach()]
+        attention_weights = self.mask_attention(attention_weights, attention_mask)
+        attention_weights = self.attn_softmax(attention_weights)
+        attention_weights_for_visualization = [attention_weights.clone().detach()]
 
-            attention_weights = self.attn_dropout(attention_weights)
+        attention_weights = self.attn_dropout(attention_weights)
 
-            # Calculate sequences as the weighted sums of values based on these softmax weights
-            sequences = torch.einsum('...htT,...hTv->...htv', attention_weights, v_heads)
-        else:
-            sequences = F.scaled_dot_product_attention(
-                q_heads,
-                k_heads,
-                v_heads,
-                attn_mask=attention_mask,
-                dropout_p=self.dropout,
-                is_causal=self.self_attn
-            )
+        # Calculate sequences as the weighted sums of values based on these softmax weights
+        sequences = torch.einsum('...htT,...hTv->...htv', attention_weights, v_heads)
 
         sequences = sequences.permute(0, 2, 1, 3)
 

@@ -18,7 +18,7 @@ class AttentionConfig(ConfigDict):
                  v_bias: bool = False,
                  o_bias: bool = False,
                  heads_activation_function: Optional[str] = None,
-                 use_infinite_attention: bool = False,
+                 attn_impl: Literal["mha", "gqa", "infini"] = 'mha',
                  infinite_attention_n_segments: int = 16,
                  infinite_attention_update: Literal["nonlinear", "linear"] = 'linear',
                  use_grok_scaled_attn: bool = True):
@@ -32,7 +32,7 @@ class AttentionConfig(ConfigDict):
         self.v_bias = v_bias
         self.o_bias = o_bias
         self.heads_activation_function = heads_activation_function
-        self.use_infinite_attention = use_infinite_attention
+        self.attn_impl = attn_impl
         self.infinite_attention_n_segments = infinite_attention_n_segments
         self.infinite_attention_update = infinite_attention_update
         self.use_grok_scaled_attn = use_grok_scaled_attn
@@ -76,7 +76,8 @@ class EncoderDecoderConfig(ConfigDict):
                  per_lang_embedding_layers: int = 0,
                  embedding_activation: str = 'none',
                  param_sharing_type: Literal["none", "all", "cycle-rev", "cycle", "ffn-cycle-rev", "heads-cycle-rev"] = 'none',
-                 m_independent_layers: int = 1):
+                 m_independent_layers: int = 1,
+                 moe_diversity_loss_coefficient: float = 0.0):
         self.device = device
         self.vocab_size = vocab_size
         self.n_layers = n_layers
@@ -86,6 +87,8 @@ class EncoderDecoderConfig(ConfigDict):
         self.embedding_activation = embedding_activation
         self.param_sharing_type = param_sharing_type
         self.m_independent_layers = m_independent_layers
+
+        self.moe_diversity_loss_coefficient = moe_diversity_loss_coefficient
 
         self.self_attn_config = self_attn_config
         self.cross_attn_config = cross_attn_config
@@ -109,7 +112,8 @@ class TransformerConfig(ConfigDict):
                  positional_encoding_dim: int = 64,
                  learnable_positional_encoding: bool = False,
                  tie_embeddings: bool = False,
-                 padding_value: int = 0,
+                 padding_value: int = -100,
+                 label_smoothing: float = 0.0,
                  norm_eps: float = 1e-5,
                  norm = nn.LayerNorm,
                  init_weights_from: str = 'glorot_uniform',
@@ -123,6 +127,7 @@ class TransformerConfig(ConfigDict):
         self.positional_encoding_dim = positional_encoding_dim
         self.learnable_positional_encoding = learnable_positional_encoding
         self.tie_embeddings = tie_embeddings
+        self.label_smoothing = label_smoothing
         self.padding_value = padding_value
         self.norm_eps = norm_eps
         self.norm = norm
