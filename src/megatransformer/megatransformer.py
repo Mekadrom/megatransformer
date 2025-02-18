@@ -1,7 +1,7 @@
 from torch import nn
 from typing import Optional, Union
 
-from . import embedding_mlp, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, transformer_utils, criteria, grouped_query_attn, infini_multihead_attn
+from . import embedding_mlp, infinite_multihead_attn, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, transformer_utils, criteria, grouped_query_attn
 
 import admin_torch
 import math
@@ -15,51 +15,6 @@ class MegaTransformerOutput:
         self.moe_loss = moe_loss
         self.decoder_gating_variances = decoder_gating_variances
         self.encoder_gating_variances = encoder_gating_variances
-
-def init_weights(model: nn.Module,
-                 d_model: int,
-                 init_weights_from: str = 'glorot_uniform',
-                 init_weights_gain: float = 1.0,
-                 tie_embeddings=False):
-    for p in model.parameters():
-        # glorot initialization needs at least two dimensions on the tensor
-        if p.dim() > 1:
-            if init_weights_from in ['glorot_uniform', 'xavier_uniform']:
-                nn.init.xavier_uniform_(p, gain=init_weights_gain)
-            elif init_weights_from in ['glorot_normal', 'xavier_normal']:
-                nn.init.xavier_normal_(p, gain=init_weights_gain)
-            elif init_weights_from == 'kaiming_uniform':
-                nn.init.kaiming_uniform_(p)
-            elif init_weights_from == 'kaiming_normal':
-                nn.init.kaiming_normal_(p)
-            elif init_weights_from == 'orthogonal':
-                nn.init.orthogonal_(p)
-            else:
-                raise Exception(f"Unknown weight initialization method: {init_weights_from}")
-
-    # share weights between the embedding layers and the logit layer
-    if isinstance(model, MegaTransformer):
-        encoder: Encoder = model.encoder
-        decoder: Decoder = model.decoder
-        if isinstance(encoder.embed_tokens, nn.Embedding) and isinstance(decoder.embed_tokens, nn.Embedding):
-            encoder_embedding: nn.Embedding = encoder.embed_tokens
-            decoder_embedding: nn.Embedding = decoder.embed_tokens
-            nn.init.normal_(encoder_embedding.weight, mean=0., std=d_model ** -0.5)
-            if tie_embeddings:
-                decoder_embedding.weight = encoder_embedding.weight
-                decoder.lm_head.weight = decoder_embedding.weight
-        elif isinstance(encoder.embed_tokens, embedding_mlp.EmbeddingMLP) \
-            and isinstance(decoder.embed_tokens, embedding_mlp.EmbeddingMLP) \
-            and isinstance(decoder.lm_head, nn.Sequential):
-            encoder_embedding: embedding_mlp.EmbeddingMLP = encoder.embed_tokens
-            decoder_embedding: embedding_mlp.EmbeddingMLP = decoder.embed_tokens
-
-            nn.init.normal_(encoder_embedding.embedding.weight, mean=0., std=d_model ** -0.5)
-
-            if tie_embeddings:
-                decoder_embedding.embedding.weight = encoder_embedding.embedding.weight
-                decoder.lm_head[-1].weight = decoder.embed_tokens.embedding.weight
-    print("Model initialized.")
 
 class EncoderLayer(nn.Module):
     def __init__(self, device, model_config):
@@ -81,7 +36,7 @@ class EncoderLayer(nn.Module):
         if self_attn_config.attn_impl == 'gqa':
             self.self_attn: nn.Module = grouped_query_attn.GroupedQueryMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
         elif self_attn_config.attn_impl == 'infini':
-            self.self_attn: nn.Module = infini_multihead_attn.InfiniMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
+            self.self_attn: nn.Module = infinite_multihead_attn.InfiniteMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
         else:
             self.self_attn: nn.Module = multihead_attn.MultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
 
@@ -283,7 +238,7 @@ class DecoderLayer(nn.Module):
         if self_attn_config.attn_impl == 'gqa':
             self.self_attn: nn.Module = grouped_query_attn.GroupedQueryMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
         elif self_attn_config.attn_impl == 'infini':
-            self.self_attn: nn.Module = infini_multihead_attn.InfiniMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
+            self.self_attn: nn.Module = infinite_multihead_attn.InfiniteMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
         else:
             self.self_attn: nn.Module = multihead_attn.MultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
 
@@ -291,7 +246,7 @@ class DecoderLayer(nn.Module):
             if cross_attn_config.attn_impl == 'gqa':
                 self.cross_attn: nn.Module = grouped_query_attn.GroupedQueryMultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)
             elif cross_attn_config.attn_impl == 'infini':
-                self.cross_attn: nn.Module = infini_multihead_attn.InfiniMultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)
+                self.cross_attn: nn.Module = infinite_multihead_attn.InfiniteMultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)
             else:
                 self.cross_attn: nn.Module = multihead_attn.MultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)
         else:
@@ -394,8 +349,8 @@ class Decoder(nn.Module):
         if self.positional_encoding_type != 'rotary':
             self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(self.device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
 
-        self.moe_criteria = criteria.DecoderOnlyMoELoss(decoder_config.moe_diversity_loss_coefficient)
         self.main_criteria = criteria.LMLoss(ignore_index=model_config.padding_value, eps=model_config.label_smoothing)
+        self.moe_criteria = criteria.DecoderOnlyMoELoss(decoder_config.moe_diversity_loss_coefficient)
 
     def make_decoder_layers(self, n_layers, param_sharing_type, m_independent_layers) -> nn.ModuleList:
         def new_decoder_layer():
@@ -556,8 +511,6 @@ class MegaTransformer(nn.Module):
 
         self.main_criteria = criteria.LMLoss(ignore_index=model_config.padding_value, eps=model_config.label_smoothing)
         self.moe_criteria = criteria.TransformerMoELoss(model_config.moe_diversity_loss_coefficient)
-
-        init_weights(self, model_config.d_model, model_config.init_weights_from, model_config.init_weights_gain, model_config.tie_embeddings)
 
     def forward(
             self,

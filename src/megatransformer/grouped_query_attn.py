@@ -36,7 +36,6 @@ class GroupedQueryMultiHeadAttention(nn.Module):
         self.v_bias = attn_config.v_bias
         self.o_bias = attn_config.o_bias
         self.heads_activation_function = attn_config.heads_activation_function
-        self.use_infinite_attention = attn_config.use_infinite_attention
         self.infinite_attention_n_segments = attn_config.infinite_attention_n_segments
         self.infinite_attention_update = attn_config.infinite_attention_update
         self.use_grok_scaled_attn = attn_config.use_grok_scaled_attn

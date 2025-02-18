@@ -7,9 +7,9 @@ from . import transformer_utils
 import torch
 import torch.nn.functional as F
 
-class InfiniMultiHeadAttention(nn.Module):
+class InfiniteMultiHeadAttention(nn.Module):
     def __init__(self, device, model_config, attn_config, self_attn, in_decoder=False):
-        super(InfiniMultiHeadAttention, self).__init__()
+        super(InfiniteMultiHeadAttention, self).__init__()
 
         self.device = device
         self.attn_config = attn_config

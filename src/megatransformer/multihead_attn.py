@@ -35,7 +35,6 @@ class MultiHeadAttention(nn.Module):
         self.v_bias = attn_config.v_bias
         self.o_bias = attn_config.o_bias
         self.heads_activation_function = attn_config.heads_activation_function
-        self.use_infinite_attention = attn_config.use_infinite_attention
         self.infinite_attention_n_segments = attn_config.infinite_attention_n_segments
         self.infinite_attention_update = attn_config.infinite_attention_update
         self.use_grok_scaled_attn = attn_config.use_grok_scaled_attn
@@ -75,9 +74,7 @@ class MultiHeadAttention(nn.Module):
 
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(1).to(torch.bool)
 
-            # attention_weights = attention_weights.masked_fill_(attention_mask, -float('inf'))
-            attention_weights = attention_weights + attention_mask
-
+            attention_weights = attention_weights.masked_fill_(attention_mask, -float('inf'))
         if self.self_attn:
             attention_weights = attention_weights.masked_fill_(~self.causal_mask[:attention_weights.shape[-2], :attention_weights.shape[-1]], -float('inf'))
 
@@ -135,30 +132,31 @@ class MultiHeadAttention(nn.Module):
             q_heads = self.rotary_embedding.rotate_queries_or_keys(q_heads, seq_dim=-2)
             k_heads = self.rotary_embedding.rotate_queries_or_keys(k_heads.unsqueeze(0), seq_dim=-2).squeeze(0) # adds a singleton dimension for the rotation operation and then removes it for the torch compiler
 
-        if return_attn_values:
-            attention_weights = torch.einsum('...htq,...hTq->...htT', q_heads, k_heads)
+        # if return_attn_values:
+        attention_weights = torch.einsum('...htq,...hTq->...htT', q_heads, k_heads)
 
-            attention_weights = (1.0 / (self.d_queries ** 0.5)) * attention_weights
-            if bool(self.use_grok_scaled_attn):
-                attention_weights = 30.0 * torch.tanh(attention_weights / 30.0) # grok version of scaled attention
+        attention_weights = (1.0 / (self.d_queries ** 0.5)) * attention_weights
+        if bool(self.use_grok_scaled_attn):
+            attention_weights = 30.0 * torch.tanh(attention_weights / 30.0) # grok version of scaled attention
 
-            attention_weights = self.mask_attention(attention_weights, attention_mask)
-            attention_weights = self.attn_softmax(attention_weights)
-            attention_weights_for_visualization = [attention_weights.clone().detach()]
+        attention_weights = self.mask_attention(attention_weights, attention_mask)
+        attention_weights = self.attn_softmax(attention_weights)
+        attention_weights_for_visualization = [attention_weights.clone().detach()]
 
-            attention_weights = self.attn_dropout(attention_weights)
+        attention_weights = self.attn_dropout(attention_weights)
 
-            # Calculate sequences as the weighted sums of values based on these softmax weights
-            sequences = torch.einsum('...htT,...hTv->...htv', attention_weights, v_heads)
-        else:
-            sequences = F.scaled_dot_product_attention(
-                q_heads,
-                k_heads,
-                v_heads,
-                attn_mask=attention_mask,
-                dropout_p=self.dropout,
-                is_causal=self.self_attn
-            )
+        # Calculate sequences as the weighted sums of values based on these softmax weights
+        sequences = torch.einsum('...htT,...hTv->...htv', attention_weights, v_heads)
+        # else:
+        #     attention_weights_for_visualization = []
+        #     sequences = F.scaled_dot_product_attention(
+        #         q_heads,
+        #         k_heads,
+        #         v_heads,
+        #         attn_mask=attention_mask,
+        #         dropout_p=self.dropout,
+        #         is_causal=self.self_attn
+        #     )
 
         sequences = sequences.permute(0, 2, 1, 3)
 

@@ -1,7 +1,8 @@
 from torch import nn
 
-from . import transformer_utils
+from . import sparse_moe, transformer_utils
 
+import copy
 import torch
 
 class Phi3MLP(nn.Module):
@@ -11,18 +12,38 @@ class Phi3MLP(nn.Module):
         ffn_config = model_config.ffn_config
 
         self.d_model = model_config.d_model
+        self.dropout = model_config.dropout
+        self.norm = model_config.norm
+        self.norm_eps = model_config.norm_eps
+
+        self.ffn_type = ffn_config.ffn_type
         self.d_inner = ffn_config.d_inner
         self.activation_function = ffn_config.activation_function
+        self.ffn_bias = ffn_config.ffn_bias
 
-        self.gate_up_proj = nn.Linear(self.d_model, 2 * self.d_inner, bias=False)
-        self.down_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
+        self.layer_norm = self.norm(self.d_model, self.norm_eps)
+        self.activation = transformer_utils.create_activation_function(self.d_inner, self.activation_function)
+        self.dropout = nn.Dropout(self.dropout)
+        
+        self.expand: nn.Module
+        if self.ffn_type == 'sparse':
+            sparse_ffn_config = copy.deepcopy(ffn_config)
+            sparse_ffn_config.d_inner = 2 * self.d_inner
+            self.expand = sparse_moe.SparseMoE(model_config)
+        else:
+            self.expand = nn.Linear(self.d_model, 2 * self.d_inner, bias=self.ffn_bias)
+        self.condense = nn.Linear(self.d_inner, self.d_model, bias=self.ffn_bias)
 
-        self.activation_fn = transformer_utils.create_activation_function(self.d_inner, self.activation_function)
+    def forward(self, sequences: torch.Tensor) -> torch.Tensor:
+        sequences = self.layer_norm(sequences)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        up_states = self.gate_up_proj(hidden_states)
+        expanded = self.expand(sequences)
 
-        gate, up_states = up_states.chunk(2, dim=-1)
-        up_states = up_states * self.activation_fn(gate)
+        gate, expanded = expanded.chunk(2, dim=-1)
+        expanded = expanded * self.activation_function(gate)
 
-        return self.down_proj(up_states)
+        condensed = self.condense(expanded)
+
+        condensed = self.dropout(condensed)
+
+        return condensed

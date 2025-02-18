@@ -47,9 +47,8 @@ class LMLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, labels: torch.Tensor):
         logits = logits.view(-1, logits.size(-1))
-        
         labels = labels.view(-1)
-        
+
         loss = F.cross_entropy(
             logits, 
             labels,
