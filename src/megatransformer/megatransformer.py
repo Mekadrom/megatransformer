@@ -35,7 +35,7 @@ class EncoderLayer(nn.Module):
 
         if self_attn_config.attn_impl == 'gqa':
             self.self_attn: nn.Module = grouped_query_attn.GroupedQueryMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
-        elif self_attn_config.attn_impl == 'infini':
+        elif self_attn_config.attn_impl == 'infinite':
             self.self_attn: nn.Module = infinite_multihead_attn.InfiniteMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
         else:
             self.self_attn: nn.Module = multihead_attn.MultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=False)
@@ -237,7 +237,7 @@ class DecoderLayer(nn.Module):
 
         if self_attn_config.attn_impl == 'gqa':
             self.self_attn: nn.Module = grouped_query_attn.GroupedQueryMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
-        elif self_attn_config.attn_impl == 'infini':
+        elif self_attn_config.attn_impl == 'infinite':
             self.self_attn: nn.Module = infinite_multihead_attn.InfiniteMultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
         else:
             self.self_attn: nn.Module = multihead_attn.MultiHeadAttention(device, model_config, self_attn_config, self_attn=True, in_decoder=True)
@@ -245,7 +245,7 @@ class DecoderLayer(nn.Module):
         if use_cross_attn:
             if cross_attn_config.attn_impl == 'gqa':
                 self.cross_attn: nn.Module = grouped_query_attn.GroupedQueryMultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)
-            elif cross_attn_config.attn_impl == 'infini':
+            elif cross_attn_config.attn_impl == 'infinite':
                 self.cross_attn: nn.Module = infinite_multihead_attn.InfiniteMultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)
             else:
                 self.cross_attn: nn.Module = multihead_attn.MultiHeadAttention(device, model_config, cross_attn_config, self_attn=False, in_decoder=True)

@@ -54,19 +54,28 @@ class InfiniteMultiHeadAttention(nn.Module):
 
         self.qkv_norm = self.norm(self.d_model, self.norm_eps)
 
+        self.attn_softmax = nn.Softmax(dim=-1)
         self.attn_dropout = nn.Dropout(self.dropout)
+        self.output_dropout = nn.Dropout(self.dropout)
 
         self.heads_activation = None
         if self.heads_activation_function is not None:
             self.heads_activation = transformer_utils.create_activation_function(self.d_model, self.heads_activation_function)
 
-        self.infinite_attn_elu: Optional[nn.ELU] = None
-        self.infinite_attn_beta: Optional[nn.Parameter] = None
-
         assert self.maxlen % self.infinite_attention_n_segments == 0, "maxlen must be divisible by infinite_attention_n_segments"
 
-        self.infinite_attn_beta = nn.Parameter(torch.ones((1,)))
-        self.infinite_attn_elu = nn.ELU()
+        self.infinite_attn_segment_size = self.maxlen // self.infinite_attention_n_segments
+
+        # eg: 42 * 64 -> 64 = 2688 -> 64
+        self.k_memory_compression = nn.Sequential(
+            nn.Linear(self.infinite_attn_segment_size * self.d_queries, self.d_queries),
+            nn.ELU(),
+        )
+        self.v_memory_compression = nn.Sequential(
+            nn.Linear(self.infinite_attn_segment_size * self.d_values, self.d_values),
+            nn.ELU(),
+        )
+
         self.register_buffer('causal_mask', torch.tril(torch.ones((self.maxlen // self.infinite_attention_n_segments) + 1, (self.maxlen // self.infinite_attention_n_segments) + 1).to(device)))
 
     def mask_attention(self, attention_weights: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -77,10 +86,9 @@ class InfiniteMultiHeadAttention(nn.Module):
 
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(1).to(torch.bool)
 
-            attention_weights = attention_weights.masked_fill_(~attention_mask, -float('inf'))
-
+            attention_weights = attention_weights.masked_fill_(attention_mask, -float('inf'))
         if self.self_attn:
-            attention_weights = attention_weights.masked_fill_(self.causal_mask[:attention_weights.shape[-2], :attention_weights.shape[-1]] == 0, -float('inf'))
+            attention_weights = attention_weights.masked_fill_(~self.causal_mask[:attention_weights.shape[-2], :attention_weights.shape[-1]], -float('inf'))
 
         return attention_weights
 
@@ -92,6 +100,17 @@ class InfiniteMultiHeadAttention(nn.Module):
             key_sequences = self.qkv_norm(key_sequences)
             value_sequences = self.qkv_norm(value_sequences)
 
+        N, t, _ = query_sequences.shape
+        N, T, _ = key_sequences.shape
+
+        if t < self.maxlen:
+            # pad to maxlen with zeros prepended along the sequence length
+            query_sequences = F.pad(query_sequences, (0, 0, 0, self.maxlen - t), value=0.0)
+        if T < self.maxlen:
+            # pad to maxlen with zeros prepended along the sequence length
+            key_sequences = F.pad(key_sequences, (0, 0, 0, self.maxlen - T), value=0.0)
+            value_sequences = F.pad(value_sequences, (0, 0, 0, self.maxlen - T), value=0.0)
+
         q_heads: torch.Tensor = self.q_proj(query_sequences)
         k_heads: torch.Tensor = self.k_proj(key_sequences)
         v_heads: torch.Tensor = self.v_proj(value_sequences)
@@ -101,71 +120,59 @@ class InfiniteMultiHeadAttention(nn.Module):
             k_heads = self.heads_activation(k_heads)
             v_heads = self.heads_activation(v_heads)
 
-        N, t, _ = q_heads.shape
-        N, T, _ = k_heads.shape
-
         # Split the last dimension by the n_kv_heads subspaces
         q_heads = q_heads.contiguous().view(N, t, self.n_gqa_groups, self.n_heads, self.d_queries) # (N, query_sequence_pad_length, n_gqa_groups, n_heads, d_queries)
         k_heads = k_heads.contiguous().view(N, T, self.n_heads, self.d_queries) # (N, key_value_sequence_pad_length, n_heads, d_queries)
         v_heads = v_heads.contiguous().view(N, T, self.n_heads, self.d_values) # (N, key_value_sequence_pad_length, n_heads, d_values)
 
-        q_heads = q_heads.permute(0, 2, 3, 1, 4) # Nghtd
-        k_heads = k_heads.permute(0, 2, 1, 3) # NhTd
+        q_heads = q_heads.permute(0, 2, 3, 1, 4) # Nghtq
+        k_heads = k_heads.permute(0, 2, 1, 3) # NhTq
         v_heads = v_heads.permute(0, 2, 1, 3) # NhTv
 
         if hasattr(self, 'rotary_embedding') and self.rotary_embedding is not None:
             q_heads = self.rotary_embedding.rotate_queries_or_keys(q_heads, seq_dim=-2)
             k_heads = self.rotary_embedding.rotate_queries_or_keys(k_heads.unsqueeze(0), seq_dim=-2).squeeze(0) # adds a singleton dimension for the rotation operation and then removes it for the torch compiler
 
-        memory = torch.zeros((self.n_heads, self.d_queries, self.d_queries)).to(query_sequences.device)
-        z = torch.zeros((self.n_heads, self.d_queries, 1)).to(query_sequences.device)
+        k_segments = k_heads.split(self.infinite_attention_n_segments, dim=-2)
+        v_segments = v_heads.split(self.infinite_attention_n_segments, dim=-2)
 
-        q_heads = q_heads.view(N, self.n_gqa_groups, self.n_heads, self.infinite_attention_n_segments, t // self.infinite_attention_n_segments, self.d_queries) # Nghitq
-        k_heads = k_heads.view(N, self.n_heads, self.infinite_attention_n_segments, T // self.infinite_attention_n_segments, self.d_queries) # NhiTq
-        v_heads = v_heads.view(N, self.n_heads, self.infinite_attention_n_segments, T // self.infinite_attention_n_segments, self.d_values) # NhiTv
+        # example: maxlen // infinite_attention_n_segments + (maxlen % infinite_attention_n_segments) = 128 // 6 + (128 % 6) = 21 + 2 = 23 = r
+        # example tensor would be of shape Nhrq or Nhrv
+        recent_k = torch.cat(k_segments[-2:], dim=-2)
+        recent_v = torch.cat(v_segments[-2:], dim=-2)
 
-        output = []
-        for idx in range(self.infinite_attention_n_segments):
-            sigma_q: torch.Tensor = self.infinite_attn_elu(q_heads[:, :, :, idx, :, :]) + 1.0
-            sigma_k: torch.Tensor = self.infinite_attn_elu(k_heads[:, :, idx, :, :]) + 1.0
+        # Nhiq or Nhiv where i = maxlen // infinite_attention_n_segments
+        k_segments = torch.stack(k_segments[:-2], dim=2)
+        v_segments = torch.stack(v_segments[:-2], dim=2)
 
-            A_mem = (sigma_q @ memory) / ((sigma_q @ z) + (1e-6))
+        k_summaries = self.k_memory_compression(k_segments.view(N, self.n_heads, -1)) # Nhq
+        v_summaries = self.v_memory_compression(v_segments.view(N, self.n_heads, -1)) # Nhv
 
-            attention_weights: torch.Tensor = torch.einsum('...ghtq,...hTq->...htT', q_heads[:, :, :, idx, :, :], k_heads[:, :, idx, :, :])
+        k_heads = torch.cat([k_summaries, recent_k], dim=-2) # Nhrq
+        v_heads = torch.cat([v_summaries, recent_v], dim=-2) # Nhrv
 
-            # scaled attention
-            attention_weights = (1.0 / (self.d_queries ** 0.5)) * attention_weights
-            if bool(self.use_grok_scaled_attn):
-                attention_weights = 30.0 * torch.tanh(attention_weights / 30.0)
+        # generate attention weights by taking the dot product of queries and keys
+        attention_weights = torch.einsum('...ghtq,...hTq->...htT', q_heads, k_heads)
 
-            attention_weights = self.mask_attention(attention_weights, None)
-            attention_weights = F.softmax(attention_weights, dim=-1)
+        attention_weights = (1.0 / (self.d_queries ** 0.5)) * attention_weights
+        if bool(self.use_grok_scaled_attn):
+            attention_weights = 30.0 * torch.tanh(attention_weights / 30.0) # grok version of scaled attention
 
-            attention_weights_for_visualization = [attention_weights.clone().detach().contiguous().view(N, self.n_gqa_groups, self.n_heads, t // self.infinite_attention_n_segments, T // self.infinite_attention_n_segments)]
+        attention_weights = self.mask_attention(attention_weights, attention_mask)
+        attention_weights = self.attn_softmax(attention_weights)
+        attention_weights_for_visualization = [attention_weights.clone().detach()]
 
-            # not included in paper for some reason? experiment
-            # attention_weights = self.dropout(attention_weights)
-            attention_weights = attention_weights @ v_heads[:, :, idx, :, :]
+        attention_weights = self.attn_dropout(attention_weights)
 
-            attention_weights = (F.sigmoid(self.infinite_attn_beta) * A_mem) + ((1 - F.sigmoid(self.infinite_attn_beta)) * attention_weights)
+        # Calculate sequences as the weighted sums of values based on these softmax weights
+        sequences = torch.einsum('...htT,...hTv->...htv', attention_weights, v_heads)
 
-            if self.infinite_attention_update == 'linear':
-                memory = memory + (sigma_k.transpose(-2, -1) @ v_heads[:, :, idx, :, :])
-            else:
-                delta = (sigma_k @ memory) / ((sigma_k @ z) + 1e-6)
-                memory = memory + (sigma_k.transpose(-2, -1) @ (v_heads[:, :, idx, :, :] - delta))
-
-            z = z + sigma_k.sum(dim=-2, keepdim=True)
-
-            output.append(attention_weights)
-
-        sequences = torch.concat(output, dim = 2) # NhiTv
+        sequences = sequences.permute(0, 2, 1, 3)
 
         # Concatenate the n_heads subspaces (each with an output of size d_values)
         sequences = sequences.contiguous().view(N, t, -1)
 
-        sequences = self.attn_dropout(sequences)
-
         sequences = self.o_proj(sequences)
+        sequences = self.output_dropout(sequences)
 
         return sequences, attention_weights_for_visualization

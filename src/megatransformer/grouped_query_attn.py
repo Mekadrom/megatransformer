@@ -77,9 +77,7 @@ class GroupedQueryMultiHeadAttention(nn.Module):
 
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(1).to(torch.bool)
 
-            # attention_weights = attention_weights.masked_fill_(attention_mask, -float('inf'))
-            attention_weights = attention_weights + attention_mask
-
+            attention_weights = attention_weights.masked_fill_(attention_mask, -float('inf'))
         if self.self_attn:
             attention_weights = attention_weights.masked_fill_(~self.causal_mask[:attention_weights.shape[-2], :attention_weights.shape[-1]], -float('inf'))
 

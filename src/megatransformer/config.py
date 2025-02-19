@@ -18,7 +18,7 @@ class AttentionConfig(ConfigDict):
                  v_bias: bool = False,
                  o_bias: bool = False,
                  heads_activation_function: Optional[str] = None,
-                 attn_impl: Literal["mha", "gqa", "infini"] = 'mha',
+                 attn_impl: Literal["mha", "gqa", "infinite"] = 'mha',
                  infinite_attention_n_segments: int = 16,
                  infinite_attention_update: Literal["nonlinear", "linear"] = 'linear',
                  use_grok_scaled_attn: bool = True):
@@ -46,9 +46,7 @@ class FFNConfig(ConfigDict):
                  moe_top_k: int = 2,
                  millions_moe_n_heads: int = 1,
                  millions_moe_d_keys: int = 128,
-                 millions_moe_input_dropout: float = 0.0,
-                 millions_moe_query_dropout: float = 0.0,
-                 millions_moe_value_dropout: float = 0.0,
+                 millions_moe_dropout: float = 0.0,
                  activation_function: str = 'gelu',
                  ffn_bias: bool = False):
         self.ffn_type = ffn_type
@@ -59,9 +57,7 @@ class FFNConfig(ConfigDict):
         self.moe_top_k = moe_top_k
         self.millions_moe_n_heads = millions_moe_n_heads
         self.millions_moe_d_keys = millions_moe_d_keys
-        self.millions_moe_input_dropout = millions_moe_input_dropout
-        self.millions_moe_query_dropout = millions_moe_query_dropout
-        self.millions_moe_value_dropout = millions_moe_value_dropout
+        self.millions_moe_dropout = millions_moe_dropout
         self.activation_function = activation_function
         self.ffn_bias = ffn_bias
 

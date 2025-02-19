@@ -100,14 +100,21 @@ def init_weights(model: nn.Module,
             init_weights(decoder_layer.cross_attn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         init_weights(decoder_layer.ffn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
     elif isinstance(model, multihead_attn.MultiHeadAttention) or isinstance(model, grouped_query_attn.GroupedQueryMultiHeadAttention):
-        mha: Union[multihead_attn.MultiHeadAttention, grouped_query_attn.GroupedQueryMultiHeadAttention] = model
-        init_weights(mha.q_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(mha.k_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(mha.v_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(mha.qkv_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(mha.o_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        attn: Union[multihead_attn.MultiHeadAttention, grouped_query_attn.GroupedQueryMultiHeadAttention] = model
+        init_weights(attn.q_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.k_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.v_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.qkv_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.o_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
     elif isinstance(model, infinite_multihead_attn.InfiniteMultiHeadAttention):
-        raise NotImplementedError("Weight initialization for InfiniteMultiHeadAttention not implemented.")
+        attn: infinite_multihead_attn.InfiniteMultiHeadAttention = model
+        init_weights(attn.q_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.k_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.v_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.qkv_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.o_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.k_memory_compression[0], d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.v_memory_compression[0], d_model, init_weights_from, init_weights_gain, tie_embeddings)
     elif isinstance(model, positionwise_fcn.PositionWiseFCNetwork) or isinstance(model, phi3_mlp.Phi3MLP):
         fcn: Union[positionwise_fcn.PositionWiseFCNetwork, phi3_mlp.Phi3MLP] = model
         init_weights(fcn.layer_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
@@ -178,19 +185,21 @@ def record_model_param_stats(args, summary_writer: SummaryWriter, model, step, p
             record_model_param_stats(args, summary_writer, cross_attn, step, prefix='/'.join([prefix, 'cross_attn']))
         record_model_param_stats(args, summary_writer, ffn, step, prefix='/'.join([prefix, 'ffn']))
     elif isinstance(model, multihead_attn.MultiHeadAttention) or isinstance(model, grouped_query_attn.GroupedQueryMultiHeadAttention):
-        mha: Union[multihead_attn.MultiHeadAttention, grouped_query_attn.GroupedQueryMultiHeadAttention] = model
-        q_proj: nn.Linear = mha.q_proj
-        k_proj: nn.Linear = mha.k_proj
-        v_proj: nn.Linear = mha.v_proj
-        qkv_norm: nn.LayerNorm = mha.qkv_norm
-        out_proj: nn.Linear = mha.o_proj
-        record_model_param_stats(args, summary_writer, q_proj, step, prefix='/'.join([prefix, 'q_proj']))
-        record_model_param_stats(args, summary_writer, k_proj, step, prefix='/'.join([prefix, 'k_proj']))
-        record_model_param_stats(args, summary_writer, v_proj, step, prefix='/'.join([prefix, 'v_proj']))
-        record_model_param_stats(args, summary_writer, qkv_norm, step, prefix='/'.join([prefix, 'qkv_norm']))
-        record_model_param_stats(args, summary_writer, out_proj, step, prefix='/'.join([prefix, 'o_proj']))
+        attn: Union[multihead_attn.MultiHeadAttention, grouped_query_attn.GroupedQueryMultiHeadAttention] = model
+        record_model_param_stats(args, summary_writer, attn.q_proj, step, prefix='/'.join([prefix, 'q_proj']))
+        record_model_param_stats(args, summary_writer, attn.k_proj, step, prefix='/'.join([prefix, 'k_proj']))
+        record_model_param_stats(args, summary_writer, attn.v_proj, step, prefix='/'.join([prefix, 'v_proj']))
+        record_model_param_stats(args, summary_writer, attn.qkv_norm, step, prefix='/'.join([prefix, 'qkv_norm']))
+        record_model_param_stats(args, summary_writer, attn.o_proj, step, prefix='/'.join([prefix, 'o_proj']))
     elif isinstance(model, infinite_multihead_attn.InfiniteMultiHeadAttention):
-        raise NotImplementedError("Weight visualization for InfiniteMultiHeadAttention not implemented.")
+        attn: infinite_multihead_attn.InfiniteMultiHeadAttention = model
+        record_model_param_stats(args, summary_writer, attn.q_proj, step, prefix='/'.join([prefix, 'q_proj']))
+        record_model_param_stats(args, summary_writer, attn.k_proj, step, prefix='/'.join([prefix, 'k_proj']))
+        record_model_param_stats(args, summary_writer, attn.v_proj, step, prefix='/'.join([prefix, 'v_proj']))
+        record_model_param_stats(args, summary_writer, attn.qkv_norm, step, prefix='/'.join([prefix, 'qkv_norm']))
+        record_model_param_stats(args, summary_writer, attn.o_proj, step, prefix='/'.join([prefix, 'o_proj']))
+        record_model_param_stats(args, summary_writer, attn.k_memory_compression[0], step, prefix='/'.join([prefix, 'k_memory_compression']))
+        record_model_param_stats(args, summary_writer, attn.v_memory_compression[0], step, prefix='/'.join([prefix, 'v_memory_compression']))
     elif isinstance(model, positionwise_fcn.PositionWiseFCNetwork) or isinstance(model, phi3_mlp.Phi3MLP):
         ffn: Union[positionwise_fcn.PositionWiseFCNetwork, phi3_mlp.Phi3MLP] = model
         record_model_param_stats(args, summary_writer, ffn.layer_norm, step, prefix='/'.join([prefix, 'layer_norm']))

@@ -36,9 +36,7 @@ class MillionsMoE(nn.Module):
         self.top_k = ffn_config.moe_top_k
         self.n_heads = ffn_config.millions_moe_n_heads
         self.d_keys = ffn_config.millions_moe_d_keys
-        self.input_dropout = ffn_config.millions_moe_input_dropout
-        self.query_dropout = ffn_config.millions_moe_query_dropout
-        self.value_dropout = ffn_config.millions_moe_value_dropout
+        self.dropout = ffn_config.millions_moe_dropout
         self.activation_function = ffn_config.activation_function
 
         self.query_cast = nn.Linear(self.d_model, self.n_heads * self.d_keys)
@@ -51,9 +49,7 @@ class MillionsMoE(nn.Module):
 
         self.activation = transformer_utils.create_activation_function(self.d_model, self.activation_function)
 
-        self.input_dropout = nn.Dropout(self.input_dropout)
-        self.query_dropout = nn.Dropout(self.query_dropout)
-        self.value_dropout = nn.Dropout(self.value_dropout)
+        self.apply_dropout = nn.Dropout(self.dropout)
 
         self.initialize_keys()
 
@@ -110,10 +106,10 @@ class MillionsMoE(nn.Module):
     def get_indices(self, queries: torch.Tensor):
         N, T, D = queries.shape
 
-        queries = self.input_dropout(queries) # (N, T, D)
+        queries = self.apply_dropout(queries) # (N, T, D)
 
         query_heads = self.query_cast(queries.contiguous().view(-1, D)) # (N*T, H*K)
-        query_heads = self.query_dropout(query_heads.view(N*T*self.n_heads, self.d_keys)) # (N*T*H, K)
+        query_heads = self.apply_dropout(query_heads.view(N*T*self.n_heads, self.d_keys)) # (N*T*H, K)
 
         assert query_heads.shape == (N*T*self.n_heads, self.d_keys) # (N*T*H, K)
 
@@ -147,4 +143,4 @@ class MillionsMoE(nn.Module):
 
         values = self.peer_forward(queries).view(N, T, D)
 
-        return self.value_dropout(values), None
+        return self.apply_dropout(values), None
