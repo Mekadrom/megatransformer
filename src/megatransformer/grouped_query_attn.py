@@ -89,7 +89,8 @@ class GroupedQueryMultiHeadAttention(nn.Module):
                 value_sequences: torch.Tensor,
                 attention_mask: Optional[torch.Tensor]=None,
                 k_cache: Optional[list[torch.Tensor]]=None,
-                v_cache: Optional[list[torch.Tensor]]=None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+                v_cache: Optional[list[torch.Tensor]]=None,
+                return_attn_values: Optional[bool]=False) -> tuple[torch.Tensor, list[torch.Tensor]]:
         query_sequences = self.qkv_norm(query_sequences)
 
         # if this isn't self-attention, they will already have been normed in the last layer of the Encoder (from whence they came)

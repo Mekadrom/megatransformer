@@ -73,7 +73,23 @@ class EncoderDecoderConfig(ConfigDict):
                  embedding_activation: str = 'none',
                  param_sharing_type: Literal["none", "all", "cycle-rev", "cycle", "ffn-cycle-rev", "heads-cycle-rev"] = 'none',
                  m_independent_layers: int = 1,
-                 moe_diversity_loss_coefficient: float = 0.0):
+                 embed_scale: float = 1.0,
+                 pre_self_attn_norm: bool = False,
+                 post_self_attn_norm: bool = False,
+                 pre_cross_attn_norm: bool = False,
+                 post_cross_attn_norm: bool = False,
+                 pre_ffn_norm: bool = False,
+                 post_ffn_norm: bool = True,
+                 moe_diversity_loss_coefficient: float = 0.0,
+                 n_huginn_prelude_layers: Optional[int] = None,
+                 n_huginn_thinking_layers: Optional[int] = None,
+                 n_huginn_coda_layers: Optional[int] = None,
+                 mean_huginn_thinking_steps: Optional[int] = None,
+                 mean_huginn_backprop_depth: Optional[int] = None,
+                 huginn_thought_initialization_method: Optional[Literal["none", "zero", "normal", "embed", "like-init", "unit"]] = None,
+                 huginn_adapter_method: Optional[Literal["add", "gate", "linear"]] = None,
+                 huginn_exit_criteria: Optional[Literal["kl_divergence"]] = None,
+                 huginn_exit_criteria_threshold: Optional[float] = None):
         self.device = device
         self.vocab_size = vocab_size
         self.n_layers = n_layers
@@ -83,8 +99,25 @@ class EncoderDecoderConfig(ConfigDict):
         self.embedding_activation = embedding_activation
         self.param_sharing_type = param_sharing_type
         self.m_independent_layers = m_independent_layers
+        self.embed_scale = embed_scale
+        self.pre_self_attn_norm = pre_self_attn_norm
+        self.post_self_attn_norm = post_self_attn_norm
+        self.pre_cross_attn_norm = pre_cross_attn_norm
+        self.post_cross_attn_norm = post_cross_attn_norm
+        self.pre_ffn_norm = pre_ffn_norm
+        self.post_ffn_norm = post_ffn_norm
 
         self.moe_diversity_loss_coefficient = moe_diversity_loss_coefficient
+
+        self.n_huginn_prelude_layers = n_huginn_prelude_layers
+        self.n_huginn_thinking_layers = n_huginn_thinking_layers
+        self.n_huginn_coda_layers = n_huginn_coda_layers
+        self.mean_huginn_thinking_steps = mean_huginn_thinking_steps
+        self.mean_huginn_backprop_depth = mean_huginn_backprop_depth
+        self.huginn_thought_initialization_method = huginn_thought_initialization_method
+        self.huginn_adapter_method = huginn_adapter_method
+        self.huginn_exit_criteria = huginn_exit_criteria
+        self.huginn_exit_criteria_threshold = huginn_exit_criteria_threshold
 
         self.self_attn_config = self_attn_config
         self.cross_attn_config = cross_attn_config

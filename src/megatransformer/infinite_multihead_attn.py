@@ -64,9 +64,9 @@ class InfiniteMultiHeadAttention(nn.Module):
 
         assert self.maxlen % self.infinite_attention_n_segments == 0, "maxlen must be divisible by infinite_attention_n_segments"
 
-        self.infinite_attn_segment_size = self.maxlen // self.infinite_attention_n_segments
+        self.infinite_attn_segment_size = (self.maxlen // self.infinite_attention_n_segments)
 
-        # eg: 42 * 64 -> 64 = 2688 -> 64
+        # eg: 6 * 8 * 64 -> 48 * 64 = 2048 -> 64
         self.k_memory_compression = nn.Sequential(
             nn.Linear(self.infinite_attn_segment_size * self.d_queries, self.d_queries),
             nn.ELU(),
@@ -76,23 +76,28 @@ class InfiniteMultiHeadAttention(nn.Module):
             nn.ELU(),
         )
 
-        self.register_buffer('causal_mask', torch.tril(torch.ones((self.maxlen // self.infinite_attention_n_segments) + 1, (self.maxlen // self.infinite_attention_n_segments) + 1).to(device)))
+        self.register_buffer('causal_mask', torch.tril(torch.ones(self.maxlen + 1, self.maxlen + 1).to(self.device)).to(torch.bool))
 
     def mask_attention(self, attention_weights: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
         # mask away tokens by setting such weights to a large negative number, so that they evaluate to 0 under the softmax
-        if attention_mask is not None:
-            assert attention_mask.shape[0] == attention_weights.shape[0], f"batch dimension for padding is wrong: {attention_mask.shape[0]} != {attention_weights.shape[0]}. overall shape: {attention_mask.shape} != {attention_weights.shape}"
-            assert attention_mask.shape[1] == attention_weights.shape[3], f"padding mask length is wrong: {attention_mask.shape[1]} != {attention_weights.shape[3]}. overall shape: {attention_mask.shape} != {attention_weights.shape}"
+        # if attention_mask is not None:
+        #     assert attention_mask.shape[0] == attention_weights.shape[0], f"batch dimension for padding is wrong: {attention_mask.shape[0]} != {attention_weights.shape[0]}. overall shape: {attention_mask.shape} != {attention_weights.shape}"
+        #     assert attention_mask.shape[1] == attention_weights.shape[3], f"padding mask length is wrong: {attention_mask.shape[1]} != {attention_weights.shape[3]}. overall shape: {attention_mask.shape} != {attention_weights.shape}"
 
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1).to(torch.bool)
+        #     attention_mask = attention_mask.unsqueeze(1).unsqueeze(1).to(torch.bool)
 
-            attention_weights = attention_weights.masked_fill_(attention_mask, -float('inf'))
+        #     attention_weights = attention_weights.masked_fill_(attention_mask, -float('inf'))
         if self.self_attn:
             attention_weights = attention_weights.masked_fill_(~self.causal_mask[:attention_weights.shape[-2], :attention_weights.shape[-1]], -float('inf'))
 
         return attention_weights
 
-    def forward(self, query_sequences: torch.Tensor, key_sequences: torch.Tensor, value_sequences: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    def forward(self,
+                query_sequences: torch.Tensor,
+                key_sequences: torch.Tensor,
+                value_sequences: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None,
+                return_attn_values: Optional[bool] = False) -> tuple[torch.Tensor, list[torch.Tensor]]:
         query_sequences = self.qkv_norm(query_sequences)
 
         # if this isn't self-attention, they will already have been normed in the last layer of the Encoder (from whence they came)
@@ -103,14 +108,6 @@ class InfiniteMultiHeadAttention(nn.Module):
         N, t, _ = query_sequences.shape
         N, T, _ = key_sequences.shape
 
-        if t < self.maxlen:
-            # pad to maxlen with zeros prepended along the sequence length
-            query_sequences = F.pad(query_sequences, (0, 0, 0, self.maxlen - t), value=0.0)
-        if T < self.maxlen:
-            # pad to maxlen with zeros prepended along the sequence length
-            key_sequences = F.pad(key_sequences, (0, 0, 0, self.maxlen - T), value=0.0)
-            value_sequences = F.pad(value_sequences, (0, 0, 0, self.maxlen - T), value=0.0)
-
         q_heads: torch.Tensor = self.q_proj(query_sequences)
         k_heads: torch.Tensor = self.k_proj(key_sequences)
         v_heads: torch.Tensor = self.v_proj(value_sequences)
@@ -119,6 +116,16 @@ class InfiniteMultiHeadAttention(nn.Module):
             q_heads = self.heads_activation(q_heads)
             k_heads = self.heads_activation(k_heads)
             v_heads = self.heads_activation(v_heads)
+
+        if t < self.maxlen:
+            # pad to maxlen with zeros prepended along the sequence length
+            q_heads = torch.cat([torch.zeros(N, self.maxlen - t, self.n_heads * self.n_gqa_groups * self.d_queries).to(self.device), q_heads], dim=1)
+            t = self.maxlen
+        if T < self.maxlen:
+            # pad to maxlen with zeros prepended along the sequence length
+            k_heads = torch.cat([torch.zeros(N, self.maxlen - T, self.n_heads * self.d_values).to(self.device), k_heads], dim=1)
+            v_heads = torch.cat([torch.zeros(N, self.maxlen - T, self.n_heads * self.d_values).to(self.device), v_heads], dim=1)
+            T = self.maxlen
 
         # Split the last dimension by the n_kv_heads subspaces
         q_heads = q_heads.contiguous().view(N, t, self.n_gqa_groups, self.n_heads, self.d_queries) # (N, query_sequence_pad_length, n_gqa_groups, n_heads, d_queries)
@@ -133,20 +140,20 @@ class InfiniteMultiHeadAttention(nn.Module):
             q_heads = self.rotary_embedding.rotate_queries_or_keys(q_heads, seq_dim=-2)
             k_heads = self.rotary_embedding.rotate_queries_or_keys(k_heads.unsqueeze(0), seq_dim=-2).squeeze(0) # adds a singleton dimension for the rotation operation and then removes it for the torch compiler
 
-        k_segments = k_heads.split(self.infinite_attention_n_segments, dim=-2)
-        v_segments = v_heads.split(self.infinite_attention_n_segments, dim=-2)
+        # produces a list of tensors of shape Nhsq or Nhsv where s = maxlen // infinite_attention_n_segments
+        k_segments = k_heads.split(self.infinite_attn_segment_size, dim=-2)
+        v_segments = v_heads.split(self.infinite_attn_segment_size, dim=-2)
 
-        # example: maxlen // infinite_attention_n_segments + (maxlen % infinite_attention_n_segments) = 128 // 6 + (128 % 6) = 21 + 2 = 23 = r
-        # example tensor would be of shape Nhrq or Nhrv
+        # grabs last two infinite attention chunks, produces tensor of shape Nhrq or Nhrv where r = 2 * (maxlen // infinite_attention_n_segments) eg r = 2 * (256 // 8) = 64, so tensor would be of shape Nh(64)q or Nh(64)v
         recent_k = torch.cat(k_segments[-2:], dim=-2)
         recent_v = torch.cat(v_segments[-2:], dim=-2)
 
-        # Nhiq or Nhiv where i = maxlen // infinite_attention_n_segments
-        k_segments = torch.stack(k_segments[:-2], dim=2)
-        v_segments = torch.stack(v_segments[:-2], dim=2)
+        # Nhiq or Nhiv where i = (maxlen // infinite_attention_n_segments) - 2 = 30, so tensor would be of shape Nh(30)q or Nh(30)v
+        k_segments = torch.stack(k_segments[:-2], dim=2).to(k_heads.device).to(k_heads.dtype)
+        v_segments = torch.stack(v_segments[:-2], dim=2).to(v_heads.device).to(v_heads.dtype)
 
-        k_summaries = self.k_memory_compression(k_segments.view(N, self.n_heads, -1)) # Nhq
-        v_summaries = self.v_memory_compression(v_segments.view(N, self.n_heads, -1)) # Nhv
+        k_summaries = self.k_memory_compression(k_segments.view(N, self.n_heads, self.infinite_attention_n_segments - 2, -1)) # Nh(i*q)
+        v_summaries = self.v_memory_compression(v_segments.view(N, self.n_heads, self.infinite_attention_n_segments - 2, -1)) # Nh(i*v)
 
         k_heads = torch.cat([k_summaries, recent_k], dim=-2) # Nhrq
         v_heads = torch.cat([v_summaries, recent_v], dim=-2) # Nhrv

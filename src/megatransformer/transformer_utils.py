@@ -3,10 +3,18 @@ from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from typing import Union
 
-from . import swiglu, megatransformer, multihead_attn, positionwise_fcn, grouped_query_attn, phi3_mlp, millions_moe, infinite_multihead_attn
+from . import swiglu, megatransformer, multihead_attn, positionwise_fcn, grouped_query_attn, phi3_mlp, millions_moe, infinite_multihead_attn, rmsnorm
 
 import math
 import torch
+
+class ReturnNthParameterModule(nn.Module):
+    def __init__(self, idx: int = 0):
+        super(ReturnNthParameterModule, self).__init__()
+        self.idx = idx
+
+    def forward(self, *args):
+        return args[self.idx]
 
 def get_activation_function(activation_function_name):
     if activation_function_name == 'relu':
@@ -78,27 +86,45 @@ def init_weights(model: nn.Module,
         init_weights(encoder.embed_tokens, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         for encoder_layer in encoder.encoder_layers:
             init_weights(encoder_layer, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(encoder.post_encoder_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
     elif isinstance(model, megatransformer.EncoderLayer):
         encoder_layer: megatransformer.EncoderLayer = model
+        if encoder_layer.pre_self_attn_norm is not None:
+            init_weights(encoder_layer.pre_self_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         init_weights(encoder_layer.self_attn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        if encoder_layer.post_self_attn_norm is not None:
+            init_weights(encoder_layer.post_self_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        if encoder_layer.pre_ffn_norm is not None:
+            init_weights(encoder_layer.pre_ffn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         init_weights(encoder_layer.ffn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        if encoder_layer.post_ffn_norm is not None:
+            init_weights(encoder_layer.post_ffn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
     elif isinstance(model, megatransformer.Decoder):
         decoder: megatransformer.Decoder = model
         init_weights(decoder.embed_tokens, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         for decoder_layer in decoder.decoder_layers:
             init_weights(decoder_layer, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(decoder.post_decoder_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         if tie_embeddings:
             decoder.lm_head.weight = decoder.embed_tokens.weight
         else:
             init_weights(decoder.lm_head, d_model, init_weights_from, init_weights_gain, tie_embeddings)
     elif isinstance(model, megatransformer.DecoderLayer):
         decoder_layer: megatransformer.DecoderLayer = model
+        if decoder_layer.pre_self_attn_norm is not None:
+            init_weights(decoder_layer.pre_self_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         init_weights(decoder_layer.self_attn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        if decoder_layer.post_self_attn_norm is not None:
+            init_weights(decoder_layer.post_self_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        if decoder_layer.pre_cross_attn_norm is not None:
+            init_weights(decoder_layer.pre_cross_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         if decoder_layer.cross_attn is not None:
             init_weights(decoder_layer.cross_attn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        if decoder_layer.post_cross_attn_norm is not None:
+            init_weights(decoder_layer.post_cross_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        if decoder_layer.pre_ffn_norm is not None:
+            init_weights(decoder_layer.pre_ffn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         init_weights(decoder_layer.ffn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        if decoder_layer.post_ffn_norm is not None:
+            init_weights(decoder_layer.post_ffn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
     elif isinstance(model, multihead_attn.MultiHeadAttention) or isinstance(model, grouped_query_attn.GroupedQueryMultiHeadAttention):
         attn: Union[multihead_attn.MultiHeadAttention, grouped_query_attn.GroupedQueryMultiHeadAttention] = model
         init_weights(attn.q_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
@@ -146,53 +172,83 @@ def init_weights(model: nn.Module,
         layer_norm: nn.LayerNorm = model
         nn.init.ones_(layer_norm.weight)
         nn.init.zeros_(layer_norm.bias)
+    elif isinstance(model, rmsnorm.RMSNorm):
+        pass
     else:
         raise Exception(f"Unknown model type: {type(model)}")
         
     print(f"{type(model)} initialized.")
 
-def record_model_param_stats(args, summary_writer: SummaryWriter, model, step, prefix='', embedding_tokens=None):
-    model = sanitize_model(model)
-    if isinstance(model, megatransformer.MegaTransformer):
-        record_model_param_stats(args, summary_writer, model.encoder, step, prefix='/'.join([prefix, 'encoder']), embedding_tokens=embedding_tokens)
-        record_model_param_stats(args, summary_writer, model.decoder, step, prefix='/'.join([prefix, 'decoder']), embedding_tokens=embedding_tokens)
-    elif isinstance(model, megatransformer.Encoder):
-        encoder: megatransformer.Encoder = model
+def record_model_param_stats(args, summary_writer: SummaryWriter, module, step, prefix='', embedding_tokens=None):
+    module = sanitize_model(module)
+    if isinstance(module, megatransformer.MegaTransformer):
+        record_model_param_stats(args, summary_writer, module.encoder, step, prefix='/'.join([prefix, 'encoder']), embedding_tokens=embedding_tokens)
+        record_model_param_stats(args, summary_writer, module.decoder, step, prefix='/'.join([prefix, 'decoder']), embedding_tokens=embedding_tokens)
+    elif isinstance(module, megatransformer.Encoder):
+        encoder: megatransformer.Encoder = module
         record_model_param_stats(args, summary_writer, encoder.embed_tokens, step, prefix='/'.join([prefix, 'embed_tokens']))
-        for i, encoder_layer in enumerate(model.encoder_layers):
+        for i, encoder_layer in enumerate(module.encoder_layers):
             record_model_param_stats(args, summary_writer, encoder_layer, step, prefix=f'/'.join([prefix, 'encoder_layer', str(i)]))
-        record_model_param_stats(args, summary_writer, encoder.post_encoder_norm, step, prefix='/'.join([prefix, 'post_encoder_norm']))
-    elif isinstance(model, megatransformer.Decoder):
-        decoder: megatransformer.Decoder = model
+    elif isinstance(module, megatransformer.HuginnDecoder):
+        decoder: megatransformer.HuginnDecoder = module
         record_model_param_stats(args, summary_writer, decoder.embed_tokens, step, prefix='/'.join([prefix, 'embed_tokens']), embedding_tokens=embedding_tokens)
-        for i, decoder_layer in enumerate(model.decoder_layers):
-            record_model_param_stats(args, summary_writer, decoder_layer, step, prefix=f'/'.join([prefix, 'decoder_layer', str(i)]))
-        record_model_param_stats(args, summary_writer, decoder.post_decoder_norm, step, prefix='/'.join([prefix, 'post_decoder_norm']))
+        for i, decoder_layer in enumerate(decoder.prelude_layers):
+            record_model_param_stats(args, summary_writer, decoder_layer, step, prefix=f'/'.join([prefix, 'prelude_layer', str(i)]))
+        for i, decoder_layer in enumerate(decoder.thinking_block):
+            record_model_param_stats(args, summary_writer, decoder_layer, step, prefix=f'/'.join([prefix, 'thinking_layer', str(i)]))
+        for i, decoder_layer in enumerate(decoder.coda_layers):
+            record_model_param_stats(args, summary_writer, decoder_layer, step, prefix=f'/'.join([prefix, 'coda_layer', str(i)]))
         record_model_param_stats(args, summary_writer, decoder.lm_head, step, prefix='/'.join([prefix, 'lm_head']))
-    elif isinstance(model, megatransformer.EncoderLayer):
-        encoder_layer: megatransformer.EncoderLayer = model
+    elif isinstance(module, megatransformer.Decoder):
+        decoder: megatransformer.Decoder = module
+        record_model_param_stats(args, summary_writer, decoder.embed_tokens, step, prefix='/'.join([prefix, 'embed_tokens']), embedding_tokens=embedding_tokens)
+        for i, decoder_layer in enumerate(decoder.decoder_layers):
+            record_model_param_stats(args, summary_writer, decoder_layer, step, prefix=f'/'.join([prefix, 'decoder_layer', str(i)]))
+        record_model_param_stats(args, summary_writer, decoder.lm_head, step, prefix='/'.join([prefix, 'lm_head']))
+    elif isinstance(module, megatransformer.EncoderLayer):
+        encoder_layer: megatransformer.EncoderLayer = module
         self_attn: nn.Module = encoder_layer.self_attn
         ffn: nn.Module = encoder_layer.ffn
+        if encoder_layer.pre_self_attn_norm is not None:
+            record_model_param_stats(args, summary_writer, encoder_layer.pre_self_attn_norm, step, prefix='/'.join([prefix, 'pre_self_attn_norm']))
         record_model_param_stats(args, summary_writer, self_attn, step, prefix='/'.join([prefix, 'self_attn']))
+        if encoder_layer.post_self_attn_norm is not None:
+            record_model_param_stats(args, summary_writer, encoder_layer.post_self_attn_norm, step, prefix='/'.join([prefix, 'post_self_attn_norm']))
+        if encoder_layer.pre_ffn_norm is not None:
+            record_model_param_stats(args, summary_writer, encoder_layer.pre_ffn_norm, step, prefix='/'.join([prefix, 'pre_ffn_norm']))
         record_model_param_stats(args, summary_writer, ffn, step, prefix='/'.join([prefix, 'ffn']))
-    elif isinstance(model, megatransformer.DecoderLayer):
-        decoder_layer: megatransformer.DecoderLayer = model
+        if encoder_layer.post_ffn_norm is not None:
+            record_model_param_stats(args, summary_writer, encoder_layer.post_ffn_norm, step, prefix='/'.join([prefix, 'post_ffn_norm']))
+    elif isinstance(module, megatransformer.DecoderLayer):
+        decoder_layer: megatransformer.DecoderLayer = module
         self_attn: nn.Module = decoder_layer.self_attn
         cross_attn: nn.Module = decoder_layer.cross_attn
         ffn: nn.Module = decoder_layer.ffn
+        if decoder_layer.pre_self_attn_norm is not None:
+            record_model_param_stats(args, summary_writer, decoder_layer.pre_self_attn_norm, step, prefix='/'.join([prefix, 'pre_self_attn_norm']))
         record_model_param_stats(args, summary_writer, self_attn, step, prefix='/'.join([prefix, 'self_attn']))
+        if decoder_layer.post_self_attn_norm is not None:
+            record_model_param_stats(args, summary_writer, decoder_layer.post_self_attn_norm, step, prefix='/'.join([prefix, 'post_self_attn_norm']))
         if cross_attn is not None:
+            if decoder_layer.pre_cross_attn_norm is not None:
+                record_model_param_stats(args, summary_writer, decoder_layer.pre_cross_attn_norm, step, prefix='/'.join([prefix, 'pre_cross_attn_norm']))
             record_model_param_stats(args, summary_writer, cross_attn, step, prefix='/'.join([prefix, 'cross_attn']))
+            if decoder_layer.post_cross_attn_norm is not None:
+                record_model_param_stats(args, summary_writer, decoder_layer.post_cross_attn_norm, step, prefix='/'.join([prefix, 'post_cross_attn_norm']))
+        if decoder_layer.pre_ffn_norm is not None:
+            record_model_param_stats(args, summary_writer, decoder_layer.pre_ffn_norm, step, prefix='/'.join([prefix, 'pre_ffn_norm']))
         record_model_param_stats(args, summary_writer, ffn, step, prefix='/'.join([prefix, 'ffn']))
-    elif isinstance(model, multihead_attn.MultiHeadAttention) or isinstance(model, grouped_query_attn.GroupedQueryMultiHeadAttention):
-        attn: Union[multihead_attn.MultiHeadAttention, grouped_query_attn.GroupedQueryMultiHeadAttention] = model
+        if decoder_layer.post_ffn_norm is not None:
+            record_model_param_stats(args, summary_writer, decoder_layer.post_ffn_norm, step, prefix='/'.join([prefix, 'post_ffn_norm']))
+    elif isinstance(module, multihead_attn.MultiHeadAttention) or isinstance(module, grouped_query_attn.GroupedQueryMultiHeadAttention):
+        attn: Union[multihead_attn.MultiHeadAttention, grouped_query_attn.GroupedQueryMultiHeadAttention] = module
         record_model_param_stats(args, summary_writer, attn.q_proj, step, prefix='/'.join([prefix, 'q_proj']))
         record_model_param_stats(args, summary_writer, attn.k_proj, step, prefix='/'.join([prefix, 'k_proj']))
         record_model_param_stats(args, summary_writer, attn.v_proj, step, prefix='/'.join([prefix, 'v_proj']))
         record_model_param_stats(args, summary_writer, attn.qkv_norm, step, prefix='/'.join([prefix, 'qkv_norm']))
         record_model_param_stats(args, summary_writer, attn.o_proj, step, prefix='/'.join([prefix, 'o_proj']))
-    elif isinstance(model, infinite_multihead_attn.InfiniteMultiHeadAttention):
-        attn: infinite_multihead_attn.InfiniteMultiHeadAttention = model
+    elif isinstance(module, infinite_multihead_attn.InfiniteMultiHeadAttention):
+        attn: infinite_multihead_attn.InfiniteMultiHeadAttention = module
         record_model_param_stats(args, summary_writer, attn.q_proj, step, prefix='/'.join([prefix, 'q_proj']))
         record_model_param_stats(args, summary_writer, attn.k_proj, step, prefix='/'.join([prefix, 'k_proj']))
         record_model_param_stats(args, summary_writer, attn.v_proj, step, prefix='/'.join([prefix, 'v_proj']))
@@ -200,15 +256,15 @@ def record_model_param_stats(args, summary_writer: SummaryWriter, model, step, p
         record_model_param_stats(args, summary_writer, attn.o_proj, step, prefix='/'.join([prefix, 'o_proj']))
         record_model_param_stats(args, summary_writer, attn.k_memory_compression[0], step, prefix='/'.join([prefix, 'k_memory_compression']))
         record_model_param_stats(args, summary_writer, attn.v_memory_compression[0], step, prefix='/'.join([prefix, 'v_memory_compression']))
-    elif isinstance(model, positionwise_fcn.PositionWiseFCNetwork) or isinstance(model, phi3_mlp.Phi3MLP):
-        ffn: Union[positionwise_fcn.PositionWiseFCNetwork, phi3_mlp.Phi3MLP] = model
+    elif isinstance(module, positionwise_fcn.PositionWiseFCNetwork) or isinstance(module, phi3_mlp.Phi3MLP):
+        ffn: Union[positionwise_fcn.PositionWiseFCNetwork, phi3_mlp.Phi3MLP] = module
         record_model_param_stats(args, summary_writer, ffn.layer_norm, step, prefix='/'.join([prefix, 'layer_norm']))
         record_model_param_stats(args, summary_writer, ffn.expand, step, prefix='/'.join([prefix, 'expand']))
         record_model_param_stats(args, summary_writer, ffn.condense, step, prefix='/'.join([prefix, 'condense']))
-    elif isinstance(model, millions_moe.MillionsMoE):
+    elif isinstance(module, millions_moe.MillionsMoE):
         raise NotImplementedError("Weight visualization for MillionsMoE not implemented.")
-    elif isinstance(model, nn.Embedding):
-        embedding: nn.Embedding = model
+    elif isinstance(module, nn.Embedding):
+        embedding: nn.Embedding = module
         if embedding_tokens is not None:
             metadata = embedding_tokens
             print(f"Metadata for {prefix}: {len(metadata)}")
@@ -217,9 +273,9 @@ def record_model_param_stats(args, summary_writer: SummaryWriter, model, step, p
         summary_writer.add_histogram(f'{prefix}/weight', embedding.weight, step)
         if embedding.weight.grad is not None:
             summary_writer.add_histogram(f'{prefix}/weight_grad', embedding.weight.grad, step)
-        summary_writer.add_embedding(embedding.weight, global_step=step, tag=f'{prefix}/embedding', metadata=metadata, metadata_header=['token'])
-    elif isinstance(model, nn.Linear):
-        linear: nn.Linear = model
+        summary_writer.add_embedding(embedding.weight, global_step=step, tag=f'{prefix}/embedding'.replace("/", ".")[1:], metadata=metadata)
+    elif isinstance(module, nn.Linear):
+        linear: nn.Linear = module
         summary_writer.add_histogram(f'{prefix}/weight', linear.weight, step)
         if linear.bias is not None:
             summary_writer.add_histogram(f'{prefix}/bias', linear.bias, step)
@@ -227,12 +283,17 @@ def record_model_param_stats(args, summary_writer: SummaryWriter, model, step, p
             summary_writer.add_histogram(f'{prefix}/weight_grad', linear.weight.grad, step)
             if linear.bias is not None:
                 summary_writer.add_histogram(f'{prefix}/bias_grad', linear.bias.grad, step)
-    elif isinstance(model, nn.LayerNorm):
-        layer_norm: nn.LayerNorm = model
+    elif isinstance(module, nn.LayerNorm):
+        layer_norm: nn.LayerNorm = module
         summary_writer.add_histogram(f'{prefix}/weight', layer_norm.weight, step)
         summary_writer.add_histogram(f'{prefix}/bias', layer_norm.bias, step)
         if layer_norm.weight.grad is not None:
             summary_writer.add_histogram(f'{prefix}/weight_grad', layer_norm.weight.grad, step)
             summary_writer.add_histogram(f'{prefix}/bias_grad', layer_norm.bias.grad, step)
+    elif isinstance(module, rmsnorm.RMSNorm):
+        rms_norm: rmsnorm.RMSNorm = module
+        summary_writer.add_histogram(f'{prefix}/weight', rms_norm.weight, step)
+        if rms_norm.weight.grad is not None:
+            summary_writer.add_histogram(f'{prefix}/weight_grad', rms_norm.weight.grad, step)
 
     print(f"Posted statistics for {prefix}")

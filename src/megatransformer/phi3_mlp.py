@@ -1,4 +1,5 @@
 from torch import nn
+from typing import Optional, Any
 
 from . import sparse_moe, transformer_utils
 
@@ -34,16 +35,16 @@ class Phi3MLP(nn.Module):
             self.expand = nn.Linear(self.d_model, 2 * self.d_inner, bias=self.ffn_bias)
         self.condense = nn.Linear(self.d_inner, self.d_model, bias=self.ffn_bias)
 
-    def forward(self, sequences: torch.Tensor) -> torch.Tensor:
+    def forward(self, sequences: torch.Tensor) -> tuple[torch.Tensor, Optional[Any]]:
         sequences = self.layer_norm(sequences)
 
         expanded = self.expand(sequences)
 
         gate, expanded = expanded.chunk(2, dim=-1)
-        expanded = expanded * self.activation_function(gate)
+        expanded = expanded * self.activation(gate)
 
         condensed = self.condense(expanded)
 
         condensed = self.dropout(condensed)
 
-        return condensed
+        return condensed, None

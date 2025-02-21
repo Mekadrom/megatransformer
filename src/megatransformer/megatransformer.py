@@ -1,20 +1,31 @@
 from torch import nn
-from typing import Optional, Union
+from typing import Optional, Union, Callable
 
-from . import embedding_mlp, infinite_multihead_attn, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, transformer_utils, criteria, grouped_query_attn
+from . import config, embedding_mlp, infinite_multihead_attn, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, mult, transformer_utils, criteria, grouped_query_attn, huginn_criteria
 
 import admin_torch
+import copy
 import math
+import random
 import torch
+import warnings
 
 class MegaTransformerOutput:
-    def __init__(self, logits: torch.Tensor, loss: torch.Tensor, prediction_loss: torch.Tensor, moe_loss: torch.Tensor, decoder_gating_variances: list[torch.Tensor], encoder_gating_variances: Optional[list[torch.Tensor]]=None):
+    def __init__(self,
+                logits: torch.Tensor,
+                loss: torch.Tensor,
+                prediction_loss: torch.Tensor,
+                moe_loss: torch.Tensor,
+                decoder_gating_variances: list[torch.Tensor],
+                encoder_gating_variances: Optional[list[torch.Tensor]]=None,
+                block_stats: Optional[tuple]=None):
         self.logits = logits
         self.loss = loss
         self.prediction_loss = prediction_loss
         self.moe_loss = moe_loss
         self.decoder_gating_variances = decoder_gating_variances
         self.encoder_gating_variances = encoder_gating_variances
+        self.block_stats = block_stats
 
 class EncoderLayer(nn.Module):
     def __init__(self, device, model_config):
@@ -26,8 +37,12 @@ class EncoderLayer(nn.Module):
         ffn_config = model_config.ffn_config
 
         self.use_admin = model_config.use_admin
-        self.norm = model_config.norm
-        self.norm_eps = model_config.norm_eps
+        norm = model_config.norm
+
+        self.pre_self_attn_norm = norm(model_config.d_model, model_config.norm_eps) if encoder_config.pre_self_attn_norm else None
+        self.post_self_attn_norm = norm(model_config.d_model, model_config.norm_eps) if encoder_config.post_self_attn_norm else None
+        self.pre_ffn_norm = norm(model_config.d_model, model_config.norm_eps) if encoder_config.pre_ffn_norm else None
+        self.post_ffn_norm = norm(model_config.d_model, model_config.norm_eps) if encoder_config.post_ffn_norm else None
 
         self.n_layers = encoder_config.n_layers
         self.ffn_type = ffn_config.ffn_type
@@ -43,10 +58,16 @@ class EncoderLayer(nn.Module):
         self.self_attn_residual: nn.Module
         self.ffn_residual: nn.Module
         if self.use_admin:
-            self.self_attn_residual = admin_torch.as_module(self.n_layers)
+            if self_attn_config.attn_impl == 'infinite':
+                self.self_attn_residual = transformer_utils.ReturnNthParameterModule()
+            else:
+                self.self_attn_residual = admin_torch.as_module(self.n_layers)
             self.ffn_residual = admin_torch.as_module(self.n_layers)
         else:
-            self.self_attn_residual = sum.Sum()
+            if self_attn_config.attn_impl == 'infinite':
+                self.self_attn_residual = transformer_utils.ReturnNthParameterModule()
+            else:
+                self.self_attn_residual = sum.Sum()
             self.ffn_residual = sum.Sum()
 
         moe: Optional[nn.Module] = None
@@ -64,11 +85,25 @@ class EncoderLayer(nn.Module):
             self.ffn = nn.Sequential(moe, self.ffn)
 
     def forward(self, encoder_sequences, key_padding_mask) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        self_attn, _ = self.self_attn(encoder_sequences, encoder_sequences, encoder_sequences, key_padding_mask)
+        # pre-LN
+        if self.pre_self_attn_norm is not None:
+            encoder_sequences = self.pre_self_attn_norm(encoder_sequences)
 
+        self_attn, _ = self.self_attn(encoder_sequences, encoder_sequences, encoder_sequences, key_padding_mask)
         encoder_sequences = self.self_attn_residual(encoder_sequences, self_attn)
+
+        if self.post_self_attn_norm is not None:
+            encoder_sequences = self.post_self_attn_norm(encoder_sequences)
+
+        if self.pre_ffn_norm is not None:
+            encoder_sequences = self.pre_ffn_norm(encoder_sequences)
+
         ffn, gating_variances = self.ffn(encoder_sequences)
         encoder_sequences = self.ffn_residual(encoder_sequences, ffn)
+
+        # post-LN
+        if self.post_ffn_norm is not None:
+            encoder_sequences = self.post_ffn_norm(encoder_sequences)
             
         return encoder_sequences, gating_variances
 
@@ -79,7 +114,7 @@ class Encoder(nn.Module):
         self.device = device
 
         self.model_config = model_config
-        encoder_config = model_config.encoder_config
+        self.encoder_config = model_config.encoder_config
 
         self.maxlen = model_config.maxlen
         self.d_model = model_config.d_model
@@ -90,13 +125,14 @@ class Encoder(nn.Module):
         self.norm_eps = model_config.norm_eps
         self.norm = model_config.norm
 
-        self.vocab_size = encoder_config.vocab_size
-        self.n_layers = encoder_config.n_layers
-        self.embedding_compression_dim = encoder_config.embedding_compression_dim
-        self.per_lang_embedding_layers = encoder_config.per_lang_embedding_layers
-        self.embedding_activation = encoder_config.embedding_activation
-        self.param_sharing_type = encoder_config.param_sharing_type
-        self.m_independent_layers = encoder_config.m_independent_layers
+        self.vocab_size = self.encoder_config.vocab_size
+        self.n_layers = self.encoder_config.n_layers
+        self.embedding_compression_dim = self.encoder_config.embedding_compression_dim
+        self.per_lang_embedding_layers = self.encoder_config.per_lang_embedding_layers
+        self.embedding_activation = self.encoder_config.embedding_activation
+        self.param_sharing_type = self.encoder_config.param_sharing_type
+        self.m_independent_layers = self.encoder_config.m_independent_layers
+        self.embed_scale = self.encoder_config.embed_scale
 
         self.embed_tokens: Union[embedding_mlp.EmbeddingMLP, per_lang_embedding.PerLangEmbedding, nn.Embedding]
         if self.embedding_compression_dim != 0:
@@ -107,7 +143,6 @@ class Encoder(nn.Module):
             self.embed_tokens = nn.Embedding(self.vocab_size, self.d_model)
 
         self.encoder_dropout = nn.Dropout(self.dropout)
-        self.post_encoder_norm = self.norm(self.d_model, self.norm_eps)
         self.encoder_layers = self.make_encoder_layers(self.n_layers, self.param_sharing_type, self.m_independent_layers)
 
         if self.positional_encoding_type != 'rotary':
@@ -178,7 +213,7 @@ class Encoder(nn.Module):
         return nn.ModuleList(layers)
 
     def apply_embedding_transformation(self, encoder_sequences : torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(encoder_sequences) * math.sqrt(self.d_model)
+        return self.embed_tokens(encoder_sequences) * math.sqrt(self.d_model) * self.embed_scale
 
     def apply_positional_embedding(self, encoder_sequences: torch.Tensor) -> torch.Tensor:
         # 1D buffer/sinusoidal encoding is applied here. 2D buffer/sinusoidal encoding and rotary encoding are applied in the MultiHeadAttention layer(s)
@@ -212,9 +247,6 @@ class Encoder(nn.Module):
             if gating_variance is not None:
                 gating_variances.append(gating_variance)
 
-        # post-LN
-        encoder_sequences = self.post_encoder_norm(encoder_sequences)
-
         return encoder_sequences, gating_variances
 
 class DecoderLayer(nn.Module):
@@ -227,6 +259,15 @@ class DecoderLayer(nn.Module):
         cross_attn_config = decoder_config.cross_attn_config
         use_cross_attn = cross_attn_config is not None
         ffn_config = model_config.ffn_config
+        
+        norm = model_config.norm
+
+        self.pre_self_attn_norm = norm(model_config.d_model, model_config.norm_eps) if decoder_config.pre_self_attn_norm else None
+        self.post_self_attn_norm = norm(model_config.d_model, model_config.norm_eps) if decoder_config.post_self_attn_norm else None
+        self.pre_cross_attn_norm = norm(model_config.d_model, model_config.norm_eps) if decoder_config.pre_cross_attn_norm else None
+        self.post_cross_attn_norm = norm(model_config.d_model, model_config.norm_eps) if decoder_config.post_cross_attn_norm else None
+        self.pre_ffn_norm = norm(model_config.d_model, model_config.norm_eps) if decoder_config.pre_ffn_norm else None
+        self.post_ffn_norm = norm(model_config.d_model, model_config.norm_eps) if decoder_config.post_ffn_norm else None
         
         self.use_admin = model_config.use_admin
 
@@ -253,12 +294,26 @@ class DecoderLayer(nn.Module):
             self.cross_attn = None
 
         if self.use_admin:
-            self.self_attn_residual = admin_torch.as_module(self.n_layers)
-            self.cross_attn_residual = admin_torch.as_module(self.n_layers)
+            if self_attn_config.attn_impl == 'infinite':
+                self.self_attn_residual = transformer_utils.ReturnNthParameterModule()
+            else:
+                self.self_attn_residual = admin_torch.as_module(self.n_layers)
+
+            if use_cross_attn and cross_attn_config.attn_impl == 'infinite':
+                self.cross_attn_residual = transformer_utils.ReturnNthParameterModule()
+            else:
+                self.cross_attn_residual = admin_torch.as_module(self.n_layers)
             self.ffn_residual = admin_torch.as_module(self.n_layers)
         else:
-            self.self_attn_residual = sum.Sum()
-            self.cross_attn_residual = sum.Sum()
+            if self_attn_config.attn_impl == 'infinite':
+                self.self_attn_residual = transformer_utils.ReturnNthParameterModule()
+            else:
+                self.self_attn_residual = sum.Sum()
+
+            if use_cross_attn and cross_attn_config.attn_impl == 'infinite':
+                self.cross_attn_residual = transformer_utils.ReturnNthParameterModule()
+            else:
+                self.cross_attn_residual = sum.Sum()
             self.ffn_residual = sum.Sum()
 
         self.ffn: nn.Module
@@ -281,20 +336,35 @@ class DecoderLayer(nn.Module):
                 decoder_attention_mask: Optional[torch.Tensor],
                 encoder_attention_mask: Optional[torch.Tensor]=None,
                 kv_cache: Optional[list[torch.Tensor]]=None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # print(f"decoder_sequences before self attn shape: {decoder_sequence.shape}, min: {decoder_sequence.min()}, max: {decoder_sequence.max()}, mean: {decoder_sequence.mean()}, std: {decoder_sequence.std()}, norm: {decoder_sequence.norm()}")
+        # pre-LN
+        if self.pre_self_attn_norm is not None:
+            decoder_sequence = self.pre_self_attn_norm(decoder_sequence)
 
         self_attn, _ = self.self_attn(decoder_sequence, decoder_sequence, decoder_sequence, decoder_attention_mask)
         decoder_sequence = self.self_attn_residual(decoder_sequence, self_attn)
 
-        # print(f"decoder_sequences before cross attn shape: {decoder_sequence.shape}, min: {decoder_sequence.min()}, max: {decoder_sequence.max()}, mean: {decoder_sequence.mean()}, std: {decoder_sequence.std()}, norm: {decoder_sequence.norm()}")
+        if self.post_self_attn_norm is not None:
+            decoder_sequence = self.post_self_attn_norm(decoder_sequence)
 
         if self.cross_attn is not None and encoder_sequence is not None:
+            if self.pre_cross_attn_norm is not None:
+                decoder_sequence = self.pre_cross_attn_norm(decoder_sequence)
+
             cross_attn, _ = self.cross_attn(decoder_sequence, encoder_sequence, encoder_sequence, encoder_attention_mask, kv_cache=kv_cache)
             decoder_sequence = self.cross_attn_residual(decoder_sequence, cross_attn)
 
-        ffn, gating_variances = self.ffn(decoder_sequence)
+            if self.post_cross_attn_norm is not None:
+                decoder_sequence = self.post_cross_attn_norm(decoder_sequence)
 
+        if self.pre_ffn_norm is not None:
+            decoder_sequence = self.pre_ffn_norm(decoder_sequence)
+
+        ffn, gating_variances = self.ffn(decoder_sequence)
         decoder_sequence = self.ffn_residual(decoder_sequence, ffn)
+
+        # post-LN
+        if self.post_ffn_norm is not None:
+            decoder_sequence = self.post_ffn_norm(decoder_sequence)
 
         return decoder_sequence, gating_variances
 
@@ -305,7 +375,7 @@ class Decoder(nn.Module):
         self.device = device
 
         self.model_config = model_config
-        decoder_config = model_config.decoder_config
+        self.decoder_config = model_config.decoder_config
 
         self.maxlen = model_config.maxlen
         self.d_model = model_config.d_model
@@ -313,16 +383,15 @@ class Decoder(nn.Module):
         self.positional_encoding_type = model_config.positional_encoding_type
         self.positional_encoding_dim = model_config.positional_encoding_dim
         self.learnable_positional_encoding = model_config.learnable_positional_encoding
-        self.norm_eps = model_config.norm_eps
-        self.norm = model_config.norm
 
-        self.vocab_size = decoder_config.vocab_size
-        self.n_layers = decoder_config.n_layers
-        self.embedding_compression_dim = decoder_config.embedding_compression_dim
-        self.per_lang_embedding_layers = decoder_config.per_lang_embedding_layers
-        self.embedding_activation = decoder_config.embedding_activation
-        self.param_sharing_type = decoder_config.param_sharing_type
-        self.m_independent_layers = decoder_config.m_independent_layers
+        self.vocab_size = self.decoder_config.vocab_size
+        self.n_layers = self.decoder_config.n_layers
+        self.embedding_compression_dim = self.decoder_config.embedding_compression_dim
+        self.per_lang_embedding_layers = self.decoder_config.per_lang_embedding_layers
+        self.embedding_activation = self.decoder_config.embedding_activation
+        self.param_sharing_type = self.decoder_config.param_sharing_type
+        self.m_independent_layers = self.decoder_config.m_independent_layers
+        self.embed_scale = self.decoder_config.embed_scale
 
         self.embed_tokens: Union[embedding_mlp.EmbeddingMLP, per_lang_embedding.PerLangEmbedding, nn.Embedding]
         if self.embedding_compression_dim != 0:
@@ -333,8 +402,7 @@ class Decoder(nn.Module):
             self.embed_tokens = nn.Embedding(self.vocab_size, self.d_model)
 
         self.decoder_dropout = nn.Dropout(self.dropout)
-        self.post_decoder_norm = self.norm(self.d_model, self.norm_eps)
-        self.decoder_layers = self.make_decoder_layers(self.n_layers, self.param_sharing_type, self.m_independent_layers)
+        self.init_decoder_layers()
 
         self.lm_head: nn.Module
         if self.embedding_compression_dim != 0:
@@ -350,7 +418,10 @@ class Decoder(nn.Module):
             self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(self.device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
 
         self.main_criteria = criteria.LMLoss(ignore_index=model_config.padding_value, eps=model_config.label_smoothing)
-        self.moe_criteria = criteria.DecoderOnlyMoELoss(decoder_config.moe_diversity_loss_coefficient)
+        self.moe_criteria = criteria.DecoderOnlyMoELoss(self.decoder_config.moe_diversity_loss_coefficient)
+
+    def init_decoder_layers(self):
+        self.decoder_layers = self.make_decoder_layers(self.n_layers, self.param_sharing_type, self.m_independent_layers)
 
     def make_decoder_layers(self, n_layers, param_sharing_type, m_independent_layers) -> nn.ModuleList:
         def new_decoder_layer():
@@ -421,7 +492,7 @@ class Decoder(nn.Module):
         return nn.ModuleList(layers)
 
     def apply_embedding_transformation(self, decoder_sequences: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(decoder_sequences) * math.sqrt(self.d_model)
+        return self.embed_tokens(decoder_sequences) * math.sqrt(self.d_model) * self.embed_scale
     
     def apply_positional_embedding(self, labels: torch.Tensor) -> torch.Tensor:
         # 1D buffer/sinusoidal encoding is applied here. 2D buffer/sinusoidal encoding and rotary encoding are applied in the MultiHeadAttention layer(s)
@@ -438,6 +509,25 @@ class Decoder(nn.Module):
                             kv_cache: Optional[list[torch.Tensor]]=None) -> torch.Tensor:
         return decoder_layer(decoder_sequences, encoder_sequences, decoder_attention_mask, encoder_attention_mask=encoder_attention_mask, kv_cache=kv_cache)
 
+    def decoder_block_forward(self,
+                              decoder_sequences: torch.Tensor,
+                              encoder_sequences: Optional[torch.Tensor],
+                              decoder_attention_mask: Optional[torch.Tensor],
+                              kv_caches: Optional[list[list[torch.Tensor]]]) -> tuple:
+        gating_variances = []
+        if kv_caches:
+            for decoder_layer, kv_cache in zip(self.decoder_layers, kv_caches):
+                decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, decoder_attention_mask, decoder_layer, kv_cache=kv_cache)
+                if gating_variance is not None:
+                    gating_variances.append(gating_variance)
+        else:
+            for decoder_layer in self.decoder_layers:
+                decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, decoder_attention_mask, decoder_layer)
+                if gating_variance is not None:
+                    gating_variances.append(gating_variance)
+
+        return decoder_sequences, gating_variances
+
     def forward(self,
                 input_ids: torch.Tensor,
                 labels: Optional[torch.Tensor]=None,
@@ -445,7 +535,7 @@ class Decoder(nn.Module):
                 targets_embeds: Optional[torch.Tensor]=None,
                 decoder_attention_mask: Optional[torch.Tensor]=None,
                 return_dict: bool=False,
-                kv_caches: Optional[list[list[torch.Tensor]]]=None) -> Union[tuple[torch.Tensor, list[torch.Tensor]], MegaTransformerOutput]:
+                kv_caches: Optional[list[list[torch.Tensor]]]=None) -> Union[tuple, MegaTransformerOutput]:
         if targets_embeds is None:
             assert torch.all(input_ids < self.vocab_size), f"Decoder input is out of bounds: {torch.max(input_ids)} >= {self.vocab_size}"
 
@@ -463,20 +553,10 @@ class Decoder(nn.Module):
 
         decoder_sequences = self.apply_positional_embedding(decoder_sequences)
         decoder_sequences = self.decoder_dropout(decoder_sequences)
+        block_results = self.decoder_block_forward(decoder_sequences, encoder_sequences, decoder_attention_mask, kv_caches)
 
-        gating_variances = []
-        if kv_caches:
-            for decoder_layer, kv_cache in zip(self.decoder_layers, kv_caches):
-                decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, decoder_attention_mask, decoder_layer, kv_cache=kv_cache)
-                if gating_variance is not None:
-                    gating_variances.append(gating_variance)
-        else:
-            for decoder_layer in self.decoder_layers:
-                decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, decoder_attention_mask, decoder_layer)
-                if gating_variance is not None:
-                    gating_variances.append(gating_variance)
+        decoder_sequences, gating_variances = block_results[0], block_results[1]
 
-        decoder_sequences = self.post_decoder_norm(decoder_sequences)
         logits = self.lm_head(decoder_sequences)
 
         if labels is not None:
@@ -493,9 +573,156 @@ class Decoder(nn.Module):
                 loss=main_loss + moe_loss,
                 prediction_loss=main_loss,
                 moe_loss=moe_loss,
-                decoder_gating_variances=gating_variances_tensor
+                decoder_gating_variances=gating_variances_tensor,
+                block_stats=block_results[2:] if len(block_results) > 2 else None
             )
         return logits, gating_variances
+
+class HuginnDecoder(Decoder):
+    def __init__(self, device, model_config):
+        super(HuginnDecoder, self).__init__(device, model_config)
+
+        self.n_prelude_layers = self.decoder_config.n_huginn_prelude_layers
+        self.n_thinking_layers = self.decoder_config.n_huginn_thinking_layers
+        self.n_coda_layers = self.decoder_config.n_huginn_coda_layers
+
+        self.mean_thinking_steps = self.decoder_config.mean_huginn_thinking_steps
+        self.mean_backprop_depth = self.decoder_config.mean_huginn_backprop_depth
+        self.thought_initialization_method = self.decoder_config.huginn_thought_initialization_method
+        self.adapter_method = self.decoder_config.huginn_adapter_method
+        self.exit_criteria = self.decoder_config.huginn_exit_criteria
+        self.exit_criteria_threshold = self.decoder_config.huginn_exit_criteria_threshold
+
+        self.adapter: nn.Module
+        if self.adapter_method == 'sum':
+            self.adapter = sum.Sum() # todo: implement other adapter methods
+        elif self.adapter_method == "gate":
+            self.adapter = mult.Mult()
+        elif self.adapter_method == "linear":
+            self.adapter = nn.Linear(model_config.d_model * 2, model_config.d_model)
+        else:
+            raise ValueError(f"Invalid adapter method: {self.adapter_method}")
+        
+        if self.exit_criteria == 'kl_divergence':
+            self.exit_criteria = huginn_criteria.KLDivergenceCriteria(self.exit_criteria_threshold) # todo: implement other exit criteria
+        else:
+            raise ValueError(f"Invalid exit criteria: {self.exit_criteria}")
+
+    def init_decoder_layers(self):
+        self.prelude_layers = self.make_decoder_layers(self.n_prelude_layers, self.param_sharing_type, self.m_independent_layers)
+        self.thinking_block = self.make_decoder_layers(self.n_thinking_layers, self.param_sharing_type, self.m_independent_layers)
+        self.coda_layers = self.make_decoder_layers(self.n_coda_layers, self.param_sharing_type, self.m_independent_layers)
+
+    def initialize_thinking_state(self, input_embeds):
+        """
+        Taken directly from the original Huginn implementation: https://github.com/seal-rg/recurrent-pretraining/blob/main/recpre/model_dynamic.py
+        """
+        if self.thought_initialization_method == "none":
+            return input_embeds
+        if self.thought_initialization_method == "normal":
+            x = torch.randn_like(input_embeds)
+        elif self.thought_initialization_method == "embed":
+            x = torch.randn_like(input_embeds).mul(1 / math.sqrt(input_embeds.shape[-1]))
+        elif self.thought_initialization_method == "like-init":
+            x = torch.randn_like(input_embeds)
+            std = self.embed_tokens.weight.std().float().item()
+            torch.nn.init.trunc_normal_(x, mean=0.0, std=std, a=-3 * std, b=3 * std)
+            if self.embed_scale != 1:
+                x = x * self.embed_scale
+        elif self.thought_initialization_method == "zero":
+            x = torch.zeros_like(input_embeds)
+        elif self.thought_initialization_method == "unit":
+            x = torch.randn_like(input_embeds)
+            std, mean = torch.std_mean(x, dim=-1, keepdim=True)
+            x = (x - mean) / std
+        return x
+    
+    def n_k_steps(self, mean_steps, mean_backprop_depth):
+        # todo: get seeding working
+        n_generator = torch.Generator(device="cpu")
+        n_generator.manual_seed(42 % (2**31 - 1))
+        k_generator = torch.Generator(device="cpu")
+        k_generator.manual_seed(42 % (2**31 - 1))
+
+        t = max(mean_steps - mean_backprop_depth, 0)
+        s = mean_backprop_depth
+
+        if self.training:
+            # poisson log normal filling
+            sigma = 0.5
+            mu = math.log(t + s) - (sigma**2 / 2)
+            rate = torch.zeros((1,)).log_normal_(mean=mu, std=sigma, generator=n_generator)
+            p = torch.poisson(torch.tensor([rate], dtype=torch.float), generator=n_generator) + 1
+            n = torch.clamp(p - s, min=0)
+            k = torch.as_tensor(torch.minimum(torch.as_tensor(s), p))
+        else:
+            n, k = torch.tensor(mean_steps), torch.tensor(0)
+        return n.to(torch.long), k.to(torch.long)
+
+    def apply_thinking_layers(self,
+                              x: torch.Tensor,
+                              last_thought_state: Optional[torch.Tensor],
+                              n_steps: Union[int, torch.Tensor],
+                              decoder_sequences: torch.Tensor,
+                              encoder_sequences: Optional[torch.Tensor],
+                              decoder_attention_mask: Optional[torch.Tensor],
+                              encoder_attention_mask: Optional[torch.Tensor]=None,
+                              kv_cache: Optional[list[torch.Tensor]]=None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        gating_variances = []
+        for _ in range(n_steps):
+            gating_variances_this_step = []
+            if self.adapter_method == "linear":
+                x = self.adapter(torch.cat([x, decoder_sequences], dim=-1))
+            else:
+                x = self.adapter(x, decoder_sequences)
+            for thinking_layer in self.thinking_block:
+                x, gating_variance = self.apply_decoder_layer(x, encoder_sequences, decoder_attention_mask, thinking_layer, encoder_attention_mask, kv_cache)
+                gating_variances_this_step.append(gating_variance)
+                if not self.training and self.exit_criteria.should_exit(last_thought_state, x):
+                    break
+                last_thought_state = x
+            gating_variances.extend(gating_variances_this_step)
+
+        return x, gating_variances
+    
+    def decoder_block_forward(self,
+                              decoder_sequences: torch.Tensor,
+                              encoder_sequences: Optional[torch.Tensor],
+                              decoder_attention_mask: Optional[torch.Tensor],
+                              kv_caches: Optional[list[list[torch.Tensor]]]) -> tuple:
+        if kv_caches is not None:
+            warnings.warn("KV caches are not yet supported in HuginnDecoder")
+
+        gating_variances = []
+        for decoder_layer in self.prelude_layers:
+            decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, decoder_attention_mask, decoder_layer)
+            if gating_variance is not None:
+                gating_variances.append(gating_variance)
+
+        if self.training:
+            n_steps_no_grad, k_steps_grad = self.n_k_steps(self.mean_thinking_steps, self.mean_backprop_depth)
+        else:
+            n_steps_no_grad, k_steps_grad = self.mean_thinking_steps, 0
+
+        x = self.initialize_thinking_state(decoder_sequences)
+        with torch.no_grad():
+            x, _ = self.apply_thinking_layers(x, None, n_steps_no_grad - 1, decoder_sequences, encoder_sequences, decoder_attention_mask)
+            last_thought_state = x
+            x, _ = self.apply_thinking_layers(x, last_thought_state, 1, decoder_sequences, encoder_sequences, decoder_attention_mask)
+
+        if k_steps_grad > 0:
+            decoder_sequences, thinking_gating_variances = self.apply_thinking_layers(x, last_thought_state, k_steps_grad, decoder_sequences, encoder_sequences, decoder_attention_mask)
+
+        # only add grad-required gating variances
+        if thinking_gating_variances is not None:
+            gating_variances.extend(thinking_gating_variances)
+
+        for decoder_layer in self.coda_layers:
+            decoder_sequences, gating_variance = self.apply_decoder_layer(decoder_sequences, encoder_sequences, decoder_attention_mask, decoder_layer)
+            if gating_variance is not None:
+                gating_variances.append(gating_variance)
+
+        return decoder_sequences, gating_variances, n_steps_no_grad, k_steps_grad
 
 class MegaTransformer(nn.Module):
     def __init__(self, model_config):
