@@ -40,8 +40,10 @@ class GroupedQueryMultiHeadAttention(nn.Module):
 
         if self.positional_encoding_type == 'rotary':
             self.rotary_embedding = RotaryEmbedding(dim=self.positional_encoding_dim, learned_freq=self.learnable_positional_encoding).to(device)
+            self.alibi_bias = None
         elif self.positional_encoding_type == 'alibi':
             self.alibi_bias = nn.Parameter(transformer_utils.create_alibi_bias(n_heads=self.n_heads, maxlen=self.maxlen), requires_grad=False)
+            self.rotary_embedding = None
         else:
             self.rotary_embedding = None
             self.alibi_bias = None

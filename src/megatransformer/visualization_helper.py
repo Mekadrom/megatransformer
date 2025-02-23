@@ -27,11 +27,19 @@ def viz_attn_weights(attn: Union[multihead_attn.MultiHeadAttention, grouped_quer
     residual, attention_weights = attn(tgt_seq, src_seq, src_seq, key_padding_mask, return_attn_values=True)
     tgt_seq = attn_residual(tgt_seq, residual)
 
-    for a, attention_weight_grid in enumerate(attention_weights):
-        attention_weight_grid = attention_weight_grid.to(torch.float32).cpu().contiguous()
-        for head_num in range(attention_weight_grid.size(1)):
-            image_data = viz_attn_weight(stack_name, layer_num, head_num, attention_weight_grid[:, head_num, :tgt_seq_len, :src_seq_len].transpose(-2, -1).squeeze(0).to(torch.float32).cpu().detach().numpy(), tgt_tokens, src_tokens, annot=annot)
-            log_callback(f"{decoder_or_encoder}/viz/layer_{layer_num}/segment_{a}/head_{head_num}/{self_or_cross}-attn", plt.imread(image_data), global_step=step, dataformats='HWC')
+    if len(attention_weights.shape) == 5:
+        for b, grouped_attention_weights in enumerate(attention_weights):
+            for a, attention_weight_grid in enumerate(grouped_attention_weights):
+                attention_weight_grid = attention_weight_grid.to(torch.float32).cpu().contiguous()
+                for head_num in range(attention_weight_grid.size(1)):
+                    image_data = viz_attn_weight(stack_name, layer_num, head_num, attention_weight_grid[:, head_num, :tgt_seq_len, :src_seq_len].transpose(-2, -1).squeeze(0).to(torch.float32).cpu().detach().numpy(), tgt_tokens, src_tokens, annot=annot)
+                    log_callback(f"{decoder_or_encoder}/viz/layer_{layer_num}/segment_{b}/{a}/head_{head_num}/{self_or_cross}-attn", plt.imread(image_data), global_step=step, dataformats='HWC')
+    else:
+        for a, attention_weight_grid in enumerate(attention_weights):
+            attention_weight_grid = attention_weight_grid.to(torch.float32).cpu().contiguous()
+            for head_num in range(attention_weight_grid.size(1)):
+                image_data = viz_attn_weight(stack_name, layer_num, head_num, attention_weight_grid[:, head_num, :tgt_seq_len, :src_seq_len].transpose(-2, -1).squeeze(0).to(torch.float32).cpu().detach().numpy(), tgt_tokens, src_tokens, annot=annot)
+                log_callback(f"{decoder_or_encoder}/viz/layer_{layer_num}/segment_{a}/head_{head_num}/{self_or_cross}-attn", plt.imread(image_data), global_step=step, dataformats='HWC')
 
     return tgt_seq
 

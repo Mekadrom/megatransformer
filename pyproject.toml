@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "megatransformer"
-version = "0.1.109"
+version = "0.1.116"
 authors = [
     { name = "Justin Hartmann", email = "zadarimm@gmail.com" },
 ]

@@ -10,15 +10,12 @@ class PositionWiseFCNetwork(nn.Module):
 
         self.d_model = model_config.d_model
         self.dropout = model_config.dropout
-        self.norm = model_config.norm
-        self.norm_eps = model_config.norm_eps
 
         self.ffn_type = ffn_config.ffn_type
         self.d_inner = ffn_config.d_inner
         self.activation_function = ffn_config.activation_function
         self.ffn_bias = ffn_config.ffn_bias
 
-        self.layer_norm = self.norm(self.d_model, self.norm_eps)
         self.activation = transformer_utils.create_activation_function(self.d_inner, self.activation_function)
         self.dropout = nn.Dropout(self.dropout)
         

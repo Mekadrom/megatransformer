@@ -152,7 +152,6 @@ def init_weights(model: nn.Module,
         init_weights(attn.v_memory_compression[0], d_model, init_weights_from, init_weights_gain, tie_embeddings)
     elif isinstance(model, positionwise_fcn.PositionWiseFCNetwork) or isinstance(model, phi3_mlp.Phi3MLP):
         fcn: Union[positionwise_fcn.PositionWiseFCNetwork, phi3_mlp.Phi3MLP] = model
-        init_weights(fcn.layer_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         init_weights(fcn.expand, d_model, init_weights_from, init_weights_gain, tie_embeddings)
         init_weights(fcn.condense, d_model, init_weights_from, init_weights_gain, tie_embeddings)
     elif isinstance(model, millions_moe.MillionsMoE):
@@ -267,7 +266,6 @@ def record_model_param_stats(args, summary_writer: SummaryWriter, module, step, 
         record_model_param_stats(args, summary_writer, attn.v_memory_compression[0], step, prefix='/'.join([prefix, 'v_memory_compression']))
     elif isinstance(module, positionwise_fcn.PositionWiseFCNetwork) or isinstance(module, phi3_mlp.Phi3MLP):
         ffn: Union[positionwise_fcn.PositionWiseFCNetwork, phi3_mlp.Phi3MLP] = module
-        record_model_param_stats(args, summary_writer, ffn.layer_norm, step, prefix='/'.join([prefix, 'layer_norm']))
         record_model_param_stats(args, summary_writer, ffn.expand, step, prefix='/'.join([prefix, 'expand']))
         record_model_param_stats(args, summary_writer, ffn.condense, step, prefix='/'.join([prefix, 'condense']))
     elif isinstance(module, millions_moe.MillionsMoE):

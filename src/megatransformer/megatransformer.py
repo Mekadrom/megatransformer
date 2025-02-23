@@ -122,8 +122,6 @@ class Encoder(nn.Module):
         self.positional_encoding_type = model_config.positional_encoding_type
         self.positional_encoding_dim = model_config.positional_encoding_dim
         self.learnable_positional_encoding = model_config.learnable_positional_encoding
-        self.norm_eps = model_config.norm_eps
-        self.norm = model_config.norm
 
         self.vocab_size = self.encoder_config.vocab_size
         self.n_layers = self.encoder_config.n_layers
