@@ -27,7 +27,7 @@ def viz_attn_weights(attn: Union[multihead_attn.MultiHeadAttention, grouped_quer
     residual, attention_weights = attn(tgt_seq, src_seq, src_seq, key_padding_mask, return_attn_values=True)
     tgt_seq = attn_residual(tgt_seq, residual)
 
-    if len(attention_weights.shape) == 5:
+    if len(attention_weights[0].shape) == 5:
         for b, grouped_attention_weights in enumerate(attention_weights):
             for a, attention_weight_grid in enumerate(grouped_attention_weights):
                 attention_weight_grid = attention_weight_grid.to(torch.float32).cpu().contiguous()
@@ -45,8 +45,21 @@ def viz_attn_weights(attn: Union[multihead_attn.MultiHeadAttention, grouped_quer
 
 def viz_encoder_layer(encoder_layer: megatransformer.EncoderLayer, src_seq, src_seq_len, src_key_padding_mask, src_tokens, log_callback, step, layer_num, annot=True):
     print(f"Visualizing encoder layer {layer_num}...")
+    if encoder_layer.pre_self_attn_norm is not None:
+        residual = encoder_layer.pre_self_attn_norm(residual)
+
     residual = viz_attn_weights(encoder_layer.self_attn, encoder_layer.self_attn_residual, layer_num, src_seq, src_seq_len, src_key_padding_mask, src_seq, src_seq_len, src_tokens, src_tokens, log_callback, step, annot=annot)
+
+    if encoder_layer.post_self_attn_norm is not None:
+        residual = encoder_layer.post_self_attn_norm(residual)
+
+    if encoder_layer.pre_ffn_norm is not None:
+        residual = encoder_layer.pre_ffn_norm(residual)
+
     ffn_out, _ = encoder_layer.ffn(residual)
+
+    if encoder_layer.post_ffn_norm is not None:
+        residual = encoder_layer.post_ffn_norm(residual)
     return encoder_layer.ffn_residual(residual, ffn_out)
 
 def viz_encoder_layers(encoder_layers: list[megatransformer.EncoderLayer], seq, seq_len, key_padding_mask, tokens, log_callback, step, annot=True):
@@ -64,12 +77,33 @@ def viz_encoder(device, encoder: megatransformer.Encoder, seq, seq_len, key_padd
 
 def viz_decoder_layer(decoder_layer: megatransformer.DecoderLayer, src_seq, src_seq_len, src_key_padding_mask, tgt_seq, tgt_seq_len, tgt_key_padding_mask, src_tokens, tgt_tokens, log_callback, step, layer_num, annot=True):
     print(f"Visualizing decoder layer {layer_num}...")
+    if decoder_layer.pre_self_attn_norm is not None:
+        tgt_seq = decoder_layer.pre_self_attn_norm(tgt_seq)
+
     tgt_seq = viz_attn_weights(decoder_layer.self_attn, decoder_layer.self_attn_residual, layer_num, tgt_seq, tgt_seq_len, tgt_key_padding_mask, tgt_seq, tgt_seq_len, tgt_tokens, tgt_tokens, log_callback, step, annot=annot)
+
+    if decoder_layer.post_self_attn_norm is not None:
+        tgt_seq = decoder_layer.post_self_attn_norm(tgt_seq)
+
     if decoder_layer.cross_attn is not None:
+        if decoder_layer.pre_cross_attn_norm is not None:
+            tgt_seq = decoder_layer.pre_cross_attn_norm(tgt_seq)
+
         residual = viz_attn_weights(decoder_layer.cross_attn, decoder_layer.cross_attn_residual, layer_num, src_seq, src_seq_len, src_key_padding_mask, tgt_seq, tgt_seq_len, src_tokens, tgt_tokens, log_callback, step, annot=annot)
+
+        if decoder_layer.post_cross_attn_norm is not None:
+            tgt_seq = decoder_layer.post_cross_attn_norm(tgt_seq)
     else:
         residual = tgt_seq
+
+    if decoder_layer.pre_ffn_norm is not None:
+        residual = decoder_layer.pre_ffn_norm(residual)
+
     ffn_out, _ = decoder_layer.ffn(residual)
+
+    if decoder_layer.post_ffn_norm is not None:
+        residual = decoder_layer.post_ffn_norm(residual)
+        
     return decoder_layer.ffn_residual(residual, ffn_out)
 
 def viz_decoder_layers(decoder_layers, src_seq, src_seq_len, src_key_padding_mask, tgt_seq, tgt_seq_len, tgt_key_padding_mask, src_tokens, tgt_tokens, log_callback, step, annot=True):

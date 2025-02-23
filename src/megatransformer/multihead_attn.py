@@ -66,10 +66,11 @@ class MultiHeadAttention(nn.Module):
         if self.heads_activation_function is not None:
             self.heads_activation = transformer_utils.create_activation_function(self.d_model, self.heads_activation_function)
 
-        self.register_buffer('causal_mask', torch.tril(torch.ones(self.maxlen + 1, self.maxlen + 1).to(self.device)).to(torch.bool))
+        self.register_buffer('causal_mask', ~torch.tril(torch.ones(self.maxlen + 1, self.maxlen + 1).to(self.device)).to(torch.bool))
 
     def mask_attention(self, attention_weights: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
         # mask away tokens by setting such weights to a large negative number, so that they evaluate to 0 under the softmax
+        # masks should be either bool tensors with True values where values should be masked, or float/integer tensors with 1 values where values should be masked
         if attention_mask is not None:
             assert attention_mask.shape[0] == attention_weights.shape[0], f"batch dimension for padding is wrong: {attention_mask.shape[0]} != {attention_weights.shape[0]}. overall shape: {attention_mask.shape} != {attention_weights.shape}"
             assert attention_mask.shape[1] == attention_weights.shape[3], f"padding mask length is wrong: {attention_mask.shape[1]} != {attention_weights.shape[3]}. overall shape: {attention_mask.shape} != {attention_weights.shape}"
@@ -78,7 +79,7 @@ class MultiHeadAttention(nn.Module):
 
             attention_weights = attention_weights.masked_fill_(attention_mask, -float('inf'))
         if self.self_attn:
-            attention_weights = attention_weights.masked_fill_(~self.causal_mask[:attention_weights.shape[-2], :attention_weights.shape[-1]], -float('inf'))
+            attention_weights = attention_weights.masked_fill_(self.causal_mask[:attention_weights.shape[-2], :attention_weights.shape[-1]], -float('inf'))
 
         return attention_weights
 
