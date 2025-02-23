@@ -145,7 +145,7 @@ class Encoder(nn.Module):
         self.encoder_dropout = nn.Dropout(self.dropout)
         self.encoder_layers = self.make_encoder_layers(self.n_layers, self.param_sharing_type, self.m_independent_layers)
 
-        if self.positional_encoding_type != 'rotary':
+        if self.positional_encoding_type == 'sinusoidal':
             self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
 
     def make_encoder_layers(self, n_layers, param_sharing_type, m_independent_layers) -> nn.ModuleList:
@@ -414,7 +414,7 @@ class Decoder(nn.Module):
         else:
             self.lm_head = nn.Linear(self.d_model, self.vocab_size)
 
-        if self.positional_encoding_type != 'rotary':
+        if self.positional_encoding_type == 'sinusoidal':
             self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(self.device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
 
         self.main_criteria = criteria.LMLoss(ignore_index=model_config.padding_value, eps=model_config.label_smoothing)

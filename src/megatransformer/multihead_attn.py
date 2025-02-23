@@ -35,12 +35,15 @@ class MultiHeadAttention(nn.Module):
         self.v_bias = attn_config.v_bias
         self.o_bias = attn_config.o_bias
         self.heads_activation_function = attn_config.heads_activation_function
-        self.infinite_attention_n_segments = attn_config.infinite_attention_n_segments
-        self.infinite_attention_update = attn_config.infinite_attention_update
         self.use_grok_scaled_attn = attn_config.use_grok_scaled_attn
 
         if self.positional_encoding_type == 'rotary':
             self.rotary_embedding = RotaryEmbedding(dim=self.positional_encoding_dim, learned_freq=self.learnable_positional_encoding).to(device)
+        elif self.positional_encoding_type == 'alibi':
+            self.alibi_bias = nn.Parameter(transformer_utils.create_alibi_bias(n_heads=self.n_heads, maxlen=self.maxlen), requires_grad=False)
+        else:
+            self.rotary_embedding = None
+            self.alibi_bias = None
 
         # A linear projection to cast (n_kv_heads sets of) queries from the input query sequences
         self.q_proj = nn.Linear(self.d_model, self.n_heads * self.d_queries, bias=self.q_bias) # (N, query_sequence_pad_length, n_kv_heads * d_queries)
@@ -60,9 +63,6 @@ class MultiHeadAttention(nn.Module):
         self.heads_activation = None
         if self.heads_activation_function is not None:
             self.heads_activation = transformer_utils.create_activation_function(self.d_model, self.heads_activation_function)
-
-        self.infinite_attn_elu: Optional[nn.ELU] = None
-        self.infinite_attn_beta: Optional[nn.Parameter] = None
 
         self.register_buffer('causal_mask', torch.tril(torch.ones(self.maxlen + 1, self.maxlen + 1).to(self.device)).to(torch.bool))
 
@@ -128,12 +128,15 @@ class MultiHeadAttention(nn.Module):
         k_heads = k_heads.permute(0, 2, 1, 3) # NhTd
         v_heads = v_heads.permute(0, 2, 1, 3) # NhTv
 
-        if hasattr(self, 'rotary_embedding') and self.rotary_embedding is not None:
+        if self.rotary_embedding is not None:
             q_heads = self.rotary_embedding.rotate_queries_or_keys(q_heads, seq_dim=-2)
             k_heads = self.rotary_embedding.rotate_queries_or_keys(k_heads.unsqueeze(0), seq_dim=-2).squeeze(0) # adds a singleton dimension for the rotation operation and then removes it for the torch compiler
 
         # if return_attn_values:
         attention_weights = torch.einsum('...htq,...hTq->...htT', q_heads, k_heads)
+
+        if self.alibi_bias is not None:
+            attention_weights = attention_weights + self.alibi_bias
 
         attention_weights = (1.0 / (self.d_queries ** 0.5)) * attention_weights
         if bool(self.use_grok_scaled_attn):

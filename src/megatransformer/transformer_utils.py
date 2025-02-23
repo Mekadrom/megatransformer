@@ -16,6 +16,15 @@ class ReturnNthParameterModule(nn.Module):
     def forward(self, *args):
         return args[self.idx]
 
+def create_alibi_bias(n_heads, maxlen):
+    slopes = torch.pow(2, -torch.arange(1, n_heads + 1) * 8 / n_heads)
+    # Create position differences matrix
+    pos = torch.arange(maxlen)
+    diff = pos.unsqueeze(-1) - pos.unsqueeze(-2)  # [seq_len, seq_len]
+    # Calculate bias for each head
+    bias = -torch.abs(diff).unsqueeze(0) * slopes.unsqueeze(-1).unsqueeze(-1)
+    return bias  # [n_heads, seq_len, seq_len]
+
 def get_activation_function(activation_function_name):
     if activation_function_name == 'relu':
         return nn.ReLU

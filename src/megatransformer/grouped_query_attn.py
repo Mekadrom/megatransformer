@@ -36,12 +36,15 @@ class GroupedQueryMultiHeadAttention(nn.Module):
         self.v_bias = attn_config.v_bias
         self.o_bias = attn_config.o_bias
         self.heads_activation_function = attn_config.heads_activation_function
-        self.infinite_attention_n_segments = attn_config.infinite_attention_n_segments
-        self.infinite_attention_update = attn_config.infinite_attention_update
         self.use_grok_scaled_attn = attn_config.use_grok_scaled_attn
 
         if self.positional_encoding_type == 'rotary':
             self.rotary_embedding = RotaryEmbedding(dim=self.positional_encoding_dim, learned_freq=self.learnable_positional_encoding).to(device)
+        elif self.positional_encoding_type == 'alibi':
+            self.alibi_bias = nn.Parameter(transformer_utils.create_alibi_bias(n_heads=self.n_heads, maxlen=self.maxlen), requires_grad=False)
+        else:
+            self.rotary_embedding = None
+            self.alibi_bias = None
 
         self.n_q_heads = self.n_gqa_groups * self.n_heads
 
@@ -63,9 +66,6 @@ class GroupedQueryMultiHeadAttention(nn.Module):
         self.heads_activation = None
         if self.heads_activation_function is not None:
             self.heads_activation = transformer_utils.create_activation_function(self.d_model, self.heads_activation_function)
-
-        self.infinite_attn_elu: Optional[nn.ELU] = None
-        self.infinite_attn_beta: Optional[nn.Parameter] = None
 
         self.register_buffer('causal_mask', torch.tril(torch.ones(self.maxlen + 1, self.maxlen + 1).to(self.device)).to(torch.bool))
 
@@ -137,6 +137,9 @@ class GroupedQueryMultiHeadAttention(nn.Module):
 
         # generate attention weights by taking the dot product of queries and keys
         attention_weights = torch.einsum('...ghtq,...hTq->...htT', q_heads, k_heads)
+
+        if self.alibi_bias is not None:
+            attention_weights = attention_weights + self.alibi_bias
 
         attention_weights = (1.0 / (self.d_queries ** 0.5)) * attention_weights
         if bool(self.use_grok_scaled_attn):

@@ -137,7 +137,7 @@ class TransformerConfig(ConfigDict):
                  d_model: Optional[int] = None,
                  dropout: Optional[float] = None,
                  use_admin: bool = False,
-                 positional_encoding_type: Literal["sinusoidal", "rotary"] = 'rotary',
+                 positional_encoding_type: Literal["sinusoidal", "rotary", "alibi"] = 'rotary',
                  positional_encoding_dim: int = 64,
                  learnable_positional_encoding: bool = False,
                  tie_embeddings: bool = False,

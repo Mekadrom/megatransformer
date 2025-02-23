@@ -40,6 +40,11 @@ class InfiniteMultiHeadAttention(nn.Module):
 
         if self.positional_encoding_type == 'rotary':
             self.rotary_embedding = RotaryEmbedding(dim=self.positional_encoding_dim, learned_freq=self.learnable_positional_encoding).to(device)
+        elif self.positional_encoding_type == 'alibi':
+            self.alibi_bias = nn.Parameter(transformer_utils.create_alibi_bias(n_heads=self.n_heads, maxlen=self.maxlen), requires_grad=False)
+        else:
+            self.rotary_embedding = None
+            self.alibi_bias = None
 
         self.n_q_heads = self.n_gqa_groups * self.n_heads
 
@@ -136,7 +141,7 @@ class InfiniteMultiHeadAttention(nn.Module):
         k_heads = k_heads.permute(0, 2, 1, 3) # NhTq
         v_heads = v_heads.permute(0, 2, 1, 3) # NhTv
 
-        if hasattr(self, 'rotary_embedding') and self.rotary_embedding is not None:
+        if self.rotary_embedding is not None:
             q_heads = self.rotary_embedding.rotate_queries_or_keys(q_heads, seq_dim=-2)
             k_heads = self.rotary_embedding.rotate_queries_or_keys(k_heads.unsqueeze(0), seq_dim=-2).squeeze(0) # adds a singleton dimension for the rotation operation and then removes it for the torch compiler
 
@@ -160,6 +165,9 @@ class InfiniteMultiHeadAttention(nn.Module):
 
         # generate attention weights by taking the dot product of queries and keys
         attention_weights = torch.einsum('...ghtq,...hTq->...htT', q_heads, k_heads)
+
+        if self.alibi_bias is not None:
+            attention_weights = attention_weights + self.alibi_bias
 
         attention_weights = (1.0 / (self.d_queries ** 0.5)) * attention_weights
         if bool(self.use_grok_scaled_attn):
