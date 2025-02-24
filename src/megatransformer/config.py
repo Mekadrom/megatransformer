@@ -5,9 +5,16 @@ import yaml
 
 class ConfigDict:
     def __repr__(self):
-        return str(self.__dict__)
+        return yaml.dump(self)
+    
+    @classmethod
+    def to_yaml(cls, dumper, data):
+        cleaned_data = dict((k, v) for (k, v) in data.__dict__.items() if v is not None)
+        return dumper.represent_mapping(cls.yaml_tag, cleaned_data)
 
-class AttentionConfig(ConfigDict):
+class AttentionConfig(ConfigDict, yaml.YAMLObject):
+    yaml_tag = u'!AttentionConfig'
+
     def __init__(self,
                  n_heads: int,
                  n_gqa_groups: int,
@@ -37,7 +44,9 @@ class AttentionConfig(ConfigDict):
         self.infinite_attention_update = infinite_attention_update
         self.use_grok_scaled_attn = use_grok_scaled_attn
 
-class FFNConfig(ConfigDict):
+class FFNConfig(ConfigDict, yaml.YAMLObject):
+    yaml_tag = u'!FFNConfig'
+
     def __init__(self,
                  ffn_type: Literal["millions", "phi3", "simple", "sparse"],
                  d_inner: int,
@@ -61,7 +70,9 @@ class FFNConfig(ConfigDict):
         self.activation_function = activation_function
         self.ffn_bias = ffn_bias
 
-class EncoderDecoderConfig(ConfigDict):
+class EncoderDecoderConfig(ConfigDict, yaml.YAMLObject):
+    yaml_tag = u'!EncoderDecoderConfig'
+
     def __init__(self,
                  device,
                  vocab_size: int,
@@ -127,8 +138,11 @@ class EncoderDecoderConfig(ConfigDict):
         if 'cross_attn_config' in config:
             self.cross_attn_config = AttentionConfig(**config['cross_attn_config'])
 
-class TransformerConfig(ConfigDict):
+class TransformerConfig(ConfigDict, yaml.YAMLObject):
+    yaml_tag = u'!TransformerConfig'
+
     def __init__(self,
+                 ignore_token_id: int = -100,
                  encoder_config: Optional[EncoderDecoderConfig] = None,
                  decoder_config: Optional[EncoderDecoderConfig] = None,
                  tokenizer: Optional[str] = None,
@@ -141,12 +155,13 @@ class TransformerConfig(ConfigDict):
                  positional_encoding_dim: int = 64,
                  learnable_positional_encoding: bool = False,
                  tie_embeddings: bool = False,
-                 padding_value: int = -100,
                  label_smoothing: float = 0.0,
                  norm_eps: float = 1e-5,
                  norm = nn.LayerNorm,
                  init_weights_from: str = 'glorot_uniform',
                  init_weights_gain: float = 1.0):
+        self.ignore_token_id = ignore_token_id
+
         self.maxlen = maxlen
         self.d_model = d_model
         self.dropout = dropout
@@ -157,7 +172,6 @@ class TransformerConfig(ConfigDict):
         self.learnable_positional_encoding = learnable_positional_encoding
         self.tie_embeddings = tie_embeddings
         self.label_smoothing = label_smoothing
-        self.padding_value = padding_value
         self.norm_eps = norm_eps
         self.norm = norm
         self.init_weights_from = init_weights_from
@@ -173,11 +187,19 @@ class TransformerConfig(ConfigDict):
             config = yaml.safe_load(f)
         self.__dict__.update(config)
 
-        self.encoder_config = EncoderDecoderConfig(**config['encoder_config'])
-        self.encoder_config.load_config(config['encoder_config'])
+        if 'encoder_config' in config:
+            self.encoder_config = EncoderDecoderConfig(**config['encoder_config'])
+            self.encoder_config.load_config(config['encoder_config'])
         self.decoder_config = EncoderDecoderConfig(**config['decoder_config'])
         self.decoder_config.load_config(config['decoder_config'])
 
         self.ffn_config = FFNConfig(**config['ffn_config'])
 
         print(f"Loaded config from {path}")
+
+if __name__ == '__main__':
+    config = TransformerConfig(ignore_token_id=-100)
+    config.load_yaml('configs/causal/aiayn.yaml')
+    with open('configs/causal/test.yaml', 'w') as f:
+        yaml.dump(config, f)
+    print(config)

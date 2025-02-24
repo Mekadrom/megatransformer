@@ -1,13 +1,13 @@
 from torch import nn
+from torch.amp import autocast
 from typing import Optional, Union, Callable
 
 from . import config, embedding_mlp, infinite_multihead_attn, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, mult, transformer_utils, criteria, grouped_query_attn, huginn_criteria
 
 import admin_torch
-import copy
 import math
-import random
 import torch
+import torch.nn.functional as F
 import warnings
 
 class MegaTransformerOutput:
@@ -375,6 +375,8 @@ class Decoder(nn.Module):
         self.model_config = model_config
         self.decoder_config = model_config.decoder_config
 
+        self.ignore_token_id = self.model_config.ignore_token_id
+
         self.maxlen = model_config.maxlen
         self.d_model = model_config.d_model
         self.dropout = model_config.dropout
@@ -415,7 +417,7 @@ class Decoder(nn.Module):
         if self.positional_encoding_type == 'sinusoidal':
             self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(self.device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
 
-        self.main_criteria = criteria.LMLoss(ignore_index=model_config.padding_value, eps=model_config.label_smoothing)
+        self.main_criteria = criteria.LMLoss(ignore_token_id=self.ignore_token_id, eps=model_config.label_smoothing)
         self.moe_criteria = criteria.DecoderOnlyMoELoss(self.decoder_config.moe_diversity_loss_coefficient)
 
     def init_decoder_layers(self):
@@ -575,6 +577,64 @@ class Decoder(nn.Module):
                 block_stats=block_results[2:] if len(block_results) > 2 else None
             )
         return logits, gating_variances
+    
+    def generate(self, input_ids, max_length, **kwargs):
+        top_k = kwargs.get('top_k', None)
+        top_p = kwargs.get('top_p', None)
+        with torch.no_grad():
+            with autocast('cuda' if 'cuda' in self.device else 'cpu'):
+                input_ids = input_ids.to(self.device)
+                decoded = input_ids.clone().detach().to(self.device)
+
+                for i in range(max_length - input_ids.shape[1]):
+                    logits, _ = self(input_ids=decoded)
+                    next_token_logits = logits[:, -1, :]
+                    
+                    # Convert logits to probabilities
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    
+                    if top_k is not None:
+                        # Get top k values and their indices
+                        top_probs, top_indices = probs.topk(top_k, dim=-1)
+                        
+                        # Sample from the top k distribution
+                        sampled_idx = torch.multinomial(top_probs, 1)
+                        
+                        # Map back to vocabulary space
+                        next_token = torch.gather(top_indices, -1, sampled_idx)
+                    elif top_p is not None:
+                        # Nucleus sampling (top-p)
+                        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                        
+                        # Remove tokens with cumulative probability above the threshold
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        # Shift the indices to the right to keep the first token above threshold
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        
+                        # Create a mask for indices to keep
+                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                        filtered_probs = probs.clone()
+                        filtered_probs[indices_to_remove] = 0
+                        
+                        # Renormalize probabilities
+                        filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
+                        
+                        # Sample from the filtered distribution
+                        next_token = torch.multinomial(filtered_probs, 1)
+                    else:
+                        # Greedy decoding
+                        next_token = torch.argmax(probs, dim=-1, keepdim=True)
+                    
+                    # Concatenate with previous tokens
+                    decoded = torch.cat([decoded, next_token], dim=1)
+                    
+                    # Check if we should stop generation
+                    if next_token.item() == self.ignore_token_id or next_token.item() == kwargs.get('eos_token_id', None):
+                        break
+                        
+                return decoded
 
 class HuginnDecoder(Decoder):
     def __init__(self, device, model_config):
@@ -729,12 +789,12 @@ class MegaTransformer(nn.Module):
         self.encoder_config = model_config.encoder_config
         self.decoder_config = model_config.decoder_config
 
-        self.padding_value = model_config.padding_value
+        self.ignore_token_id = model_config.ignore_token_id
 
         self.encoder: Encoder = Encoder(self.encoder_config.device, model_config)
         self.decoder: Decoder = Decoder(self.decoder_config.device, model_config)
 
-        self.main_criteria = criteria.LMLoss(ignore_index=model_config.padding_value, eps=model_config.label_smoothing)
+        self.main_criteria = criteria.LMLoss(ignore_token_id=self.ignore_token_id, eps=model_config.label_smoothing)
         self.moe_criteria = criteria.TransformerMoELoss(model_config.moe_diversity_loss_coefficient)
 
     def forward(
@@ -748,11 +808,11 @@ class MegaTransformer(nn.Module):
         """
         Full encoder-decoder transformer forward pass function, with device cast handling if necessary (training does not support this but inference should)
         """
-        if self.padding_value is not None:
+        if self.ignore_token_id is not None:
             if attention_mask is None and input_ids is not None:
-                attention_mask = input_ids == self.padding_value
+                attention_mask = input_ids == self.ignore_token_id
             if decoder_attention_mask is None and labels is not None:
-                decoder_attention_mask = labels == self.padding_value
+                decoder_attention_mask = labels == self.ignore_token_id
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.encoder_config.device)
@@ -790,3 +850,34 @@ class MegaTransformer(nn.Module):
                 decoder_gating_variances=decoder_gating_variances_tensor
             )
         return logits, encoder_gating_variances, decoder_gating_variances
+
+    def generate(self, input_ids, max_length, **kwargs):
+        with torch.no_grad():
+            with autocast('cuda' if 'cuda' in self.encoder_config.device else 'cpu'):
+                input_ids = input_ids.to(self.encoder_config.device)
+
+                encoder_attention_mask = (input_ids == self.ignore_token_id).to(self.encoder_config.device)
+
+                encoder_sequences, _ = self.encoder(input_ids, encoder_attention_mask)
+
+            with autocast('cuda' if 'cuda' in self.decoder_config.device else 'cpu'):
+                steps = 0
+                decoded = torch.LongTensor([[self.bos_token_id]]).to(self.decoder_config.device)
+                while True:
+                    encoder_sequences = encoder_sequences.to(self.decoder_config.device)
+                    encoder_attention_mask = encoder_attention_mask.to(self.decoder_config.device)
+
+                    decoder_sequences, _ = self.decoder(encoder_sequences=encoder_sequences, input_ids=decoded, decoder_attention_mask=None, encoder_attention_mask=encoder_attention_mask)
+
+                    next_word_scores = decoder_sequences[:, -1, :]
+                    next_word_scores = F.log_softmax(next_word_scores, dim=-1)
+
+                    next_word = torch.argmax(next_word_scores, dim=-1)
+
+                    decoded = torch.cat([decoded, next_word.unsqueeze(1)], dim=1)
+
+                    steps += 1
+                    if steps >= max_length or next_word.item() == self.ignore_token_id or next_word.item() == kwargs.get('eos_token_id', None):
+                        break
+
+                return decoded

@@ -8,7 +8,7 @@ positional_encoding: rotary
 positional_embedding_dim: 64
 
 tie_embeddings: False
-padding_value: 0
+ignore_token_id: -100
 
 decoder_config:
   device: cuda:0

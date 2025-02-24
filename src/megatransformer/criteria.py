@@ -1,8 +1,10 @@
+from lm_eval import models, tasks
 from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence
 
 import torch
 import torch.nn.functional as F
+import transformers
 
 class LabelSmoothedCE(nn.Module):
     def __init__(self, ignore_index=-100, eps=0.1):
@@ -40,9 +42,9 @@ class LabelSmoothedCE(nn.Module):
 
 # doesn't handle packing/padding sequences
 class LMLoss(nn.Module):
-    def __init__(self, ignore_index=-100, eps=0.0):
+    def __init__(self, ignore_token_id=-100, eps=0.0):
         super(LMLoss, self).__init__()
-        self.ignore_index = ignore_index
+        self.ignore_token_id = ignore_token_id
         self.label_smoothing = eps
 
     def forward(self, logits: torch.Tensor, labels: torch.Tensor):
@@ -52,7 +54,7 @@ class LMLoss(nn.Module):
         loss = F.cross_entropy(
             logits, 
             labels,
-            ignore_index=self.ignore_index,  # Typically -100 for HuggingFace models
+            ignore_index=self.ignore_token_id,
             reduction='mean',
             label_smoothing=self.label_smoothing
         )
@@ -90,3 +92,30 @@ class TransformerMoELoss(nn.Module):
             return moe_diversity_loss, encoder_moe_gating_variances_tensor, decoder_moe_gating_variances_tensor
         else:
             return torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
+
+# class CustomLMEvalModel(models.LMEvalModel):
+#     def __init__(self, model, tokenizer):
+#         self._model = model  # Your custom PyTorch model
+#         self._tokenizer = tokenizer
+        
+#     def _model_call(self, inputs):
+#         # Convert inputs to your model's expected format
+#         # Typically involves handling tokenization and attention masks
+#         with torch.no_grad():
+#             outputs = self._model(inputs)
+#             return outputs
+    
+#     def generate(self, inputs, max_length, **kwargs):
+#         # Implement generation logic for your specific model
+#         generated = self._model.generate(
+#             inputs, 
+#             max_length=max_length,
+#             **kwargs
+#         )
+#         return generated
+    
+#     def tok_encode(self, string):
+#         return self._tokenizer.encode(string, add_special_tokens=False)
+    
+#     def tok_decode(self, tokens):
+#         return self._tokenizer.decode(tokens)

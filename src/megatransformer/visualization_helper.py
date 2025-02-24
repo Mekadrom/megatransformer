@@ -73,7 +73,7 @@ def viz_encoder(device, encoder: megatransformer.Encoder, seq, seq_len, key_padd
         seq = encoder.apply_embedding_transformation(seq)
     seq = encoder.apply_positional_embedding(seq)
     seq = viz_encoder_layers(encoder.encoder_layers, seq, seq_len, key_padding_mask, tokens, log_callback, step, annot=annot)
-    return encoder.post_encoder_norm(seq).to(device)
+    return seq.to(device)
 
 def viz_decoder_layer(decoder_layer: megatransformer.DecoderLayer, src_seq, src_seq_len, src_key_padding_mask, tgt_seq, tgt_seq_len, tgt_key_padding_mask, src_tokens, tgt_tokens, log_callback, step, layer_num, annot=True):
     print(f"Visualizing decoder layer {layer_num}...")
@@ -103,7 +103,7 @@ def viz_decoder_layer(decoder_layer: megatransformer.DecoderLayer, src_seq, src_
 
     if decoder_layer.post_ffn_norm is not None:
         residual = decoder_layer.post_ffn_norm(residual)
-        
+
     return decoder_layer.ffn_residual(residual, ffn_out)
 
 def viz_decoder_layers(decoder_layers, src_seq, src_seq_len, src_key_padding_mask, tgt_seq, tgt_seq_len, tgt_key_padding_mask, src_tokens, tgt_tokens, log_callback, step, annot=True):
@@ -118,7 +118,7 @@ def viz_decoder(device, decoder: megatransformer.Decoder, src_seq, src_seq_len, 
     tgt_seq = decoder.apply_positional_embedding(tgt_seq.to(device))
     return viz_decoder_layers(decoder.decoder_layers, src_seq, src_seq_len, src_key_padding_mask, tgt_seq, tgt_seq_len, tgt_key_padding_mask, src_tokens, tgt_tokens, log_callback, step, annot=annot)
 
-def viz_model(encoder_device, decoder_device, model: megatransformer.MegaTransformer, log_callback, step, maxlen, src, src_labels, tgt=None, tgt_labels=None, padding_value=-100, annot=True):
+def viz_model(encoder_device, decoder_device, model: megatransformer.MegaTransformer, log_callback, step, maxlen, src, src_labels, tgt=None, tgt_labels=None, ignore_token_id=-100, annot=True):
     model.eval()
     with torch.no_grad():
         src_seq_len = src.size(1)
@@ -127,8 +127,8 @@ def viz_model(encoder_device, decoder_device, model: megatransformer.MegaTransfo
         src = torch.cat([src, torch.zeros([1, maxlen - src.size(1)], dtype=torch.long, device=src.device)], dim=1)
         tgt = torch.cat([tgt, torch.zeros([1, maxlen - tgt.size(1)], dtype=torch.long, device=tgt.device)], dim=1)
 
-        src_key_padding_mask = src == padding_value
-        tgt_key_padding_mask = (tgt == padding_value).to(tgt.device)
+        src_key_padding_mask = src == ignore_token_id
+        tgt_key_padding_mask = (tgt == ignore_token_id).to(tgt.device)
 
         # permanent device assignments
         src = src.to(encoder_device)
