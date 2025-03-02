@@ -83,7 +83,7 @@ class InfiniteMultiHeadAttention(nn.Module):
             nn.ELU(),
         )
 
-        self.register_buffer('causal_mask', torch.tril(torch.ones(self.maxlen + 1, self.maxlen + 1).to(self.device)).to(torch.bool))
+        self.register_buffer('causal_mask', torch.triu(torch.ones(self.maxlen+1, self.maxlen+1), diagonal=1).to(device).to(torch.bool))
 
     def mask_attention(self, attention_weights: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
         # mask away tokens by setting such weights to a large negative number, so that they evaluate to 0 under the softmax
@@ -95,7 +95,7 @@ class InfiniteMultiHeadAttention(nn.Module):
 
         #     attention_weights = attention_weights.masked_fill_(attention_mask, -float('inf'))
         if self.self_attn:
-            attention_weights = attention_weights.masked_fill_(~self.causal_mask[:attention_weights.shape[-2], :attention_weights.shape[-1]], -float('inf'))
+            attention_weights = attention_weights.masked_fill_(self.causal_mask[:attention_weights.shape[-2], :attention_weights.shape[-1]], -float('inf'))
 
         return attention_weights
 

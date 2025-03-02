@@ -66,7 +66,8 @@ class MultiHeadAttention(nn.Module):
         if self.heads_activation_function is not None:
             self.heads_activation = transformer_utils.create_activation_function(self.d_model, self.heads_activation_function)
 
-        self.register_buffer('causal_mask', ~torch.tril(torch.ones(self.maxlen + 1, self.maxlen + 1).to(self.device)).to(torch.bool))
+        self.register_buffer('causal_mask', torch.tril(torch.ones(self.maxlen+1, self.maxlen+1)).view(1, 1, self.maxlen+1, self.maxlen+1).to(device).to(torch.bool))
+        self.causal_mask.requires_grad = False
 
     def mask_attention(self, attention_weights: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
         # mask away tokens by setting such weights to a large negative number, so that they evaluate to 0 under the softmax
@@ -75,11 +76,13 @@ class MultiHeadAttention(nn.Module):
             assert attention_mask.shape[0] == attention_weights.shape[0], f"batch dimension for padding is wrong: {attention_mask.shape[0]} != {attention_weights.shape[0]}. overall shape: {attention_mask.shape} != {attention_weights.shape}"
             assert attention_mask.shape[1] == attention_weights.shape[3], f"padding mask length is wrong: {attention_mask.shape[1]} != {attention_weights.shape[3]}. overall shape: {attention_mask.shape} != {attention_weights.shape}"
 
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1).to(torch.bool)
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
 
-            attention_weights = attention_weights.masked_fill_(attention_mask, -float('inf'))
+            attention_weights.masked_fill_(attention_mask.to(torch.bool) == 0, -float('inf'))
         if self.self_attn:
-            attention_weights = attention_weights.masked_fill_(self.causal_mask[:attention_weights.shape[-2], :attention_weights.shape[-1]], -float('inf'))
+            t = attention_weights.shape[-2]
+            T = attention_weights.shape[-1]
+            attention_weights.masked_fill_(self.causal_mask[:, :, :t, :T] == 0, -float('inf'))
 
         return attention_weights
 
@@ -105,38 +108,38 @@ class MultiHeadAttention(nn.Module):
             k_cache.append(k_new)
             v_cache.append(v_new)
 
-            k_heads = torch.cat(k_cache, dim=1)
-            v_heads = torch.cat(v_cache, dim=1)
+            k = torch.cat(k_cache, dim=1)
+            v = torch.cat(v_cache, dim=1)
 
-            q_heads = self.q_proj(query_sequences[:, -1:])
+            q = self.q_proj(query_sequences[:, -1:])
         else:
-            q_heads: torch.Tensor = self.q_proj(query_sequences)
-            k_heads: torch.Tensor = self.k_proj(key_sequences)
-            v_heads: torch.Tensor = self.v_proj(value_sequences)
+            q: torch.Tensor = self.q_proj(query_sequences)
+            k: torch.Tensor = self.k_proj(key_sequences)
+            v: torch.Tensor = self.v_proj(value_sequences)
 
         if self.heads_activation is not None:
-            q_heads = self.heads_activation(q_heads)
-            k_heads = self.heads_activation(k_heads)
-            v_heads = self.heads_activation(v_heads)
+            q = self.heads_activation(q)
+            k = self.heads_activation(k)
+            v = self.heads_activation(v)
 
-        N, t, _ = q_heads.shape
-        N, T, _ = k_heads.shape
+        N, t, _ = q.shape
+        N, T, _ = k.shape
 
         # Split the last dimension by the n_kv_heads subspaces
-        q_heads = q_heads.contiguous().view(N, t, self.n_heads, self.d_queries) # (N, query_sequence_pad_length, n_heads, d_queries)
-        k_heads = k_heads.contiguous().view(N, T, self.n_heads, self.d_queries) # (N, key_value_sequence_pad_length, n_heads, d_queries)
-        v_heads = v_heads.contiguous().view(N, T, self.n_heads, self.d_values) # (N, key_value_sequence_pad_length, n_heads, d_values)
+        q = q.contiguous().view(N, t, self.n_heads, self.d_queries) # (N, query_sequence_pad_length, n_heads, d_queries)
+        k = k.contiguous().view(N, T, self.n_heads, self.d_queries) # (N, key_value_sequence_pad_length, n_heads, d_queries)
+        v = v.contiguous().view(N, T, self.n_heads, self.d_values) # (N, key_value_sequence_pad_length, n_heads, d_values)
 
-        q_heads = q_heads.permute(0, 2, 1, 3) # Nhtd
-        k_heads = k_heads.permute(0, 2, 1, 3) # NhTd
-        v_heads = v_heads.permute(0, 2, 1, 3) # NhTv
+        q = q.permute(0, 2, 1, 3) # Nhtd
+        k = k.permute(0, 2, 1, 3) # NhTd
+        v = v.permute(0, 2, 1, 3) # NhTv
 
         if self.rotary_embedding is not None:
-            q_heads = self.rotary_embedding.rotate_queries_or_keys(q_heads, seq_dim=-2)
-            k_heads = self.rotary_embedding.rotate_queries_or_keys(k_heads.unsqueeze(0), seq_dim=-2).squeeze(0) # adds a singleton dimension for the rotation operation and then removes it for the torch compiler
+            q = self.rotary_embedding.rotate_queries_or_keys(q, seq_dim=-2)
+            k = self.rotary_embedding.rotate_queries_or_keys(k.unsqueeze(0), seq_dim=-2).squeeze(0) # adds a singleton dimension for the rotation operation and then removes it for the torch compiler
 
         # if return_attn_values:
-        attention_weights = torch.einsum('...htq,...hTq->...htT', q_heads, k_heads)
+        attention_weights = torch.einsum('...htq,...hTq->...htT', q, k)
 
         if self.alibi_bias is not None:
             attention_weights = attention_weights + self.alibi_bias
@@ -152,17 +155,7 @@ class MultiHeadAttention(nn.Module):
         attention_weights = self.attn_dropout(attention_weights)
 
         # Calculate sequences as the weighted sums of values based on these softmax weights
-        sequences = torch.einsum('...htT,...hTv->...htv', attention_weights, v_heads)
-        # else:
-        #     attention_weights_for_visualization = []
-        #     sequences = F.scaled_dot_product_attention(
-        #         q_heads,
-        #         k_heads,
-        #         v_heads,
-        #         attn_mask=attention_mask,
-        #         dropout_p=self.dropout,
-        #         is_causal=self.self_attn
-        #     )
+        sequences = torch.einsum('...htT,...hTv->...htv', attention_weights, v)
 
         sequences = sequences.permute(0, 2, 1, 3)
 

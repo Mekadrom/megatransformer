@@ -27,8 +27,6 @@ class PositionWiseFCNetwork(nn.Module):
         self.condense = nn.Linear(self.d_inner, self.d_model, bias=self.ffn_bias)
 
     def forward(self, sequences, *args):
-        sequences = self.layer_norm(sequences)
-
         if type(self.expand) == nn.Linear:
             sequences = self.expand(sequences)
             gating_variances = None

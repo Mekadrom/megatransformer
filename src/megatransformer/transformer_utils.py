@@ -84,81 +84,89 @@ def sanitize_model(model):
 
 def init_weights(model: nn.Module,
                  d_model: int,
-                 init_weights_from: str = 'glorot_uniform',
+                 d_head: int,
+                 d_ff: int,
+                 n_layers: int,
+                 init_weights_from: str = 'glorot_normal',
                  init_weights_gain: float = 1.0,
-                 tie_embeddings=False):
+                 tie_embeddings=False,
+                 scale_residual=False):
+    residual_scale = 1.0 / math.sqrt(n_layers) if scale_residual else 1.0
     if isinstance(model, megatransformer.MegaTransformer):
-        init_weights(model.encoder, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(model.decoder, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(model.encoder, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
+        init_weights(model.decoder, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
     elif isinstance(model, megatransformer.Encoder):
         encoder: megatransformer.Encoder = model
-        init_weights(encoder.embed_tokens, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(encoder.embed_tokens, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         for encoder_layer in encoder.encoder_layers:
-            init_weights(encoder_layer, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(encoder_layer, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
     elif isinstance(model, megatransformer.EncoderLayer):
         encoder_layer: megatransformer.EncoderLayer = model
         if encoder_layer.pre_self_attn_norm is not None:
-            init_weights(encoder_layer.pre_self_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(encoder_layer.self_attn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(encoder_layer.pre_self_attn_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
+        init_weights(encoder_layer.self_attn, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         if encoder_layer.post_self_attn_norm is not None:
-            init_weights(encoder_layer.post_self_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(encoder_layer.post_self_attn_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         if encoder_layer.pre_ffn_norm is not None:
-            init_weights(encoder_layer.pre_ffn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(encoder_layer.ffn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(encoder_layer.pre_ffn_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
+        init_weights(encoder_layer.ffn, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         if encoder_layer.post_ffn_norm is not None:
-            init_weights(encoder_layer.post_ffn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(encoder_layer.post_ffn_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
     elif isinstance(model, megatransformer.Decoder):
         decoder: megatransformer.Decoder = model
-        init_weights(decoder.embed_tokens, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(decoder.embed_tokens, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         for decoder_layer in decoder.decoder_layers:
-            init_weights(decoder_layer, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(decoder_layer, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         if tie_embeddings:
             decoder.lm_head.weight = decoder.embed_tokens.weight
         else:
-            init_weights(decoder.lm_head, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(decoder.lm_head, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
     elif isinstance(model, megatransformer.DecoderLayer):
         decoder_layer: megatransformer.DecoderLayer = model
         if decoder_layer.pre_self_attn_norm is not None:
-            init_weights(decoder_layer.pre_self_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(decoder_layer.self_attn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(decoder_layer.pre_self_attn_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
+        init_weights(decoder_layer.self_attn, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         if decoder_layer.post_self_attn_norm is not None:
-            init_weights(decoder_layer.post_self_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(decoder_layer.post_self_attn_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         if decoder_layer.pre_cross_attn_norm is not None:
-            init_weights(decoder_layer.pre_cross_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(decoder_layer.pre_cross_attn_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         if decoder_layer.cross_attn is not None:
-            init_weights(decoder_layer.cross_attn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(decoder_layer.cross_attn, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         if decoder_layer.post_cross_attn_norm is not None:
-            init_weights(decoder_layer.post_cross_attn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(decoder_layer.post_cross_attn_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         if decoder_layer.pre_ffn_norm is not None:
-            init_weights(decoder_layer.pre_ffn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(decoder_layer.ffn, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(decoder_layer.pre_ffn_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
+        init_weights(decoder_layer.ffn, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         if decoder_layer.post_ffn_norm is not None:
-            init_weights(decoder_layer.post_ffn_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+            init_weights(decoder_layer.post_ffn_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
     elif isinstance(model, multihead_attn.MultiHeadAttention) or isinstance(model, grouped_query_attn.GroupedQueryMultiHeadAttention):
         attn: Union[multihead_attn.MultiHeadAttention, grouped_query_attn.GroupedQueryMultiHeadAttention] = model
-        init_weights(attn.q_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(attn.k_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(attn.v_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(attn.qkv_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(attn.o_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        attn_std = 1.#math.sqrt(2.0 / d_model)
+        init_weights(attn.q_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
+        init_weights(attn.k_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
+        init_weights(attn.v_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
+        init_weights(attn.o_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2 * residual_scale, tie_embeddings, scale_residual)
+        init_weights(attn.qkv_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
     elif isinstance(model, infinite_multihead_attn.InfiniteMultiHeadAttention):
         attn: infinite_multihead_attn.InfiniteMultiHeadAttention = model
-        init_weights(attn.q_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(attn.k_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(attn.v_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(attn.qkv_norm, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(attn.o_proj, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(attn.k_memory_compression[0], d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(attn.v_memory_compression[0], d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        init_weights(attn.q_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
+        init_weights(attn.k_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
+        init_weights(attn.v_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
+        init_weights(attn.o_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
+        init_weights(attn.qkv_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
+        
+        init_weights(attn.k_memory_compression[0], d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
+        init_weights(attn.v_memory_compression[0], d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
     elif isinstance(model, positionwise_fcn.PositionWiseFCNetwork) or isinstance(model, phi3_mlp.Phi3MLP):
         fcn: Union[positionwise_fcn.PositionWiseFCNetwork, phi3_mlp.Phi3MLP] = model
-        init_weights(fcn.expand, d_model, init_weights_from, init_weights_gain, tie_embeddings)
-        init_weights(fcn.condense, d_model, init_weights_from, init_weights_gain, tie_embeddings)
+        ff_std = 1.# math.sqrt(2.0 / (d_model + d_ff))
+        init_weights(fcn.expand, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
+        init_weights(fcn.condense, d_model, d_head, d_ff, n_layers, "normal", 0.2 * residual_scale, tie_embeddings, scale_residual)
     elif isinstance(model, millions_moe.MillionsMoE):
         raise NotImplementedError("Weight initialization for MillionsMoE not implemented.")
     elif isinstance(model, nn.Embedding):
         embedding: nn.Embedding = model
-        nn.init.normal_(embedding.weight, mean=0., std=d_model ** -0.5)
+        nn.init.normal_(embedding.weight, mean=0., std=init_weights_gain * 1./math.sqrt(d_model))
     elif isinstance(model, nn.Linear):
         linear: nn.Linear = model
         if init_weights_from == 'glorot_uniform':
@@ -171,6 +179,8 @@ def init_weights(model: nn.Module,
             nn.init.kaiming_normal_(linear.weight)
         elif init_weights_from == 'orthogonal':
             nn.init.orthogonal_(linear.weight)
+        elif init_weights_from == 'normal':
+            nn.init.normal_(linear.weight, mean=0., std=init_weights_gain)
         else:
             raise Exception(f"Unknown weight initialization method: {init_weights_from}")
         

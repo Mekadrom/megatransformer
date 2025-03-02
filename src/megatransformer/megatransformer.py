@@ -1,8 +1,9 @@
 from torch import nn
 from torch.amp import autocast
-from typing import Optional, Union, Callable
+from transformers import TextStreamer
+from typing import Optional, Union
 
-from . import config, embedding_mlp, infinite_multihead_attn, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, mult, transformer_utils, criteria, grouped_query_attn, huginn_criteria
+from . import embedding_mlp, infinite_multihead_attn, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, mult, transformer_utils, criteria, grouped_query_attn, huginn_criteria
 
 import admin_torch
 import math
@@ -180,14 +181,14 @@ class Encoder(nn.Module):
                 elif i <= m_independent_layers * (math.ceil(n_layers / m_independent_layers) - 1):
                     res_idx = ((i - 1) % m_independent_layers) + 1
                     new_layer = new_encoder_layer()
-                    new_layer.ffn = layers[res_idx].fcn
-                    new_layer.ffn_residual = layers[res_idx].fcn_residual
+                    new_layer.ffn = layers[res_idx].ffn
+                    new_layer.ffn_residual = layers[res_idx].ffn_residual
                     layers.append(new_layer)
                 else:
                     res_idx = m_independent_layers - ((i - 1) % m_independent_layers)
                     new_layer = new_encoder_layer()
-                    new_layer.ffn = layers[res_idx].fcn
-                    new_layer.ffn_residual = layers[res_idx].fcn_residual
+                    new_layer.ffn = layers[res_idx].ffn
+                    new_layer.ffn_residual = layers[res_idx].ffn_residual
                     layers.append(new_layer)
             elif param_sharing_type == 'heads-cycle-rev':
                 if i <= m_independent_layers:
@@ -383,6 +384,7 @@ class Decoder(nn.Module):
         self.positional_encoding_type = model_config.positional_encoding_type
         self.positional_encoding_dim = model_config.positional_encoding_dim
         self.learnable_positional_encoding = model_config.learnable_positional_encoding
+        self.norm = model_config.norm
 
         self.vocab_size = self.decoder_config.vocab_size
         self.n_layers = self.decoder_config.n_layers
@@ -404,6 +406,10 @@ class Decoder(nn.Module):
         self.decoder_dropout = nn.Dropout(self.dropout)
         self.init_decoder_layers()
 
+        self.post_block_norm = None
+        if self.decoder_config.post_block_norm:
+            self.post_block_norm = self.norm(self.d_model, self.model_config.norm_eps)
+
         self.lm_head: nn.Module
         if self.embedding_compression_dim != 0:
             self.lm_head = nn.Sequential(
@@ -417,8 +423,10 @@ class Decoder(nn.Module):
         if self.positional_encoding_type == 'sinusoidal':
             self.tensor_positional_encoding = nn.Parameter(transformer_utils.get_tensor_positional_encoding(self.device, self.d_model, self.positional_encoding_dim, self.learnable_positional_encoding, self.maxlen))
 
-        self.main_criteria = criteria.LMLoss(ignore_token_id=self.ignore_token_id, eps=model_config.label_smoothing)
+        self.main_criteria = criteria.LMLoss(eps=model_config.label_smoothing)
         self.moe_criteria = criteria.DecoderOnlyMoELoss(self.decoder_config.moe_diversity_loss_coefficient)
+
+        self.apply(self._init_weights)
 
     def init_decoder_layers(self):
         self.decoder_layers = self.make_decoder_layers(self.n_layers, self.param_sharing_type, self.m_independent_layers)
@@ -457,14 +465,14 @@ class Decoder(nn.Module):
                 elif i <= m_independent_layers * (math.ceil(n_layers / m_independent_layers) - 1):
                     res_idx = ((i - 1) % m_independent_layers) + 1
                     new_layer = new_decoder_layer()
-                    new_layer.ffn = layers[res_idx].fcn
-                    new_layer.ffn_residual = layers[res_idx].fcn_residual
+                    new_layer.ffn = layers[res_idx].ffn
+                    new_layer.ffn_residual = layers[res_idx].ffn_residual
                     layers.append(new_layer)
                 else:
                     res_idx = m_independent_layers - ((i - 1) % m_independent_layers)
                     new_layer = new_decoder_layer()
-                    new_layer.ffn = layers[res_idx].fcn
-                    new_layer.ffn_residual = layers[res_idx].fcn_residual
+                    new_layer.ffn = layers[res_idx].ffn
+                    new_layer.ffn_residual = layers[res_idx].ffn_residual
                     layers.append(new_layer)
             elif param_sharing_type == 'heads-cycle-rev':
                 if i <= m_independent_layers:
@@ -494,11 +502,11 @@ class Decoder(nn.Module):
     def apply_embedding_transformation(self, decoder_sequences: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(decoder_sequences) * math.sqrt(self.d_model) * self.embed_scale
     
-    def apply_positional_embedding(self, labels: torch.Tensor) -> torch.Tensor:
+    def apply_positional_embedding(self, decoder_sequences: torch.Tensor) -> torch.Tensor:
         # 1D buffer/sinusoidal encoding is applied here. 2D buffer/sinusoidal encoding and rotary encoding are applied in the MultiHeadAttention layer(s)
         if hasattr(self, 'tensor_positional_encoding'):
-            return labels + self.tensor_positional_encoding[:, :labels.size(1), :]
-        return labels
+            return decoder_sequences + self.tensor_positional_encoding[:, :decoder_sequences.size(1), :]
+        return decoder_sequences
     
     def apply_decoder_layer(self,
                             decoder_sequences: torch.Tensor,
@@ -555,6 +563,9 @@ class Decoder(nn.Module):
         decoder_sequences = self.decoder_dropout(decoder_sequences)
         block_results = self.decoder_block_forward(decoder_sequences, encoder_sequences, decoder_attention_mask, kv_caches)
 
+        if self.post_block_norm is not None:
+            decoder_sequences = self.post_block_norm(decoder_sequences)
+
         decoder_sequences, gating_variances = block_results[0], block_results[1]
 
         logits = self.lm_head(decoder_sequences)
@@ -570,7 +581,7 @@ class Decoder(nn.Module):
         if return_dict:
             return MegaTransformerOutput(
                 logits=logits,
-                loss=main_loss + moe_loss,
+                loss=main_loss + moe_loss if main_loss is not None and moe_loss is not None else main_loss if main_loss is not None else moe_loss if moe_loss is not None else None,
                 prediction_loss=main_loss,
                 moe_loss=moe_loss,
                 decoder_gating_variances=gating_variances_tensor,
@@ -578,9 +589,11 @@ class Decoder(nn.Module):
             )
         return logits, gating_variances
     
-    def generate(self, input_ids, max_length, **kwargs):
-        top_k = kwargs.get('top_k', None)
-        top_p = kwargs.get('top_p', None)
+    def can_generate(self):
+        return True
+    
+    def generate(self, input_ids, max_length, top_k=None, top_p=None, temperature=1.0, streamer: TextStreamer=None, eos_token_id=None, do_sample: bool=False, **kwargs):
+        self.eval()
         with torch.no_grad():
             with autocast('cuda' if 'cuda' in self.device else 'cpu'):
                 input_ids = input_ids.to(self.device)
@@ -588,53 +601,55 @@ class Decoder(nn.Module):
 
                 for i in range(max_length - input_ids.shape[1]):
                     logits, _ = self(input_ids=decoded)
-                    next_token_logits = logits[:, -1, :]
-                    
-                    # Convert logits to probabilities
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    
-                    if top_k is not None:
-                        # Get top k values and their indices
-                        top_probs, top_indices = probs.topk(top_k, dim=-1)
-                        
-                        # Sample from the top k distribution
-                        sampled_idx = torch.multinomial(top_probs, 1)
-                        
-                        # Map back to vocabulary space
-                        next_token = torch.gather(top_indices, -1, sampled_idx)
-                    elif top_p is not None:
-                        # Nucleus sampling (top-p)
-                        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                        
-                        # Remove tokens with cumulative probability above the threshold
-                        sorted_indices_to_remove = cumulative_probs > top_p
-                        # Shift the indices to the right to keep the first token above threshold
-                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        sorted_indices_to_remove[..., 0] = 0
-                        
-                        # Create a mask for indices to keep
-                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                        filtered_probs = probs.clone()
-                        filtered_probs[indices_to_remove] = 0
-                        
-                        # Renormalize probabilities
-                        filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
-                        
-                        # Sample from the filtered distribution
-                        next_token = torch.multinomial(filtered_probs, 1)
+
+                    if do_sample:
+                        logits = logits[:, -1] / temperature
+                        if top_k is not None:
+                            indices_to_remove = logits < torch.topk(logits, k=top_k)[0][..., -1, None]
+                            logits[indices_to_remove] = float('-inf')
+
+                        if top_p is not None:
+                            # Nucleus sampling (top-p)
+                            sorted_probs, sorted_indices = torch.sort(logits, descending=True)
+                            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                            
+                            # Remove tokens with cumulative probability above the threshold
+                            sorted_indices_to_remove = cumulative_probs > top_p
+                            # Shift the indices to the right to keep the first token above threshold
+                            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                            sorted_indices_to_remove[..., 0] = 0
+                            
+                            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool).scatter_(
+                                dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+                            )
+
+                            logits[indices_to_remove] = float('-inf')
+
+                        probs = F.softmax(logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
                     else:
-                        # Greedy decoding
-                        next_token = torch.argmax(probs, dim=-1, keepdim=True)
-                    
-                    # Concatenate with previous tokens
+                        next_token = torch.argmax(logits[:, -1], dim=-1, keepdim=True)
+
+                    if streamer is not None:
+                        streamer.put(next_token)
+
                     decoded = torch.cat([decoded, next_token], dim=1)
                     
-                    # Check if we should stop generation
-                    if next_token.item() == self.ignore_token_id or next_token.item() == kwargs.get('eos_token_id', None):
+                    if next_token.item() == self.ignore_token_id or (eos_token_id is not None and next_token.item() == eos_token_id):
                         break
                         
                 return decoded
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
 class HuginnDecoder(Decoder):
     def __init__(self, device, model_config):
@@ -794,7 +809,7 @@ class MegaTransformer(nn.Module):
         self.encoder: Encoder = Encoder(self.encoder_config.device, model_config)
         self.decoder: Decoder = Decoder(self.decoder_config.device, model_config)
 
-        self.main_criteria = criteria.LMLoss(ignore_token_id=self.ignore_token_id, eps=model_config.label_smoothing)
+        self.main_criteria = criteria.LMLoss(eps=model_config.label_smoothing)
         self.moe_criteria = criteria.TransformerMoELoss(model_config.moe_diversity_loss_coefficient)
 
     def forward(
@@ -810,9 +825,9 @@ class MegaTransformer(nn.Module):
         """
         if self.ignore_token_id is not None:
             if attention_mask is None and input_ids is not None:
-                attention_mask = input_ids == self.ignore_token_id
+                attention_mask = input_ids != self.ignore_token_id
             if decoder_attention_mask is None and labels is not None:
-                decoder_attention_mask = labels == self.ignore_token_id
+                decoder_attention_mask = labels != self.ignore_token_id
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.encoder_config.device)

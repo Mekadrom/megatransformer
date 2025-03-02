@@ -42,24 +42,18 @@ class LabelSmoothedCE(nn.Module):
 
 # doesn't handle packing/padding sequences
 class LMLoss(nn.Module):
-    def __init__(self, ignore_token_id=-100, eps=0.0):
+    def __init__(self, eps=0.0):
         super(LMLoss, self).__init__()
-        self.ignore_token_id = ignore_token_id
         self.label_smoothing = eps
 
     def forward(self, logits: torch.Tensor, labels: torch.Tensor):
-        logits = logits.view(-1, logits.size(-1))
-        labels = labels.view(-1)
-
-        loss = F.cross_entropy(
-            logits, 
-            labels,
-            ignore_index=self.ignore_token_id,
-            reduction='mean',
-            label_smoothing=self.label_smoothing
-        )
-        
-        return loss
+        # Shift for next token prediction
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten and compute loss
+        shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+        shift_labels = shift_labels.view(-1)
+        return F.cross_entropy(shift_logits, shift_labels, label_smoothing=self.label_smoothing, ignore_index=-100)
 
 class DecoderOnlyMoELoss(nn.Module):
     def __init__(self, diversity_loss_coefficient=0.0):
