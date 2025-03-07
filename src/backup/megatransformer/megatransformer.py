@@ -3,7 +3,9 @@ from torch.amp import autocast
 from transformers import TextStreamer
 from typing import Optional, Union
 
-from . import embedding_mlp, infinite_multihead_attn, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, mult, transformer_utils, criteria, grouped_query_attn, huginn_criteria
+from ...megatransformer.model import huginn_criteria
+
+from . import embedding_mlp, infinite_multihead_attn, millions_moe, phi3_mlp, per_lang_embedding, positionwise_fcn, multihead_attn, sum, mult, transformer_utils, criteria, grouped_query_attn
 
 import admin_torch
 import math
@@ -751,9 +753,9 @@ class HuginnDecoder(Decoder):
             for thinking_layer in self.thinking_block:
                 x, gating_variance = self.apply_decoder_layer(x, encoder_sequences, decoder_attention_mask, thinking_layer, encoder_attention_mask, kv_cache)
                 gating_variances_this_step.append(gating_variance)
-                if not self.training and self.exit_criteria.should_exit(last_thought_state, x):
-                    break
                 last_thought_state = x
+            if not self.training and self.exit_criteria.should_exit(last_thought_state, x):
+                break
             gating_variances.extend(gating_variances_this_step)
 
         return x, gating_variances

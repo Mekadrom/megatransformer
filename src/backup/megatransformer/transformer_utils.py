@@ -40,6 +40,12 @@ def get_activation_function(activation_function_name):
         return nn.LeakyReLU
     elif activation_function_name == 'silu':
         return nn.SiLU
+    elif activation_function_name == 'tanh':
+        return nn.Tanh
+    elif activation_function_name == 'sigmoid':
+        return nn.Sigmoid
+    elif activation_function_name == 'swiglu':
+        return swiglu.SwiGLU
     elif activation_function_name == 'none':
         return nn.Identity
     else:
@@ -142,17 +148,17 @@ def init_weights(model: nn.Module,
     elif isinstance(model, multihead_attn.MultiHeadAttention) or isinstance(model, grouped_query_attn.GroupedQueryMultiHeadAttention):
         attn: Union[multihead_attn.MultiHeadAttention, grouped_query_attn.GroupedQueryMultiHeadAttention] = model
         attn_std = 1.#math.sqrt(2.0 / d_model)
-        init_weights(attn.q_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
-        init_weights(attn.k_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
-        init_weights(attn.v_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
-        init_weights(attn.o_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2 * residual_scale, tie_embeddings, scale_residual)
+        init_weights(attn.q_proj, d_model, d_head, d_ff, n_layers, "normal", 0.02, tie_embeddings, scale_residual)
+        init_weights(attn.k_proj, d_model, d_head, d_ff, n_layers, "normal", 0.02, tie_embeddings, scale_residual)
+        init_weights(attn.v_proj, d_model, d_head, d_ff, n_layers, "normal", 0.02, tie_embeddings, scale_residual)
+        init_weights(attn.o_proj, d_model, d_head, d_ff, n_layers, "normal", 0.02 * residual_scale, tie_embeddings, scale_residual)
         init_weights(attn.qkv_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
     elif isinstance(model, infinite_multihead_attn.InfiniteMultiHeadAttention):
         attn: infinite_multihead_attn.InfiniteMultiHeadAttention = model
-        init_weights(attn.q_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
-        init_weights(attn.k_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
-        init_weights(attn.v_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
-        init_weights(attn.o_proj, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
+        init_weights(attn.q_proj, d_model, d_head, d_ff, n_layers, "normal", 0.02, tie_embeddings, scale_residual)
+        init_weights(attn.k_proj, d_model, d_head, d_ff, n_layers, "normal", 0.02, tie_embeddings, scale_residual)
+        init_weights(attn.v_proj, d_model, d_head, d_ff, n_layers, "normal", 0.02, tie_embeddings, scale_residual)
+        init_weights(attn.o_proj, d_model, d_head, d_ff, n_layers, "normal", 0.02, tie_embeddings, scale_residual)
         init_weights(attn.qkv_norm, d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
         
         init_weights(attn.k_memory_compression[0], d_model, d_head, d_ff, n_layers, init_weights_from, init_weights_gain, tie_embeddings, scale_residual)
@@ -160,8 +166,8 @@ def init_weights(model: nn.Module,
     elif isinstance(model, positionwise_fcn.PositionWiseFCNetwork) or isinstance(model, phi3_mlp.Phi3MLP):
         fcn: Union[positionwise_fcn.PositionWiseFCNetwork, phi3_mlp.Phi3MLP] = model
         ff_std = 1.# math.sqrt(2.0 / (d_model + d_ff))
-        init_weights(fcn.expand, d_model, d_head, d_ff, n_layers, "normal", 0.2, tie_embeddings, scale_residual)
-        init_weights(fcn.condense, d_model, d_head, d_ff, n_layers, "normal", 0.2 * residual_scale, tie_embeddings, scale_residual)
+        init_weights(fcn.expand, d_model, d_head, d_ff, n_layers, "normal", 0.02, tie_embeddings, scale_residual)
+        init_weights(fcn.condense, d_model, d_head, d_ff, n_layers, "normal", 0.02 * residual_scale, tie_embeddings, scale_residual)
     elif isinstance(model, millions_moe.MillionsMoE):
         raise NotImplementedError("Weight initialization for MillionsMoE not implemented.")
     elif isinstance(model, nn.Embedding):
