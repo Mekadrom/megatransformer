@@ -147,25 +147,7 @@ def create_huginn_model(tokenizer, max_position_embeddings):
     ))
 
 
-def check_tpu_availability():
-    try:
-        import torch_xla
-        import torch_xla.core.xla_model as xm
-        
-        device = xm.xla_device()
-        print(f"TPU is available! Device: {device}")
-        
-        tpu_cores = xm.xrt_world_size()
-        print(f"Number of TPU cores: {tpu_cores}")
-        print(f"TPU type: {torch_xla._XLAC._get_tpu_type()}")
-        
-        return True
-    except (ImportError, EnvironmentError, RuntimeError) as e:
-        print(f"TPU is not available: {e}")
-        return False
-
-
-is_tpu_available = check_tpu_availability()
+is_tpu_available = megatransformer_utils.check_tpu_availability()
 print(f"TPU available: {is_tpu_available}")
 
 argparser = argparse.ArgumentParser()
@@ -219,6 +201,7 @@ model = model_maker(tokenizer, args.max_position_embeddings)
 print(f"tokenizer: {tokenizer}")
 print(f"model structure: {model}")
 print(f"model parameters: {(sum(p.numel() for p in model.parameters())):,}")
+print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
 
 datasets = load_dataset(args.dataset_name, args.dataset_config_name)
 
@@ -304,7 +287,7 @@ trainer = Trainer(
     data_collator=data_collator,
     train_dataset=tokenized_datasets["train"],
     eval_dataset=tokenized_datasets["validation"],
-    tokenizer=tokenizer,
+    processing_class=tokenizer,
 )
 
 trainer.add_callback(generation_callback)

@@ -198,3 +198,20 @@ def create_norm(config):
         return rmsnorm.RMSNorm(config.hidden_size, eps=config.norm_eps)
     else:
         raise Exception(f"Unknown normalization type {config.norm_type}")
+
+def check_tpu_availability():
+    try:
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        
+        device = xm.xla_device()
+        print(f"TPU is available! Device: {device}")
+        
+        tpu_cores = xm.xrt_world_size()
+        print(f"Number of TPU cores: {tpu_cores}")
+        print(f"TPU type: {torch_xla._XLAC._get_tpu_type()}")
+        
+        return True
+    except (ImportError, EnvironmentError, RuntimeError) as e:
+        print(f"TPU is not available: {e}")
+        return False

@@ -30,11 +30,10 @@ class SelfAttention(nn.Module):
         if bool(config.use_rotary_embedding):
             self.rotary_embedding = RotaryEmbedding(dim=config.rotary_embedding_dim, learned_freq=config.rotary_embedding_learnable)
 
-        self.alibi_bias = None
         if bool(config.use_alibi_bias):
-            alibi_bias = megatransformer_utils.create_alibi_bias(n_heads=config.num_attention_heads, maxlen=config.max_position_embeddings)
-            parameter = nn.Parameter(alibi_bias)
-            parameter.requires_grad = False
+            self.register_buffer('alibi_bias', megatransformer_utils.create_alibi_bias(n_heads=config.num_attention_heads, maxlen=config.max_position_embeddings))
+        else:
+            self.register_buffer('alibi_bias', None)
         
         self.output = nn.Linear(config.hidden_size, config.hidden_size)
         
@@ -60,7 +59,7 @@ class SelfAttention(nn.Module):
         past_key_value=None,
         output_attentions=False,
     ) -> SelfAttentionOutput:
-        _, t = hidden_states.shape[:2]
+        N, t = hidden_states.shape[:2]
         
         query_layer = self.query(hidden_states)
         key_layer = self.key(hidden_states)
@@ -85,7 +84,7 @@ class SelfAttention(nn.Module):
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
         if self.alibi_bias is not None:
-            attention_scores = attention_scores + self.alibi_bias
+            attention_scores = attention_scores + self.alibi_bias[:, :t, :t].unsqueeze(0).repeat(N, 1, 1, 1)
 
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
 
