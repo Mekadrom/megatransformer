@@ -2,72 +2,14 @@ from datasets import load_dataset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling
 
-from . import custom_callbacks, custom_trainers, megatransformer_utils
-from .model import megatransformer_causal
+from model import megatransformer_causal
 
 import argparse
+import custom_callbacks
+import custom_trainers
+import megatransformer_utils
 import os
 import re
-import torch
-
-
-def create_gpt2_model(tokenizer, max_position_embeddings):
-    # gpt2-small closest equivalent (~124M params)
-    return megatransformer_causal.MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
-        vocab_size=tokenizer.vocab_size,
-        max_position_embeddings=max_position_embeddings,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    ))
-
-def create_modern_model(tokenizer, max_position_embeddings):
-    # uses more modern approaches to causal language modeling (~148M params)
-    return megatransformer_causal.MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
-        vocab_size=tokenizer.vocab_size,
-        max_position_embeddings=max_position_embeddings,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_activation="swiglu",
-        norm_type="rmsnorm",
-        ffn_type="mlp",
-        use_positional_embedding=False,
-        use_sinusoidal_embedding=False,
-        use_rotary_embedding=False,
-        use_alibi_bias=True,
-        use_qkv_bias=False,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    ))
-
-def create_huginn_model(tokenizer, max_position_embeddings):
-    # uses a recurrent approach to emulate a deeper model
-    return megatransformer_causal.MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
-        vocab_size=tokenizer.vocab_size,
-        max_position_embeddings=max_position_embeddings,
-        hidden_size=768,
-        num_hidden_layers=None,
-        num_prelude_layers=2,
-        num_recurrent_layers=4,
-        num_coda_layers=2,
-        num_attention_heads=12,
-        intermediate_activation="swiglu",
-        norm_type="rmsnorm",
-        ffn_type="gated",
-        use_positional_embedding=False,
-        use_sinusoidal_embedding=False,
-        use_rotary_embedding=False,
-        use_alibi_bias=True,
-        use_qkv_bias=False,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    ))
 
 
 is_tpu_available = megatransformer_utils.check_tpu_availability()
@@ -119,7 +61,9 @@ argparser.add_argument('--lora_rank', type=int, default=16, help='Rank for LoRA 
 argparser.add_argument('--lora_alpha', type=int, default=32, help='Alpha for LoRA adaptation')
 argparser.add_argument('--lora_dropout', type=float, default=0.05, help='Dropout for LoRA adaptation')
 
-args = argparser.parse_args()
+args, unk = argparser.parse_known_args()
+
+print(f"unknown args: {unk}")
 
 run_dir = os.path.join("runs", "causal", args.dataset_name, args.run_name)
 
@@ -136,11 +80,11 @@ tokenizer.bos_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 
 if args.config == "gpt2":
-    model_maker = create_gpt2_model
+    model_maker = megatransformer_causal.create_gpt2_model
 elif args.config == "huginn":
-    model_maker = create_huginn_model
+    model_maker = megatransformer_causal.create_huginn_model
 else:
-    model_maker = create_modern_model
+    model_maker = megatransformer_causal.create_modern_model
 
 model = model_maker(tokenizer, args.max_position_embeddings)
 
@@ -181,7 +125,7 @@ def clean_dataset(examples):
     return {"text": cleaned_texts}
 
 def tokenize_function(examples):
-    return tokenizer(examples['text'], truncation=True, max_length=args.max_position_embeddings, padding_side="right")
+    return tokenizer(examples['text'], truncation=True, max_length=args.max_position_embeddings)
 
 datasets = datasets.map(clean_dataset, batched=True)
 tokenized_datasets = datasets.map(tokenize_function, batched=True, remove_columns=["text"])
@@ -255,4 +199,3 @@ trainer.add_callback(custom_callbacks.GenerationCallback(
 trainer.add_callback(custom_callbacks.PerplexityCallback(writer))
 
 trainer.train()
-eval_results = trainer.evaluate()

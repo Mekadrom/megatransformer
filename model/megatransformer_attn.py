@@ -1,27 +1,25 @@
 from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
 
-from .. import megatransformer_utils
-
 import math
+import megatransformer_utils
 import torch
 import torch.nn.functional as F
 
 
 class SelfAttentionOutput:
-    def __init__(self, hidden_states, key_value=None, attention_probs=None):
+    def __init__(self, hidden_states: torch.Tensor, attention_probs: torch.Tensor=None):
         self.hidden_states = hidden_states
-        self.key_value = key_value
         self.attention_probs = attention_probs
 
-class SelfAttention(nn.Module):
+class MegaTransformerSelfAttention(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.attention_head_size = config.hidden_size // config.num_attention_heads
         self.use_grok_scaled_attn = config.use_grok_scaled_attn
-        
+
         self.query = nn.Linear(config.hidden_size, config.hidden_size, bias=config.use_qkv_bias)
         self.key = nn.Linear(config.hidden_size, config.hidden_size, bias=config.use_qkv_bias)
         self.value = nn.Linear(config.hidden_size, config.hidden_size, bias=config.use_qkv_bias)
@@ -53,11 +51,10 @@ class SelfAttention(nn.Module):
     
     def forward(
         self,
-        hidden_states,
-        attention_mask=None,
-        head_mask=None,
-        past_key_value=None,
-        output_attentions=False,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor=None,
+        head_mask: torch.Tensor=None,
+        output_attentions: bool=False,
     ) -> SelfAttentionOutput:
         N, t = hidden_states.shape[:2]
         
@@ -66,20 +63,12 @@ class SelfAttention(nn.Module):
         value_layer = self.value(hidden_states)
 
         if self.rotary_embedding is not None:
-            query_layer, key_layer = self.rotary_embedding.rotate_queries_and_keys(query_layer, key_layer)
+            query_layer = self.rotary_embedding.rotate_queries_or_keys(query_layer)
+            key_layer = self.rotary_embedding.rotate_queries_or_keys(key_layer)
         
         query_layer = self.transpose_for_scores(query_layer)
         key_layer = self.transpose_for_scores(key_layer)
         value_layer = self.transpose_for_scores(value_layer)
-        
-        # Use saved key/value if provided for incremental decoding
-        if past_key_value is not None:
-            past_key, past_value = past_key_value
-            key_layer = torch.cat([past_key, key_layer], dim=2)
-            value_layer = torch.cat([past_value, value_layer], dim=2)
-        
-        # Get current key and value for caching
-        current_key_value = (key_layer, value_layer) if past_key_value is not None else None
         
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
@@ -117,6 +106,5 @@ class SelfAttention(nn.Module):
         
         return SelfAttentionOutput(
             hidden_states=output,
-            key_value=current_key_value,
             attention_probs=attention_probs if output_attentions else None,
         )

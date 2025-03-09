@@ -1,8 +1,8 @@
 from torch import nn
 
-from . import swiglu
-from .. import megatransformer_utils
+from model import swiglu
 
+import megatransformer_utils
 
 class SimpleFFN(nn.Module):
     def __init__(self, config):

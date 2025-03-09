@@ -49,6 +49,7 @@ coverage.xml
 .pytest_cache/
 cover/
 runs/
+runs.bak/
 
 # Translations
 *.mo

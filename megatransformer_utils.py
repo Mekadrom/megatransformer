@@ -2,7 +2,7 @@ from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
 from transformers import PretrainedConfig
 from transformers import set_seed as hf_set_seed
 
-from .model import rmsnorm, swiglu
+from model import rmsnorm, swiglu
 
 import math
 import numpy as np

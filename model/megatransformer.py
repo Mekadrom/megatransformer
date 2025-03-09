@@ -1,10 +1,10 @@
 from torch import nn
 from typing import Optional, Union
 
-from . import huginn_criteria, megatransformer_attn, megatransformer_ffn, mult, sum
-from .. import megatransformer_utils
+from model import huginn_criteria, megatransformer_attn, megatransformer_ffn, mult, sum
 
 import math
+import megatransformer_utils
 import torch
 
 
@@ -17,7 +17,7 @@ class BlockOutput:
 class MegaTransformerBlock(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__()
-        self.attention = megatransformer_attn.SelfAttention(config)
+        self.attention = megatransformer_attn.MegaTransformerSelfAttention(config)
         
         self.ffn: nn.Module
         if config.ffn_type == "mlp":
@@ -49,7 +49,6 @@ class MegaTransformerBlock(nn.Module):
         hidden_states,
         attention_mask=None,
         head_mask=None,
-        past_key_value=None,
         output_attentions=False,
         output_hidden_states=False
     ):
@@ -62,12 +61,10 @@ class MegaTransformerBlock(nn.Module):
             pre_attn_input,
             attention_mask=attention_mask,
             head_mask=head_mask,
-            past_key_value=past_key_value,
             output_attentions=output_attentions,
         )
 
         attn_output = attn_outputs.hidden_states
-        next_key_value = attn_outputs.key_value
         attention_probs = attn_outputs.attention_probs
 
         hidden_states = hidden_states + attn_output
@@ -85,7 +82,6 @@ class MegaTransformerBlock(nn.Module):
 
         return BlockOutput(
             hidden_states=hidden_states,
-            key_value=next_key_value,
             attention_probs=attention_probs,
         )
 

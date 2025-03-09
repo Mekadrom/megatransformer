@@ -3,9 +3,9 @@ from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 from typing import Optional, Union
 
-from . import megatransformer
-from .. import megatransformer_utils
+from model import megatransformer
 
+import megatransformer_utils
 import torch
 
 
@@ -64,14 +64,11 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        past_key_values=None,
-        use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
         
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds")
@@ -80,9 +77,6 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
             batch_size, seq_length = input_ids.shape
         else:
             batch_size, seq_length = inputs_embeds.shape[:2]
-        
-        if past_key_values is None:
-            past_key_values = tuple([None] * self.config.num_hidden_layers)
         
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
@@ -111,9 +105,8 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         # Initialize lists to store outputs for each layer
         all_hidden_states: Optional[list] = [] if output_hidden_states else None
         all_attentions: Optional[list] = [] if output_attentions else None
-        next_cache: Optional[list] = [] if use_cache else None
         
-        for i, (block, past_key_value) in enumerate(zip(self.transformer, past_key_values)):
+        for i, block in enumerate(self.transformer):
             if all_hidden_states is not None:
                 all_hidden_states.append(hidden_states)
             
@@ -121,20 +114,15 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
                 hidden_states,
                 attention_mask=attention_mask,
                 head_mask=head_mask[i],
-                past_key_value=past_key_value if use_cache else None,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states
             )
 
             hidden_states = outputs.hidden_states
-            next_key_value = outputs.key_value
             attention_probs = outputs.attention_probs
 
             if hasattr(outputs, "all_hidden_states") and all_hidden_states is not None:
                 all_hidden_states.extend(outputs.all_hidden_states)
-            
-            if next_cache is not None:
-                next_cache.append(next_key_value)
             
             if all_attentions:
                 all_attentions.append(attention_probs)
@@ -145,11 +133,10 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
             all_hidden_states.append(hidden_states)
         
         if not return_dict:
-            return hidden_states, next_cache, all_hidden_states, all_attentions
+            return hidden_states, all_hidden_states, all_attentions
         
         return CausalLMOutputWithCrossAttentions(
             logits=hidden_states,
-            past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
         )
@@ -166,8 +153,6 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         
         return {
             "input_ids": input_ids,
-            "past_key_values": past,
-            "use_cache": kwargs.get("use_cache", True),
             "attention_mask": attention_mask,
             "position_ids": position_ids,
         }
@@ -218,8 +203,6 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
-        past_key_values=None,
-        use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -233,8 +216,6 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -259,10 +240,68 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
-            past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
     
     def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
         return self.transformer.prepare_inputs_for_generation(input_ids, past=past, **kwargs)
+
+
+def create_gpt2_model(tokenizer, max_position_embeddings):
+    # gpt2-small closest equivalent (~124M params)
+    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        max_position_embeddings=max_position_embeddings,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    ))
+
+def create_modern_model(tokenizer, max_position_embeddings):
+    # uses more modern approaches to causal language modeling (~148M params)
+    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        max_position_embeddings=max_position_embeddings,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_activation="swiglu",
+        norm_type="rmsnorm",
+        ffn_type="mlp",
+        use_positional_embedding=False,
+        use_sinusoidal_embedding=False,
+        use_rotary_embedding=True,
+        use_alibi_bias=False,
+        use_qkv_bias=False,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    ))
+
+def create_huginn_model(tokenizer, max_position_embeddings):
+    # uses a recurrent approach to emulate a deeper model
+    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        max_position_embeddings=max_position_embeddings,
+        hidden_size=768,
+        num_hidden_layers=None,
+        num_prelude_layers=2,
+        num_recurrent_layers=4,
+        num_coda_layers=2,
+        num_attention_heads=12,
+        intermediate_activation="swiglu",
+        norm_type="rmsnorm",
+        ffn_type="mlp",
+        use_positional_embedding=False,
+        use_sinusoidal_embedding=False,
+        use_rotary_embedding=False,
+        use_alibi_bias=True,
+        use_qkv_bias=False,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    ))
