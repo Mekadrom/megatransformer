@@ -60,6 +60,8 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         self,
         input_ids=None,
         attention_mask=None,
+        past_key_values: list[megatransformer_utils.KVCache]=None,
+        use_cache=False,
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
@@ -106,7 +108,7 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         all_hidden_states: Optional[list] = [] if output_hidden_states else None
         all_attentions: Optional[list] = [] if output_attentions else None
         
-        for i, block in enumerate(self.transformer):
+        for i, (block, past_key_value) in enumerate(zip(self.transformer, past_key_values)):
             if all_hidden_states is not None:
                 all_hidden_states.append(hidden_states)
             
@@ -114,6 +116,8 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
                 hidden_states,
                 attention_mask=attention_mask,
                 head_mask=head_mask[i],
+                past_key_values=past_key_value,
+                use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states
             )
@@ -133,26 +137,29 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
             all_hidden_states.append(hidden_states)
         
         if not return_dict:
-            return hidden_states, all_hidden_states, all_attentions
+            return hidden_states, past_key_values, all_hidden_states, all_attentions
         
         return CausalLMOutputWithCrossAttentions(
             logits=hidden_states,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
         )
     
-    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
-        if past:
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask: torch.Tensor=None, **kwargs):
+        if past_key_values is not None and past_key_values[0] is not None:
             input_ids = input_ids[:, -1:]
-        
-        attention_mask = kwargs.get("attention_mask", None)
+
+        use_cache = kwargs.get("use_cache", True)
         position_ids = kwargs.get("position_ids", None)
         
-        if past is not None:
+        if position_ids is not None:
             position_ids = position_ids[:, -1:] if position_ids is not None else None
-        
+
         return {
             "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
         }
@@ -201,6 +208,8 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
+        past_key_values: list[megatransformer_utils.KVCache]=None,
+        use_cache=False,
         inputs_embeds=None,
         labels=None,
         output_attentions=None,
@@ -208,6 +217,12 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
         return_dict=None,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        past_key_values = past_key_values if past_key_values is not None else [None] * self.config.num_hidden_layers
+        if use_cache:
+            for i in range(len(past_key_values)):
+                if past_key_values[i] is None:
+                    past_key_values[i] = megatransformer_utils.KVCache()
         
         transformer_outputs = self.transformer(
             input_ids=input_ids,
@@ -215,6 +230,8 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -240,12 +257,13 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
+            past_key_values=past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
     
-    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
-        return self.transformer.prepare_inputs_for_generation(input_ids, past=past, **kwargs)
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        return self.transformer.prepare_inputs_for_generation(input_ids, **kwargs)
 
 
 def create_gpt2_model(tokenizer, max_position_embeddings):

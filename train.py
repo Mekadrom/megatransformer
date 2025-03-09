@@ -185,17 +185,18 @@ trainer = trainer_maker(
     processing_class=tokenizer,
 )
 
-trainer.add_callback(custom_callbacks.GenerationCallback(
-    writer,
-    tokenizer=tokenizer,
-    prompts=[
-        "In this paper, we propose a novel approach to",
-        "The Higgs boson, sometimes called the Higgs particle, is",
-        "The capital of France is",
-        "2 + 2 ="
-    ],
-    generation_steps=1000,
-))
+if not args.use_xla and not args.use_deepspeed:
+    trainer.add_callback(custom_callbacks.GenerationCallback(
+        writer,
+        tokenizer=tokenizer,
+        prompts=[
+            "In this paper, we propose a novel approach to",
+            "The Higgs boson, sometimes called the Higgs particle, is",
+            "The capital of France is",
+            "2 + 2 ="
+        ],
+        generation_steps=1000,
+    ))
 trainer.add_callback(custom_callbacks.PerplexityCallback(writer))
 
 trainer.train()

@@ -12,29 +12,28 @@ class GenerationCallback(TrainerCallback):
         self.generation_steps = generation_steps
         
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        if (state.global_step % self.generation_steps == 0) and state.is_world_process_zero:
-            device = next(model.parameters()).device
+        if ((state.global_step == 1) or (state.global_step % self.generation_steps == 0)) and state.is_world_process_zero:
+            inputs = self.tokenizer(self.prompts, padding=True, return_tensors="pt").to(model.device)
+
+            print(f"Generating text at step {state.global_step}...")
             
-            inputs = self.tokenizer(self.prompts, padding=True, return_tensors="pt").to(device)
-            
-            model.eval()
             with torch.no_grad():
+                # Temporarily gather full model weights
                 outputs = model.generate(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
+                    use_cache=True,
                     max_length=100,
                     num_return_sequences=1,
                     do_sample=True,
                     top_p=0.92,
                     temperature=0.7,
                 )
-            
+        
             generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
             
             for i, text in enumerate(generated_texts):
                 self.writer.add_text(f"generation/sample_{i}", text, state.global_step)
-            
-            model.train()
 
 
 class PerplexityCallback(TrainerCallback):

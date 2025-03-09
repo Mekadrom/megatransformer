@@ -8,9 +8,10 @@ import torch.nn.functional as F
 
 
 class SelfAttentionOutput:
-    def __init__(self, hidden_states: torch.Tensor, attention_probs: torch.Tensor=None):
-        self.hidden_states = hidden_states
-        self.attention_probs = attention_probs
+    def __init__(self, hidden_states: torch.Tensor, past_key_values: megatransformer_utils.KVCache, attention_probs: torch.Tensor=None):
+        self.hidden_states: torch.Tensor = hidden_states
+        self.past_key_values: megatransformer_utils.KVCache = past_key_values
+        self.attention_probs: torch.Tensor = attention_probs
 
 class MegaTransformerSelfAttention(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
@@ -54,10 +55,12 @@ class MegaTransformerSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor=None,
         head_mask: torch.Tensor=None,
+        past_key_values: megatransformer_utils.KVCache=None,
+        use_cache=False,
         output_attentions: bool=False,
     ) -> SelfAttentionOutput:
-        N, t = hidden_states.shape[:2]
-        
+        N, _ = hidden_states.shape[:2]
+
         query_layer = self.query(hidden_states)
         key_layer = self.key(hidden_states)
         value_layer = self.value(hidden_states)
@@ -69,8 +72,26 @@ class MegaTransformerSelfAttention(nn.Module):
         query_layer = self.transpose_for_scores(query_layer)
         key_layer = self.transpose_for_scores(key_layer)
         value_layer = self.transpose_for_scores(value_layer)
-        
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+
+        # cache keys and values in the shape (B, N, S, H/N) where N is the number of heads
+        if past_key_values is not None:
+            past_key, past_value = past_key_values.key, past_key_values.value
+            if past_key is not None and past_value is not None:
+                k = torch.cat([past_key, key_layer], dim=-2)
+                v = torch.cat([past_value, value_layer], dim=-2)
+            else:
+                k = key_layer
+                v = value_layer
+        else:
+            k = key_layer
+            v = value_layer
+
+        if use_cache:
+            if past_key_values is None:
+                past_key_values = megatransformer_utils.KVCache()
+            past_key_values.update(key=key_layer, value=value_layer)
+
+        attention_scores = torch.matmul(query_layer, k.transpose(-1, -2))
 
         if self.alibi_bias is not None:
             attention_scores = attention_scores + self.alibi_bias[:, :t, :t].unsqueeze(0).repeat(N, 1, 1, 1)
@@ -80,7 +101,11 @@ class MegaTransformerSelfAttention(nn.Module):
         if bool(self.use_grok_scaled_attn):
             attention_scores = 30.0 * torch.tanh(attention_scores / 30.0)
         
-        attention_scores = attention_scores.masked_fill(self.causal_mask[:, :, :t, :t] == 0, float("-inf"))
+        _, _, t = query_layer.shape[:3]
+        _, _, T = key_layer.shape[:3]
+
+        causal_mask_slice = self.causal_mask[:, :, :t, :T]
+        attention_scores = attention_scores.masked_fill(causal_mask_slice == 0, float("-inf"))
         
         if attention_mask is not None:
             # HuggingFace uses 1 for tokens to attend to and 0 for masked tokens
@@ -94,7 +119,7 @@ class MegaTransformerSelfAttention(nn.Module):
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
         
-        context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer = torch.matmul(attention_probs, v)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         
         new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size,)
@@ -106,5 +131,6 @@ class MegaTransformerSelfAttention(nn.Module):
         
         return SelfAttentionOutput(
             hidden_states=output,
+            past_key_values=past_key_values,
             attention_probs=attention_probs if output_attentions else None,
         )

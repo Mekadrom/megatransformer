@@ -9,9 +9,9 @@ import torch
 
 
 class BlockOutput:
-    def __init__(self, hidden_states, key_value=None, attention_probs=None):
+    def __init__(self, hidden_states, kv_cache: megatransformer_utils.KVCache=None, attention_probs=None):
         self.hidden_states = hidden_states
-        self.key_value = key_value
+        self.kv_cache = kv_cache
         self.attention_probs = attention_probs
 
 class MegaTransformerBlock(nn.Module):
@@ -49,6 +49,8 @@ class MegaTransformerBlock(nn.Module):
         hidden_states,
         attention_mask=None,
         head_mask=None,
+        past_key_values: megatransformer_utils.KVCache=None,
+        use_cache=False,
         output_attentions=False,
         output_hidden_states=False
     ):
@@ -57,10 +59,16 @@ class MegaTransformerBlock(nn.Module):
         else:
             pre_attn_input = hidden_states
 
+        if use_cache:
+            if past_key_values is None:
+                past_key_values = megatransformer_utils.KVCache()
+
         attn_outputs = self.attention(
             pre_attn_input,
             attention_mask=attention_mask,
             head_mask=head_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
             output_attentions=output_attentions,
         )
 
@@ -82,6 +90,7 @@ class MegaTransformerBlock(nn.Module):
 
         return BlockOutput(
             hidden_states=hidden_states,
+            kv_cache=past_key_values,
             attention_probs=attention_probs,
         )
 
@@ -95,6 +104,7 @@ class RecurrentBlockOutput:
         self.attention_probs = attention_probs
 
 
+# todo: implement kv caching
 class MegaTransformerRecurrentBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -177,8 +187,6 @@ class MegaTransformerRecurrentBlock(nn.Module):
         hidden_states,
         attention_mask=None,
         head_mask=None,
-        past_key_value=None,
-        use_cache=None,
         output_attentions=False,
         output_hidden_states=False
     ):
@@ -191,17 +199,34 @@ class MegaTransformerRecurrentBlock(nn.Module):
         last_thought_state = x
         if n_steps_no_grad > 0:
             with torch.no_grad():
-                outputs = self.apply_thinking_layers(x, last_thought_state, n_steps_no_grad, hidden_states, attention_mask, head_mask, past_key_value, use_cache, output_attentions, output_hidden_states)
+                outputs = self.apply_thinking_layers(
+                    x,
+                    last_thought_state,
+                    n_steps_no_grad,
+                    hidden_states,
+                    attention_mask,
+                    head_mask,
+                    output_attentions,
+                    output_hidden_states
+                )
                 x = outputs.hidden_states
                 last_thought_state = outputs.last_thought_state
 
         if k_steps_grad > 0:
-            outputs = self.apply_thinking_layers(x, last_thought_state, k_steps_grad, hidden_states, attention_mask, head_mask, past_key_value, use_cache, output_attentions, output_hidden_states)
+            outputs = self.apply_thinking_layers(
+                x,
+                last_thought_state,
+                k_steps_grad,
+                hidden_states,
+                attention_mask,
+                head_mask,
+                output_attentions,
+                output_hidden_states
+            )
 
         return RecurrentBlockOutput(
             hidden_states=outputs.hidden_states,
             last_thought_state=outputs.last_thought_state,
-            next_cache=outputs.next_cache,
             all_hidden_states=outputs.all_hidden_states,
             attention_probs=outputs.attention_probs,
         )
@@ -213,8 +238,6 @@ class MegaTransformerRecurrentBlock(nn.Module):
                               hidden_states: torch.Tensor,
                               attention_mask: Optional[torch.Tensor],
                               head_mask,
-                              past_key_values=None,
-                              use_cache=False,
                               output_attentions: bool=False,
                               output_hidden_states: bool=False):
         all_hidden_states: Optional[list] = [] if output_hidden_states else None
@@ -226,7 +249,7 @@ class MegaTransformerRecurrentBlock(nn.Module):
             else:
                 x = self.adapter(x, hidden_states)
 
-            for i, (thinking_layer, past_key_value) in enumerate(zip(self.blocks, past_key_values)):
+            for i, thinking_layer in enumerate(self.blocks):
                 if all_hidden_states is not None:
                     all_hidden_states.append(hidden_states)
 
@@ -234,7 +257,6 @@ class MegaTransformerRecurrentBlock(nn.Module):
                     hidden_states,
                     attention_mask=attention_mask,
                     head_mask=head_mask[i],
-                    past_key_value=past_key_value,
                     output_attentions=output_attentions,
                 )
 
@@ -255,7 +277,6 @@ class MegaTransformerRecurrentBlock(nn.Module):
         return RecurrentBlockOutput(
             hidden_states=hidden_states,
             last_thought_state=last_thought_state,
-            next_cache=None,
             all_hidden_states=all_hidden_states,
             attention_probs=all_attentions,
         )

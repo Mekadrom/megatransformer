@@ -4,6 +4,7 @@ from transformers import AutoTokenizer, pipeline
 import argparse
 import os
 import torch
+import time
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument("--run_name", type=str, required=True, help="Name of the run")
@@ -31,7 +32,7 @@ model = model_maker(tokenizer, args.max_position_embeddings)
 model_file_path = os.path.join("runs", "causal", args.dataset_path, args.run_name, "pytorch_model.bin")
 if os.path.exists(model_file_path):
     print(f"Loading model from {model_file_path}")
-    model.load_state_dict(torch.load(model_file_path, map_location=args.device), strict=False)
+    model.load_state_dict(torch.load(model_file_path), strict=False)
 
 if args.compile_model:
     model = torch.compile(model)
@@ -41,7 +42,9 @@ if args.bf16:
     model = model.to(torch.bfloat16)
     print("Model converted to bf16")
 
-print(f"Model loaded with {sum(p.numel() for p in model.parameters())} parameters")
+model = model.to(args.device)
+
+print(f"Model loaded with {sum(p.numel() for p in model.parameters()):,} parameters")
 
 while True:
     user_input = input("Enter a prompt (or 'exit' to quit): ")
@@ -49,7 +52,9 @@ while True:
         break
     inputs = tokenizer(user_input, return_tensors="pt").to(args.device)
     with torch.no_grad():
+        start = time.time()
         outputs = model.generate(
+            use_cache=True,
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             max_length=args.max_position_embeddings,
@@ -58,6 +63,7 @@ while True:
             top_p=0.92,
             temperature=0.7,
         )
+        print(f"Generation time: {time.time() - start:.2f} seconds")
     
     generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
     print(f"Generated text: {generated_texts}")
