@@ -32,24 +32,22 @@ To install MegaTransformer, follow these steps:
 `pip install --index-url https://test.pypi.org/simple/ megatransformer`
 
 ## Usage
-Here's a basic example of how to use MegaTransformer:
-
-```python
-from megatransformer import config, megatransformer
-
-model_config = config.TransformerConfig()
-model_config.load_yaml("model_config.yaml")
-
-model = megatransformer.Transformer(model_config)
-# or for autoregressive causal LM
-model = megatransformer.Decoder(model_config)
-
-# train or load model weights for evaluation/inference like any other torch module
+To train using deepspeed, use the following command:
+```bash
+deepspeed --num_gpus=2 train.py \
+  --use_deepspeed \
+  --deepspeed_config ds_config.json \
+  --zero_stage 3 \
+  --offload_optimizer \
+  --offload_param \
+  --bf16 \
+  --run_name "my_distributed_model" \
+  --batch_size 8 \
+  --gradient_accumulation_steps 4 \
+  --config modern \
+  --dataset_name wikitext \
+  --dataset_config_name wikitext-103-v1
 ```
-
-See the example usage scripts under the `examples` directory for more detailed examples.
-* examples/wmt14ende.py
-    * Example of training a megatransformer model on the WMT14 English-German dataset using mostly huggingface builtin tools
 
 ## Contributing
 please do not touch anything

@@ -1,3 +1,4 @@
+from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
 from transformers import PretrainedConfig
 from transformers import set_seed as hf_set_seed
 
@@ -215,3 +216,33 @@ def check_tpu_availability():
     except (ImportError, EnvironmentError, RuntimeError) as e:
         print(f"TPU is not available: {e}")
         return False
+
+
+def setup_int8_training(args, model):
+    # Method 1: Using PEFT with Bits and Bytes quantization
+    if args.use_int8_peft:
+        print("Setting up INT8 training with PEFT/LoRA")
+        
+        model = prepare_model_for_kbit_training(model, args.use_gradient_checkpointing)
+        
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=["query", "key", "value", "dense"],
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+        
+        return model
+    
+    # Method 2: Using DeepSpeed ZeroQuant (configured in ds_config.json)
+    elif args.use_int8_deepspeed:
+        print("Using DeepSpeed for INT8 quantization during training")
+        return model
+    # No INT8 training
+    else:
+        return model

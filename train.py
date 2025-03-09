@@ -1,169 +1,14 @@
-from collections import deque
 from datasets import load_dataset
-from torch import nn
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoTokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling, TrainerCallback
-from typing import Optional, Literal
+from transformers import AutoTokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling
 
-from . import megatransformer_utils
+from . import custom_callbacks, custom_trainers, megatransformer_utils
 from .model import megatransformer_causal
 
 import argparse
-import math
 import os
 import re
 import torch
-
-
-class GrokFastMATrainer(Trainer):
-    def __init__(self, *args, window_size=100, lamb=5.0, filter_type='mean', warmup=True, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.window_size = window_size
-        self.lamb = lamb
-        self.filter_type = filter_type
-        self.warmup = warmup
-        self.grads = None
-    
-    def training_step(self, model, inputs):
-        loss = super().training_step(model, inputs)
-        # Apply gradfilter_ma after gradients are computed but before optimizer step
-        self.grads = self.gradfilter_ma(model, self.grads, self.window_size, self.lamb, self.filter_type, self.warmup)
-        return loss
-    
-    def gradfilter_ma(
-        self, 
-        m: nn.Module,
-        grads: Optional[dict[str, deque]] = None,
-        window_size: int = 100,
-        lamb: float = 5.0,
-        filter_type: Literal['mean', 'sum'] = 'mean',
-        warmup: bool = True,
-        trigger: bool = False,
-    ) -> dict[str, deque]:
-        if grads is None:
-            grads = {n: deque(maxlen=window_size) for n, p in m.named_parameters() if p.requires_grad and p.grad is not None}
-
-        for n, p in m.named_parameters():
-            if p.requires_grad and p.grad is not None:
-                grads[n].append(p.grad.data.detach())  # .cpu())
-
-                # Modify the gradients
-                if not warmup or len(grads[n]) == window_size and not trigger:
-                    if filter_type == "mean":
-                        avg = sum(grads[n]) / len(grads[n])
-                    elif filter_type == "sum":
-                        avg = sum(grads[n])
-                    else:
-                        raise ValueError(f"Unrecognized filter_type {filter_type}")
-                    p.grad.data = p.grad.data + avg * lamb
-
-        return grads
-
-
-class GrokfastEMATrainer(Trainer):
-    def __init__(self, *args, alpha=0.98, lamb=2.0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.alpha = alpha
-        self.lamb = lamb
-        self.grads = None
-    
-    def training_step(self, model, inputs):
-        loss = super().training_step(model, inputs)
-        # Apply gradfilter_ema after gradients are computed but before optimizer step
-        self.grads = self.gradfilter_ema(model, self.grads, self.alpha, self.lamb)
-        return loss
-    
-    def gradfilter_ema(
-        self, 
-        m: nn.Module,
-        grads: Optional[dict[str, torch.Tensor]] = None,
-        alpha: float = 0.98,
-        lamb: float = 2.0,
-    ) -> dict[str, torch.Tensor]:
-        if grads is None:
-            grads = {n: p.grad.data.detach() for n, p in m.named_parameters() if p.requires_grad and p.grad is not None}
-        
-        for n, p in m.named_parameters():
-            if p.requires_grad and p.grad is not None:
-                grads[n] = grads[n] * alpha + p.grad.data.detach() * (1 - alpha)
-                p.grad.data = p.grad.data + grads[n] * lamb
-        
-        return grads
-
-class DebugTrainer(Trainer):
-    def get_train_dataloader(self):
-        train_dataloader = super().get_train_dataloader()
-        return train_dataloader
-    
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        # Log batch data
-        if self.state.global_step < 5:  # Only for first few steps
-            print(f"Step {self.state.global_step} inputs:")
-            for k, v in inputs.items():
-                if hasattr(v, "shape"):
-                    print(f"  {k}: {v.shape}")
-            
-            # Print tokens
-            if "input_ids" in inputs:
-                tokens = inputs["input_ids"][0].tolist()
-                print(f"  First example tokens: {tokens}...")
-                
-                # Decode if tokenizer is available
-                if hasattr(self, "tokenizer"):
-                    decoded = self.processing_class.decode(tokens)
-                    print(f"  Decoded: {decoded[:100]}...")
-        
-        return super().training_step(model, inputs)
-
-
-class GenerationCallback(TrainerCallback):
-    def __init__(self, writer, tokenizer, prompts, generation_steps=2000):
-        self.writer = writer
-        self.tokenizer = tokenizer
-        self.prompts = prompts
-        self.generation_steps = generation_steps
-        
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if (state.global_step % self.generation_steps == 0) and state.is_world_process_zero:
-            device = next(model.parameters()).device
-            
-            inputs = self.tokenizer(self.prompts, padding=True, return_tensors="pt").to(device)
-            
-            model.eval()
-            with torch.no_grad():
-                outputs = model.generate(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    max_length=100,
-                    num_return_sequences=1,
-                    do_sample=True,
-                    top_p=0.92,
-                    temperature=0.7,
-                )
-            
-            generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            
-            for i, text in enumerate(generated_texts):
-                self.writer.add_text(f"generation/sample_{i}", text, state.global_step)
-            
-            model.train()
-
-
-class PerplexityCallback(TrainerCallback):
-    def __init__(self, writer):
-        self.writer = writer
-
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is None:
-            return
-        
-        is_eval = any(key.startswith("eval_") for key in logs.keys())
-        loss_key = "eval_loss" if is_eval else "loss"
-
-        if loss_key in logs:
-            perplexity = math.exp(logs[loss_key])
-            tag = "eval/perplexity" if is_eval else "train/perplexity"
-            self.writer.add_scalar(tag, perplexity, state.global_step)
 
 
 def create_gpt2_model(tokenizer, max_position_embeddings):
@@ -247,6 +92,7 @@ argparser.add_argument('--batch_size', type=int, default=4, help='Batch size')
 argparser.add_argument('--gradient_accumulation_steps', type=int, default=32, help='Gradient accumulation steps')
 argparser.add_argument('--warmup_ratio', type=float, default=0.03, help='Warmup ratio')
 argparser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm')
+argparser.add_argument('--use_gradient_checkpointing', action='store_true', help='Whether to use gradient checkpointing')
 argparser.add_argument('--fp16', action='store_true', help='Whether to use fp16')
 argparser.add_argument('--bf16', action='store_true', help='Whether to use bf16')
 argparser.add_argument('--use_xla', action='store_true', default=is_tpu_available, help='Whether to use XLA')
@@ -258,6 +104,20 @@ argparser.add_argument('--grokfast_ma_window_size', type=int, default=100, help=
 argparser.add_argument('--grokfast_ma_lambda', type=float, default=5.0, help='Lambda for GrokFast MA trainer')
 argparser.add_argument('--grokfast_ma_filter_type', type=str, default='mean', help='Filter type for GrokFast MA trainer')
 argparser.add_argument('--grokfast_ma_warmup', action='store_true', help='Whether to use warmup for GrokFast MA trainer')
+
+# deepspeed
+argparser.add_argument('--use_deepspeed', action='store_true', help='Whether to use DeepSpeed')
+argparser.add_argument('--deepspeed_config', type=str, default='ds_config.json', help='DeepSpeed configuration file')
+argparser.add_argument('--zero_stage', type=int, default=3, help='ZeRO optimization stage (0, 1, 2, or 3)')
+argparser.add_argument('--offload_optimizer', action='store_true', help='Offload optimizer states to CPU')
+argparser.add_argument('--offload_param', action='store_true', help='Offload parameters to CPU')
+
+# peft lora/int8 training
+argparser.add_argument('--use_int8_peft', action='store_true', help='Use INT8 with PEFT/LoRA')
+argparser.add_argument('--use_int8_deepspeed', action='store_true', help='Use DeepSpeed INT8 quantization')
+argparser.add_argument('--lora_rank', type=int, default=16, help='Rank for LoRA adaptation')
+argparser.add_argument('--lora_alpha', type=int, default=32, help='Alpha for LoRA adaptation')
+argparser.add_argument('--lora_dropout', type=float, default=0.05, help='Dropout for LoRA adaptation')
 
 args = argparser.parse_args()
 
@@ -284,6 +144,8 @@ else:
 
 model = model_maker(tokenizer, args.max_position_embeddings)
 
+model = megatransformer_utils.setup_int8_training(args, model)
+
 print(f"tokenizer: {tokenizer}")
 print(f"model structure: {model}")
 print(f"model parameters: {(sum(p.numel() for p in model.parameters())):,}")
@@ -295,21 +157,21 @@ def clean_dataset(examples):
     texts = examples["text"]
     cleaned_texts = []
     for text in texts:
-        # Replace special tokens
+        # replace special tokens
         cleaned = text.replace("@-@", "-")
         cleaned = cleaned.replace("@,@", ",")
         
-        # Fix spaces around punctuation
+        # fix spaces around punctuation
         for punct in ",.!?;:)]\"'":
             cleaned = cleaned.replace(f" {punct}", punct)
         
         for punct in "([\"'":
             cleaned = cleaned.replace(f"{punct} ", punct)
         
-        # Fix double spaces
+        # fix double spaces
         cleaned = re.sub(r' {2,}', ' ', cleaned)
         
-        # Normalize multiple newlines (optional)
+        # normalize multiple newlines
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
         
         if not cleaned.strip():
@@ -325,10 +187,16 @@ datasets = datasets.map(clean_dataset, batched=True)
 tokenized_datasets = datasets.map(tokenize_function, batched=True, remove_columns=["text"])
 
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+if args.use_deepspeed:
+    if os.path.exists(args.deepspeed_config):
+        print(f"Loading DeepSpeed config from {args.deepspeed_config}")
+    else:
+        raise FileNotFoundError(f"DeepSpeed config file {args.deepspeed_config} not found.")
+
 training_args = TrainingArguments(
     # i'm basically only ever going to be able to afford the smallest tpu-v2 or v3
     # tpu_num_cores=8 if args.use_xla else None,
-
     output_dir=run_dir,
     overwrite_output_dir=True,
     learning_rate=args.learning_rate,
@@ -346,33 +214,21 @@ training_args = TrainingArguments(
     eval_steps=1000,
     save_safetensors=False,
     save_steps=500,
+    gradient_checkpointing=args.use_gradient_checkpointing,
     bf16=args.bf16,
     fp16=args.fp16,
     max_grad_norm=args.max_grad_norm,
-    torch_compile=args.compile_model,
+    torch_compile=args.compile_model and not args.use_deepspeed,
+    deepspeed=args.deepspeed_config if args.use_deepspeed else None,
 )
-
-generation_callback = GenerationCallback(
-    writer,
-    tokenizer=tokenizer,
-    prompts=[
-        "In this paper, we propose a novel approach to",
-        "The Higgs boson, sometimes called the Higgs particle, is",
-        "The capital of France is",
-        "2 + 2 ="
-    ],
-    generation_steps=1000,
-)
-
-perplexity_callback = PerplexityCallback(writer)
 
 argparser_args = args
 if args.trainer == "grokfast_ema":
-    trainer_maker = lambda *args, **kwargs: GrokfastEMATrainer(*args, alpha=argparser_args.grokfast_ema_alpha, lamb=argparser_args.grokfast_ema_lambda, **kwargs)
+    trainer_maker = lambda *args, **kwargs: custom_trainers.GrokfastEMATrainer(*args, alpha=argparser_args.grokfast_ema_alpha, lamb=argparser_args.grokfast_ema_lambda, **kwargs)
 elif args.trainer == "grokfast_ma":
-    trainer_maker = lambda *args, **kwargs: GrokFastMATrainer(*args, window_size=argparser_args.grokfast_ma_window_size, lamb=argparser_args.grokfast_ma_lambda, filter_type=argparser_args.grokfast_ma_filter_type, warmup=argparser_args.grokfast_ma_warmup, **kwargs)
+    trainer_maker = lambda *args, **kwargs: custom_trainers.GrokFastMATrainer(*args, window_size=argparser_args.grokfast_ma_window_size, lamb=argparser_args.grokfast_ma_lambda, filter_type=argparser_args.grokfast_ma_filter_type, warmup=argparser_args.grokfast_ma_warmup, **kwargs)
 elif args.trainer == "debug":
-    trainer_maker = DebugTrainer
+    trainer_maker = custom_trainers.DebugTrainer
 else:
     trainer_maker = Trainer
 
@@ -385,8 +241,18 @@ trainer = trainer_maker(
     processing_class=tokenizer,
 )
 
-trainer.add_callback(generation_callback)
-trainer.add_callback(perplexity_callback)
+trainer.add_callback(custom_callbacks.GenerationCallback(
+    writer,
+    tokenizer=tokenizer,
+    prompts=[
+        "In this paper, we propose a novel approach to",
+        "The Higgs boson, sometimes called the Higgs particle, is",
+        "The capital of France is",
+        "2 + 2 ="
+    ],
+    generation_steps=1000,
+))
+trainer.add_callback(custom_callbacks.PerplexityCallback(writer))
 
 trainer.train()
 eval_results = trainer.evaluate()
