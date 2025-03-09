@@ -1,6 +1,9 @@
-from transformers import AutoTokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling, TrainerCallback
+from collections import deque
 from datasets import load_dataset
+from torch import nn
 from torch.utils.tensorboard import SummaryWriter
+from transformers import AutoTokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling, TrainerCallback
+from typing import Optional, Literal
 
 from . import megatransformer_utils
 from .model import megatransformer_causal
@@ -11,6 +14,81 @@ import os
 import re
 import torch
 
+
+class GrokFastMATrainer(Trainer):
+    def __init__(self, *args, window_size=100, lamb=5.0, filter_type='mean', warmup=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.window_size = window_size
+        self.lamb = lamb
+        self.filter_type = filter_type
+        self.warmup = warmup
+        self.grads = None
+    
+    def training_step(self, model, inputs):
+        loss = super().training_step(model, inputs)
+        # Apply gradfilter_ma after gradients are computed but before optimizer step
+        self.grads = self.gradfilter_ma(model, self.grads, self.window_size, self.lamb, self.filter_type, self.warmup)
+        return loss
+    
+    def gradfilter_ma(
+        self, 
+        m: nn.Module,
+        grads: Optional[dict[str, deque]] = None,
+        window_size: int = 100,
+        lamb: float = 5.0,
+        filter_type: Literal['mean', 'sum'] = 'mean',
+        warmup: bool = True,
+        trigger: bool = False,
+    ) -> dict[str, deque]:
+        if grads is None:
+            grads = {n: deque(maxlen=window_size) for n, p in m.named_parameters() if p.requires_grad and p.grad is not None}
+
+        for n, p in m.named_parameters():
+            if p.requires_grad and p.grad is not None:
+                grads[n].append(p.grad.data.detach())  # .cpu())
+
+                # Modify the gradients
+                if not warmup or len(grads[n]) == window_size and not trigger:
+                    if filter_type == "mean":
+                        avg = sum(grads[n]) / len(grads[n])
+                    elif filter_type == "sum":
+                        avg = sum(grads[n])
+                    else:
+                        raise ValueError(f"Unrecognized filter_type {filter_type}")
+                    p.grad.data = p.grad.data + avg * lamb
+
+        return grads
+
+
+class GrokfastEMATrainer(Trainer):
+    def __init__(self, *args, alpha=0.98, lamb=2.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha = alpha
+        self.lamb = lamb
+        self.grads = None
+    
+    def training_step(self, model, inputs):
+        loss = super().training_step(model, inputs)
+        # Apply gradfilter_ema after gradients are computed but before optimizer step
+        self.grads = self.gradfilter_ema(model, self.grads, self.alpha, self.lamb)
+        return loss
+    
+    def gradfilter_ema(
+        self, 
+        m: nn.Module,
+        grads: Optional[dict[str, torch.Tensor]] = None,
+        alpha: float = 0.98,
+        lamb: float = 2.0,
+    ) -> dict[str, torch.Tensor]:
+        if grads is None:
+            grads = {n: p.grad.data.detach() for n, p in m.named_parameters() if p.requires_grad and p.grad is not None}
+        
+        for n, p in m.named_parameters():
+            if p.requires_grad and p.grad is not None:
+                grads[n] = grads[n] * alpha + p.grad.data.detach() * (1 - alpha)
+                p.grad.data = p.grad.data + grads[n] * lamb
+        
+        return grads
 
 class DebugTrainer(Trainer):
     def get_train_dataloader(self):
@@ -173,9 +251,17 @@ argparser.add_argument('--fp16', action='store_true', help='Whether to use fp16'
 argparser.add_argument('--bf16', action='store_true', help='Whether to use bf16')
 argparser.add_argument('--use_xla', action='store_true', default=is_tpu_available, help='Whether to use XLA')
 
+argparser.add_argument('--trainer', type=str, default="default", help='Trainer type: grokfast_ema, grokfast_ma, debug, or default')
+argparser.add_argument('--grokfast_ema_alpha', type=float, default=0.98, help='Alpha for GrokFast EMA trainer')
+argparser.add_argument('--grokfast_ema_lambda', type=float, default=2.0, help='Lambda for GrokFast EMA trainer')
+argparser.add_argument('--grokfast_ma_window_size', type=int, default=100, help='Window size for GrokFast MA trainer')
+argparser.add_argument('--grokfast_ma_lambda', type=float, default=5.0, help='Lambda for GrokFast MA trainer')
+argparser.add_argument('--grokfast_ma_filter_type', type=str, default='mean', help='Filter type for GrokFast MA trainer')
+argparser.add_argument('--grokfast_ma_warmup', action='store_true', help='Whether to use warmup for GrokFast MA trainer')
+
 args = argparser.parse_args()
 
-run_dir = os.path.join("runs", "causal", "wikitext", args.run_name)
+run_dir = os.path.join("runs", "causal", args.dataset_name, args.run_name)
 
 writer = SummaryWriter(run_dir)
 
@@ -280,8 +366,17 @@ generation_callback = GenerationCallback(
 
 perplexity_callback = PerplexityCallback(writer)
 
-# trainer = DebugTrainer(
-trainer = Trainer(
+argparser_args = args
+if args.trainer == "grokfast_ema":
+    trainer_maker = lambda *args, **kwargs: GrokfastEMATrainer(*args, alpha=argparser_args.grokfast_ema_alpha, lamb=argparser_args.grokfast_ema_lambda, **kwargs)
+elif args.trainer == "grokfast_ma":
+    trainer_maker = lambda *args, **kwargs: GrokFastMATrainer(*args, window_size=argparser_args.grokfast_ma_window_size, lamb=argparser_args.grokfast_ma_lambda, filter_type=argparser_args.grokfast_ma_filter_type, warmup=argparser_args.grokfast_ma_warmup, **kwargs)
+elif args.trainer == "debug":
+    trainer_maker = DebugTrainer
+else:
+    trainer_maker = Trainer
+
+trainer = trainer_maker(
     model=model,
     args=training_args,
     data_collator=data_collator,
