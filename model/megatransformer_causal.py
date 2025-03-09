@@ -27,12 +27,12 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         
-        if config.num_hidden_layers is not None:
-            self.transformer = nn.ModuleList([megatransformer.MegaTransformerBlock(config) for _ in range(config.num_hidden_layers)])
+        if config.n_layers is not None:
+            self.transformer = nn.ModuleList([megatransformer.MegaTransformerBlock(config) for _ in range(config.n_layers)])
         else:
-            prelude = nn.ModuleList([megatransformer.MegaTransformerBlock(config) for _ in range(config.num_prelude_layers)])
+            prelude = nn.ModuleList([megatransformer.MegaTransformerBlock(config) for _ in range(config.n_prelude_layers)])
             recurrent = megatransformer.MegaTransformerRecurrentBlock(config)
-            coda = nn.ModuleList([megatransformer.MegaTransformerBlock(config) for _ in range(config.num_coda_layers)])
+            coda = nn.ModuleList([megatransformer.MegaTransformerBlock(config) for _ in range(config.n_coda_layers)])
 
             self.transformer = nn.ModuleList([*prelude, recurrent, *coda])
         
@@ -83,7 +83,7 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
         
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+        head_mask = self.get_head_mask(head_mask, self.config.n_layers)
         
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
@@ -218,7 +218,7 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        past_key_values = past_key_values if past_key_values is not None else [None] * self.config.num_hidden_layers
+        past_key_values = past_key_values if past_key_values is not None else [None] * self.config.n_layers
         if use_cache:
             for i in range(len(past_key_values)):
                 if past_key_values[i] is None:
@@ -271,9 +271,6 @@ def create_gpt2_model(tokenizer, max_position_embeddings):
     return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
         max_position_embeddings=max_position_embeddings,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
@@ -284,9 +281,6 @@ def create_modern_model(tokenizer, max_position_embeddings):
     return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
         max_position_embeddings=max_position_embeddings,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
         intermediate_activation="swiglu",
         norm_type="rmsnorm",
         ffn_type="mlp",
@@ -305,12 +299,10 @@ def create_huginn_model(tokenizer, max_position_embeddings):
     return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
         max_position_embeddings=max_position_embeddings,
-        hidden_size=768,
-        num_hidden_layers=None,
-        num_prelude_layers=2,
-        num_recurrent_layers=4,
-        num_coda_layers=2,
-        num_attention_heads=12,
+        n_layers=None,
+        n_prelude_layers=2,
+        n_recurrent_layers=4,
+        n_coda_layers=2,
         intermediate_activation="swiglu",
         norm_type="rmsnorm",
         ffn_type="mlp",

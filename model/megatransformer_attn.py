@@ -16,25 +16,29 @@ class SelfAttentionOutput:
 class MegaTransformerSelfAttention(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__()
-        self.num_attention_heads = config.num_attention_heads
+        self.n_heads = config.n_heads
         self.hidden_size = config.hidden_size
-        self.attention_head_size = config.hidden_size // config.num_attention_heads
         self.use_grok_scaled_attn = config.use_grok_scaled_attn
 
-        self.query = nn.Linear(config.hidden_size, config.hidden_size, bias=config.use_qkv_bias)
-        self.key = nn.Linear(config.hidden_size, config.hidden_size, bias=config.use_qkv_bias)
-        self.value = nn.Linear(config.hidden_size, config.hidden_size, bias=config.use_qkv_bias)
+        self.d_queries = config.d_queries
+        self.d_values = config.d_values
+        self.n_query_groups = config.n_query_groups
+        self.n_heads = config.n_heads
+
+        self.q_proj = nn.Linear(config.hidden_size, self.n_query_groups * self.d_queries, bias=config.use_qkv_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.n_heads * self.d_queries, bias=config.use_qkv_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.n_heads * self.d_values, bias=config.use_qkv_bias)
 
         self.rotary_embedding = None
         if bool(config.use_rotary_embedding):
             self.rotary_embedding = RotaryEmbedding(dim=config.rotary_embedding_dim, learned_freq=config.rotary_embedding_learnable)
 
         if bool(config.use_alibi_bias):
-            self.register_buffer('alibi_bias', megatransformer_utils.create_alibi_bias(n_heads=config.num_attention_heads, maxlen=config.max_position_embeddings))
+            self.register_buffer('alibi_bias', megatransformer_utils.create_alibi_bias(n_heads=config.n_heads, maxlen=config.max_position_embeddings))
         else:
             self.register_buffer('alibi_bias', None)
         
-        self.output = nn.Linear(config.hidden_size, config.hidden_size)
+        self.o_proj = nn.Linear(self.n_heads * self.d_values, config.hidden_size)
         
         self.attn_dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.proj_dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -43,12 +47,6 @@ class MegaTransformerSelfAttention(nn.Module):
             "causal_mask",
             torch.tril(torch.ones(config.max_position_embeddings, config.max_position_embeddings)).view(1, 1, config.max_position_embeddings, config.max_position_embeddings),
         )
-    
-    def transpose_for_scores(self, x):
-        """Reshape from [B, S, H] to [B, N, S, H/N] where N is the number of heads"""
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
     
     def forward(
         self,
@@ -61,37 +59,33 @@ class MegaTransformerSelfAttention(nn.Module):
     ) -> SelfAttentionOutput:
         N, _ = hidden_states.shape[:2]
 
-        query_layer = self.query(hidden_states)
-        key_layer = self.key(hidden_states)
-        value_layer = self.value(hidden_states)
+        queries = self.q_proj(hidden_states)
+        keys = self.k_proj(hidden_states)
+        values = self.v_proj(hidden_states)
 
         if self.rotary_embedding is not None:
-            query_layer = self.rotary_embedding.rotate_queries_or_keys(query_layer)
-            key_layer = self.rotary_embedding.rotate_queries_or_keys(key_layer)
+            queries = self.rotary_embedding.rotate_queries_or_keys(queries)
+            keys = self.rotary_embedding.rotate_queries_or_keys(keys)
         
-        query_layer = self.transpose_for_scores(query_layer)
-        key_layer = self.transpose_for_scores(key_layer)
-        value_layer = self.transpose_for_scores(value_layer)
+        queries = queries.view(N, -1, self.n_query_groups, self.d_queries).permute(0, 2, 1, 3).contiguous()
+        keys_to_cache = keys.view(N, -1, self.n_heads, self.d_queries).permute(0, 2, 1, 3).contiguous()
+        values_to_cache = values.view(N, -1, self.n_heads, self.d_values).permute(0, 2, 1, 3).contiguous()
 
         # cache keys and values in the shape (B, N, S, H/N) where N is the number of heads
         if past_key_values is not None:
-            past_key, past_value = past_key_values.key, past_key_values.value
-            if past_key is not None and past_value is not None:
-                k = torch.cat([past_key, key_layer], dim=-2)
-                v = torch.cat([past_value, value_layer], dim=-2)
-            else:
-                k = key_layer
-                v = value_layer
+            past_key, past_value = past_key_values
+            keys = torch.cat([past_key, keys_to_cache], dim=-2)
+            values = torch.cat([past_value, values_to_cache], dim=-2)
         else:
-            k = key_layer
-            v = value_layer
+            keys = keys_to_cache
+            values = values_to_cache
 
         if use_cache:
             if past_key_values is None:
                 past_key_values = megatransformer_utils.KVCache()
-            past_key_values.update(key=key_layer, value=value_layer)
+            past_key_values.update(key=keys_to_cache, value=values_to_cache)
 
-        attention_scores = torch.matmul(query_layer, k.transpose(-1, -2))
+        attention_scores = torch.matmul(queries, keys.transpose(-1, -2))
 
         if self.alibi_bias is not None:
             attention_scores = attention_scores + self.alibi_bias[:, :t, :t].unsqueeze(0).repeat(N, 1, 1, 1)
@@ -101,8 +95,8 @@ class MegaTransformerSelfAttention(nn.Module):
         if bool(self.use_grok_scaled_attn):
             attention_scores = 30.0 * torch.tanh(attention_scores / 30.0)
         
-        _, _, t = query_layer.shape[:3]
-        _, _, T = key_layer.shape[:3]
+        _, _, t = queries.shape[:3]
+        _, _, T = keys.shape[:3]
 
         causal_mask_slice = self.causal_mask[:, :, :t, :T]
         attention_scores = attention_scores.masked_fill(causal_mask_slice == 0, float("-inf"))
@@ -119,14 +113,14 @@ class MegaTransformerSelfAttention(nn.Module):
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
         
-        context_layer = torch.matmul(attention_probs, v)
+        context_layer = torch.matmul(attention_probs, values)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         
         new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
         
         # Apply output projection
-        output = self.output(context_layer)
+        output = self.o_proj(context_layer)
         output = self.proj_dropout(output)
         
         return SelfAttentionOutput(
