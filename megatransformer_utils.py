@@ -93,46 +93,6 @@ class PreAllocatedKVCache:
         return ['key', 'value']
 
 
-class HuginnKVCache:
-    """
-    A KV cache that supports a depth parameter for each key-value update.
-    Basically, the `key` and `value` lists represent a stack of keys and values for each depth into a given block.
-    Every block within the thinking stack has its own instance of this KV cache.
-    As the model iterates through the thinking stack, it will update the keys and values for each depth for each given block.
-    """
-    def __init__(self):
-        self.key: list[torch.Tensor] = []
-        self.value: list[torch.Tensor] = []
-
-    def reset(self):
-        self.key = []
-        self.value = []
-
-    def update(self, depth, key: torch.Tensor, value: torch.Tensor):
-        if self.key[depth] is None:
-            self.key[depth] = key
-        else:
-            self.key[depth] = torch.cat([self.key[depth], key], dim=2)
-        if self.value[depth] is None:
-            self.value[depth] = value
-        else:
-            self.value[depth] = torch.cat([self.value[depth], value], dim=2)
-
-    def __getitem__(self, idx):
-        if idx == 0:
-            return self.key
-        elif idx == 1:
-            return self.value
-        else:
-            raise IndexError(f"HuginnKVCache index out of range: {idx}")
-        
-    def size(self):
-        return {
-            "keys_shape": self.key[0].shape if self.key is not None and len(self.key) > 0 else None,
-            "values_shape": self.value[0].shape if self.value is not None and len(self.value) > 0 else None
-        }
-
-
 class MegaTransformerConfig(PretrainedConfig):
     model_type = "megatransformer"
     
