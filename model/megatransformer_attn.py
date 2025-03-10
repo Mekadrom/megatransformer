@@ -13,6 +13,9 @@ class SelfAttentionOutput:
         self.past_key_values: megatransformer_utils.KVCache = past_key_values
         self.attention_probs: torch.Tensor = attention_probs
 
+    def __deepspeed_tensor_attributes__(self):
+        return ['hidden_states', 'attention_probs']
+
 class MegaTransformerSelfAttention(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__()
@@ -90,8 +93,7 @@ class MegaTransformerSelfAttention(nn.Module):
         if self.alibi_bias is not None:
             attention_scores = attention_scores + self.alibi_bias[:, :t, :t].unsqueeze(0).repeat(N, 1, 1, 1)
 
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-
+        attention_scores = attention_scores / math.sqrt(self.d_queries)
         if bool(self.use_grok_scaled_attn):
             attention_scores = 30.0 * torch.tanh(attention_scores / 30.0)
         
