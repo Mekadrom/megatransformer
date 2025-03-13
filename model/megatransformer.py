@@ -1,6 +1,8 @@
 from torch import nn
 from typing import Optional, Union
 
+import torch.utils.tensorboard
+
 from model import huginn_criteria, megatransformer_attn, megatransformer_ffn, mult, sum
 
 import math
@@ -9,9 +11,9 @@ import torch
 
 
 class BlockOutput:
-    def __init__(self, hidden_states, kv_cache: megatransformer_utils.KVCache=None, attention_probs=None):
+    def __init__(self, hidden_states, past_key_values: megatransformer_utils.KVCache=None, attention_probs=None):
         self.hidden_states = hidden_states
-        self.kv_cache = kv_cache
+        self.past_key_values = past_key_values
         self.attention_probs = attention_probs
 
 class MegaTransformerBlock(nn.Module):
@@ -90,18 +92,20 @@ class MegaTransformerBlock(nn.Module):
 
         return BlockOutput(
             hidden_states=hidden_states,
-            kv_cache=past_key_values,
+            past_key_values=past_key_values,
             attention_probs=attention_probs,
         )
 
 
 class RecurrentBlockOutput:
-    def __init__(self, hidden_states, last_thought_state, next_cache=None, all_hidden_states=None, attention_probs=None):
+    def __init__(self, hidden_states, last_thought_state, past_key_values=None, all_hidden_states=None, attention_probs=None, n_steps_no_grad=None, k_steps_grad=None):
         self.hidden_states = hidden_states
         self.last_thought_state = last_thought_state
-        self.next_cache = next_cache
+        self.past_key_values = past_key_values
         self.all_hidden_states = all_hidden_states
         self.attention_probs = attention_probs
+        self.n_steps_no_grad = n_steps_no_grad
+        self.k_steps_grad = k_steps_grad
 
 
 # todo: implement kv caching
@@ -116,7 +120,10 @@ class MegaTransformerRecurrentBlock(nn.Module):
         self.exit_criteria = self.config.huginn_exit_criteria
         self.exit_criteria_threshold = self.config.huginn_exit_criteria_threshold
 
-        self.blocks = nn.ModuleList([MegaTransformerBlock(config) for _ in range(config.num_recurrent_layers)])
+        self.lockstep_n = self.config.huginn_lockstep_n
+        self.lockstep_k = self.config.huginn_lockstep_k
+
+        self.blocks = nn.ModuleList([MegaTransformerBlock(config) for _ in range(config.n_recurrent_layers)])
 
         self.adapter: nn.Module
         if self.adapter_method == 'sum':
@@ -132,7 +139,9 @@ class MegaTransformerRecurrentBlock(nn.Module):
             self.exit_criteria = huginn_criteria.KLDivergenceCriteria(self.exit_criteria_threshold) # todo: implement other exit criteria
         else:
             raise ValueError(f"Invalid exit criteria: {self.exit_criteria}")
-
+        
+        self.step = 0
+        
     def initialize_thinking_state(self, input_embeds):
         """
         Taken directly from the original Huginn implementation: https://github.com/seal-rg/recurrent-pretraining/blob/main/recpre/model_dynamic.py
@@ -161,11 +170,18 @@ class MegaTransformerRecurrentBlock(nn.Module):
         return x
     
     def n_k_steps(self, mean_steps, backprop_depth):
+        seed_n = 514229 + self.step  # easiest way to make the sampler re-runnable in checkpointing
+        seed_k = 317811 + self.step
+        if not self.lockstep_n and torch.distributed.is_initialized():
+            seed_n = seed_n * (torch.distributed.get_rank() + 1)
+        if not self.lockstep_k and torch.distributed.is_initialized():
+            seed_k = seed_k * (torch.distributed.get_rank() + 1)
+
         # todo: get seeding working here
         n_generator = torch.Generator(device="cpu")
-        n_generator.manual_seed(42 % (2**31 - 1))
+        n_generator.manual_seed(seed_n % (2**31 - 1))
         k_generator = torch.Generator(device="cpu")
-        k_generator.manual_seed(42 % (2**31 - 1))
+        k_generator.manual_seed(seed_k % (2**31 - 1))
 
         t = max(mean_steps - backprop_depth, 0)
         s = backprop_depth
@@ -178,6 +194,7 @@ class MegaTransformerRecurrentBlock(nn.Module):
             p = torch.poisson(torch.tensor([rate], dtype=torch.float), generator=n_generator) + 1
             n = torch.clamp(p - s, min=0)
             k = torch.as_tensor(torch.minimum(torch.as_tensor(s), p))
+            self.step += 1
         else:
             n, k = torch.tensor(mean_steps), torch.tensor(0)
         return n.to(torch.long), k.to(torch.long)
@@ -187,13 +204,12 @@ class MegaTransformerRecurrentBlock(nn.Module):
         hidden_states,
         attention_mask=None,
         head_mask=None,
+        past_key_values: Optional[list[list[megatransformer_utils.KVCache]]]=None,
+        use_cache=False,
         output_attentions=False,
         output_hidden_states=False
     ):
-        if self.training:
-            n_steps_no_grad, k_steps_grad = self.n_k_steps(self.mean_thinking_steps, self.backprop_depth)
-        else:
-            n_steps_no_grad, k_steps_grad = self.mean_thinking_steps, 0
+        n_steps_no_grad, k_steps_grad = self.n_k_steps(self.mean_thinking_steps, self.backprop_depth)
 
         x = self.initialize_thinking_state(hidden_states)
         last_thought_state = x
@@ -206,6 +222,8 @@ class MegaTransformerRecurrentBlock(nn.Module):
                     hidden_states,
                     attention_mask,
                     head_mask,
+                    past_key_values,
+                    use_cache,
                     output_attentions,
                     output_hidden_states
                 )
@@ -220,15 +238,21 @@ class MegaTransformerRecurrentBlock(nn.Module):
                 hidden_states,
                 attention_mask,
                 head_mask,
+                past_key_values,
+                use_cache,
                 output_attentions,
-                output_hidden_states
+                output_hidden_states,
+                start_step_idx=n_steps_no_grad
             )
 
         return RecurrentBlockOutput(
             hidden_states=outputs.hidden_states,
             last_thought_state=outputs.last_thought_state,
+            past_key_values=outputs.past_key_values,
             all_hidden_states=outputs.all_hidden_states,
             attention_probs=outputs.attention_probs,
+            n_steps_no_grad=n_steps_no_grad,
+            k_steps_grad=k_steps_grad,
         )
 
     def apply_thinking_layers(self,
@@ -238,32 +262,37 @@ class MegaTransformerRecurrentBlock(nn.Module):
                               hidden_states: torch.Tensor,
                               attention_mask: Optional[torch.Tensor],
                               head_mask,
+                              past_key_values: Optional[list[list[megatransformer_utils.KVCache]]]=None,
+                              use_cache: bool=False,
                               output_attentions: bool=False,
-                              output_hidden_states: bool=False):
+                              output_hidden_states: bool=False,
+                              start_step_idx=0):
         all_hidden_states: Optional[list] = [] if output_hidden_states else None
         all_attentions: Optional[list] = [] if output_attentions else None
 
-        for _ in range(n_steps):
+        for step in range(n_steps):
             if self.adapter_method == "linear":
                 x = self.adapter(torch.cat([x, hidden_states], dim=-1))
             else:
                 x = self.adapter(x, hidden_states)
 
             for i, thinking_layer in enumerate(self.blocks):
-                if all_hidden_states is not None:
+                if output_hidden_states:
                     all_hidden_states.append(hidden_states)
 
                 outputs = thinking_layer(
                     hidden_states,
                     attention_mask=attention_mask,
-                    head_mask=head_mask[i],
+                    head_mask=head_mask[i] if head_mask is not None else None,
+                    # past_key_values=past_key_values[self.config.n_prelude_layers + i][start_step_idx+step] if past_key_values is not None else None,
+                    # use_cache=use_cache,
                     output_attentions=output_attentions,
                 )
 
                 hidden_states = outputs.hidden_states
                 attention_probs = outputs.attention_probs
 
-                if all_attentions is not None:
+                if output_attentions:
                     all_attentions.append(attention_probs)
 
                 last_thought_state = hidden_states
@@ -271,12 +300,13 @@ class MegaTransformerRecurrentBlock(nn.Module):
             if not self.training and self.exit_criteria.should_exit(last_thought_state, x):
                 break
 
-        if all_hidden_states is not None:
+        if output_hidden_states:
             all_hidden_states.append(hidden_states)
 
         return RecurrentBlockOutput(
             hidden_states=hidden_states,
             last_thought_state=last_thought_state,
+            past_key_values=past_key_values,
             all_hidden_states=all_hidden_states,
             attention_probs=all_attentions,
         )

@@ -83,7 +83,9 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
         
-        head_mask = self.get_head_mask(head_mask, self.config.n_layers)
+        # todo: find out what this does and if it is needed for huginn
+        if self.config.n_layers is not None:
+            head_mask = self.get_head_mask(head_mask, self.config.n_layers)
         
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
@@ -115,7 +117,7 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
             outputs = block(
                 hidden_states,
                 attention_mask=attention_mask,
-                head_mask=head_mask[i],
+                head_mask=head_mask[i] if head_mask is not None else None,
                 past_key_values=past_key_value,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
@@ -137,13 +139,22 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
             all_hidden_states.append(hidden_states)
         
         if not return_dict:
-            return hidden_states, past_key_values, all_hidden_states, all_attentions
+            return (
+                hidden_states,
+                past_key_values,
+                all_hidden_states,
+                all_attentions,
+                outputs.n_steps_no_grad if hasattr(outputs, "n_steps_no_grad") else None,
+                outputs.k_steps_grad if hasattr(outputs, "k_steps_grad") else None,
+            )
         
-        return CausalLMOutputWithCrossAttentions(
+        return dict(
             logits=hidden_states,
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
+            n_steps_no_grad=outputs.n_steps_no_grad if hasattr(outputs, "n_steps_no_grad") else None,
+            k_steps_grad=outputs.k_steps_grad if hasattr(outputs, "k_steps_grad") else None,
         )
     
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask: torch.Tensor=None, **kwargs):
@@ -163,6 +174,7 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
             "attention_mask": attention_mask,
             "position_ids": position_ids,
         }
+    
 
 class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
     config_class = megatransformer_utils.MegaTransformerConfig
@@ -218,11 +230,33 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        past_key_values = past_key_values if past_key_values is not None else [None] * self.config.n_layers
-        if use_cache:
-            for i in range(len(past_key_values)):
-                if past_key_values[i] is None:
-                    past_key_values[i] = megatransformer_utils.KVCache()
+        if self.config.n_layers is not None:
+            past_key_values = past_key_values if past_key_values is not None else [None] * self.config.n_layers
+            if use_cache:
+                for i in range(len(past_key_values)):
+                    if past_key_values[i] is None:
+                        past_key_values[i] = megatransformer_utils.KVCache()
+        else:
+            past_key_values = past_key_values if past_key_values is not None else [None] * (self.config.n_prelude_layers + 1 + self.config.n_coda_layers)
+            # if use_cache:
+            #     # initialize kv caches for prelude layers as past_key_values[0:n_prelude_layers] = KVCache()
+            #     for i in range(len(self.config.n_prelude_layers)):
+            #         if past_key_values[i] is None:
+            #             past_key_values[i] = megatransformer_utils.KVCache()
+
+            #     # initialize kv caches for recurrent layers as past_key_values[n_prelude_layers] = list[KVCache()]
+            #     if past_key_values[self.config.n_prelude_layers] is None:
+            #         # use a list of KVCache() for the recurrent layer
+            #         huginn_kv_cache = [None] * (self.config.huginn_mean_thinking_steps * 2)
+            #         for j in range(len(huginn_kv_cache)):
+            #             huginn_kv_cache[j] = megatransformer_utils.KVCache()
+            #         past_key_values[self.config.n_prelude_layers] = huginn_kv_cache
+
+            #     # initialize kv caches for coda layers as past_key_values[n_prelude_layers+1:] = KVCache()
+            #     for i in range(self.config.n_prelude_layers + 1, len(past_key_values)):
+            #         if past_key_values[i] is None:
+            #             past_key_values[i] = megatransformer_utils.KVCache()
+            # print(f"initialized past_key_values: {past_key_values}")
         
         transformer_outputs = self.transformer(
             input_ids=input_ids,
@@ -238,7 +272,12 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
             return_dict=return_dict,
         )
         
-        hidden_states = transformer_outputs[0]
+        if return_dict:
+            # dict
+            hidden_states = transformer_outputs['logits']
+        else:
+            # tuple
+            hidden_states = transformer_outputs[0]
         
         lm_logits = self.lm_head(hidden_states)
         
@@ -251,15 +290,20 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         
         if not return_dict:
-            output = (lm_logits,) + transformer_outputs[1:]
+            output = (
+                lm_logits,
+                *transformer_outputs[1:],
+            )
             return ((loss,) + output) if loss is not None else output
         
-        return CausalLMOutputWithCrossAttentions(
+        return dict(
             loss=loss,
             logits=lm_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
+            past_key_values=transformer_outputs['past_key_values'],
+            hidden_states=transformer_outputs['hidden_states'],
+            attentions=transformer_outputs['attentions'],
+            n_steps_no_grad=transformer_outputs['n_steps_no_grad'],
+            k_steps_grad=transformer_outputs['k_steps_grad'],
         )
     
     def prepare_inputs_for_generation(self, input_ids, **kwargs):

@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 class HuginnExitCriteria:
     def should_exit(self, last_thought_state: torch.Tensor, current_thought_state: torch.Tensor):
@@ -14,5 +15,5 @@ class KLDivergenceCriteria(HuginnExitCriteria):
         if last_thought_state is None or current_thought_state is None:
             return False
 
-        kl_divergence = torch.kl_div(last_thought_state, current_thought_state)
-        return kl_divergence < self.threshold
+        kl_divergence = F.kl_div(last_thought_state, current_thought_state, reduction="none", log_target=True).sum(dim=-1)
+        return (kl_divergence < self.threshold).any()

@@ -147,7 +147,7 @@ training_args = TrainingArguments(
     lr_scheduler_type="cosine",
     warmup_ratio=args.warmup_ratio,
     per_device_train_batch_size=args.batch_size,
-    per_device_eval_batch_size=args.batch_size,
+    per_device_eval_batch_size=1 if args.config == 'huginn' else args.batch_size,
     gradient_accumulation_steps=args.gradient_accumulation_steps,
     num_train_epochs=args.num_train_epochs,
     weight_decay=args.weight_decay,
@@ -185,16 +185,24 @@ trainer = trainer_maker(
     processing_class=tokenizer,
 )
 
-if not args.use_xla and not args.use_deepspeed:
+prompts = [
+    "In this paper, we propose a novel approach to",
+    "The Higgs boson, sometimes called the Higgs particle, is",
+    "The capital of France is",
+    "2 + 2 ="
+]
+if args.use_deepspeed:
+    trainer.add_callback(custom_callbacks.DeepspeedGenerationCallback(
+        writer,
+        tokenizer=tokenizer,
+        prompts=prompts,
+        generation_steps=1000,
+    ))
+else:
     trainer.add_callback(custom_callbacks.GenerationCallback(
         writer,
         tokenizer=tokenizer,
-        prompts=[
-            "In this paper, we propose a novel approach to",
-            "The Higgs boson, sometimes called the Higgs particle, is",
-            "The capital of France is",
-            "2 + 2 ="
-        ],
+        prompts=prompts,
         generation_steps=1000,
     ))
 trainer.add_callback(custom_callbacks.PerplexityCallback(writer))

@@ -119,7 +119,9 @@ class MegaTransformerConfig(PretrainedConfig):
         huginn_thought_initialization_method="like-init",
         huginn_adapter_method="linear",
         huginn_exit_criteria="kl_divergence",
-        huginn_exit_criteria_threshold=1e-4,
+        huginn_exit_criteria_threshold=5e-4,
+        huginn_lockstep_n=True,
+        huginn_lockstep_k=True,
 
         norm_type="layernorm",
         norm_eps=1e-5,
@@ -176,6 +178,8 @@ class MegaTransformerConfig(PretrainedConfig):
         self.huginn_adapter_method = huginn_adapter_method
         self.huginn_exit_criteria = huginn_exit_criteria
         self.huginn_exit_criteria_threshold = huginn_exit_criteria_threshold
+        self.huginn_lockstep_n = huginn_lockstep_n
+        self.huginn_lockstep_k = huginn_lockstep_k
 
         self.norm_type = norm_type
         self.norm_eps = norm_eps
