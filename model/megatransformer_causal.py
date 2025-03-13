@@ -8,6 +8,34 @@ from model import megatransformer
 import megatransformer_utils
 import torch
 
+class MegaTransformerCausalOutput(dict):
+    def __init__(self,
+        loss: Optional[torch.Tensor]=None,
+        logits: Optional[torch.Tensor]=None,
+        past_key_values: Optional[list[megatransformer_utils.KVCache]]=None,
+        hidden_states: Optional[list]=None,
+        attentions: Optional[list]=None,
+        n_steps_no_grad: Optional[int]=None,
+        k_steps_grad: Optional[int]=None,
+    ):
+        self.loss = loss
+        self.logits = logits
+        self.past_key_values = past_key_values
+        self.hidden_states = hidden_states
+        self.attentions = attentions
+        self.n_steps_no_grad = n_steps_no_grad
+        self.k_steps_grad = k_steps_grad
+
+        super().__init__(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            attentions=attentions,
+            n_steps_no_grad=n_steps_no_grad,
+            k_steps_grad=k_steps_grad,
+        )
+
 
 class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
     config_class = megatransformer_utils.MegaTransformerConfig
@@ -148,7 +176,7 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
                 outputs.k_steps_grad if hasattr(outputs, "k_steps_grad") else None,
             )
         
-        return dict(
+        return MegaTransformerCausalOutput(
             logits=hidden_states,
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
@@ -274,7 +302,7 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
         
         if return_dict:
             # dict
-            hidden_states = transformer_outputs['logits']
+            hidden_states = transformer_outputs.logits
         else:
             # tuple
             hidden_states = transformer_outputs[0]
@@ -296,14 +324,14 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
             )
             return ((loss,) + output) if loss is not None else output
         
-        return dict(
+        return MegaTransformerCausalOutput(
             loss=loss,
             logits=lm_logits,
-            past_key_values=transformer_outputs['past_key_values'],
-            hidden_states=transformer_outputs['hidden_states'],
-            attentions=transformer_outputs['attentions'],
-            n_steps_no_grad=transformer_outputs['n_steps_no_grad'],
-            k_steps_grad=transformer_outputs['k_steps_grad'],
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+            n_steps_no_grad=transformer_outputs.n_steps_no_grad,
+            k_steps_grad=transformer_outputs.k_steps_grad,
         )
     
     def prepare_inputs_for_generation(self, input_ids, **kwargs):

@@ -191,20 +191,12 @@ prompts = [
     "The capital of France is",
     "2 + 2 ="
 ]
-if args.use_deepspeed:
-    trainer.add_callback(custom_callbacks.DeepspeedGenerationCallback(
-        writer,
-        tokenizer=tokenizer,
-        prompts=prompts,
-        generation_steps=1000,
-    ))
-else:
-    trainer.add_callback(custom_callbacks.GenerationCallback(
-        writer,
-        tokenizer=tokenizer,
-        prompts=prompts,
-        generation_steps=1000,
-    ))
+trainer.add_callback(custom_callbacks.GenerationCallback(
+    writer,
+    tokenizer=tokenizer,
+    prompts=prompts,
+    generation_steps=1000,
+))
 trainer.add_callback(custom_callbacks.PerplexityCallback(writer))
 
 trainer.train()

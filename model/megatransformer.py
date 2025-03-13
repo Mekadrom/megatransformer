@@ -84,7 +84,7 @@ class MegaTransformerBlock(nn.Module):
 
         pre_ffn_input = self.pre_ffn_norm(hidden_states)
         ffn_output = self.ffn(pre_ffn_input)
-        
+
         hidden_states = hidden_states + ffn_output
 
         if self.post_ffn_norm is not None:
@@ -270,7 +270,7 @@ class MegaTransformerRecurrentBlock(nn.Module):
         all_hidden_states: Optional[list] = [] if output_hidden_states else None
         all_attentions: Optional[list] = [] if output_attentions else None
 
-        for step in range(n_steps):
+        for step in range(n_steps.item()):
             if self.adapter_method == "linear":
                 x = self.adapter(torch.cat([x, hidden_states], dim=-1))
             else:

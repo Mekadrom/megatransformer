@@ -12,6 +12,7 @@ argparser.add_argument("--tokenizer_name", type=str, default="mistralai/Mistral-
 argparser.add_argument("--dataset_path", type=str, default="wikitext", help="Path to the dataset")
 argparser.add_argument("--config", type=str, default="modern", help="Model configuration: gpt2, modern, or huginn")
 argparser.add_argument("--max_position_embeddings", type=int, default=1024, help="Max position embeddings (maximum sequence length)")
+argparser.add_argument("--max_test_length", type=int, default=256, help="Maximum length for test generation")
 argparser.add_argument("--compile_model", action="store_true", help="Whether to compile the model")
 argparser.add_argument("--bf16", action="store_true", help="Whether to use bf16")
 argparser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for training (cuda or cpu)")
@@ -43,6 +44,7 @@ if args.bf16:
     print("Model converted to bf16")
 
 model = model.to(args.device)
+model.eval()
 
 print(f"Model loaded with {sum(p.numel() for p in model.parameters()):,} parameters")
 
@@ -54,10 +56,10 @@ while True:
     with torch.no_grad():
         start = time.time()
         outputs = model.generate(
-            use_cache=True,
+            use_cache=False,
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
-            max_length=args.max_position_embeddings,
+            max_length=args.max_test_length,
             num_return_sequences=1,
             do_sample=True,
             top_p=0.92,

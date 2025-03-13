@@ -10,11 +10,27 @@ print_section() {
 
 # Update and upgrade system packages
 print_section "Updating system packages"
-sudo apt update -y && sudo apt upgrade -y
+# Use DEBIAN_FRONTEND=noninteractive to prevent interactive prompts
+# -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" 
+# will keep existing config files when possible
+sudo apt update -y
+echo "Running system upgrade. This might require your input for configuration changes..."
+sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 
-# Install NVIDIA CUDA toolkit
-print_section "Installing NVIDIA CUDA toolkit"
-sudo apt install -y nvidia-cuda-toolkit
+# Check if a reboot is needed
+if [ -f /var/run/reboot-required ]; then
+    echo "*** System update requires a reboot ***"
+    read -p "Would you like to reboot now? (y/n): " choice
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        echo "The script will need to be run again after reboot."
+        echo "Rebooting in 10 seconds..."
+        sleep 10
+        sudo reboot
+        exit 0
+    else
+        echo "Continuing without reboot. Some changes may not take effect until system is rebooted."
+    fi
+fi
 
 # Generate SSH key
 print_section "Generating SSH key"
@@ -50,6 +66,8 @@ else
     git clone "$REPO_URL" ~/project
     cd ~/project
     
+    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
     # Check if requirements.txt exists
     if [ -f "requirements.txt" ]; then
         print_section "Installing Python requirements"
@@ -60,13 +78,3 @@ else
 fi
 
 git config --global credential.helper store
-
-# Hugging Face login
-print_section "Hugging Face login"
-echo "You will need your Hugging Face token for the next step."
-echo "Get your token from: https://huggingface.co/settings/tokens"
-read -p "Press Enter when you're ready to proceed with Hugging Face login... "
-huggingface-cli login
-
-print_section "Setup complete!"
-echo "Your environment has been configured successfully."

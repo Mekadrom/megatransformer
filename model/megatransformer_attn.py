@@ -8,9 +8,9 @@ import torch.nn.functional as F
 
 
 class SelfAttentionOutput:
-    def __init__(self, hidden_states: torch.Tensor, past_key_values: megatransformer_utils.KVCache, attention_probs: torch.Tensor=None):
+    def __init__(self, hidden_states: torch.Tensor, past_key_values, attention_probs: torch.Tensor=None):
         self.hidden_states: torch.Tensor = hidden_states
-        self.past_key_values: megatransformer_utils.KVCache = past_key_values
+        self.past_key_values = past_key_values
         self.attention_probs: torch.Tensor = attention_probs
 
     def __deepspeed_tensor_attributes__(self):

@@ -21,7 +21,7 @@ class GenerationCallback(TrainerCallback):
                 outputs = model.generate(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
-                    use_cache=True,
+                    use_cache=False,
                     max_length=100,
                     num_return_sequences=1,
                     do_sample=True,
