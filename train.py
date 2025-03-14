@@ -61,6 +61,12 @@ argparser.add_argument('--lora_rank', type=int, default=16, help='Rank for LoRA 
 argparser.add_argument('--lora_alpha', type=int, default=32, help='Alpha for LoRA adaptation')
 argparser.add_argument('--lora_dropout', type=float, default=0.05, help='Dropout for LoRA adaptation')
 
+# logging
+argparser.add_argument('--logging_steps', type=int, default=100, help='Logging steps')
+argparser.add_argument('--eval_steps', type=int, default=1000, help='Evaluation steps')
+argparser.add_argument('--save_steps', type=int, default=500, help='Save steps')
+argparser.add_argument('--generation_steps', type=int, default=1000, help='Generation steps')
+
 args, unk = argparser.parse_known_args()
 
 print(f"unknown args: {unk}")
@@ -153,11 +159,11 @@ training_args = TrainingArguments(
     weight_decay=args.weight_decay,
     report_to="tensorboard",
     logging_dir=run_dir,
-    logging_steps=100,
+    logging_steps=args.logging_steps,
     eval_strategy="steps",
-    eval_steps=1000,
+    eval_steps=args.eval_steps,
     save_safetensors=False,
-    save_steps=500,
+    save_steps=args.save_steps,
     gradient_checkpointing=args.use_gradient_checkpointing,
     bf16=args.bf16,
     fp16=args.fp16,
@@ -195,7 +201,7 @@ trainer.add_callback(custom_callbacks.GenerationCallback(
     writer,
     tokenizer=tokenizer,
     prompts=prompts,
-    generation_steps=1000,
+    generation_steps=args.generation_steps,
 ))
 trainer.add_callback(custom_callbacks.PerplexityCallback(writer))
 
