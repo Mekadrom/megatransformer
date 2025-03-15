@@ -64,7 +64,10 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
 
             self.transformer = nn.ModuleList([*prelude, recurrent, *coda])
         
-        self.norm_final = megatransformer_utils.create_norm(config)
+        if config.use_final_norm:
+            self.norm_final = megatransformer_utils.create_norm(config)
+        else:
+            self.norm_final = None
         
         self.apply(self._init_weights)
 
@@ -161,7 +164,8 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
             if all_attentions:
                 all_attentions.append(attention_probs)
         
-        hidden_states = self.norm_final(hidden_states)
+        if self.norm_final is not None:
+            hidden_states = self.norm_final(hidden_states)
         
         if all_hidden_states is not None:
             all_hidden_states.append(hidden_states)

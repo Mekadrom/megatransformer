@@ -137,6 +137,7 @@ class MegaTransformerConfig(PretrainedConfig):
         post_attn_norm=False,
         pre_ffn_norm=True,
         post_ffn_norm=False,
+        use_final_norm=True,
 
         use_positional_embedding=True,
 
@@ -197,6 +198,7 @@ class MegaTransformerConfig(PretrainedConfig):
         self.post_attn_norm = post_attn_norm
         self.pre_ffn_norm = pre_ffn_norm
         self.post_ffn_norm = post_ffn_norm
+        self.use_final_norm = use_final_norm
 
         self.use_positional_embedding = use_positional_embedding
 
