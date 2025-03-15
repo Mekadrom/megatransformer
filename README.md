@@ -26,10 +26,8 @@ The following papers were used as a reference for feature implementations:
     * Introduces the idea of a slow gradient amplifier to stabilize training
 * [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202v1)
     * Introduces the idea of using GLU or variants of GLU (e.g. Swiglu) in the FFN layer of a transformer
-
-## Installation
-To install MegaTransformer, follow these steps:
-`pip install --index-url https://test.pypi.org/simple/ megatransformer`
+* [Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach](https://www.arxiv.org/abs/2502.05171)
+    * Introduces the idea of using a recurrent central block of transformer decoder layers with a stochastic number of iterations that unrolls to a larger model depending on the complexity of the task
 
 ## Usage
 To train using deepspeed with ZeRO-2 (best compatibility and performance trade-off), use the following command:
@@ -49,4 +47,4 @@ please do not touch anything
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ## Contact
-For any questions or feedback, please contact us at support@megatransformer.com.
+For any questions or feedback, please create an issue with whatever template you like.
