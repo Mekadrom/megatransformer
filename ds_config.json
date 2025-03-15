@@ -21,6 +21,10 @@
             "total_num_steps": "auto"
         }
     },
+
+    "zero_optimization": {
+        "stage": 0
+    },
     
     "fp16": {
         "enabled": "auto",
