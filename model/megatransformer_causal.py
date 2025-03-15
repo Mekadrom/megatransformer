@@ -366,6 +366,31 @@ def create_modern_model(tokenizer, max_position_embeddings):
         pad_token_id=tokenizer.pad_token_id,
     ))
 
+def create_modern_medium_model(tokenizer, max_position_embeddings):
+    # uses more modern approaches to causal language modeling (~536M params)
+    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        max_position_embeddings=max_position_embeddings,
+        hidden_size=1024,
+        n_layers=24,
+        d_queries=64,
+        d_values=64,
+        n_query_groups=16,
+        n_heads=16,
+        intermediate_size=4096,
+        intermediate_activation="swiglu",
+        norm_type="rmsnorm",
+        ffn_type="mlp",
+        use_positional_embedding=False,
+        use_sinusoidal_embedding=False,
+        use_rotary_embedding=True,
+        use_alibi_bias=False,
+        use_qkv_bias=False,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    ))
+
 def create_huginn_model(tokenizer, max_position_embeddings):
     # uses a recurrent approach to emulate a deeper model
     return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
@@ -387,3 +412,41 @@ def create_huginn_model(tokenizer, max_position_embeddings):
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     ))
+
+def create_huginn_sandwich_model(tokenizer, max_position_embeddings):
+    # uses a recurrent approach to emulate a deeper model
+    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        max_position_embeddings=max_position_embeddings,
+        n_layers=None,
+        n_prelude_layers=2,
+        n_recurrent_layers=4,
+        n_coda_layers=2,
+        intermediate_activation="swiglu",
+        norm_type="rmsnorm",
+        ffn_type="mlp",
+        # all norms enabled for sandwich norm
+        post_attn_norm=True,
+        post_ffn_norm=True,
+        use_positional_embedding=False,
+        use_sinusoidal_embedding=False,
+        use_rotary_embedding=False,
+        use_alibi_bias=True,
+        use_qkv_bias=False,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    ))
+
+lookup = { 
+    "gpt2": create_gpt2_model,
+    "modern": create_modern_model,
+    "modern_medium": create_modern_medium_model,
+    "huginn": create_huginn_model,
+    "huginn_sandwich": create_huginn_sandwich_model,
+}
+
+def model_config_lookup(config):
+    if config not in lookup:
+        raise ValueError(f"Unknown model configuration: {config}")
+    return lookup[config]

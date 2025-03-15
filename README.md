@@ -32,21 +32,14 @@ To install MegaTransformer, follow these steps:
 `pip install --index-url https://test.pypi.org/simple/ megatransformer`
 
 ## Usage
-To train using deepspeed, use the following command:
+To train using deepspeed with ZeRO-2 (best compatibility and performance trade-off), use the following command:
 ```bash
 deepspeed --num_gpus=2 train.py \
-  --use_deepspeed \
-  --deepspeed_config ds_config.json \
-  --zero_stage 3 \
-  --offload_optimizer \
-  --offload_param \
-  --bf16 \
-  --run_name "my_distributed_model" \
-  --batch_size 8 \
-  --gradient_accumulation_steps 4 \
-  --config modern \
-  --dataset_name wikitext \
-  --dataset_config_name wikitext-103-v1
+    --use_deepspeed \
+    --bf16 \
+    --run_name my_run_name \
+    --config modern \
+    --deepspeed_config ds_config_zero-2.json
 ```
 
 ## Contributing

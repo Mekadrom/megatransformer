@@ -15,7 +15,7 @@ class GrokFastMATrainer(Trainer):
         self.warmup = warmup
         self.grads = None
     
-    def training_step(self, model, inputs):
+    def training_step(self, model, inputs, num_items_in_batch=None):
         loss = super().training_step(model, inputs)
         # Apply gradfilter_ma after gradients are computed but before optimizer step
         self.grads = self.gradfilter_ma(model, self.grads, self.window_size, self.lamb, self.filter_type, self.warmup)
@@ -58,7 +58,7 @@ class GrokfastEMATrainer(Trainer):
         self.lamb = lamb
         self.grads = None
     
-    def training_step(self, model, inputs):
+    def training_step(self, model, inputs, num_items_in_batch=None):
         loss = super().training_step(model, inputs)
         # Apply gradfilter_ema after gradients are computed but before optimizer step
         self.grads = self.gradfilter_ema(model, self.grads, self.alpha, self.lamb)
@@ -80,6 +80,7 @@ class GrokfastEMATrainer(Trainer):
                 p.grad.data = p.grad.data + grads[n] * lamb
         
         return grads
+
 
 class DebugTrainer(Trainer):
     def get_train_dataloader(self):
@@ -105,3 +106,24 @@ class DebugTrainer(Trainer):
                     print(f"  Decoded: {decoded[:100]}...")
         
         return super().training_step(model, inputs)
+
+def trainer_lookup(argparser_args, trainer_name, default=Trainer):
+    if trainer_name == "grokfast_ema":\
+        return lambda *args, **kwargs: GrokfastEMATrainer(
+            *args,
+            alpha=argparser_args.grokfast_ema_alpha,
+            lamb=argparser_args.grokfast_ema_lambda,
+            **kwargs
+        )
+    elif trainer_name == "grokfast_ma":
+        return lambda *args, **kwargs: GrokFastMATrainer(
+            *args,
+            window_size=argparser_args.grokfast_ma_window_size,
+            lamb=argparser_args.grokfast_ma_lambda,
+            filter_type=argparser_args.grokfast_ma_filter_type,
+            warmup=argparser_args.grokfast_ma_warmup,
+            **kwargs
+        ),
+    elif trainer_name == "debug":
+        return DebugTrainer,
+    return default

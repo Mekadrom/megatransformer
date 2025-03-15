@@ -80,7 +80,7 @@ class MegaTransformerBlock(nn.Module):
         hidden_states = hidden_states + attn_output
 
         if self.post_attn_norm is not None:
-            attn_outputs = self.post_attn_norm(attn_outputs)
+            attn_outputs = self.post_attn_norm(attn_output)
 
         pre_ffn_input = self.pre_ffn_norm(hidden_states)
         ffn_output = self.ffn(pre_ffn_input)
