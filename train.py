@@ -1,101 +1,19 @@
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoTokenizer, TrainingArguments, DataCollatorForLanguageModeling
+from transformers import TrainingArguments, DataCollatorForLanguageModeling
 
-from model import megatransformer_causal
-
-import argparse
 import custom_callbacks
 import custom_trainers
 import megatransformer_utils
 import os
 
 
-is_tpu_available = megatransformer_utils.check_tpu_availability()
-print(f"TPU available: {is_tpu_available}")
-
-argparser = argparse.ArgumentParser()
-
-# meta params
-argparser.add_argument('--seed', type=int, default=42, help='Random seed')
-argparser.add_argument('--run_name', type=str, help='Name of the run')
-argparser.add_argument('--dataset_name', type=str, default='wikitext', help='Dataset name')
-argparser.add_argument('--dataset_config_name', type=str, default='wikitext-103-v1', help='Dataset config name')
-argparser.add_argument('--tokenizer_name', type=str, default="mistralai/Mistral-7B-v0.1", help='Tokenizer name')
-argparser.add_argument('--trainer', type=str, default="default", help='Trainer type: grokfast_ema, grokfast_ma, debug, or default')
-argparser.add_argument('--config', type=str, default="modern", help='Model configuration: gpt2, modern, or huginn')
-argparser.add_argument('--max_position_embeddings', type=int, default=1024, help='Max position embeddings (maximum sequence length)')
-
-# efficiency params
-argparser.add_argument('--compile_model', action='store_true', help='Whether to compile the model')
-argparser.add_argument('--use_gradient_checkpointing', action='store_true', help='Whether to use gradient checkpointing')
-argparser.add_argument('--use_xla', action='store_true', default=is_tpu_available, help='Whether to use XLA')
-
-# generic hyperparams
-argparser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate')
-argparser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
-argparser.add_argument('--num_train_epochs', type=int, default=3, help='Number of training epochs')
-argparser.add_argument('--batch_size', type=int, default=4, help='Batch size')
-argparser.add_argument('--gradient_accumulation_steps', type=int, default=32, help='Gradient accumulation steps')
-argparser.add_argument('--warmup_ratio', type=float, default=0.03, help='Warmup ratio')
-argparser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm')
-argparser.add_argument('--fp16', action='store_true', help='Whether to use fp16')
-argparser.add_argument('--bf16', action='store_true', help='Whether to use bf16')
-
-# grokfast hyperparams
-argparser.add_argument('--grokfast_ema_alpha', type=float, default=0.98, help='Alpha for GrokFast EMA trainer')
-argparser.add_argument('--grokfast_ema_lambda', type=float, default=2.0, help='Lambda for GrokFast EMA trainer')
-argparser.add_argument('--grokfast_ma_window_size', type=int, default=100, help='Window size for GrokFast MA trainer')
-argparser.add_argument('--grokfast_ma_lambda', type=float, default=5.0, help='Lambda for GrokFast MA trainer')
-argparser.add_argument('--grokfast_ma_filter_type', type=str, default='mean', help='Filter type for GrokFast MA trainer')
-argparser.add_argument('--grokfast_ma_warmup', action='store_true', help='Whether to use warmup for GrokFast MA trainer')
-
-# deepspeed
-argparser.add_argument('--use_deepspeed', action='store_true', help='Whether to use DeepSpeed')
-argparser.add_argument('--deepspeed_config', type=str, default='ds_config.json', help='DeepSpeed configuration file')
-argparser.add_argument('--zero_stage', type=int, default=3, help='ZeRO optimization stage (0, 1, 2, or 3)')
-argparser.add_argument('--offload_optimizer', action='store_true', help='Offload optimizer states to CPU')
-argparser.add_argument('--offload_param', action='store_true', help='Offload parameters to CPU')
-
-# peft lora/int8 training
-argparser.add_argument('--use_int8_peft', action='store_true', help='Use INT8 with PEFT/LoRA')
-argparser.add_argument('--use_int8_deepspeed', action='store_true', help='Use DeepSpeed INT8 quantization')
-argparser.add_argument('--lora_rank', type=int, default=16, help='Rank for LoRA adaptation')
-argparser.add_argument('--lora_alpha', type=int, default=32, help='Alpha for LoRA adaptation')
-argparser.add_argument('--lora_dropout', type=float, default=0.05, help='Dropout for LoRA adaptation')
-
-# logging
-argparser.add_argument('--logging_steps', type=int, default=100, help='Logging steps')
-argparser.add_argument('--eval_steps', type=int, default=1000, help='Evaluation steps')
-argparser.add_argument('--save_steps', type=int, default=500, help='Save steps')
-argparser.add_argument('--generation_steps', type=int, default=1000, help='Generation steps')
-
-args, unk = argparser.parse_known_args()
-
-print(f"unknown args: {unk}")
-
+args, unk = megatransformer_utils.parse_args()
 run_dir = os.path.join("runs", "causal", args.dataset_name, args.run_name)
 
-megatransformer_utils.set_seed_everywhere(args.seed)
+tokenizer, model = megatransformer_utils.load_model_and_tokenizer(args, run_dir)
 
-tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, add_bos_token=False)
-print(f"default tokenizer.padding_side: {tokenizer.padding_side}")
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.bos_token = tokenizer.eos_token
-tokenizer.padding_side = "right"
-print(f"modified tokenizer: {tokenizer}")
-
-model = megatransformer_causal.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
-model = megatransformer_utils.setup_int8_training(args, model)
-
-print(f"model structure: {model}")
-print(f"model parameters: {(sum(p.numel() for p in model.parameters())):,}")
-print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
-
-if args.use_deepspeed:
-    if os.path.exists(args.deepspeed_config):
-        print(f"Loading DeepSpeed config from {args.deepspeed_config}")
-    else:
-        raise FileNotFoundError(f"DeepSpeed config file {args.deepspeed_config} not found.")
+if not os.path.exists(run_dir):
+    os.makedirs(run_dir)
 
 writer = SummaryWriter(run_dir)
 training_args = TrainingArguments(
