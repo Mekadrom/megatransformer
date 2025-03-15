@@ -328,6 +328,7 @@ def parse_args():
     argparser.add_argument('--trainer', type=str, default="default", help='Trainer type: grokfast_ema, grokfast_ma, debug, or default')
     argparser.add_argument('--config', type=str, default="modern", help='Model configuration: gpt2, modern, or huginn')
     argparser.add_argument('--max_position_embeddings', type=int, default=1024, help='Max position embeddings (maximum sequence length)')
+    argparser.add_argument('--cpu', action='store_true', help='Use CPU for training')
 
     # efficiency params
     argparser.add_argument('--compile_model', action='store_true', help='Whether to compile the model')

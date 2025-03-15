@@ -53,6 +53,7 @@ training_args = TrainingArguments(
     max_grad_norm=args.max_grad_norm,
     torch_compile=args.compile_model and not args.use_deepspeed,
     deepspeed=args.deepspeed_config if args.use_deepspeed else None,
+    use_cpu=args.cpu
 )
 datasets = dataset_loading.load_dataset(args.dataset_name, args.dataset_config_name, tokenizer, args.max_position_embeddings)
 trainer = custom_trainers.trainer_lookup(args, args.trainer)(
@@ -74,7 +75,7 @@ trainer = custom_trainers.trainer_lookup(args, args.trainer)(
             ],
             generation_steps=args.generation_steps,
         ),
-        custom_callbacks.PerplexityCallback(writer)
+        custom_callbacks.MetricsCallback(writer)
     ]
 )
 

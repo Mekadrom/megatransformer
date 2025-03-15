@@ -76,7 +76,7 @@ trainer = SFTTrainer(
             ],
             generation_steps=args.generation_steps,
         ),
-        custom_callbacks.PerplexityCallback(writer)
+        custom_callbacks.MetricsCallback(writer)
     ]
 )
 

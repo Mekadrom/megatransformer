@@ -1,6 +1,7 @@
 from collections import deque
 from torch import nn
 from transformers import Trainer
+from transformers.integrations import TensorBoardCallback
 from typing import Optional, Literal
 
 import torch
@@ -107,7 +108,33 @@ class DebugTrainer(Trainer):
         
         return super().training_step(model, inputs)
 
-def trainer_lookup(argparser_args, trainer_name, default=Trainer):
+
+class DefaultTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        self.get_tensorboard_writer()
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
+        if self.writer is not None:
+            prefix = "train/" if model.training else "eval/"
+            if hasattr(outputs, "n_steps_no_grad") and hasattr(outputs, "k_steps_grad"):
+                self.log_steps(prefix, outputs.n_steps_no_grad, outputs.k_steps_grad)
+        return loss
+    
+    def log_steps(self, prefix, n_steps_no_grad, k_steps_grad):
+        self.writer.add_scalar(f"{prefix}n_steps_no_grad", n_steps_no_grad, self.state.global_step)
+        self.writer.add_scalar(f"{prefix}k_steps_grad", k_steps_grad, self.state.global_step)
+
+    def get_tensorboard_writer(self):
+        for callback in self.callback_handler.callbacks:
+            if isinstance(callback, TensorBoardCallback):
+                self.writer = callback.tb_writer
+                break
+
+        if not hasattr(self, "writer"):
+            print("Warning: No TensorBoard writer found. Please check your callback setup.")
+            self.writer = None
+
+
+def trainer_lookup(argparser_args, trainer_name, default=DefaultTrainer):
     if trainer_name == "grokfast_ema":\
         return lambda *args, **kwargs: GrokfastEMATrainer(
             *args,

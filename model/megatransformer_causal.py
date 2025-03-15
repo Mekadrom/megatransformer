@@ -141,6 +141,7 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         all_hidden_states: Optional[list] = [] if output_hidden_states else None
         all_attentions: Optional[list] = [] if output_attentions else None
         
+        recurrent_outputs = None
         for i, (block, past_key_value) in enumerate(zip(self.transformer, past_key_values)):
             if all_hidden_states is not None:
                 all_hidden_states.append(hidden_states)
@@ -154,6 +155,9 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states
             )
+
+            if isinstance(block, megatransformer.MegaTransformerRecurrentBlock):
+                recurrent_outputs = outputs
 
             hidden_states = outputs.hidden_states
             attention_probs = outputs.attention_probs
@@ -176,8 +180,8 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
                 past_key_values,
                 all_hidden_states,
                 all_attentions,
-                outputs.n_steps_no_grad if hasattr(outputs, "n_steps_no_grad") else None,
-                outputs.k_steps_grad if hasattr(outputs, "k_steps_grad") else None,
+                recurrent_outputs.n_steps_no_grad if recurrent_outputs is not None else None,
+                recurrent_outputs.k_steps_grad if recurrent_outputs is not None else None,
             )
         
         return MegaTransformerCausalOutput(
@@ -185,8 +189,8 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
-            n_steps_no_grad=outputs.n_steps_no_grad if hasattr(outputs, "n_steps_no_grad") else None,
-            k_steps_grad=outputs.k_steps_grad if hasattr(outputs, "k_steps_grad") else None,
+            n_steps_no_grad=recurrent_outputs.n_steps_no_grad if recurrent_outputs is not None else None,
+            k_steps_grad=recurrent_outputs.k_steps_grad if recurrent_outputs is not None else None,
         )
     
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask: torch.Tensor=None, **kwargs):
@@ -303,7 +307,7 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        
+
         if return_dict:
             # dict
             hidden_states = transformer_outputs.logits
@@ -334,8 +338,8 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
-            n_steps_no_grad=transformer_outputs.n_steps_no_grad,
-            k_steps_grad=transformer_outputs.k_steps_grad,
+            n_steps_no_grad=transformer_outputs.n_steps_no_grad if hasattr(transformer_outputs, "n_steps_no_grad") else None,
+            k_steps_grad=transformer_outputs.k_steps_grad if hasattr(transformer_outputs, "k_steps_grad") else None,
         )
     
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
@@ -442,12 +446,42 @@ def create_huginn_sandwich_model(tokenizer, max_position_embeddings):
         pad_token_id=tokenizer.pad_token_id,
     ))
 
+
+def create_test_tiny_huginn_model(tokenizer, max_position_embeddings):
+    # uses a recurrent approach to emulate a deeper model
+    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        max_position_embeddings=max_position_embeddings,
+        n_layers=None,
+        hidden_size=64,
+        d_queries=16,
+        d_values=16,
+        n_query_groups=4,
+        n_heads=4,
+        intermediate_size=256,
+        n_prelude_layers=1,
+        n_recurrent_layers=1,
+        n_coda_layers=1,
+        intermediate_activation="relu",
+        norm_type="layernorm",
+        ffn_type="mlp",
+        use_positional_embedding=False,
+        use_sinusoidal_embedding=False,
+        use_rotary_embedding=True,
+        use_alibi_bias=False,
+        use_qkv_bias=False,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    ))
+
 lookup = { 
     "gpt2": create_gpt2_model,
     "modern": create_modern_model,
     "modern_medium": create_modern_medium_model,
     "huginn": create_huginn_model,
     "huginn_sandwich": create_huginn_sandwich_model,
+    "test_tiny_huginn": create_test_tiny_huginn_model,
 }
 
 def model_config_lookup(config):
