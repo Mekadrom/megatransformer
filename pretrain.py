@@ -5,6 +5,7 @@ from model import megatransformer_causal
 
 import custom_callbacks
 import custom_trainers
+import dataset_loading
 import megatransformer_utils
 import os
 
@@ -21,7 +22,7 @@ print(f"modified tokenizer: {tokenizer}")
 
 model = megatransformer_causal.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
 model = megatransformer_utils.setup_int8_training(args, model)
-model = megatransformer_utils.load_model(args.finetune, model, run_dir)
+model = megatransformer_utils.load_model(False, model, run_dir)
 
 if not os.path.exists(run_dir):
     os.makedirs(run_dir)
@@ -53,7 +54,7 @@ training_args = TrainingArguments(
     torch_compile=args.compile_model and not args.use_deepspeed,
     deepspeed=args.deepspeed_config if args.use_deepspeed else None,
 )
-datasets = megatransformer_utils.make_datasets(args.dataset_name, args.dataset_config_name, tokenizer, args.max_position_embeddings)
+datasets = dataset_loading.load_dataset(args.dataset_name, args.dataset_config_name, tokenizer, args.max_position_embeddings)
 trainer = custom_trainers.trainer_lookup(args, args.trainer)(
     model=model,
     args=training_args,

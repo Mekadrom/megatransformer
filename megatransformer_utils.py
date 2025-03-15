@@ -1,4 +1,3 @@
-from datasets import load_dataset
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
 from transformers import PretrainedConfig
 from transformers import set_seed as hf_set_seed
@@ -12,7 +11,6 @@ import math
 import numpy as np
 import os
 import random
-import re
 import torch
 import torch.nn as nn
 
@@ -273,42 +271,6 @@ def create_norm(config):
     else:
         raise Exception(f"Unknown normalization type {config.norm_type}")
 
-def make_datasets(name, config_name, tokenizer, max_position_embeddings):
-    dataset = load_dataset(name, config_name)
-    def clean_dataset(examples):
-        texts: list[str] = examples["text"]
-        cleaned_texts = []
-        for text in texts:
-            # replace special tokens
-            cleaned = text.replace("@-@", "-")
-            cleaned = cleaned.replace("@,@", ",")
-            cleaned = cleaned.replace("@.@", ".")
-            
-            # fix spaces around punctuation
-            for punct in ",.!?;:)]\"'":
-                cleaned = cleaned.replace(f" {punct}", punct)
-            
-            for punct in "([\"'":
-                cleaned = cleaned.replace(f"{punct} ", punct)
-            
-            # fix double spaces
-            cleaned = re.sub(r' {2,}', ' ', cleaned)
-            
-            # normalize multiple newlines
-            cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-            
-            if not cleaned.strip():
-                continue
-
-            cleaned_texts.append(cleaned)
-        return {"text": cleaned_texts}
-
-    def tokenize_function(examples):
-        return tokenizer(examples['text'], truncation=True, max_length=max_position_embeddings)
-
-    dataset = dataset.map(clean_dataset, batched=True)
-    return dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-
 # function definitions for args/initialization shared by pretrain and finetune scripts
 def check_tpu_availability():
     try:
@@ -366,7 +328,6 @@ def parse_args():
     argparser.add_argument('--trainer', type=str, default="default", help='Trainer type: grokfast_ema, grokfast_ma, debug, or default')
     argparser.add_argument('--config', type=str, default="modern", help='Model configuration: gpt2, modern, or huginn')
     argparser.add_argument('--max_position_embeddings', type=int, default=1024, help='Max position embeddings (maximum sequence length)')
-    argparser.add_argument('--finetune', action='store_true', help='Whether to fine-tune the model. This enforces a check to load a model from a checkpoint.')
 
     # efficiency params
     argparser.add_argument('--compile_model', action='store_true', help='Whether to compile the model')

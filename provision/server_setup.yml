@@ -1,0 +1,92 @@
+---
+- name: Setup development environment
+  hosts: all
+  become: yes
+  vars:
+    ssh_public_key: "{{ ssh_public_key }}"  # Public key content to add
+    repo_url: "{{ repo_url }}"              # Git repository URL
+    project_dir: "~/project"                # Project directory location
+    install_pytorch: true                   # Whether to install PyTorch
+    pytorch_version: "cu124"                # CUDA version for PyTorch
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade system packages
+      apt:
+        upgrade: yes
+        force_apt_get: yes
+        dpkg_options: 'force-confdef,force-confold'
+
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Notify about reboot requirement
+      debug:
+        msg: "System requires a reboot. You should reboot the server after this playbook completes."
+      when: reboot_required.stat.exists
+
+    - name: Ensure .ssh directory exists
+      file:
+        path: "~/.ssh"
+        state: directory
+        mode: '0700'
+      become: no
+
+    - name: Add GitHub SSH key
+      copy:
+        content: "{{ ssh_public_key }}"
+        dest: "~/.ssh/github_key.pub"
+        mode: '0644'
+      become: no
+
+    - name: Generate SSH config file
+      blockinfile:
+        path: "~/.ssh/config"
+        create: yes
+        mode: '0600'
+        block: |
+          Host github.com
+              IdentityFile ~/.ssh/github_key
+              IdentitiesOnly yes
+      become: no
+
+    - name: Clone git repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ project_dir }}"
+        accept_hostkey: yes
+      become: no
+      when: repo_url is defined and repo_url != ""
+
+    - name: Install PyTorch with CUDA support
+      shell: pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/{{ pytorch_version }}
+      args:
+        chdir: "{{ project_dir }}"
+      become: no
+      when: install_pytorch | bool
+
+    - name: Check if requirements.txt exists
+      stat:
+        path: "{{ project_dir }}/requirements.txt"
+      register: requirements_file
+      become: no
+      when: repo_url is defined and repo_url != ""
+
+    - name: Install Python requirements
+      pip:
+        requirements: "{{ project_dir }}/requirements.txt"
+      become: no
+      when: requirements_file.stat is defined and requirements_file.stat.exists
+
+    - name: Configure global git credential helper
+      git_config:
+        name: credential.helper
+        scope: global
+        value: store
+      become: no
