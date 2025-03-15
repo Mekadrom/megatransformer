@@ -7,6 +7,7 @@ import torch
 import time
 
 argparser = argparse.ArgumentParser()
+argparser.add_argument("--logging_base_dir", type=str, default=os.path.join('runs', 'causal'), help="Base directory for logging")
 argparser.add_argument("--run_name", type=str, required=True, help="Name of the run")
 argparser.add_argument("--tokenizer_name", type=str, default="mistralai/Mistral-7B-v0.1", help="Tokenizer name")
 argparser.add_argument("--dataset_path", type=str, default="wikitext", help="Path to the dataset")

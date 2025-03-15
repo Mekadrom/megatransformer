@@ -321,6 +321,7 @@ def parse_args():
 
     # meta params
     argparser.add_argument('--seed', type=int, default=42, help='Random seed')
+    argparser.add_argument('--logging_base_dir', type=str, default=os.path.join('runs', 'causal'), help='Base directory for logging')
     argparser.add_argument('--run_name', type=str, help='Name of the run')
     argparser.add_argument('--dataset_name', type=str, default='wikitext', help='Dataset name')
     argparser.add_argument('--dataset_config_name', type=str, default='wikitext-103-v1', help='Dataset config name')
@@ -450,3 +451,13 @@ def load_model(finetune, model, run_dir):
     print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
 
     return model
+
+
+def get_token_correlation(hidden_states):
+    x_c = hidden_states - hidden_states.mean(dim=1, keepdim=True)
+
+    normed_x = x_c / x_c.norm(dim=-1, keepdim=True)
+
+    token_correlation = (normed_x @ normed_x.transpose(1, 2)).mean() - (1 / hidden_states.shape[1])
+
+    return token_correlation

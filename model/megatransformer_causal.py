@@ -164,6 +164,8 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
 
             if hasattr(outputs, "all_hidden_states") and all_hidden_states is not None:
                 all_hidden_states.extend(outputs.all_hidden_states)
+            elif hasattr(outputs, "hidden_states") and all_hidden_states is not None:
+                all_hidden_states.append(outputs.hidden_states)
             
             if all_attentions:
                 all_attentions.append(attention_probs)

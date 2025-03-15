@@ -4,6 +4,7 @@ from transformers import Trainer
 from transformers.integrations import TensorBoardCallback
 from typing import Optional, Literal
 
+import megatransformer_utils
 import torch
 
 
@@ -112,11 +113,17 @@ class DebugTrainer(Trainer):
 class DefaultTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self.get_tensorboard_writer()
+        inputs["output_hidden_states"] = True
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
-        if self.writer is not None:
+
+        if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
             if hasattr(outputs, "n_steps_no_grad") and hasattr(outputs, "k_steps_grad"):
                 self.log_steps(prefix, outputs.n_steps_no_grad, outputs.k_steps_grad)
+            if hasattr(outputs, "hidden_states"):
+                for i, hidden_state in enumerate(outputs.hidden_states):
+                    token_correlation = megatransformer_utils.get_token_correlation(hidden_state)
+                    self.writer.add_scalar(f"{prefix}token_correlation_{i}", token_correlation, self.state.global_step)
         return loss
     
     def log_steps(self, prefix, n_steps_no_grad, k_steps_grad):
@@ -135,7 +142,7 @@ class DefaultTrainer(Trainer):
 
 
 def trainer_lookup(argparser_args, trainer_name, default=DefaultTrainer):
-    if trainer_name == "grokfast_ema":\
+    if trainer_name == "grokfast_ema":
         return lambda *args, **kwargs: GrokfastEMATrainer(
             *args,
             alpha=argparser_args.grokfast_ema_alpha,

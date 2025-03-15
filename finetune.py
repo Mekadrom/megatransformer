@@ -14,7 +14,7 @@ import os
 
 
 args, unk = megatransformer_utils.parse_args()
-run_dir = os.path.join("runs", "causal", args.dataset_name, args.run_name)
+run_dir = os.path.join(args.logging_base_dir, args.dataset_name, args.run_name)
 
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, add_bos_token=False)
 print(f"default tokenizer.padding_side: {tokenizer.padding_side}")
