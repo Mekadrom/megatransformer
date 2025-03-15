@@ -24,8 +24,8 @@ tokenizer.padding_side = "right"
 print(f"modified tokenizer: {tokenizer}")
 
 model = megatransformer_causal.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
-model = megatransformer_utils.setup_int8_training(args, model)
 model = megatransformer_utils.load_model(True, model, run_dir)
+model = megatransformer_utils.setup_int8_training(args, model)
 
 if not os.path.exists(run_dir):
     os.makedirs(run_dir)
