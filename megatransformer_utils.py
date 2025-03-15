@@ -1,10 +1,10 @@
 from datasets import load_dataset
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import PretrainedConfig
 from transformers import set_seed as hf_set_seed
 from typing import Optional
 
-from model import megatransformer_causal, rmsnorm, swiglu
+from model import rmsnorm, swiglu
 
 import argparse
 import glob
@@ -454,17 +454,7 @@ def setup_int8_training(args, model):
     else:
         return model
 
-def load_model_and_tokenizer(args, run_dir):
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, add_bos_token=False)
-    print(f"default tokenizer.padding_side: {tokenizer.padding_side}")
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.bos_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-    print(f"modified tokenizer: {tokenizer}")
-
-    model = megatransformer_causal.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
-    model = setup_int8_training(args, model)
-
+def load_model(finetune, model, run_dir):
     # load if model file exists
     if os.path.exists(run_dir):
         globbed_checkpoint_folders = glob.glob(os.path.join(run_dir, "checkpoint-*", "pytorch_model.bin"))
@@ -488,11 +478,11 @@ def load_model_and_tokenizer(args, run_dir):
 
     if not model_loaded:
         print("Model not loaded from checkpoint.")
-        if args.finetune:
+        if finetune:
             raise ValueError("Fine-tuning is enabled but no checkpoint found. Please check the run directory, or your configuration.")
 
     print(f"model structure: {model}")
     print(f"model parameters: {(sum(p.numel() for p in model.parameters())):,}")
     print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
 
-    return tokenizer, model
+    return model

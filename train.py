@@ -1,5 +1,7 @@
 from torch.utils.tensorboard import SummaryWriter
-from transformers import TrainingArguments, DataCollatorForLanguageModeling
+from transformers import AutoTokenizer, TrainingArguments, DataCollatorForLanguageModeling
+
+from model import megatransformer_causal
 
 import custom_callbacks
 import custom_trainers
@@ -10,7 +12,16 @@ import os
 args, unk = megatransformer_utils.parse_args()
 run_dir = os.path.join("runs", "causal", args.dataset_name, args.run_name)
 
-tokenizer, model = megatransformer_utils.load_model_and_tokenizer(args, run_dir)
+tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, add_bos_token=False)
+print(f"default tokenizer.padding_side: {tokenizer.padding_side}")
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.bos_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+print(f"modified tokenizer: {tokenizer}")
+
+model = megatransformer_causal.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
+model = megatransformer_utils.setup_int8_training(args, model)
+tokenizer, model = megatransformer_utils.load_model(args.finetune, model, run_dir)
 
 if not os.path.exists(run_dir):
     os.makedirs(run_dir)
