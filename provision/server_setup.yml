@@ -3,11 +3,12 @@
   hosts: all
   become: yes
   vars:
-    ssh_public_key: "{{ ssh_public_key }}"  # Public key content to add
-    repo_url: "{{ repo_url }}"              # Git repository URL
-    project_dir: "~/project"                # Project directory location
-    install_pytorch: true                   # Whether to install PyTorch
-    pytorch_version: "cu124"                # CUDA version for PyTorch
+    ssh_public_key: "{{ ssh_public_key }}"   # Public key content to add
+    ssh_private_key: "{{ ssh_private_key }}" # Private key content to add
+    repo_url: "{{ repo_url }}"               # Git repository URL
+    project_dir: "~/project"                 # Project directory location
+    install_pytorch: true                    # Whether to install PyTorch
+    pytorch_version: "cu124"                 # CUDA version for PyTorch
 
   tasks:
     - name: Update apt cache
@@ -45,6 +46,13 @@
         mode: '0644'
       become: no
 
+    - name: Add GitHub SSH private key
+      copy:
+        content: "{{ ssh_private_key }}"
+        dest: "~/.ssh/github_key"
+        mode: '0600'
+      become: no
+
     - name: Generate SSH config file
       blockinfile:
         path: "~/.ssh/config"
@@ -69,7 +77,6 @@
       args:
         chdir: "{{ project_dir }}"
       become: no
-      when: install_pytorch | bool
 
     - name: Check if requirements.txt exists
       stat:

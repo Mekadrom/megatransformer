@@ -1,5 +1,4 @@
-import generic_unprocessed
-import wikitext
+from dataset_loading import generic_unprocessed, wikitext
 
 def load_dataset(
     dataset_name: str,
