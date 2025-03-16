@@ -124,9 +124,11 @@ class DefaultTrainer(Trainer):
                 for i, hidden_state in enumerate(outputs.hidden_states):
                     token_correlation = megatransformer_utils.get_token_correlation(hidden_state)
                     self.writer.add_scalar(f"{prefix}token_correlation_{i}", token_correlation, self.state.global_step)
-        return loss
+        return (loss, outputs) if return_outputs else loss
     
     def log_steps(self, prefix, n_steps_no_grad, k_steps_grad):
+        if n_steps_no_grad is None or k_steps_grad is None:
+            return
         self.writer.add_scalar(f"{prefix}n_steps_no_grad", n_steps_no_grad, self.state.global_step)
         self.writer.add_scalar(f"{prefix}k_steps_grad", k_steps_grad, self.state.global_step)
 

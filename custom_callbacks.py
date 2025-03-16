@@ -11,7 +11,10 @@ import torch
 def get_writer(trainer: Trainer):
     for callback in trainer.callback_handler.callbacks:
         if isinstance(callback, TensorBoardCallback):
-            return callback.tb_writer
+            if callback.tb_writer is not None:
+                return callback.tb_writer
+            
+    return None
 
 
 class GenerationCallback(TrainerCallback):
@@ -22,12 +25,12 @@ class GenerationCallback(TrainerCallback):
         self.generation_steps = generation_steps
         
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        writer = get_writer(self.trainer)
-        if writer is None:
-            print("No TensorBoard writer found, skipping generation...")
-            return
-
         if ((state.global_step == 1) or (state.global_step % self.generation_steps == 0)) and state.is_world_process_zero:
+            writer = get_writer(self.trainer)
+            if writer is None:
+                print("No TensorBoard writer found, skipping generation...")
+                return
+
             inputs = self.tokenizer(self.prompts, padding=True, return_tensors="pt").to(model.device)
 
             print(f"Generating text at step {state.global_step}...")
@@ -69,7 +72,7 @@ class MetricsCallback(TrainerCallback):
         model = kwargs.get("model", None)
         tokenizer = kwargs.get("processing_class", None)
         if model is not None and tokenizer is not None:
-            embedding_weights = model.get_input_embeddings().weight.data.cpu().numpy()
+            embedding_weights = model.get_input_embeddings().weight.data.clone().to(torch.float32).cpu().numpy()
             vocab = tokenizer.get_vocab()
             sorted_vocab = sorted(vocab.items(), key=lambda x: x[1])
             tokens = [token for token, _ in sorted_vocab]
