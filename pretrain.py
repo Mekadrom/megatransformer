@@ -56,6 +56,19 @@ training_args = TrainingArguments(
     use_cpu=args.cpu
 )
 datasets = dataset_loading.load_dataset(args.dataset_name, args.dataset_config_name, tokenizer, args.max_position_embeddings)
+
+generation_callback = custom_callbacks.GenerationCallback(
+    tokenizer=tokenizer,
+    prompts=[
+        "In this paper, we propose a novel approach to",
+        "The Higgs boson, sometimes called the Higgs particle, is",
+        "The capital of France is",
+        "2 + 2 ="
+    ],
+    generation_steps=args.generation_steps,
+)
+metrics_callback = custom_callbacks.MetricsCallback()
+
 trainer = custom_trainers.trainer_lookup(args, args.trainer)(
     model=model,
     args=training_args,
@@ -63,20 +76,10 @@ trainer = custom_trainers.trainer_lookup(args, args.trainer)(
     train_dataset=datasets["train"],
     eval_dataset=datasets["validation"],
     processing_class=tokenizer,
-    callbacks=[
-        custom_callbacks.GenerationCallback(
-            writer,
-            tokenizer=tokenizer,
-            prompts=[
-                "In this paper, we propose a novel approach to",
-                "The Higgs boson, sometimes called the Higgs particle, is",
-                "The capital of France is",
-                "2 + 2 ="
-            ],
-            generation_steps=args.generation_steps,
-        ),
-        custom_callbacks.MetricsCallback(writer)
-    ]
+    callbacks=[generation_callback, metrics_callback]
 )
+
+generation_callback.trainer = trainer
+metrics_callback.trainer = trainer
 
 trainer.train()
