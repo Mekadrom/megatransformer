@@ -29,7 +29,7 @@ if not os.path.exists(run_dir):
 
 writer = SummaryWriter(run_dir)
 training_args = TrainingArguments(
-    # tpu_num_cores=8 if args.use_xla else None,
+    tpu_num_cores=8 if args.use_xla else None,
     output_dir=run_dir,
     overwrite_output_dir=True,
     learning_rate=args.learning_rate,
@@ -51,9 +51,11 @@ training_args = TrainingArguments(
     bf16=args.bf16,
     fp16=args.fp16,
     max_grad_norm=args.max_grad_norm,
-    torch_compile=args.compile_model and not args.use_deepspeed,
-    deepspeed=args.deepspeed_config if args.use_deepspeed else None,
-    use_cpu=args.cpu
+    torch_compile=args.compile_model and not args.use_deepspeed and not args.use_xla,
+    deepspeed=args.deepspeed_config if args.use_deepspeed and not args.use_xla else None,
+    use_cpu=args.cpu,
+    log_level=args.log_level,
+    logging_first_step=True,
 )
 datasets = dataset_loading.load_dataset(args.dataset_name, args.dataset_config_name, tokenizer, args.max_position_embeddings)
 
@@ -82,4 +84,5 @@ trainer = custom_trainers.trainer_lookup(args, args.trainer)(
 generation_callback.trainer = trainer
 metrics_callback.trainer = trainer
 
+print(f"Starting training with {sum(p.numel() for p in model.parameters()):,} parameters")
 trainer.train()

@@ -1,6 +1,8 @@
 from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
 
+from model import swiglu
+
 import math
 import megatransformer_utils
 import torch
@@ -31,6 +33,14 @@ class MegaTransformerSelfAttention(nn.Module):
         self.q_proj = nn.Linear(config.hidden_size, self.n_query_groups * self.d_queries, bias=config.use_qkv_bias)
         self.k_proj = nn.Linear(config.hidden_size, self.n_heads * self.d_queries, bias=config.use_qkv_bias)
         self.v_proj = nn.Linear(config.hidden_size, self.n_heads * self.d_values, bias=config.use_qkv_bias)
+
+        self.heads_activation = None
+        if config.heads_activation is not None:
+            activation_type = megatransformer_utils.get_activation_function(config.heads_activation)
+            if activation_type == swiglu.SwiGLU:
+                self.heads_activation = swiglu.SwiGLU(config.d_values)
+            else:
+                self.heads_activation = activation_type()
 
         self.rotary_embedding = None
         if bool(config.use_rotary_embedding):
@@ -65,6 +75,11 @@ class MegaTransformerSelfAttention(nn.Module):
         queries = self.q_proj(hidden_states)
         keys = self.k_proj(hidden_states)
         values = self.v_proj(hidden_states)
+
+        if self.heads_activation is not None:
+            queries = self.heads_activation(queries)
+            keys = self.heads_activation(keys)
+            values = self.heads_activation(values)
 
         if self.rotary_embedding is not None:
             queries = self.rotary_embedding.rotate_queries_or_keys(queries)

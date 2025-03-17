@@ -10,8 +10,8 @@ argparser = argparse.ArgumentParser()
 argparser.add_argument("--logging_base_dir", type=str, default=os.path.join('runs', 'causal'), help="Base directory for logging")
 argparser.add_argument("--run_name", type=str, required=True, help="Name of the run")
 argparser.add_argument("--tokenizer_name", type=str, default="mistralai/Mistral-7B-v0.1", help="Tokenizer name")
-argparser.add_argument("--dataset_path", type=str, default="wikitext", help="Path to the dataset")
-argparser.add_argument("--config", type=str, default="modern", help="Model configuration: gpt2, modern, or huginn")
+argparser.add_argument("--dataset_name", type=str, default="wikitext", help="Path to the dataset")
+argparser.add_argument("--config", type=str, default="modern_small", help="Model configuration: gpt2, modern, or huginn")
 argparser.add_argument("--max_position_embeddings", type=int, default=1024, help="Max position embeddings (maximum sequence length)")
 argparser.add_argument("--max_test_length", type=int, default=256, help="Maximum length for test generation")
 argparser.add_argument("--compile_model", action="store_true", help="Whether to compile the model")
@@ -22,16 +22,9 @@ args = argparser.parse_args()
 
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
 
-if args.config == "gpt2":
-    model_maker = megatransformer_causal.create_gpt2_model
-elif args.config == "huginn":
-    model_maker = megatransformer_causal.create_huginn_model
-else:
-    model_maker = megatransformer_causal.create_modern_model
+model = megatransformer_causal.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
 
-model = model_maker(tokenizer, args.max_position_embeddings)
-
-model_file_path = os.path.join("runs", "causal", args.dataset_path, args.run_name, "pytorch_model.bin")
+model_file_path = os.path.join(args.logging_base_dir, args.dataset_name, args.run_name, "pytorch_model.bin")
 if os.path.exists(model_file_path):
     print(f"Loading model from {model_file_path}")
     model.load_state_dict(torch.load(model_file_path), strict=False)
@@ -63,10 +56,10 @@ while True:
             max_length=args.max_test_length,
             num_return_sequences=1,
             do_sample=True,
-            top_p=0.92,
-            temperature=0.7,
+            top_p=0.99,
+            temperature=0.9,
         )
         print(f"Generation time: {time.time() - start:.2f} seconds")
     
     generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    print(f"Generated text: {generated_texts}")
+    print(f"Generated text: {generated_texts[0]}")

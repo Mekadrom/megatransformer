@@ -348,7 +348,7 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
         return self.transformer.prepare_inputs_for_generation(input_ids, **kwargs)
 
 
-def create_gpt2_model(tokenizer, max_position_embeddings):
+def create_gpt2_small_model(tokenizer, max_position_embeddings):
     # gpt2-small closest equivalent (~124M params)
     return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
@@ -358,7 +358,7 @@ def create_gpt2_model(tokenizer, max_position_embeddings):
         pad_token_id=tokenizer.pad_token_id,
     ))
 
-def create_modern_model(tokenizer, max_position_embeddings):
+def create_modern_small_model(tokenizer, max_position_embeddings):
     # uses more modern approaches to causal language modeling (~148M params)
     return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
@@ -401,7 +401,7 @@ def create_modern_medium_model(tokenizer, max_position_embeddings):
         pad_token_id=tokenizer.pad_token_id,
     ))
 
-def create_huginn_model(tokenizer, max_position_embeddings):
+def create_huginn_small_model(tokenizer, max_position_embeddings):
     # uses a recurrent approach to emulate a deeper model (~120M params)
     return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
@@ -423,7 +423,7 @@ def create_huginn_model(tokenizer, max_position_embeddings):
         pad_token_id=tokenizer.pad_token_id,
     ))
 
-def create_huginn_sandwich_model(tokenizer, max_position_embeddings):
+def create_huginn_small_model_with_sandwich_norm(tokenizer, max_position_embeddings):
     # uses a recurrent approach to emulate a deeper model
     return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
@@ -506,11 +506,11 @@ def create_test_tiny_huginn_model(tokenizer, max_position_embeddings):
     ))
 
 lookup = { 
-    "gpt2": create_gpt2_model,
-    "modern": create_modern_model,
+    "gpt2_small": create_gpt2_small_model,
+    "modern_small": create_modern_small_model,
     "modern_medium": create_modern_medium_model,
-    "huginn": create_huginn_model,
-    "huginn_sandwich": create_huginn_sandwich_model,
+    "huginn_small": create_huginn_small_model,
+    "huginn_small_sandwich": create_huginn_small_model_with_sandwich_norm,
     "huginn_medium": create_huginn_medium_model,
     "test_tiny_huginn": create_test_tiny_huginn_model,
 }

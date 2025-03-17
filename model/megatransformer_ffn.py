@@ -23,6 +23,7 @@ class SimpleFFN(nn.Module):
         hidden_states = self.dropout(hidden_states)
         return hidden_states
 
+
 class GateFFN(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__()
@@ -42,3 +43,16 @@ class GateFFN(nn.Module):
         hidden_states = self.condense(hidden_states)
         hidden_states = self.dropout(hidden_states)
         return hidden_states
+
+
+class ActivationFFN(nn.Module):
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
+        super().__init__()
+        activation_type = megatransformer_utils.get_activation_function(config.intermediate_activation)
+        if activation_type == swiglu.SwiGLU:
+            self.activation = swiglu.SwiGLU(config.intermediate_size)
+        else:
+            self.activation = activation_type()
+
+    def forward(self, hidden_states):
+        return self.activation(hidden_states)

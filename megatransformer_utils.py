@@ -111,6 +111,7 @@ class MegaTransformerConfig(PretrainedConfig):
         d_values=64,
         n_query_groups=12,
         n_heads=12,
+        heads_activation=None,
         intermediate_size=3072,
         intermediate_activation="gelu",
         hidden_dropout_prob=0.1,
@@ -169,6 +170,7 @@ class MegaTransformerConfig(PretrainedConfig):
         self.d_values = d_values
         self.n_query_groups = n_query_groups
         self.n_heads = n_heads
+        self.heads_activation = heads_activation
         self.intermediate_size = intermediate_size
         self.intermediate_activation = intermediate_activation
         self.hidden_dropout_prob = hidden_dropout_prob
@@ -330,6 +332,7 @@ def parse_args():
     argparser.add_argument('--config', type=str, default="modern", help='Model configuration: gpt2, modern, or huginn')
     argparser.add_argument('--max_position_embeddings', type=int, default=1024, help='Max position embeddings (maximum sequence length)')
     argparser.add_argument('--cpu', action='store_true', help='Use CPU for training')
+    argparser.add_argument('--log_level', type=str, default='info', help='Logging level: debug, info, warning, error, critical')
 
     # efficiency params
     argparser.add_argument('--compile_model', action='store_true', help='Whether to compile the model')
@@ -377,7 +380,20 @@ def parse_args():
 
     args, unk = argparser.parse_known_args()
 
-    print(f"unknown args: {unk}")
+    if args.dataset_config_name == '' or args.dataset_config_name == 'None':
+        setattr(args, 'dataset_config_name', None)
+
+    if unk and len(unk) > 0:
+        print(f"unknown args: {unk}")
+
+    if args.use_xla and args.use_deepspeed:
+        raise ValueError("DeepSpeed is not supported with TPU training. Please use CPU or GPU, or disable DeepSpeed.")
+    
+    if args.use_xla and args.use_int8_peft:
+        raise ValueError("INT8 training with PEFT is not supported with TPU training. Please use CPU or GPU, or disable INT8 training.")
+    
+    if args.use_xla and args.fp16:
+        raise ValueError("FP16 training is not supported with TPU training. Please only enable BF16, or disable FP16 training.")
 
     set_seed_everywhere(args.seed)
 
