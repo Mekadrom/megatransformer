@@ -9,7 +9,9 @@ def load_dataset(
     dataset_name: str,
     dataset_config_name: str,
     tokenizer,
-    max_position_embeddings: int
+    max_position_embeddings: int,
+    streaming: bool = False,
+    save_path: str = None,
 ):
     print(f"Loading dataset {dataset_name} with config {dataset_config_name}")
     streaming = "fineweb" in dataset_name.lower()
@@ -26,7 +28,8 @@ def load_dataset(
             dataset_config_name,
             tokenizer,
             max_position_embeddings,
-            streaming=streaming
+            streaming=streaming,
+            save_path=save_path
         )
 
     if "validation" not in dataset:

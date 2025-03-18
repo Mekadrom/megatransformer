@@ -1,4 +1,6 @@
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
+
+import os
 
 
 def load(dataset_name,
@@ -6,7 +8,12 @@ def load(dataset_name,
          tokenizer,
          max_position_embeddings,
          streaming=False,
-         stride=128):
+         stride=128,
+         save_path=None):
+    if save_path is not None and not streaming and os.path.exists(save_path):
+        print(f"Loading dataset from {save_path}")
+        dataset = load_from_disk(save_path)
+
     dataset = load_dataset(dataset_name, dataset_config_name, streaming=streaming)
 
     def tokenize_function(examples):
@@ -29,4 +36,9 @@ def load(dataset_name,
             "input_ids": all_input_ids,
             "attention_mask": attention_masks,
         }
-    return dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+
+    if save_path is not None and not streaming:
+        print(f"Saving dataset to {save_path}")
+        tokenized_dataset.save_to_disk(save_path)
+    return tokenized_dataset
