@@ -17,11 +17,11 @@ END_AUDIO_TOKEN = "<|/AUDIO|>"
 
 
 
-class SimplePrelude(nn.Module):
-    def __init__(self, config, n_prelude_layers: int, dropout: float):
+class SimpleBlock(nn.Module):
+    def __init__(self, config, n_layers: int, dropout: float):
         super().__init__()
         self.config = config
-        self.prelude = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(n_prelude_layers)])
+        self.prelude = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(n_layers)])
         self.dropout = nn.Dropout(dropout)
 
     def forward(
@@ -95,7 +95,7 @@ class TextFeatureExtractor(nn.Module):
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        self.prelude = SimplePrelude(config, config.n_prelude_layers, config.hidden_dropout_prob)
+        self.prelude = SimpleBlock(config, config.n_prelude_layers, config.hidden_dropout_prob)
 
     def forward(
         self,
@@ -183,7 +183,7 @@ class AudioFeatureExtractor(nn.Module):
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        self.prelude = SimplePrelude(config, config.n_prelude_layers, config.hidden_dropout_prob)
+        self.prelude = SimpleBlock(config, config.n_prelude_layers, config.hidden_dropout_prob)
 
     def forward(
         self,
@@ -254,7 +254,7 @@ class ImageViTFeatureExtractor(nn.Module):
         
         self.dropout = nn.Dropout(config.image_encoder_pos_dropout)
 
-        self.prelude = SimplePrelude(config, config.n_prelude_layers, config.hidden_dropout_prob)
+        self.prelude = SimpleBlock(config, config.n_prelude_layers, config.hidden_dropout_prob)
 
     def forward(
         self,
@@ -289,7 +289,7 @@ class ImageViTFeatureExtractor(nn.Module):
         return tokens
 
 class AudioEmbeddingUpsampleConv2dGenerator(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__()
         self.config = config
 
@@ -373,11 +373,11 @@ class MegaTransformerMultimodalDecoder(nn.Module):
         super().__init__()
         self.config = config
 
+        self.text_coda = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(config.n_coda_layers)])
         self.text_decoder = nn.Linear(config.hidden_size, config.vocab_size)
-        self.audio_decoder = nn.Sequential(
-            nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(config.n_coda_layers)]),
-            AudioEmbeddingUpsampleConv2dGenerator(config),
-        )
+
+        self.audio_coda = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(config.n_coda_layers)])
+        self.audio_decoder =  AudioEmbeddingUpsampleConv2dGenerator(config),
 
         self.image_coda = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(config.n_coda_layers)])
         self.image_decoder = megatransformer_image_decoder.ConditionalGaussianDiffusion(config.image_decoder_activation, config.hidden_size)
@@ -386,8 +386,7 @@ class MegaTransformerMultimodalDecoder(nn.Module):
                 text_hidden_states=None,
                 image_hidden_states=None,
                 audio_hidden_states=None,
-                image_labels=None
-    ):
+                image_labels=None):
         if text_hidden_states is None:
             text_logits = None
         else:
@@ -396,13 +395,14 @@ class MegaTransformerMultimodalDecoder(nn.Module):
         if audio_hidden_states is None:
             audio_outputs = None
         else:
+            audio_hidden_states = self.audio_coda(audio_hidden_states)[0]
             audio_outputs = self.audio_decoder(audio_hidden_states)
 
         if image_hidden_states is None:
             image_outputs = None
             image_reconstruction_loss = None
         else:
-            image_hidden_states = self.image_coda(image_hidden_states)
+            image_hidden_states = self.image_coda(image_hidden_states)[0]
             image_outputs, image_reconstruction_loss = self.image_decoder(image_labels, image_hidden_states)
 
         return text_logits, audio_outputs, image_outputs, image_reconstruction_loss
