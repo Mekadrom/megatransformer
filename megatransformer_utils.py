@@ -1,4 +1,5 @@
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
+from positional_encodings.torch_encodings import PositionalEncoding2D
 from transformers import PretrainedConfig
 from transformers import set_seed as hf_set_seed
 from typing import Optional
@@ -156,6 +157,33 @@ class MegaTransformerConfig(PretrainedConfig):
         pad_token_id=50256,
         bos_token_id=50256,
         eos_token_id=50256,
+
+        # multimodal specific
+        begin_image_token_id=50257,
+        end_image_token_id=50258,
+        begin_audio_token_id=50259,
+        end_audio_token_id=50260,
+
+        audio_encoder_base_channels=32,
+        audio_encoder_kernel_sizes=[3, 3, 3, 3, 3, 3],
+        audio_n_mels=128,
+        audio_max_frames=1024,
+        audio_hop_length=512,
+        audio_encoder_dropout=0.1,
+        audio_encoder_activation="relu",
+        audio_encoder_norm_type="layernorm",
+        audio_encoder_norm_eps=1e-5,
+
+        image_image_size=224,
+        image_encoder_patch_size=16,
+        image_encoder_pos_dropout=0.1,
+        image_encoder_activation="relu",
+        image_encoder_norm_type="layernorm",
+        image_encoder_norm_eps=1e-5,
+
+        image_decoder_dropout=0.1,
+        image_decoder_activation="relu",
+
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -219,6 +247,98 @@ class MegaTransformerConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
+        self.begin_image_token_id = begin_image_token_id
+        self.end_image_token_id = end_image_token_id
+        self.begin_audio_token_id = begin_audio_token_id
+        self.end_audio_token_id = end_audio_token_id
+
+        self.audio_encoder_base_channels = audio_encoder_base_channels
+        self.audio_encoder_kernel_sizes = audio_encoder_kernel_sizes
+        self.audio_n_mels = audio_n_mels
+        self.audio_max_frames = audio_max_frames
+        self.audio_hop_length = audio_hop_length
+        self.audio_encoder_dropout = audio_encoder_dropout
+        self.audio_encoder_activation = audio_encoder_activation
+        self.audio_encoder_norm_type = audio_encoder_norm_type
+        self.audio_encoder_norm_eps = audio_encoder_norm_eps
+
+        self.image_image_size = image_image_size
+        self.image_encoder_patch_size = image_encoder_patch_size
+        self.image_encoder_pos_dropout = image_encoder_pos_dropout
+        self.image_encoder_activation = image_encoder_activation
+        self.image_encoder_norm_type = image_encoder_norm_type
+        self.image_encoder_norm_eps = image_encoder_norm_eps
+
+        self.image_decoder_dropout = image_decoder_dropout
+        self.image_decoder_activation = image_decoder_activation
+
+class MegaTransformerCausalOutput(dict):
+    def __init__(self,
+        loss: Optional[torch.Tensor]=None,
+        logits: Optional[torch.Tensor]=None,
+        past_key_values: Optional[list[KVCache]]=None,
+        hidden_states: Optional[list]=None,
+        attentions: Optional[list]=None,
+        n_steps_no_grad: Optional[int]=None,
+        k_steps_grad: Optional[int]=None,
+    ):
+        self.loss = loss
+        self.logits = logits
+        self.past_key_values = past_key_values
+        self.hidden_states = hidden_states
+        self.attentions = attentions
+        self.n_steps_no_grad = n_steps_no_grad
+        self.k_steps_grad = k_steps_grad
+
+        super().__init__(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            attentions=attentions,
+            n_steps_no_grad=n_steps_no_grad,
+            k_steps_grad=k_steps_grad,
+        )
+
+class BlockOutput:
+    def __init__(self, hidden_states, past_key_values: KVCache=None, attention_probs=None):
+        self.hidden_states = hidden_states
+        self.past_key_values = past_key_values
+        self.attention_probs = attention_probs
+
+class MegaTransformerMultimodalOutput(dict):
+    def __init__(self,
+        loss: Optional[torch.Tensor]=None,
+        logits: Optional[torch.Tensor]=None,
+        image_raw_outputs: Optional[torch.Tensor]=None,
+        audio_logits: Optional[torch.Tensor]=None,
+        past_key_values: Optional[list[KVCache]]=None,
+        hidden_states: Optional[list]=None,
+        attentions: Optional[list]=None,
+        n_steps_no_grad: Optional[int]=None,
+        k_steps_grad: Optional[int]=None,
+    ):
+        self.loss = loss
+        self.logits = logits
+        self.image_raw_outputs = image_raw_outputs
+        self.audio_logits = audio_logits
+        self.past_key_values = past_key_values
+        self.hidden_states = hidden_states
+        self.attentions = attentions
+        self.n_steps_no_grad = n_steps_no_grad
+        self.k_steps_grad = k_steps_grad
+
+        super().__init__(
+            loss=loss,
+            logits=logits,
+            image_raw_outputs=image_raw_outputs,
+            audio_logits=audio_logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            attentions=attentions,
+            n_steps_no_grad=n_steps_no_grad,
+            k_steps_grad=k_steps_grad,
+        )
 
 def create_alibi_bias(n_heads, maxlen):
     slopes = torch.pow(2, -torch.arange(1, n_heads + 1) * 8 / n_heads)
@@ -229,17 +349,24 @@ def create_alibi_bias(n_heads, maxlen):
     bias = -torch.abs(diff).unsqueeze(0) * slopes.unsqueeze(-1).unsqueeze(-1)
     return bias  # [n_heads, seq_len, seq_len]
 
-def create_sinusoidal_embedding(max_position_embeddings, hidden_size):
-    positional_encoding = torch.zeros((max_position_embeddings, hidden_size)) # (max_length, d_model)
-    for i in range(max_position_embeddings):
-        for k in range(hidden_size):
-            if k % 2 == 0:
-                positional_encoding[i, k] = math.sin(i / math.pow(10000, k / hidden_size))
-            else:
-                positional_encoding[i, k] = math.cos(i / math.pow(10000, (k - 1) / hidden_size))
-    return positional_encoding.unsqueeze(0) # (1, max_length, d_model)
+def create_sinusoidal_embedding(max_position_embeddings, hidden_size, dims=1):
+    if dims == 1:
+        positional_encoding = torch.zeros((max_position_embeddings, hidden_size)) # (max_length, d_model)
+        for i in range(max_position_embeddings):
+            for k in range(hidden_size):
+                if k % 2 == 0:
+                    positional_encoding[i, k] = math.sin(i / math.pow(10000, k / hidden_size))
+                else:
+                    positional_encoding[i, k] = math.cos(i / math.pow(10000, (k - 1) / hidden_size))
+        return positional_encoding.unsqueeze(0) # (1, max_length, d_model)
+    elif dims == 2:
+        positional_encoding_2d = PositionalEncoding2D(hidden_size)
+        positional_encoding = torch.zeros((1, max_position_embeddings, max_position_embeddings, hidden_size))
+        return positional_encoding_2d(positional_encoding)
+    else:
+        raise ValueError("dims must be 1 or 2")
 
-def get_activation_function(activation_function_name):
+def get_activation_type(activation_function_name):
     if activation_function_name == 'relu':
         return nn.ReLU
     elif activation_function_name == 'gelu':
@@ -265,13 +392,13 @@ def get_activation_function(activation_function_name):
     else:
         raise Exception(f"Unknown activation function {activation_function_name}")
 
-def create_norm(config):
-    if config.norm_type == "layernorm":
-        return nn.LayerNorm(config.hidden_size, eps=config.norm_eps)
-    elif config.norm_type == "rmsnorm":
-        return rmsnorm.RMSNorm(config.hidden_size, eps=config.norm_eps)
+def create_norm(hidden_size, norm_type, norm_eps):
+    if norm_type == "layernorm":
+        return nn.LayerNorm(hidden_size, eps=norm_eps)
+    elif norm_type == "rmsnorm":
+        return rmsnorm.RMSNorm(hidden_size, eps=norm_eps)
     else:
-        raise Exception(f"Unknown normalization type {config.norm_type}")
+        raise Exception(f"Unknown normalization type {norm_type}")
 
 # function definitions for args/initialization shared by pretrain and finetune scripts
 def check_tpu_availability():
@@ -324,15 +451,15 @@ def parse_args():
     # meta params
     argparser.add_argument('--seed', type=int, default=42, help='Random seed')
     argparser.add_argument('--logging_base_dir', type=str, default=os.path.join('runs', 'causal'), help='Base directory for logging')
-    argparser.add_argument('--run_name', type=str, help='Name of the run')
-    argparser.add_argument('--dataset_name', type=str, default='wikitext', help='Dataset name')
-    argparser.add_argument('--dataset_config_name', type=str, default='wikitext-103-v1', help='Dataset config name')
+    argparser.add_argument('--run_name', type=str, help='Name of the run', required=True)
+    argparser.add_argument('--include_modes', type=str, default='text,audio,image', help='Comma-separated list of modes to include (e.g., text,audio,image or audio,image), order agnostic')
+    argparser.add_argument('--dataset_cache_dir', type=str, default='cached_datasets', help='Path to the dataset cache directory')
     argparser.add_argument('--tokenizer_name', type=str, default="mistralai/Mistral-7B-v0.1", help='Tokenizer name')
     argparser.add_argument('--trainer', type=str, default="default", help='Trainer type: grokfast_ema, grokfast_ma, debug, or default')
     argparser.add_argument('--config', type=str, default="modern", help='Model configuration: gpt2, modern, or huginn')
-    argparser.add_argument('--max_position_embeddings', type=int, default=1024, help='Max position embeddings (maximum sequence length)')
+    argparser.add_argument('--max_position_embeddings', type=int, default=8192, help='Max position embeddings (maximum sequence length)')
     argparser.add_argument('--cpu', action='store_true', help='Use CPU for training')
-    argparser.add_argument('--log_level', type=str, default='info', help='Logging level: debug, info, warning, error, critical')
+    argparser.add_argument('--log_level', type=str, default='warning', help='Logging level: debug, info, warning, error, critical')
 
     # efficiency params
     argparser.add_argument('--compile_model', action='store_true', help='Whether to compile the model')
@@ -342,7 +469,8 @@ def parse_args():
     # generic hyperparams
     argparser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate')
     argparser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
-    argparser.add_argument('--num_train_epochs', type=int, default=3, help='Number of training epochs')
+    argparser.add_argument('--num_train_epochs', type=int, default=-1, help='Number of training epochs')
+    argparser.add_argument('--max_steps', type=int, default=-1, help='Max steps for training')
     argparser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     argparser.add_argument('--gradient_accumulation_steps', type=int, default=32, help='Gradient accumulation steps')
     argparser.add_argument('--warmup_ratio', type=float, default=0.03, help='Warmup ratio')
@@ -360,10 +488,8 @@ def parse_args():
 
     # deepspeed
     argparser.add_argument('--use_deepspeed', action='store_true', help='Whether to use DeepSpeed')
-    argparser.add_argument('--deepspeed_config', type=str, default='ds_config.json', help='DeepSpeed configuration file')
-    argparser.add_argument('--zero_stage', type=int, default=3, help='ZeRO optimization stage (0, 1, 2, or 3)')
-    argparser.add_argument('--offload_optimizer', action='store_true', help='Offload optimizer states to CPU')
-    argparser.add_argument('--offload_param', action='store_true', help='Offload parameters to CPU')
+    argparser.add_argument('--deepspeed_config', type=str, default=None, help='DeepSpeed configuration file')
+    argparser.add_argument('--local_rank', type=int, default=-1, help='Local rank for distributed training')
 
     # peft lora/int8 training
     argparser.add_argument('--use_int8_peft', action='store_true', help='Use INT8 with PEFT/LoRA')
@@ -380,8 +506,7 @@ def parse_args():
 
     args, unk = argparser.parse_known_args()
 
-    if args.dataset_config_name == '' or args.dataset_config_name == 'None':
-        setattr(args, 'dataset_config_name', None)
+    setattr(args, 'include_modes', args.include_modes.split(','))
 
     if unk and len(unk) > 0:
         print(f"unknown args: {unk}")
@@ -394,12 +519,22 @@ def parse_args():
     
     if args.use_xla and args.fp16:
         raise ValueError("FP16 training is not supported with TPU training. Please only enable BF16, or disable FP16 training.")
+    
+    if args.fp16 and args.bf16:
+        raise ValueError("FP16 and BF16 training cannot be enabled at the same time. Please choose one.")
+    
+    if args.num_train_epochs == -1 and args.max_steps == -1:
+        raise ValueError("Either num_train_epochs or max_steps must be specified. Please check your configuration.")
+    
+    if args.num_train_epochs != -1 and args.max_steps != -1:
+        print("Both num_train_epochs and max_steps are specified. max_steps will take precedence.")
+        args.num_train_epochs = -1
 
     set_seed_everywhere(args.seed)
 
     # make sure deepspeed config specified exists
     if args.use_deepspeed:
-        if os.path.exists(args.deepspeed_config):
+        if args.deepspeed_config is not None and os.path.exists(args.deepspeed_config):
             print(f"Loading DeepSpeed config from {args.deepspeed_config}")
         else:
             raise FileNotFoundError(f"DeepSpeed config file {args.deepspeed_config} not found.")

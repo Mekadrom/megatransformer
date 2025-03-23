@@ -1,17 +1,16 @@
-from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, TrainingArguments, DataCollatorForLanguageModeling
 
-from model import megatransformer_causal
+from dataset_loading import multimodal_dataset
+from model import megatransformer_causal, megatransformer_multimodal, megatransformer_recurrent
 
 import custom_callbacks
 import custom_trainers
-import dataset_loading
 import megatransformer_utils
 import os
 
 
 args, unk = megatransformer_utils.parse_args()
-run_dir = os.path.join(args.logging_base_dir, args.dataset_name, args.run_name)
+run_dir = os.path.join(args.logging_base_dir, args.run_name)
 
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, add_bos_token=False)
 print(f"default tokenizer.padding_side: {tokenizer.padding_side}")
@@ -20,14 +19,21 @@ tokenizer.bos_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 print(f"modified tokenizer: {tokenizer}")
 
-model = megatransformer_causal.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
+if len(args.include_modes) > 1 or "text" not in args.include_modes:
+    # multimodal supports mixed mode training, but also single mode for audio transcription/generation and image description/generation
+    model_maker = megatransformer_multimodal
+elif 'recurrent' in args.config:
+    model_maker = megatransformer_recurrent
+else:
+    model_maker = megatransformer_causal
+
+model = model_maker.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
 model = megatransformer_utils.load_model(False, model, run_dir)
 model = megatransformer_utils.setup_int8_training(args, model)
 
 if not os.path.exists(run_dir):
     os.makedirs(run_dir)
 
-writer = SummaryWriter(run_dir)
 training_args = TrainingArguments(
     tpu_num_cores=8 if args.use_xla else None,
     output_dir=run_dir,
@@ -38,7 +44,8 @@ training_args = TrainingArguments(
     per_device_train_batch_size=args.batch_size,
     per_device_eval_batch_size=1 if args.config == 'huginn' else args.batch_size,
     gradient_accumulation_steps=args.gradient_accumulation_steps,
-    num_train_epochs=args.num_train_epochs,
+    num_train_epochs=args.num_train_epochs if args.num_train_epochs > 0 else 1,
+    max_steps=args.max_steps if args.max_steps > 0 else -1,
     weight_decay=args.weight_decay,
     report_to="tensorboard",
     logging_dir=run_dir,
@@ -56,32 +63,85 @@ training_args = TrainingArguments(
     use_cpu=args.cpu,
     log_level=args.log_level,
     logging_first_step=True,
+    local_rank=args.local_rank,
 )
-datasets = dataset_loading.load_dataset(args.dataset_name, args.dataset_config_name, tokenizer, args.max_position_embeddings)
 
-generation_callback = custom_callbacks.GenerationCallback(
+print(f"DeepSpeed config path: {args.deepspeed_config}")
+print(f"DeepSpeed enabled: {args.use_deepspeed}")
+print(f"XLA enabled: {args.use_xla}")
+print(f"Final DeepSpeed setting: {training_args.deepspeed}")
+
+text_examples = 10_000
+audio_examples = 10_000
+image_examples = 10_000
+
+text_weight = 1.0 if "text" in args.include_modes else 0.0
+audio_weight = 1.0 if "audio" in args.include_modes else 0.0
+image_weight = 1.0 if "image" in args.include_modes else 0.0
+
+train_dataset = multimodal_dataset.MultimodalDataset(
+    approximated_length=text_examples + audio_examples + image_examples,
     tokenizer=tokenizer,
-    prompts=[
-        "In this paper, we propose a novel approach to",
-        "The Higgs boson, sometimes called the Higgs particle, is",
-        "The capital of France is",
-        "2 + 2 ="
-    ],
-    generation_steps=args.generation_steps,
+    image_size=model.config.image_image_size,
+    cache_dir=args.dataset_cache_dir,
+    text_weight=text_weight,
+    audio_weight=audio_weight,
+    image_weight=image_weight,
+    split="train",
+    seed=args.seed,
+    max_position_embeddings=args.max_position_embeddings,
 )
-metrics_callback = custom_callbacks.MetricsCallback()
+
+validation_dataset = multimodal_dataset.MultimodalDataset(
+    approximated_length=3_760 + 9_150 + 12_400,
+    tokenizer=tokenizer,
+    image_size=model.config.image_image_size,
+    cache_dir=args.dataset_cache_dir,
+    text_weight=text_weight,
+    audio_weight=audio_weight,
+    image_weight=image_weight,
+    split="validation",
+    seed=args.seed,
+    max_position_embeddings=args.max_position_embeddings,
+)
+
+if 'multimodal' in args.config.lower():
+    data_collator = multimodal_dataset.DataCollatorForMultimodalLanguageModeling(
+        tokenizer=tokenizer,
+        max_position_embeddings=args.max_position_embeddings,
+        image_size=model.config.image_image_size,
+        audio_max_frames=model.config.audio_max_frames,
+        mlm=False
+    )
+else:
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
 trainer = custom_trainers.trainer_lookup(args, args.trainer)(
     model=model,
     args=training_args,
-    data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
-    train_dataset=datasets["train"],
-    eval_dataset=datasets["validation"],
+    data_collator=data_collator,
+    train_dataset=train_dataset,
+    eval_dataset=validation_dataset,
     processing_class=tokenizer,
-    callbacks=[generation_callback, metrics_callback]
 )
 
-generation_callback.trainer = trainer
+if not 'multimodal' in args.config.lower():
+    # todo: implement for multimodal
+    generation_callback = custom_callbacks.GenerationCallback(
+        tokenizer=tokenizer,
+        prompts=[
+            "In this paper, we propose a novel approach to",
+            "The Higgs boson, sometimes called the Higgs particle, is",
+            "The capital of France is",
+            "2 + 2 ="
+        ],
+        generation_steps=args.generation_steps,
+    )
+    trainer.add_callback(generation_callback)
+    generation_callback.trainer = trainer
+
+metrics_callback = custom_callbacks.MetricsCallback()
+trainer.add_callback(metrics_callback)
 metrics_callback.trainer = trainer
 
 print(f"Starting training with {sum(p.numel() for p in model.parameters()):,} parameters")

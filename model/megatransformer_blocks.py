@@ -3,18 +3,12 @@ from typing import Optional, Union
 
 import torch.utils.tensorboard
 
-from model import huginn_criteria, megatransformer_attn, megatransformer_ffn, mult, sum
+from model import megatransformer_attn, megatransformer_ffn, mult, recurrent_criteria, sum
 
 import math
 import megatransformer_utils
 import torch
 
-
-class BlockOutput:
-    def __init__(self, hidden_states, past_key_values: megatransformer_utils.KVCache=None, attention_probs=None):
-        self.hidden_states = hidden_states
-        self.past_key_values = past_key_values
-        self.attention_probs = attention_probs
 
 class MegaTransformerBlock(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
@@ -30,19 +24,19 @@ class MegaTransformerBlock(nn.Module):
             raise ValueError(f"Unknown ffn_type: {config.ffn_type}")
 
         if config.pre_attn_norm:
-            self.pre_attn_norm = megatransformer_utils.create_norm(config)
+            self.pre_attn_norm = megatransformer_utils.create_norm(config.hidden_size, config.norm_type, config.norm_eps)
         else:
             self.pre_attn_norm = None
         if config.post_attn_norm:
-            self.post_attn_norm = megatransformer_utils.create_norm(config)
+            self.post_attn_norm = megatransformer_utils.create_norm(config.hidden_size, config.norm_type, config.norm_eps)
         else:
             self.post_attn_norm = None
         if config.pre_ffn_norm:
-            self.pre_ffn_norm = megatransformer_utils.create_norm(config)
+            self.pre_ffn_norm = megatransformer_utils.create_norm(config.hidden_size, config.norm_type, config.norm_eps)
         else:
             self.pre_ffn_norm = None
         if config.post_ffn_norm:
-            self.post_ffn_norm = megatransformer_utils.create_norm(config)
+            self.post_ffn_norm = megatransformer_utils.create_norm(config.hidden_size, config.norm_type, config.norm_eps)
         else:
             self.post_ffn_norm = None
     
@@ -90,12 +84,11 @@ class MegaTransformerBlock(nn.Module):
         if self.post_ffn_norm is not None:
             hidden_states = self.post_ffn_norm(hidden_states)
 
-        return BlockOutput(
+        return megatransformer_utils.BlockOutput(
             hidden_states=hidden_states,
             past_key_values=past_key_values,
             attention_probs=attention_probs,
         )
-
 
 class RecurrentBlockOutput:
     def __init__(self, hidden_states, last_thought_state, past_key_values=None, all_hidden_states=None, attention_probs=None, n_steps_no_grad=None, k_steps_grad=None):
@@ -136,7 +129,7 @@ class MegaTransformerRecurrentBlock(nn.Module):
             raise ValueError(f"Invalid adapter method: {self.adapter_method}")
         
         if self.exit_criteria == 'kl_divergence':
-            self.exit_criteria = huginn_criteria.KLDivergenceCriteria(self.exit_criteria_threshold) # todo: implement other exit criteria
+            self.exit_criteria = recurrent_criteria.KLDivergenceCriteria(self.exit_criteria_threshold) # todo: implement other exit criteria
         else:
             raise ValueError(f"Invalid exit criteria: {self.exit_criteria}")
         

@@ -3,11 +3,11 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-class HuginnExitCriteria:
+class RecurrentExitCriteria:
     def should_exit(self, last_thought_state: torch.Tensor, current_thought_state: torch.Tensor):
         raise NotImplementedError
 
-class KLDivergenceCriteria(HuginnExitCriteria):
+class KLDivergenceCriteria(RecurrentExitCriteria):
     def __init__(self, threshold: float):
         self.threshold = threshold
 

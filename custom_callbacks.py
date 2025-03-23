@@ -77,7 +77,7 @@ class MetricsCallback(TrainerCallback):
             sorted_vocab = sorted(vocab.items(), key=lambda x: x[1])
             tokens = [token for token, _ in sorted_vocab]
 
-            assert len(tokens) == embedding_weights.shape[0], "Mismatch between tokens and embedding weights"
+            assert len(tokens) == embedding_weights.shape[0], f"Mismatch between tokens and embedding weights: {len(tokens)} vs {embedding_weights.shape[0]}"
             writer.add_embedding(
                 mat=embedding_weights,
                 metadata=tokens,

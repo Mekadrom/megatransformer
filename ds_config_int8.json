@@ -41,10 +41,6 @@
         "stage3_param_persistence_threshold": "auto"
     },
     
-    "bf16": {
-        "enabled": "auto"
-    },
-    
     "quantization": {
         "enabled": true,
         "quantize_training": true,

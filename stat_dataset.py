@@ -7,10 +7,10 @@ import dataset_loading
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument("--tokenizer_name", type=str, default="mistralai/Mistral-7B-v0.1", help="Tokenizer name")
-argparser.add_argument("--dataset_name", type=str, default="wikitext", help="Path to the dataset")
+argparser.add_argument("--dataset_name", type=str, default="wikitext", help="Path to the dataset") # or gair-prox/FineWeb-pro
 argparser.add_argument("--dataset_config_name", type=str, default="wikitext-103-v1", help="Dataset config name")
 argparser.add_argument("--max_position_embeddings", type=int, default=8192, help="Max position embeddings (maximum sequence length)")
-argparser.add_argument("--dataset_cache_dir", type=str, default=None, help="Path to the dataset cache directory")
+argparser.add_argument("--dataset_cache_dir", type=str, default="cached_datasets", help="Path to the dataset cache directory")
 
 args = argparser.parse_args()
 
@@ -24,7 +24,7 @@ tokenizer.bos_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 print(f"modified tokenizer: {tokenizer}")
 
-datasets = dataset_loading.load_dataset(args.dataset_name, args.dataset_config_name, tokenizer, args.max_position_embeddings, save_path=args.dataset_cache_dir)
+datasets = dataset_loading.load_dataset(args.dataset_name, args.dataset_config_name, tokenizer, args.max_position_embeddings, cache_dir=args.dataset_cache_dir)
 
 collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 

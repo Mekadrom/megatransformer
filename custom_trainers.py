@@ -120,7 +120,7 @@ class DefaultTrainer(Trainer):
             prefix = "train/" if model.training else "eval/"
             if hasattr(outputs, "n_steps_no_grad") and hasattr(outputs, "k_steps_grad"):
                 self.log_steps(prefix, outputs.n_steps_no_grad, outputs.k_steps_grad)
-            if hasattr(outputs, "hidden_states"):
+            if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
                 for i, hidden_state in enumerate(outputs.hidden_states):
                     token_correlation = megatransformer_utils.get_token_correlation(hidden_state)
                     self.writer.add_scalar(f"{prefix}token_correlation_{i}", token_correlation, self.state.global_step)

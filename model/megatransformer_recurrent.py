@@ -1,6 +1,5 @@
 from torch import nn
 from transformers import PreTrainedModel, GenerationMixin
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 from typing import Optional, Union
 
 from model import megatransformer_blocks
@@ -9,7 +8,7 @@ import megatransformer_utils
 import torch
 
 
-class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
+class MegaTransformerRecurrentCausalModel(PreTrainedModel, GenerationMixin):
     config_class = megatransformer_utils.MegaTransformerConfig
     
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
@@ -27,8 +26,12 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         
-        self.transformer = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(config.n_layers)])
+        prelude = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(config.n_prelude_layers)])
+        recurrent = megatransformer_blocks.MegaTransformerRecurrentBlock(config)
+        coda = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(config.n_coda_layers)])
 
+        self.transformer = nn.ModuleList([*prelude, recurrent, *coda])
+        
         if config.use_final_norm:
             self.norm_final = megatransformer_utils.create_norm(config.hidden_size, config.norm_type, config.norm_eps)
         else:
@@ -79,8 +82,6 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
         
-        head_mask = self.get_head_mask(head_mask, self.config.n_layers)
-        
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
         
@@ -104,6 +105,7 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         all_hidden_states: Optional[list] = [] if output_hidden_states else None
         all_attentions: Optional[list] = [] if output_attentions else None
         
+        recurrent_outputs = None
         for i, (block, past_key_value) in enumerate(zip(self.transformer, past_key_values)):
             if all_hidden_states is not None:
                 all_hidden_states.append(hidden_states)
@@ -117,6 +119,9 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states
             )
+
+            if isinstance(block, megatransformer_blocks.MegaTransformerRecurrentBlock):
+                recurrent_outputs = outputs
 
             hidden_states = outputs.hidden_states
             attention_probs = outputs.attention_probs
@@ -141,6 +146,8 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
                 past_key_values,
                 all_hidden_states,
                 all_attentions,
+                recurrent_outputs.n_steps_no_grad if recurrent_outputs is not None else None,
+                recurrent_outputs.k_steps_grad if recurrent_outputs is not None else None,
             )
         
         return megatransformer_utils.MegaTransformerCausalOutput(
@@ -148,6 +155,8 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
+            n_steps_no_grad=recurrent_outputs.n_steps_no_grad if recurrent_outputs is not None else None,
+            k_steps_grad=recurrent_outputs.k_steps_grad if recurrent_outputs is not None else None,
         )
     
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask: torch.Tensor=None, **kwargs):
@@ -169,12 +178,12 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         }
     
 
-class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
+class MegaTransformerRecurrentCausalLMHead(PreTrainedModel, GenerationMixin):
     config_class = megatransformer_utils.MegaTransformerConfig
     
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__(config)
-        self.transformer = MegaTransformerSimpleCausalModel(config)
+        self.transformer = MegaTransformerRecurrentCausalModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
         self.apply(self._init_weights)
@@ -223,11 +232,26 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        past_key_values = past_key_values if past_key_values is not None else [None] * self.config.n_layers
-        if use_cache:
-            for i in range(len(past_key_values)):
-                if past_key_values[i] is None:
-                    past_key_values[i] = megatransformer_utils.KVCache()
+        past_key_values = past_key_values if past_key_values is not None else [None] * (self.config.n_prelude_layers + 1 + self.config.n_coda_layers)
+        # if use_cache:
+        #     # initialize kv caches for prelude layers as past_key_values[0:n_prelude_layers] = KVCache()
+        #     for i in range(len(self.config.n_prelude_layers)):
+        #         if past_key_values[i] is None:
+        #             past_key_values[i] = megatransformer_utils.KVCache()
+
+        #     # initialize kv caches for recurrent layers as past_key_values[n_prelude_layers] = list[KVCache()]
+        #     if past_key_values[self.config.n_prelude_layers] is None:
+        #         # use a list of KVCache() for the recurrent layer
+        #         recurrent_kv_cache = [None] * (self.config.recurrent_mean_thinking_steps * 2)
+        #         for j in range(len(recurrent_kv_cache)):
+        #             recurrent_kv_cache[j] = megatransformer_utils.KVCache()
+        #         past_key_values[self.config.n_prelude_layers] = recurrent_kv_cache
+
+        #     # initialize kv caches for coda layers as past_key_values[n_prelude_layers+1:] = KVCache()
+        #     for i in range(self.config.n_prelude_layers + 1, len(past_key_values)):
+        #         if past_key_values[i] is None:
+        #             past_key_values[i] = megatransformer_utils.KVCache()
+        # print(f"initialized past_key_values: {past_key_values}")
         
         transformer_outputs = self.transformer(
             input_ids=input_ids,
@@ -273,47 +297,71 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
+            n_steps_no_grad=transformer_outputs.n_steps_no_grad,
+            k_steps_grad=transformer_outputs.k_steps_grad,
         )
     
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         return self.transformer.prepare_inputs_for_generation(input_ids, **kwargs)
 
 
-def create_gpt2_small_model(tokenizer, max_position_embeddings):
-    # gpt2-small closest equivalent (~124M params)
-    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+def create_recurrent_small_model(tokenizer, max_position_embeddings):
+    # uses a recurrent approach to emulate a deeper model (~120M params)
+    return MegaTransformerRecurrentCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
         max_position_embeddings=max_position_embeddings,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    ))
-
-def create_modern_small_model(tokenizer, max_position_embeddings):
-    # uses more modern approaches to causal language modeling (~148M params)
-    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
-        vocab_size=tokenizer.vocab_size,
-        max_position_embeddings=max_position_embeddings,
+        n_layers=None,
+        n_prelude_layers=2,
+        n_recurrent_layers=4,
+        n_coda_layers=2,
         intermediate_activation="swiglu",
         norm_type="rmsnorm",
         ffn_type="mlp",
         use_positional_embedding=False,
         use_sinusoidal_embedding=False,
-        use_rotary_embedding=True,
-        use_alibi_bias=False,
+        use_rotary_embedding=False,
+        use_alibi_bias=True,
         use_qkv_bias=False,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     ))
 
-def create_modern_medium_model(tokenizer, max_position_embeddings):
-    # uses more modern approaches to causal language modeling (~536M params)
-    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+def create_recurrent_small_model_with_sandwich_norm(tokenizer, max_position_embeddings):
+    # uses a recurrent approach to emulate a deeper model
+    return MegaTransformerRecurrentCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        max_position_embeddings=max_position_embeddings,
+        n_layers=None,
+        n_prelude_layers=2,
+        n_recurrent_layers=4,
+        n_coda_layers=2,
+        intermediate_activation="swiglu",
+        norm_type="rmsnorm",
+        ffn_type="mlp",
+        # all norms enabled for sandwich norm
+        post_attn_norm=True,
+        post_ffn_norm=True,
+        use_positional_embedding=False,
+        use_sinusoidal_embedding=False,
+        use_rotary_embedding=False,
+        use_alibi_bias=True,
+        use_qkv_bias=False,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    ))
+
+def create_recurrent_medium_model(tokenizer, max_position_embeddings):
+    # uses a recurrent approach to emulate a deeper model (~200M params)
+    return MegaTransformerRecurrentCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
         max_position_embeddings=max_position_embeddings,
         hidden_size=1024,
-        n_layers=24,
+        n_layers=None,
+        n_prelude_layers=2,
+        n_recurrent_layers=4,
+        n_coda_layers=2,
         d_queries=64,
         d_values=64,
         n_query_groups=16,
@@ -324,26 +372,30 @@ def create_modern_medium_model(tokenizer, max_position_embeddings):
         ffn_type="mlp",
         use_positional_embedding=False,
         use_sinusoidal_embedding=False,
-        use_rotary_embedding=True,
-        use_alibi_bias=False,
+        use_rotary_embedding=False,
+        use_alibi_bias=True,
         use_qkv_bias=False,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     ))
 
-def create_test_tiny_model(tokenizer, max_position_embeddings):
+
+def create_test_tiny_recurrent_model(tokenizer, max_position_embeddings):
     # uses a recurrent approach to emulate a deeper model (~2M params)
-    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+    return MegaTransformerRecurrentCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
         max_position_embeddings=max_position_embeddings,
-        n_layers=3,
+        n_layers=None,
         hidden_size=64,
         d_queries=16,
         d_values=16,
         n_query_groups=4,
         n_heads=4,
         intermediate_size=256,
+        n_prelude_layers=1,
+        n_recurrent_layers=1,
+        n_coda_layers=1,
         intermediate_activation="relu",
         norm_type="layernorm",
         ffn_type="mlp",
@@ -358,10 +410,10 @@ def create_test_tiny_model(tokenizer, max_position_embeddings):
     ))
 
 lookup = { 
-    "gpt2_small": create_gpt2_small_model,
-    "modern_small": create_modern_small_model,
-    "modern_medium": create_modern_medium_model,
-    "test_tiny": create_test_tiny_model,
+    "recurrent_small": create_recurrent_small_model,
+    "recurrent_small_sandwich": create_recurrent_small_model_with_sandwich_norm,
+    "recurrent_medium": create_recurrent_medium_model,
+    "test_tiny_recurrent": create_test_tiny_recurrent_model,
 }
 
 def model_config_lookup(config):

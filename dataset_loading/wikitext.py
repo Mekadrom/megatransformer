@@ -34,8 +34,8 @@ def clean_wikitext_examples(examples):
         cleaned_texts.append(cleaned)
     return {"text": cleaned_texts}
 
-def load(dataset_name, dataset_config_name, tokenizer, max_position_embeddings):
-    dataset = load_dataset(dataset_name, dataset_config_name)
+def load_text_dataset(dataset_name, dataset_config_name, split, tokenizer, max_position_embeddings, streaming=False, cache_dir=None):
+    dataset = load_dataset(dataset_name, dataset_config_name, split=split, streaming=streaming, cache_dir=cache_dir)
 
     def tokenize_function(examples):
         return tokenizer(examples['text'], truncation=True, max_length=max_position_embeddings)

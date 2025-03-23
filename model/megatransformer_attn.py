@@ -36,7 +36,7 @@ class MegaTransformerSelfAttention(nn.Module):
 
         self.heads_activation = None
         if config.heads_activation is not None:
-            activation_type = megatransformer_utils.get_activation_function(config.heads_activation)
+            activation_type = megatransformer_utils.get_activation_type(config.heads_activation)
             if activation_type == swiglu.SwiGLU:
                 self.heads_activation = swiglu.SwiGLU(config.d_values)
             else:
