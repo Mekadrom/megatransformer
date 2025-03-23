@@ -17,7 +17,6 @@ print(f"default tokenizer.padding_side: {tokenizer.padding_side}")
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.bos_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
-print(f"modified tokenizer: {tokenizer}")
 
 if len(args.include_modes) > 1 or "text" not in args.include_modes:
     # multimodal supports mixed mode training, but also single mode for audio transcription/generation and image description/generation
@@ -30,6 +29,10 @@ else:
 model = model_maker.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
 model = megatransformer_utils.load_model(False, model, run_dir)
 model = megatransformer_utils.setup_int8_training(args, model)
+
+print(f"modified tokenizer: {tokenizer}")
+
+print(f"special tokens: {tokenizer.special_tokens_map}")
 
 if not os.path.exists(run_dir):
     os.makedirs(run_dir)

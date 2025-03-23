@@ -159,10 +159,10 @@ class MegaTransformerConfig(PretrainedConfig):
         eos_token_id=50256,
 
         # multimodal specific
-        begin_image_token_id=50257,
-        end_image_token_id=50258,
-        begin_audio_token_id=50259,
-        end_audio_token_id=50260,
+        begin_audio_token_id=50257,
+        end_audio_token_id=50258,
+        begin_image_token_id=50259,
+        end_image_token_id=50260,
 
         audio_encoder_base_channels=32,
         audio_encoder_kernel_sizes=[3, 3, 3, 3, 3, 3],
@@ -247,10 +247,10 @@ class MegaTransformerConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
-        self.begin_image_token_id = begin_image_token_id
-        self.end_image_token_id = end_image_token_id
         self.begin_audio_token_id = begin_audio_token_id
         self.end_audio_token_id = end_audio_token_id
+        self.begin_image_token_id = begin_image_token_id
+        self.end_image_token_id = end_image_token_id
 
         self.audio_encoder_base_channels = audio_encoder_base_channels
         self.audio_encoder_kernel_sizes = audio_encoder_kernel_sizes
@@ -311,7 +311,7 @@ class MegaTransformerMultimodalOutput(dict):
         loss: Optional[torch.Tensor]=None,
         logits: Optional[torch.Tensor]=None,
         image_raw_outputs: Optional[torch.Tensor]=None,
-        audio_logits: Optional[torch.Tensor]=None,
+        audio_raw_outputs: Optional[torch.Tensor]=None,
         past_key_values: Optional[list[KVCache]]=None,
         hidden_states: Optional[list]=None,
         attentions: Optional[list]=None,
@@ -321,7 +321,7 @@ class MegaTransformerMultimodalOutput(dict):
         self.loss = loss
         self.logits = logits
         self.image_raw_outputs = image_raw_outputs
-        self.audio_logits = audio_logits
+        self.audio_raw_outputs = audio_raw_outputs
         self.past_key_values = past_key_values
         self.hidden_states = hidden_states
         self.attentions = attentions
@@ -332,7 +332,7 @@ class MegaTransformerMultimodalOutput(dict):
             loss=loss,
             logits=logits,
             image_raw_outputs=image_raw_outputs,
-            audio_logits=audio_logits,
+            audio_logits=audio_raw_outputs,
             past_key_values=past_key_values,
             hidden_states=hidden_states,
             attentions=attentions,
@@ -457,7 +457,7 @@ def parse_args():
     argparser.add_argument('--tokenizer_name', type=str, default="mistralai/Mistral-7B-v0.1", help='Tokenizer name')
     argparser.add_argument('--trainer', type=str, default="default", help='Trainer type: grokfast_ema, grokfast_ma, debug, or default')
     argparser.add_argument('--config', type=str, default="modern", help='Model configuration: gpt2, modern, or huginn')
-    argparser.add_argument('--max_position_embeddings', type=int, default=8192, help='Max position embeddings (maximum sequence length)')
+    argparser.add_argument('--max_position_embeddings', type=int, default=4096, help='Max position embeddings (maximum sequence length)')
     argparser.add_argument('--cpu', action='store_true', help='Use CPU for training')
     argparser.add_argument('--log_level', type=str, default='warning', help='Logging level: debug, info, warning, error, critical')
 

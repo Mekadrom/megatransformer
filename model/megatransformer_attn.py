@@ -108,12 +108,16 @@ class MegaTransformerSelfAttention(nn.Module):
         _, _, t = queries.shape[:3]
         _, _, T = keys.shape[:3]
 
+        # print(f"queries: {queries.shape}, keys: {keys.shape}, values: {values.shape}")
+
         if self.alibi_bias is not None:
             attention_scores = attention_scores + self.alibi_bias[:, :t, :t].unsqueeze(0).repeat(N, 1, 1, 1)
 
         attention_scores = attention_scores / math.sqrt(self.d_queries)
         if bool(self.use_grok_scaled_attn):
             attention_scores = 30.0 * torch.tanh(attention_scores / 30.0)
+
+        # print(f"attention_scores: {attention_scores.shape}")
         
         causal_mask_slice = self.causal_mask[:, :, :t, :T]
         attention_scores = attention_scores.masked_fill(causal_mask_slice == 0, float("-inf"))
