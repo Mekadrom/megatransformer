@@ -85,7 +85,11 @@ image_weight = 1.0 if "image" in args.include_modes else 0.0
 train_dataset = multimodal_dataset.MultimodalDataset(
     approximated_length=text_examples + audio_examples + image_examples,
     tokenizer=tokenizer,
-    image_size=model.config.image_image_size,
+    n_mels=model.config.audio_n_mels,
+    n_fft=model.config.audio_n_fft,
+    hop_length=model.config.audio_hop_length,
+    audio_max_frames=model.config.audio_max_frames,
+    image_size=model.config.image_size,
     cache_dir=args.dataset_cache_dir,
     text_weight=text_weight,
     audio_weight=audio_weight,
@@ -98,7 +102,11 @@ train_dataset = multimodal_dataset.MultimodalDataset(
 validation_dataset = multimodal_dataset.MultimodalDataset(
     approximated_length=3_760 + 9_150 + 12_400,
     tokenizer=tokenizer,
-    image_size=model.config.image_image_size,
+    n_mels=model.config.audio_n_mels,
+    n_fft=model.config.audio_n_fft,
+    hop_length=model.config.audio_hop_length,
+    audio_max_frames=model.config.audio_max_frames,
+    image_size=model.config.image_size,
     cache_dir=args.dataset_cache_dir,
     text_weight=text_weight,
     audio_weight=audio_weight,
@@ -112,7 +120,7 @@ if 'multimodal' in args.config.lower():
     data_collator = multimodal_dataset.DataCollatorForMultimodalLanguageModeling(
         tokenizer=tokenizer,
         max_position_embeddings=args.max_position_embeddings,
-        image_size=model.config.image_image_size,
+        image_size=model.config.image_size,
         audio_max_frames=model.config.audio_max_frames,
         mlm=False
     )
@@ -128,7 +136,20 @@ trainer = custom_trainers.trainer_lookup(args, args.trainer)(
     processing_class=tokenizer,
 )
 
-if not 'multimodal' in args.config.lower():
+if 'multimodal' in args.config.lower():
+    generation_callback = custom_callbacks.MultimodalGenerationCallback(
+        tokenizer=tokenizer,
+        text_only_prompts=[
+            "In this paper, we propose a novel approach to",
+            "The Higgs boson, sometimes called the Higgs particle, is",
+            "The capital of France is",
+            "2 + 2 ="
+        ],
+        generation_steps=args.generation_steps,
+    )
+    trainer.add_callback(generation_callback)
+    generation_callback.trainer = trainer
+else:
     # todo: implement for multimodal
     generation_callback = custom_callbacks.GenerationCallback(
         tokenizer=tokenizer,

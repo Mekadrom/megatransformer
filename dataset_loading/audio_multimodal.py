@@ -1,5 +1,6 @@
 from datasets import load_dataset, Audio, config
-from typing import List, Literal, Optional 
+from transformers import PreTrainedTokenizer
+from typing import List, Literal, Optional
 
 import librosa
 import logging
@@ -42,19 +43,19 @@ def extract_audio_features(audio, sr=16000, n_mels=128, n_fft=1024, hop_length=5
     
     # Convert to log scale (dB)
     log_mel_spec = librosa.power_to_db(mel_spec)
-    
+
     return log_mel_spec
 
 def load_audio_dataset(
     dataset_name,
     dataset_config_name: Literal["clean", "other", "all"], 
     split,
-    tokenizer=None,
+    tokenizer: PreTrainedTokenizer,
+    n_mels: int,
+    n_fft: int,
+    hop_length: int,
+    max_frames: int,
     batch_size: int = 100,
-    n_mels: int = 128,
-    n_fft: int = 1024,
-    hop_length: int = 512,
-    max_duration: Optional[float] = None,
     streaming: bool = False,
     cache_dir: Optional[str] = None,
 ):
@@ -79,9 +80,11 @@ def load_audio_dataset(
     # Load dataset
     dataset = load_dataset(dataset_name, dataset_config_name, cache_dir=cache_dir, split=split, streaming=streaming, trust_remote_code=True)
 
-    audio_placeholder_token = tokenizer.convert_tokens_to_ids("<|AUDIO|>")
+    begin_audio_token_id = tokenizer.convert_tokens_to_ids("<|AUDIO|>")
+    end_audio_token_id = tokenizer.convert_tokens_to_ids("<|/AUDIO|>")
 
-    assert isinstance(audio_placeholder_token, int), f"Audio placeholder token should be an integer, got {type(audio_placeholder_token)}"
+    assert isinstance(begin_audio_token_id, int), f"Audio placeholder token should be an integer, got {type(begin_audio_token_id)}"
+    assert isinstance(end_audio_token_id, int), f"Audio placeholder token should be an integer, got {type(end_audio_token_id)}"
     
     # Define processing function for custom features
     def process_audio(examples):
@@ -100,17 +103,12 @@ def load_audio_dataset(
             tokenized = tokenizer(text=text, add_special_tokens=True)
             input_ids = tokenized.input_ids
 
-            # Skip long audio files if specified
-            if max_duration is not None:
-                duration = len(audio["array"]) / audio["sampling_rate"]
-                if duration > max_duration:
-                    continue
-            
-            transcription_input_ids = [audio_placeholder_token] + input_ids
-            generation_input_ids = input_ids + [audio_placeholder_token]
+            # model will interleave embeds between the begin and end tokens; they need to be appended in the text input beforehand so that the embedding process applies appropriately to each token
+            transcription_input_ids = [begin_audio_token_id, end_audio_token_id] + input_ids
+            generation_input_ids = input_ids + [begin_audio_token_id, end_audio_token_id]
             
             # Extract features
-            audio_raw_inputs = extract_audio_features(
+            audio_mels = extract_audio_features(
                 audio,
                 sr=16000,
                 n_mels=n_mels,
@@ -118,12 +116,16 @@ def load_audio_dataset(
                 hop_length=hop_length
             )
 
+            audio_mels = torch.tensor(audio_mels)
+
+            if audio_mels.shape[-1] > max_frames:
+                continue
+
             all_input_ids.append(torch.tensor(transcription_input_ids))
             all_input_ids.append(torch.tensor(generation_input_ids))
 
-            audio_raw_inputs = torch.tensor(audio_raw_inputs)
-            all_audio_raw_inputs.append(audio_raw_inputs)
-            all_audio_raw_inputs.append(audio_raw_inputs)
+            all_audio_raw_inputs.append(audio_mels)
+            all_audio_raw_inputs.append(audio_mels)
 
         # Pad sequences to the same length
         max_length = max([len(ids) for ids in all_input_ids])

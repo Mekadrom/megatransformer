@@ -93,17 +93,18 @@ def load_image_dataset(tokenizer, dataset_name, dataset_config_name, dataset_spl
         raise ValueError(f"Unsupported image dataset: {dataset_name}")
     return dataset
 
-def load_audio_dataset(tokenizer, dataset_name, dataset_config_name, dataset_split, streaming=False, cache_dir=None):
+def load_audio_dataset(n_mels, n_fft, hop_length, max_frames, tokenizer, dataset_name, dataset_config_name, dataset_split, streaming=False, cache_dir=None):
     if "mozilla" in dataset_name.lower() or "commonvoice" in dataset_name.lower():
         dataset = audio_multimodal.load_audio_dataset(
             dataset_name,
             dataset_config_name,
             dataset_split,
             tokenizer,
+            n_mels=n_mels,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            max_frames=max_frames,
             batch_size=100,
-            n_mels=128,
-            n_fft=1024,
-            hop_length=512,
             streaming=streaming,
             cache_dir=cache_dir,
         )
@@ -116,6 +117,10 @@ def load_dataset(
     max_position_embeddings: int,
     split: str = "train",
     dataset_type: Literal["text", "image", "audio"] = "text",
+    n_mels: int = None,
+    n_fft: int = None,
+    hop_length: int = None,
+    audio_max_frames: float = None,
     image_size: int = None,
     streaming: bool = False,
     cache_dir: str = None,
@@ -132,6 +137,6 @@ def load_dataset(
     elif dataset_type == "image":
         return load_image_dataset(tokenizer, dataset_name, dataset_config_name, split, image_size, streaming=streaming, cache_dir=cache_dir)
     elif dataset_type == "audio":
-        return load_audio_dataset(tokenizer, dataset_name, dataset_config_name, split, streaming=streaming, cache_dir=cache_dir)
+        return load_audio_dataset(n_mels, n_fft, hop_length, audio_max_frames, tokenizer, dataset_name, dataset_config_name, split, streaming=streaming, cache_dir=cache_dir)
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")

@@ -164,17 +164,21 @@ class MegaTransformerConfig(PretrainedConfig):
         begin_image_token_id=50259,
         end_image_token_id=50260,
 
+        audio_n_mels=128,
+        audio_n_fft=1024,
+        audio_hop_length=512,
+        audio_max_duration=16.0, # used for trimming data/skipping examples that are too long
+        audio_sample_rate=16000,
+
+        image_size=224,
+
         audio_encoder_base_channels=32,
         audio_encoder_kernel_sizes=[3, 3, 3, 3, 3, 3],
-        audio_n_mels=128,
-        audio_max_frames=1024,
-        audio_hop_length=512,
         audio_encoder_dropout=0.1,
         audio_encoder_activation="relu",
         audio_encoder_norm_type="layernorm",
         audio_encoder_norm_eps=1e-5,
 
-        image_image_size=224,
         image_encoder_patch_size=16,
         image_encoder_pos_dropout=0.1,
         image_encoder_activation="relu",
@@ -252,17 +256,23 @@ class MegaTransformerConfig(PretrainedConfig):
         self.begin_image_token_id = begin_image_token_id
         self.end_image_token_id = end_image_token_id
 
+        self.image_size = image_size
+
+        self.audio_n_mels = audio_n_mels
+        self.audio_n_fft = audio_n_fft
+        self.audio_n_stft = audio_n_fft // 2 + 1
+        self.audio_hop_length = audio_hop_length
+        self.audio_max_duration = audio_max_duration
+        self.audio_max_frames = round((audio_max_duration * audio_sample_rate) / audio_hop_length)
+        self.audio_sample_rate = audio_sample_rate
+
         self.audio_encoder_base_channels = audio_encoder_base_channels
         self.audio_encoder_kernel_sizes = audio_encoder_kernel_sizes
-        self.audio_n_mels = audio_n_mels
-        self.audio_max_frames = audio_max_frames
-        self.audio_hop_length = audio_hop_length
         self.audio_encoder_dropout = audio_encoder_dropout
         self.audio_encoder_activation = audio_encoder_activation
         self.audio_encoder_norm_type = audio_encoder_norm_type
         self.audio_encoder_norm_eps = audio_encoder_norm_eps
 
-        self.image_image_size = image_image_size
         self.image_encoder_patch_size = image_encoder_patch_size
         self.image_encoder_pos_dropout = image_encoder_pos_dropout
         self.image_encoder_activation = image_encoder_activation

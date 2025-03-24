@@ -56,9 +56,11 @@ class MegaTransformerSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.proj_dropout = nn.Dropout(config.hidden_dropout_prob)
         
+        max_positions = config.max_position_embeddings + config.audio_max_frames
+
         self.register_buffer(
             "causal_mask",
-            torch.tril(torch.ones(config.max_position_embeddings, config.max_position_embeddings)).view(1, 1, config.max_position_embeddings, config.max_position_embeddings),
+            torch.tril(torch.ones(max_positions, max_positions)).view(1, 1, max_positions, max_positions),
         )
     
     def forward(

@@ -59,6 +59,10 @@ class MultimodalDataset(IterableDataset):
         self,
         approximated_length: int,
         tokenizer: PreTrainedTokenizer,
+        n_mels: int,
+        n_fft: int,
+        hop_length: int,
+        audio_max_frames: float,
         image_size: int,
         cache_dir: str = "cached_datasets",
         text_weight: float = 1.0,
@@ -104,6 +108,10 @@ class MultimodalDataset(IterableDataset):
                 self.max_position_embeddings,
                 split,
                 "audio",
+                n_mels=n_mels,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                audio_max_frames=audio_max_frames,
                 streaming=True,
                 cache_dir=self.cache_dir
             )
@@ -207,10 +215,10 @@ class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling)
         all_labels[all_input_ids == self.tokenizer.pad_token_id] = -100
 
         all_audio_raw_inputs = [torch.nn.functional.pad(audio, (0, self.audio_max_frames - audio.shape[-1]), value=0).unsqueeze(0) for audio in all_audio_raw_inputs]
-        all_audio_raw_inputs = torch.stack(all_audio_raw_inputs)
+        all_audio_raw_inputs = torch.stack(all_audio_raw_inputs).unsqueeze(0)
         all_audio_labels = all_audio_raw_inputs.clone()
 
-        all_image_raw_inputs = torch.stack(all_image_raw_inputs, dim=0)
+        all_image_raw_inputs = torch.stack(all_image_raw_inputs, dim=0).unsqueeze(0)
         all_image_labels = all_image_raw_inputs.clone()
 
         # bullshit function expects every example to consist of only tensors of the same shapes per key

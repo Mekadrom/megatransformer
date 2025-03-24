@@ -42,9 +42,11 @@ def load_image_dataset(dataset_name: str,
 
     dataset = load_dataset(dataset_name, dataset_config_name, streaming=streaming, cache_dir=cache_dir, split=split, trust_remote_code=True)
 
-    image_placeholder_token = tokenizer.convert_tokens_to_ids("<|IMAGE|>")
+    begin_image_token_id = tokenizer.convert_tokens_to_ids("<|IMAGE|>")
+    end_image_token_id = tokenizer.convert_tokens_to_ids("<|/IMAGE|>")
 
-    assert isinstance(image_placeholder_token, int), f"Image placeholder token should be an integer, got {type(image_placeholder_token)}"
+    assert isinstance(begin_image_token_id, int), f"Image placeholder token should be an integer, got {type(begin_image_token_id)}"
+    assert isinstance(end_image_token_id, int), f"Image placeholder token should be an integer, got {type(end_image_token_id)}"
 
     transform = get_transform(image_size)
 
@@ -65,8 +67,9 @@ def load_image_dataset(dataset_name: str,
                 # append the image placeholder token
                 # before input_ids: describe image (image followed by text)
                 # after input_ids: generate image (text followed by image)
-                image_transcription_input_ids = [image_placeholder_token] + input_ids
-                image_generation_input_ids = input_ids + [image_placeholder_token]
+                # model will interleave embeds between the begin and end tokens; they need to be appended in the text input beforehand so that the embedding process applies appropriately to each token
+                image_transcription_input_ids = [begin_image_token_id, end_image_token_id] + input_ids
+                image_generation_input_ids = input_ids + [begin_image_token_id, end_image_token_id]
 
                 all_input_ids.append(torch.tensor(image_transcription_input_ids))
                 all_input_ids.append(torch.tensor(image_generation_input_ids))
