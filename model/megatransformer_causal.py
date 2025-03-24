@@ -1,6 +1,5 @@
 from torch import nn
 from transformers import PreTrainedModel, GenerationMixin
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 from typing import Optional, Union
 
 from model import megatransformer_blocks

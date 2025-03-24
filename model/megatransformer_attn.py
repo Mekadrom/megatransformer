@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 
-class SelfAttentionOutput:
+class MegaTransformerSelfAttentionOutput:
     def __init__(self, hidden_states: torch.Tensor, past_key_values, attention_probs: torch.Tensor=None):
         self.hidden_states: torch.Tensor = hidden_states
         self.past_key_values = past_key_values
@@ -71,7 +71,7 @@ class MegaTransformerSelfAttention(nn.Module):
         past_key_values: megatransformer_utils.KVCache=None,
         use_cache=False,
         output_attentions: bool=False,
-    ) -> SelfAttentionOutput:
+    ) -> MegaTransformerSelfAttentionOutput:
         N, _ = hidden_states.shape[:2]
 
         queries = self.q_proj(hidden_states)
@@ -146,7 +146,7 @@ class MegaTransformerSelfAttention(nn.Module):
         output = self.o_proj(context_layer)
         output = self.proj_dropout(output)
         
-        return SelfAttentionOutput(
+        return MegaTransformerSelfAttentionOutput(
             hidden_states=output,
             past_key_values=past_key_values,
             attention_probs=attention_probs if output_attentions else None,

@@ -1,10 +1,12 @@
-from model import swiglu
 from typing import Optional
+
+from model import megatransformer_modules
 
 import megatransformer_utils
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 class ImageUpsampleConv2dGenerator(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
@@ -31,7 +33,7 @@ class ImageUpsampleConv2dGenerator(nn.Module):
                 nn.Upsample(size=(upsample_target, upsample_target), mode="bilinear", align_corners=False),
                 nn.Conv2d(channels[i], out_channels, kernel_size=3, stride=1, padding=1),
                 nn.BatchNorm2d(out_channels),
-                activation_type() if activation_type is not swiglu.SwiGLU else swiglu.SwiGLU(out_channels),
+                activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(out_channels),
                 nn.Dropout2d(dropout)
             ))
 
@@ -46,73 +48,6 @@ class ImageUpsampleConv2dGenerator(nn.Module):
             x = layer(x) # unflatten makes it [batch_size, hidden_size, 1, 1] and it upsamples size and downsamples featuers from there
         return x
     
-class SinusoidalPositionalEmbeddings(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, time: torch.Tensor) -> torch.Tensor:
-        device = time.device
-        half_dim = self.dim // 2
-        embeddings = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-
-        if self.dim % 2 == 1:
-            embeddings = F.pad(embeddings, (0, 1, 0, 0))
-
-        return embeddings
-
-class SimpleSelfAttentionBlock(nn.Module):
-    def __init__(self, channels: int, num_heads: int = 8):
-        super().__init__()
-        self.norm = nn.GroupNorm(8, channels)
-        self.attention = nn.MultiheadAttention(channels, num_heads, batch_first=True)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        
-        h = self.norm(x)
-        
-        h = h.reshape(B, C, -1).permute(0, 2, 1)  # [B, H*W, C]
-        
-        h, _ = self.attention(h, h, h)
-        
-        h = h.permute(0, 2, 1).reshape(B, C, H, W)
-        
-        return x + h
-
-class SimpleCrossAttentionBlock(nn.Module):
-    def __init__(self, query_dim, context_dim, heads=8, dim_head=64):
-        super().__init__()
-        inner_dim = dim_head * heads
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        
-        # Projections
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
-        
-        self.to_out = nn.Linear(inner_dim, query_dim)
-        
-    def forward(self, x, context):
-        batch_size, _, _ = x.shape
-        h = self.heads
-        
-        q = self.to_q(x).reshape(batch_size, -1, h, self.inner_dim // h).permute(0, 2, 1, 3)
-        k = self.to_k(context).reshape(batch_size, -1, h, self.inner_dim // h).permute(0, 2, 1, 3)
-        v = self.to_v(context).reshape(batch_size, -1, h, self.inner_dim // h).permute(0, 2, 1, 3)
-        
-        attn = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
-        attn = attn.softmax(dim=-1)
-        
-        out = torch.einsum('bhij,bhjd->bhid', attn, v)
-        out = out.permute(0, 2, 1, 3).reshape(batch_size, -1, self.inner_dim)
-        
-        return self.to_out(out)
-
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, time_embedding_dim, activation, dropout):
         super().__init__()
@@ -121,19 +56,19 @@ class ResidualBlock(nn.Module):
         activation_type = megatransformer_utils.get_activation_type(activation)
         self.conv1 = nn.Sequential(
             nn.GroupNorm(8, in_channels),
-            activation_type() if activation_type is not swiglu.SwiGLU else swiglu.SwiGLU(in_channels),
+            activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(in_channels),
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
         )
 
         if time_embedding_dim is not None:
             self.time_mlp = nn.Sequential(
-                activation_type() if activation_type is not swiglu.SwiGLU else swiglu.SwiGLU(time_embedding_dim),
+                activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(time_embedding_dim),
                 nn.Linear(time_embedding_dim, out_channels),
             )
 
         self.conv2 = nn.Sequential(
             nn.GroupNorm(8, out_channels),
-            activation_type() if activation_type is not swiglu.SwiGLU else swiglu.SwiGLU(out_channels),
+            activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(out_channels),
             nn.Dropout(dropout),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
         )
@@ -163,12 +98,12 @@ class DownBlock(nn.Module):
         ])
 
         self.attn_blocks = nn.ModuleList([
-            SimpleSelfAttentionBlock(out_channels) if has_attn else nn.Identity()
+            megatransformer_modules.SimpleSelfAttentionBlock(out_channels) if has_attn else nn.Identity()
             for _ in range(num_res_blocks) if has_attn
         ])
 
         self.cross_attn_blocks = nn.ModuleList([
-            SimpleCrossAttentionBlock(out_channels, out_channels) if has_attn else nn.Identity()
+            megatransformer_modules.SimpleCrossAttentionBlock(out_channels, out_channels) if has_attn else nn.Identity()
             for _ in range(num_res_blocks) if has_attn
         ])
 
@@ -195,12 +130,12 @@ class UpBlock(nn.Module):
         ])
 
         self.attn_blocks = nn.ModuleList([
-            SimpleSelfAttentionBlock(out_channels) if has_attn else nn.Identity()
+            megatransformer_modules.SimpleSelfAttentionBlock(out_channels) if has_attn else nn.Identity()
             for _ in range(num_res_blocks) if has_attn
         ])
 
         self.cross_attn_blocks = nn.ModuleList([
-            SimpleCrossAttentionBlock(out_channels, out_channels) if has_attn else nn.Identity()
+            megatransformer_modules.SimpleCrossAttentionBlock(out_channels, out_channels) if has_attn else nn.Identity()
             for _ in range(num_res_blocks) if has_attn
         ])
 
@@ -238,9 +173,9 @@ class UNet(nn.Module):
 
         activation_type = megatransformer_utils.get_activation_type(activation)
         self.time_embedding = nn.Sequential(
-            SinusoidalPositionalEmbeddings(model_channels),
+            megatransformer_modules.SinusoidalPositionalEmbeddings(model_channels),
             nn.Linear(model_channels, time_embedding_dim),
-            activation_type() if activation_type is not swiglu.SwiGLU else swiglu.SwiGLU(time_embedding_dim),
+            activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(time_embedding_dim),
             nn.Linear(time_embedding_dim, time_embedding_dim),
         )
 
@@ -267,7 +202,7 @@ class UNet(nn.Module):
         self.middle_res_block = ResidualBlock(
             channels[-1], channels[-1], time_embedding_dim, activation, dropout
         )
-        self.middle_attn_block = SimpleSelfAttentionBlock(channels[-1])
+        self.middle_attn_block = megatransformer_modules.SimpleSelfAttentionBlock(channels[-1])
         self.middle_res_block2 = ResidualBlock(
             channels[-1], channels[-1], time_embedding_dim, activation, dropout
         )

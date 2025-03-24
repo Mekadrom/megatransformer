@@ -2,7 +2,7 @@ from torch import nn
 from transformers import GenerationMixin, PreTrainedModel, PreTrainedTokenizer
 from typing import Optional, Union
 
-from model import megatransformer_blocks, megatransformer_audio_decoder, megatransformer_image_decoder, swiglu
+from model import megatransformer_blocks, megatransformer_audio_encoder, megatransformer_audio_decoder, megatransformer_image_encoder, megatransformer_image_decoder, megatransformer_modules
 
 import megatransformer_utils
 import torch
@@ -23,69 +23,6 @@ class MultimodalGenerationOutput:
         self.audio_outputs = audio_outputs 
         self.image_outputs = image_outputs
 
-
-class SimpleBlock(nn.Module):
-    def __init__(self, config, n_layers: int, dropout: float):
-        super().__init__()
-        self.config = config
-        self.prelude = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(n_layers)])
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        past_key_values: list[megatransformer_utils.KVCache]=None,
-        use_cache=False,
-        head_mask=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        all_hidden_states: Optional[list] = [] if output_hidden_states else None
-        all_attentions: Optional[list] = [] if output_attentions else None
-
-        for i, block in enumerate(self.prelude):
-            past_key_value = past_key_values[i] if past_key_values is not None else None
-            if all_hidden_states is not None:
-                all_hidden_states.append(hidden_states)
-
-            outputs = block(
-                hidden_states,
-                attention_mask=attention_mask,
-                head_mask=head_mask[i] if head_mask is not None else None,
-                past_key_values=past_key_value,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states
-            )
-
-            hidden_states = outputs.hidden_states
-            attention_probs = outputs.attention_probs
-
-            if all_attentions is not None:
-                all_attentions.append(attention_probs)
-
-        if all_hidden_states is not None:
-            all_hidden_states.append(hidden_states)
-
-        hidden_states = self.dropout(hidden_states)
-
-        if not return_dict:
-            return (
-                hidden_states,
-                past_key_values,
-                all_hidden_states,
-                all_attentions,
-            )
-
-        return megatransformer_utils.MegaTransformerCausalOutput(
-            logits=hidden_states,
-            past_key_values=past_key_values,
-            hidden_states=all_hidden_states,
-            attentions=all_attentions,
-        )
-
 class TextFeatureExtractor(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__()
@@ -102,7 +39,7 @@ class TextFeatureExtractor(nn.Module):
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        self.prelude = SimpleBlock(config, config.n_prelude_layers, config.hidden_dropout_prob)
+        self.prelude = megatransformer_modules.SimpleBlock(config, config.n_prelude_layers, config.hidden_dropout_prob)
 
     def forward(
         self,
@@ -144,161 +81,6 @@ class TextFeatureExtractor(nn.Module):
         )
 
         return prelude_outputs
-        
-
-class AudioConv(nn.Module):
-    def __init__(self, input_channels=1, base_channels=32, kernel_sizes=[3, 3, 3, 3, 3], dropout=0.1, activation="gelu"):
-        super().__init__()
-        self.conv_layers = nn.ModuleList()
-
-        activation_type = megatransformer_utils.get_activation_type(activation)
-
-        channels = [input_channels] + [base_channels * (2**i) for i in range(len(kernel_sizes))]
-        for i in range(len(kernel_sizes)):
-            out_channels = channels[i+1]
-
-            self.conv_layers.append(nn.Sequential(
-                nn.Conv2d(channels[i], out_channels, kernel_size=kernel_sizes[i], stride=(2, 1), padding=1),
-                nn.BatchNorm2d(out_channels),
-                activation_type() if activation_type is not swiglu.SwiGLU else swiglu.SwiGLU(out_channels),
-                nn.Dropout2d(dropout)
-            ))
-    
-    def forward(self, features: torch.Tensor):
-        # x: [batch_size, channels, height, width]
-        for i, layer in enumerate(self.conv_layers):
-            # print(f"audio features: {features.shape} into conv {i}")
-            features = layer(features)
-        return features
-
-class AudioFeatureExtractor(nn.Module):
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
-        super().__init__()
-        self.config = config
-
-        self.pos_encoding = nn.Parameter(torch.zeros(1, config.audio_max_frames, config.hidden_size))
-        
-        self.conv_feature_extractor = AudioConv(
-            input_channels=1,
-            base_channels=config.audio_encoder_base_channels,
-            kernel_sizes=config.audio_encoder_kernel_sizes,
-            dropout=config.audio_encoder_dropout,
-            activation=config.audio_encoder_activation,
-        )
-
-        conv_output_channels = config.audio_encoder_base_channels * (2**(len(config.audio_encoder_kernel_sizes) - 1))
-        self.conv_projection = nn.Linear(conv_output_channels * 2, config.hidden_size)
-
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-        self.prelude = SimpleBlock(config, config.n_prelude_layers, config.hidden_dropout_prob)
-
-    def forward(
-        self,
-        features: torch.Tensor,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        N, *_, T = features.shape
-
-        features = self.conv_feature_extractor(features)
-        # print(f"audio features: {features.shape} from conv_feature_extractor")
-
-        features = features.permute(0, 3, 1, 2) # [batch_size, audio_seq_len, channels, n_mels]
-        features = features.reshape(N, T, -1) # [batch_size, audio_seq_len, channels * hidden_size]
-
-        features = self.conv_projection(features)
-
-        features = features + self.pos_encoding[:, :T, :]
-
-        features = self.dropout(features)
-
-        # print(f"audio features: {features.shape} after projection and reshaping")
-
-        features = self.prelude(
-            features,
-            attention_mask=torch.ones((N, T), device=features.device),
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        # print(f"audio features: {features[0].shape} after prelude")
-
-        return features
-
-class PatchEmbedding(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768):
-        super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.n_patches = (img_size // patch_size) ** 2
-        
-        # Linear projection of flattened patches
-        self.proj = nn.Conv2d(
-            in_channels,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size
-        )
-    
-    def forward(self, x: torch.Tensor):
-        # x: (B, C, H, W)
-        B, C, H, W = x.shape
-        assert H == W == self.img_size, f"Input image size ({H}*{W}) doesn't match model ({self.img_size}*{self.img_size})"
-        
-        # (B, embed_dim, H/patch_size, W/patch_size) -> (B, embed_dim, n_patches)
-        x = self.proj(x)
-        x = x.flatten(2)
-        # (B, embed_dim, n_patches) -> (B, n_patches, embed_dim)
-        x = x.transpose(1, 2)
-        
-        return x
-
-class ImageViTFeatureExtractor(nn.Module):
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
-        super().__init__()
-        self.config = config
-
-        self.patch_embed = PatchEmbedding(config.image_size, config.image_encoder_patch_size, 3, config.hidden_size)
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.n_patches, self.config.hidden_size))
-        
-        self.dropout = nn.Dropout(config.image_encoder_pos_dropout)
-
-        self.prelude = SimpleBlock(config, config.n_prelude_layers, config.hidden_dropout_prob)
-
-    def forward(
-        self,
-        image_raw_inputs,
-        past_key_values: list[megatransformer_utils.KVCache]=None,
-        use_cache=False,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        # image_raw_inputs: [batch_size, channels, height, width]
-        B = image_raw_inputs.shape[0]
-
-        # patches: [batch_size, n_patches, hidden_size] / [batch_size, (img_size // patch_size) ** 2, hidden_size]
-        patches = self.patch_embed(image_raw_inputs)
-        patches = patches + self.pos_embed
-
-        patches = self.dropout(patches)
-
-        attention_mask = torch.ones((B, patches.size(1)), device=patches.device)
-
-        tokens = self.prelude(
-            patches,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        return tokens
 
 class MegaTransformerMultimodalEncoder(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
@@ -306,8 +88,8 @@ class MegaTransformerMultimodalEncoder(nn.Module):
         self.config = config
 
         self.text_embedding = TextFeatureExtractor(config)
-        self.audio_embedding = AudioFeatureExtractor(config)
-        self.image_embedding = ImageViTFeatureExtractor(config)
+        self.audio_embedding = megatransformer_audio_encoder.AudioFeatureExtractor(config)
+        self.image_embedding = megatransformer_image_encoder.ImageViTFeatureExtractor(config)
 
         self.apply(self._init_weights)
 
@@ -336,8 +118,8 @@ class MegaTransformerMultimodalEncoder(nn.Module):
         else:
             B, N, C, M, T = audio_raw_inputs.shape
 
-            # # combine batch and n_audios dimensions for easier processing
-            # audio_raw_inputs = audio_raw_inputs.view(-1, C, M, T)
+            # combine batch and n_audios dimensions for easier processing
+            audio_raw_inputs = audio_raw_inputs.view(-1, C, M, T)
 
             # Find which samples in the batch have valid audio content
             valid_samples = audio_raw_inputs.sum(dim=(1, 2)) != 0  # [batch_size, audio_max_frames]
@@ -359,8 +141,8 @@ class MegaTransformerMultimodalEncoder(nn.Module):
                 # Place valid outputs in the appropriate positions
                 audio_logits[valid_batch_indices] = valid_outputs[0]
 
-                # # restore n_audios dimension
-                # audio_logits = audio_logits.view(B, N, T, -1)
+                # restore n_audios dimension
+                audio_logits = audio_logits.view(B, N, T, -1)
 
                 # Reconstruct the full outputs tuple
                 other_outputs = [audio_logits]
@@ -381,9 +163,9 @@ class MegaTransformerMultimodalEncoder(nn.Module):
         if image_raw_inputs is None:
             image_prelude_outputs = None
         else:
-            # B, N, C, H, W = image_raw_inputs.shape
-            # # combine batch and n_images dimensions for easier processing
-            # image_raw_inputs = image_raw_inputs.view(-1, C, H, W)
+            B, N, C, H, W = image_raw_inputs.shape
+            # combine batch and n_images dimensions for easier processing
+            image_raw_inputs = image_raw_inputs.view(-1, C, H, W)
 
             # Find which samples in the batch have valid image content
             valid_samples = image_raw_inputs.sum(dim=(1, 2, 3)) != 0  # [batch_size]
@@ -405,10 +187,10 @@ class MegaTransformerMultimodalEncoder(nn.Module):
                 # Place valid outputs in the appropriate positions
                 image_logits[valid_batch_indices] = valid_outputs[0]
 
-                # _, T, _ = image_logits.shape
+                _, T, _ = image_logits.shape
 
-                # # restore n_images dimension
-                # image_logits = image_logits.view(B, N, T, -1)
+                # restore n_images dimension
+                image_logits = image_logits.view(B, N, T, -1)
                 
                 # Reconstruct the full outputs tuple
                 other_outputs = [image_logits]
@@ -436,10 +218,10 @@ class MegaTransformerMultimodalDecoder(nn.Module):
 
         self.text_decoder = nn.Linear(config.hidden_size, config.vocab_size)
 
-        self.audio_coda = SimpleBlock(config, config.n_coda_layers, config.hidden_dropout_prob)
+        self.audio_coda = megatransformer_modules.SimpleBlock(config, config.n_coda_layers, config.hidden_dropout_prob)
         self.audio_decoder =  megatransformer_audio_decoder.AudioEmbeddingUpsampleConv2dGenerator(config)
 
-        self.image_coda = SimpleBlock(config, config.n_coda_layers, config.hidden_dropout_prob)
+        self.image_coda = megatransformer_modules.SimpleBlock(config, config.n_coda_layers, config.hidden_dropout_prob)
         self.image_decoder = megatransformer_image_decoder.ConditionalGaussianDiffusion(config.image_decoder_activation, config.hidden_size)
 
     def forward(self,
@@ -593,7 +375,6 @@ class MegaTransformerMultimodalRecurrentModel(PreTrainedModel, GenerationMixin):
             "position_ids": position_ids,
         }
     
-
 class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
     config_class = megatransformer_utils.MegaTransformerConfig
     

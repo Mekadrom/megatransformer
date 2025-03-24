@@ -3,7 +3,7 @@ from typing import Optional, Union
 
 import torch.utils.tensorboard
 
-from model import megatransformer_attn, megatransformer_ffn, mult, recurrent_criteria, sum
+from model import megatransformer_attn, megatransformer_ffn, megatransformer_modules, recurrent_criteria
 
 import math
 import megatransformer_utils
@@ -18,8 +18,6 @@ class MegaTransformerBlock(nn.Module):
         self.ffn: nn.Module
         if config.ffn_type == "mlp":
             self.ffn = megatransformer_ffn.SimpleFFN(config)
-        elif config.ffn_type == "gated":
-            self.ffn = megatransformer_ffn.GateFFN(config)
         else:
             raise ValueError(f"Unknown ffn_type: {config.ffn_type}")
 
@@ -120,9 +118,9 @@ class MegaTransformerRecurrentBlock(nn.Module):
 
         self.adapter: nn.Module
         if self.adapter_method == 'sum':
-            self.adapter = sum.Sum() # todo: implement other adapter methods
+            self.adapter = megatransformer_modules.Sum() # todo: implement other adapter methods
         elif self.adapter_method == "gate":
-            self.adapter = mult.Mult()
+            self.adapter = megatransformer_modules.Mult()
         elif self.adapter_method == "linear":
             self.adapter = nn.Linear(config.hidden_size * 2, config.hidden_size)
         else:

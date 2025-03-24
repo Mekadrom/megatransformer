@@ -1,4 +1,4 @@
-from model import swiglu
+from model import megatransformer_modules
 
 import megatransformer_utils
 import torch
@@ -27,7 +27,7 @@ class AudioEmbeddingUpsampleConv2dGenerator(nn.Module):
                 nn.Upsample(size=upsample_target, mode="bilinear", align_corners=False),
                 nn.Conv2d(channels[i], out_channels, kernel_size=3, stride=1, padding=1),
                 nn.BatchNorm2d(out_channels),
-                activation_type() if activation_type is not swiglu.SwiGLU else swiglu.SwiGLU(out_channels),
+                activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(out_channels),
                 nn.Dropout2d(dropout)
             ))
 
