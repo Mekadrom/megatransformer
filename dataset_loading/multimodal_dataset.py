@@ -59,6 +59,7 @@ class MultimodalDataset(IterableDataset):
         self,
         approximated_length: int,
         tokenizer: PreTrainedTokenizer,
+        sample_rate: int,
         n_mels: int,
         n_fft: int,
         hop_length: int,
@@ -108,6 +109,7 @@ class MultimodalDataset(IterableDataset):
                 self.max_position_embeddings,
                 split,
                 "audio",
+                sample_rate=sample_rate,
                 n_mels=n_mels,
                 n_fft=n_fft,
                 hop_length=hop_length,
@@ -185,26 +187,32 @@ class MultimodalDataset(IterableDataset):
                         break
 
 class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling):
-    def __init__(self, tokenizer: PreTrainedTokenizer, max_position_embeddings, image_size, audio_max_frames, *args, **kwargs):
+    def __init__(self, tokenizer: PreTrainedTokenizer, max_position_embeddings, image_size, audio_max_frames, audio_max_waveform_length, *args, **kwargs):
         super().__init__(tokenizer=tokenizer, *args, **kwargs)
         self.max_position_embeddings = max_position_embeddings
         self.image_size = image_size
         self.audio_max_frames = audio_max_frames
+        self.audio_max_waveform_length = audio_max_waveform_length
 
     """DataCollatorForLanguageModeling but additional dataset dict keys are allowed through."""
     def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
         all_input_ids = []
         all_audio_raw_inputs = []
+        audio_waveform_labels = []
         all_image_raw_inputs = []
 
         for example in examples:
             if "audio_raw_inputs" not in example:
+                # mels, 1 length
                 example["audio_raw_inputs"] = torch.zeros((128, 1))
+                # waveform, 1 channel and 1 sample
+                example["audio_waveform_labels"] = torch.zeros((1))
             if "image_raw_inputs" not in example:
                 example["image_raw_inputs"] = torch.zeros((3, self.image_size, self.image_size))
 
             all_input_ids.append(example["input_ids"])
             all_audio_raw_inputs.append(example["audio_raw_inputs"])
+            audio_waveform_labels.append(example["audio_waveform_labels"])
             all_image_raw_inputs.append(example["image_raw_inputs"])
 
         # Pad sequences to the same length
@@ -215,10 +223,14 @@ class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling)
         all_labels[all_input_ids == self.tokenizer.pad_token_id] = -100
 
         all_audio_raw_inputs = [torch.nn.functional.pad(audio, (0, self.audio_max_frames - audio.shape[-1]), value=0).unsqueeze(0) for audio in all_audio_raw_inputs]
-        all_audio_raw_inputs = torch.stack(all_audio_raw_inputs).unsqueeze(0)
-        all_audio_labels = all_audio_raw_inputs.clone()
+        all_audio_raw_inputs = torch.stack(all_audio_raw_inputs).unsqueeze(1)
 
-        all_image_raw_inputs = torch.stack(all_image_raw_inputs, dim=0).unsqueeze(0)
+        audio_mel_spec_labels = all_audio_raw_inputs.clone()
+        audio_waveform_labels = [torch.nn.functional.pad(audio, (0, self.audio_max_waveform_length - audio.shape[-1]), value=0).unsqueeze(0) for audio in audio_waveform_labels]
+
+        audio_waveform_labels = torch.stack(audio_waveform_labels)
+
+        all_image_raw_inputs = torch.stack(all_image_raw_inputs, dim=0).unsqueeze(1)
         all_image_labels = all_image_raw_inputs.clone()
 
         # bullshit function expects every example to consist of only tensors of the same shapes per key
@@ -228,7 +240,8 @@ class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling)
             "input_ids": all_input_ids,
             "labels": all_labels,
             "audio_raw_inputs": all_audio_raw_inputs,
-            "audio_labels": all_audio_labels,
+            "audio_mel_spec_labels": audio_mel_spec_labels,
+            "audio_waveform_labels": audio_waveform_labels,
             "image_raw_inputs": all_image_raw_inputs,
             "image_labels": all_image_labels,
         }

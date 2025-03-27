@@ -49,7 +49,8 @@ class SwiGLU(nn.Module):
         x = self.cast(x)
         return x
 
-class SinusoidalPositionalEmbeddings(nn.Module):
+class SinusoidalPositionEmbeddings(nn.Module):
+    """Time step embeddings for diffusion models."""
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -57,64 +58,16 @@ class SinusoidalPositionalEmbeddings(nn.Module):
     def forward(self, time: torch.Tensor) -> torch.Tensor:
         device = time.device
         half_dim = self.dim // 2
-        embeddings = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = torch.log(torch.tensor(10000.0, dtype=time.dtype)) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, dtype=time.dtype, device=device) * -embeddings)
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
 
+        # Handle odd dimensions
         if self.dim % 2 == 1:
             embeddings = F.pad(embeddings, (0, 1, 0, 0))
 
         return embeddings
-
-class SimpleSelfAttentionBlock(nn.Module):
-    def __init__(self, channels: int, num_heads: int = 8):
-        super().__init__()
-        self.norm = nn.GroupNorm(8, channels)
-        self.attention = nn.MultiheadAttention(channels, num_heads, batch_first=True)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        
-        h = self.norm(x)
-        
-        h = h.reshape(B, C, -1).permute(0, 2, 1)  # [B, H*W, C]
-        
-        h, _ = self.attention(h, h, h)
-        
-        h = h.permute(0, 2, 1).reshape(B, C, H, W)
-        
-        return x + h
-
-class SimpleCrossAttentionBlock(nn.Module):
-    def __init__(self, query_dim, context_dim, heads=8, dim_head=64):
-        super().__init__()
-        self.inner_dim = dim_head * heads
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        
-        # Projections
-        self.to_q = nn.Linear(query_dim, self.inner_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, self.inner_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, self.inner_dim, bias=False)
-        
-        self.to_out = nn.Linear(self.inner_dim, query_dim)
-        
-    def forward(self, x: torch.Tensor, context):
-        batch_size, _, _ = x.shape
-        h = self.heads
-        
-        q = self.to_q(x).reshape(batch_size, -1, h, self.inner_dim // h).permute(0, 2, 1, 3)
-        k = self.to_k(context).reshape(batch_size, -1, h, self.inner_dim // h).permute(0, 2, 1, 3)
-        v = self.to_v(context).reshape(batch_size, -1, h, self.inner_dim // h).permute(0, 2, 1, 3)
-        
-        attn = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
-        attn = attn.softmax(dim=-1)
-        
-        out = torch.einsum('bhij,bhjd->bhid', attn, v)
-        out = out.permute(0, 2, 1, 3).reshape(batch_size, -1, self.inner_dim)
-        
-        return self.to_out(out)
 
 class SimpleBlock(nn.Module):
     def __init__(self, config, n_layers: int, dropout: float):

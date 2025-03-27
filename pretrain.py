@@ -28,11 +28,34 @@ else:
 
 model = model_maker.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
 model = megatransformer_utils.load_model(False, model, run_dir)
+
+if args.local_rank == 0:
+    print(f"model structure: {model}")
+    print(f"model parameters: {(sum(p.numel() for p in model.parameters())):,}")
+    print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
+
+    if len(args.include_modes) > 1 or "text" not in args.include_modes:
+        print(f"model.input_transform parameters: {(sum(p.numel() for p in model.input_transform.parameters())):,}")
+        print(f"model.input_transform.text_embedding parameters: {(sum(p.numel() for p in model.input_transform.text_embedding.parameters())):,}")
+        print(f"model.input_transform.audio_embedding parameters: {(sum(p.numel() for p in model.input_transform.audio_embedding.parameters())):,}")
+        print(f"model.input_transform.image_embedding parameters: {(sum(p.numel() for p in model.input_transform.image_embedding.parameters())):,}")
+        print(f"model.world_model parameters: {(sum(p.numel() for p in model.world_model.parameters())):,}")
+        print(f"model.output_transform.text_coda parameters: {(sum(p.numel() for p in model.output_transform.text_coda.parameters())):,}")
+        print(f"model.output_transform.text_decoder parameters: {(sum(p.numel() for p in model.output_transform.text_decoder.parameters())):,}")
+        print(f"model.output_transform.audio_coda parameters: {(sum(p.numel() for p in model.output_transform.audio_coda.parameters())):,}")
+        print(f"model.output_transform.audio_decoder parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.parameters())):,}")
+        print(f"model.output_transform.audio_decoder.vocoder parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.vocoder.parameters())):,}")
+        print(f"model.output_transform.image_coda parameters: {(sum(p.numel() for p in model.output_transform.image_coda.parameters())):,}")
+        print(f"model.output_transform.image_decoder parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.parameters())):,}")
+
+    print(f"modified tokenizer: {tokenizer}")
+    print(f"special tokens: {tokenizer.special_tokens_map}")
+
+    print(f"DeepSpeed config path: {args.deepspeed_config}")
+    print(f"DeepSpeed enabled: {args.use_deepspeed}")
+    print(f"XLA enabled: {args.use_xla}")
+
 model = megatransformer_utils.setup_int8_training(args, model)
-
-print(f"modified tokenizer: {tokenizer}")
-
-print(f"special tokens: {tokenizer.special_tokens_map}")
 
 if not os.path.exists(run_dir):
     os.makedirs(run_dir)
@@ -41,7 +64,6 @@ training_args = TrainingArguments(
     tpu_num_cores=8 if args.use_xla else None,
     output_dir=run_dir,
     overwrite_output_dir=True,
-    learning_rate=args.learning_rate,
     lr_scheduler_type="cosine",
     warmup_ratio=args.warmup_ratio,
     per_device_train_batch_size=args.batch_size,
@@ -69,11 +91,6 @@ training_args = TrainingArguments(
     local_rank=args.local_rank,
 )
 
-print(f"DeepSpeed config path: {args.deepspeed_config}")
-print(f"DeepSpeed enabled: {args.use_deepspeed}")
-print(f"XLA enabled: {args.use_xla}")
-print(f"Final DeepSpeed setting: {training_args.deepspeed}")
-
 text_examples = 10_000
 audio_examples = 10_000
 image_examples = 10_000
@@ -85,6 +102,7 @@ image_weight = 1.0 if "image" in args.include_modes else 0.0
 train_dataset = multimodal_dataset.MultimodalDataset(
     approximated_length=text_examples + audio_examples + image_examples,
     tokenizer=tokenizer,
+    sample_rate=model.config.audio_sample_rate,
     n_mels=model.config.audio_n_mels,
     n_fft=model.config.audio_n_fft,
     hop_length=model.config.audio_hop_length,
@@ -102,6 +120,7 @@ train_dataset = multimodal_dataset.MultimodalDataset(
 validation_dataset = multimodal_dataset.MultimodalDataset(
     approximated_length=3_760 + 9_150 + 12_400,
     tokenizer=tokenizer,
+    sample_rate=model.config.audio_sample_rate,
     n_mels=model.config.audio_n_mels,
     n_fft=model.config.audio_n_fft,
     hop_length=model.config.audio_hop_length,
@@ -122,6 +141,7 @@ if 'multimodal' in args.config.lower():
         max_position_embeddings=args.max_position_embeddings,
         image_size=model.config.image_size,
         audio_max_frames=model.config.audio_max_frames,
+        audio_max_waveform_length=model.config.audio_max_waveform_length,
         mlm=False
     )
 else:

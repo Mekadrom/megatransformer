@@ -4,7 +4,7 @@ from transformers import PretrainedConfig
 from transformers import set_seed as hf_set_seed
 from typing import Optional
 
-from model import rmsnorm, swiglu
+from model import megatransformer_modules
 
 import argparse
 import glob
@@ -164,29 +164,82 @@ class MegaTransformerConfig(PretrainedConfig):
         begin_image_token_id=50259,
         end_image_token_id=50260,
 
+        text_prelude_config=None,
+
+        audio_prelude_config=None,
+
         audio_n_mels=128,
         audio_n_fft=1024,
         audio_hop_length=512,
-        audio_max_duration=16.0, # used for trimming data/skipping examples that are too long
+        audio_max_duration=10.0, # used for trimming data/skipping examples that are too long
         audio_sample_rate=16000,
 
         image_size=224,
 
         audio_encoder_base_channels=32,
         audio_encoder_kernel_sizes=[3, 3, 3, 3, 3, 3],
-        audio_encoder_dropout=0.1,
-        audio_encoder_activation="relu",
         audio_encoder_norm_type="layernorm",
         audio_encoder_norm_eps=1e-5,
+        audio_encoder_activation="relu",
+        audio_encoder_dropout=0.1,
+
+        image_prelude_config=None,
 
         image_encoder_patch_size=16,
-        image_encoder_pos_dropout=0.1,
-        image_encoder_activation="relu",
         image_encoder_norm_type="layernorm",
         image_encoder_norm_eps=1e-5,
+        image_encoder_activation="relu",
+        image_encoder_pos_dropout=0.1,
 
+        text_coda_config=None,
+
+        audio_coda_config=None,
+
+        audio_decoder_model_channels=128,
+        audio_decoder_time_embedding_dim=128,
+        audio_decoder_num_res_blocks=4,
+        audio_decoder_activation="silu",
+        audio_decoder_dropout=0.1,
+
+        audio_decoder_unet_dropout=0.1,
+        audio_decoder_down_block_self_attn_n_heads=8,
+        audio_decoder_down_block_self_attn_d_queries=64,
+        audio_decoder_down_block_self_attn_d_values=64,
+        audio_decoder_down_block_self_attn_use_flash_attention=True,
+        audio_decoder_up_block_self_attn_n_heads=8,
+        audio_decoder_up_block_self_attn_d_queries=64,
+        audio_decoder_up_block_self_attn_d_values=64,
+        audio_decoder_up_block_self_attn_use_flash_attention=True,
+        audio_decoder_cross_attn_n_heads=8,
+        audio_decoder_cross_attn_d_queries=64,
+        audio_decoder_cross_attn_d_values=64,
+        audio_decoder_cross_attn_use_flash_attention=True,
+
+        audio_vocoder_hidden_channels=2048,
+        audio_vocoder_upsample_factors=[8, 8, 4],
+        audio_vocoder_n_residual_layers=4,
+
+        image_coda_config=None,
+
+        image_decoder_model_channels=128,
+        image_decoder_time_embedding_dim=128,
+        image_decoder_num_res_blocks=4,
+        image_decoder_activation="silu",
         image_decoder_dropout=0.1,
-        image_decoder_activation="relu",
+
+        image_decoder_unet_dropout=0.1,
+        image_decoder_down_block_self_attn_n_heads=8,
+        image_decoder_down_block_self_attn_d_queries=64,
+        image_decoder_down_block_self_attn_d_values=64,
+        image_decoder_down_block_self_attn_use_flash_attention=True,
+        image_decoder_up_block_self_attn_n_heads=8,
+        image_decoder_up_block_self_attn_d_queries=64,
+        image_decoder_up_block_self_attn_d_values=64,
+        image_decoder_up_block_self_attn_use_flash_attention=True,
+        image_decoder_cross_attn_n_heads=8,
+        image_decoder_cross_attn_d_queries=64,
+        image_decoder_cross_attn_d_values=64,
+        image_decoder_cross_attn_use_flash_attention=True,
 
         **kwargs
     ):
@@ -256,31 +309,85 @@ class MegaTransformerConfig(PretrainedConfig):
         self.begin_image_token_id = begin_image_token_id
         self.end_image_token_id = end_image_token_id
 
-        self.image_size = image_size
+        self.text_prelude_config = text_prelude_config
+
+        self.audio_prelude_config = audio_prelude_config
 
         self.audio_n_mels = audio_n_mels
         self.audio_n_fft = audio_n_fft
         self.audio_n_stft = audio_n_fft // 2 + 1
         self.audio_hop_length = audio_hop_length
         self.audio_max_duration = audio_max_duration
-        self.audio_max_frames = round((audio_max_duration * audio_sample_rate) / audio_hop_length)
+        self.audio_max_waveform_length = round(self.audio_max_duration * audio_sample_rate)
+        self.audio_max_frames = round(self.audio_max_waveform_length / audio_hop_length)
         self.audio_sample_rate = audio_sample_rate
 
         self.audio_encoder_base_channels = audio_encoder_base_channels
         self.audio_encoder_kernel_sizes = audio_encoder_kernel_sizes
-        self.audio_encoder_dropout = audio_encoder_dropout
-        self.audio_encoder_activation = audio_encoder_activation
         self.audio_encoder_norm_type = audio_encoder_norm_type
         self.audio_encoder_norm_eps = audio_encoder_norm_eps
+        self.audio_encoder_activation = audio_encoder_activation
+        self.audio_encoder_dropout = audio_encoder_dropout
+
+        self.image_size = image_size
+
+        self.image_prelude_config = image_prelude_config
 
         self.image_encoder_patch_size = image_encoder_patch_size
-        self.image_encoder_pos_dropout = image_encoder_pos_dropout
-        self.image_encoder_activation = image_encoder_activation
         self.image_encoder_norm_type = image_encoder_norm_type
         self.image_encoder_norm_eps = image_encoder_norm_eps
+        self.image_encoder_activation = image_encoder_activation
+        self.image_encoder_pos_dropout = image_encoder_pos_dropout
 
-        self.image_decoder_dropout = image_decoder_dropout
+        self.text_coda_config = text_coda_config
+
+        self.audio_coda_config = audio_coda_config
+
+        self.audio_decoder_activation = audio_decoder_activation
+        self.audio_decoder_model_channels = audio_decoder_model_channels
+        self.audio_decoder_time_embedding_dim = audio_decoder_time_embedding_dim
+        self.audio_decoder_num_res_blocks = audio_decoder_num_res_blocks
+        self.audio_decoder_dropout = audio_decoder_dropout
+
+        self.audio_decoder_unet_dropout = audio_decoder_unet_dropout
+        self.audio_decoder_down_block_self_attn_n_heads = audio_decoder_down_block_self_attn_n_heads
+        self.audio_decoder_down_block_self_attn_d_queries = audio_decoder_down_block_self_attn_d_queries
+        self.audio_decoder_down_block_self_attn_d_values = audio_decoder_down_block_self_attn_d_values
+        self.audio_decoder_down_block_self_attn_use_flash_attention = audio_decoder_down_block_self_attn_use_flash_attention
+        self.audio_decoder_up_block_self_attn_n_heads = audio_decoder_up_block_self_attn_n_heads
+        self.audio_decoder_up_block_self_attn_d_queries = audio_decoder_up_block_self_attn_d_queries
+        self.audio_decoder_up_block_self_attn_d_values = audio_decoder_up_block_self_attn_d_values
+        self.audio_decoder_up_block_self_attn_use_flash_attention = audio_decoder_up_block_self_attn_use_flash_attention
+        self.audio_decoder_cross_attn_n_heads = audio_decoder_cross_attn_n_heads
+        self.audio_decoder_cross_attn_d_queries = audio_decoder_cross_attn_d_queries
+        self.audio_decoder_cross_attn_d_values = audio_decoder_cross_attn_d_values
+        self.audio_decoder_cross_attn_use_flash_attention = audio_decoder_cross_attn_use_flash_attention            
+
+        self.audio_vocoder_hidden_channels = audio_vocoder_hidden_channels
+        self.audio_vocoder_upsample_factors = audio_vocoder_upsample_factors
+        self.audio_vocoder_n_residual_layers = audio_vocoder_n_residual_layers
+
+        self.image_coda_config = image_coda_config
+
         self.image_decoder_activation = image_decoder_activation
+        self.image_decoder_model_channels = image_decoder_model_channels
+        self.image_decoder_time_embedding_dim = image_decoder_time_embedding_dim
+        self.image_decoder_num_res_blocks = image_decoder_num_res_blocks
+        self.image_decoder_dropout = image_decoder_dropout
+
+        self.image_decoder_unet_dropout = image_decoder_unet_dropout
+        self.image_decoder_down_block_self_attn_n_heads = image_decoder_down_block_self_attn_n_heads
+        self.image_decoder_down_block_self_attn_d_queries = image_decoder_down_block_self_attn_d_queries
+        self.image_decoder_down_block_self_attn_d_values = image_decoder_down_block_self_attn_d_values
+        self.image_decoder_down_block_self_attn_use_flash_attention = image_decoder_down_block_self_attn_use_flash_attention
+        self.image_decoder_up_block_self_attn_n_heads = image_decoder_up_block_self_attn_n_heads
+        self.image_decoder_up_block_self_attn_d_queries = image_decoder_up_block_self_attn_d_queries
+        self.image_decoder_up_block_self_attn_d_values = image_decoder_up_block_self_attn_d_values
+        self.image_decoder_up_block_self_attn_use_flash_attention = image_decoder_up_block_self_attn_use_flash_attention
+        self.image_decoder_cross_attn_n_heads = image_decoder_cross_attn_n_heads
+        self.image_decoder_cross_attn_d_queries = image_decoder_cross_attn_d_queries
+        self.image_decoder_cross_attn_d_values = image_decoder_cross_attn_d_values
+        self.image_decoder_cross_attn_use_flash_attention = image_decoder_cross_attn_use_flash_attention
 
 class MegaTransformerCausalOutput(dict):
     def __init__(self,
@@ -396,7 +503,7 @@ def get_activation_type(activation_function_name):
     elif activation_function_name == 'sigmoid':
         return nn.Sigmoid
     elif activation_function_name == 'swiglu':
-        return swiglu.SwiGLU
+        return megatransformer_modules.SwiGLU
     elif activation_function_name == 'none':
         return nn.Identity
     else:
@@ -406,7 +513,7 @@ def create_norm(hidden_size, norm_type, norm_eps):
     if norm_type == "layernorm":
         return nn.LayerNorm(hidden_size, eps=norm_eps)
     elif norm_type == "rmsnorm":
-        return rmsnorm.RMSNorm(hidden_size, eps=norm_eps)
+        return megatransformer_modules.RMSNorm(hidden_size, eps=norm_eps)
     else:
         raise Exception(f"Unknown normalization type {norm_type}")
 
@@ -473,6 +580,7 @@ def parse_args():
 
     # efficiency params
     argparser.add_argument('--compile_model', action='store_true', help='Whether to compile the model')
+    argparser.add_argument('--cudnn_benchmark', action='store_true', help='Whether to enable cuDNN benchmark')
     argparser.add_argument('--use_gradient_checkpointing', action='store_true', help='Whether to use gradient checkpointing')
     argparser.add_argument('--use_xla', action='store_true', default=is_tpu_available, help='Whether to use XLA')
 
@@ -549,6 +657,10 @@ def parse_args():
         else:
             raise FileNotFoundError(f"DeepSpeed config file {args.deepspeed_config} not found.")
 
+    if args.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
+        print("cuDNN benchmark enabled.")
+
     return args, unk
 
 def setup_int8_training(args, model):
@@ -606,10 +718,6 @@ def load_model(finetune, model, run_dir):
         print("Model not loaded from checkpoint.")
         if finetune:
             raise ValueError("Fine-tuning is enabled but no checkpoint found. Please check the run directory, or your configuration.")
-
-    print(f"model structure: {model}")
-    print(f"model parameters: {(sum(p.numel() for p in model.parameters())):,}")
-    print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
 
     return model
 

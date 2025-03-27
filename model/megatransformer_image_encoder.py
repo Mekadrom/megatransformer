@@ -43,7 +43,9 @@ class ImageViTFeatureExtractor(nn.Module):
         
         self.dropout = nn.Dropout(config.image_encoder_pos_dropout)
 
-        self.prelude = megatransformer_modules.SimpleBlock(config, config.n_prelude_layers, config.hidden_dropout_prob)
+        self.prelude = megatransformer_modules.SimpleBlock(
+            config.image_prelude_config, config.image_prelude_config.n_prelude_layers, config.hidden_dropout_prob
+        )
 
     def forward(
         self,

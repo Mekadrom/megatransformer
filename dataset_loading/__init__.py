@@ -12,10 +12,12 @@ text_validation_dataset_config_name = "wikitext-2-v1"
 text_validation_split = "validation"
 
 audio_train_dataset_name = "mozilla-foundation/common_voice_11_0"
+# audio_train_dataset_name = "facebook/voxpopuli"
 audio_train_dataset_config_name = "en"
 audio_train_split = "train"
 
 audio_validation_dataset_name = "mozilla-foundation/common_voice_11_0"
+# audio_validation_dataset_name = "facebook/voxpopuli"
 audio_validation_dataset_config_name = "en"
 audio_validation_split = "validation"
 
@@ -93,13 +95,14 @@ def load_image_dataset(tokenizer, dataset_name, dataset_config_name, dataset_spl
         raise ValueError(f"Unsupported image dataset: {dataset_name}")
     return dataset
 
-def load_audio_dataset(n_mels, n_fft, hop_length, max_frames, tokenizer, dataset_name, dataset_config_name, dataset_split, streaming=False, cache_dir=None):
-    if "mozilla" in dataset_name.lower() or "commonvoice" in dataset_name.lower():
+def load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, max_frames, tokenizer, dataset_name, dataset_config_name, dataset_split, streaming=False, cache_dir=None):
+    if "mozilla" in dataset_name.lower() or "commonvoice" in dataset_name.lower() or "voxpopuli" in dataset_name.lower():
         dataset = audio_multimodal.load_audio_dataset(
             dataset_name,
             dataset_config_name,
             dataset_split,
             tokenizer,
+            sample_rate=sample_rate,
             n_mels=n_mels,
             n_fft=n_fft,
             hop_length=hop_length,
@@ -117,6 +120,7 @@ def load_dataset(
     max_position_embeddings: int,
     split: str = "train",
     dataset_type: Literal["text", "image", "audio"] = "text",
+    sample_rate: int = None,
     n_mels: int = None,
     n_fft: int = None,
     hop_length: int = None,
@@ -137,6 +141,6 @@ def load_dataset(
     elif dataset_type == "image":
         return load_image_dataset(tokenizer, dataset_name, dataset_config_name, split, image_size, streaming=streaming, cache_dir=cache_dir)
     elif dataset_type == "audio":
-        return load_audio_dataset(n_mels, n_fft, hop_length, audio_max_frames, tokenizer, dataset_name, dataset_config_name, split, streaming=streaming, cache_dir=cache_dir)
+        return load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, audio_max_frames, tokenizer, dataset_name, dataset_config_name, split, streaming=streaming, cache_dir=cache_dir)
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")

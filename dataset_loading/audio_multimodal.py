@@ -1,6 +1,6 @@
 from datasets import load_dataset, Audio, config
 from transformers import PreTrainedTokenizer
-from typing import List, Literal, Optional
+from typing import Literal, Optional
 
 import librosa
 import logging
@@ -23,6 +23,7 @@ def extract_audio_features(audio, sr=16000, n_mels=128, n_fft=1024, hop_length=5
         
     Returns:
         log_mel_spec: Log mel spectrogram features
+        y: Raw audio waveform
     """
     # Check if audio is already processed
     if isinstance(audio, dict) and 'array' in audio:
@@ -40,17 +41,20 @@ def extract_audio_features(audio, sr=16000, n_mels=128, n_fft=1024, hop_length=5
     mel_spec = librosa.feature.melspectrogram(
         y=y, sr=sr, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length
     )
-    
+
     # Convert to log scale (dB)
     log_mel_spec = librosa.power_to_db(mel_spec)
 
-    return log_mel_spec
+    waveform = torch.tensor(y)
+
+    return log_mel_spec, waveform
 
 def load_audio_dataset(
     dataset_name,
     dataset_config_name: Literal["clean", "other", "all"], 
     split,
     tokenizer: PreTrainedTokenizer,
+    sample_rate: int,
     n_mels: int,
     n_fft: int,
     hop_length: int,
@@ -99,6 +103,7 @@ def load_audio_dataset(
 
         all_input_ids = []
         all_audio_raw_inputs = []
+        all_audio_waveform_labels = []
         for text, audio in zip(texts, audios):
             tokenized = tokenizer(text=text, add_special_tokens=True)
             input_ids = tokenized.input_ids
@@ -108,9 +113,9 @@ def load_audio_dataset(
             generation_input_ids = input_ids + [begin_audio_token_id, end_audio_token_id]
             
             # Extract features
-            audio_mels = extract_audio_features(
+            audio_mels, waveforms = extract_audio_features(
                 audio,
-                sr=16000,
+                sr=sample_rate,
                 n_mels=n_mels,
                 n_fft=n_fft,
                 hop_length=hop_length
@@ -127,6 +132,9 @@ def load_audio_dataset(
             all_audio_raw_inputs.append(audio_mels)
             all_audio_raw_inputs.append(audio_mels)
 
+            all_audio_waveform_labels.append(waveforms)
+            all_audio_waveform_labels.append(waveforms)
+
         # Pad sequences to the same length
         max_length = max([len(ids) for ids in all_input_ids])
         all_input_ids = [torch.nn.functional.pad(ids, (0, max_length - len(ids)), value=0) for ids in all_input_ids]
@@ -135,7 +143,8 @@ def load_audio_dataset(
         return {
             "input_ids": torch.stack(all_input_ids),
             "audio_raw_inputs": all_audio_raw_inputs,
-            "audio_labels": all_audio_raw_inputs,
+            "audio_mel_spec_labels": all_audio_raw_inputs,
+            "audio_waveform_labels": all_audio_waveform_labels,
         }
     
     logger.info("Processing dataset with custom feature extraction...")
