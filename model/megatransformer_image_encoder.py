@@ -20,18 +20,18 @@ class PatchEmbedding(nn.Module):
             stride=patch_size
         )
     
-    def forward(self, x: torch.Tensor):
+    def forward(self, features: torch.Tensor):
         # x: (B, C, H, W)
-        B, C, H, W = x.shape
+        B, C, H, W = features.shape
         assert H == W == self.img_size, f"Input image size ({H}*{W}) doesn't match model ({self.img_size}*{self.img_size})"
         
         # (B, embed_dim, H/patch_size, W/patch_size) -> (B, embed_dim, n_patches)
-        x = self.proj(x)
-        x = x.flatten(2)
+        features = self.proj(features)
+        features = features.flatten(2)
         # (B, embed_dim, n_patches) -> (B, n_patches, embed_dim)
-        x = x.transpose(1, 2)
+        features = features.transpose(1, 2)
         
-        return x
+        return features
 
 class ImageViTFeatureExtractor(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
@@ -67,7 +67,7 @@ class ImageViTFeatureExtractor(nn.Module):
 
         attention_mask = torch.ones((B, patches.size(1)), device=patches.device)
 
-        tokens = self.prelude(
+        outputs = self.prelude(
             patches,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -77,4 +77,4 @@ class ImageViTFeatureExtractor(nn.Module):
             return_dict=return_dict,
         )
 
-        return tokens
+        return outputs

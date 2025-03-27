@@ -142,10 +142,14 @@ if 'multimodal' in args.config.lower():
         image_size=model.config.image_size,
         audio_max_frames=model.config.audio_max_frames,
         audio_max_waveform_length=model.config.audio_max_waveform_length,
-        mlm=False
+        mlm=False,
     )
 else:
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+optimizer = None
+if "multimodal" in args.config.lower():
+    optimizer = megatransformer_utils.create_multimodal_optimizer(model, args.weight_decay)
 
 trainer = custom_trainers.trainer_lookup(args, args.trainer)(
     model=model,
@@ -154,17 +158,19 @@ trainer = custom_trainers.trainer_lookup(args, args.trainer)(
     train_dataset=train_dataset,
     eval_dataset=validation_dataset,
     processing_class=tokenizer,
+    optimizers=(optimizer, None)
 )
 
+prompts = [
+    "In this paper, we propose a novel approach to",
+    "The Higgs boson, sometimes called the Higgs particle, is",
+    "The capital of France is",
+    "2 + 2 ="
+]
 if 'multimodal' in args.config.lower():
     generation_callback = custom_callbacks.MultimodalGenerationCallback(
         tokenizer=tokenizer,
-        text_only_prompts=[
-            "In this paper, we propose a novel approach to",
-            "The Higgs boson, sometimes called the Higgs particle, is",
-            "The capital of France is",
-            "2 + 2 ="
-        ],
+        text_only_prompts=prompts,
         generation_steps=args.generation_steps,
     )
     trainer.add_callback(generation_callback)
@@ -173,12 +179,7 @@ else:
     # todo: implement for multimodal
     generation_callback = custom_callbacks.GenerationCallback(
         tokenizer=tokenizer,
-        prompts=[
-            "In this paper, we propose a novel approach to",
-            "The Higgs boson, sometimes called the Higgs particle, is",
-            "The capital of France is",
-            "2 + 2 ="
-        ],
+        prompts=prompts,
         generation_steps=args.generation_steps,
     )
     trainer.add_callback(generation_callback)

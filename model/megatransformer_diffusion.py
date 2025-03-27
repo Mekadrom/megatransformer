@@ -563,7 +563,7 @@ class UNet(nn.Module):
         h = self.middle_attn_block(h)
         h = self.middle_res_block2(h, time_embedding)
 
-        for up_block, skip in zip(self.up_blocks, reversed(skips)):
+        for i, (up_block, skip) in enumerate(zip(self.up_blocks, reversed(skips))):
             h = up_block(h, skip, time_embedding, condition=condition)
 
         h = torch.cat([h, initial_h], dim=1)

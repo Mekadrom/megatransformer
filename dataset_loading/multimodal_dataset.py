@@ -9,8 +9,6 @@ import time
 import torch
 
 
-datasets.config.HF_DATASETS_TIMEOUT = 900 
-
 class LimitedStreamDataset(IterableDataset):
     """Wrapper for an IterableDataset that limits the number of samples"""
     
@@ -76,6 +74,7 @@ class MultimodalDataset(IterableDataset):
         seed: int = 42,
         max_position_embeddings: int = 1024,
     ):
+        self.approximated_length = approximated_length
         self.tokenizer = tokenizer
         self.cache_dir = cache_dir
         self.text_weight = text_weight
@@ -83,8 +82,8 @@ class MultimodalDataset(IterableDataset):
         self.image_weight = image_weight
         self.split = split
         self.max_position_embeddings = max_position_embeddings
+
         self.rng = random.Random(seed)
-        self.approximated_length = approximated_length
 
         self.delegate_datasets = []
         weights = []
@@ -115,7 +114,7 @@ class MultimodalDataset(IterableDataset):
                 hop_length=hop_length,
                 audio_max_frames=audio_max_frames,
                 streaming=True,
-                cache_dir=self.cache_dir
+                cache_dir=self.cache_dir,
             )
 
             if audio_examples > 0:
@@ -131,7 +130,7 @@ class MultimodalDataset(IterableDataset):
                 "image",
                 image_size=image_size,
                 streaming=True,
-                cache_dir=self.cache_dir
+                cache_dir=self.cache_dir,
             )
 
             if image_examples > 0:
@@ -187,14 +186,16 @@ class MultimodalDataset(IterableDataset):
                         break
 
 class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling):
+    """DataCollatorForLanguageModeling but additional dataset dict keys are allowed through."""
+
     def __init__(self, tokenizer: PreTrainedTokenizer, max_position_embeddings, image_size, audio_max_frames, audio_max_waveform_length, *args, **kwargs):
         super().__init__(tokenizer=tokenizer, *args, **kwargs)
+
         self.max_position_embeddings = max_position_embeddings
         self.image_size = image_size
         self.audio_max_frames = audio_max_frames
         self.audio_max_waveform_length = audio_max_waveform_length
 
-    """DataCollatorForLanguageModeling but additional dataset dict keys are allowed through."""
     def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
         all_input_ids = []
         all_audio_raw_inputs = []

@@ -319,7 +319,7 @@ class MegaTransformerMultimodalDecoder(nn.Module):
                 audio_waveform_labels=audio_waveform_labels,
             )
 
-            # print(f"mel_spectrogram_or_noise_output: {mel_spectrogram_or_noise_output.shape}, audio_waveforms: {audio_waveforms.shape}, audio_reconstruction_loss: {audio_reconstruction_loss.shape}")
+            print(f"mel_spectrogram_or_noise_output: {mel_spectrogram_or_noise_output.shape}, audio_waveforms: {audio_waveforms.shape}, audio_reconstruction_loss: {audio_reconstruction_loss.shape}")
 
             # restore n_audios dimension
             audio_outputs = mel_spectrogram_or_noise_output.view(B2, E2, C2, H2, W2)

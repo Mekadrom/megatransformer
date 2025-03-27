@@ -13,6 +13,7 @@ import numpy as np
 import os
 import random
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 
@@ -118,14 +119,14 @@ class MegaTransformerConfig(PretrainedConfig):
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
 
-        huginn_mean_thinking_steps=32,
-        huginn_backprop_depth=8,
-        huginn_thought_initialization_method="like-init",
-        huginn_adapter_method="linear",
-        huginn_exit_criteria="kl_divergence",
-        huginn_exit_criteria_threshold=5e-4,
-        huginn_lockstep_n=True,
-        huginn_lockstep_k=True,
+        recurrent_mean_thinking_steps=32,
+        recurrent_backprop_depth=8,
+        recurrent_thought_initialization_method="like-init",
+        recurrent_adapter_method="linear",
+        recurrent_exit_criteria="kl_divergence",
+        recurrent_exit_criteria_threshold=5e-4,
+        recurrent_lockstep_n=True,
+        recurrent_lockstep_k=True,
 
         norm_type="layernorm",
         norm_eps=1e-5,
@@ -261,15 +262,15 @@ class MegaTransformerConfig(PretrainedConfig):
         self.hidden_dropout_prob = hidden_dropout_prob
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
 
-        # huginn specific
-        self.huginn_mean_thinking_steps = huginn_mean_thinking_steps
-        self.huginn_backprop_depth = huginn_backprop_depth
-        self.huginn_thought_initialization_method = huginn_thought_initialization_method
-        self.huginn_adapter_method = huginn_adapter_method
-        self.huginn_exit_criteria = huginn_exit_criteria
-        self.huginn_exit_criteria_threshold = huginn_exit_criteria_threshold
-        self.huginn_lockstep_n = huginn_lockstep_n
-        self.huginn_lockstep_k = huginn_lockstep_k
+        # recurrent specific
+        self.recurrent_mean_thinking_steps = recurrent_mean_thinking_steps
+        self.recurrent_backprop_depth = recurrent_backprop_depth
+        self.recurrent_thought_initialization_method = recurrent_thought_initialization_method
+        self.recurrent_adapter_method = recurrent_adapter_method
+        self.recurrent_exit_criteria = recurrent_exit_criteria
+        self.recurrent_exit_criteria_threshold = recurrent_exit_criteria_threshold
+        self.recurrent_lockstep_n = recurrent_lockstep_n
+        self.recurrent_lockstep_k = recurrent_lockstep_k
 
         self.norm_type = norm_type
         self.norm_eps = norm_eps
@@ -573,7 +574,7 @@ def parse_args():
     argparser.add_argument('--dataset_cache_dir', type=str, default='cached_datasets', help='Path to the dataset cache directory')
     argparser.add_argument('--tokenizer_name', type=str, default="mistralai/Mistral-7B-v0.1", help='Tokenizer name')
     argparser.add_argument('--trainer', type=str, default="default", help='Trainer type: grokfast_ema, grokfast_ma, debug, or default')
-    argparser.add_argument('--config', type=str, default="modern", help='Model configuration: gpt2, modern, or huginn')
+    argparser.add_argument('--config', type=str, default="modern", help='Model configuration.')
     argparser.add_argument('--max_position_embeddings', type=int, default=4096, help='Max position embeddings (maximum sequence length)')
     argparser.add_argument('--cpu', action='store_true', help='Use CPU for training')
     argparser.add_argument('--log_level', type=str, default='warning', help='Logging level: debug, info, warning, error, critical')
@@ -637,9 +638,6 @@ def parse_args():
     
     if args.use_xla and args.fp16:
         raise ValueError("FP16 training is not supported with TPU training. Please only enable BF16, or disable FP16 training.")
-    
-    if args.fp16 and args.bf16:
-        raise ValueError("FP16 and BF16 training cannot be enabled at the same time. Please choose one.")
     
     if args.num_train_epochs == -1 and args.max_steps == -1:
         raise ValueError("Either num_train_epochs or max_steps must be specified. Please check your configuration.")
@@ -730,3 +728,51 @@ def get_token_correlation(hidden_states):
     token_correlation = (normed_x @ normed_x.transpose(1, 2)).mean() - (1 / hidden_states.shape[1])
 
     return token_correlation
+
+def create_multimodal_optimizer(model, weight_decay):
+    audio_decoder_params = set(model.output_transform.audio_decoder.parameters())
+    vocoder_params = set(model.output_transform.audio_decoder.vocoder.parameters())
+
+    # Get parameters unique to audio_decoder (excluding vocoder)
+    audio_decoder_only_params = [p for p in audio_decoder_params if p not in vocoder_params]
+
+    # Create AdamW optimizer with these groups
+    optimizer = torch.optim.AdamW([
+        {'params': model.input_transform.parameters(), 'lr': 1e-4},
+        {'params': model.world_model.parameters(), 'lr': 5e-5},
+        {'params': model.output_transform.text_coda.parameters(), 'lr': 1e-4},
+        {'params': model.output_transform.text_decoder.parameters(), 'lr': 2e-4},
+        {'params': model.output_transform.audio_coda.parameters(), 'lr': 1e-4},
+        {'params': audio_decoder_only_params, 'lr': 5e-5},
+        {'params': model.output_transform.audio_decoder.vocoder.parameters(), 'lr': 3e-4},
+        {'params': model.output_transform.image_coda.parameters(), 'lr': 1e-4},
+        {'params': model.output_transform.image_decoder.parameters(), 'lr': 5e-5},
+    ], weight_decay=weight_decay)
+    return optimizer
+
+def ensure_all_grads(model):
+    """Make sure all parameters have at least zero gradients"""
+    for param in model.parameters():
+        if param.requires_grad and param.grad is None:
+            param.grad = torch.zeros_like(param)
+
+def sync_check(message):
+    """Check if all ranks can synchronize"""
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        print(f"[Rank {rank}] Before barrier: {message}")
+        dist.barrier()
+        print(f"[Rank {rank}] After barrier: {message}")
+
+def log_rank_info(message):
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    print(f"[Rank {rank}/{world_size}] {message}")
+
+def debug_cuda_memory():
+    """Print CUDA memory usage for current device"""
+    if torch.cuda.is_available():
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"[Rank {rank}] CUDA Memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")

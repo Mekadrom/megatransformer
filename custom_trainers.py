@@ -4,8 +4,6 @@ from transformers import Trainer
 from transformers.integrations import TensorBoardCallback
 from typing import Optional, Literal
 
-from model import megatransformer_multimodal
-
 import megatransformer_utils
 import torch
 
@@ -116,6 +114,7 @@ class DefaultTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self.get_tensorboard_writer()
         inputs["output_hidden_states"] = True
+
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
 
         if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
@@ -143,37 +142,6 @@ class DefaultTrainer(Trainer):
         if not hasattr(self, "writer"):
             print("Warning: No TensorBoard writer found. Please check your callback setup.")
             self.writer = None
-
-    def create_optimizer(self):
-        # Create optimizer with layerwise learning rate
-        if isinstance(self.model, megatransformer_multimodal.MegaTransformerCausalWMHeads):
-            # Use custom optimizer for multimodal model
-            optimizer = self.create_optimizer_with_layerwise_lr(self.model, self.args)
-        else:
-            # Use default optimizer
-            optimizer = super().create_optimizer()
-        return optimizer
-
-    def create_optimizer_with_layerwise_lr(self, model: megatransformer_multimodal.MegaTransformerCausalWMHeads, args):
-        audio_decoder_params = set(model.output_transform.audio_decoder.parameters())
-        vocoder_params = set(model.output_transform.audio_decoder.vocoder.parameters())
-
-        # Get parameters unique to audio_decoder (excluding vocoder)
-        audio_decoder_only_params = [p for p in audio_decoder_params if p not in vocoder_params]
-
-        # Create AdamW optimizer with these groups
-        optimizer = torch.optim.AdamW([
-            {'params': model.input_transform.parameters(), 'lr': 1e-4},
-            {'params': model.world_model.parameters(), 'lr': 5e-5},
-            {'params': model.output_transform.text_coda.parameters(), 'lr': 1e-4},
-            {'params': model.output_transform.text_decoder.parameters(), 'lr': 2e-4},
-            {'params': model.output_transform.audio_coda.parameters(), 'lr': 1e-4},
-            {'params': audio_decoder_only_params, 'lr': 5e-5},
-            {'params': model.output_transform.audio_decoder.vocoder.parameters(), 'lr': 3e-4},
-            {'params': model.output_transform.image_coda.parameters(), 'lr': 1e-4},
-            {'params': model.output_transform.image_decoder.parameters(), 'lr': 5e-5},
-        ], weight_decay=self.args.weight_decay)
-        return optimizer
 
 def trainer_lookup(argparser_args, trainer_name, default=DefaultTrainer):
     if trainer_name == "grokfast_ema":

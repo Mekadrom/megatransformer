@@ -80,21 +80,6 @@ def load_text_only_dataset(tokenizer, max_position_embeddings, dataset_name, dat
         )
     return dataset
 
-def load_image_dataset(tokenizer, dataset_name, dataset_config_name, dataset_split, image_size, streaming=False, cache_dir=None):
-    if "laion" in dataset_name.lower():
-        dataset = image_multimodal.load_image_dataset(
-            dataset_name,
-            dataset_config_name,
-            dataset_split,
-            tokenizer,
-            image_size=image_size,
-            streaming=streaming,
-            cache_dir=cache_dir,
-        )
-    else:
-        raise ValueError(f"Unsupported image dataset: {dataset_name}")
-    return dataset
-
 def load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, max_frames, tokenizer, dataset_name, dataset_config_name, dataset_split, streaming=False, cache_dir=None):
     if "mozilla" in dataset_name.lower() or "commonvoice" in dataset_name.lower() or "voxpopuli" in dataset_name.lower():
         dataset = audio_multimodal.load_audio_dataset(
@@ -113,6 +98,21 @@ def load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, max_frames, token
         )
     else:
         raise ValueError(f"Unsupported audio dataset: {dataset_name}")
+    return dataset
+
+def load_image_dataset(tokenizer, dataset_name, dataset_config_name, dataset_split, image_size, streaming=False, cache_dir=None):
+    if "laion" in dataset_name.lower():
+        dataset = image_multimodal.load_image_dataset(
+            dataset_name,
+            dataset_config_name,
+            dataset_split,
+            tokenizer,
+            image_size=image_size,
+            streaming=streaming,
+            cache_dir=cache_dir,
+        )
+    else:
+        raise ValueError(f"Unsupported image dataset: {dataset_name}")
     return dataset
 
 def load_dataset(
@@ -138,9 +138,9 @@ def load_dataset(
     print(f"Loading dataset {dataset_name} with config {dataset_config_name}, split {split} for {dataset_type}.")
     if dataset_type == "text":
         return load_text_only_dataset(tokenizer, max_position_embeddings, dataset_name, dataset_config_name, split, streaming=streaming, cache_dir=cache_dir)
-    elif dataset_type == "image":
-        return load_image_dataset(tokenizer, dataset_name, dataset_config_name, split, image_size, streaming=streaming, cache_dir=cache_dir)
     elif dataset_type == "audio":
         return load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, audio_max_frames, tokenizer, dataset_name, dataset_config_name, split, streaming=streaming, cache_dir=cache_dir)
+    elif dataset_type == "image":
+        return load_image_dataset(tokenizer, dataset_name, dataset_config_name, split, image_size, streaming=streaming, cache_dir=cache_dir)
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")

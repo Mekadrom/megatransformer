@@ -34,14 +34,14 @@ class AudioEmbeddingUpsampleConv2dGenerator(nn.Module):
                 nn.Dropout2d(dropout)
             ))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, features: torch.Tensor):
         # naive approach; alternating conv2d and upsample layers to reach n_mels
         # x: [batch_size, channels, timestep, hidden_size]
-        x = x.permute(0, 1, 3, 2) # [batch_size, channels, hidden_size, timestep]
-        x = x.reshape(x.shape[0], x.shape[1] * x.shape[2], 1, x.shape[3]) # [batch_size, channels * hidden_size, 1, timestep]
-        for layer in self.conv_layers:
-            x = layer(x)
-        return x
+        features = features.permute(0, 1, 3, 2) # [batch_size, channels, hidden_size, timestep]
+        features = features.reshape(features.shape[0], features.shape[1] * features.shape[2], 1, features.shape[3]) # [batch_size, channels * hidden_size, 1, timestep]
+        for i, layer in enumerate(self.conv_layers):
+            features = layer(features)
+        return features
 
 class ResidualBlock(nn.Module):
     """Residual block with dilated convolutions for the vocoder."""
@@ -72,22 +72,21 @@ class ResidualBlock(nn.Module):
         ])
         self.gate_conv = nn.Conv1d(channels, channels, kernel_size=1)
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        residual = features
         
-        # First dilated conv
-        x = F.leaky_relu(x, negative_slope=self.leaky_relu_slope)
-        x = self.convs[0](x)
-        x = F.leaky_relu(x, negative_slope=self.leaky_relu_slope)
+        features = F.leaky_relu(features, negative_slope=self.leaky_relu_slope)
+        features = self.convs[0](features)
         
-        # Second dilated conv
-        x = self.convs[1](x)
+        features = F.leaky_relu(features, negative_slope=self.leaky_relu_slope)
+        features = self.convs[1](features)
         
         # Gate mechanism for controlled information flow
         gate = torch.sigmoid(self.gate_conv(residual))
-        
-        return residual + gate * x
 
+        gated = residual + gate * features
+
+        return gated
 
 class UpsampleBlock(nn.Module):
     """Upsampling block for the vocoder."""
@@ -111,11 +110,11 @@ class UpsampleBlock(nn.Module):
         )
         self.norm = nn.BatchNorm1d(out_channels)
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = self.norm(x)
-        x = F.leaky_relu(x, negative_slope=self.leaky_relu_slope)
-        return x
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        features = self.conv(features)
+        features = self.norm(features)
+        features = F.leaky_relu(features, negative_slope=self.leaky_relu_slope)
+        return features
 
 
 class AudioVocoder(nn.Module):
@@ -230,14 +229,11 @@ class AudioVocoder(nn.Module):
             [B, 1, T_audio] Audio waveform
         """
         # Initial processing
-        # print(f"mel_spec: {mel_spec.shape}")
         x = self.initial_conv(mel_spec)
-        # print(f"x: {x.shape}")
         
         # Upsampling
         for i, upsample in enumerate(self.upsample_blocks):
             x = upsample(x)
-            # print(f"x upsample {i}: {x.shape}")
         
         # Apply conditioning if provided
         if self.has_condition and condition is not None:
@@ -250,23 +246,16 @@ class AudioVocoder(nn.Module):
                 )
             
             cond = self.conditioning_layer(condition)
-            # print(f"x before cond: {x.shape}")
             x = x + cond
-            # print(f"x after cond: {x.shape}")
         
         # Apply residual blocks
         for i, res_block in enumerate(self.residual_blocks):
             x = res_block(x)
-            # print(f"x res {i}: {x.shape}")
         
         # Final layers
         waveform = self.final_layers(x)
-        # print(f"waveform before squeeze: {waveform.shape}")
-
         waveform = waveform.squeeze(1)  # Remove channel dimension
 
-        # print(f"waveform after squeeze: {waveform.shape}")
-        
         return waveform
 
 # Multi-Resolution STFT Loss for better vocoder training
@@ -515,8 +504,6 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         # Model forward pass with condition
         model_output = self.unet(x_t, t.to(x_0.dtype), condition=condition)
 
-        # print(f"model_output from unet: {model_output.shape}")
-        
         loss_dict = {}
 
         if self.predict_epsilon:
@@ -538,18 +525,14 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             condition = condition.reshape(B*E, condition.shape[2], condition.shape[3])
             condition = condition.permute(0, 2, 1)  # [B*E, M, T]
 
-            # print(f"before vocoder pred_x0: {pred_x0.shape} condition: {condition.shape}")
             pred_waveform = self.vocoder(pred_x0, condition=condition)
 
-            # print(f"before pad pred_waveform: {pred_waveform.shape}, audio_waveform_labels: {audio_waveform_labels.shape}")
             pred_waveform = F.pad(pred_waveform, (0, audio_waveform_labels.shape[-1] - pred_waveform.shape[-1]), value=0)
 
-            # print(f"before loss pred_waveform: {pred_waveform.shape} audio_waveform_labels: {audio_waveform_labels.shape}")
             loss_dict["waveform_l1"] = F.l1_loss(pred_waveform, audio_waveform_labels)
 
             # extract example dimension
             pred_waveform = pred_waveform.view(B, E, pred_waveform.shape[-1])
-            # print(f"after view pred_waveform: {pred_waveform.shape}")
 
             # Multi-resolution STFT loss
             sc_loss, mag_loss = self.stft_loss(pred_waveform, audio_waveform_labels)

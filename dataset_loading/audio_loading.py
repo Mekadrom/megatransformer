@@ -45,9 +45,10 @@ def extract_audio_features(audio, sr=16000, n_mels=128, n_fft=1024, hop_length=5
     # Convert to log scale (dB)
     log_mel_spec = librosa.power_to_db(mel_spec)
 
-    waveform = torch.tensor(y)
+    mels = torch.tensor(log_mel_spec)
+    waveforms = torch.tensor(y)
 
-    return log_mel_spec, waveform
+    return mels, waveforms
 
 def load_audio_dataset(
     dataset_name,
@@ -118,10 +119,8 @@ def load_audio_dataset(
                 sr=sample_rate,
                 n_mels=n_mels,
                 n_fft=n_fft,
-                hop_length=hop_length
+                hop_length=hop_length,
             )
-
-            audio_mels = torch.tensor(audio_mels)
 
             if audio_mels.shape[-1] > max_frames:
                 continue

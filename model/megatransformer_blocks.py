@@ -101,18 +101,18 @@ class RecurrentBlockOutput:
 
 # todo: implement kv caching
 class MegaTransformerRecurrentBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__()
         self.config = config
-        self.mean_thinking_steps = config.huginn_mean_thinking_steps
-        self.backprop_depth = config.huginn_backprop_depth
-        self.thought_initialization_method = self.config.huginn_thought_initialization_method
-        self.adapter_method = self.config.huginn_adapter_method
-        self.exit_criteria = self.config.huginn_exit_criteria
-        self.exit_criteria_threshold = self.config.huginn_exit_criteria_threshold
+        self.mean_thinking_steps = config.recurrent_mean_thinking_steps
+        self.backprop_depth = config.recurrent_backprop_depth
+        self.thought_initialization_method = self.config.recurrent_thought_initialization_method
+        self.adapter_method = self.config.recurrent_adapter_method
+        self.exit_criteria = self.config.recurrent_exit_criteria
+        self.exit_criteria_threshold = self.config.recurrent_exit_criteria_threshold
 
-        self.lockstep_n = self.config.huginn_lockstep_n
-        self.lockstep_k = self.config.huginn_lockstep_k
+        self.lockstep_n = self.config.recurrent_lockstep_n
+        self.lockstep_k = self.config.recurrent_lockstep_k
 
         self.blocks = nn.ModuleList([MegaTransformerBlock(config) for _ in range(config.n_recurrent_layers)])
 
@@ -176,6 +176,8 @@ class MegaTransformerRecurrentBlock(nn.Module):
 
         t = max(mean_steps - backprop_depth, 0)
         s = backprop_depth
+
+        megatransformer_utils.sync_check("getting steps")
 
         if self.training:
             # poisson log normal filling
