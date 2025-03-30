@@ -776,3 +776,17 @@ def debug_cuda_memory():
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
         print(f"[Rank {rank}] CUDA Memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+
+def embedding_weight_init(hidden_size):
+    def init_weights(module):
+        if isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=hidden_size ** -0.5)
+            if module.bias is not None:
+                module.bias.data.zero_()
+    return init_weights
+
+def transformer_weight_init(hidden_size):
+    def init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_normal_(module.weight, gain=0.02)
+    return init_weights

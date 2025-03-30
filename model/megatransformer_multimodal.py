@@ -18,10 +18,12 @@ END_AUDIO_TOKEN = "<|/AUDIO|>"
 
 class MultimodalGenerationOutput:
     """Output class for multimodal generation results."""
-    def __init__(self, sequences, audio_outputs=None, image_outputs=None):
+    def __init__(self, sequences, audio_outputs=None, audio_mel_specs=None, image_outputs=None, intermediate_image_outputs=None):
         self.sequences = sequences
-        self.audio_outputs = audio_outputs 
+        self.audio_outputs = audio_outputs
+        self.audio_mel_specs = audio_mel_specs
         self.image_outputs = image_outputs
+        self.intermediate_image_outputs = intermediate_image_outputs
 
 class TextFeatureExtractor(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
@@ -40,8 +42,13 @@ class TextFeatureExtractor(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         self.prelude = megatransformer_modules.SimpleBlock(
-            config.text_prelude_config, config.text_prelude_config.n_prelude_layers, config.hidden_dropout_prob
+            config.text_prelude_config, "text_prelude", config.text_prelude_config.n_prelude_layers, config.hidden_dropout_prob
         )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        self.apply(megatransformer_utils.embedding_weight_init)
 
     def forward(
         self,
@@ -92,17 +99,6 @@ class MegaTransformerMultimodalEncoder(nn.Module):
         self.text_embedding = TextFeatureExtractor(config)
         self.audio_embedding = megatransformer_audio_encoder.AudioFeatureExtractor(config)
         self.image_embedding = megatransformer_image_encoder.ImageViTFeatureExtractor(config)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
 
     def forward(self,
                 text_input_ids=None,
@@ -219,12 +215,12 @@ class MegaTransformerMultimodalDecoder(nn.Module):
         self.config = config
 
         self.text_coda = megatransformer_modules.SimpleBlock(
-            config.text_coda_config, config.text_coda_config.n_coda_layers, config.hidden_dropout_prob
+            config.text_coda_config, "text_coda", config.text_coda_config.n_coda_layers, config.hidden_dropout_prob
         )
         self.text_decoder = nn.Linear(config.hidden_size, config.vocab_size)
 
         self.audio_coda = megatransformer_modules.SimpleBlock(
-            config.audio_coda_config, config.audio_coda_config.n_coda_layers, config.audio_decoder_dropout
+            config.audio_coda_config, "audio_coda", config.audio_coda_config.n_coda_layers, config.audio_decoder_dropout
         )
         self.audio_decoder =  megatransformer_audio_decoder.AudioConditionalGaussianDiffusion(
             config=config,  # for vocoder to grab its details from
@@ -256,7 +252,7 @@ class MegaTransformerMultimodalDecoder(nn.Module):
         )
 
         self.image_coda = megatransformer_modules.SimpleBlock(
-            config.image_coda_config, config.image_coda_config.n_coda_layers, config.image_decoder_dropout
+            config.image_coda_config, "image_coda", config.image_coda_config.n_coda_layers, config.image_decoder_dropout
         )
         self.image_decoder = megatransformer_image_decoder.ImageConditionalGaussianDiffusion(
             hidden_size=config.hidden_size,
@@ -286,6 +282,32 @@ class MegaTransformerMultimodalDecoder(nn.Module):
             cross_attn_use_flash_attention=config.image_decoder_cross_attn_use_flash_attention,
         )
 
+    def audio_coda_forward(self, audio_hidden_states, audio_mel_spec_labels=None, audio_waveform_labels=None):
+        _, _, H1, W1 = audio_hidden_states.shape
+        if audio_mel_spec_labels is not None:
+            _, _, C2, H2, W2 = audio_mel_spec_labels.shape
+
+        # combine batch and n_audios/example # dimensions for easier processing
+        audio_hidden_states = audio_hidden_states.view(-1, H1, W1)
+        if audio_mel_spec_labels is not None:
+            audio_mel_spec_labels = audio_mel_spec_labels.view(-1, C2, H2, W2)
+        if audio_waveform_labels is not None:
+            audio_waveform_labels = audio_waveform_labels.view(-1, audio_waveform_labels.shape[-1])
+
+        return self.audio_coda(audio_hidden_states)[0], audio_mel_spec_labels, audio_waveform_labels
+
+    def image_coda_forward(self, image_hidden_states, image_labels=None):
+        _, _, H1, W1 = image_hidden_states.shape
+        if image_labels is not None:
+            _, _, C2, H2, W2 = image_labels.shape
+
+        # combine batch and n_images dimensions for easier processing
+        image_hidden_states = image_hidden_states.view(-1, H1, W1)
+        if image_labels is not None:
+            image_labels = image_labels.view(-1, C2, H2, W2)
+
+        return self.image_coda(image_hidden_states)[0], image_labels
+
     def forward(self,
                 text_hidden_states=None,
                 image_hidden_states=None,
@@ -300,40 +322,44 @@ class MegaTransformerMultimodalDecoder(nn.Module):
             text_logits = self.text_decoder(text_hidden_states)
 
         if audio_hidden_states is None:
-            audio_outputs = None
+            mel_spec_reconstructions = None
+            audio_waveforms = None
             audio_reconstruction_loss = None
         else:
             B1, E1, H1, W1 = audio_hidden_states.shape
-            B2, E2, C2, H2, W2 = audio_mel_spec_labels.shape
+            audio_hidden_states, audio_mel_spec_labels, audio_waveform_labels = self.audio_coda_forward(
+                audio_hidden_states,
+                audio_mel_spec_labels,
+                audio_waveform_labels,
+            )
 
-            # combine batch and n_audios dimensions for easier processing
-            audio_hidden_states = audio_hidden_states.view(-1, H1, W1)
-            audio_mel_spec_labels = audio_mel_spec_labels.view(-1, C2, H2, W2)
-            audio_waveform_labels = audio_waveform_labels.view(-1, audio_waveform_labels.shape[-1])
-
-            audio_hidden_states = self.audio_coda(audio_hidden_states)[0]
-
-            mel_spectrogram_or_noise_output, audio_reconstruction_loss, audio_waveforms = self.audio_decoder(
+            mel_spec_reconstructions, audio_reconstruction_loss, audio_waveforms = self.audio_decoder(
                 audio_mel_spec_labels,
                 condition=audio_hidden_states,
                 audio_waveform_labels=audio_waveform_labels,
             )
 
-            print(f"mel_spectrogram_or_noise_output: {mel_spectrogram_or_noise_output.shape}, audio_waveforms: {audio_waveforms.shape}, audio_reconstruction_loss: {audio_reconstruction_loss.shape}")
-
             # restore n_audios dimension
-            audio_outputs = mel_spectrogram_or_noise_output.view(B2, E2, C2, H2, W2)
+            mel_spec_reconstructions = mel_spec_reconstructions.view(B1, E1, -1, H1, W1)
         if image_hidden_states is None:
             image_outputs = None
             image_reconstruction_loss = None
         else:
-            image_hidden_states = self.image_coda(image_hidden_states)[0]
+            B1, E1, H1, W1 = image_hidden_states.shape
+            image_hidden_states, image_labels = self.image_coda_forward(
+                image_hidden_states,
+                image_labels,
+            )
+
             image_outputs, image_reconstruction_loss = self.image_decoder(
                 image_labels,
                 condition=image_hidden_states,
             )
 
-        return text_logits, audio_outputs, audio_reconstruction_loss, image_outputs, image_reconstruction_loss
+            # restore n_images dimension
+            image_outputs = image_outputs.view(B1, E1, -1, H1, W1)
+
+        return text_logits, mel_spec_reconstructions, audio_waveforms, audio_reconstruction_loss, image_outputs, image_reconstruction_loss
 
 class MegaTransformerMultimodalRecurrentModel(PreTrainedModel, GenerationMixin):
     config_class = megatransformer_utils.MegaTransformerConfig
@@ -354,19 +380,7 @@ class MegaTransformerMultimodalRecurrentModel(PreTrainedModel, GenerationMixin):
             self.norm_final = megatransformer_utils.create_norm(config.hidden_size, config.norm_type, config.norm_eps)
         else:
             self.norm_final = None
-        
-        self.apply(self._init_weights)
 
-    def _init_weights(self, module):
-        """Initialize weights as in the original implementation"""
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-    
     def forward(
         self,
         inputs_embeds,
@@ -401,14 +415,19 @@ class MegaTransformerMultimodalRecurrentModel(PreTrainedModel, GenerationMixin):
                 past_key_values=past_key_value,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
             )
 
             if isinstance(block, megatransformer_blocks.MegaTransformerRecurrentBlock):
                 recurrent_outputs = outputs
 
-            hidden_states = outputs.hidden_states
-            attention_probs = outputs.attention_probs
+            if not return_dict:
+                hidden_states = outputs[0]
+                attention_probs = outputs[2]
+            else:
+                hidden_states = outputs.hidden_states
+                attention_probs = outputs.attention_probs
 
             if hasattr(outputs, "all_hidden_states") and all_hidden_states is not None:
                 all_hidden_states.extend(outputs.all_hidden_states)
@@ -870,7 +889,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                 image_positions = []
         else:
             assert labels is None and image_labels is None and audio_mel_spec_labels is None and audio_waveform_labels is None, "If inputs_embeds is provided, labels, image_labels, and audio_labels should not be provided."
-        
+
         transformer_outputs = self.world_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -908,24 +927,24 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         else:
             output_text_logits = None
 
-        if torch.count_nonzero(audio_hidden_states) != 0:
-            _, output_audio, audio_reconstruction_loss, *_ = self.output_transform(
-                audio_hidden_states=audio_hidden_states,
-                audio_mel_spec_labels=audio_mel_spec_labels,
-                audio_waveform_labels=audio_waveform_labels,
-            )
-        else:
-            output_audio = None
+        # if torch.count_nonzero(audio_hidden_states) != 0:
+        #     _, output_audio, audio_reconstruction_loss, *_ = self.output_transform(
+        #         audio_hidden_states=audio_hidden_states,
+        #         audio_mel_spec_labels=audio_mel_spec_labels,
+        #         audio_waveform_labels=audio_waveform_labels,
+        #     )
+        # else:
+        output_audio = None
+        audio_reconstruction_loss = None
 
-        if torch.count_nonzero(image_hidden_states) != 0:
-            *_, output_images, image_reconstruction_loss = self.output_transform(
-                image_hidden_states=image_hidden_states,
-                image_labels=image_labels,
-            )
-        else:
-            output_images = None
-            audio_reconstruction_loss = None
-            image_reconstruction_loss = None
+        # if torch.count_nonzero(image_hidden_states) != 0:
+        #     *_, output_images, image_reconstruction_loss = self.output_transform(
+        #         image_hidden_states=image_hidden_states,
+        #         image_labels=image_labels,
+        #     )
+        # else:
+        output_images = None
+        image_reconstruction_loss = None
 
         text_loss = None
         if labels is not None:
@@ -1033,16 +1052,30 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
 
         all_audio_outputs = []
         all_image_outputs = []
+        all_audio_mel_specs = []
+        intermediate_image_outputs = []
         
         # Tracking state for modal generation
         in_audio_generation = [False] * batch_size
         in_image_generation = [False] * batch_size
-        current_modal_tokens = []
-        
+        current_modal_tokens = {}
+
+        for i in range(batch_size):
+            last_token = input_ids[i, -1].item()
+            if last_token == self.config.begin_audio_token_id:
+                in_audio_generation[i] = True
+                current_modal_tokens[i] = []
+            elif last_token == self.config.begin_image_token_id:
+                in_image_generation[i] = True
+                current_modal_tokens[i] = []
+            else:
+                in_audio_generation[i] = False
+                in_image_generation[i] = False
+
         # Configure model kwargs for the first step
         model_kwargs["attention_mask"] = attention_mask.clone() if attention_mask is not None else None
         
-        while current_length < max_length and not any(in_audio_generation) and not any(in_image_generation):
+        while current_length < max_length or any(in_audio_generation) or any(in_image_generation):
             outputs = self.world_model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -1090,45 +1123,58 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
             # Check for special tokens and handle modal generation
             for i in range(batch_size):
                 text_token_id = next_tokens[i].item()
-                
+
                 # Handle modal generation state transitions
-                if text_token_id == self.config.begin_audio_token_id:
+                if not in_audio_generation[i] and not in_image_generation[i] and text_token_id == self.config.begin_audio_token_id:
                     in_audio_generation[i] = True
                     current_modal_tokens[i] = []
-                elif (text_token_id == self.config.end_audio_token_id or len(current_modal_tokens[i]) > self.config.audio_max_frames) and in_audio_generation:
+                elif in_audio_generation[i] and i in current_modal_tokens and (text_token_id == self.config.end_audio_token_id or len(current_modal_tokens[i]) > self.config.audio_max_frames):
                     in_audio_generation[i] = False
-                    
-                    # Process collected audio tokens through audio generator
-                    audio_hidden_states = torch.cat(current_modal_tokens[i], device=text_token_logits.device)
 
-                    # Generate audio using your audio decoder
-                    audio_output = self.output_transform(audio_hidden_states=audio_hidden_states)
-                    all_audio_outputs.append(audio_output)
+                    # Process collected audio tokens through audio generator
+                    # add batch dimension and example dimension
+                    audio_hidden_states = torch.cat(current_modal_tokens[i]).unsqueeze(0).unsqueeze(0)
+
+                    audio_coda_outputs, _, _ = self.output_transform.audio_coda_forward(audio_hidden_states)
+
+                    audio_mel_specs = self.output_transform.audio_decoder.sample(
+                        condition=audio_coda_outputs,
+                        n_mels=self.config.audio_n_mels,
+                        device=text_token_logits.device,
+                    )
+
+                    all_audio_mel_specs.append(audio_mel_specs)
+
+                    # remove singleton channel dimension from mel specs
+                    audio_waveforms = self.output_transform.audio_decoder.vocoder(audio_mel_specs.squeeze(1), audio_coda_outputs.permute(0, 2, 1))
+
+                    if torch.isnan(audio_waveforms).any():
+                        print("NaN in audio waveforms")
+                    if torch.isinf(audio_waveforms).any():
+                        print("Inf in audio waveforms")
+
+                    all_audio_outputs.append(audio_waveforms)
 
                     next_tokens[i] = self.config.end_audio_token_id
-                elif text_token_id == self.config.begin_image_token_id:
-                    in_image_generation = True
+                elif not in_audio_generation[i] and not in_image_generation[i] and text_token_id == self.config.begin_image_token_id:
+                    in_image_generation[i] = True
                     current_modal_tokens[i] = []
-                elif (text_token_id == self.config.end_image_token_id or len(current_modal_tokens[i]) > (self.config.image_size // self.config.image_encoder_patch_size) ** 2) and in_image_generation:
-                    in_image_generation = False
+                elif in_image_generation[i] and i in current_modal_tokens and (text_token_id == self.config.end_image_token_id or len(current_modal_tokens[i]) >= (self.config.image_size // self.config.image_encoder_patch_size) ** 2):
+                    in_image_generation[i] = False
                     
                     # Process collected image tokens through image generator
-                    image_hidden_states = torch.cat(current_modal_tokens[i], device=text_token_logits.device)
+                    # add batch dimension and example dimension
+                    image_hidden_states = torch.cat(current_modal_tokens[i]).unsqueeze(0).unsqueeze(0)
 
-                    image_hidden_states = self.output_transform.image_coda(image_hidden_states)
-                        
-                    # Generate image using your image decoder/diffusion model
-                    image_output = self.output_transform.image_decoder.sample(
-                        device=text_token_logits.device,
-                        batch_size=1,
-                        image_size=self.config.image_size,
-                        condition=image_hidden_states
-                    )
-                    all_image_outputs.append(image_output)
+                    image_coda_outputs, _ = self.output_transform.image_coda_forward(image_hidden_states)
+
+                    image_hidden_states, intermediate_images = self.output_transform.image_decoder.sample(device=image_coda_outputs.device, condition=image_coda_outputs, return_intermediate=True)
+                    all_image_outputs.append(image_hidden_states)
+                    intermediate_image_outputs.append(intermediate_images)
 
                     next_tokens[i] = self.config.end_image_token_id
                 # Collect tokens for modal generation
-                elif in_audio_generation or in_image_generation:
+                elif (in_audio_generation[i] or in_image_generation[i]) and i in current_modal_tokens:
                     current_modal_tokens[i].append(raw_multimodal_logits)
             
             # Add the next tokens to the growing sequences
@@ -1153,10 +1199,12 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
             return MultimodalGenerationOutput(
                 sequences=all_input_ids,
                 audio_outputs=all_audio_outputs if all_audio_outputs else None,
+                audio_mel_specs=all_audio_mel_specs if all_audio_mel_specs else None,
                 image_outputs=all_image_outputs if all_image_outputs else None,
+                intermediate_image_outputs=intermediate_image_outputs if intermediate_image_outputs else None,
             )
         else:
-            return (all_input_ids, all_audio_outputs, all_image_outputs)
+            return (all_input_ids, all_audio_outputs, all_audio_mel_specs, all_image_outputs, intermediate_image_outputs)
 
     def adjust_logits_during_generation(
         self,
@@ -1432,12 +1480,12 @@ def create_test_tiny_multimodal_model(tokenizer: PreTrainedTokenizer, max_positi
         vocab_size=tokenizer.vocab_size + 4,
         max_position_embeddings=max_position_embeddings,
         n_layers=None,
-        hidden_size=64,
-        d_queries=16,
-        d_values=16,
-        n_query_groups=4,
-        n_heads=4,
-        intermediate_size=256,
+        hidden_size=8,
+        d_queries=4,
+        d_values=4,
+        n_query_groups=2,
+        n_heads=2,
+        intermediate_size=64,
         n_prelude_layers=1,
         n_recurrent_layers=1,
         n_coda_layers=1,
@@ -1447,6 +1495,7 @@ def create_test_tiny_multimodal_model(tokenizer: PreTrainedTokenizer, max_positi
         use_positional_embedding=False,
         use_sinusoidal_embedding=False,
         use_rotary_embedding=True,
+        rotary_embedding_dim=4,
         use_alibi_bias=False,
         use_qkv_bias=False,
         bos_token_id=tokenizer.bos_token_id,
@@ -1458,29 +1507,32 @@ def create_test_tiny_multimodal_model(tokenizer: PreTrainedTokenizer, max_positi
         begin_image_token_id=begin_image_token_id,
         end_image_token_id=end_image_token_id,
 
-        audio_decoder_model_channels=64,
+        audio_decoder_model_channels=32,
 
-        audio_decoder_down_block_self_attn_n_heads=4,
-        audio_decoder_down_block_self_attn_d_queries=32,
-        audio_decoder_down_block_self_attn_d_values=32,
-        audio_decoder_up_block_self_attn_n_heads=4,
-        audio_decoder_up_block_self_attn_d_queries=32,
-        audio_decoder_up_block_self_attn_d_values=32,
-        audio_decoder_cross_attn_n_heads=4,
-        audio_decoder_cross_attn_d_queries=32,
-        audio_decoder_cross_attn_d_values=32,
+        audio_decoder_down_block_self_attn_n_heads=2,
+        audio_decoder_down_block_self_attn_d_queries=16,
+        audio_decoder_down_block_self_attn_d_values=16,
+        audio_decoder_up_block_self_attn_n_heads=2,
+        audio_decoder_up_block_self_attn_d_queries=16,
+        audio_decoder_up_block_self_attn_d_values=16,
+        audio_decoder_cross_attn_n_heads=2,
+        audio_decoder_cross_attn_d_queries=16,
+        audio_decoder_cross_attn_d_values=16,
 
-        image_decoder_model_channels=64,
+        audio_vocoder_hidden_channels=16,
+        audio_vocoder_n_residual_layers=1,
 
-        image_decoder_down_block_self_attn_n_heads=4,
-        image_decoder_down_block_self_attn_d_queries=32,
-        image_decoder_down_block_self_attn_d_values=32,
-        image_decoder_up_block_self_attn_n_heads=4,
-        image_decoder_up_block_self_attn_d_queries=32,
-        image_decoder_up_block_self_attn_d_values=32,
-        image_decoder_cross_attn_n_heads=4,
-        image_decoder_cross_attn_d_queries=32,
-        image_decoder_cross_attn_d_values=32,
+        image_decoder_model_channels=32,
+
+        image_decoder_down_block_self_attn_n_heads=2,
+        image_decoder_down_block_self_attn_d_queries=16,
+        image_decoder_down_block_self_attn_d_values=16,
+        image_decoder_up_block_self_attn_n_heads=2,
+        image_decoder_up_block_self_attn_d_queries=16,
+        image_decoder_up_block_self_attn_d_values=16,
+        image_decoder_cross_attn_n_heads=2,
+        image_decoder_cross_attn_d_queries=16,
+        image_decoder_cross_attn_d_values=16,
     )
 
     config.text_prelude_config = config

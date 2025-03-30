@@ -115,6 +115,9 @@ class DefaultTrainer(Trainer):
         self.get_tensorboard_writer()
         inputs["output_hidden_states"] = True
 
+        self.train_dataset.epoch = self.state.epoch
+        self.eval_dataset.epoch = self.state.epoch
+
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
 
         if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:

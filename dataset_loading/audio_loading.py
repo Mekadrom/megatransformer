@@ -1,4 +1,4 @@
-from datasets import load_dataset, Audio, config
+from datasets import load_dataset, Audio
 from transformers import PreTrainedTokenizer
 from typing import Literal, Optional
 
@@ -33,6 +33,11 @@ def extract_audio_features(audio, sr=16000, n_mels=128, n_fft=1024, hop_length=5
         # Resample if needed
         if orig_sr != sr:
             y = librosa.resample(y, orig_freq=orig_sr, target_freq=sr)
+    elif isinstance(audio, torch.Tensor):
+        # waveform as tensor
+        y = audio.numpy()
+        # assume default sample rate
+        orig_sr = sr
     else:
         # Fallback for direct file paths
         y, orig_sr = librosa.load(audio, sr=sr)
@@ -45,8 +50,8 @@ def extract_audio_features(audio, sr=16000, n_mels=128, n_fft=1024, hop_length=5
     # Convert to log scale (dB)
     log_mel_spec = librosa.power_to_db(mel_spec)
 
-    mels = torch.tensor(log_mel_spec)
-    waveforms = torch.tensor(y)
+    mels = torch.tensor(log_mel_spec, dtype=torch.float32)
+    waveforms = torch.tensor(y, dtype=torch.float32)
 
     return mels, waveforms
 

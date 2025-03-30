@@ -19,6 +19,14 @@ class PatchEmbedding(nn.Module):
             kernel_size=patch_size,
             stride=patch_size
         )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize weights for the Conv2d layer
+        nn.init.xavier_uniform_(self.proj.weight)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
     
     def forward(self, features: torch.Tensor):
         # x: (B, C, H, W)
@@ -44,7 +52,7 @@ class ImageViTFeatureExtractor(nn.Module):
         self.dropout = nn.Dropout(config.image_encoder_pos_dropout)
 
         self.prelude = megatransformer_modules.SimpleBlock(
-            config.image_prelude_config, config.image_prelude_config.n_prelude_layers, config.hidden_dropout_prob
+            config.image_prelude_config, "image_prelude", config.image_prelude_config.n_prelude_layers, config.hidden_dropout_prob
         )
 
     def forward(

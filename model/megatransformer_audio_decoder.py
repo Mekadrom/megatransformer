@@ -1,4 +1,4 @@
-from model import megatransformer_diffusion, megatransformer_modules
+from model import megatransformer_diffusion
 from typing import Optional
 
 import megatransformer_utils
@@ -7,43 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class AudioEmbeddingUpsampleConv2dGenerator(nn.Module):
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
-        super().__init__()
-        self.config = config
-
-        activation = config.image_decoder_activation
-        dropout = config.image_decoder_dropout
-
-        self.conv_layers = nn.ModuleList()
-
-        activation_type = megatransformer_utils.get_activation_type(activation)
-
-        channels = [64, 32, 16, 8, 1]
-        sizes = [(1, 500), (4, 500), (16, 500), (64, 500), (128, 500)]
-        
-        for i in range(len(channels) - 1):
-            out_channels = channels[i+1]
-            upsample_target = sizes[i+1]
-
-            self.conv_layers.append(nn.Sequential(
-                nn.Upsample(size=upsample_target, mode="bilinear", align_corners=False),
-                nn.Conv2d(channels[i], out_channels, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(out_channels),
-                activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(out_channels),
-                nn.Dropout2d(dropout)
-            ))
-
-    def forward(self, features: torch.Tensor):
-        # naive approach; alternating conv2d and upsample layers to reach n_mels
-        # x: [batch_size, channels, timestep, hidden_size]
-        features = features.permute(0, 1, 3, 2) # [batch_size, channels, hidden_size, timestep]
-        features = features.reshape(features.shape[0], features.shape[1] * features.shape[2], 1, features.shape[3]) # [batch_size, channels * hidden_size, 1, timestep]
-        for i, layer in enumerate(self.conv_layers):
-            features = layer(features)
-        return features
-
-class ResidualBlock(nn.Module):
+class VocoderResidualBlock(nn.Module):
     """Residual block with dilated convolutions for the vocoder."""
     def __init__(
         self, 
@@ -71,6 +35,18 @@ class ResidualBlock(nn.Module):
             )
         ])
         self.gate_conv = nn.Conv1d(channels, channels, kernel_size=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize weights for the Conv1d layers
+        for conv in self.convs:
+            nn.init.kaiming_normal_(conv.weight, nonlinearity='leaky_relu')
+            if conv.bias is not None:
+                nn.init.zeros_(conv.bias)
+        nn.init.kaiming_normal_(self.gate_conv.weight, nonlinearity='leaky_relu')
+        if self.gate_conv.bias is not None:
+            nn.init.zeros_(self.gate_conv.bias)
         
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         residual = features
@@ -88,7 +64,7 @@ class ResidualBlock(nn.Module):
 
         return gated
 
-class UpsampleBlock(nn.Module):
+class VocoderUpsampleBlock(nn.Module):
     """Upsampling block for the vocoder."""
     def __init__(
         self, 
@@ -109,6 +85,14 @@ class UpsampleBlock(nn.Module):
             padding=(kernel_size - upsample_factor) // 2
         )
         self.norm = nn.BatchNorm1d(out_channels)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize weights for the ConvTranspose1d layer
+        nn.init.kaiming_normal_(self.conv.weight, nonlinearity='leaky_relu')
+        if self.conv.bias is not None:
+            nn.init.zeros_(self.conv.bias)
         
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         features = self.conv(features)
@@ -154,7 +138,7 @@ class AudioVocoder(nn.Module):
         current_channels = hidden_channels
         for factor in upsample_factors:
             self.upsample_blocks.append(
-                UpsampleBlock(
+                VocoderUpsampleBlock(
                     current_channels, 
                     current_channels // 2, 
                     upsample_factor=factor,
@@ -168,7 +152,7 @@ class AudioVocoder(nn.Module):
         for i in range(n_residual_layers):
             dilation = 2 ** (i % dilation_cycle)
             self.residual_blocks.append(
-                ResidualBlock(
+                VocoderResidualBlock(
                     channels=current_channels,
                     dilation=dilation,
                     kernel_size=kernel_size,
@@ -203,14 +187,19 @@ class AudioVocoder(nn.Module):
             nn.Tanh()  # Output in range [-1, 1]
         )
         
-        # Initialize weights
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, m):
-        if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
-            nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize weights for the Conv1d layers
+        nn.init.kaiming_normal_(self.initial_conv.weight, nonlinearity='leaky_relu')
+        if self.initial_conv.bias is not None:
+            nn.init.zeros_(self.initial_conv.bias)
+        
+        for layer in self.final_layers:
+            if isinstance(layer, nn.Conv1d):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity='leaky_relu')
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
     
     def forward(
         self, 
@@ -443,7 +432,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         sqrt_recip_alphas_t = self._extract(self.sqrt_recip_alphas_cumprod, t, x.shape)
         
         # Model forward pass with condition
-        model_output = self.unet(x, t, condition=condition)
+        model_output = self.unet(x, t.to(x.dtype), condition=condition)
         
         if self.predict_epsilon:
             # Model predicts noise ε
@@ -478,13 +467,13 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             return posterior_mean + torch.sqrt(posterior_variance) * noise
     
     @torch.no_grad()
-    def sample(self, device, batch_size=1, image_size=224, condition=None):
+    def sample(self, device, condition, batch_size=1, n_mels=128):
         """Sample with conditioning"""
         # Start from pure noise
-        x = torch.randn(batch_size, 3, image_size, image_size, device=device)
-        
+        x = torch.randn(batch_size, 1, n_mels, condition.shape[-1], dtype=condition.dtype, device=device)
+
         # Iteratively denoise with conditioning
-        for time_step in reversed(range(self.num_timesteps)):
+        for time_step in reversed(range(1, self.num_timesteps)):
             t = torch.full((batch_size,), time_step, device=device, dtype=torch.long)
             x = self.p_sample(x, t, time_step, condition=condition)
             
@@ -497,6 +486,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
     def forward(self, x_0: torch.Tensor, condition=None, audio_waveform_labels=None):
         """Training forward pass with conditioning"""
         batch_size = x_0.shape[0]
+
         t = torch.randint(0, self.num_timesteps, (batch_size,), device=x_0.device, dtype=torch.long)
         noise = torch.randn_like(x_0)
         x_t = self.q_sample(x_0, t, noise)

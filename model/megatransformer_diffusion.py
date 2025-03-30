@@ -25,6 +25,11 @@ class AudioDiffusionSelfAttentionBlock(nn.Module):
         self.out_proj = nn.Linear(self.d_values * n_heads, hidden_size)
         
         self.dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        self.apply(megatransformer_utils.transformer_weight_init)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -105,6 +110,11 @@ class AudioDiffusionCrossAttentionBlock(nn.Module):
         self.out_proj = nn.Linear(n_heads*d_values, hidden_size)
 
         self.dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        self.apply(megatransformer_utils.transformer_weight_init)
     
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         B, H, W, T = x.size()
@@ -177,8 +187,12 @@ class ImageDiffusionSelfAttentionBlock(nn.Module):
         
         self.out_proj = nn.Linear(self.d_values * n_heads, hidden_size)
         
-        # Always create dropout layer (needed for non-flash path)
         self.dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        self.apply(megatransformer_utils.transformer_weight_init)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -251,21 +265,23 @@ class ImageDiffusionCrossAttentionBlock(nn.Module):
         self.out_proj = nn.Linear(n_heads*d_values, hidden_size)
 
         self.dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        self.apply(megatransformer_utils.transformer_weight_init)
     
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.size()
         tgt_seq_len = H * W
-        BC, CC, HC, WC = context.size()
-        ctxt_seq_len = HC * WC
+        BC, T, CC = context.size()
+        ctxt_seq_len = T
 
         assert B == BC, f"Batch size mismatch: {B} vs {BC}"
 
         x = x.contiguous().view(B, C, tgt_seq_len)    # [B, C, tgt_seq_len]
         x = x.permute(0, 2, 1)  # [B, tgt_seq_len, C]
 
-        context = context.contiguous().view(B, CC, ctxt_seq_len)   # [B, CC, ctxt_seq_len]
-        context = context.permute(0, 2, 1)  # [B, ctxt_seq_len, CC]
-        
         q: torch.Tensor = self.q_proj(x)        # [B, tgt_seq_len, n_heads*d_queries]
         k: torch.Tensor = self.k_proj(context)  # [B, ctxt_seq_len, n_heads*d_queries]
         v: torch.Tensor = self.v_proj(context)  # [B, ctxt_seq_len, n_heads*d_values]
@@ -333,6 +349,21 @@ class ResidualBlock(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.GroupNorm):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, a=0.2)
+                if m.bias is not None:
+                    m.bias.data.zero_()
+        if isinstance(self.shortcut, nn.Conv2d):
+            self.shortcut.weight.data.zero_()
+            self.shortcut.bias.data.zero_()
+
     def forward(self, x: torch.Tensor, time_embedding: Optional[torch.Tensor]=None) -> torch.Tensor:
         h = self.conv1(x)
 
@@ -374,6 +405,12 @@ class DownBlock(nn.Module):
         ])
 
         self.downsample = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.downsample.weight, a=0.2)
+        self.downsample.bias.data.zero_()
 
     def forward(self, x: torch.Tensor, time_embedding: Optional[torch.Tensor]=None, condition=None) -> tuple[torch.Tensor, torch.Tensor]:
         for res_block, attn_block in zip(self.res_blocks, self.attn_blocks):
@@ -428,6 +465,12 @@ class UpBlock(nn.Module):
             ) if has_attn and has_condition else nn.Identity()
             for _ in range(num_res_blocks)
         ])
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.upsample[1].weight, a=0.2)
+        self.upsample[1].bias.data.zero_()
 
     def forward(self, x: torch.Tensor, skip: list[torch.Tensor], time_embedding: torch.Tensor, condition=None) -> torch.Tensor:
         x = self.upsample(x)
@@ -509,7 +552,7 @@ class UNet(nn.Module):
         self.middle_res_block = ResidualBlock(
             channels[-1], channels[-1], time_embedding_dim, activation, dropout
         )
-        self.middle_attn_block = AudioDiffusionSelfAttentionBlock(
+        self.middle_attn_block = self_attn_class(
             channels[-1], down_block_self_attn_n_heads, down_block_self_attn_d_queries, down_block_self_attn_d_values, use_flash_attention=down_block_self_attn_use_flash_attention, dropout=dropout
         )
         self.middle_res_block2 = ResidualBlock(
@@ -547,6 +590,14 @@ class UNet(nn.Module):
             model_channels*2, model_channels, time_embedding_dim, activation, dropout
         )
         self.final_conv = nn.Conv2d(model_channels, out_channels, kernel_size=3, padding=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        self.init_conv.weight.data.normal_(0.0, 0.02)
+        self.init_conv.bias.data.zero_()
+        self.final_conv.weight.data.normal_(0.0, 0.02)
+        self.final_conv.bias.data.zero_()
 
     def forward(self, x: torch.Tensor, timesteps: torch.Tensor, condition=None) -> torch.Tensor:
         time_embedding = self.time_embedding(timesteps)
@@ -745,14 +796,4 @@ class GaussianDiffusion(nn.Module):
         return x
     
     def forward(self, x_0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = x_0.shape[0]
-        t = torch.randint(0, self.num_timesteps, (batch_size,), device=x_0.device, dtype=torch.long)
-        noise = torch.randn_like(x_0)
-        x_t = self.q_sample(x_0, t, noise)
-
-        model_output = self.unet(x_t, t)
-
-        if self.predict_epsilon:
-            return model_output, noise
-        else:
-            return model_output, x_0
+        raise NotImplementedError("Forward method not implemented. Use q_sample or p_sample for training and sampling.")

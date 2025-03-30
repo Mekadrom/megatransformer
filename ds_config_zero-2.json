@@ -28,9 +28,12 @@
             "device": "cpu",
             "pin_memory": true
         },
-        "overlap_comm": true,
         "contiguous_gradients": true,
-        "reduce_bucket_size": "auto"
+        "overlap_comm": false,
+        "reduce_scatter": false,
+        "allgather_partitions": true,
+        "allgather_bucket_size": 5e8,
+        "reduce_bucket_size": 5e8
     },
     
     "bf16": {

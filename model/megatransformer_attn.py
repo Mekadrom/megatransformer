@@ -1,5 +1,6 @@
 from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
+from typing import Optional, Union
 
 from model import megatransformer_modules
 
@@ -71,7 +72,8 @@ class MegaTransformerSelfAttention(nn.Module):
         past_key_values: megatransformer_utils.KVCache=None,
         use_cache=False,
         output_attentions: bool=False,
-    ) -> MegaTransformerSelfAttentionOutput:
+        return_dict: bool=False,
+    ) -> Union[tuple[torch.Tensor, megatransformer_utils.KVCache, torch.Tensor], MegaTransformerSelfAttentionOutput]:
         N, _ = hidden_states.shape[:2]
 
         queries = self.q_proj(hidden_states)
@@ -145,6 +147,13 @@ class MegaTransformerSelfAttention(nn.Module):
         # Apply output projection
         output = self.o_proj(context_layer)
         output = self.proj_dropout(output)
+
+        if not return_dict:
+            return (
+                output,
+                past_key_values,
+                attention_probs if output_attentions else None,
+            )
         
         return MegaTransformerSelfAttentionOutput(
             hidden_states=output,

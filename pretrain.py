@@ -1,3 +1,10 @@
+# import os
+
+# os.environ["DEEPSPEED_UNIT_TEST"] = "1"
+# os.environ["NCCL_DEBUG"] = "INFO"
+# os.environ["NCCL_IB_DISABLE"] = "1"
+# os.environ["NCCL_P2P_DISABLE"] = "1"
+
 from transformers import AutoTokenizer, TrainingArguments, DataCollatorForLanguageModeling
 
 from dataset_loading import multimodal_dataset
@@ -7,6 +14,7 @@ import custom_callbacks
 import custom_trainers
 import megatransformer_utils
 import os
+import torch
 
 
 args, unk = megatransformer_utils.parse_args()
@@ -190,4 +198,8 @@ trainer.add_callback(metrics_callback)
 metrics_callback.trainer = trainer
 
 print(f"Starting training with {sum(p.numel() for p in model.parameters()):,} parameters")
-trainer.train()
+torch.cuda.cudart().cudaProfilerStart()
+try:
+    trainer.train()
+finally:
+    torch.cuda.cudart().cudaProfilerStop()

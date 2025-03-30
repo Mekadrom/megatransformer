@@ -1,4 +1,4 @@
-from dataset_loading import audio_multimodal, generic_text, image_multimodal, wikitext
+from dataset_loading import audio_loading, generic_text, image_loading, wikitext
 from transformers import PreTrainedTokenizer
 from typing import Literal
 
@@ -82,7 +82,7 @@ def load_text_only_dataset(tokenizer, max_position_embeddings, dataset_name, dat
 
 def load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, max_frames, tokenizer, dataset_name, dataset_config_name, dataset_split, streaming=False, cache_dir=None):
     if "mozilla" in dataset_name.lower() or "commonvoice" in dataset_name.lower() or "voxpopuli" in dataset_name.lower():
-        dataset = audio_multimodal.load_audio_dataset(
+        dataset = audio_loading.load_audio_dataset(
             dataset_name,
             dataset_config_name,
             dataset_split,
@@ -102,7 +102,7 @@ def load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, max_frames, token
 
 def load_image_dataset(tokenizer, dataset_name, dataset_config_name, dataset_split, image_size, streaming=False, cache_dir=None):
     if "laion" in dataset_name.lower():
-        dataset = image_multimodal.load_image_dataset(
+        dataset = image_loading.load_image_dataset(
             dataset_name,
             dataset_config_name,
             dataset_split,

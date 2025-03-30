@@ -70,9 +70,10 @@ class SinusoidalPositionEmbeddings(nn.Module):
         return embeddings
 
 class SimpleBlock(nn.Module):
-    def __init__(self, config, n_layers: int, dropout: float):
+    def __init__(self, config, name, n_layers: int, dropout: float):
         super().__init__()
         self.config = config
+        self.name = name
         self.prelude = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(n_layers)])
         self.dropout = nn.Dropout(dropout)
 
@@ -105,8 +106,12 @@ class SimpleBlock(nn.Module):
                 output_hidden_states=output_hidden_states
             )
 
-            hidden_states = outputs.hidden_states
-            attention_probs = outputs.attention_probs
+            if not return_dict:
+                hidden_states = outputs[0]
+                attention_probs = outputs[2]
+            else:
+                hidden_states = outputs.hidden_states
+                attention_probs = outputs.attention_probs
 
             if all_attentions is not None:
                 all_attentions.append(attention_probs)

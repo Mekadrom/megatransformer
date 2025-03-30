@@ -22,6 +22,18 @@ class AudioConv(nn.Module):
                 activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(out_channels),
                 nn.Dropout2d(dropout)
             ))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for layer in self.conv_layers:
+            if isinstance(layer, nn.Conv2d):
+                nn.init.kaiming_normal_(layer.weight, a=0, mode='fan_out', nonlinearity='relu')
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+            elif isinstance(layer, nn.BatchNorm2d):
+                nn.init.ones_(layer.weight)
+                nn.init.zeros_(layer.bias)
     
     def forward(self, features: torch.Tensor):
         # x: [batch_size, channels, height, width]
@@ -50,8 +62,15 @@ class AudioFeatureExtractor(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         self.prelude = megatransformer_modules.SimpleBlock(
-            config.audio_prelude_config, config.audio_prelude_config.n_prelude_layers, config.hidden_dropout_prob
+            config.audio_prelude_config, "audio_prelude", config.audio_prelude_config.n_prelude_layers, config.hidden_dropout_prob
         )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.conv_projection.weight)
+        if self.conv_projection.bias is not None:
+            nn.init.zeros_(self.conv_projection.bias)
 
     def forward(
         self,

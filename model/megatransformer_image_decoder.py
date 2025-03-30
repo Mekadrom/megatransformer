@@ -1,50 +1,10 @@
-from model import megatransformer_diffusion, megatransformer_modules
+from typing import Union
 
-import megatransformer_utils
+from model import megatransformer_diffusion
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-
-class ImageUpsampleConv2dGenerator(nn.Module):
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
-        super().__init__()
-        self.config = config
-
-        activation = config.image_decoder_activation
-        dropout = config.image_decoder_dropout
-
-        self.conv_layers = nn.ModuleList([
-            nn.Unflatten(-1, (768, 1, 1)),
-        ])
-
-        activation_type = megatransformer_utils.get_activation_type(activation)
-
-        channels = [768, 384, 96, 48, 24, 3]
-        image_sizes = [1, 4, 16, 64, 128, 224]
-        
-        for i in range(len(channels) - 1):
-            out_channels = channels[i+1]
-            upsample_target = image_sizes[i+1]
-
-            self.conv_layers.append(nn.Sequential(
-                nn.Upsample(size=(upsample_target, upsample_target), mode="bilinear", align_corners=False),
-                nn.Conv2d(channels[i], out_channels, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(out_channels),
-                activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(out_channels),
-                nn.Dropout2d(dropout)
-            ))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x is of the shape [batch_size, sequence_length, hidden_size]
-        x = x.permute(0, 2, 1) # [batch_size, hidden_size, sequence_length]
-
-        # do mean pooling to get one feature for now
-        x = x.mean(dim=-1) # [batch_size, hidden_size]
-
-        for layer in self.conv_layers:
-            x = layer(x) # unflatten makes it [batch_size, hidden_size, 1, 1] and it upsamples size and downsamples featuers from there
-        return x
 
 class ImageConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffusion):
     def __init__(self, *args, **kwargs):
@@ -61,7 +21,7 @@ class ImageConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         sqrt_recip_alphas_t = self._extract(self.sqrt_recip_alphas_cumprod, t, x.shape)
         
         # Model forward pass with condition
-        model_output = self.unet(x, t, condition=condition)
+        model_output = self.unet(x, t.to(x.dtype), condition=condition)
         
         if self.predict_epsilon:
             # Model predicts noise ε
@@ -96,21 +56,27 @@ class ImageConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             return posterior_mean + torch.sqrt(posterior_variance) * noise
     
     @torch.no_grad()
-    def sample(self, device, batch_size=1, image_size=224, condition=None):
+    def sample(self, device, condition, batch_size=1, image_size=224, return_intermediate=False) -> Union[tuple[torch.Tensor, list[torch.Tensor]], torch.Tensor]:
         """Sample with conditioning"""
         # Start from pure noise
         x = torch.randn(batch_size, 3, image_size, image_size, device=device)
         
         # Iteratively denoise with conditioning
-        for time_step in reversed(range(self.num_timesteps)):
+        time_step_outputs = []
+        for time_step in reversed(range(1, self.num_timesteps)):
             t = torch.full((batch_size,), time_step, device=device, dtype=torch.long)
             x = self.p_sample(x, t, time_step, condition=condition)
+            if return_intermediate:
+                # perform same image normalization per intermediate step
+                intermediate_output = (x + 1) / 2
+                intermediate_output = torch.clamp(intermediate_output, 0.0, 1.0)
+                time_step_outputs.append(intermediate_output)
             
         # Scale to [0, 1] range
         x = (x + 1) / 2
         x = torch.clamp(x, 0.0, 1.0)
         
-        return x
+        return x, time_step_outputs if return_intermediate else x
     
     def forward(self, x_0: torch.Tensor, condition=None):
         """Training forward pass with conditioning"""
@@ -120,7 +86,7 @@ class ImageConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         x_t = self.q_sample(x_0, t, noise)
         
         # Model forward pass with condition
-        model_output = self.unet(x_t, t, condition=condition)
+        model_output = self.unet(x_t, t.to(x_0.dtype), condition=condition)
         
         if self.predict_epsilon:
             # Loss to the added noise

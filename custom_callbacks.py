@@ -1,13 +1,17 @@
 from PIL import Image
+from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from transformers import PreTrainedTokenizer, Trainer, TrainerCallback
 from transformers.integrations import TensorBoardCallback
 from typing import Any, Optional
 
+from dataset_loading import audio_loading
 from model import megatransformer_multimodal
 
+import librosa
 import math
+import matplotlib.pyplot as plt
 import numpy as np
 import os
 import torch
@@ -59,14 +63,28 @@ class GenerationCallback(TrainerCallback):
                 writer.add_text(f"generation/sample_{i}", text, state.global_step)
 
 class MultimodalGenerationCallback(TrainerCallback):
-    def __init__(self, tokenizer: PreTrainedTokenizer, text_only_prompts, generation_steps=2000):
+    def __init__(self,
+                 tokenizer: PreTrainedTokenizer,
+                 text_only_prompts,
+                 audio_sample_rate: int = 16000,
+                 audio_n_mels: int = 128,
+                 audio_n_fft: int = 1024,
+                 audio_hop_length: int = 512,
+                 generation_steps=2000):
         self.trainer: Optional[Trainer] = None
         self.tokenizer = tokenizer
         self.text_only_prompts = text_only_prompts
         self.generation_steps = generation_steps
 
-        self.test_audio, self.sample_rate = torchaudio.load("test_alm.mp3")
-        self.test_audio = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000)(self.test_audio)
+        self.test_audio_waveforms, self.sample_rate = torchaudio.load("test_alm.mp3")
+        self.test_audio_waveforms = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000)(self.test_audio_waveforms)
+        self.test_audio_mels = audio_loading.extract_audio_features(
+            self.test_audio_waveforms,
+            audio_sample_rate,
+            audio_n_mels,
+            audio_n_fft,
+            audio_hop_length,
+        )[0]
         self.test_audio_prompt_text = "It is from Westport, above the villages of Murrisk and Lecanvey."
         self.test_audio_prompt = tokenizer(self.test_audio_prompt_text, return_tensors="pt")
 
@@ -83,209 +101,197 @@ class MultimodalGenerationCallback(TrainerCallback):
                 return
 
             test_audio_prompt = self.test_audio_prompt.to(model.device)
-            test_audio = self.test_audio.unsqueeze(0).to(model.device)
+            test_audio = self.test_audio_mels.unsqueeze(0).unsqueeze(0).to(model.device)
 
             test_image_prompt = self.test_image_prompt.to(model.device)
-            test_image = self.test_image.unsqueeze(0).to(model.device)
+            test_image = self.test_image.unsqueeze(0).unsqueeze(0).to(model.device)
 
             print(f"Generating at step {state.global_step}...")
             
-            text_only_inputs = self.tokenizer(self.prompts, padding=True, return_tensors="pt").to(model.device)
+            text_only_inputs = self.tokenizer(self.text_only_prompts, padding=True, return_tensors="pt").to(model.device)
             with torch.no_grad():
-                outputs = model.generate(
-                    input_ids=text_only_inputs["input_ids"],
-                    attention_mask=text_only_inputs["attention_mask"],
-                    use_cache=False,
-                    max_length=100,
-                    num_return_sequences=1,
-                    do_sample=True,
-                    top_p=0.92,
-                    temperature=0.7,
-                )
+                with autocast('cuda' if model.device.type == 'cuda' else 'cpu', dtype=torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32):
+                    outputs = model.generate(
+                        input_ids=text_only_inputs["input_ids"],
+                        attention_mask=text_only_inputs["attention_mask"],
+                        use_cache=False,
+                        max_length=100,
+                        num_return_sequences=1,
+                        do_sample=True,
+                        top_p=0.92,
+                        temperature=0.7,
+                        return_dict_in_generate=False
+                    )
 
-                generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-                
-                for i, text in enumerate(generated_texts):
-                    writer.add_text(f"generation/sample_{i}", text, state.global_step)
+                    generated_texts = self.tokenizer.batch_decode(outputs[0], skip_special_tokens=True)
+                    
+                    for i, text in enumerate(generated_texts):
+                        writer.add_text(f"generation/sample_{i}", text, state.global_step)
 
-                # Generate audio
-                audio_generation_outputs = model.generate(
-                    input_ids=torch.cat([test_audio_prompt["input_ids"], torch.tensor(model.config.begin_audio_token_id).unsqueeze(0).to(model.device)], dim=1),
-                    attention_mask=torch.cat([test_audio_prompt["attention_mask"], torch.ones(1, 1).to(model.device)], dim=1),
-                    use_cache=False,
-                    max_length=100,
-                    num_return_sequences=1,
-                    do_sample=True,
-                    top_p=0.92,
-                    temperature=0.7,
-                    return_dict_in_generate=True,
-                )
+                    begin_audio_token = torch.tensor(model.config.begin_audio_token_id).unsqueeze(0).unsqueeze(0).to(model.device)
 
-                audio_mel_specs = audio_generation_outputs.audio_outputs[0]
+                    # Generate audio
+                    audio_generation_outputs = model.generate(
+                        input_ids=torch.cat([test_audio_prompt["input_ids"], begin_audio_token], dim=1),
+                        attention_mask=torch.cat([test_audio_prompt["attention_mask"], torch.ones(1, 1).to(model.device)], dim=1),
+                        use_cache=False,
+                        max_length=100,
+                        num_return_sequences=1,
+                        do_sample=True,
+                        top_p=0.92,
+                        temperature=0.7,
+                        return_dict_in_generate=True,
+                    )
 
-                # Transform from mel specs to audio
-                audio_waveforms = self.reconstruct_audio_from_mel(
-                    audio_mel_specs,
-                    sample_rate=model.config.audio_decoder_sample_rate,
-                    n_fft=model.config.audio_n_fft,
-                    n_stft=model.config.audio_n_stft,
-                    hop_length=model.config.audio_hop_length,
-                    n_mels=model.config.audio_n_mels,
-                )
+                    audio_mel_specs = audio_generation_outputs.audio_mel_specs[0].cpu()
+                    audio_waveforms = audio_generation_outputs.audio_outputs[0].to(torch.float64).cpu()
 
-                # Save audio
-                audio_filepath = os.path.join(self.trainer.args.output_dir, f"generated_audio_step_{state.global_step}.wav")
-                self.save_audio_to_file(
-                    audio_waveforms[0],
-                    audio_filepath,
-                    sample_rate=model.config.audio_decoder_sample_rate,
-                    normalize=True,
-                )
-                writer.add_text(
-                    "generated_audio/prompt",
-                    self.test_audio_prompt_text,
-                    state.global_step,
-                )
-                writer.add_audio(
-                    f"generated_audio/sample",
-                    audio_waveforms[0],
-                    state.global_step,
-                    sample_rate=model.config.audio_decoder_sample_rate,
-                )
+                    # Save audio
+                    audio_filepath = os.path.join(self.trainer.args.output_dir, f"generated_audio_step_{state.global_step}.wav")
+                    self.save_audio_to_file(
+                        audio_waveforms,
+                        audio_filepath,
+                        sample_rate=model.config.audio_sample_rate,
+                        normalize=True,
+                    )
+                    writer.add_text(
+                        "generated_audio/prompt",
+                        self.test_audio_prompt_text,
+                        state.global_step,
+                    )
 
-                # transcribe audio
-                audio_transcription_outputs = model.generate(
-                    # interleave in generator will splice audio in between begin and end token embeddings
-                    input_ids=torch.tensor([model.config.begin_audio_token_id, model.config.end_audio_token_id]).unsqueeze(0).to(model.device),
-                    audio_raw_inputs=test_audio,
-                    attention_mask=torch.ones(1, 1).to(model.device),
-                    use_cache=False,
-                    max_length=100,
-                    num_return_sequences=2,
-                    do_sample=True,
-                    top_p=0.92,
-                    temperature=0.7,
-                )
+                    # clip waveforms
+                    audio_waveforms = torch.clamp(audio_waveforms, -1.0, 1.0)
 
-                audio_transcription_texts = audio_transcription_outputs.sequences
-                audio_transcription_texts = self.tokenizer.batch_decode(audio_transcription_texts, skip_special_tokens=True)
-                writer.add_audio(
-                    f"audio_transcription/sample",
-                    self.test_audio,
-                    state.global_step,
-                    sample_rate=model.config.audio_decoder_sample_rate,
-                )
-                for i, text in enumerate(audio_transcription_texts):
-                    writer.add_text(f"audio_transcription/sample_{i}", text, state.global_step)
+                    writer.add_audio(
+                        f"generated_audio/sample",
+                        audio_waveforms,
+                        state.global_step,
+                        sample_rate=model.config.audio_sample_rate,
+                    )
 
-                # Generate image
-                image_generation_outputs = model.generate(
-                    input_ids=torch.cat([test_image_prompt["input_ids"], torch.tensor(model.config.begin_image_token_id).unsqueeze(0).to(model.device)], dim=1),
-                    attention_mask=torch.cat([test_image_prompt["attention_mask"], torch.ones(1, 1).to(model.device)], dim=1),
-                    use_cache=False,
-                    max_length=100,
-                    num_return_sequences=1,
-                    do_sample=True,
-                    top_p=0.92,
-                    temperature=0.7,
-                    return_dict_in_generate=True,
-                )
-                image_generation_outputs = image_generation_outputs.image_outputs[0]
-                # Save image
-                image_filepath = os.path.join(self.trainer.args.output_dir, f"generated_image_step_{state.global_step}.png")
-                image = transforms.ToPILImage()(image_generation_outputs[0].cpu())
-                image.save(image_filepath)
-                writer.add_image(
-                    f"generated_image/sample",
-                    image_generation_outputs[0].cpu(),
-                    state.global_step,
-                )
-                writer.add_text(
-                    "generated_image/prompt",
-                    self.test_image_prompt_text,
-                    state.global_step,
-                )
+                    try:
+                        # after vocoder mel spec
+                        writer.add_image(
+                            f"generated_audio/waveform_mel_spec",
+                            self.viz_waveform(audio_waveforms[0].squeeze(0).cpu().numpy(), model.config.audio_sample_rate),
+                            state.global_step,
+                        )
+                    except Exception as e:
+                        writer.add_text(
+                            f"generated_audio/waveform_mel_spec/error",
+                            str(e),
+                            state.global_step,
+                        )
 
-                # transcribe image
-                image_transcription_outputs = model.generate(
-                    # interleave in generator will splice image in between begin and end token embeddings
-                    input_ids=torch.tensor([model.config.begin_image_token_id, model.config.end_image_token_id]).unsqueeze(0).to(model.device),
-                    image_raw_inputs=test_image,
-                    attention_mask=torch.ones(1, 1).to(model.device),
-                    use_cache=False,
-                    max_length=100,
-                    num_return_sequences=2,
-                    do_sample=True,
-                    top_p=0.92,
-                    temperature=0.7,
-                )
-                image_transcription_texts = image_transcription_outputs.sequences
-                image_transcription_texts = self.tokenizer.batch_decode(image_transcription_texts, skip_special_tokens=True)
-                for i, text in enumerate(image_transcription_texts):
-                    writer.add_text(f"image_transcription/sample_{i}", text, state.global_step)
-                writer.add_image(
-                    f"image_transcription/sample",
-                    test_image,
-                    state.global_step,
-                )
+                    try:
+                        # before vocoder mel spec
+                        writer.add_image(
+                            f"generated_audio/mel_spec",
+                            self.viz_mels(audio_mel_specs[0].squeeze(0).cpu().numpy(), model.config.audio_sample_rate),
+                            state.global_step,
+                        )
+                    except Exception as e:
+                        writer.add_text(
+                            f"generated_audio/mel_spec/error",
+                            str(e),
+                            state.global_step,
+                        )
 
-                # holy shit this is a lot of code
+                    # transcribe audio
+                    audio_transcription_outputs = model.generate(
+                        # interleave in generator will splice audio in between begin and end token embeddings
+                        input_ids=torch.tensor([model.config.begin_audio_token_id, model.config.end_audio_token_id]).unsqueeze(0).to(model.device),
+                        audio_raw_inputs=test_audio,
+                        use_cache=False,
+                        max_length=100,
+                        num_return_sequences=2,
+                        do_sample=True,
+                        top_p=0.92,
+                        temperature=0.7,
+                        return_dict_in_generate=True,
+                    )
 
-    def reconstruct_audio_from_mel(
-        self,
-        mel_spec,
-        sample_rate,
-        n_fft,
-        n_stft,
-        hop_length,
-        n_mels,
-        power=2.0,
-        is_log_scale=True,
-        n_iter=32,
-    ):
-        # Ensure mel_spec is a torch tensor
-        if not isinstance(mel_spec, torch.Tensor):
-            mel_spec = torch.tensor(mel_spec)
-        
-        # Add channel dimension if needed
-        if mel_spec.dim() == 2:
-            mel_spec = mel_spec.unsqueeze(0)
-        
-        # If mel_spec is in log scale (dB), convert back to power
-        if is_log_scale:
-            mel_spec = torch.exp(mel_spec * 0.115129) # 10.0 / np.log(10.0) ≈ 4.342, then divided by 10 for dB
-        
-        # Define the inverse mel scale transform
-        inverse_mel_scale = torchaudio.transforms.InverseMelScale(
-            n_stft=n_stft,
-            n_mels=n_mels,
-            sample_rate=sample_rate,
-            f_min=0.0,
-            f_max=sample_rate // 2,
-            max_iter=200,  # Convergence iterations for the inverse mel transform
-            tolerance_loss=1e-5,
-            tolerance_change=1e-8,
-        )
-        
-        # Apply inverse mel scale to get linear spectrogram
-        linear_spec = inverse_mel_scale(mel_spec)
-        
-        # Define Griffin-Lim algorithm
-        griffin_lim = torchaudio.transforms.GriffinLim(
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=n_fft,
-            power=power,
-            n_iter=n_iter,
-            momentum=0.99,
-            rand_init=False,
-        )
-        
-        # Apply Griffin-Lim to get audio
-        waveform = griffin_lim(linear_spec)
-        
-        return waveform
-    
+                    audio_transcription_texts = audio_transcription_outputs.sequences
+                    audio_transcription_texts = self.tokenizer.batch_decode(audio_transcription_texts, skip_special_tokens=True)
+                    writer.add_audio(
+                        f"audio_transcription/sample",
+                        self.test_audio_waveforms,
+                        state.global_step,
+                        sample_rate=model.config.audio_sample_rate,
+                    )
+                    for i, text in enumerate(audio_transcription_texts):
+                        writer.add_text(f"audio_transcription/sample_{i}", text, state.global_step)
+
+                    begin_image_token = torch.tensor(model.config.begin_image_token_id).unsqueeze(0).unsqueeze(0).to(model.device)
+
+                    # Generate image
+                    image_generation_outputs = model.generate(
+                        input_ids=torch.cat([test_image_prompt["input_ids"], begin_image_token], dim=1),
+                        attention_mask=torch.cat([test_image_prompt["attention_mask"], torch.ones(1, 1).to(model.device)], dim=1),
+                        use_cache=False,
+                        max_length=100,
+                        num_return_sequences=1,
+                        do_sample=True,
+                        top_p=0.92,
+                        temperature=0.7,
+                        return_dict_in_generate=True,
+                    )
+
+                    # images are in shape (batch_size, channels, height, width)
+                    image_output = image_generation_outputs.image_outputs[0].cpu()
+                    image_intermediate_outputs = image_generation_outputs.intermediate_image_outputs[0]
+
+                    # Save image
+                    image_filepath = os.path.join(self.trainer.args.output_dir, f"generated_image_step_{state.global_step}.png")
+                    image = transforms.ToPILImage()(image_output.squeeze(0))
+                    image = image.convert("RGB")
+                    image.save(image_filepath)
+                    writer.add_image(
+                        f"generated_image/sample",
+                        image_output.squeeze(0),
+                        state.global_step,
+                    )
+                    for i, timestep_image in enumerate(image_intermediate_outputs):
+                        timestep_image = timestep_image.cpu()
+                        writer.add_image(
+                            f"generated_image/timestep_{i}",
+                            timestep_image.squeeze(0),
+                            state.global_step,
+                        )
+                    writer.add_text(
+                        "generated_image/prompt",
+                        self.test_image_prompt_text,
+                        state.global_step,
+                    )
+
+                    # transcribe image
+                    image_transcription_outputs = model.generate(
+                        # interleave in generator will splice image in between begin and end token embeddings
+                        input_ids=torch.tensor([model.config.begin_image_token_id, model.config.end_image_token_id]).unsqueeze(0).to(model.device),
+                        image_raw_inputs=test_image,
+                        attention_mask=torch.ones(1, 1).to(model.device),
+                        use_cache=False,
+                        max_length=100,
+                        num_return_sequences=2,
+                        do_sample=True,
+                        top_p=0.92,
+                        temperature=0.7,
+                        return_dict_in_generate=True,
+                    )
+                    image_transcription_texts = image_transcription_outputs.sequences
+                    image_transcription_texts = self.tokenizer.batch_decode(image_transcription_texts, skip_special_tokens=True)
+                    for i, text in enumerate(image_transcription_texts):
+                        writer.add_text(f"image_transcription/sample_{i}", text, state.global_step)
+                    
+                    writer.add_image(
+                        f"image_transcription/sample",
+                        test_image[0].squeeze(0).cpu(),
+                        state.global_step,
+                    )
+
+                    # holy shit this is a lot of code
+
     def save_audio_to_file(
         self,
         waveform, 
@@ -312,7 +318,7 @@ class MultimodalGenerationCallback(TrainerCallback):
         # Save audio file
         torchaudio.save(
             filepath,
-            waveform,
+            waveform.cpu(),
             sample_rate,
             bits_per_sample=bits_per_sample,
             format="wav"
@@ -361,6 +367,64 @@ class MultimodalGenerationCallback(TrainerCallback):
             )
         
         print(f"Logged {batch_size} audio samples to TensorBoard with tag '{tag}'")
+
+    def viz_waveform(self, audio_array, sr=16000, n_mels=128):
+        """
+        Generate a visualization of a mel spectrogram for TensorBoard
+        
+        Parameters:
+        audio_array: numpy array of audio samples, shape [frames]
+        sample_rate: audio sample rate in Hz
+        n_mels: number of mel bands
+        
+        Returns:
+        A numpy array with shape [1, height, width, 3] for TensorBoard
+        """
+        audio_array = np.clip(audio_array, -1.0, 1.0)
+
+        # Generate mel spectrogram
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio_array, 
+            sr=sr,
+            n_mels=n_mels,
+            fmax=8000,
+        )
+        
+        # Convert to log scale (dB)
+        log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+        
+        return self.viz_mels(log_mel_spec, sr)
+
+    def viz_mels(self, log_mel_spec, sr=16000):
+        # Normalize to [0, 1] range for visualization
+        log_mel_spec = (log_mel_spec - log_mel_spec.min()) / (log_mel_spec.max() - log_mel_spec.min())
+        
+        # Create a figure with no padding
+        fig, ax = plt.subplots(figsize=(10, 4))
+        img = librosa.display.specshow(
+            log_mel_spec, 
+            x_axis='time',
+            y_axis='mel', 
+            sr=sr,
+            fmax=8000,
+            ax=ax
+        )
+        plt.colorbar(img, format='%+2.0f dB')
+        plt.title('Mel Spectrogram')
+        plt.tight_layout()
+        
+        # Convert figure to numpy array
+        fig.canvas.draw()
+        data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        
+        # Close the figure to free memory
+        plt.close(fig)
+        
+        # Add batch dimension
+        data = np.expand_dims(data, axis=0)
+        
+        return data
 
 class MetricsCallback(TrainerCallback):
     def __init__(self):

@@ -2,7 +2,6 @@ from torch.utils.data import IterableDataset
 from transformers import DataCollatorForLanguageModeling, PreTrainedTokenizer
 from typing import Iterator, Any, List, Dict, Union, Optional
 
-import datasets
 import dataset_loading
 import random
 import time
@@ -83,6 +82,8 @@ class MultimodalDataset(IterableDataset):
         self.split = split
         self.max_position_embeddings = max_position_embeddings
 
+        self.epoch = 0
+
         self.rng = random.Random(seed)
 
         self.delegate_datasets = []
@@ -155,33 +156,115 @@ class MultimodalDataset(IterableDataset):
         # Create a worker-specific infinite generator
         return self._sample_generator()
     
+    # def _sample_generator(self) -> Iterator[Any]:
+    #     """Infinite generator that yields random samples from delegate datasets"""
+    #     while True:
+    #         try:
+    #             # Randomly select a dataset based on weights
+    #             dataset_idx = random.choices(range(self.num_datasets), weights=self.weights, k=1)[0]
+                
+    #             # Get next item from the selected dataset
+    #             yield next(self.iterators[dataset_idx])
+                
+    #         except StopIteration:
+    #             # If one iterator is exhausted, reinitialize it
+    #             self.iterators[dataset_idx] = iter(self.delegate_datasets[dataset_idx])
+                
+    #             # Try again with the fresh iterator
+    #             try:
+    #                 yield next(self.iterators[dataset_idx])
+    #             except StopIteration:
+    #                 # If still empty, the dataset might truly be empty
+    #                 # Skip this dataset by reducing its weight to 0 and renormalizing
+    #                 if sum(self.weights) - self.weights[dataset_idx] > 0:
+    #                     self.weights[dataset_idx] = 0
+    #                     total = sum(self.weights)
+    #                     if total > 0:
+    #                         self.weights = [w / total for w in self.weights]
+                    
+    #                 # If all datasets are exhausted, break the infinite loop
+    #                 if sum(self.weights) == 0:
+    #                     break
+
+    # def _sample_generator(self) -> Iterator[Any]:
+    #     """Generator that yields random samples from delegate datasets with synchronized sampling across GPUs"""
+    #     # Get distributed info
+    #     is_distributed = torch.distributed.is_initialized()
+    #     rank = torch.distributed.get_rank() if is_distributed else 0
+        
+    #     while True:
+    #         try:
+    #             # Generate the same random seed across all processes
+    #             if is_distributed:
+    #                 # Create a tensor on rank 0 and broadcast to all processes
+    #                 if rank == 0:
+    #                     random_seed = torch.tensor([random.randint(0, 2**31-1)], dtype=torch.long, device="cuda")
+    #                 else:
+    #                     random_seed = torch.tensor([0], dtype=torch.long, device="cuda")
+    #                 print(f"rank {rank} random seed: {random_seed.item()}")
+    #                 torch.distributed.broadcast(random_seed, src=0)
+                    
+    #                 # Use the same seed to make the choice
+    #                 local_rng = random.Random(random_seed.item())
+    #                 dataset_idx = local_rng.choices(range(self.num_datasets), weights=self.weights, k=1)[0]
+    #             else:
+    #                 # Single GPU case - normal random selection
+    #                 dataset_idx = random.choices(range(self.num_datasets), weights=self.weights, k=1)[0]
+                
+    #             # Get next item from the selected dataset
+    #             print(f"yielding from dataset {dataset_idx}\n")
+    #             yield next(self.iterators[dataset_idx])
+                
+    #         except StopIteration:
+    #             # If one iterator is exhausted, reinitialize it
+    #             self.iterators[dataset_idx] = iter(self.delegate_datasets[dataset_idx])
+                
+    #             # Try again with the fresh iterator
+    #             try:
+    #                 yield next(self.iterators[dataset_idx])
+    #             except StopIteration:
+    #                 # If still empty, the dataset might truly be empty
+    #                 # Skip this dataset by reducing its weight to 0 and renormalizing
+    #                 if sum(self.weights) - self.weights[dataset_idx] > 0:
+    #                     self.weights[dataset_idx] = 0
+    #                     total = sum(self.weights)
+    #                     if total > 0:
+    #                         self.weights = [w / total for w in self.weights]
+                    
+    #                 # If all datasets are exhausted, break the infinite loop
+    #                 if sum(self.weights) == 0:
+    #                     break
+
     def _sample_generator(self) -> Iterator[Any]:
-        """Infinite generator that yields random samples from delegate datasets"""
+        """Generator with deterministic sampling using epoch and iteration for seed"""
+        is_distributed = torch.distributed.is_initialized()
+        
+        # Track iterations for deterministic sampling
+        iteration = 0
+        
         while True:
             try:
-                # Randomly select a dataset based on weights
-                dataset_idx = random.choices(range(self.num_datasets), weights=self.weights, k=1)[0]
+                # Use a deterministic seed based on iteration number
+                # This ensures all processes make the same random choice
+                seed = hash(f"epoch_{self.epoch}_iter_{iteration}")
+                iteration += 1
                 
-                # Get next item from the selected dataset
+                # All processes will choose the same dataset
+                dataset_idx = random.Random(seed).choices(range(self.num_datasets), weights=self.weights, k=1)[0]
+                
                 yield next(self.iterators[dataset_idx])
                 
             except StopIteration:
-                # If one iterator is exhausted, reinitialize it
+                # Handle iterator exhaustion
                 self.iterators[dataset_idx] = iter(self.delegate_datasets[dataset_idx])
                 
-                # Try again with the fresh iterator
                 try:
                     yield next(self.iterators[dataset_idx])
                 except StopIteration:
-                    # If still empty, the dataset might truly be empty
-                    # Skip this dataset by reducing its weight to 0 and renormalizing
                     if sum(self.weights) - self.weights[dataset_idx] > 0:
                         self.weights[dataset_idx] = 0
-                        total = sum(self.weights)
-                        if total > 0:
-                            self.weights = [w / total for w in self.weights]
+                        self.weights = [w / sum(self.weights) for w in self.weights] if sum(self.weights) > 0 else []
                     
-                    # If all datasets are exhausted, break the infinite loop
                     if sum(self.weights) == 0:
                         break
 
@@ -246,7 +329,5 @@ class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling)
             "image_raw_inputs": all_image_raw_inputs,
             "image_labels": all_image_labels,
         }
-
-        # print({k: v.shape for k, v in batch.items()})
 
         return batch

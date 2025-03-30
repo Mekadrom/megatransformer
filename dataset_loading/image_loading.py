@@ -1,10 +1,9 @@
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset
 from PIL import Image
 from transformers import PreTrainedTokenizer
 from torchvision import transforms
 from typing import Optional
 
-import os
 import requests
 import torch
 
