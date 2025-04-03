@@ -643,6 +643,7 @@ class GaussianDiffusion(nn.Module):
             predict_epsilon: bool = True,
             has_condition: bool = False,
             unet_dropout: float = 0.1,
+            betas_schedule="linear",
             down_block_self_attn_n_heads=6,
             down_block_self_attn_d_queries=64,
             down_block_self_attn_d_values=64,
@@ -689,7 +690,11 @@ class GaussianDiffusion(nn.Module):
             cross_attn_use_flash_attention=cross_attn_use_flash_attention,
         )
 
-        betas = torch.linspace(beta_start, beta_end, num_timesteps)
+        if betas_schedule == "cosine":
+            betas = self.cosine_beta_schedule()
+        else:
+            betas = torch.linspace(beta_start, beta_end, num_timesteps)
+
         self.register_buffer("betas", betas)
         alphas = 1.0 - betas
         self.register_buffer("alphas", alphas)
@@ -720,6 +725,14 @@ class GaussianDiffusion(nn.Module):
         sqrt_recip1m_alphas_cumprod = torch.sqrt(1.0 / (1.0 - alphas_cumprod))
         self.register_buffer("sqrt_recip1m_alphas_cumprod", sqrt_recip1m_alphas_cumprod)
 
+    def cosine_beta_schedule(timesteps, s=0.008):
+        steps = timesteps + 1
+        x = torch.linspace(0, timesteps, steps)
+        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clip(betas, 0.0001, 0.9999)
+
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor]=None) -> torch.Tensor:
         if noise is None:
             noise = torch.randn_like(x_start)
@@ -746,6 +759,7 @@ class GaussianDiffusion(nn.Module):
             
             # Calculate posterior mean using betas_t
             denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
+            denominator = torch.clamp(denominator, min=1e-8)
             posterior_mean = (
                 x * (1 - betas_t) / denominator +
                 pred_x0 * betas_t / denominator
@@ -757,6 +771,7 @@ class GaussianDiffusion(nn.Module):
             
             # Calculate posterior mean using betas_t
             denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
+            denominator = torch.clamp(denominator, min=1e-8)
             posterior_mean = (
                 x * (1 - betas_t) / denominator +
                 pred_x0 * betas_t / denominator

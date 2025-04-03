@@ -1,20 +1,11 @@
 from torch import nn
 from transformers import GenerationMixin, PreTrainedModel, PreTrainedTokenizer
-from typing import Optional, Union
 
-from model import megatransformer_audio_decoder, megatransformer_blocks, megatransformer_audio_encoder, megatransformer_diffusion, megatransformer_image_encoder, megatransformer_image_decoder, megatransformer_modules
+from model import megatransformer_audio_decoder, megatransformer_recurrent, megatransformer_audio_encoder, megatransformer_diffusion, megatransformer_image_encoder, megatransformer_image_decoder, megatransformer_modules, megatransformer_text_encoder
 
-import copy
 import megatransformer_utils
 import torch
 import torch.nn.functional as F
-
-
-BEGIN_IMAGE_TOKEN = "<|IMAGE|>"
-END_IMAGE_TOKEN = "<|/IMAGE|>"
-
-BEGIN_AUDIO_TOKEN = "<|AUDIO|>"
-END_AUDIO_TOKEN = "<|/AUDIO|>"
 
 
 class MultimodalGenerationOutput:
@@ -26,78 +17,12 @@ class MultimodalGenerationOutput:
         self.image_outputs = image_outputs
         self.intermediate_image_outputs = intermediate_image_outputs
 
-class TextFeatureExtractor(nn.Module):
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
-        super().__init__()
-        self.config = config
-
-        self.wte = nn.Embedding(config.vocab_size, config.hidden_size)
-
-        self.wpe: Optional[Union[nn.Embedding, nn.Parameter]] = None
-        if config.use_positional_embedding:
-            self.wpe = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        elif config.use_sinusoidal_embedding:
-            self.wpe = nn.Parameter(megatransformer_utils.create_sinusoidal_embedding(config.max_position_embeddings, config.hidden_size))
-            self.wpe.requires_grad = config.sinusoidal_embedding_learnable
-
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-        self.prelude = megatransformer_modules.SimpleBlock(
-            config.text_prelude_config, "text_prelude", config.text_prelude_config.n_prelude_layers, config.hidden_dropout_prob
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        self.apply(megatransformer_utils.embedding_weight_init)
-
-    def forward(
-        self,
-        input_ids,
-        attention_mask=None,
-        past_key_values: list[megatransformer_utils.KVCache]=None,
-        use_cache=False,
-        head_mask=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        batch_size, seq_length = input_ids.shape
-        inputs_embeds = self.wte(input_ids)
-        if self.wpe is not None:
-            if isinstance(self.wpe, nn.Parameter):
-                position_embeds = self.wpe
-                position_embeds = position_embeds[:, :seq_length, :].expand(batch_size, -1, -1)
-            else:
-                position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
-                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-                position_embeds = self.wpe(position_ids)
-            hidden_states = inputs_embeds + position_embeds
-        else:
-            # positional embedding likely applied in self attention block
-            hidden_states = inputs_embeds
-        
-        hidden_states = self.dropout(hidden_states)
-
-        prelude_outputs = self.prelude(
-            hidden_states,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            head_mask=head_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        return prelude_outputs
-
 class MegaTransformerMultimodalEncoder(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__()
         self.config = config
 
-        self.text_embedding = TextFeatureExtractor(config)
+        self.text_embedding = megatransformer_text_encoder.TextFeatureExtractor(config)
         self.audio_embedding = megatransformer_audio_encoder.AudioFeatureExtractor(config)
         self.image_embedding = megatransformer_image_encoder.ImageViTFeatureExtractor(config)
 
@@ -238,6 +163,7 @@ class MegaTransformerMultimodalDecoder(nn.Module):
             num_res_blocks=config.audio_decoder_num_res_blocks,
             has_condition=True,
             unet_dropout=config.audio_decoder_unet_dropout,
+            betas_schedule=config.audio_decoder_betas_schedule,
             down_block_self_attn_n_heads=config.audio_decoder_down_block_self_attn_n_heads,
             down_block_self_attn_d_queries=config.audio_decoder_down_block_self_attn_d_queries,
             down_block_self_attn_d_values=config.audio_decoder_down_block_self_attn_d_values,
@@ -269,6 +195,7 @@ class MegaTransformerMultimodalDecoder(nn.Module):
             num_res_blocks=config.image_decoder_num_res_blocks,
             has_condition=True,
             unet_dropout=config.image_decoder_unet_dropout,
+            betas_schedule=config.image_decoder_betas_schedule,
             down_block_self_attn_n_heads=config.image_decoder_down_block_self_attn_n_heads,
             down_block_self_attn_d_queries=config.image_decoder_down_block_self_attn_d_queries,
             down_block_self_attn_d_values=config.image_decoder_down_block_self_attn_d_values,
@@ -366,134 +293,6 @@ class MegaTransformerMultimodalDecoder(nn.Module):
 
         return text_logits, mel_spec_reconstructions, audio_waveforms, audio_reconstruction_loss, image_outputs, image_reconstruction_loss
 
-class MegaTransformerMultimodalRecurrentModel(PreTrainedModel, GenerationMixin):
-    config_class = megatransformer_utils.MegaTransformerConfig
-    
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
-        super().__init__(config)
-        self.config = config
-        
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        
-        prelude = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(config.n_prelude_layers)])
-        recurrent = megatransformer_blocks.MegaTransformerRecurrentBlock(config)
-        coda = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(config.n_coda_layers)])
-
-        self.transformer = nn.ModuleList([*prelude, recurrent, *coda])
-        
-        if config.use_final_norm:
-            self.norm_final = megatransformer_utils.create_norm(config.hidden_size, config.norm_type, config.norm_eps)
-        else:
-            self.norm_final = None
-
-    def forward(
-        self,
-        inputs_embeds,
-        attention_mask=None,
-        past_key_values: list[megatransformer_utils.KVCache]=None,
-        use_cache=False,
-        output_attentions=True,
-        output_hidden_states=True,
-        return_dict=False,
-    ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
-        batch_size, seq_length = inputs_embeds.shape[:2]
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), device=inputs_embeds.device)
-        
-        hidden_states = self.dropout(inputs_embeds)
-        
-        # Initialize lists to store outputs for each layer
-        all_hidden_states: Optional[list] = [] if output_hidden_states else None
-        all_attentions: Optional[list] = [] if output_attentions else None
-
-        for i, block in enumerate(self.transformer):
-            past_key_value = past_key_values[i] if past_key_values is not None else None
-            if all_hidden_states is not None:
-                all_hidden_states.append(hidden_states)
-            
-            outputs = block(
-                hidden_states,
-                attention_mask=attention_mask,
-                past_key_values=past_key_value,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-
-            if not return_dict:
-                hidden_states = outputs[0]
-                attention_probs = outputs[2]
-            else:
-                hidden_states = outputs.hidden_states
-                attention_probs = outputs.attention_probs
-
-            # [3] is past_key_value
-
-            if isinstance(block, megatransformer_blocks.MegaTransformerRecurrentBlock):
-                if not return_dict:
-                    n_steps_no_grad = outputs[4]
-                    k_steps_grad = outputs[5]
-                else:
-                    n_steps_no_grad = outputs.n_steps_no_grad
-                    k_steps_grad = outputs.k_steps_grad
-            else:
-                n_steps_no_grad = None
-                k_steps_grad = None
-
-            if hasattr(outputs, "all_hidden_states") and all_hidden_states is not None:
-                all_hidden_states.extend(outputs.all_hidden_states)
-            elif hasattr(outputs, "hidden_states") and all_hidden_states is not None:
-                all_hidden_states.append(outputs.hidden_states)
-            
-            if all_attentions:
-                all_attentions.append(attention_probs)
-        
-        if self.norm_final is not None:
-            hidden_states = self.norm_final(hidden_states)
-        
-        if all_hidden_states is not None:
-            all_hidden_states.append(hidden_states)
-        
-        if not return_dict:
-            return (
-                hidden_states,
-                past_key_values,
-                all_hidden_states,
-                all_attentions,
-                n_steps_no_grad,
-                k_steps_grad,
-            )
-        
-        return megatransformer_utils.MegaTransformerCausalOutput(
-            logits=hidden_states,
-            past_key_values=past_key_values,
-            hidden_states=all_hidden_states,
-            attentions=all_attentions,
-            n_steps_no_grad=n_steps_no_grad,
-            k_steps_grad=k_steps_grad,
-        )
-    
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask: torch.Tensor=None, **kwargs):
-        if past_key_values is not None and past_key_values[0] is not None:
-            input_ids = input_ids[:, -1:]
-
-        use_cache = kwargs.get("use_cache", True)
-        position_ids = kwargs.get("position_ids", None)
-        
-        if position_ids is not None:
-            position_ids = position_ids[:, -1:] if position_ids is not None else None
-
-        return {
-            "input_ids": input_ids,
-            "past_key_values": past_key_values,
-            "use_cache": use_cache,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-        }
-    
 class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
     config_class = megatransformer_utils.MegaTransformerConfig
     
@@ -502,7 +301,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         self.config = config
 
         self.input_transform = MegaTransformerMultimodalEncoder(config)
-        self.world_model = MegaTransformerMultimodalRecurrentModel(config)
+        self.world_model = megatransformer_recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
         self.output_transform = MegaTransformerMultimodalDecoder(config)
 
     def get_input_embeddings(self):
@@ -1348,13 +1147,18 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
 
 def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     tokenizer.add_special_tokens({
-        "additional_special_tokens": [BEGIN_AUDIO_TOKEN, END_AUDIO_TOKEN, BEGIN_IMAGE_TOKEN, END_IMAGE_TOKEN]
+        "additional_special_tokens": [
+            megatransformer_utils.BEGIN_AUDIO_TOKEN,
+            megatransformer_utils.END_AUDIO_TOKEN,
+            megatransformer_utils.BEGIN_IMAGE_TOKEN,
+            megatransformer_utils.END_IMAGE_TOKEN
+        ]
     })
 
-    begin_audio_token_id = tokenizer.convert_tokens_to_ids(BEGIN_AUDIO_TOKEN)
-    end_audio_token_id = tokenizer.convert_tokens_to_ids(END_AUDIO_TOKEN)
-    begin_image_token_id = tokenizer.convert_tokens_to_ids(BEGIN_IMAGE_TOKEN)
-    end_image_token_id = tokenizer.convert_tokens_to_ids(END_IMAGE_TOKEN)
+    begin_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_AUDIO_TOKEN)
+    end_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_AUDIO_TOKEN)
+    begin_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_IMAGE_TOKEN)
+    end_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_IMAGE_TOKEN)
 
     print(begin_audio_token_id, end_audio_token_id, begin_image_token_id, end_image_token_id)
 
@@ -1386,7 +1190,7 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
         audio_decoder_model_channels=64,
         audio_decoder_time_embedding_dim=64,
         audio_decoder_num_res_blocks=2,
-
+        audio_decoder_betas_schedule="cosine",
         audio_decoder_down_block_self_attn_n_heads=4,
         audio_decoder_up_block_self_attn_n_heads=4,
         audio_decoder_cross_attn_n_heads=4,
@@ -1394,6 +1198,7 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
         image_decoder_model_channels=64,
         image_decoder_time_embedding_dim=64,
         image_decoder_num_res_blocks=2,
+        image_decoder_betas_schedule="cosine",
     )
 
     config.text_prelude_config = config
@@ -1408,13 +1213,18 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
 
 def create_medium_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     tokenizer.add_special_tokens({
-        "additional_special_tokens": [BEGIN_AUDIO_TOKEN, END_AUDIO_TOKEN, BEGIN_IMAGE_TOKEN, END_IMAGE_TOKEN]
+        "additional_special_tokens": [
+            megatransformer_utils.BEGIN_AUDIO_TOKEN,
+            megatransformer_utils.END_AUDIO_TOKEN,
+            megatransformer_utils.BEGIN_IMAGE_TOKEN,
+            megatransformer_utils.END_IMAGE_TOKEN
+        ]
     })
 
-    begin_audio_token_id = tokenizer.convert_tokens_to_ids(BEGIN_AUDIO_TOKEN)
-    end_audio_token_id = tokenizer.convert_tokens_to_ids(END_AUDIO_TOKEN)
-    begin_image_token_id = tokenizer.convert_tokens_to_ids(BEGIN_IMAGE_TOKEN)
-    end_image_token_id = tokenizer.convert_tokens_to_ids(END_IMAGE_TOKEN)
+    begin_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_AUDIO_TOKEN)
+    end_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_AUDIO_TOKEN)
+    begin_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_IMAGE_TOKEN)
+    end_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_IMAGE_TOKEN)
 
     print(begin_audio_token_id, end_audio_token_id, begin_image_token_id, end_image_token_id)
 
@@ -1463,13 +1273,18 @@ def create_medium_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_
 
 def create_normal_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     tokenizer.add_special_tokens({
-        "additional_special_tokens": [BEGIN_AUDIO_TOKEN, END_AUDIO_TOKEN, BEGIN_IMAGE_TOKEN, END_IMAGE_TOKEN]
+        "additional_special_tokens": [
+            megatransformer_utils.BEGIN_AUDIO_TOKEN,
+            megatransformer_utils.END_AUDIO_TOKEN,
+            megatransformer_utils.BEGIN_IMAGE_TOKEN,
+            megatransformer_utils.END_IMAGE_TOKEN
+        ]
     })
 
-    begin_audio_token_id = tokenizer.convert_tokens_to_ids(BEGIN_AUDIO_TOKEN)
-    end_audio_token_id = tokenizer.convert_tokens_to_ids(END_AUDIO_TOKEN)
-    begin_image_token_id = tokenizer.convert_tokens_to_ids(BEGIN_IMAGE_TOKEN)
-    end_image_token_id = tokenizer.convert_tokens_to_ids(END_IMAGE_TOKEN)
+    begin_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_AUDIO_TOKEN)
+    end_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_AUDIO_TOKEN)
+    begin_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_IMAGE_TOKEN)
+    end_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_IMAGE_TOKEN)
 
     print(begin_audio_token_id, end_audio_token_id, begin_image_token_id, end_image_token_id)
 
@@ -1517,13 +1332,18 @@ def create_normal_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_
 
 def create_test_tiny_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     tokenizer.add_special_tokens({
-        "additional_special_tokens": [BEGIN_AUDIO_TOKEN, END_AUDIO_TOKEN, BEGIN_IMAGE_TOKEN, END_IMAGE_TOKEN]
+        "additional_special_tokens": [
+            megatransformer_utils.BEGIN_AUDIO_TOKEN,
+            megatransformer_utils.END_AUDIO_TOKEN,
+            megatransformer_utils.BEGIN_IMAGE_TOKEN,
+            megatransformer_utils.END_IMAGE_TOKEN
+        ]
     })
 
-    begin_audio_token_id = tokenizer.convert_tokens_to_ids(BEGIN_AUDIO_TOKEN)
-    end_audio_token_id = tokenizer.convert_tokens_to_ids(END_AUDIO_TOKEN)
-    begin_image_token_id = tokenizer.convert_tokens_to_ids(BEGIN_IMAGE_TOKEN)
-    end_image_token_id = tokenizer.convert_tokens_to_ids(END_IMAGE_TOKEN)
+    begin_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_AUDIO_TOKEN)
+    end_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_AUDIO_TOKEN)
+    begin_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_IMAGE_TOKEN)
+    end_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_IMAGE_TOKEN)
 
     print(begin_audio_token_id, end_audio_token_id, begin_image_token_id, end_image_token_id)
 

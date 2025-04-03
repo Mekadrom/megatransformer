@@ -8,7 +8,6 @@ from model import megatransformer_modules
 
 import argparse
 import glob
-import inspect
 import math
 import numpy as np
 import os
@@ -17,6 +16,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+
+BEGIN_IMAGE_TOKEN = "<|IMAGE|>"
+END_IMAGE_TOKEN = "<|/IMAGE|>"
+
+BEGIN_AUDIO_TOKEN = "<|AUDIO|>"
+END_AUDIO_TOKEN = "<|/AUDIO|>"
 
 class KVCache:
     def __init__(self):
@@ -204,6 +209,7 @@ class MegaTransformerConfig(PretrainedConfig):
         audio_decoder_dropout=0.1,
 
         audio_decoder_unet_dropout=0.1,
+        audio_decoder_betas_schedule="linear",
         audio_decoder_down_block_self_attn_n_heads=8,
         audio_decoder_down_block_self_attn_d_queries=64,
         audio_decoder_down_block_self_attn_d_values=64,
@@ -230,6 +236,7 @@ class MegaTransformerConfig(PretrainedConfig):
         image_decoder_dropout=0.1,
 
         image_decoder_unet_dropout=0.1,
+        image_decoder_betas_schedule="linear",
         image_decoder_down_block_self_attn_n_heads=8,
         image_decoder_down_block_self_attn_d_queries=64,
         image_decoder_down_block_self_attn_d_values=64,
@@ -352,6 +359,7 @@ class MegaTransformerConfig(PretrainedConfig):
         self.audio_decoder_dropout = audio_decoder_dropout
 
         self.audio_decoder_unet_dropout = audio_decoder_unet_dropout
+        self.audio_decoder_betas_schedule = audio_decoder_betas_schedule
         self.audio_decoder_down_block_self_attn_n_heads = audio_decoder_down_block_self_attn_n_heads
         self.audio_decoder_down_block_self_attn_d_queries = audio_decoder_down_block_self_attn_d_queries
         self.audio_decoder_down_block_self_attn_d_values = audio_decoder_down_block_self_attn_d_values
@@ -378,6 +386,7 @@ class MegaTransformerConfig(PretrainedConfig):
         self.image_decoder_dropout = image_decoder_dropout
 
         self.image_decoder_unet_dropout = image_decoder_unet_dropout
+        self.image_decoder_betas_schedule = image_decoder_betas_schedule
         self.image_decoder_down_block_self_attn_n_heads = image_decoder_down_block_self_attn_n_heads
         self.image_decoder_down_block_self_attn_d_queries = image_decoder_down_block_self_attn_d_queries
         self.image_decoder_down_block_self_attn_d_values = image_decoder_down_block_self_attn_d_values
@@ -744,10 +753,10 @@ def create_multimodal_optimizer(model, weight_decay):
         {'params': model.output_transform.text_coda.parameters(), 'lr': 1e-4},
         {'params': model.output_transform.text_decoder.parameters(), 'lr': 2e-4},
         {'params': model.output_transform.audio_coda.parameters(), 'lr': 1e-4},
-        {'params': audio_decoder_only_params, 'lr': 5e-5},
+        {'params': audio_decoder_only_params, 'lr': 2e-5},
         {'params': model.output_transform.audio_decoder.vocoder.parameters(), 'lr': 3e-5},
         {'params': model.output_transform.image_coda.parameters(), 'lr': 1e-4},
-        {'params': model.output_transform.image_decoder.parameters(), 'lr': 5e-5},
+        {'params': model.output_transform.image_decoder.parameters(), 'lr': 2e-5},
     ], weight_decay=weight_decay)
     return optimizer
 

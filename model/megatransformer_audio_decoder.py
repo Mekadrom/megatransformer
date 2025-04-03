@@ -451,6 +451,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             
             # Calculate posterior mean using betas_t
             denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
+            denominator = torch.clamp(denominator, min=1e-8)
             posterior_mean = (
                 x * (1 - betas_t) / denominator +
                 pred_x0 * betas_t / denominator
@@ -462,6 +463,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             
             # Calculate posterior mean using betas_t
             denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
+            denominator = torch.clamp(denominator, min=1e-8)
             posterior_mean = (
                 x * (1 - betas_t) / denominator +
                 pred_x0 * betas_t / denominator
