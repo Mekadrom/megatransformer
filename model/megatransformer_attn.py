@@ -123,7 +123,15 @@ class MegaTransformerSelfAttention(nn.Module):
 
         # print(f"attention_scores: {attention_scores.shape}")
         
-        causal_mask_slice = self.causal_mask[:, :, :t, :T]
+        max_seq_len = max(t, T)
+        if max_seq_len > min(self.causal_mask.shape[-1], self.causal_mask.shape[-2]):
+            # recalculate causal mask with new longest length
+            self.register_buffer(
+                "causal_mask",
+                torch.tril(torch.ones(max_seq_len, max_seq_len)).view(1, 1, max_seq_len, max_seq_len),
+            )
+
+        causal_mask_slice = self.causal_mask[:, :, :t, :T].to(attention_scores.device)
         attention_scores = attention_scores.masked_fill(causal_mask_slice == 0, float("-inf"))
         
         if attention_mask is not None:

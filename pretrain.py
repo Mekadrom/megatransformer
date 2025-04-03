@@ -15,7 +15,6 @@ import custom_callbacks
 import custom_trainers
 import megatransformer_utils
 import os
-import torch
 
 
 args, unk = megatransformer_utils.parse_args()
@@ -38,13 +37,12 @@ else:
 model = model_maker.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
 model = megatransformer_utils.load_model(False, model, run_dir)
 
-if args.local_rank == 0:
+if args.local_rank == 0 or not args.use_deepspeed:
     print(f"model structure: {model}")
     print(f"model parameters: {(sum(p.numel() for p in model.parameters())):,}")
     print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
 
     if len(args.include_modes) > 1 or "text" not in args.include_modes:
-        print(f"model.input_transform parameters: {(sum(p.numel() for p in model.input_transform.parameters())):,}")
         print(f"model.input_transform.text_embedding parameters: {(sum(p.numel() for p in model.input_transform.text_embedding.parameters())):,}")
         print(f"model.input_transform.audio_embedding parameters: {(sum(p.numel() for p in model.input_transform.audio_embedding.parameters())):,}")
         print(f"model.input_transform.image_embedding parameters: {(sum(p.numel() for p in model.input_transform.image_embedding.parameters())):,}")

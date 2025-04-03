@@ -4,6 +4,7 @@ from typing import Optional, Union
 
 from model import megatransformer_audio_decoder, megatransformer_blocks, megatransformer_audio_encoder, megatransformer_diffusion, megatransformer_image_encoder, megatransformer_image_decoder, megatransformer_modules
 
+import copy
 import megatransformer_utils
 import torch
 import torch.nn.functional as F
@@ -1363,7 +1364,7 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
         max_position_embeddings=max_position_embeddings,
         n_layers=None,
         n_prelude_layers=2,
-        n_recurrent_layers=4,
+        n_recurrent_layers=2,
         n_coda_layers=2,
         intermediate_activation="swiglu",
         norm_type="rmsnorm",
@@ -1381,6 +1382,18 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
         end_audio_token_id=end_audio_token_id,
         begin_image_token_id=begin_image_token_id,
         end_image_token_id=end_image_token_id,
+
+        audio_decoder_model_channels=64,
+        audio_decoder_time_embedding_dim=64,
+        audio_decoder_num_res_blocks=2,
+
+        audio_decoder_down_block_self_attn_n_heads=4,
+        audio_decoder_up_block_self_attn_n_heads=4,
+        audio_decoder_cross_attn_n_heads=4,
+
+        image_decoder_model_channels=64,
+        image_decoder_time_embedding_dim=64,
+        image_decoder_num_res_blocks=2,
     )
 
     config.text_prelude_config = config
