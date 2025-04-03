@@ -1,9 +1,10 @@
-# import os
+import os
 
-# os.environ["DEEPSPEED_UNIT_TEST"] = "1"
-# os.environ["NCCL_DEBUG"] = "INFO"
-# os.environ["NCCL_IB_DISABLE"] = "1"
-# os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["DEEPSPEED_UNIT_TEST"] = "1"
+os.environ["NCCL_DEBUG"] = "INFO"
+os.environ["NCCL_IB_DISABLE"] = "1"
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ['NCCL_TIMEOUT'] = '1200000'
 
 from transformers import AutoTokenizer, TrainingArguments, DataCollatorForLanguageModeling
 
@@ -83,8 +84,9 @@ training_args = TrainingArguments(
     report_to="tensorboard",
     logging_dir=run_dir,
     logging_steps=args.logging_steps,
-    eval_strategy="steps",
-    eval_steps=args.eval_steps,
+    # eval_strategy="steps",
+    eval_strategy="no",
+    # eval_steps=args.eval_steps,
     save_safetensors=False,
     save_steps=args.save_steps,
     gradient_checkpointing=args.use_gradient_checkpointing,
@@ -99,16 +101,12 @@ training_args = TrainingArguments(
     local_rank=args.local_rank,
 )
 
-text_examples = 10_000
-audio_examples = 10_000
-image_examples = 10_000
-
 text_weight = 1.0 if "text" in args.include_modes else 0.0
 audio_weight = 1.0 if "audio" in args.include_modes else 0.0
 image_weight = 1.0 if "image" in args.include_modes else 0.0
 
 train_dataset = multimodal_dataset.MultimodalDataset(
-    approximated_length=text_examples + audio_examples + image_examples,
+    approximated_length=300_000,
     tokenizer=tokenizer,
     sample_rate=model.config.audio_sample_rate,
     n_mels=model.config.audio_n_mels,
@@ -125,23 +123,23 @@ train_dataset = multimodal_dataset.MultimodalDataset(
     max_position_embeddings=args.max_position_embeddings,
 )
 
-validation_dataset = multimodal_dataset.MultimodalDataset(
-    approximated_length=3_760 + 9_150 + 12_400,
-    tokenizer=tokenizer,
-    sample_rate=model.config.audio_sample_rate,
-    n_mels=model.config.audio_n_mels,
-    n_fft=model.config.audio_n_fft,
-    hop_length=model.config.audio_hop_length,
-    audio_max_frames=model.config.audio_max_frames,
-    image_size=model.config.image_size,
-    cache_dir=args.dataset_cache_dir,
-    text_weight=text_weight,
-    audio_weight=audio_weight,
-    image_weight=image_weight,
-    split="validation",
-    seed=args.seed,
-    max_position_embeddings=args.max_position_embeddings,
-)
+# validation_dataset = multimodal_dataset.MultimodalDataset(
+#     approximated_length=200_000,
+#     tokenizer=tokenizer,
+#     sample_rate=model.config.audio_sample_rate,
+#     n_mels=model.config.audio_n_mels,
+#     n_fft=model.config.audio_n_fft,
+#     hop_length=model.config.audio_hop_length,
+#     audio_max_frames=model.config.audio_max_frames,
+#     image_size=model.config.image_size,
+#     cache_dir=args.dataset_cache_dir,
+#     text_weight=0.0, # no text in validation
+#     audio_weight=audio_weight,
+#     image_weight=image_weight,
+#     split="validation",
+#     seed=args.seed,
+#     max_position_embeddings=args.max_position_embeddings,
+# )
 
 if 'multimodal' in args.config.lower():
     data_collator = multimodal_dataset.DataCollatorForMultimodalLanguageModeling(
@@ -164,7 +162,7 @@ trainer = custom_trainers.trainer_lookup(args, args.trainer)(
     args=training_args,
     data_collator=data_collator,
     train_dataset=train_dataset,
-    eval_dataset=validation_dataset,
+    # eval_dataset=validation_dataset,
     processing_class=tokenizer,
     optimizers=(optimizer, None)
 )
@@ -198,8 +196,4 @@ trainer.add_callback(metrics_callback)
 metrics_callback.trainer = trainer
 
 print(f"Starting training with {sum(p.numel() for p in model.parameters()):,} parameters")
-torch.cuda.cudart().cudaProfilerStart()
-try:
-    trainer.train()
-finally:
-    torch.cuda.cudart().cudaProfilerStop()
+trainer.train()

@@ -326,6 +326,7 @@ class MegaTransformerMultimodalDecoder(nn.Module):
             audio_waveforms = None
             audio_reconstruction_loss = None
         else:
+            # (batch, example, seq_len, hidden_size)
             B1, E1, H1, W1 = audio_hidden_states.shape
             audio_hidden_states, audio_mel_spec_labels, audio_waveform_labels = self.audio_coda_forward(
                 audio_hidden_states,
@@ -340,11 +341,13 @@ class MegaTransformerMultimodalDecoder(nn.Module):
             )
 
             # restore n_audios dimension
-            mel_spec_reconstructions = mel_spec_reconstructions.view(B1, E1, -1, H1, W1)
+            # (batch, example, channels, hidden_size, seq_len)
+            mel_spec_reconstructions = mel_spec_reconstructions.view(B1, E1, 1, self.config.audio_n_mels, H1)
         if image_hidden_states is None:
             image_outputs = None
             image_reconstruction_loss = None
         else:
+            # (batch, example, seq_len, hidden_size)
             B1, E1, H1, W1 = image_hidden_states.shape
             image_hidden_states, image_labels = self.image_coda_forward(
                 image_hidden_states,
@@ -357,7 +360,8 @@ class MegaTransformerMultimodalDecoder(nn.Module):
             )
 
             # restore n_images dimension
-            image_outputs = image_outputs.view(B1, E1, -1, H1, W1)
+            # (batch, example, channels, hidden_size, seq_len)
+            image_outputs = image_outputs.view(B1, E1, 3, self.config.image_size, self.config.image_size)
 
         return text_logits, mel_spec_reconstructions, audio_waveforms, audio_reconstruction_loss, image_outputs, image_reconstruction_loss
 
@@ -387,9 +391,9 @@ class MegaTransformerMultimodalRecurrentModel(PreTrainedModel, GenerationMixin):
         attention_mask=None,
         past_key_values: list[megatransformer_utils.KVCache]=None,
         use_cache=False,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
+        output_attentions=True,
+        output_hidden_states=True,
+        return_dict=False,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
@@ -403,7 +407,6 @@ class MegaTransformerMultimodalRecurrentModel(PreTrainedModel, GenerationMixin):
         all_hidden_states: Optional[list] = [] if output_hidden_states else None
         all_attentions: Optional[list] = [] if output_attentions else None
 
-        recurrent_outputs = None
         for i, block in enumerate(self.transformer):
             past_key_value = past_key_values[i] if past_key_values is not None else None
             if all_hidden_states is not None:
@@ -419,15 +422,25 @@ class MegaTransformerMultimodalRecurrentModel(PreTrainedModel, GenerationMixin):
                 return_dict=return_dict,
             )
 
-            if isinstance(block, megatransformer_blocks.MegaTransformerRecurrentBlock):
-                recurrent_outputs = outputs
-
             if not return_dict:
                 hidden_states = outputs[0]
                 attention_probs = outputs[2]
             else:
                 hidden_states = outputs.hidden_states
                 attention_probs = outputs.attention_probs
+
+            # [3] is past_key_value
+
+            if isinstance(block, megatransformer_blocks.MegaTransformerRecurrentBlock):
+                if not return_dict:
+                    n_steps_no_grad = outputs[4]
+                    k_steps_grad = outputs[5]
+                else:
+                    n_steps_no_grad = outputs.n_steps_no_grad
+                    k_steps_grad = outputs.k_steps_grad
+            else:
+                n_steps_no_grad = None
+                k_steps_grad = None
 
             if hasattr(outputs, "all_hidden_states") and all_hidden_states is not None:
                 all_hidden_states.extend(outputs.all_hidden_states)
@@ -449,8 +462,8 @@ class MegaTransformerMultimodalRecurrentModel(PreTrainedModel, GenerationMixin):
                 past_key_values,
                 all_hidden_states,
                 all_attentions,
-                recurrent_outputs.n_steps_no_grad if recurrent_outputs is not None else None,
-                recurrent_outputs.k_steps_grad if recurrent_outputs is not None else None,
+                n_steps_no_grad,
+                k_steps_grad,
             )
         
         return megatransformer_utils.MegaTransformerCausalOutput(
@@ -458,8 +471,8 @@ class MegaTransformerMultimodalRecurrentModel(PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
-            n_steps_no_grad=recurrent_outputs.n_steps_no_grad if recurrent_outputs is not None else None,
-            k_steps_grad=recurrent_outputs.k_steps_grad if recurrent_outputs is not None else None,
+            n_steps_no_grad=n_steps_no_grad,
+            k_steps_grad=k_steps_grad,
         )
     
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask: torch.Tensor=None, **kwargs):
@@ -533,7 +546,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
             image_raw_inputs=image_raw_inputs,
             text_past_key_values=text_past_key_values
         )
-        
+
         # Extract the embeddings
         text_embeds = text_prelude_outputs[0] if isinstance(text_prelude_outputs, tuple) else text_prelude_outputs
         
@@ -544,6 +557,10 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         image_embeds = None
         if image_prelude_outputs is not None:
             image_embeds = image_prelude_outputs[0] if isinstance(image_prelude_outputs, tuple) else image_prelude_outputs
+
+        # megatransformer_utils.print_debug_tensor('text_embeds', text_embeds)
+        # megatransformer_utils.print_debug_tensor('audio_embeds', audio_embeds)
+        # megatransformer_utils.print_debug_tensor('image_embeds', image_embeds)
 
         # Get batch size and device
         batch_size = text_input_ids.shape[0]
@@ -567,34 +584,47 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
             # Find begin token positions
             begin_audio_pos = (batch_ids == self.config.begin_audio_token_id).nonzero(as_tuple=True)[0]
             begin_image_pos = (batch_ids == self.config.begin_image_token_id).nonzero(as_tuple=True)[0]
+
+            # print(f"Batch {b}: Begin audio positions: {begin_audio_pos}")
+            # print(f"Batch {b}: Begin image positions: {begin_image_pos}")
             
             segments = []
             current_pos = 0
             
             # (n_mode_exmaple, begin pos, length, type) for this batch
-            special_positions = []
+            pre_filtered_special_positions = []
             for pos in begin_audio_pos:
-                special_positions.append([None, pos.item(), 0])
+                pre_filtered_special_positions.append([None, pos.item(), 0])
 
             for pos in begin_image_pos:
-                special_positions.append([None, pos.item(), 1])
+                pre_filtered_special_positions.append([None, pos.item(), 1])
             
             # Sort by begin position
-            special_positions.sort(key=lambda x: x[1])
+            pre_filtered_special_positions.sort(key=lambda x: x[1])
 
             # Assign indices to each special position after sorting
             audio_idx = 0
             image_idx = 0
-            for i, special_position in enumerate(special_positions):
+            special_positions = []
+            for i, special_position in enumerate(pre_filtered_special_positions):
                 if special_position[-1] == 0:
+                    if audio_raw_inputs is None or audio_raw_inputs[audio_idx].count_nonzero() == 0:
+                        audio_idx += 1
+                        continue
                     special_position[0] = audio_idx
                     audio_idx += 1
                 else:
+                    if image_raw_inputs is None or image_raw_inputs[image_idx].count_nonzero() == 0:
+                        image_idx += 1
+                        continue
                     special_position[0] = image_idx
                     image_idx += 1
-                special_positions[i] = tuple(special_position)
+                special_positions.append(tuple(special_position))
+
+            # print(f"Batch {b}: Special positions: {special_positions}")
 
             new_pos = 0
+            # iterate over only valid special positions
             for i, (idx, begin_pos, modal_type) in enumerate(special_positions):
                 # Add text up to begin token
                 if begin_pos > current_pos:
@@ -607,7 +637,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                 segments.append(begin_token_embed)
                 new_pos += 1
                 
-                if modal_type == 0 and audio_embeds is not None and b < audio_embeds.shape[0] and idx < audio_embeds.shape[1] and torch.count_nonzero(audio_embeds[b][idx]) > 0:
+                if modal_type == 0 and audio_embeds is not None and b < audio_embeds.shape[0] and idx < audio_embeds.shape[1]:
                     audio_segment = audio_embeds[b][idx]
 
                     segments.append(audio_segment)
@@ -620,10 +650,10 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                     new_pos += audio_segment.shape[0]
 
                     # Add end token embed
-                    end_token_embed = batch_embeds[begin_pos+1:begin_pos+2]
+                    end_token_embed = batch_embeds[begin_pos:begin_pos+1]
                     segments.append(end_token_embed)
                     new_pos += 1
-                elif modal_type == 1 and image_embeds is not None and b < image_embeds.shape[0] and idx < image_embeds.shape[1] and torch.count_nonzero(image_embeds[b][idx]) > 0:
+                elif modal_type == 1 and image_embeds is not None and b < image_embeds.shape[0] and idx < image_embeds.shape[1]:
                     image_segment = image_embeds[b][idx]
 
                     segments.append(image_segment)
@@ -636,7 +666,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                     new_pos += image_segment.shape[0]
 
                     # Add end token embed
-                    end_token_embed = batch_embeds[begin_pos+1:begin_pos+2]
+                    end_token_embed = batch_embeds[begin_pos:begin_pos+1]
                     segments.append(end_token_embed)
                     new_pos += 1
 
@@ -645,9 +675,16 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
             
             # Add any remaining text
             if current_pos < batch_embeds.shape[0]:
+                # print(f"adding remaining text: {current_pos} to {batch_embeds.shape[0]}")
                 text_segment = batch_embeds[current_pos:]
                 segments.append(text_segment)
             
+            total_length = 0
+            for s, segment in enumerate(segments):
+                total_length += segment.shape[0]
+
+            # print(f"Batch {b}: Total length of segments: {total_length}")
+
             # Concatenate all segments
             if segments:
                 batch_embeddings = torch.cat(segments, dim=0)
@@ -843,9 +880,9 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         audio_mel_spec_labels=None,
         audio_waveform_labels=None,
         image_labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
+        output_attentions=True,
+        output_hidden_states=True,
+        return_dict=False,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -927,30 +964,32 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         else:
             output_text_logits = None
 
-        # if torch.count_nonzero(audio_hidden_states) != 0:
-        #     _, output_audio, audio_reconstruction_loss, *_ = self.output_transform(
-        #         audio_hidden_states=audio_hidden_states,
-        #         audio_mel_spec_labels=audio_mel_spec_labels,
-        #         audio_waveform_labels=audio_waveform_labels,
-        #     )
-        # else:
-        output_audio = None
-        audio_reconstruction_loss = None
+        if torch.count_nonzero(audio_hidden_states) != 0:
+            _, output_audio, _, audio_reconstruction_loss, *_ = self.output_transform(
+                audio_hidden_states=audio_hidden_states,
+                audio_mel_spec_labels=audio_mel_spec_labels,
+                audio_waveform_labels=audio_waveform_labels,
+            )
+        else:
+            # output dummy audio so huggingface data parallelization doesn't have a conniption
+            output_audio = torch.zeros_like(audio_raw_inputs)
+            audio_reconstruction_loss = None
 
-        # if torch.count_nonzero(image_hidden_states) != 0:
-        #     *_, output_images, image_reconstruction_loss = self.output_transform(
-        #         image_hidden_states=image_hidden_states,
-        #         image_labels=image_labels,
-        #     )
-        # else:
-        output_images = None
-        image_reconstruction_loss = None
+        if torch.count_nonzero(image_hidden_states) != 0:
+            *_, output_images, image_reconstruction_loss = self.output_transform(
+                image_hidden_states=image_hidden_states,
+                image_labels=image_labels,
+            )
+        else:
+            # output dummy images so huggingface data parallelization doesn't have a conniption
+            output_images = torch.zeros_like(image_raw_inputs)
+            image_reconstruction_loss = None
 
         text_loss = None
         if labels is not None:
             shift_logits = output_text_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            
+
             loss_fct = nn.CrossEntropyLoss()
             text_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
@@ -971,25 +1010,25 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                 total_loss = total_loss + image_reconstruction_loss
         
         if not return_dict:
-            output = (
+            outputs = (
                 output_text_logits,
                 output_audio,
                 output_images,
-                *transformer_outputs[1:],
             )
-            return ((total_loss,) + output) if total_loss is not None else output
-        
-        return megatransformer_utils.MegaTransformerMultimodalOutput(
-            loss=total_loss,
-            logits=output_text_logits,
-            audio_raw_outputs=output_audio,
-            image_raw_outputs=output_images,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            n_steps_no_grad=transformer_outputs.n_steps_no_grad,
-            k_steps_grad=transformer_outputs.k_steps_grad,
-        )
+            outputs = ((total_loss,) + outputs) if total_loss is not None else outputs
+        else:
+            outputs = megatransformer_utils.MegaTransformerMultimodalOutput(
+                loss=total_loss,
+                logits=output_text_logits,
+                audio_raw_outputs=output_audio,
+                image_raw_outputs=output_images,
+                past_key_values=transformer_outputs.past_key_values,
+                hidden_states=transformer_outputs.hidden_states,
+                attentions=transformer_outputs.attentions,
+                n_steps_no_grad=transformer_outputs.n_steps_no_grad,
+                k_steps_grad=transformer_outputs.k_steps_grad,
+            )
+        return outputs
     
     def generate(
         self,
@@ -1577,7 +1616,7 @@ if __name__ == '__main__':
             self.patch_size = 16
             self.image_embeds_length = (self.image_size // self.patch_size) ** 2  # 196
 
-            self.hidden_size = 64
+            self.hidden_size = 8
 
             self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
             self.object_instance = create_test_tiny_multimodal_model(
@@ -1788,15 +1827,15 @@ if __name__ == '__main__':
             # batch_size, seq_len
             self.assertEqual(tuple(text_input_ids.shape), (2, self.max_position_embeddings))
 
-            audio_raw_inputs = torch.zeros((2, 0, 1, self.n_mels, self.audio_max_frames), dtype=torch.float32)
+            audio_raw_inputs = torch.zeros((2, 1, 1, self.n_mels, self.audio_max_frames), dtype=torch.float32)
 
             # batch_size, n_audios, channels, n_mels, max_audio_frames
-            self.assertEqual(tuple(audio_raw_inputs.shape), (2, 0, 1, self.n_mels, self.audio_max_frames))
+            self.assertEqual(tuple(audio_raw_inputs.shape), (2, 1, 1, self.n_mels, self.audio_max_frames))
 
-            image_raw_inputs = torch.zeros((2, 0, 3, self.image_size, self.image_size), dtype=torch.float32)
+            image_raw_inputs = torch.zeros((2, 1, 3, self.image_size, self.image_size), dtype=torch.float32)
 
             # batch_size, n_images, channels, height, width
-            self.assertEqual(tuple(image_raw_inputs.shape), (2, 0, 3, self.image_size, self.image_size))
+            self.assertEqual(tuple(image_raw_inputs.shape), (2, 1, 3, self.image_size, self.image_size))
 
             embeddings, masks, audio_positions, image_positions, _, _, _ = self.object_instance.interleave_batch_aligned_embeds(
                 text_input_ids=text_input_ids,

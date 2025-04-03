@@ -361,7 +361,7 @@ class ResidualBlock(nn.Module):
                 if m.bias is not None:
                     m.bias.data.zero_()
         if isinstance(self.shortcut, nn.Conv2d):
-            self.shortcut.weight.data.zero_()
+            nn.init.kaiming_normal_(self.shortcut.weight, a=0.2)
             self.shortcut.bias.data.zero_()
 
     def forward(self, x: torch.Tensor, time_embedding: Optional[torch.Tensor]=None) -> torch.Tensor:
@@ -745,9 +745,10 @@ class GaussianDiffusion(nn.Module):
             pred_x0 = torch.clamp(pred_x0, -1., 1.)
             
             # Calculate posterior mean using betas_t
+            denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
             posterior_mean = (
-                x * (1 - betas_t) / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape)) +
-                pred_x0 * betas_t / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape))
+                x * (1 - betas_t) / denominator +
+                pred_x0 * betas_t / denominator
             )
         else:
             # Model directly predicts x_0
@@ -755,9 +756,10 @@ class GaussianDiffusion(nn.Module):
             pred_x0 = torch.clamp(pred_x0, -1., 1.)
             
             # Calculate posterior mean using betas_t
+            denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
             posterior_mean = (
-                x * (1 - betas_t) / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape)) +
-                pred_x0 * betas_t / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape))
+                x * (1 - betas_t) / denominator +
+                pred_x0 * betas_t / denominator
             )
         
         # Calculate posterior variance using betas_t

@@ -59,7 +59,13 @@ def load_image_dataset(dataset_name: str,
 
         for caption, image_url in zip(captions, image_urls):
             image_raw_input = fetch_and_transform_image(image_url, transform)
-            if image_raw_input is not None:
+            if image_raw_input is None:
+                # add dummy example
+                image_raw_input = torch.zeros((3, image_size, image_size), dtype=torch.float32)
+                input_ids = [begin_image_token_id, end_image_token_id]
+                all_input_ids.append(torch.tensor(input_ids))
+                all_input_ids.append(torch.tensor(input_ids))
+            else:
                 tokenized = tokenizer(text=caption, add_special_tokens=True)
                 input_ids = tokenized.input_ids
 
@@ -73,8 +79,8 @@ def load_image_dataset(dataset_name: str,
                 all_input_ids.append(torch.tensor(image_transcription_input_ids))
                 all_input_ids.append(torch.tensor(image_generation_input_ids))
 
-                all_image_raw_inputs.append(image_raw_input)
-                all_image_raw_inputs.append(image_raw_input)
+            all_image_raw_inputs.append(image_raw_input)
+            all_image_raw_inputs.append(image_raw_input)
         
         # Pad sequences to the same length
         max_length = max([len(ids) for ids in all_input_ids])

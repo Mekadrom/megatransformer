@@ -156,89 +156,8 @@ class MultimodalDataset(IterableDataset):
         # Create a worker-specific infinite generator
         return self._sample_generator()
     
-    # def _sample_generator(self) -> Iterator[Any]:
-    #     """Infinite generator that yields random samples from delegate datasets"""
-    #     while True:
-    #         try:
-    #             # Randomly select a dataset based on weights
-    #             dataset_idx = random.choices(range(self.num_datasets), weights=self.weights, k=1)[0]
-                
-    #             # Get next item from the selected dataset
-    #             yield next(self.iterators[dataset_idx])
-                
-    #         except StopIteration:
-    #             # If one iterator is exhausted, reinitialize it
-    #             self.iterators[dataset_idx] = iter(self.delegate_datasets[dataset_idx])
-                
-    #             # Try again with the fresh iterator
-    #             try:
-    #                 yield next(self.iterators[dataset_idx])
-    #             except StopIteration:
-    #                 # If still empty, the dataset might truly be empty
-    #                 # Skip this dataset by reducing its weight to 0 and renormalizing
-    #                 if sum(self.weights) - self.weights[dataset_idx] > 0:
-    #                     self.weights[dataset_idx] = 0
-    #                     total = sum(self.weights)
-    #                     if total > 0:
-    #                         self.weights = [w / total for w in self.weights]
-                    
-    #                 # If all datasets are exhausted, break the infinite loop
-    #                 if sum(self.weights) == 0:
-    #                     break
-
-    # def _sample_generator(self) -> Iterator[Any]:
-    #     """Generator that yields random samples from delegate datasets with synchronized sampling across GPUs"""
-    #     # Get distributed info
-    #     is_distributed = torch.distributed.is_initialized()
-    #     rank = torch.distributed.get_rank() if is_distributed else 0
-        
-    #     while True:
-    #         try:
-    #             # Generate the same random seed across all processes
-    #             if is_distributed:
-    #                 # Create a tensor on rank 0 and broadcast to all processes
-    #                 if rank == 0:
-    #                     random_seed = torch.tensor([random.randint(0, 2**31-1)], dtype=torch.long, device="cuda")
-    #                 else:
-    #                     random_seed = torch.tensor([0], dtype=torch.long, device="cuda")
-    #                 print(f"rank {rank} random seed: {random_seed.item()}")
-    #                 torch.distributed.broadcast(random_seed, src=0)
-                    
-    #                 # Use the same seed to make the choice
-    #                 local_rng = random.Random(random_seed.item())
-    #                 dataset_idx = local_rng.choices(range(self.num_datasets), weights=self.weights, k=1)[0]
-    #             else:
-    #                 # Single GPU case - normal random selection
-    #                 dataset_idx = random.choices(range(self.num_datasets), weights=self.weights, k=1)[0]
-                
-    #             # Get next item from the selected dataset
-    #             print(f"yielding from dataset {dataset_idx}\n")
-    #             yield next(self.iterators[dataset_idx])
-                
-    #         except StopIteration:
-    #             # If one iterator is exhausted, reinitialize it
-    #             self.iterators[dataset_idx] = iter(self.delegate_datasets[dataset_idx])
-                
-    #             # Try again with the fresh iterator
-    #             try:
-    #                 yield next(self.iterators[dataset_idx])
-    #             except StopIteration:
-    #                 # If still empty, the dataset might truly be empty
-    #                 # Skip this dataset by reducing its weight to 0 and renormalizing
-    #                 if sum(self.weights) - self.weights[dataset_idx] > 0:
-    #                     self.weights[dataset_idx] = 0
-    #                     total = sum(self.weights)
-    #                     if total > 0:
-    #                         self.weights = [w / total for w in self.weights]
-                    
-    #                 # If all datasets are exhausted, break the infinite loop
-    #                 if sum(self.weights) == 0:
-    #                     break
-
     def _sample_generator(self) -> Iterator[Any]:
         """Generator with deterministic sampling using epoch and iteration for seed"""
-        is_distributed = torch.distributed.is_initialized()
-        
         # Track iterations for deterministic sampling
         iteration = 0
         
@@ -251,9 +170,9 @@ class MultimodalDataset(IterableDataset):
                 
                 # All processes will choose the same dataset
                 dataset_idx = random.Random(seed).choices(range(self.num_datasets), weights=self.weights, k=1)[0]
-                
+                # if torch.distributed.is_initialized():
+                #     print(f"Rank {torch.distributed.get_rank()} - epoch {self.epoch} - iter {iteration} - dataset {dataset_idx} - seed {seed}")
                 yield next(self.iterators[dataset_idx])
-                
             except StopIteration:
                 # Handle iterator exhaustion
                 self.iterators[dataset_idx] = iter(self.delegate_datasets[dataset_idx])
@@ -286,6 +205,15 @@ class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling)
         all_image_raw_inputs = []
 
         for example in examples:
+            if not "audio_raw_inputs" in example and not "image_raw_inputs" in example:
+                # text only example, returns a list of batch examples; convert to tensors
+                input_ids = example["input_ids"]
+
+                if not isinstance(input_ids, torch.Tensor):
+                    input_ids = torch.tensor(input_ids)
+            else:
+                input_ids = example["input_ids"]
+
             if "audio_raw_inputs" not in example:
                 # mels, 1 length
                 example["audio_raw_inputs"] = torch.zeros((128, 1))
@@ -294,7 +222,7 @@ class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling)
             if "image_raw_inputs" not in example:
                 example["image_raw_inputs"] = torch.zeros((3, self.image_size, self.image_size))
 
-            all_input_ids.append(example["input_ids"])
+            all_input_ids.append(input_ids)
             all_audio_raw_inputs.append(example["audio_raw_inputs"])
             audio_waveform_labels.append(example["audio_waveform_labels"])
             all_image_raw_inputs.append(example["image_raw_inputs"])
@@ -304,7 +232,7 @@ class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling)
         all_input_ids = torch.stack(all_input_ids)
 
         all_labels = all_input_ids.clone()
-        all_labels[all_input_ids == self.tokenizer.pad_token_id] = -100
+        all_labels[all_labels == self.tokenizer.pad_token_id] = -100
 
         all_audio_raw_inputs = [torch.nn.functional.pad(audio, (0, self.audio_max_frames - audio.shape[-1]), value=0).unsqueeze(0) for audio in all_audio_raw_inputs]
         all_audio_raw_inputs = torch.stack(all_audio_raw_inputs).unsqueeze(1)

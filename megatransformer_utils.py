@@ -8,6 +8,7 @@ from model import megatransformer_modules
 
 import argparse
 import glob
+import inspect
 import math
 import numpy as np
 import os
@@ -217,7 +218,7 @@ class MegaTransformerConfig(PretrainedConfig):
         audio_decoder_cross_attn_use_flash_attention=True,
 
         audio_vocoder_hidden_channels=2048,
-        audio_vocoder_upsample_factors=[8, 8, 4],
+        audio_vocoder_upsample_factors=[8, 8, 8],
         audio_vocoder_n_residual_layers=4,
 
         image_coda_config=None,
@@ -744,7 +745,7 @@ def create_multimodal_optimizer(model, weight_decay):
         {'params': model.output_transform.text_decoder.parameters(), 'lr': 2e-4},
         {'params': model.output_transform.audio_coda.parameters(), 'lr': 1e-4},
         {'params': audio_decoder_only_params, 'lr': 5e-5},
-        {'params': model.output_transform.audio_decoder.vocoder.parameters(), 'lr': 3e-4},
+        {'params': model.output_transform.audio_decoder.vocoder.parameters(), 'lr': 3e-5},
         {'params': model.output_transform.image_coda.parameters(), 'lr': 1e-4},
         {'params': model.output_transform.image_decoder.parameters(), 'lr': 5e-5},
     ], weight_decay=weight_decay)
@@ -790,3 +791,12 @@ def transformer_weight_init(hidden_size):
         if isinstance(module, nn.Linear):
             nn.init.xavier_normal_(module.weight, gain=0.02)
     return init_weights
+
+def print_debug_tensor(pre: str, tensor: torch.Tensor):
+    if tensor is None:
+        print(f"{pre}: None")
+    elif tensor.dtype in [torch.float16, torch.float32, torch.float64, torch.bfloat16]:
+        print(f"{pre}:\n\tdtype: {tensor.dtype}\n\tshape: {tensor.shape}\n\tmean: {tensor.mean()}\n\tstd: {tensor.std()}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tnorm: {tensor.norm()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
+    else:
+        # non-float tensors
+        print(f"{pre}:\n\tdtype: {tensor.dtype}\n\tshape: {tensor.shape}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")

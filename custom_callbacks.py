@@ -12,6 +12,7 @@ from model import megatransformer_multimodal
 import librosa
 import math
 import matplotlib.pyplot as plt
+import megatransformer_utils
 import numpy as np
 import os
 import torch
@@ -180,7 +181,7 @@ class MultimodalGenerationCallback(TrainerCallback):
                     except Exception as e:
                         writer.add_text(
                             f"generated_audio/waveform_mel_spec/error",
-                            str(e),
+                            f"ERROR: probably NaN in waveforms {e}",
                             state.global_step,
                         )
 
@@ -194,7 +195,7 @@ class MultimodalGenerationCallback(TrainerCallback):
                     except Exception as e:
                         writer.add_text(
                             f"generated_audio/mel_spec/error",
-                            str(e),
+                            f"ERROR: probably librosa error {e}",
                             state.global_step,
                         )
 
@@ -222,6 +223,26 @@ class MultimodalGenerationCallback(TrainerCallback):
                     )
                     for i, text in enumerate(audio_transcription_texts):
                         writer.add_text(f"audio_transcription/sample_{i}", text, state.global_step)
+
+                    # test just vocoder by inputing ground truth mel specs and taking output as waveform reconstruction
+                    # no idea what the conditioning should be for this
+                    audio_waveforms = model.output_transform.audio_decoder.vocoder(test_audio.squeeze(1).view(-1, test_audio.shape[-2], test_audio.shape[-1]))
+                    audio_waveforms = torch.clamp(audio_waveforms, -1.0, 1.0)[0].to(torch.float64).cpu()
+
+                    audio_waveforms_filepath = os.path.join(self.trainer.args.output_dir, f"generated_audio_vocoder_step_{state.global_step}.wav")
+                    self.save_audio_to_file(
+                        audio_waveforms,
+                        audio_waveforms_filepath,
+                        sample_rate=model.config.audio_sample_rate,
+                        normalize=True,
+                    )
+
+                    writer.add_audio(
+                        f"generated_audio_vocoder/sample",
+                        audio_waveforms,
+                        state.global_step,
+                        sample_rate=model.config.audio_sample_rate,
+                    )
 
                     begin_image_token = torch.tensor(model.config.begin_image_token_id).unsqueeze(0).unsqueeze(0).to(model.device)
 

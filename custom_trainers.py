@@ -6,6 +6,7 @@ from typing import Optional, Literal
 
 import megatransformer_utils
 import torch
+import types
 
 
 class GrokFastMATrainer(Trainer):
@@ -113,10 +114,12 @@ class DebugTrainer(Trainer):
 class DefaultTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self.get_tensorboard_writer()
-        inputs["output_hidden_states"] = True
+        # inputs["output_hidden_states"] = True
+        # inputs["return_dict"] = False
 
         self.train_dataset.epoch = self.state.epoch
-        self.eval_dataset.epoch = self.state.epoch
+        if hasattr(self, "eval_dataset") and self.eval_dataset is not None:
+            self.eval_dataset.epoch = self.state.epoch
 
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
 

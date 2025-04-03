@@ -113,7 +113,7 @@ class AudioVocoder(nn.Module):
         hidden_channels,
         in_channels: int,  # Number of mel bands
         conditioning_channels: int,
-        upsample_factors: list[int] = [8, 8, 4],  # Total upsampling of 256 (matching hop_length)
+        upsample_factors: list[int] = [8, 8, 8],  # Total upsampling of 256 (matching hop_length)
         n_residual_layers: int = 4, 
         dilation_cycle: int = 4,
         kernel_size: int = 3,
@@ -217,6 +217,15 @@ class AudioVocoder(nn.Module):
         Returns:
             [B, 1, T_audio] Audio waveform
         """
+        if torch.isnan(mel_spec).any():
+            print("NaN detected in mel_spec input to vocoder")
+        if torch.isinf(mel_spec).any():
+            print("Inf detected in mel_spec input to vocoder")
+
+        # remove channel dimension
+        if mel_spec.dim() == 4:
+            mel_spec = mel_spec.squeeze(1)  # [B, n_mels, T_mel]
+
         # Initial processing
         x = self.initial_conv(mel_spec)
         
@@ -327,7 +336,7 @@ class MultiResolutionSTFTLoss(nn.Module):
             )
             
             # Spectral convergence loss
-            sc_loss += torch.norm(target_mag - pred_mag, p="fro") / torch.norm(target_mag, p="fro")
+            sc_loss += torch.norm(target_mag - pred_mag, p="fro") / (torch.norm(target_mag, p="fro") + 1e-7)
             
             # Log magnitude loss
             log_pred_mag = torch.log(pred_mag.clamp(min=1e-7))
@@ -441,9 +450,10 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             pred_x0 = torch.clamp(pred_x0, -1., 1.)
             
             # Calculate posterior mean using betas_t
+            denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
             posterior_mean = (
-                x * (1 - betas_t) / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape)) +
-                pred_x0 * betas_t / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape))
+                x * (1 - betas_t) / denominator +
+                pred_x0 * betas_t / denominator
             )
         else:
             # Model directly predicts x_0
@@ -451,9 +461,10 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             pred_x0 = torch.clamp(pred_x0, -1., 1.)
             
             # Calculate posterior mean using betas_t
+            denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
             posterior_mean = (
-                x * (1 - betas_t) / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape)) +
-                pred_x0 * betas_t / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape))
+                x * (1 - betas_t) / denominator +
+                pred_x0 * betas_t / denominator
             )
         
         # Calculate posterior variance using betas_t
@@ -495,27 +506,30 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         model_output = self.unet(x_t, t.to(x_0.dtype), condition=condition)
 
         loss_dict = {}
-
         if self.predict_epsilon:
             # Loss to the added noise
             loss_dict["noise_mse"] = F.mse_loss(model_output, noise)
 
             pred_x0 = self.predict_start_from_noise(x_t, t, model_output)
+            # megatransformer_utils.print_debug_tensor('initial pred_x0', pred_x0)
             pred_x0 = torch.clamp(pred_x0, -1., 1.)
+            model_output = pred_x0
 
             loss_dict["mel_l1"] = F.l1_loss(pred_x0, x_0)
 
             B, E, M, T = pred_x0.shape
 
-            # print(f"before reshape pred_x0: {pred_x0.shape} condition: {condition.shape}")
-
-            # combine batch an element dimensions again
+            # combine batch and element dimensions again
             pred_x0 = pred_x0.view(B*E, M, T)
             condition = condition.unsqueeze(1).expand(-1, E, -1, -1)  # [B, E, T, M]
             condition = condition.reshape(B*E, condition.shape[2], condition.shape[3])
             condition = condition.permute(0, 2, 1)  # [B*E, M, T]
 
-            pred_waveform = self.vocoder(pred_x0, condition=condition)
+            # megatransformer_utils.print_debug_tensor('condition', condition)
+            # megatransformer_utils.print_debug_tensor('final pred_x0', pred_x0)
+
+            # use mel spec label as input to vocoder instead of potentially unstable output from diffusion model
+            pred_waveform = self.vocoder(x_0, condition=condition)
 
             pred_waveform = F.pad(pred_waveform, (0, audio_waveform_labels.shape[-1] - pred_waveform.shape[-1]), value=0)
 
@@ -523,6 +537,8 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
 
             # extract example dimension
             pred_waveform = pred_waveform.view(B, E, pred_waveform.shape[-1])
+
+            # megatransformer_utils.print_debug_tensor('pred_waveform', pred_waveform)
 
             # Multi-resolution STFT loss
             sc_loss, mag_loss = self.stft_loss(pred_waveform, audio_waveform_labels)
@@ -534,11 +550,11 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             loss_dict["direct"] = F.mse_loss(model_output, x_0)
 
         total_loss = (
-            1.0 * loss_dict["noise_mse"] + 
+            1.0 * loss_dict.get("noise_mse", 0.0) + 
             1.0 * loss_dict.get("direct", 0.0) +
-            10.0 * loss_dict.get("mel_l1", 0.0) +
+            3.0 * loss_dict.get("mel_l1", 0.0) +
             1.0 * loss_dict.get("waveform_l1", 0.0) +
-            2.0 * (loss_dict.get("sc_loss", 0.0) + loss_dict.get("mag_loss", 0.0))
+            1.5 * (loss_dict.get("sc_loss", 0.0) + loss_dict.get("mag_loss", 0.0))
         )
 
         return model_output, total_loss, pred_waveform

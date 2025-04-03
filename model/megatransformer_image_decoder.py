@@ -2,6 +2,7 @@ from typing import Union
 
 from model import megatransformer_diffusion
 
+import megatransformer_utils
 import torch
 import torch.nn.functional as F
 
@@ -30,9 +31,10 @@ class ImageConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             pred_x0 = torch.clamp(pred_x0, -1., 1.)
             
             # Calculate posterior mean using betas_t
+            denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
             posterior_mean = (
-                x * (1 - betas_t) / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape)) +
-                pred_x0 * betas_t / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape))
+                x * (1 - betas_t) / denominator +
+                pred_x0 * betas_t / denominator
             )
         else:
             # Model directly predicts x_0
@@ -41,8 +43,8 @@ class ImageConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             
             # Calculate posterior mean using betas_t
             posterior_mean = (
-                x * (1 - betas_t) / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape)) +
-                pred_x0 * betas_t / torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape))
+                x * (1 - betas_t) / denominator +
+                pred_x0 * betas_t / denominator
             )
         
         # Calculate posterior variance using betas_t
@@ -88,10 +90,26 @@ class ImageConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         # Model forward pass with condition
         model_output = self.unet(x_t, t.to(x_0.dtype), condition=condition)
         
+        loss_dict = {}
         if self.predict_epsilon:
             # Loss to the added noise
-            loss = F.mse_loss(model_output, noise)
+            loss_dict["noise_mse"] = F.mse_loss(model_output, noise)
+
+            pred_x0 = self.predict_start_from_noise(x_t, t, model_output)
+            # megatransformer_utils.print_debug_tensor('initial pred_x0', pred_x0)
+            pred_x0 = torch.clamp(pred_x0, -1., 1.)
+            model_output = pred_x0
+            
+            # Loss to the original image
+            loss_dict["pred_x0_mse"] = F.mse_loss(model_output, x_0)
         else:
             # Loss to the original image
-            loss = F.mse_loss(model_output, x_0)
-        return model_output, loss
+            loss_dict["direct"] = F.mse_loss(model_output, x_0)
+
+        total_loss = (
+            1.0 * loss_dict.get("noise_mse", 0.0) +
+            1.0 * loss_dict.get("pred_x0_mse", 0.0) +
+            1.0 * loss_dict.get("direct", 0.0)
+        )
+
+        return model_output, total_loss

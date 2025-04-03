@@ -228,6 +228,7 @@ class MegaTransformerRecurrentBlock(nn.Module):
         n_steps_no_grad, k_steps_grad = self.n_k_steps(self.mean_thinking_steps, self.backprop_depth)
 
         all_hidden_states = [] if output_hidden_states else None
+        all_attentions = [] if output_attentions else None
 
         x = self.initialize_thinking_state(hidden_states)
         last_thought_state = x
@@ -253,11 +254,15 @@ class MegaTransformerRecurrentBlock(nn.Module):
                     last_thought_state = outputs[1]
                     if output_hidden_states:
                         all_hidden_states.extend(outputs[2])
+                    if output_attentions:
+                        all_attentions.extend(outputs[3])
                 else:
                     x = outputs.hidden_states
                     last_thought_state = outputs.last_thought_state
                     if output_hidden_states:
                         all_hidden_states.extend(outputs.all_hidden_states)
+                    if output_attentions:
+                        all_attentions.extend(outputs.attention_probs)
 
         if k_steps_grad > 0:
             outputs, _ = self.apply_thinking_layers(
@@ -279,11 +284,15 @@ class MegaTransformerRecurrentBlock(nn.Module):
                 last_thought_state = outputs[1]
                 if output_hidden_states:
                     all_hidden_states.extend(outputs[2])
+                if output_attentions:
+                    all_attentions.extend(outputs[3])
             else:
                 x = outputs.hidden_states
                 last_thought_state = outputs.last_thought_state
                 if output_hidden_states:
                     all_hidden_states.extend(outputs.all_hidden_states)
+                if output_attentions:
+                    all_attentions.extend(outputs.attention_probs)
 
         if not return_dict:
             return (
@@ -291,7 +300,7 @@ class MegaTransformerRecurrentBlock(nn.Module):
                 last_thought_state,
                 past_key_values,
                 all_hidden_states,
-                outputs.attention_probs,
+                all_attentions,
                 n_steps_no_grad,
                 k_steps_grad,
             )
@@ -299,9 +308,9 @@ class MegaTransformerRecurrentBlock(nn.Module):
         return RecurrentBlockOutput(
             hidden_states=x,
             last_thought_state=outputs.last_thought_state,
-            past_key_values=outputs.past_key_values,
+            past_key_values=past_key_values,
             all_hidden_states=all_hidden_states,
-            attention_probs=outputs.attention_probs,
+            attention_probs=all_attentions,
             n_steps_no_grad=min(n_steps_no_grad, actual_n_steps),
             k_steps_grad=k_steps_grad,
         )
