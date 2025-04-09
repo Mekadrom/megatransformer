@@ -1,5 +1,7 @@
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
 from positional_encodings.torch_encodings import PositionalEncoding2D
+from torch.nn import DataParallel
+from torch.nn.parallel import DistributedDataParallel
 from transformers import PretrainedConfig
 from transformers import set_seed as hf_set_seed
 from typing import Optional
@@ -181,7 +183,7 @@ class MegaTransformerConfig(PretrainedConfig):
         audio_max_duration=10.0, # used for trimming data/skipping examples that are too long
         audio_sample_rate=16000,
 
-        image_size=224,
+        image_size=128,
 
         audio_encoder_base_channels=32,
         audio_encoder_kernel_sizes=[3, 3, 3, 3, 3, 3],
@@ -400,6 +402,9 @@ class MegaTransformerConfig(PretrainedConfig):
         self.image_decoder_cross_attn_d_values = image_decoder_cross_attn_d_values
         self.image_decoder_cross_attn_use_flash_attention = image_decoder_cross_attn_use_flash_attention
 
+        self.current_epoch = 0
+        self.current_global_step = 0
+
 class MegaTransformerCausalOutput(dict):
     def __init__(self,
         loss: Optional[torch.Tensor]=None,
@@ -460,13 +465,22 @@ class MegaTransformerMultimodalOutput(dict):
             loss=loss,
             logits=logits,
             image_raw_outputs=image_raw_outputs,
-            audio_logits=audio_raw_outputs,
+            audio_raw_outputs=audio_raw_outputs,
             past_key_values=past_key_values,
             hidden_states=hidden_states,
             attentions=attentions,
             n_steps_no_grad=n_steps_no_grad,
             k_steps_grad=k_steps_grad,
         )
+
+class MultimodalGenerationOutput:
+    """Output class for multimodal generation results."""
+    def __init__(self, sequences=None, audio_outputs=None, audio_mel_specs=None, image_outputs=None, intermediate_image_outputs=None):
+        self.sequences = sequences
+        self.audio_outputs = audio_outputs
+        self.audio_mel_specs = audio_mel_specs
+        self.image_outputs = image_outputs
+        self.intermediate_image_outputs = intermediate_image_outputs
 
 def create_alibi_bias(n_heads, maxlen):
     slopes = torch.pow(2, -torch.arange(1, n_heads + 1) * 8 / n_heads)
@@ -809,3 +823,12 @@ def print_debug_tensor(pre: str, tensor: torch.Tensor):
     else:
         # non-float tensors
         print(f"{pre}:\n\tdtype: {tensor.dtype}\n\tshape: {tensor.shape}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
+
+def sanitize_model(model):
+    if isinstance(model, DistributedDataParallel):
+        return sanitize_model(model.module)
+    if hasattr(model, '_orig_mod'):
+        return sanitize_model(model._orig_mod)
+    if isinstance(model, DataParallel):
+        return sanitize_model(model.module)
+    return model

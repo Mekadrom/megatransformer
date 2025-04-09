@@ -7,16 +7,16 @@ from transformers.integrations import TensorBoardCallback
 from typing import Any, Optional
 
 from dataset_loading import audio_loading
-from model import megatransformer_multimodal
+from model import megatransformer_multimodal, megatransformer_image_decoder
 
 import librosa
 import math
 import matplotlib.pyplot as plt
-import megatransformer_utils
 import numpy as np
 import os
 import torch
 import torchaudio
+import torchvision
 
 
 def get_writer(trainer: Trainer):
@@ -446,6 +446,93 @@ class MultimodalGenerationCallback(TrainerCallback):
         data = np.expand_dims(data, axis=0)
         
         return data
+
+class ImageGenerationCallback(TrainerCallback):
+    def __init__(self,
+                 tokenizer: PreTrainedTokenizer,
+                 generation_steps=2000):
+        self.trainer: Optional[Trainer] = None
+        self.tokenizer = tokenizer
+        self.generation_steps = generation_steps
+
+        self.test_image: Any = Image.open("test_vlm.png").convert("RGB")
+        self.test_image = transforms.ToTensor()(self.test_image)
+        self.test_image_prompt_text = [
+            "A man ironing a shirt while strapped to the back of a taxi on a busy street.",
+            "A man strapped to the back of a taxi ironing a shirt on a busy street.",
+            "A man on the back of a taxi ironing a shirt. The taxi is driving on a busy street.",
+            "A taxi driving through a busy street with a man strapped to the back of it. He is ironing a shirt.",
+        ]
+        self.test_image_prompt = tokenizer(self.test_image_prompt_text, return_tensors="pt", padding=True)
+
+    def on_step_end(self, args, state, control, model: megatransformer_image_decoder.ImageDiffusionSingleTaskModel=None, **kwargs):
+        if ((state.global_step == 1) or (state.global_step % self.generation_steps == 0)) and state.is_world_process_zero:
+            writer = get_writer(self.trainer)
+            if writer is None:
+                print("No TensorBoard writer found, skipping generation...")
+                return
+
+            print(f"Generating at step {state.global_step}...")
+
+            if torch.distributed.is_initialized():
+                device = torch.device(f"cuda:{torch.distributed.get_rank()}")
+            elif torch.cuda.is_available():
+                device = torch.device("cuda")
+            else:
+                device = torch.device("cpu")
+            
+            with torch.no_grad():
+                with autocast(device.type, dtype=torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32):
+                    self.log_generate(model, state, writer, None, device, "linear")
+                    self.log_generate(model, state, writer, 50, device, "ddim")
+
+    def log_generate(self, model: megatransformer_image_decoder.ImageDiffusionSingleTaskModel, state, writer, ddim_steps, device, sample_type):
+        diffusion_generator = torch.Generator(device=device)
+        diffusion_generator.manual_seed(42)  # same seed for all samples throughout training
+
+        # Generate image
+        image_generation_outputs = model.generate(
+            input_ids=self.test_image_prompt["input_ids"].to(device),
+            attention_mask=self.test_image_prompt["attention_mask"].to(device),
+            num_samples=4,
+            override_ddim_sampling_steps=ddim_steps,
+            use_cache=False,
+            return_dict_in_generate=True,
+            diffusion_generator=diffusion_generator,
+        )
+
+        # images are in shape (batch_size, channels, height, width)
+        image_output = image_generation_outputs.image_outputs[0].cpu()
+        image_intermediate_outputs = image_generation_outputs.intermediate_image_outputs
+
+        image_output = torchvision.utils.make_grid(image_output, nrow=2, padding=1)
+
+        # Save image
+        image_filepath = os.path.join(self.trainer.args.output_dir, f"generated_image_step_{state.global_step}_{sample_type}.png")
+        image = transforms.ToPILImage()(image_output.squeeze(0))
+        image = image.convert("RGB")
+        image.save(image_filepath)
+
+
+        writer.add_image(
+            f"generated_image/sample_{sample_type}",
+            image_output.squeeze(0),
+            state.global_step,
+        )
+        for i, timestep_image in zip(reversed(range(len(image_intermediate_outputs))), image_intermediate_outputs):
+            timestep_image = timestep_image.cpu()
+            timestep_image = torchvision.utils.make_grid(timestep_image, nrow=2, padding=1)
+            writer.add_image(
+                f"generated_image/timestep_{i}_{sample_type}",
+                timestep_image.squeeze(0),
+                state.global_step,
+            )
+        for i, text in enumerate(self.test_image_prompt_text):
+            writer.add_text(
+                f"generated_image/prompt_{i}_{sample_type}",
+                text,
+                state.global_step,
+            )
 
 class MetricsCallback(TrainerCallback):
     def __init__(self):

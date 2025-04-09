@@ -54,6 +54,7 @@ class LimitedStreamDataset(IterableDataset):
 class MultimodalDataset(IterableDataset):
     def __init__(
         self,
+        config,  # megatransformer_utils.MegaTransformerConfig,
         approximated_length: int,
         tokenizer: PreTrainedTokenizer,
         sample_rate: int,
@@ -73,6 +74,7 @@ class MultimodalDataset(IterableDataset):
         seed: int = 42,
         max_position_embeddings: int = 1024,
     ):
+        self.config = config
         self.approximated_length = approximated_length
         self.tokenizer = tokenizer
         self.cache_dir = cache_dir
@@ -82,7 +84,7 @@ class MultimodalDataset(IterableDataset):
         self.split = split
         self.max_position_embeddings = max_position_embeddings
 
-        self.epoch = 0
+        self.seed_epoch = 0
 
         self.rng = random.Random(seed)
 
@@ -165,7 +167,7 @@ class MultimodalDataset(IterableDataset):
             try:
                 # Use a deterministic seed based on iteration number
                 # This ensures all processes make the same random choice
-                seed = hash(f"epoch_{self.epoch}_iter_{iteration}")
+                seed = hash(f"epoch_{self.config.current_epoch}_iter_{self.config.current_global_step}") % (2**32)
                 iteration += 1
                 
                 # All processes will choose the same dataset
@@ -190,7 +192,15 @@ class MultimodalDataset(IterableDataset):
 class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling):
     """DataCollatorForLanguageModeling but additional dataset dict keys are allowed through."""
 
-    def __init__(self, tokenizer: PreTrainedTokenizer, max_position_embeddings, image_size, audio_max_frames, audio_max_waveform_length, *args, **kwargs):
+    def __init__(self,
+                 tokenizer: PreTrainedTokenizer,
+                 max_position_embeddings=512,
+                 image_size=None,
+                 audio_max_frames=None,
+                 audio_max_waveform_length=None,
+                 modes=["text", "audio", "image"],
+                 *args,
+                 **kwargs):
         super().__init__(tokenizer=tokenizer, *args, **kwargs)
 
         self.max_position_embeddings = max_position_embeddings
@@ -198,11 +208,16 @@ class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling)
         self.audio_max_frames = audio_max_frames
         self.audio_max_waveform_length = audio_max_waveform_length
 
+        self.modes = modes
+
     def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
         all_input_ids = []
+
         all_audio_raw_inputs = []
         audio_waveform_labels = []
+
         all_image_raw_inputs = []
+        all_image_labels = []
 
         for example in examples:
             if not "audio_raw_inputs" in example and not "image_raw_inputs" in example:
@@ -214,48 +229,64 @@ class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling)
             else:
                 input_ids = example["input_ids"]
 
-            if "audio_raw_inputs" not in example:
-                # mels, 1 length
-                example["audio_raw_inputs"] = torch.zeros((128, 1))
-                # waveform, 1 channel and 1 sample
-                example["audio_waveform_labels"] = torch.zeros((1))
-            if "image_raw_inputs" not in example:
-                example["image_raw_inputs"] = torch.zeros((3, self.image_size, self.image_size))
+            if "audio" in self.modes:
+                if "audio_raw_inputs" not in example:
+                    # mels, 1 length
+                    example["audio_raw_inputs"] = torch.zeros((128, 1))
+                    # waveform, 1 channel and 1 sample
+                    example["audio_waveform_labels"] = torch.zeros((1))
+            if "image" in self.modes:
+                if "image_raw_inputs" not in example:
+                    example["image_raw_inputs"] = torch.zeros((3, self.image_size, self.image_size))
 
             all_input_ids.append(input_ids)
-            all_audio_raw_inputs.append(example["audio_raw_inputs"])
-            audio_waveform_labels.append(example["audio_waveform_labels"])
-            all_image_raw_inputs.append(example["image_raw_inputs"])
+
+            if "audio_raw_inputs" in example:
+                all_audio_raw_inputs.append(example["audio_raw_inputs"])
+                audio_waveform_labels.append(example["audio_waveform_labels"])
+
+            if "image_raw_inputs" in example:
+                all_image_raw_inputs.append(example["image_raw_inputs"])
+                all_image_labels.append(example["image_raw_inputs"])
 
         # Pad sequences to the same length
         all_input_ids = [torch.nn.functional.pad(ids, (0, self.max_position_embeddings - len(ids)), value=self.tokenizer.pad_token_id) for ids in all_input_ids]
         all_input_ids = torch.stack(all_input_ids)
-
-        all_labels = all_input_ids.clone()
-        all_labels[all_labels == self.tokenizer.pad_token_id] = -100
-
-        all_audio_raw_inputs = [torch.nn.functional.pad(audio, (0, self.audio_max_frames - audio.shape[-1]), value=0).unsqueeze(0) for audio in all_audio_raw_inputs]
-        all_audio_raw_inputs = torch.stack(all_audio_raw_inputs).unsqueeze(1)
-
-        audio_mel_spec_labels = all_audio_raw_inputs.clone()
-        audio_waveform_labels = [torch.nn.functional.pad(audio, (0, self.audio_max_waveform_length - audio.shape[-1]), value=0).unsqueeze(0) for audio in audio_waveform_labels]
-
-        audio_waveform_labels = torch.stack(audio_waveform_labels)
-
-        all_image_raw_inputs = torch.stack(all_image_raw_inputs, dim=0).unsqueeze(1)
-        all_image_labels = all_image_raw_inputs.clone()
 
         # bullshit function expects every example to consist of only tensors of the same shapes per key
         # batch = super().torch_call(examples)
 
         batch = {
             "input_ids": all_input_ids,
-            "labels": all_labels,
-            "audio_raw_inputs": all_audio_raw_inputs,
-            "audio_mel_spec_labels": audio_mel_spec_labels,
-            "audio_waveform_labels": audio_waveform_labels,
-            "image_raw_inputs": all_image_raw_inputs,
-            "image_labels": all_image_labels,
         }
+
+        if "text" in self.modes:
+            all_labels = all_input_ids.clone()
+            all_labels[all_labels == self.tokenizer.pad_token_id] = -100
+            batch.update({
+                "labels": all_labels,
+            })
+
+        if "audio" in self.modes:
+            all_audio_raw_inputs = [torch.nn.functional.pad(audio, (0, self.audio_max_frames - audio.shape[-1]), value=0).unsqueeze(0) for audio in all_audio_raw_inputs]
+            all_audio_raw_inputs = torch.stack(all_audio_raw_inputs).unsqueeze(1)
+
+            audio_mel_spec_labels = all_audio_raw_inputs.clone()
+            audio_waveform_labels = [torch.nn.functional.pad(audio, (0, self.audio_max_waveform_length - audio.shape[-1]), value=0).unsqueeze(0) for audio in audio_waveform_labels]
+
+            audio_waveform_labels = torch.stack(audio_waveform_labels)
+            batch.update({
+                "audio_raw_inputs": all_audio_raw_inputs,
+                "audio_mel_spec_labels": audio_mel_spec_labels,
+                "audio_waveform_labels": audio_waveform_labels,
+            })
+
+        if "image" in self.modes:
+            all_image_raw_inputs = torch.stack(all_image_raw_inputs, dim=0).unsqueeze(1)
+            all_image_labels = torch.stack(all_image_labels, dim=0).unsqueeze(1)
+            batch.update({
+                "image_raw_inputs": all_image_raw_inputs,
+                "image_labels": all_image_labels,
+            })
 
         return batch

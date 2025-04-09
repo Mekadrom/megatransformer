@@ -8,15 +8,6 @@ import torch
 import torch.nn.functional as F
 
 
-class MultimodalGenerationOutput:
-    """Output class for multimodal generation results."""
-    def __init__(self, sequences, audio_outputs=None, audio_mel_specs=None, image_outputs=None, intermediate_image_outputs=None):
-        self.sequences = sequences
-        self.audio_outputs = audio_outputs
-        self.audio_mel_specs = audio_mel_specs
-        self.image_outputs = image_outputs
-        self.intermediate_image_outputs = intermediate_image_outputs
-
 class MegaTransformerMultimodalEncoder(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
         super().__init__()
@@ -154,8 +145,8 @@ class MegaTransformerMultimodalDecoder(nn.Module):
             activation=config.audio_decoder_activation,
             scale_factor=(2, 1),
             stride=(2, 1),
-            self_attn_class=megatransformer_diffusion.AudioDiffusionSelfAttentionBlock,
-            cross_attn_class=megatransformer_diffusion.AudioDiffusionCrossAttentionBlock,
+            self_attn_class=megatransformer_audio_decoder.AudioDiffusionSelfAttentionBlock,
+            cross_attn_class=megatransformer_audio_decoder.AudioDiffusionCrossAttentionBlock,
             in_channels=1,
             model_channels=config.audio_decoder_model_channels,
             out_channels=1,
@@ -181,13 +172,14 @@ class MegaTransformerMultimodalDecoder(nn.Module):
         self.image_coda = megatransformer_modules.SimpleBlock(
             config.image_coda_config, "image_coda", config.image_coda_config.n_coda_layers, config.image_decoder_dropout
         )
-        self.image_decoder = megatransformer_image_decoder.ImageConditionalGaussianDiffusion(
+        self.image_decoder = megatransformer_diffusion.GaussianDiffusion(
+            config=config,
             hidden_size=config.hidden_size,
             activation=config.image_decoder_activation,
             scale_factor=(2, 2),
             stride=(2, 2),
-            self_attn_class=megatransformer_diffusion.ImageDiffusionSelfAttentionBlock,
-            cross_attn_class=megatransformer_diffusion.ImageDiffusionCrossAttentionBlock,
+            self_attn_class=megatransformer_image_decoder.ImageDiffusionSelfAttentionBlock,
+            cross_attn_class=megatransformer_image_decoder.ImageDiffusionCrossAttentionBlock,
             in_channels=3,
             model_channels=config.image_decoder_model_channels,
             out_channels=3,
@@ -814,6 +806,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                 output_text_logits,
                 output_audio,
                 output_images,
+                *transformer_outputs[1:]
             )
             outputs = ((total_loss,) + outputs) if total_loss is not None else outputs
         else:
@@ -841,6 +834,8 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         do_sample=None,
         early_stopping=None,
         num_beams=None,
+        audio_override_ddim_sampling_steps=None,
+        image_override_ddim_sampling_steps=None,
         temperature=None,
         top_k=None,
         top_p=None,
@@ -980,6 +975,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                         condition=audio_coda_outputs,
                         n_mels=self.config.audio_n_mels,
                         device=text_token_logits.device,
+                        override_ddim_sampling_steps=audio_override_ddim_sampling_steps,
                     )
 
                     all_audio_mel_specs.append(audio_mel_specs)
@@ -1007,7 +1003,12 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
 
                     image_coda_outputs, _ = self.output_transform.image_coda_forward(image_hidden_states)
 
-                    image_hidden_states, intermediate_images = self.output_transform.image_decoder.sample(device=image_coda_outputs.device, condition=image_coda_outputs, return_intermediate=True)
+                    image_hidden_states, intermediate_images = self.output_transform.image_decoder.sample(
+                        device=image_coda_outputs.device,
+                        condition=image_coda_outputs,
+                        return_intermediate=True,
+                        override_ddim_sampling_steps=image_override_ddim_sampling_steps,
+                    )
                     all_image_outputs.append(image_hidden_states)
                     intermediate_image_outputs.append(intermediate_images)
 
@@ -1035,7 +1036,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         
         # Prepare outputs
         if return_dict_in_generate:
-            return MultimodalGenerationOutput(
+            return megatransformer_utils.MultimodalGenerationOutput(
                 sequences=all_input_ids,
                 audio_outputs=all_audio_outputs if all_audio_outputs else None,
                 audio_mel_specs=all_audio_mel_specs if all_audio_mel_specs else None,
@@ -1445,9 +1446,9 @@ if __name__ == '__main__':
             self.audio_max_frames = 312
 
             # image conditions static sequence length
-            self.image_size = 224
+            self.image_size = 128
             self.patch_size = 16
-            self.image_embeds_length = (self.image_size // self.patch_size) ** 2  # 196
+            self.image_embeds_length = (self.image_size // self.patch_size) ** 2  # 64
 
             self.hidden_size = 8
 

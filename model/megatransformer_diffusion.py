@@ -1,3 +1,5 @@
+from functools import partial
+from torch.amp import autocast
 from typing import Optional, Union
 
 from model import megatransformer_modules
@@ -8,316 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class AudioDiffusionSelfAttentionBlock(nn.Module):
-    def __init__(self, hidden_size, n_heads, d_queries, d_values, use_flash_attention=True, dropout=0.1):
-        super().__init__()
-        self.hidden_dim = hidden_size
-        self.n_heads = n_heads
-        self.d_queries = d_queries
-        self.d_values = d_values
-        self.use_flash_attention = use_flash_attention
-        
-        self.q_proj = nn.Linear(hidden_size, d_queries * n_heads)
-        self.k_proj = nn.Linear(hidden_size, d_queries * n_heads)
-        self.v_proj = nn.Linear(hidden_size, d_values * n_heads)
-        
-        self.out_proj = nn.Linear(self.d_values * n_heads, hidden_size)
-        
-        self.dropout = nn.Dropout(dropout)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        self.apply(megatransformer_utils.transformer_weight_init)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Normal multi-head self attention, but it expects 4D input where it will batch by the first and third dimensions,
-        and outputs the same shape.
-        Args:
-            x: [B, H, W, T] where B is batch size, H is height, W is width and T is time.
-        Returns:
-            output: [B, H, W, T] where B is batch size, H is height, W is width and T is time. Attention is applied
-            along the T dimension, between the W dimension values, batched along B*W.
-        """
-        B, H, W, T = x.shape
-
-        x = x.permute(0, 2, 1, 3)  # [B, W, H, T]
-
-        x = x.contiguous().view(-1, H, T)  # [B*W, H, T]
-
-        x = x.permute(0, 2, 1)  # [B*W, T, H]
-        
-        q: torch.Tensor = self.q_proj(x)  # [B*W, T, n_heads*d_queries]
-        k: torch.Tensor = self.k_proj(x)
-        v: torch.Tensor = self.v_proj(x)
-        
-        q = q.view(-1, T, self.n_heads, self.d_queries)  # [B*W, T, n_heads, d_queries]
-        k = k.view(-1, T, self.n_heads, self.d_queries)
-        v = v.view(-1, T, self.n_heads, self.d_values)
-        
-        q = q.transpose(1, 2)  # [B*W, n_heads, T, d_queries]
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        
-        output: torch.Tensor
-        if self.use_flash_attention:
-            output = F.scaled_dot_product_attention(
-                q, k, v, 
-                attn_mask=None,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False
-            )  # [B*W, n_heads, T, d_values]
-        else:
-            scale = 1.0 / math.sqrt(self.d_queries)
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B*W, n_heads, T, T]
-            
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            
-            output = torch.matmul(attn_weights, v)  # [B*W, n_heads, T, d_queries]
-        
-        output = output.transpose(1, 2).contiguous()  # [B*W, T, n_heads, d_queries]
-
-        output = output.view(-1, T, self.n_heads*self.d_values)  # [B*W, T, H]
-        
-        output = self.out_proj(output)  # [B*W, T, H]
-
-        output = output.permute(0, 2, 1)  # [B*W, H, T]
-
-        # restore input shape by splitting the hidden dim into width and height
-        output = output.view(B, W, H, T)
-
-        output = output.permute(0, 2, 1, 3)  # [B, H, W, T]
-        
-        return output
-
-class AudioDiffusionCrossAttentionBlock(nn.Module):
-    def __init__(self, hidden_size, n_heads, d_queries, d_values, context_dim=None, use_flash_attention=True, dropout=0.1):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.n_heads = n_heads
-        self.d_queries = d_queries
-        self.d_values = d_values
-        self.context_dim = context_dim or hidden_size  # If None, use hidden_dim
-        self.use_flash_attention = use_flash_attention
-        
-        self.q_proj = nn.Linear(hidden_size, n_heads*d_queries)
-        self.k_proj = nn.Linear(self.context_dim, n_heads*d_queries)
-        self.v_proj = nn.Linear(self.context_dim, n_heads*d_values)
-        
-        self.out_proj = nn.Linear(n_heads*d_values, hidden_size)
-
-        self.dropout = nn.Dropout(dropout)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        self.apply(megatransformer_utils.transformer_weight_init)
-    
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        B, H, W, T = x.size()
-        BC, N, CH = context.size()
-
-        assert B == BC, f"Batch size mismatch: {B} vs {BC}. Shapes: {x.shape}, {context.shape}"
-
-        x = x.permute(0, 2, 1, 3)  # [B, W, H, T]
-        x = x.contiguous().view(B*W, H, T)    # [B*W, H, T]
-        x = x.permute(0, 2, 1)  # [B*W, T, H]
-
-        # context is 3D batched linear feature tokens, broadcast along the width dimension for attention
-        context = context.unsqueeze(2).expand(-1, -1, W, -1)  # [B, N, W, CH]
-        context = context.permute(0, 2, 3, 1)  # [B, W, CH, N]
-        context = context.contiguous().view(B*W, CH, N)   # [B*W, CH, N]
-        context = context.permute(0, 2, 1)  # [B*W, N, CH]
-
-        q: torch.Tensor = self.q_proj(x)        # [B*W, T, n_heads*d_queries]
-        k: torch.Tensor = self.k_proj(context)  # [B*W, N, n_heads*d_queries]
-        v: torch.Tensor = self.v_proj(context)  # [B*W, N, n_heads*d_values]
-
-        q = q.view(-1, T, self.n_heads, self.d_queries).transpose(1, 2)  # [B*W, n_heads, T, d_queries]
-        k = k.view(-1, N, self.n_heads, self.d_queries).transpose(1, 2)  # [B*W, n_heads, N, d_queries]
-        v = v.view(-1, N, self.n_heads, self.d_values).transpose(1, 2)  # [B*W, n_heads, N, d_values]
-
-        output: torch.Tensor
-        if self.use_flash_attention:
-            output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False
-            )  # [B*W, n_heads, T, d_values]
-        else:
-            scale = 1.0 / math.sqrt(self.d_queries)
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B*W, n_heads, T, N]
-            
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            
-            output = torch.matmul(attn_weights, v)  # [B*W, n_heads, T, d_values]
-        
-        output = output.transpose(1, 2).contiguous()  # [B*W, T, n_heads, head_dim]
-        output = output.view(-1, T, self.n_heads*self.d_values)  # [B*W, T, n_heads*d_values]
-        
-        output = self.out_proj(output)  # [B*W, T, H]
-
-        output = output.permute(0, 2, 1)  # [B*W, H, T]
-
-        # restore input shape by splitting the hidden dim into width and height
-        output = output.view(B, W, H, T)
-
-        output = output.permute(0, 2, 1, 3)  # [B, H, W, T]
-
-        return output
-
-class ImageDiffusionSelfAttentionBlock(nn.Module):
-    def __init__(self, hidden_size, n_heads, d_queries, d_values, use_flash_attention=True, dropout=0.1):
-        super().__init__()
-        self.hidden_dim = hidden_size
-        self.n_heads = n_heads
-        self.d_queries = d_queries
-        self.d_values = d_values
-        self.use_flash_attention = use_flash_attention
-        self.dropout_p = dropout  # Store dropout probability for flash attention
-        
-        self.q_proj = nn.Linear(hidden_size, d_queries * n_heads)
-        self.k_proj = nn.Linear(hidden_size, d_queries * n_heads)
-        self.v_proj = nn.Linear(hidden_size, d_values * n_heads)
-        
-        self.out_proj = nn.Linear(self.d_values * n_heads, hidden_size)
-        
-        self.dropout = nn.Dropout(dropout)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        self.apply(megatransformer_utils.transformer_weight_init)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Multi-head self attention for image data, treating spatial dimensions (H,W) as the sequence length.
-        Args:
-            x: [B, C, H, W] where B is batch size, C is channels, H is height, W is width.
-        Returns:
-            output: [B, C, H, W] where attention is applied along the spatial dimensions.
-        """
-        B, C, H, W = x.shape
-        seq_len = H * W
-
-        x = x.contiguous().view(B, C, seq_len)  # [B, C, H*W]
-        x = x.permute(0, 2, 1)  # [B, H*W, C]
-        
-        q: torch.Tensor = self.q_proj(x)  # [B, H*W, n_heads*d_queries]
-        k: torch.Tensor = self.k_proj(x)  # [B, H*W, n_heads*d_queries]
-        v: torch.Tensor = self.v_proj(x)  # [B, H*W, n_heads*d_values]
-        
-        q = q.view(B, seq_len, self.n_heads, self.d_queries)  # [B, H*W, n_heads, d_queries]
-        k = k.view(B, seq_len, self.n_heads, self.d_queries)  # [B, H*W, n_heads, d_queries]
-        v = v.view(B, seq_len, self.n_heads, self.d_values)  # [B, H*W, n_heads, d_values]
-        
-        q = q.transpose(1, 2)  # [B, n_heads, H*W, d_queries]
-        k = k.transpose(1, 2)  # [B, n_heads, H*W, d_queries]
-        v = v.transpose(1, 2)  # [B, n_heads, H*W, d_values]
-        
-        output: torch.Tensor
-        if self.use_flash_attention:
-            output = F.scaled_dot_product_attention(
-                q, k, v, 
-                attn_mask=None,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=False
-            )  # [B, n_heads, H*W, d_values]
-        else:
-            scale = 1.0 / math.sqrt(self.d_queries)
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, n_heads, H*W, H*W]
-            
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            
-            output = torch.matmul(attn_weights, v)  # [B, n_heads, H*W, d_values]
-        
-        output = output.transpose(1, 2).contiguous()  # [B, H*W, n_heads, d_values]
-        output = output.view(B, seq_len, self.n_heads*self.d_values)  # [B, H*W, n_heads*d_values]
-        
-        output = self.out_proj(output)  # [B, H*W, C]
-
-        # Reshape back to original spatial dimensions
-        output = output.view(B, H, W, C)
-        output = output.permute(0, 3, 1, 2)  # [B, C, H, W]
-        
-        return output
-
-class ImageDiffusionCrossAttentionBlock(nn.Module):
-    def __init__(self, hidden_size, n_heads, d_queries, d_values, context_dim=None, use_flash_attention=True, dropout=0.1):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.n_heads = n_heads
-        self.d_queries = d_queries
-        self.d_values = d_values
-        self.context_dim = context_dim or hidden_size  # If None, use hidden_dim
-        self.use_flash_attention = use_flash_attention
-        
-        self.q_proj = nn.Linear(hidden_size, n_heads*d_queries)
-        self.k_proj = nn.Linear(self.context_dim, n_heads*d_queries)
-        self.v_proj = nn.Linear(self.context_dim, n_heads*d_values)
-        
-        self.out_proj = nn.Linear(n_heads*d_values, hidden_size)
-
-        self.dropout = nn.Dropout(dropout)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        self.apply(megatransformer_utils.transformer_weight_init)
-    
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.size()
-        tgt_seq_len = H * W
-        BC, T, CC = context.size()
-        ctxt_seq_len = T
-
-        assert B == BC, f"Batch size mismatch: {B} vs {BC}"
-
-        x = x.contiguous().view(B, C, tgt_seq_len)    # [B, C, tgt_seq_len]
-        x = x.permute(0, 2, 1)  # [B, tgt_seq_len, C]
-
-        q: torch.Tensor = self.q_proj(x)        # [B, tgt_seq_len, n_heads*d_queries]
-        k: torch.Tensor = self.k_proj(context)  # [B, ctxt_seq_len, n_heads*d_queries]
-        v: torch.Tensor = self.v_proj(context)  # [B, ctxt_seq_len, n_heads*d_values]
-        
-        q = q.view(B, tgt_seq_len, self.n_heads, self.d_queries).transpose(1, 2)   # [B, n_heads, tgt_seq_len, d_queries]
-        k = k.view(B, ctxt_seq_len, self.n_heads, self.d_queries).transpose(1, 2)  # [B, n_heads, ctxt_seq_len, d_queries]
-        v = v.view(B, ctxt_seq_len, self.n_heads, self.d_values).transpose(1, 2)   # [B, n_heads, ctxt_seq_len, d_values]
-        
-        output: torch.Tensor
-        if self.use_flash_attention:
-            output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False
-            )  # [B, n_heads, tgt_seq_len, d_values]
-        else:
-            scale = 1.0 / math.sqrt(self.d_queries)
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, n_heads, tgt_seq_len, ctxt_seq_len]
-            
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            
-            output = torch.matmul(attn_weights, v)  # [B, n_heads, tgt_seq_len, d_values]
-        
-        output = output.transpose(1, 2).contiguous()  # [B, tgt_seq_len, n_heads, d_values]
-        output = output.view(B, tgt_seq_len, self.n_heads*self.d_values)  # [B, tgt_seq_len, n_heads*d_values]
-        
-        output = self.out_proj(output)  # [B, tgt_seq_len, C]
-
-        output = output.permute(0, 2, 1)  # [B, C, tgt_seq_len]
-
-        # restore input shape by splitting the hidden dim into width and height
-        output = output.view(B, C, H, W)
-
-        return output
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, time_embedding_dim, activation, dropout):
@@ -392,6 +84,11 @@ class DownBlock(nn.Module):
                  self_attn_use_flash_attention=True):
         super().__init__()
 
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(in_channels if i == 0 else out_channels)
+            for i in range(num_res_blocks)
+        ])
+
         self.res_blocks = nn.ModuleList([
             ResidualBlock(in_channels if i == 0 else out_channels, out_channels, time_embedding_dim, activation, dropout)
             for i in range(num_res_blocks)
@@ -413,7 +110,12 @@ class DownBlock(nn.Module):
         self.downsample.bias.data.zero_()
 
     def forward(self, x: torch.Tensor, time_embedding: Optional[torch.Tensor]=None, condition=None) -> tuple[torch.Tensor, torch.Tensor]:
-        for res_block, attn_block in zip(self.res_blocks, self.attn_blocks):
+        for norm, res_block, attn_block in zip(self.norms, self.res_blocks, self.attn_blocks):
+            # switch channel and last dimension
+            x = x.permute(0, 2, 3, 1).contiguous()
+            x = norm(x)
+            # switch back
+            x = x.permute(0, 3, 1, 2).contiguous()
             x = res_block(x, time_embedding)
             x = attn_block(x)
         return self.downsample(x), x
@@ -447,6 +149,11 @@ class UpBlock(nn.Module):
             nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
         )
 
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(in_channels*2 if i == 0 else out_channels)
+            for i in range(num_res_blocks)
+        ])
+
         self.res_blocks = nn.ModuleList([
             ResidualBlock(in_channels*2 if i == 0 else out_channels, out_channels, time_embedding_dim, activation, dropout)
             for i in range(num_res_blocks)
@@ -475,7 +182,12 @@ class UpBlock(nn.Module):
     def forward(self, x: torch.Tensor, skip: list[torch.Tensor], time_embedding: torch.Tensor, condition=None) -> torch.Tensor:
         x = self.upsample(x)
         x = torch.cat([x, skip], dim=1)
-        for res_block, attn_block, cross_attn_block in zip(self.res_blocks, self.attn_blocks, self.cross_attn_blocks):
+        for norm, res_block, attn_block, cross_attn_block in zip(self.norms, self.res_blocks, self.attn_blocks, self.cross_attn_blocks):
+            # switch channel and last dimension
+            x = x.permute(0, 2, 3, 1).contiguous()
+            x = norm(x)
+            # switch back
+            x = x.permute(0, 3, 1, 2).contiguous()
             x = res_block(x, time_embedding)
             x = attn_block(x)
             if condition is not None and not isinstance(cross_attn_block, nn.Identity):
@@ -626,6 +338,7 @@ class UNet(nn.Module):
 class GaussianDiffusion(nn.Module):
     def __init__(
             self,
+            config: megatransformer_utils.MegaTransformerConfig,
             hidden_size,
             activation,
             scale_factor,
@@ -640,7 +353,6 @@ class GaussianDiffusion(nn.Module):
             beta_start: float = 1e-4,
             beta_end: float = 0.02,
             num_timesteps: int = 1000,
-            predict_epsilon: bool = True,
             has_condition: bool = False,
             unet_dropout: float = 0.1,
             betas_schedule="linear",
@@ -656,11 +368,27 @@ class GaussianDiffusion(nn.Module):
             cross_attn_d_queries=64,
             cross_attn_d_values=64,
             cross_attn_use_flash_attention=True,
+            min_snr_loss_weight: bool = False,
+            min_snr_gamma: float = 5.0,
+            normalize: bool = True,
+            ddim_sampling_eta = 0.0,
+            sampling_timesteps=None,
     ):
         super().__init__()
 
+        self.config = config
+
         self.num_timesteps = num_timesteps
-        self.predict_epsilon = predict_epsilon
+        self.normalize = normalize
+        self.ddim_sampling_eta = ddim_sampling_eta
+
+        if sampling_timesteps is None:
+            self.sampling_timesteps = num_timesteps
+            self.is_ddim_sampling = False
+        else:
+            self.sampling_timesteps = sampling_timesteps
+            assert sampling_timesteps <= num_timesteps, f"Sampling timesteps {sampling_timesteps} must be less than or equal to total timesteps {num_timesteps}."
+            self.is_ddim_sampling = sampling_timesteps < num_timesteps
 
         self.unet = UNet(
             hidden_size,
@@ -691,126 +419,241 @@ class GaussianDiffusion(nn.Module):
         )
 
         if betas_schedule == "cosine":
-            betas = self.cosine_beta_schedule()
+            betas = self.cosine_beta_schedule(num_timesteps)
+        elif betas_schedule == "sigmoid":
+            betas = self.sigmoid_beta_schedule(num_timesteps)
         else:
             betas = torch.linspace(beta_start, beta_end, num_timesteps)
 
         self.register_buffer("betas", betas)
+
         alphas = 1.0 - betas
         self.register_buffer("alphas", alphas)
+
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         self.register_buffer("alphas_cumprod", alphas_cumprod)
 
-        sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-        self.register_buffer("sqrt_alphas_cumprod", sqrt_alphas_cumprod)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
+        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
 
-        sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-        self.register_buffer("sqrt_one_minus_alphas_cumprod", sqrt_one_minus_alphas_cumprod)
+        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1. - alphas_cumprod))
+        self.register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
+        self.register_buffer("sqrt_recip_alphas_cumprod", torch.sqrt(1. / alphas_cumprod))
+        self.register_buffer("sqrt_recip1m_alphas_cumprod", torch.sqrt(1. / (1. - alphas_cumprod)))
 
-        posterior_variance = betas * (1. - alphas_cumprod.clone().detach()) / (1. - alphas_cumprod.clone().detach())
-        posterior_variance = torch.cat([torch.tensor([0.0]), posterior_variance])
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
         self.register_buffer("posterior_variance", posterior_variance)
+        self.register_buffer("posterior_log_variance_clipped", torch.log(posterior_variance.clamp(min=1e-20)))
+        self.register_buffer("posterior_mean_coef1", betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        self.register_buffer("posterior_mean_coef2", (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
-        posterior_log_variance_clipped = torch.log(posterior_variance.clamp(min=1e-20))
-        self.register_buffer("posterior_log_variance_clipped", posterior_log_variance_clipped)
+        snr = alphas_cumprod / (1 - alphas_cumprod)
 
-        posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod.clone().detach()) / (1. - alphas_cumprod.clone().detach())
-        self.register_buffer("posterior_mean_coef1", posterior_mean_coef1)
+        maybe_clipped_snr = snr.clone()
+        if min_snr_loss_weight:
+            maybe_clipped_snr.clamp_(max = min_snr_gamma)
 
-        posterior_mean_coef2 = (1. - alphas_cumprod.clone().detach()) * torch.sqrt(alphas_cumprod.clone().detach()) / (1. - alphas_cumprod.clone().detach())
-        self.register_buffer("posterior_mean_coef2", posterior_mean_coef2)
+        loss_weight = maybe_clipped_snr / snr
 
-        sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / alphas_cumprod)
-        self.register_buffer("sqrt_recip_alphas_cumprod", sqrt_recip_alphas_cumprod)
-        sqrt_recip1m_alphas_cumprod = torch.sqrt(1.0 / (1.0 - alphas_cumprod))
-        self.register_buffer("sqrt_recip1m_alphas_cumprod", sqrt_recip1m_alphas_cumprod)
+        self.register_buffer('loss_weight', loss_weight)
 
-    def cosine_beta_schedule(timesteps, s=0.008):
+    def cosine_beta_schedule(self, timesteps, s=0.008):
         steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps)
-        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+        t = torch.linspace(0, timesteps, steps) / timesteps
+        alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi * 0.5) ** 2
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0.0001, 0.9999)
-
-    def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor]=None) -> torch.Tensor:
-        if noise is None:
-            noise = torch.randn_like(x_start)
-
-        sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x_start.shape)
-        sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
-
-        return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+        return torch.clip(betas, 0, 0.999)
     
-    def p_sample(self, x: torch.Tensor, t: torch.Tensor, t_index, condition=None):
-        """Single step of the reverse diffusion process with conditioning"""
-        betas_t = self._extract(self.betas, t, x.shape)
-        sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
-        sqrt_recip_alphas_t = self._extract(self.sqrt_recip_alphas_cumprod, t, x.shape)
-        
-        # Model forward pass with condition
-        model_output = self.unet(x, t, condition=condition)
-        
-        if self.predict_epsilon:
-            # Model predicts noise ε
-            pred_epsilon = model_output
-            pred_x0 = sqrt_recip_alphas_t * x - sqrt_recip_alphas_t * sqrt_one_minus_alphas_cumprod_t * pred_epsilon
-            pred_x0 = torch.clamp(pred_x0, -1., 1.)
-            
-            # Calculate posterior mean using betas_t
-            denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
-            denominator = torch.clamp(denominator, min=1e-8)
-            posterior_mean = (
-                x * (1 - betas_t) / denominator +
-                pred_x0 * betas_t / denominator
-            )
-        else:
-            # Model directly predicts x_0
-            pred_x0 = model_output
-            pred_x0 = torch.clamp(pred_x0, -1., 1.)
-            
-            # Calculate posterior mean using betas_t
-            denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
-            denominator = torch.clamp(denominator, min=1e-8)
-            posterior_mean = (
-                x * (1 - betas_t) / denominator +
-                pred_x0 * betas_t / denominator
-            )
-        
-        # Calculate posterior variance using betas_t
-        posterior_variance = betas_t * (1 - self._extract(self.alphas_cumprod, t-1, x.shape)) / (1 - self._extract(self.alphas_cumprod, t, x.shape))
-        
-        if t_index == 0:
-            # No noise at the last step (t=0)
-            return posterior_mean
-        else:
-            noise = torch.randn_like(x)
-            return posterior_mean + torch.sqrt(posterior_variance) * noise
-    
-    def predict_start_from_noise(self, x_t: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        """Predict x_0 from noise prediction"""
-        sqrt_recip_alphas_cumprod_t = self._extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape)
-        sqrt_recip1m_alphas_cumprod_t = self._extract(self.sqrt_recip1m_alphas_cumprod, t, x_t.shape)
-        
-        return sqrt_recip_alphas_cumprod_t * x_t - sqrt_recip1m_alphas_cumprod_t * noise
+    def sigmoid_beta_schedule(self, timesteps, start=-3, end=3, tau=1, clamp_min=1e-5):
+        steps = timesteps + 1
+        t = torch.linspace(0, timesteps, steps) / timesteps
+        v_start = torch.tensor(start / tau).sigmoid()
+        v_end = torch.tensor(end / tau).sigmoid()
+        alphas_cumprod = (-((t * (end - start) + start) / tau).sigmoid() + v_end) / (v_end - v_start)
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clip(betas, 0, 0.999)
+
+    def normalize_to_neg_one_to_one(self, x_0):
+        return x_0 * 2 - 1
+
+    def unnormalize_to_zero_to_one(self, x):
+        return (x + 1) * 0.5
 
     def _extract(self, a: torch.Tensor, t: torch.Tensor, shape: tuple) -> torch.Tensor:
         b, *_ = t.shape
         out = a.gather(-1, t.long())
         return out.reshape(b, *((1,) * (len(shape) - 1))).to(t.device)
-    
+
+    def predict_start_from_noise(self, x_t: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        return (
+            self._extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - 
+            self._extract(self.sqrt_recip1m_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def model_predictions(self, x, t, condition=None, clip_x_start=False):
+        model_output = self.unet(x, t, condition)
+        maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_x_start else nn.Identity()
+
+        pred_noise = model_output
+        x_start = self.predict_start_from_noise(x, t, pred_noise)
+        x_start = maybe_clip(x_start)
+
+        return pred_noise, x_start
+
+    def q_posterior(self, x_start, x_t, t):
+        posterior_mean = (
+            self._extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            self._extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = self._extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = self._extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_mean_variance(self, x, t, condition=None, clip_denoised=True):
+        _, x_start = self.model_predictions(x, t, condition=condition)
+
+        if clip_denoised:
+            x_start.clamp_(-1., 1.)
+
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
+        return model_mean, posterior_variance, posterior_log_variance, x_start
+
     @torch.no_grad()
-    def sample(self, device, batch_size: int, image_size: int) -> torch.Tensor:
-        x = torch.randn(batch_size, 3, image_size, image_size, device=device)
+    def p_sample(self, x: torch.Tensor, t: int, condition=None):
+        batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
 
-        for time_step in reversed(range(self.num_timesteps)):
-            t = torch.full((batch_size,), time_step, device=device, dtype=torch.long)
-            x = self.p_sample(x, t, time_step)
+        model_mean, variance, model_log_variance, x_start = self.p_mean_variance(
+            x = x, t = batched_times, condition=condition, clip_denoised=True
+        )
 
-        x = (x + 1) / 2
-        x = torch.clamp(x, 0.0, 1.0)
+        noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
 
-        return x
+        pred_x0 = model_mean + torch.exp(0.5 * model_log_variance) * noise
+
+        return pred_x0, x_start
+
+    @torch.no_grad()
+    def p_sample_loop(self, x, condition=None, return_intermediate: bool=False):
+        intermediate_images = []
+        for time_step in reversed(range(0, self.num_timesteps)):
+            x, _ = self.p_sample(x, time_step, condition=condition)
+            if return_intermediate:
+                intermediate_images.append(x)
+        return x, intermediate_images if return_intermediate else x
+
+    @torch.no_grad()
+    def ddim_sample_loop(self, x, condition=None, return_intermediate=False, override_sampling_steps=None):
+        sampling_timesteps = override_sampling_steps if override_sampling_steps is not None else self.sampling_timesteps
+
+        times = torch.linspace(-1, self.num_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+        img = torch.randn_like(x, device=x.device)
+        intermediate = []
+
+        x_start = None
+
+        for time, time_next in time_pairs:
+            time_cond = torch.full((x.shape[0],), time, device=x.device, dtype = torch.long)
+            pred_noise, x_start = self.model_predictions(img, time_cond, condition=condition, clip_x_start=True)
+
+            if time_next < 0:
+                img = x_start
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            sigma = self.ddim_sampling_eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(img)
+
+            img = x_start * alpha_next.sqrt() + \
+                  c * pred_noise + \
+                  sigma * noise
+            
+            if return_intermediate:
+                intermediate.append(img)
+
+        return img, intermediate if return_intermediate else img
+
+    @torch.no_grad()
+    def sample(self, device, batch_size: int, image_size: int, condition: Optional[torch.Tensor]=None, return_intermediate: bool=False, override_ddim_sampling_steps: Optional[int]=None, generator=None) -> torch.Tensor:
+        x = torch.randn(batch_size, 3, image_size, image_size, device=device, generator=generator)
+
+        if self.is_ddim_sampling or override_ddim_sampling_steps is not None:
+            x = self.ddim_sample_loop(x, condition=condition, return_intermediate=return_intermediate, override_sampling_steps=override_ddim_sampling_steps)
+        else:
+            x = self.p_sample_loop(x, condition=condition, return_intermediate=return_intermediate)
+
+        if return_intermediate:
+            img = x[0]
+        else:
+            img = x
+
+        if self.normalize:
+            img = self.unnormalize_to_zero_to_one(img)
+
+        return img, x[1] if return_intermediate else img
     
-    def forward(self, x_0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError("Forward method not implemented. Use q_sample or p_sample for training and sampling.")
+    @autocast('cuda', enabled = False)
+    def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor]=None) -> torch.Tensor:
+        if noise is None:
+            noise = torch.randn_like(x_start)
+
+        return (
+            self._extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    def p_losses(self, x_start: torch.Tensor, t: torch.Tensor, noise=None, condition=None):
+        b, c, h, w = x_start.shape
+        if noise is None:
+            noise = torch.randn_like(x_start)
+
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+
+        predicted_noise  = self.unet(x_noisy, t, condition)
+
+        loss = F.mse_loss(predicted_noise , noise, reduction='none')
+        loss = loss.mean(dim=[1, 2, 3])
+
+        loss = loss * self._extract(self.loss_weight, t, loss.shape)
+
+        return predicted_noise, loss.mean()
+
+    def forward(self, x_0, condition=None):
+        """
+        default impl is image diffusion
+        returns model output noises and noise reconstruction loss from `p_losses` function
+        """
+
+        if len(x_0.shape) == 5:
+            # squish batch and example dimensions if necessary
+            b, e, c, h, w = x_0.shape
+            x_0 = x_0.view(-1, c, h, w)
+        else:
+            b, c, h, w = x_0.shape
+            e = None
+
+        if condition is not None:
+            if len(condition.shape) == 5:
+                # squish batch and example dimensions if necessary
+                *_, c, h, w = condition.shape
+                condition = condition.view(-1, c, h, w)
+
+        t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device= x_0.device).long()
+
+        if self.normalize:
+            x_0 = self.normalize_to_neg_one_to_one(x_0)
+
+        model_output, mel_l1_loss = self.p_losses(x_0, t, condition=condition)
+        if e is not None:
+            # restore model example dimension
+            model_output = model_output.view(b, e, c, h, w)
+        return model_output, mel_l1_loss

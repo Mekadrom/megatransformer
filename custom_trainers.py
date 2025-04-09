@@ -4,9 +4,10 @@ from transformers import Trainer
 from transformers.integrations import TensorBoardCallback
 from typing import Optional, Literal
 
+from model import megatransformer_multimodal
+
 import megatransformer_utils
 import torch
-import types
 
 
 class GrokFastMATrainer(Trainer):
@@ -117,16 +118,19 @@ class DefaultTrainer(Trainer):
         # inputs["output_hidden_states"] = True
         # inputs["return_dict"] = False
 
-        self.train_dataset.epoch = self.state.epoch
-        if hasattr(self, "eval_dataset") and self.eval_dataset is not None:
-            self.eval_dataset.epoch = self.state.epoch
+        sanitized_model = megatransformer_utils.sanitize_model(model)
+
+        sanitized_model.config.current_epoch = self.state.epoch
+        sanitized_model.config.current_global_step = self.state.global_step
 
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
 
         if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
-            if hasattr(outputs, "n_steps_no_grad") and hasattr(outputs, "k_steps_grad"):
+            if not isinstance(outputs, tuple) and hasattr(outputs, "n_steps_no_grad") and hasattr(outputs, "k_steps_grad"):
                 self.log_steps(prefix, outputs.n_steps_no_grad, outputs.k_steps_grad)
+            elif isinstance(outputs, tuple):
+                self.log_steps(prefix, outputs[-2], outputs[-1])
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
                 for i, hidden_state in enumerate(outputs.hidden_states):
                     token_correlation = megatransformer_utils.get_token_correlation(hidden_state)
@@ -167,5 +171,5 @@ def trainer_lookup(argparser_args, trainer_name, default=DefaultTrainer):
             **kwargs
         ),
     elif trainer_name == "debug":
-        return DebugTrainer,
+        return DebugTrainer
     return default

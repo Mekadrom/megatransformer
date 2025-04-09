@@ -1,20 +1,14 @@
-import os
-
-os.environ["DEEPSPEED_UNIT_TEST"] = "1"
-os.environ["NCCL_DEBUG"] = "INFO"
-os.environ["NCCL_IB_DISABLE"] = "1"
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ['NCCL_TIMEOUT'] = '1200000'
-
-from transformers import AutoTokenizer, TrainingArguments, DataCollatorForLanguageModeling
+from transformers import AutoTokenizer, TrainingArguments
 
 from dataset_loading import multimodal_dataset
 from model import megatransformer_image_decoder
 
 import custom_callbacks
 import custom_trainers
+import dataset_loading
 import megatransformer_utils
 import os
+import torch
 
 
 args, unk = megatransformer_utils.parse_args()
@@ -36,10 +30,8 @@ if args.local_rank == 0 or not args.use_deepspeed:
     print(f"model parameters: {(sum(p.numel() for p in model.parameters())):,}")
     print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
 
-    print(f"model.input_transform.text_embedding parameters: {(sum(p.numel() for p in model.input_transform.text_embedding.parameters())):,}")
-    print(f"model.recurrent_model parameters: {(sum(p.numel() for p in model.world_model.parameters())):,}")
-    print(f"model.output_transform.image_coda parameters: {(sum(p.numel() for p in model.output_transform.image_coda.parameters())):,}")
-    print(f"model.output_transform.image_decoder parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.parameters())):,}")
+    print(f"model.text_recurrent parameters: {(sum(p.numel() for p in model.text_recurrent.parameters())):,}")
+    print(f"model.diffuser parameters: {(sum(p.numel() for p in model.diffuser.parameters())):,}")
 
     print(f"modified tokenizer: {tokenizer}")
     print(f"special tokens: {tokenizer.special_tokens_map}")
@@ -68,9 +60,8 @@ training_args = TrainingArguments(
     report_to="tensorboard",
     logging_dir=run_dir,
     logging_steps=args.logging_steps,
-    # eval_strategy="steps",
-    eval_strategy="no",
-    # eval_steps=args.eval_steps,
+    eval_strategy="steps",
+    eval_steps=args.eval_steps,
     save_safetensors=False,
     save_steps=args.save_steps,
     gradient_checkpointing=args.use_gradient_checkpointing,
@@ -85,72 +76,53 @@ training_args = TrainingArguments(
     local_rank=args.local_rank,
 )
 
-train_dataset = multimodal_dataset.MultimodalDataset(
-    approximated_length=300_000,
-    tokenizer=tokenizer,
-    sample_rate=model.config.audio_sample_rate,
-    n_mels=model.config.audio_n_mels,
-    n_fft=model.config.audio_n_fft,
-    hop_length=model.config.audio_hop_length,
-    audio_max_frames=model.config.audio_max_frames,
+train_dataset = dataset_loading.load_dataset(
+    tokenizer,
+    args.max_position_embeddings,
+    "train",
+    "image",
     image_size=model.config.image_size,
+    streaming=True,
     cache_dir=args.dataset_cache_dir,
-    text_weight=text_weight,
-    audio_weight=audio_weight,
-    image_weight=image_weight,
-    split="train",
-    seed=args.seed,
-    max_position_embeddings=args.max_position_embeddings,
 )
 
-validation_dataset = multimodal_dataset.MultimodalDataset(
-    approximated_length=200_000,
-    tokenizer=tokenizer,
-    sample_rate=model.config.audio_sample_rate,
-    n_mels=model.config.audio_n_mels,
-    n_fft=model.config.audio_n_fft,
-    hop_length=model.config.audio_hop_length,
-    audio_max_frames=model.config.audio_max_frames,
+validation_dataset = dataset_loading.load_dataset(
+    tokenizer,
+    args.max_position_embeddings,
+    "validation",
+    "image",
     image_size=model.config.image_size,
+    streaming=True,
     cache_dir=args.dataset_cache_dir,
-    text_weight=0.0, # no text in validation
-    audio_weight=audio_weight,
-    image_weight=image_weight,
-    split="validation",
-    seed=args.seed,
-    max_position_embeddings=args.max_position_embeddings,
 )
 
-if 'multimodal' in args.config.lower():
-    data_collator = multimodal_dataset.DataCollatorForMultimodalLanguageModeling(
-        tokenizer=tokenizer,
-        max_position_embeddings=args.max_position_embeddings,
-        image_size=model.config.image_size,
-        audio_max_frames=model.config.audio_max_frames,
-        audio_max_waveform_length=model.config.audio_max_waveform_length,
-        mlm=False,
-    )
-else:
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+data_collator = multimodal_dataset.DataCollatorForMultimodalLanguageModeling(
+    tokenizer=tokenizer,
+    max_position_embeddings=args.max_position_embeddings,
+    image_size=model.config.image_size,
+    modes=["image"],
+    mlm=False,
+)
 
-optimizer = None
-if "multimodal" in args.config.lower():
-    optimizer = megatransformer_utils.create_multimodal_optimizer(model, args.weight_decay)
+optimizer = torch.optim.AdamW([
+    {'params': model.text_recurrent.parameters(), 'lr': 1e-4},
+    {'params': model.diffuser.parameters(), 'lr': 1e-4},
+], weight_decay=args.weight_decay)
 
 trainer = custom_trainers.trainer_lookup(args, args.trainer)(
     model=model,
     args=training_args,
     data_collator=data_collator,
     train_dataset=train_dataset,
-    # eval_dataset=validation_dataset,
+    eval_dataset=validation_dataset,
     processing_class=tokenizer,
     optimizers=(optimizer, None)
 )
 
-# generation_callback = custom_callbacks.ImageGenerationCallback(
-#     tokenizer=tokenizer,
-#     generation_steps=args.generation_steps,
-# )
+generation_callback = custom_callbacks.ImageGenerationCallback(
+    tokenizer=tokenizer,
+    generation_steps=args.generation_steps,
+)
 trainer.add_callback(generation_callback)
 generation_callback.trainer = trainer
 

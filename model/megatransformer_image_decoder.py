@@ -1,123 +1,162 @@
-from transformer import PreTrainedTokenizer
-from typing import Union
+from transformers import PreTrainedTokenizer
 
-from model import megatransformer_diffusion, megatransformer_recurrent, megatransformer_text_encoder
+from model import megatransformer_diffusion, megatransformer_recurrent
 
 import megatransformer_utils
+
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ImageConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffusion):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-    
-    def q_sample(self, x_start, t, noise=None, condition=None):
-        # Same as before, condition not needed for forward process
-        return super().q_sample(x_start, t, noise)
-    
-    def p_sample(self, x: torch.Tensor, t: torch.Tensor, t_index, condition=None):
-        """Single step of the reverse diffusion process with conditioning"""
-        betas_t = self._extract(self.betas, t, x.shape)
-        sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
-        sqrt_recip_alphas_t = self._extract(self.sqrt_recip_alphas_cumprod, t, x.shape)
-        
-        # Model forward pass with condition
-        model_output = self.unet(x, t.to(x.dtype), condition=condition)
-        
-        if self.predict_epsilon:
-            # Model predicts noise ε
-            pred_epsilon = model_output
-            pred_x0 = sqrt_recip_alphas_t * x - sqrt_recip_alphas_t * sqrt_one_minus_alphas_cumprod_t * pred_epsilon
-            pred_x0 = torch.clamp(pred_x0, -1., 1.)
-            
-            # Calculate posterior mean using betas_t
-            denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
-            denominator = torch.clamp(denominator, min=1e-8)
-            posterior_mean = (
-                x * (1 - betas_t) / denominator +
-                pred_x0 * betas_t / denominator
-            )
-        else:
-            # Model directly predicts x_0
-            pred_x0 = model_output
-            pred_x0 = torch.clamp(pred_x0, -1., 1.)
-            
-            # Calculate posterior mean using betas_t
-            denominator = torch.sqrt(1 - self._extract(self.alphas_cumprod, t, x.shape) + 1e-8)
-            denominator = torch.clamp(denominator, min=1e-8)
-            posterior_mean = (
-                x * (1 - betas_t) / denominator +
-                pred_x0 * betas_t / denominator
-            )
-        
-        # Calculate posterior variance using betas_t
-        posterior_variance = betas_t * (1 - self._extract(self.alphas_cumprod, t-1, x.shape)) / (1 - self._extract(self.alphas_cumprod, t, x.shape))
-        
-        if t_index == 0:
-            # No noise at the last step (t=0)
-            return posterior_mean
-        else:
-            noise = torch.randn_like(x)
-            return posterior_mean + torch.sqrt(posterior_variance) * noise
-    
-    @torch.no_grad()
-    def sample(self, device, condition, batch_size=1, image_size=224, return_intermediate=False) -> Union[tuple[torch.Tensor, list[torch.Tensor]], torch.Tensor]:
-        """Sample with conditioning"""
-        # Start from pure noise
-        x = torch.randn(batch_size, 3, image_size, image_size, device=device)
-        
-        # Iteratively denoise with conditioning
-        time_step_outputs = []
-        for time_step in reversed(range(1, self.num_timesteps)):
-            t = torch.full((batch_size,), time_step, device=device, dtype=torch.long)
-            x = self.p_sample(x, t, time_step, condition=condition)
-            if return_intermediate:
-                # perform same image normalization per intermediate step
-                intermediate_output = (x + 1) / 2
-                intermediate_output = torch.clamp(intermediate_output, 0.0, 1.0)
-                time_step_outputs.append(intermediate_output)
-            
-        # Scale to [0, 1] range
-        x = (x + 1) / 2
-        x = torch.clamp(x, 0.0, 1.0)
-        
-        return x, time_step_outputs if return_intermediate else x
-    
-    def forward(self, x_0: torch.Tensor, condition=None):
-        """Training forward pass with conditioning"""
-        batch_size = x_0.shape[0]
-        t = torch.randint(0, self.num_timesteps, (batch_size,), device=x_0.device, dtype=torch.long)
-        noise = torch.randn_like(x_0)
-        x_t = self.q_sample(x_0, t, noise)
-        
-        # Model forward pass with condition
-        model_output = self.unet(x_t, t.to(x_0.dtype), condition=condition)
-        
-        loss_dict = {}
-        if self.predict_epsilon:
-            # Loss to the added noise
-            loss_dict["noise_mse"] = F.mse_loss(model_output, noise)
+class ImageDiffusionSelfAttentionBlock(nn.Module):
+    def __init__(self, hidden_size, n_heads, d_queries, d_values, use_flash_attention=True, dropout=0.1):
+        super().__init__()
+        self.hidden_dim = hidden_size
+        self.n_heads = n_heads
+        self.d_queries = d_queries
+        self.d_values = d_values
+        self.use_flash_attention = use_flash_attention
+        self.dropout_p = dropout  # Store dropout probability for flash attention
 
-            pred_x0 = self.predict_start_from_noise(x_t, t, model_output)
-            # megatransformer_utils.print_debug_tensor('initial pred_x0', pred_x0)
-            pred_x0 = torch.clamp(pred_x0, -1., 1.)
-            model_output = pred_x0
-            
-            # Loss to the original image
-            loss_dict["pred_x0_mse"] = F.mse_loss(model_output, x_0)
+        self.q_proj = nn.Linear(hidden_size, d_queries * n_heads)
+        self.k_proj = nn.Linear(hidden_size, d_queries * n_heads)
+        self.v_proj = nn.Linear(hidden_size, d_values * n_heads)
+        
+        self.out_proj = nn.Linear(self.d_values * n_heads, hidden_size)
+        
+        self.dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        self.apply(megatransformer_utils.transformer_weight_init)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Multi-head self attention for image data, treating spatial dimensions (H,W) as the sequence length.
+        Args:
+            x: [B, C, H, W] where B is batch size, C is channels, H is height, W is width.
+        Returns:
+            output: [B, C, H, W] where attention is applied along the spatial dimensions.
+        """
+        B, C, H, W = x.shape
+        seq_len = H * W
+
+        x = x.contiguous().view(B, C, seq_len)  # [B, C, H*W]
+        x = x.permute(0, 2, 1)  # [B, H*W, C]
+        
+        q: torch.Tensor = self.q_proj(x)  # [B, H*W, n_heads*d_queries]
+        k: torch.Tensor = self.k_proj(x)  # [B, H*W, n_heads*d_queries]
+        v: torch.Tensor = self.v_proj(x)  # [B, H*W, n_heads*d_values]
+        
+        q = q.view(B, seq_len, self.n_heads, self.d_queries)  # [B, H*W, n_heads, d_queries]
+        k = k.view(B, seq_len, self.n_heads, self.d_queries)  # [B, H*W, n_heads, d_queries]
+        v = v.view(B, seq_len, self.n_heads, self.d_values)  # [B, H*W, n_heads, d_values]
+        
+        q = q.transpose(1, 2)  # [B, n_heads, H*W, d_queries]
+        k = k.transpose(1, 2)  # [B, n_heads, H*W, d_queries]
+        v = v.transpose(1, 2)  # [B, n_heads, H*W, d_values]
+        
+        output: torch.Tensor
+        if self.use_flash_attention:
+            output = F.scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=None,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=False
+            )  # [B, n_heads, H*W, d_values]
         else:
-            # Loss to the original image
-            loss_dict["direct"] = F.mse_loss(model_output, x_0)
+            scale = 1.0 / math.sqrt(self.d_queries)
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, n_heads, H*W, H*W]
+            
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            
+            output = torch.matmul(attn_weights, v)  # [B, n_heads, H*W, d_values]
+        
+        output = output.transpose(1, 2).contiguous()  # [B, H*W, n_heads, d_values]
+        output = output.view(B, seq_len, self.n_heads*self.d_values)  # [B, H*W, n_heads*d_values]
+        
+        output = self.out_proj(output)  # [B, H*W, C]
 
-        total_loss = (
-            1.0 * loss_dict.get("noise_mse", 0.0) +
-            1.0 * loss_dict.get("pred_x0_mse", 0.0) +
-            1.0 * loss_dict.get("direct", 0.0)
-        )
+        # Reshape back to original spatial dimensions
+        output = output.view(B, H, W, C)
+        output = output.permute(0, 3, 1, 2)  # [B, C, H, W]
+        
+        return output
 
-        return model_output, total_loss
+class ImageDiffusionCrossAttentionBlock(nn.Module):
+    def __init__(self, hidden_size, n_heads, d_queries, d_values, context_dim=None, use_flash_attention=True, dropout=0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.n_heads = n_heads
+        self.d_queries = d_queries
+        self.d_values = d_values
+        self.context_dim = context_dim or hidden_size  # If None, use hidden_dim
+        self.use_flash_attention = use_flash_attention
+
+        self.q_proj = nn.Linear(hidden_size, n_heads*d_queries)
+        self.k_proj = nn.Linear(self.context_dim, n_heads*d_queries)
+        self.v_proj = nn.Linear(self.context_dim, n_heads*d_values)
+        
+        self.out_proj = nn.Linear(n_heads*d_values, hidden_size)
+
+        self.dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        self.apply(megatransformer_utils.transformer_weight_init)
+    
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.size()
+        tgt_seq_len = H * W
+        BC, T, CC = context.size()
+        ctxt_seq_len = T
+
+        assert B == BC, f"Batch size mismatch: {B} vs {BC}"
+
+        x = x.contiguous().view(B, C, tgt_seq_len)    # [B, C, tgt_seq_len]
+        x = x.permute(0, 2, 1)  # [B, tgt_seq_len, C]
+
+        q: torch.Tensor = self.q_proj(x)        # [B, tgt_seq_len, n_heads*d_queries]
+        k: torch.Tensor = self.k_proj(context)  # [B, ctxt_seq_len, n_heads*d_queries]
+        v: torch.Tensor = self.v_proj(context)  # [B, ctxt_seq_len, n_heads*d_values]
+        
+        q = q.view(B, tgt_seq_len, self.n_heads, self.d_queries).transpose(1, 2)   # [B, n_heads, tgt_seq_len, d_queries]
+        k = k.view(B, ctxt_seq_len, self.n_heads, self.d_queries).transpose(1, 2)  # [B, n_heads, ctxt_seq_len, d_queries]
+        v = v.view(B, ctxt_seq_len, self.n_heads, self.d_values).transpose(1, 2)   # [B, n_heads, ctxt_seq_len, d_values]
+        
+        output: torch.Tensor
+        if self.use_flash_attention:
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False
+            )  # [B, n_heads, tgt_seq_len, d_values]
+        else:
+            scale = 1.0 / math.sqrt(self.d_queries)
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, n_heads, tgt_seq_len, ctxt_seq_len]
+            
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            
+            output = torch.matmul(attn_weights, v)  # [B, n_heads, tgt_seq_len, d_values]
+        
+        output = output.transpose(1, 2).contiguous()  # [B, tgt_seq_len, n_heads, d_values]
+        output = output.view(B, tgt_seq_len, self.n_heads*self.d_values)  # [B, tgt_seq_len, n_heads*d_values]
+        
+        output = self.out_proj(output)  # [B, tgt_seq_len, C]
+
+        output = output.permute(0, 2, 1)  # [B, C, tgt_seq_len]
+
+        # restore input shape by splitting the hidden dim into width and height
+        output = output.view(B, C, H, W)
+
+        return output
 
 class ImageDiffusionSingleTaskModel(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
@@ -125,13 +164,14 @@ class ImageDiffusionSingleTaskModel(nn.Module):
         self.config = config
 
         self.text_recurrent = megatransformer_recurrent.MegaTransformerRecurrentCausalModel(config)
-        self.diffuser = ImageConditionalGaussianDiffusion(
+        self.diffuser = megatransformer_diffusion.GaussianDiffusion(
+            config,
             hidden_size=config.hidden_size,
             activation=config.image_decoder_activation,
             scale_factor=(2, 2),
             stride=(2, 2),
-            self_attn_class=megatransformer_diffusion.ImageDiffusionSelfAttentionBlock,
-            cross_attn_class=megatransformer_diffusion.ImageDiffusionCrossAttentionBlock,
+            self_attn_class=ImageDiffusionSelfAttentionBlock,
+            cross_attn_class=ImageDiffusionCrossAttentionBlock,
             in_channels=3,
             model_channels=config.image_decoder_model_channels,
             out_channels=3,
@@ -154,57 +194,130 @@ class ImageDiffusionSingleTaskModel(nn.Module):
             cross_attn_use_flash_attention=config.image_decoder_cross_attn_use_flash_attention,
         )
 
-    def forward(self,
-                input_ids,
-                image_labels,
-                attention_mask=None,
-                past_key_values: list[megatransformer_utils.KVCache]=None,
-                use_cache=False):
-        text_embeddings = self.text_prelude(input_ids)
-
+    def get_input_embeddings(self):
+        return self.text_recurrent.wte
+    
+    def set_input_embeddings(self, new_embeddings):
+        self.text_recurrent.wte = new_embeddings
+    
+    def forward(
+        self,
+        input_ids=None,
+        image_raw_inputs=None,
+        image_labels=None,
+        attention_mask=None,
+        past_key_values: list[megatransformer_utils.KVCache]=None,
+        use_cache=False,
+        head_mask=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None):
         # recurrent model (for enriching the text embeddings as conditioning for the image diffuser)
-        text_embeddings = self.text_recurrent(
-            text_embeddings, 
+        recurrent_outputs = self.text_recurrent(
+            input_ids, 
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            head_mask=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
         )
+
+        logits = recurrent_outputs.logits
+        all_hidden_states = recurrent_outputs.hidden_states
+        all_attentions = recurrent_outputs.attentions
+
+        if len(image_labels.shape) == 5:
+            # for singular image diffusion, example dimension is unnecessary
+            B, E, C, H, W = image_labels.shape
+            image_labels = image_labels.view(B, C, H, W)
 
         # reconstruction, loss
-        return self.diffuser(
+        image_outputs, loss = self.diffuser(
             image_labels,
-            condition=text_embeddings,
+            condition=logits,
         )
 
-def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
-    tokenizer.add_special_tokens({
-        "additional_special_tokens": [
-            megatransformer_utils.BEGIN_AUDIO_TOKEN,
-            megatransformer_utils.END_AUDIO_TOKEN,
-            megatransformer_utils.BEGIN_IMAGE_TOKEN,
-            megatransformer_utils.END_IMAGE_TOKEN
-        ]
-    })
+        if not return_dict:
+            outputs = (
+                image_outputs,
+                past_key_values,
+                all_hidden_states,
+                all_attentions,
+                recurrent_outputs.n_steps_no_grad,
+                recurrent_outputs.k_steps_grad,
+            )
+            outputs = ((loss,) + outputs) if loss is not None else outputs
+        else:
+            outputs = megatransformer_utils.MegaTransformerMultimodalOutput(
+                loss=loss,
+                logits=image_outputs,
+                image_raw_outputs=image_outputs,
+                past_key_values=past_key_values,
+                hidden_states=all_hidden_states,
+                attentions=all_attentions,
+                n_steps_no_grad=recurrent_outputs.n_steps_no_grad,
+                k_steps_grad=recurrent_outputs.k_steps_grad,
+            )
+        return outputs
+    
+    def generate(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        num_samples=1,
+        override_ddim_sampling_steps=None,
+        past_key_values: list[megatransformer_utils.KVCache]=None,
+        use_cache=False,
+        head_mask=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict_in_generate=None,
+        diffusion_generator=None,
+    ):
 
-    begin_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_AUDIO_TOKEN)
-    end_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_AUDIO_TOKEN)
-    begin_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_IMAGE_TOKEN)
-    end_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_IMAGE_TOKEN)
+        # recurrent model (for enriching the text embeddings as conditioning for the image diffuser)
+        text_embeddings = self.text_recurrent(
+            input_ids, 
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=False,
+        )[0]
 
-    print(begin_audio_token_id, end_audio_token_id, begin_image_token_id, end_image_token_id)
+        if num_samples > 1 and text_embeddings.shape[0] == 1:
+            # repeat text embeddings for each sample along the batch dimension if num_samples > 1
+            text_embeddings = text_embeddings.repeat_interleave(num_samples, dim=0)
 
+        pred_x0, intermediate_images = self.diffuser.sample(
+            device=text_embeddings.device,
+            condition=text_embeddings,
+            batch_size=num_samples,
+            image_size=128,
+            return_intermediate=True,
+            override_ddim_sampling_steps=override_ddim_sampling_steps,
+            generator=diffusion_generator,
+        )
+        if return_dict_in_generate:
+            return megatransformer_utils.MultimodalGenerationOutput(
+                image_outputs=[pred_x0],
+                intermediate_image_outputs=intermediate_images,
+            )
+        return ([pred_x0], intermediate_images)
+
+def create_small_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     # uses a recurrent approach to emulate a deeper model (~317M params)
     config = megatransformer_utils.MegaTransformerConfig(
-        vocab_size=tokenizer.vocab_size + 4,
+        vocab_size=tokenizer.vocab_size,
         max_position_embeddings=max_position_embeddings,
         n_layers=None,
         n_prelude_layers=2,
         n_recurrent_layers=2,
-        n_coda_layers=2,
+        n_coda_layers=1,
         intermediate_activation="swiglu",
         norm_type="rmsnorm",
         ffn_type="mlp",
@@ -217,23 +330,10 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
 
-        begin_audio_token_id=begin_audio_token_id,
-        end_audio_token_id=end_audio_token_id,
-        begin_image_token_id=begin_image_token_id,
-        end_image_token_id=end_image_token_id,
-
-        audio_decoder_model_channels=64,
-        audio_decoder_time_embedding_dim=64,
-        audio_decoder_num_res_blocks=2,
-        audio_decoder_betas_schedule="cosine",
-        audio_decoder_down_block_self_attn_n_heads=4,
-        audio_decoder_up_block_self_attn_n_heads=4,
-        audio_decoder_cross_attn_n_heads=4,
-
-        image_decoder_model_channels=64,
-        image_decoder_time_embedding_dim=64,
-        image_decoder_num_res_blocks=2,
-        image_decoder_betas_schedule="cosine",
+        image_decoder_model_channels=72,
+        image_decoder_time_embedding_dim=72,
+        image_decoder_num_res_blocks=5,
+        image_decoder_betas_schedule="sigmoid",
     )
 
     config.text_prelude_config = config
@@ -246,7 +346,7 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
 
     return ImageDiffusionSingleTaskModel(config)
 
-def create_test_tiny_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
+def create_test_tiny_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     tokenizer.add_special_tokens({
         "additional_special_tokens": [
             megatransformer_utils.BEGIN_AUDIO_TOKEN,
@@ -265,7 +365,7 @@ def create_test_tiny_multimodal_model(tokenizer: PreTrainedTokenizer, max_positi
 
     # uses a recurrent approach to emulate a deeper model (~M params)
     config = megatransformer_utils.MegaTransformerConfig(
-        vocab_size=tokenizer.vocab_size + 4,
+        vocab_size=tokenizer.vocab_size,
         max_position_embeddings=max_position_embeddings,
         n_layers=None,
         hidden_size=8,
@@ -334,8 +434,8 @@ def create_test_tiny_multimodal_model(tokenizer: PreTrainedTokenizer, max_positi
     return ImageDiffusionSingleTaskModel(config)
 
 lookup = {
-    "small_multimodal": create_small_image_diffusion_model,
-    "test_tiny_multimodal": create_test_tiny_image_diffusion_model,
+    "small": create_small_image_diffusion_model,
+    "test_tiny": create_test_tiny_image_diffusion_model,
 }
 
 def model_config_lookup(config):

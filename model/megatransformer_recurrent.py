@@ -32,6 +32,7 @@ class MegaTransformerRawEmbedsRecurrentCausalModel(PreTrainedModel, GenerationMi
         self,
         inputs_embeds,
         attention_mask=None,
+        head_mask=None,
         past_key_values: list[megatransformer_utils.KVCache]=None,
         use_cache=False,
         output_attentions=True,
@@ -58,6 +59,7 @@ class MegaTransformerRawEmbedsRecurrentCausalModel(PreTrainedModel, GenerationMi
             outputs = block(
                 hidden_states,
                 attention_mask=attention_mask,
+                head_mask=head_mask,
                 past_key_values=past_key_value,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
@@ -130,6 +132,146 @@ class MegaTransformerRawEmbedsRecurrentCausalModel(PreTrainedModel, GenerationMi
 
         return {
             "inputs_embeds": inputs_embeds,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+
+class MegaTransformerRecurrentCausalModel(PreTrainedModel, GenerationMixin):
+    config_class = megatransformer_utils.MegaTransformerConfig
+    
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
+        super().__init__(config)
+        self.config = config
+        
+        # embedding and prelude
+        self.wte = nn.Embedding(config.vocab_size, config.hidden_size)
+
+        self.wpe: Optional[Union[nn.Embedding, nn.Parameter]] = None
+        if config.use_positional_embedding:
+            self.wpe = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        elif config.use_sinusoidal_embedding:
+            self.wpe = nn.Parameter(megatransformer_utils.create_sinusoidal_embedding(config.max_position_embeddings, config.hidden_size))
+            self.wpe.requires_grad = config.sinusoidal_embedding_learnable
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        self.recurrent = MegaTransformerRawEmbedsRecurrentCausalModel(config)
+        
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """Initialize weights as in the original implementation"""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+    
+    def get_input_embeddings(self):
+        return self.wte
+    
+    def set_input_embeddings(self, new_embeddings):
+        self.wte = new_embeddings
+    
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        past_key_values: list[megatransformer_utils.KVCache]=None,
+        use_cache=False,
+        head_mask=None,
+        inputs_embeds=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds")
+        
+        if input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        else:
+            batch_size, seq_length = inputs_embeds.shape[:2]
+        
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
+        
+        if inputs_embeds is None:
+            inputs_embeds = self.wte(input_ids)
+        
+        if self.wpe is not None:
+            if isinstance(self.wpe, nn.Parameter):
+                position_embeds = self.wpe
+                position_embeds = position_embeds[:, :seq_length, :].expand(batch_size, -1, -1)
+            else:
+                position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+                position_embeds = self.wpe(position_ids)
+            hidden_states = inputs_embeds + position_embeds
+        else:
+            # positional embedding likely applied in self attention block
+            hidden_states = inputs_embeds
+        
+        hidden_states = self.dropout(hidden_states)
+
+        # Initialize lists to store outputs for each layer
+        all_hidden_states: Optional[list] = [] if output_hidden_states else None
+        all_attentions: Optional[list] = [] if output_attentions else None
+        
+        recurrent_outputs = self.recurrent(
+            hidden_states,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        if all_hidden_states is not None:
+            all_hidden_states.extend(recurrent_outputs[2] if not return_dict else recurrent_outputs.all_hidden_states)
+            all_hidden_states.append(recurrent_outputs[0] if not return_dict else recurrent_outputs.hidden_states)
+
+        if all_attentions is not None:
+            all_attentions.extend(recurrent_outputs[3] if not return_dict else recurrent_outputs.all_attentions)
+
+        if not return_dict:
+            return (
+                recurrent_outputs[0],
+                past_key_values,
+                all_hidden_states,
+                all_attentions,
+                recurrent_outputs[-2] if recurrent_outputs is not None else None,
+                recurrent_outputs[-1] if recurrent_outputs is not None else None,
+            )
+        
+        return megatransformer_utils.MegaTransformerCausalOutput(
+            logits=recurrent_outputs.hidden_states,
+            past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            n_steps_no_grad=recurrent_outputs.n_steps_no_grad if recurrent_outputs is not None else None,
+            k_steps_grad=recurrent_outputs.k_steps_grad if recurrent_outputs is not None else None,
+        )
+    
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask: torch.Tensor=None, **kwargs):
+        if past_key_values is not None and past_key_values[0] is not None:
+            input_ids = input_ids[:, -1:]
+
+        use_cache = kwargs.get("use_cache", True)
+        position_ids = kwargs.get("position_ids", None)
+        
+        if position_ids is not None:
+            position_ids = position_ids[:, -1:] if position_ids is not None else None
+
+        return {
+            "input_ids": input_ids,
             "past_key_values": past_key_values,
             "use_cache": use_cache,
             "attention_mask": attention_mask,

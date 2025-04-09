@@ -11,7 +11,10 @@ def get_transform(image_size):
     if image_size is None:
         raise ValueError("Image size must be specified for image transformations")
     return transforms.Compose([
-        transforms.Resize((image_size, image_size)),
+        # transforms.Resize((image_size, image_size)),
+        transforms.RandomResizedCrop((image_size, image_size), scale=(0.8, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0]),
     ])

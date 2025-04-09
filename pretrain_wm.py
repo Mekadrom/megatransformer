@@ -146,6 +146,7 @@ if 'multimodal' in args.config.lower():
         image_size=model.config.image_size,
         audio_max_frames=model.config.audio_max_frames,
         audio_max_waveform_length=model.config.audio_max_waveform_length,
+        modes=args.include_modes,
         mlm=False,
     )
 else:
