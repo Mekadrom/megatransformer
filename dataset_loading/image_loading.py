@@ -62,7 +62,7 @@ def load_image_dataset(dataset_name: str,
 
         for caption, image_url in zip(captions, image_urls):
             image_raw_input = fetch_and_transform_image(image_url, transform)
-            if image_raw_input is None:
+            if caption is None or image_raw_input is None:
                 # add dummy example
                 image_raw_input = torch.zeros((3, image_size, image_size), dtype=torch.float32)
                 input_ids = [begin_image_token_id, end_image_token_id]

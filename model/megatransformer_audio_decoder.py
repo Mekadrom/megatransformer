@@ -30,7 +30,7 @@ class AudioDiffusionSelfAttentionBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(megatransformer_utils.transformer_weight_init)
+        self.apply(megatransformer_utils.transformer_weight_init())
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -115,7 +115,7 @@ class AudioDiffusionCrossAttentionBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(megatransformer_utils.transformer_weight_init)
+        self.apply(megatransformer_utils.transformer_weight_init())
     
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         B, H, W, T = x.size()

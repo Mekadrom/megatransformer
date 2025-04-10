@@ -183,7 +183,7 @@ class MegaTransformerConfig(PretrainedConfig):
         audio_max_duration=10.0, # used for trimming data/skipping examples that are too long
         audio_sample_rate=16000,
 
-        image_size=128,
+        image_size=64,
 
         audio_encoder_base_channels=32,
         audio_encoder_kernel_sizes=[3, 3, 3, 3, 3, 3],
@@ -232,7 +232,7 @@ class MegaTransformerConfig(PretrainedConfig):
         image_coda_config=None,
 
         image_decoder_model_channels=128,
-        image_decoder_time_embedding_dim=128,
+        image_decoder_time_embedding_dim=256,
         image_decoder_num_res_blocks=4,
         image_decoder_activation="silu",
         image_decoder_dropout=0.1,
@@ -809,7 +809,7 @@ def embedding_weight_init(hidden_size):
                 module.bias.data.zero_()
     return init_weights
 
-def transformer_weight_init(hidden_size):
+def transformer_weight_init():
     def init_weights(module):
         if isinstance(module, nn.Linear):
             nn.init.xavier_normal_(module.weight, gain=0.02)

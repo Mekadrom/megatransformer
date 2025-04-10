@@ -455,13 +455,19 @@ class ImageGenerationCallback(TrainerCallback):
         self.tokenizer = tokenizer
         self.generation_steps = generation_steps
 
-        self.test_image: Any = Image.open("test_vlm.png").convert("RGB")
-        self.test_image = transforms.ToTensor()(self.test_image)
+        self.test_image1: Any = Image.open("test_vlm1.png").convert("RGB")
+        self.test_image2: Any = Image.open("test_vlm2.png").convert("RGB")
+        self.test_images = [
+            transforms.ToTensor()(self.test_image1),
+            transforms.ToTensor()(self.test_image1),
+            transforms.ToTensor()(self.test_image1),
+            transforms.ToTensor()(self.test_image2),
+        ]
         self.test_image_prompt_text = [
             "A man ironing a shirt while strapped to the back of a taxi on a busy street.",
             "A man strapped to the back of a taxi ironing a shirt on a busy street.",
             "A man on the back of a taxi ironing a shirt. The taxi is driving on a busy street.",
-            "A taxi driving through a busy street with a man strapped to the back of it. He is ironing a shirt.",
+            "bedroom minimalist home interior storage for kids bedroom design",
         ]
         self.test_image_prompt = tokenizer(self.test_image_prompt_text, return_tensors="pt", padding=True)
 
@@ -485,6 +491,12 @@ class ImageGenerationCallback(TrainerCallback):
                 with autocast(device.type, dtype=torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32):
                     self.log_generate(model, state, writer, None, device, "linear")
                     self.log_generate(model, state, writer, 50, device, "ddim")
+                    label_grid = torchvision.utils.make_grid(self.test_images, nrow=2, padding=1)
+                    writer.add_image(
+                        f"generated_image/label",
+                        label_grid,
+                        state.global_step,
+                    )
 
     def log_generate(self, model: megatransformer_image_decoder.ImageDiffusionSingleTaskModel, state, writer, ddim_steps, device, sample_type):
         diffusion_generator = torch.Generator(device=device)
@@ -503,7 +515,7 @@ class ImageGenerationCallback(TrainerCallback):
 
         # images are in shape (batch_size, channels, height, width)
         image_output = image_generation_outputs.image_outputs[0].cpu()
-        image_intermediate_outputs = image_generation_outputs.intermediate_image_outputs
+        noise_preds, x_start_preds = image_generation_outputs.intermediate_image_outputs
 
         image_output = torchvision.utils.make_grid(image_output, nrow=2, padding=1)
 
@@ -519,14 +531,25 @@ class ImageGenerationCallback(TrainerCallback):
             image_output.squeeze(0),
             state.global_step,
         )
-        for i, timestep_image in zip(reversed(range(len(image_intermediate_outputs))), image_intermediate_outputs):
-            timestep_image = timestep_image.cpu()
-            timestep_image = torchvision.utils.make_grid(timestep_image, nrow=2, padding=1)
+        for i, noise_pred, x_start_pred in zip(reversed(range(len(noise_preds))), noise_preds, x_start_preds):
+            noise_pred = noise_pred.cpu()
+            x_start_pred = x_start_pred.cpu()
+
+            noise_pred = torchvision.utils.make_grid(noise_pred, nrow=2, padding=1)
+            x_start_pred = torchvision.utils.make_grid(x_start_pred, nrow=2, padding=1)
+
             writer.add_image(
-                f"generated_image/timestep_{i}_{sample_type}",
-                timestep_image.squeeze(0),
+                f"generated_image/timestep_{i}_{sample_type}_noise",
+                noise_pred.squeeze(0),
                 state.global_step,
             )
+
+            writer.add_image(
+                f"generated_image/timestep_{i}_{sample_type}_x_start",
+                x_start_pred.squeeze(0),
+                state.global_step,
+            )
+
         for i, text in enumerate(self.test_image_prompt_text):
             writer.add_text(
                 f"generated_image/prompt_{i}_{sample_type}",

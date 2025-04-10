@@ -30,7 +30,7 @@ class TextFeatureExtractor(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(megatransformer_utils.embedding_weight_init)
+        self.apply(megatransformer_utils.embedding_weight_init(self.config.hidden_size))
 
     def forward(
         self,

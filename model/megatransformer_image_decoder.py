@@ -10,8 +10,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ImageDiffusionSelfAttentionBlock(nn.Module):
-    def __init__(self, hidden_size, n_heads, d_queries, d_values, use_flash_attention=True, dropout=0.1):
+class ImageRMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+
+        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
+
+    def forward(self, x):
+        return F.normalize(x, dim=1) * self.g * (x.shape[-1] ** 0.5)
+
+class ImageSelfAttentionBlock(nn.Module):
+    def __init__(self, hidden_size, n_heads, d_queries, d_values, use_flash_attention=True, dropout=0.1, is_linear_attention=True):
         super().__init__()
         self.hidden_dim = hidden_size
         self.n_heads = n_heads
@@ -19,19 +28,19 @@ class ImageDiffusionSelfAttentionBlock(nn.Module):
         self.d_values = d_values
         self.use_flash_attention = use_flash_attention
         self.dropout_p = dropout  # Store dropout probability for flash attention
+        self.is_linear_attention = is_linear_attention
 
-        self.q_proj = nn.Linear(hidden_size, d_queries * n_heads)
-        self.k_proj = nn.Linear(hidden_size, d_queries * n_heads)
-        self.v_proj = nn.Linear(hidden_size, d_values * n_heads)
-        
-        self.out_proj = nn.Linear(self.d_values * n_heads, hidden_size)
+        self.q_proj = nn.Conv2d(hidden_size, d_queries * n_heads, kernel_size=1, bias=False)
+        self.k_proj = nn.Conv2d(hidden_size, d_queries * n_heads, kernel_size=1, bias=False)
+        self.v_proj = nn.Conv2d(hidden_size, d_values * n_heads, kernel_size=1, bias=False)
+        self.out_proj = nn.Conv2d(self.d_values * n_heads, hidden_size, kernel_size=1)
         
         self.dropout = nn.Dropout(dropout)
 
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(megatransformer_utils.transformer_weight_init)
+        self.apply(megatransformer_utils.transformer_weight_init())
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -42,22 +51,18 @@ class ImageDiffusionSelfAttentionBlock(nn.Module):
             output: [B, C, H, W] where attention is applied along the spatial dimensions.
         """
         B, C, H, W = x.shape
-        seq_len = H * W
 
-        x = x.contiguous().view(B, C, seq_len)  # [B, C, H*W]
-        x = x.permute(0, 2, 1)  # [B, H*W, C]
+        q: torch.Tensor = self.q_proj(x)  # [B, n_heads*d_queries, H, W]
+        k: torch.Tensor = self.k_proj(x)  # [B, n_heads*d_queries, H, W]
+        v: torch.Tensor = self.v_proj(x)  # [B, n_heads*d_values, H, W]
         
-        q: torch.Tensor = self.q_proj(x)  # [B, H*W, n_heads*d_queries]
-        k: torch.Tensor = self.k_proj(x)  # [B, H*W, n_heads*d_queries]
-        v: torch.Tensor = self.v_proj(x)  # [B, H*W, n_heads*d_values]
-        
-        q = q.view(B, seq_len, self.n_heads, self.d_queries)  # [B, H*W, n_heads, d_queries]
-        k = k.view(B, seq_len, self.n_heads, self.d_queries)  # [B, H*W, n_heads, d_queries]
-        v = v.view(B, seq_len, self.n_heads, self.d_values)  # [B, H*W, n_heads, d_values]
-        
-        q = q.transpose(1, 2)  # [B, n_heads, H*W, d_queries]
-        k = k.transpose(1, 2)  # [B, n_heads, H*W, d_queries]
-        v = v.transpose(1, 2)  # [B, n_heads, H*W, d_values]
+        q = q.view(B, self.n_heads, self.d_queries, -1)  # [B, n_heads, d_queries, H*W]
+        k = k.view(B, self.n_heads, self.d_queries, -1)  # [B, n_heads, d_queries, H*W]
+        v = v.view(B, self.n_heads, self.d_values, -1)  # [B, n_heads, d_values, H*W]
+
+        if self.is_linear_attention:
+            q = q.softmax(dim=-2)
+            k = k.softmax(dim=-1)
         
         output: torch.Tensor
         if self.use_flash_attention:
@@ -76,18 +81,12 @@ class ImageDiffusionSelfAttentionBlock(nn.Module):
             
             output = torch.matmul(attn_weights, v)  # [B, n_heads, H*W, d_values]
         
-        output = output.transpose(1, 2).contiguous()  # [B, H*W, n_heads, d_values]
-        output = output.view(B, seq_len, self.n_heads*self.d_values)  # [B, H*W, n_heads*d_values]
-        
+        output = output.contiguous().view(B, -1, H, W)  # [B, n_heads*d_values, H, W]
         output = self.out_proj(output)  # [B, H*W, C]
 
-        # Reshape back to original spatial dimensions
-        output = output.view(B, H, W, C)
-        output = output.permute(0, 3, 1, 2)  # [B, C, H, W]
-        
         return output
 
-class ImageDiffusionCrossAttentionBlock(nn.Module):
+class ImageCrossAttentionBlock(nn.Module):
     def __init__(self, hidden_size, n_heads, d_queries, d_values, context_dim=None, use_flash_attention=True, dropout=0.1):
         super().__init__()
         self.hidden_size = hidden_size
@@ -108,7 +107,7 @@ class ImageDiffusionCrossAttentionBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(megatransformer_utils.transformer_weight_init)
+        self.apply(megatransformer_utils.transformer_weight_init())
     
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.size()
@@ -170,8 +169,9 @@ class ImageDiffusionSingleTaskModel(nn.Module):
             activation=config.image_decoder_activation,
             scale_factor=(2, 2),
             stride=(2, 2),
-            self_attn_class=ImageDiffusionSelfAttentionBlock,
-            cross_attn_class=ImageDiffusionCrossAttentionBlock,
+            self_attn_class=ImageSelfAttentionBlock,
+            cross_attn_class=ImageCrossAttentionBlock,
+            norm_class=ImageRMSNorm,
             in_channels=3,
             model_channels=config.image_decoder_model_channels,
             out_channels=3,
@@ -293,11 +293,11 @@ class ImageDiffusionSingleTaskModel(nn.Module):
             # repeat text embeddings for each sample along the batch dimension if num_samples > 1
             text_embeddings = text_embeddings.repeat_interleave(num_samples, dim=0)
 
-        pred_x0, intermediate_images = self.diffuser.sample(
+        pred_x0, noise_preds, x_start_preds = self.diffuser.sample(
             device=text_embeddings.device,
             condition=text_embeddings,
             batch_size=num_samples,
-            image_size=128,
+            image_size=64,
             return_intermediate=True,
             override_ddim_sampling_steps=override_ddim_sampling_steps,
             generator=diffusion_generator,
@@ -305,9 +305,9 @@ class ImageDiffusionSingleTaskModel(nn.Module):
         if return_dict_in_generate:
             return megatransformer_utils.MultimodalGenerationOutput(
                 image_outputs=[pred_x0],
-                intermediate_image_outputs=intermediate_images,
+                intermediate_image_outputs=(noise_preds, x_start_preds),
             )
-        return ([pred_x0], intermediate_images)
+        return ([pred_x0], (noise_preds, x_start_preds))
 
 def create_small_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     # uses a recurrent approach to emulate a deeper model (~317M params)
@@ -333,7 +333,7 @@ def create_small_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_posit
         image_decoder_model_channels=72,
         image_decoder_time_embedding_dim=72,
         image_decoder_num_res_blocks=5,
-        image_decoder_betas_schedule="sigmoid",
+        image_decoder_betas_schedule="cosine",
     )
 
     config.text_prelude_config = config

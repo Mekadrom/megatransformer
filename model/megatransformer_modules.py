@@ -29,7 +29,6 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(emb_dim))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
         x_sqr = x**2
         RMS = torch.rsqrt(x_sqr.mean(dim = -1, keepdim = True) + self.eps)
         new_x = x * RMS

@@ -11,17 +11,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class Block(nn.Module):
+    def __init__(self, in_channels, out_channels, activation, norm):
+        super().__init__()
+
+        activation_type = megatransformer_utils.get_activation_type(activation)
+
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm = norm(out_channels)
+        self.act = activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(in_channels)
+
+    def forward(self, x, time_embedding=None):
+        x = self.proj(x)
+        x = self.norm(x)
+
+        if time_embedding is not None:
+            x = x + time_embedding
+
+        x = self.act(x)
+
+        return x
+
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, time_embedding_dim, activation, dropout):
+    def __init__(self, in_channels, out_channels, time_embedding_dim, activation, norm):
         super().__init__()
         self.time_embedding_dim = time_embedding_dim
 
         activation_type = megatransformer_utils.get_activation_type(activation)
-        self.conv1 = nn.Sequential(
-            nn.GroupNorm(8, in_channels),
-            activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(in_channels),
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-        )
 
         if time_embedding_dim is not None:
             self.time_mlp = nn.Sequential(
@@ -29,43 +45,36 @@ class ResidualBlock(nn.Module):
                 nn.Linear(time_embedding_dim, out_channels),
             )
 
-        self.conv2 = nn.Sequential(
-            nn.GroupNorm(8, out_channels),
-            activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(out_channels),
-            nn.Dropout(dropout),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-        )
+        self.block1 = Block(in_channels, out_channels, activation, norm=norm)
+        self.block2 = Block(out_channels, out_channels, activation, norm=norm)
 
         if in_channels != out_channels:
             self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
             self.shortcut = nn.Identity()
 
-        self._init_weights()
+        self.apply(self._init_weights)
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.GroupNorm):
-                m.weight.data.fill_(1)
+    def _init_weights(self, m):
+        if isinstance(m, nn.GroupNorm):
+            m.weight.data.fill_(1)
+            m.bias.data.zero_()
+        elif isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, a=0.2)
+            if m.bias is not None:
                 m.bias.data.zero_()
-            elif isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, a=0.2)
-                if m.bias is not None:
-                    m.bias.data.zero_()
         if isinstance(self.shortcut, nn.Conv2d):
             nn.init.kaiming_normal_(self.shortcut.weight, a=0.2)
             self.shortcut.bias.data.zero_()
 
     def forward(self, x: torch.Tensor, time_embedding: Optional[torch.Tensor]=None) -> torch.Tensor:
-        h = self.conv1(x)
-
+        time_embedding = None
         if self.time_embedding_dim is not None and time_embedding is not None:
             time_embedding = self.time_mlp(time_embedding)
-            h = h + time_embedding.unsqueeze(-1).unsqueeze(-1)
 
-        h = self.conv2(h)
-        h = h + self.shortcut(x)
-        return h
+        h = self.block1(x, time_embedding=time_embedding)
+        h = self.block2(h)
+        return h + self.shortcut(x)
 
 class DownBlock(nn.Module):
     def __init__(self,
@@ -75,6 +84,7 @@ class DownBlock(nn.Module):
                  time_embedding_dim: int,
                  activation,
                  self_attn_class,
+                 norm_class,
                  has_attn: bool=False,
                  num_res_blocks: int=2,
                  dropout: float=0.1,
@@ -85,12 +95,12 @@ class DownBlock(nn.Module):
         super().__init__()
 
         self.norms = nn.ModuleList([
-            nn.LayerNorm(in_channels if i == 0 else out_channels)
+            megatransformer_modules.RMSNorm(in_channels if i == 0 else out_channels)
             for i in range(num_res_blocks)
         ])
 
         self.res_blocks = nn.ModuleList([
-            ResidualBlock(in_channels if i == 0 else out_channels, out_channels, time_embedding_dim, activation, dropout)
+            ResidualBlock(in_channels if i == 0 else out_channels, out_channels, time_embedding_dim, activation, norm_class)
             for i in range(num_res_blocks)
         ])
 
@@ -130,6 +140,7 @@ class UpBlock(nn.Module):
                  scale_factor,
                  self_attn_class,
                  cross_attn_class,
+                 norm_class,
                  has_attn: bool=False,
                  has_condition: bool=False,
                  num_res_blocks: int=2,
@@ -150,12 +161,12 @@ class UpBlock(nn.Module):
         )
 
         self.norms = nn.ModuleList([
-            nn.LayerNorm(in_channels*2 if i == 0 else out_channels)
+            megatransformer_modules.RMSNorm(in_channels*2 if i == 0 else out_channels)
             for i in range(num_res_blocks)
         ])
 
         self.res_blocks = nn.ModuleList([
-            ResidualBlock(in_channels*2 if i == 0 else out_channels, out_channels, time_embedding_dim, activation, dropout)
+            ResidualBlock(in_channels*2 if i == 0 else out_channels, out_channels, time_embedding_dim, activation, norm_class)
             for i in range(num_res_blocks)
         ])
 
@@ -201,6 +212,7 @@ class UNet(nn.Module):
             activation,
             self_attn_class,
             cross_attn_class,
+            norm_class,
             scale_factor: Union[int, tuple[int, int]] = 2,
             stride: Union[int, tuple[int, int]] = 1,
             in_channels: int = 3,
@@ -251,6 +263,7 @@ class UNet(nn.Module):
                     time_embedding_dim,
                     activation,
                     self_attn_class,
+                    norm_class,
                     has_attn=attention_levels[i],
                     num_res_blocks=num_res_blocks,
                     dropout=dropout,
@@ -262,13 +275,14 @@ class UNet(nn.Module):
             )
 
         self.middle_res_block = ResidualBlock(
-            channels[-1], channels[-1], time_embedding_dim, activation, dropout
+            channels[-1], channels[-1], time_embedding_dim, activation, norm_class
         )
+        self.middle_attn_norm = megatransformer_modules.RMSNorm(channels[-1])
         self.middle_attn_block = self_attn_class(
-            channels[-1], down_block_self_attn_n_heads, down_block_self_attn_d_queries, down_block_self_attn_d_values, use_flash_attention=down_block_self_attn_use_flash_attention, dropout=dropout
+            channels[-1], down_block_self_attn_n_heads, down_block_self_attn_d_queries, down_block_self_attn_d_values, use_flash_attention=down_block_self_attn_use_flash_attention, dropout=dropout, is_linear_attention=False
         )
         self.middle_res_block2 = ResidualBlock(
-            channels[-1], channels[-1], time_embedding_dim, activation, dropout
+            channels[-1], channels[-1], time_embedding_dim, activation, norm_class
         )
 
         self.up_blocks = nn.ModuleList()
@@ -283,6 +297,7 @@ class UNet(nn.Module):
                     scale_factor,
                     self_attn_class,
                     cross_attn_class,
+                    norm_class,
                     has_attn=attention_levels[i],
                     num_res_blocks=num_res_blocks,
                     dropout=dropout,
@@ -299,7 +314,7 @@ class UNet(nn.Module):
             )
 
         self.final_res_block = ResidualBlock(
-            model_channels*2, model_channels, time_embedding_dim, activation, dropout
+            model_channels*2, model_channels, time_embedding_dim, activation, norm_class
         )
         self.final_conv = nn.Conv2d(model_channels, out_channels, kernel_size=3, padding=1)
 
@@ -323,7 +338,11 @@ class UNet(nn.Module):
             skips.append(skip)
         
         h = self.middle_res_block(h, time_embedding)
-        h = self.middle_attn_block(h)
+        residual = h
+        h = h.permute(0, 2, 3, 1).contiguous()
+        h = self.middle_attn_norm(h)
+        h = h.permute(0, 3, 1, 2).contiguous()
+        h = residual + self.middle_attn_block(h)
         h = self.middle_res_block2(h, time_embedding)
 
         for i, (up_block, skip) in enumerate(zip(self.up_blocks, reversed(skips))):
@@ -345,6 +364,7 @@ class GaussianDiffusion(nn.Module):
             stride,
             self_attn_class,
             cross_attn_class,
+            norm_class,
             in_channels: int,
             model_channels: int,
             out_channels: int,
@@ -397,6 +417,7 @@ class GaussianDiffusion(nn.Module):
             stride=stride,
             self_attn_class=self_attn_class,
             cross_attn_class=cross_attn_class,
+            norm_class=norm_class,
             in_channels=in_channels,
             model_channels=model_channels,
             out_channels=out_channels,
@@ -518,7 +539,7 @@ class GaussianDiffusion(nn.Module):
         if clip_denoised:
             x_start.clamp_(-1., 1.)
 
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
@@ -537,12 +558,14 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def p_sample_loop(self, x, condition=None, return_intermediate: bool=False):
-        intermediate_images = []
+        noise_preds = []
+        x_start_preds = []
         for time_step in reversed(range(0, self.num_timesteps)):
-            x, _ = self.p_sample(x, time_step, condition=condition)
+            x, x_start = self.p_sample(x, time_step, condition=condition)
             if return_intermediate:
-                intermediate_images.append(x)
-        return x, intermediate_images if return_intermediate else x
+                noise_preds.append(x)
+                x_start_preds.append(x_start)
+        return x, noise_preds, x_start_preds if return_intermediate else x
 
     @torch.no_grad()
     def ddim_sample_loop(self, x, condition=None, return_intermediate=False, override_sampling_steps=None):
@@ -553,10 +576,11 @@ class GaussianDiffusion(nn.Module):
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
         img = torch.randn_like(x, device=x.device)
-        intermediate = []
+
+        noise_preds = []
+        x_start_preds = []
 
         x_start = None
-
         for time, time_next in time_pairs:
             time_cond = torch.full((x.shape[0],), time, device=x.device, dtype = torch.long)
             pred_noise, x_start = self.model_predictions(img, time_cond, condition=condition, clip_x_start=True)
@@ -578,9 +602,10 @@ class GaussianDiffusion(nn.Module):
                   sigma * noise
             
             if return_intermediate:
-                intermediate.append(img)
+                noise_preds.append(img)
+                x_start_preds.append(x_start)
 
-        return img, intermediate if return_intermediate else img
+        return img, noise_preds, x_start_preds if return_intermediate else img
 
     @torch.no_grad()
     def sample(self, device, batch_size: int, image_size: int, condition: Optional[torch.Tensor]=None, return_intermediate: bool=False, override_ddim_sampling_steps: Optional[int]=None, generator=None) -> torch.Tensor:
@@ -599,7 +624,7 @@ class GaussianDiffusion(nn.Module):
         if self.normalize:
             img = self.unnormalize_to_zero_to_one(img)
 
-        return img, x[1] if return_intermediate else img
+        return (img, *x[1:]) if return_intermediate else img
     
     @autocast('cuda', enabled = False)
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor]=None) -> torch.Tensor:

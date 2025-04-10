@@ -41,7 +41,7 @@ class MegaTransformerBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(megatransformer_utils.transformer_weight_init)
+        self.apply(megatransformer_utils.transformer_weight_init())
     
     def forward(
         self,
@@ -154,7 +154,7 @@ class MegaTransformerRecurrentBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(megatransformer_utils.transformer_weight_init)
+        self.apply(megatransformer_utils.transformer_weight_init())
         
     def initialize_thinking_state(self, input_embeds):
         """
