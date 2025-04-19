@@ -22,8 +22,8 @@ tokenizer.padding_side = "right"
 
 model_maker = megatransformer_image_decoder
 
-model = model_maker.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
-model = megatransformer_utils.load_model(False, model, run_dir)
+model = model_maker.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings, args.use_gradient_checkpointing)
+model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
 
 if args.local_rank == 0 or not args.use_deepspeed:
     print(f"model structure: {model}")
@@ -121,12 +121,13 @@ trainer = custom_trainers.trainer_lookup(args, args.trainer)(
 
 generation_callback = custom_callbacks.ImageGenerationCallback(
     tokenizer=tokenizer,
+    step_offset=args.start_step,
     generation_steps=args.generation_steps,
 )
 trainer.add_callback(generation_callback)
 generation_callback.trainer = trainer
 
-metrics_callback = custom_callbacks.MetricsCallback()
+metrics_callback = custom_callbacks.MetricsCallback(step_offset=args.start_step,)
 trainer.add_callback(metrics_callback)
 metrics_callback.trainer = trainer
 

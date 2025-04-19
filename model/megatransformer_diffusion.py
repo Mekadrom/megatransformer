@@ -9,6 +9,7 @@ import megatransformer_utils
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 
 class Block(nn.Module):
@@ -238,6 +239,7 @@ class UNet(nn.Module):
             cross_attn_use_flash_attention=True,
     ):
         super().__init__()
+        self.use_gradient_checkpointing = False
 
         activation_type = megatransformer_utils.get_activation_type(activation)
         self.time_embedding = nn.Sequential(
@@ -337,7 +339,10 @@ class UNet(nn.Module):
             h, skip = down_block(h, time_embedding, condition=condition)
             skips.append(skip)
         
-        h = self.middle_res_block(h, time_embedding)
+        if self.use_gradient_checkpointing and self.training:
+            h = checkpoint.checkpoint(self.middle_res_block, h, time_embedding)
+        else:
+            h = self.middle_res_block(h, time_embedding)
         residual = h
         h = h.permute(0, 2, 3, 1).contiguous()
         h = self.middle_attn_norm(h)

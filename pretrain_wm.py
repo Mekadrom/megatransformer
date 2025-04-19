@@ -176,6 +176,7 @@ if 'multimodal' in args.config.lower():
     generation_callback = custom_callbacks.MultimodalGenerationCallback(
         tokenizer=tokenizer,
         text_only_prompts=prompts,
+        step_offset=args.start_step,
         generation_steps=args.generation_steps,
     )
     trainer.add_callback(generation_callback)
@@ -185,14 +186,15 @@ else:
     generation_callback = custom_callbacks.GenerationCallback(
         tokenizer=tokenizer,
         prompts=prompts,
+        step_offset=args.start_steps,
         generation_steps=args.generation_steps,
     )
     trainer.add_callback(generation_callback)
     generation_callback.trainer = trainer
 
-metrics_callback = custom_callbacks.MetricsCallback()
+metrics_callback = custom_callbacks.MetricsCallback(step_offset=args.start_step,)
 trainer.add_callback(metrics_callback)
 metrics_callback.trainer = trainer
 
 print(f"Starting training with {sum(p.numel() for p in model.parameters()):,} parameters")
-trainer.train()
+trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)

@@ -194,6 +194,9 @@ class ImageDiffusionSingleTaskModel(nn.Module):
             cross_attn_use_flash_attention=config.image_decoder_cross_attn_use_flash_attention,
         )
 
+    def gradient_checkpointing_enable(self, **kwargs):
+        self.diffuser.unet.use_gradient_checkpointing = True
+
     def get_input_embeddings(self):
         return self.text_recurrent.wte
     
@@ -309,7 +312,7 @@ class ImageDiffusionSingleTaskModel(nn.Module):
             )
         return ([pred_x0], (noise_preds, x_start_preds))
 
-def create_small_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
+def create_small_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_position_embeddings, use_gradient_checkpointing):
     # uses a recurrent approach to emulate a deeper model (~317M params)
     config = megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
@@ -334,6 +337,8 @@ def create_small_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_posit
         image_decoder_time_embedding_dim=72,
         image_decoder_num_res_blocks=5,
         image_decoder_betas_schedule="cosine",
+
+        use_gradient_checkpointing=use_gradient_checkpointing,
     )
 
     config.text_prelude_config = config
@@ -346,7 +351,7 @@ def create_small_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_posit
 
     return ImageDiffusionSingleTaskModel(config)
 
-def create_test_tiny_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
+def create_test_tiny_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_position_embeddings, use_gradient_checkpointing):
     tokenizer.add_special_tokens({
         "additional_special_tokens": [
             megatransformer_utils.BEGIN_AUDIO_TOKEN,
@@ -421,6 +426,8 @@ def create_test_tiny_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_p
         image_decoder_cross_attn_n_heads=2,
         image_decoder_cross_attn_d_queries=16,
         image_decoder_cross_attn_d_values=16,
+
+        use_gradient_checkpointing=use_gradient_checkpointing,
     )
 
     config.text_prelude_config = config

@@ -602,6 +602,8 @@ def parse_args():
     argparser.add_argument('--max_position_embeddings', type=int, default=4096, help='Max position embeddings (maximum sequence length)')
     argparser.add_argument('--cpu', action='store_true', help='Use CPU for training')
     argparser.add_argument('--log_level', type=str, default='warning', help='Logging level: debug, info, warning, error, critical')
+    argparser.add_argument('--resume_from_checkpoint', action='store_true', help='Resume from checkpoint')
+    argparser.add_argument('--start_step', type=int, default=0, help='Start step for training')
 
     # efficiency params
     argparser.add_argument('--compile_model', action='store_true', help='Whether to compile the model')
@@ -741,7 +743,7 @@ def load_model(finetune, model, run_dir):
         if finetune:
             raise ValueError("Fine-tuning is enabled but no checkpoint found. Please check the run directory, or your configuration.")
 
-    return model
+    return model, model_loaded
 
 
 def get_token_correlation(hidden_states):

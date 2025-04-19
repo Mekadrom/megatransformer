@@ -29,14 +29,17 @@ def get_writer(trainer: Trainer):
 
 
 class GenerationCallback(TrainerCallback):
-    def __init__(self, tokenizer, prompts, generation_steps=2000):
+    def __init__(self, tokenizer, prompts, step_offset, generation_steps=2000):
         self.trainer: Optional[Trainer] = None
         self.tokenizer = tokenizer
         self.prompts = prompts
         self.generation_steps = generation_steps
+        self.step_offset = step_offset
         
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        if ((state.global_step == 1) or (state.global_step % self.generation_steps == 0)) and state.is_world_process_zero:
+        global_step = state.global_step + self.step_offset
+
+        if ((global_step == 1) or (global_step % self.generation_steps == 0)) and state.is_world_process_zero:
             writer = get_writer(self.trainer)
             if writer is None:
                 print("No TensorBoard writer found, skipping generation...")
@@ -44,7 +47,7 @@ class GenerationCallback(TrainerCallback):
 
             inputs = self.tokenizer(self.prompts, padding=True, return_tensors="pt").to(model.device)
 
-            print(f"Generating text at step {state.global_step}...")
+            print(f"Generating text at step {global_step}...")
             
             with torch.no_grad():
                 outputs = model.generate(
@@ -61,12 +64,13 @@ class GenerationCallback(TrainerCallback):
             generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
             
             for i, text in enumerate(generated_texts):
-                writer.add_text(f"generation/sample_{i}", text, state.global_step)
+                writer.add_text(f"generation/sample_{i}", text, global_step)
 
 class MultimodalGenerationCallback(TrainerCallback):
     def __init__(self,
                  tokenizer: PreTrainedTokenizer,
                  text_only_prompts,
+                 step_offset,
                  audio_sample_rate: int = 16000,
                  audio_n_mels: int = 128,
                  audio_n_fft: int = 1024,
@@ -75,6 +79,7 @@ class MultimodalGenerationCallback(TrainerCallback):
         self.trainer: Optional[Trainer] = None
         self.tokenizer = tokenizer
         self.text_only_prompts = text_only_prompts
+        self.step_offset = step_offset,
         self.generation_steps = generation_steps
 
         self.test_audio_waveforms, self.sample_rate = torchaudio.load("test_alm.mp3")
@@ -95,7 +100,9 @@ class MultimodalGenerationCallback(TrainerCallback):
         self.test_image_prompt = tokenizer(self.test_image_prompt_text, return_tensors="pt")
 
     def on_step_end(self, args, state, control, model: megatransformer_multimodal.MegaTransformerCausalWMHeads=None, **kwargs):
-        if ((state.global_step == 1) or (state.global_step % self.generation_steps == 0)) and state.is_world_process_zero:
+        global_step = state.global_step + self.step_offset
+
+        if ((global_step == 1) or (global_step % self.generation_steps == 0)) and state.is_world_process_zero:
             writer = get_writer(self.trainer)
             if writer is None:
                 print("No TensorBoard writer found, skipping generation...")
@@ -107,7 +114,7 @@ class MultimodalGenerationCallback(TrainerCallback):
             test_image_prompt = self.test_image_prompt.to(model.device)
             test_image = self.test_image.unsqueeze(0).unsqueeze(0).to(model.device)
 
-            print(f"Generating at step {state.global_step}...")
+            print(f"Generating at step {global_step}...")
             
             text_only_inputs = self.tokenizer(self.text_only_prompts, padding=True, return_tensors="pt").to(model.device)
             with torch.no_grad():
@@ -127,7 +134,7 @@ class MultimodalGenerationCallback(TrainerCallback):
                     generated_texts = self.tokenizer.batch_decode(outputs[0], skip_special_tokens=True)
                     
                     for i, text in enumerate(generated_texts):
-                        writer.add_text(f"generation/sample_{i}", text, state.global_step)
+                        writer.add_text(f"generation/sample_{i}", text, global_step)
 
                     begin_audio_token = torch.tensor(model.config.begin_audio_token_id).unsqueeze(0).unsqueeze(0).to(model.device)
 
@@ -148,7 +155,7 @@ class MultimodalGenerationCallback(TrainerCallback):
                     audio_waveforms = audio_generation_outputs.audio_outputs[0].to(torch.float64).cpu()
 
                     # Save audio
-                    audio_filepath = os.path.join(self.trainer.args.output_dir, f"generated_audio_step_{state.global_step}.wav")
+                    audio_filepath = os.path.join(self.trainer.args.output_dir, f"generated_audio_step_{global_step}.wav")
                     self.save_audio_to_file(
                         audio_waveforms,
                         audio_filepath,
@@ -158,7 +165,7 @@ class MultimodalGenerationCallback(TrainerCallback):
                     writer.add_text(
                         "generated_audio/prompt",
                         self.test_audio_prompt_text,
-                        state.global_step,
+                        global_step,
                     )
 
                     # clip waveforms
@@ -167,7 +174,7 @@ class MultimodalGenerationCallback(TrainerCallback):
                     writer.add_audio(
                         f"generated_audio/sample",
                         audio_waveforms,
-                        state.global_step,
+                        global_step,
                         sample_rate=model.config.audio_sample_rate,
                     )
 
@@ -176,13 +183,13 @@ class MultimodalGenerationCallback(TrainerCallback):
                         writer.add_image(
                             f"generated_audio/waveform_mel_spec",
                             self.viz_waveform(audio_waveforms[0].squeeze(0).cpu().numpy(), model.config.audio_sample_rate),
-                            state.global_step,
+                            global_step,
                         )
                     except Exception as e:
                         writer.add_text(
                             f"generated_audio/waveform_mel_spec/error",
                             f"ERROR: probably NaN in waveforms {e}",
-                            state.global_step,
+                            global_step,
                         )
 
                     try:
@@ -190,13 +197,13 @@ class MultimodalGenerationCallback(TrainerCallback):
                         writer.add_image(
                             f"generated_audio/mel_spec",
                             self.viz_mels(audio_mel_specs[0].squeeze(0).cpu().numpy(), model.config.audio_sample_rate),
-                            state.global_step,
+                            global_step,
                         )
                     except Exception as e:
                         writer.add_text(
                             f"generated_audio/mel_spec/error",
                             f"ERROR: probably librosa error {e}",
-                            state.global_step,
+                            global_step,
                         )
 
                     # transcribe audio
@@ -218,18 +225,18 @@ class MultimodalGenerationCallback(TrainerCallback):
                     writer.add_audio(
                         f"audio_transcription/sample",
                         self.test_audio_waveforms,
-                        state.global_step,
+                        global_step,
                         sample_rate=model.config.audio_sample_rate,
                     )
                     for i, text in enumerate(audio_transcription_texts):
-                        writer.add_text(f"audio_transcription/sample_{i}", text, state.global_step)
+                        writer.add_text(f"audio_transcription/sample_{i}", text, global_step)
 
                     # test just vocoder by inputing ground truth mel specs and taking output as waveform reconstruction
                     # no idea what the conditioning should be for this
                     audio_waveforms = model.output_transform.audio_decoder.vocoder(test_audio.squeeze(1).view(-1, test_audio.shape[-2], test_audio.shape[-1]))
                     audio_waveforms = torch.clamp(audio_waveforms, -1.0, 1.0)[0].to(torch.float64).cpu()
 
-                    audio_waveforms_filepath = os.path.join(self.trainer.args.output_dir, f"generated_audio_vocoder_step_{state.global_step}.wav")
+                    audio_waveforms_filepath = os.path.join(self.trainer.args.output_dir, f"generated_audio_vocoder_step_{global_step}.wav")
                     self.save_audio_to_file(
                         audio_waveforms,
                         audio_waveforms_filepath,
@@ -240,7 +247,7 @@ class MultimodalGenerationCallback(TrainerCallback):
                     writer.add_audio(
                         f"generated_audio_vocoder/sample",
                         audio_waveforms,
-                        state.global_step,
+                        global_step,
                         sample_rate=model.config.audio_sample_rate,
                     )
 
@@ -264,26 +271,26 @@ class MultimodalGenerationCallback(TrainerCallback):
                     image_intermediate_outputs = image_generation_outputs.intermediate_image_outputs[0]
 
                     # Save image
-                    image_filepath = os.path.join(self.trainer.args.output_dir, f"generated_image_step_{state.global_step}.png")
+                    image_filepath = os.path.join(self.trainer.args.output_dir, f"generated_image_step_{global_step}.png")
                     image = transforms.ToPILImage()(image_output.squeeze(0))
                     image = image.convert("RGB")
                     image.save(image_filepath)
                     writer.add_image(
                         f"generated_image/sample",
                         image_output.squeeze(0),
-                        state.global_step,
+                        global_step,
                     )
                     for i, timestep_image in enumerate(image_intermediate_outputs):
                         timestep_image = timestep_image.cpu()
                         writer.add_image(
                             f"generated_image/timestep_{i}",
                             timestep_image.squeeze(0),
-                            state.global_step,
+                            global_step,
                         )
                     writer.add_text(
                         "generated_image/prompt",
                         self.test_image_prompt_text,
-                        state.global_step,
+                        global_step,
                     )
 
                     # transcribe image
@@ -303,12 +310,12 @@ class MultimodalGenerationCallback(TrainerCallback):
                     image_transcription_texts = image_transcription_outputs.sequences
                     image_transcription_texts = self.tokenizer.batch_decode(image_transcription_texts, skip_special_tokens=True)
                     for i, text in enumerate(image_transcription_texts):
-                        writer.add_text(f"image_transcription/sample_{i}", text, state.global_step)
+                        writer.add_text(f"image_transcription/sample_{i}", text, global_step)
                     
                     writer.add_image(
                         f"image_transcription/sample",
                         test_image[0].squeeze(0).cpu(),
-                        state.global_step,
+                        global_step,
                     )
 
                     # holy shit this is a lot of code
@@ -450,9 +457,11 @@ class MultimodalGenerationCallback(TrainerCallback):
 class ImageGenerationCallback(TrainerCallback):
     def __init__(self,
                  tokenizer: PreTrainedTokenizer,
+                 step_offset,
                  generation_steps=2000):
         self.trainer: Optional[Trainer] = None
         self.tokenizer = tokenizer
+        self.step_offset = step_offset
         self.generation_steps = generation_steps
 
         self.test_image1: Any = Image.open("test_vlm1.png").convert("RGB")
@@ -472,13 +481,15 @@ class ImageGenerationCallback(TrainerCallback):
         self.test_image_prompt = tokenizer(self.test_image_prompt_text, return_tensors="pt", padding=True)
 
     def on_step_end(self, args, state, control, model: megatransformer_image_decoder.ImageDiffusionSingleTaskModel=None, **kwargs):
-        if ((state.global_step == 1) or (state.global_step % self.generation_steps == 0)) and state.is_world_process_zero:
+        global_step = state.global_step + self.step_offset
+
+        if ((global_step == 1) or (global_step % self.generation_steps == 0)) and state.is_world_process_zero:
             writer = get_writer(self.trainer)
             if writer is None:
                 print("No TensorBoard writer found, skipping generation...")
                 return
 
-            print(f"Generating at step {state.global_step}...")
+            print(f"Generating at step {global_step}...")
 
             if torch.distributed.is_initialized():
                 device = torch.device(f"cuda:{torch.distributed.get_rank()}")
@@ -495,10 +506,12 @@ class ImageGenerationCallback(TrainerCallback):
                     writer.add_image(
                         f"generated_image/label",
                         label_grid,
-                        state.global_step,
+                        global_step,
                     )
 
     def log_generate(self, model: megatransformer_image_decoder.ImageDiffusionSingleTaskModel, state, writer, ddim_steps, device, sample_type):
+        global_step = state.global_step + self.step_offset
+
         diffusion_generator = torch.Generator(device=device)
         diffusion_generator.manual_seed(42)  # same seed for all samples throughout training
 
@@ -520,7 +533,7 @@ class ImageGenerationCallback(TrainerCallback):
         image_output = torchvision.utils.make_grid(image_output, nrow=2, padding=1)
 
         # Save image
-        image_filepath = os.path.join(self.trainer.args.output_dir, f"generated_image_step_{state.global_step}_{sample_type}.png")
+        image_filepath = os.path.join(self.trainer.args.output_dir, f"generated_image_step_{global_step}_{sample_type}.png")
         image = transforms.ToPILImage()(image_output.squeeze(0))
         image = image.convert("RGB")
         image.save(image_filepath)
@@ -529,7 +542,7 @@ class ImageGenerationCallback(TrainerCallback):
         writer.add_image(
             f"generated_image/sample_{sample_type}",
             image_output.squeeze(0),
-            state.global_step,
+            global_step,
         )
         for i, noise_pred, x_start_pred in zip(reversed(range(len(noise_preds))), noise_preds, x_start_preds):
             noise_pred = noise_pred.cpu()
@@ -541,27 +554,30 @@ class ImageGenerationCallback(TrainerCallback):
             writer.add_image(
                 f"generated_image/timestep_{i}_{sample_type}_noise",
                 noise_pred.squeeze(0),
-                state.global_step,
+                global_step,
             )
 
             writer.add_image(
                 f"generated_image/timestep_{i}_{sample_type}_x_start",
                 x_start_pred.squeeze(0),
-                state.global_step,
+                global_step,
             )
 
         for i, text in enumerate(self.test_image_prompt_text):
             writer.add_text(
                 f"generated_image/prompt_{i}_{sample_type}",
                 text,
-                state.global_step,
+                global_step,
             )
 
 class MetricsCallback(TrainerCallback):
-    def __init__(self):
+    def __init__(self, step_offset):
         self.trainer: Optional[Trainer] = None
+        self.step_offset = step_offset
 
     def on_log(self, args, state, control, logs=None, **kwargs):
+        global_step = state.global_step + self.step_offset
+
         if logs is None:
             print("No logs found, skipping...")
             return
@@ -571,7 +587,7 @@ class MetricsCallback(TrainerCallback):
             print("No TensorBoard writer found, skipping...")
             return
 
-        self.add_perplexity(writer, logs, state)
+        self.add_perplexity(writer, logs, global_step)
 
         model = kwargs.get("model", None)
         tokenizer = kwargs.get("processing_class", None)
@@ -586,16 +602,16 @@ class MetricsCallback(TrainerCallback):
                 mat=embedding_weights,
                 metadata=tokens,
                 tag='token_embeddings',
-                global_step=state.global_step,
+                global_step=global_step,
             )
         else:
             print("Model or tokenizer not found, skipping embedding logging...")
 
-    def add_perplexity(self, writer, logs, state):
+    def add_perplexity(self, writer, logs, global_step):
         is_eval = any(key.startswith("eval_") for key in logs.keys())
         loss_key = "eval_loss" if is_eval else "loss"
 
         if loss_key in logs:
             perplexity = math.exp(logs[loss_key])
             tag = "eval/perplexity" if is_eval else "train/perplexity"
-            writer.add_scalar(tag, perplexity, state.global_step)
+            writer.add_scalar(tag, perplexity, global_step)

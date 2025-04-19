@@ -131,6 +131,7 @@ generation_callback = custom_callbacks.MultimodalGenerationCallback(
         "The capital of France is",
         "2 + 2 ="
     ],
+    step_offset=args.start_step,
     audio_sample_rate=model.config.audio_sample_rate,
     audio_n_mels=model.config.audio_n_mels,
     audio_n_fft=model.config.audio_n_fft,
@@ -140,7 +141,7 @@ generation_callback = custom_callbacks.MultimodalGenerationCallback(
 trainer.add_callback(generation_callback)
 generation_callback.trainer = trainer
 
-metrics_callback = custom_callbacks.MetricsCallback()
+metrics_callback = custom_callbacks.MetricsCallback(step_offset=args.start_step,)
 trainer.add_callback(metrics_callback)
 metrics_callback.trainer = trainer
 

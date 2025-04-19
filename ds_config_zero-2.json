@@ -29,11 +29,10 @@
             "pin_memory": true
         },
         "contiguous_gradients": true,
-        "overlap_comm": false,
-        "reduce_scatter": false,
-        "allgather_partitions": true,
-        "allgather_bucket_size": 5e8,
-        "reduce_bucket_size": 5e8
+        "overlap_comm": true,
+        "reduce_scatter": true,
+        "allgather_bucket_size": 5e7,
+        "reduce_bucket_size": 5e7
     },
     
     "bf16": {
@@ -41,7 +40,6 @@
     },
     
     "gradient_clipping": "auto",
-    "steps_per_print": 100,
     
     "wall_clock_breakdown": false,
     "communication_data_type": "fp16"
