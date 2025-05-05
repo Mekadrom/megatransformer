@@ -9,7 +9,7 @@ os.environ['NCCL_TIMEOUT'] = '1200000'
 from transformers import AutoTokenizer, TrainingArguments, DataCollatorForLanguageModeling
 
 from dataset_loading import multimodal_dataset
-from model import megatransformer_causal, megatransformer_multimodal, megatransformer_recurrent
+from model import megatransformer_audio_decoder, megatransformer_audio_encoder, megatransformer_causal, megatransformer_image_decoder, megatransformer_image_encoder, megatransformer_multimodal, megatransformer_recurrent, megatransformer_text_encoder
 
 import custom_callbacks
 import custom_trainers
@@ -35,7 +35,7 @@ else:
     model_maker = megatransformer_causal
 
 model = model_maker.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
-model = megatransformer_utils.load_model(False, model, run_dir)
+model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
 
 if args.local_rank == 0 or not args.use_deepspeed:
     print(f"model structure: {model}")
@@ -44,14 +44,20 @@ if args.local_rank == 0 or not args.use_deepspeed:
 
     if len(args.include_modes) > 1 or "text" not in args.include_modes:
         print(f"model.input_transform.text_embedding parameters: {(sum(p.numel() for p in model.input_transform.text_embedding.parameters())):,}")
+
         print(f"model.input_transform.audio_embedding parameters: {(sum(p.numel() for p in model.input_transform.audio_embedding.parameters())):,}")
-        print(f"model.input_transform.image_embedding parameters: {(sum(p.numel() for p in model.input_transform.image_embedding.parameters())):,}")
+
+        print(f"model.input_transform.image_embedding parame~ters: {(sum(p.numel() for p in model.input_transform.image_embedding.parameters())):,}")
         print(f"model.world_model parameters: {(sum(p.numel() for p in model.world_model.parameters())):,}")
+
         print(f"model.output_transform.text_coda parameters: {(sum(p.numel() for p in model.output_transform.text_coda.parameters())):,}")
         print(f"model.output_transform.text_decoder parameters: {(sum(p.numel() for p in model.output_transform.text_decoder.parameters())):,}")
+
         print(f"model.output_transform.audio_coda parameters: {(sum(p.numel() for p in model.output_transform.audio_coda.parameters())):,}")
         print(f"model.output_transform.audio_decoder parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.parameters())):,}")
-        print(f"model.output_transform.audio_decoder.vocoder parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.vocoder.parameters())):,}")
+        if hasattr(model.output_transform.audio_decoder, "vocoder"):
+            print(f"model.output_transform.audio_decoder.vocoder parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.vocoder.parameters())):,}")
+
         print(f"model.output_transform.image_coda parameters: {(sum(p.numel() for p in model.output_transform.image_coda.parameters())):,}")
         print(f"model.output_transform.image_decoder parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.parameters())):,}")
 
@@ -104,6 +110,7 @@ audio_weight = 1.0 if "audio" in args.include_modes else 0.0
 image_weight = 1.0 if "image" in args.include_modes else 0.0
 
 train_dataset = multimodal_dataset.MultimodalDataset(
+    model.config,
     approximated_length=300_000,
     tokenizer=tokenizer,
     sample_rate=model.config.audio_sample_rate,
@@ -153,7 +160,7 @@ else:
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
 optimizer = None
-if "multimodal" in args.config.lower():
+if "multimodal" in args.config.lower() and not "frankenstein" in args.config.lower():
     optimizer = megatransformer_utils.create_multimodal_optimizer(model, args.weight_decay)
 
 trainer = custom_trainers.trainer_lookup(args, args.trainer)(

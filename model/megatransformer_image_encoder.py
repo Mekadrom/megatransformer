@@ -1,9 +1,30 @@
 from model import megatransformer_modules
+from transformers import CLIPProcessor, CLIPModel
 
 import megatransformer_utils
 import torch
 import torch.nn as nn
 
+
+class PreTrainedImageFeatureExtractorWrapper(nn.Module):
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
+        super().__init__()
+        self.config = config
+
+        model_id = "openai/clip-vit-large-patch14"
+        self.processor = CLIPProcessor.from_pretrained(model_id)
+        self.model = CLIPModel.from_pretrained(model_id)
+        self.model.requires_grad = False
+
+        self.proj = nn.Linear(1024, config.hidden_size)
+
+    def forward(self, image_raw_inputs):
+        # image_raw_inputs: [batch_size, channels, height, width]
+        inputs = self.processor(images=image_raw_inputs, return_tensors="pt")
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
+        outputs = self.model.vision_model(**inputs)
+        image_features = outputs.last_hidden_state
+        return self.proj(image_features)
 
 class PatchEmbedding(nn.Module):
     def __init__(self, img_size=128, patch_size=16, in_channels=3, embed_dim=768):

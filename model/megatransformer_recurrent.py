@@ -152,7 +152,7 @@ class MegaTransformerRecurrentCausalModel(PreTrainedModel, GenerationMixin):
         if config.use_positional_embedding:
             self.wpe = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         elif config.use_sinusoidal_embedding:
-            self.wpe = nn.Parameter(megatransformer_utils.create_sinusoidal_embedding(config.max_position_embeddings, config.hidden_size))
+            self.wpe = nn.Parameter(megatransformer_utils.create_sinusoidal_1d_pos_encoding(config.max_position_embeddings, config.hidden_size))
             self.wpe.requires_grad = config.sinusoidal_embedding_learnable
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 

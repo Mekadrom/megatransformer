@@ -93,6 +93,7 @@ def load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, max_frames, token
             hop_length=hop_length,
             max_frames=max_frames,
             batch_size=100,
+            is_voice=True,
             streaming=streaming,
             cache_dir=cache_dir,
         )

@@ -613,7 +613,9 @@ class GaussianDiffusion(nn.Module):
         return img, noise_preds, x_start_preds if return_intermediate else img
 
     @torch.no_grad()
-    def sample(self, device, batch_size: int, image_size: int, condition: Optional[torch.Tensor]=None, return_intermediate: bool=False, override_ddim_sampling_steps: Optional[int]=None, generator=None) -> torch.Tensor:
+    def sample(self, device, batch_size: int, condition: Optional[torch.Tensor]=None, return_intermediate: bool=False, override_ddim_sampling_steps: Optional[int]=None, generator=None, **kwargs) -> torch.Tensor:
+        image_size = kwargs.get('image_size', self.config.image_size)
+
         x = torch.randn(batch_size, 3, image_size, image_size, device=device, generator=generator)
 
         if self.is_ddim_sampling or override_ddim_sampling_steps is not None:

@@ -1,9 +1,34 @@
 from model import megatransformer_modules
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
 import megatransformer_utils
 import torch
 import torch.nn as nn
+import transformers
 
+
+class PreTrainedAudioFeatureExtractorWrapper(nn.Module):
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
+        super().__init__()
+        self.config = config
+
+        transformers.models.whisper.feature_extraction_whisper.WhisperFeatureExtractor
+
+        model_id = "openai/whisper-small"
+        self.processor = WhisperProcessor.from_pretrained(model_id)
+        self.model = WhisperForConditionalGeneration.from_pretrained(model_id)
+        self.model.requires_grad = False
+
+    def forward(self, audio_raw_inputs, audio_waveform_labels):
+        # audio_raw_inputs: [batch_size, channels, length]
+        # audio_waveform_labels = audio_waveform_labels.permute(0, 2, 1)  # [batch_size, length, channels]
+        audio_waveform_labels = audio_waveform_labels.squeeze(1)  # [batch_size, length]
+        megatransformer_utils.print_debug_tensor('audio_waveform_labels', audio_waveform_labels)
+        inputs = self.processor(audio_waveform_labels.detach().cpu().numpy(), sampling_rate=self.config.audio_sample_rate, return_tensors="pt")
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
+        outputs = self.model(**inputs)
+        audio_features = outputs.last_hidden_state
+        return audio_features
 
 class AudioConv(nn.Module):
     def __init__(self, input_channels=1, base_channels=32, kernel_sizes=[3, 3, 3, 3, 3], dropout=0.1, activation="gelu"):
@@ -74,30 +99,31 @@ class AudioFeatureExtractor(nn.Module):
 
     def forward(
         self,
-        features: torch.Tensor,
+        audio_raw_inputs: torch.Tensor,
+        audio_waveform_labels: torch.Tensor,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
     ):
-        N, *_, T = features.shape
+        N, *_, T = audio_raw_inputs.shape
 
-        features = self.conv_feature_extractor(features)
+        audio_raw_inputs = self.conv_feature_extractor(audio_raw_inputs)
 
-        features = features.permute(0, 3, 1, 2) # [batch_size, audio_seq_len, channels, n_mels]
-        features = features.reshape(N, T, -1) # [batch_size, audio_seq_len, channels * hidden_size]
+        audio_raw_inputs = audio_raw_inputs.permute(0, 3, 1, 2) # [batch_size, audio_seq_len, channels, n_mels]
+        audio_raw_inputs = audio_raw_inputs.reshape(N, T, -1) # [batch_size, audio_seq_len, channels * hidden_size]
 
-        features = self.conv_projection(features)
+        audio_raw_inputs = self.conv_projection(audio_raw_inputs)
 
-        features = features + self.pos_encoding[:, :T, :]
+        audio_raw_inputs = audio_raw_inputs + self.pos_encoding[:, :T, :]
 
-        features = self.dropout(features)
+        audio_raw_inputs = self.dropout(audio_raw_inputs)
 
-        features = self.prelude(
-            features,
-            attention_mask=torch.ones((N, T), device=features.device),
+        audio_raw_inputs = self.prelude(
+            audio_raw_inputs,
+            attention_mask=torch.ones((N, T), device=audio_raw_inputs.device),
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
 
-        return features
+        return audio_raw_inputs

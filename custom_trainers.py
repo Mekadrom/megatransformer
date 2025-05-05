@@ -4,7 +4,7 @@ from transformers import Trainer
 from transformers.integrations import TensorBoardCallback
 from typing import Optional, Literal
 
-from model import megatransformer_multimodal
+from dataset_loading import image_loading
 
 import megatransformer_utils
 import torch
@@ -120,6 +120,11 @@ class DefaultTrainer(Trainer):
 
         sanitized_model = megatransformer_utils.sanitize_model(model)
 
+        for name, param in sanitized_model.named_parameters():
+            if param.dtype == torch.long or param.dtype == torch.int64:
+                print(f"Found long parameter: {name}")
+                param.data = param.data.to(torch.float32)
+
         sanitized_model.config.current_epoch = self.state.epoch
         sanitized_model.config.current_global_step = self.state.global_step
 
@@ -127,6 +132,9 @@ class DefaultTrainer(Trainer):
 
         if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
+
+            self.writer.add_scalar(f"fetch_misses", image_loading.misses, self.state.global_step)
+
             if not isinstance(outputs, tuple) and hasattr(outputs, "n_steps_no_grad") and hasattr(outputs, "k_steps_grad"):
                 self.log_steps(prefix, outputs.n_steps_no_grad, outputs.k_steps_grad)
             elif isinstance(outputs, tuple):

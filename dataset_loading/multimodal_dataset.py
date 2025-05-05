@@ -268,11 +268,11 @@ class DataCollatorForMultimodalLanguageModeling(DataCollatorForLanguageModeling)
             })
 
         if "audio" in self.modes:
-            all_audio_raw_inputs = [torch.nn.functional.pad(audio, (0, self.audio_max_frames - audio.shape[-1]), value=0).unsqueeze(0) for audio in all_audio_raw_inputs]
+            all_audio_raw_inputs = [torch.nn.functional.pad(audio, (0, self.audio_max_frames - audio.shape[-1]), value=0).unsqueeze(0) for audio in all_audio_raw_inputs if audio is not None]
             all_audio_raw_inputs = torch.stack(all_audio_raw_inputs).unsqueeze(1)
 
             audio_mel_spec_labels = all_audio_raw_inputs.clone()
-            audio_waveform_labels = [torch.nn.functional.pad(audio, (0, self.audio_max_waveform_length - audio.shape[-1]), value=0).unsqueeze(0) for audio in audio_waveform_labels]
+            audio_waveform_labels = [torch.nn.functional.pad(audio, (0, self.audio_max_waveform_length - audio.shape[-1]), value=0).unsqueeze(0) for audio in audio_waveform_labels if audio is not None]
 
             audio_waveform_labels = torch.stack(audio_waveform_labels)
             batch.update({

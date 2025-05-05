@@ -1,5 +1,5 @@
 from model import megatransformer_blocks
-from typing import Optional
+from typing import Optional, Union
 
 import megatransformer_utils
 import torch
@@ -134,3 +134,20 @@ class SimpleBlock(nn.Module):
             hidden_states=all_hidden_states,
             attentions=all_attentions,
         )
+
+class AvgMaxAdaptivePool2d(nn.Module):
+    def __init__(self, output_size: Union[int, tuple[int, int]]=(1, 1)):
+        super(AvgMaxAdaptivePool2d, self).__init__()
+        if isinstance(output_size, int):
+            output_size = (output_size, output_size)
+        elif isinstance(output_size, tuple) and len(output_size) == 1:
+            output_size = (output_size[0], output_size[0])
+        elif not isinstance(output_size, tuple) or len(output_size) != 2:
+            raise ValueError("output_size must be an int or a tuple of two ints.")
+        self.output_size = output_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_pool = F.adaptive_avg_pool2d(x, self.output_size)
+        max_pool = F.adaptive_max_pool2d(x, self.output_size)
+        # Concatenate along the channel dimension
+        return torch.cat((avg_pool, max_pool), dim=1)

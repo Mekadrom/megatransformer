@@ -148,8 +148,8 @@ class MegaTransformerSelfAttention(nn.Module):
         
         context_layer = torch.matmul(attention_probs, values)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-        
-        new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size,)
+
+        new_context_layer_shape = context_layer.size()[:-2] + (self.d_values*self.n_heads,)
         context_layer = context_layer.view(*new_context_layer_shape)
         
         # Apply output projection

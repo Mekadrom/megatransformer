@@ -7,7 +7,7 @@ from transformers.integrations import TensorBoardCallback
 from typing import Any, Optional
 
 from dataset_loading import audio_loading
-from model import megatransformer_multimodal, megatransformer_image_decoder
+from model import megatransformer_audio_decoder, megatransformer_image_decoder, megatransformer_multimodal
 
 import librosa
 import math
@@ -24,7 +24,6 @@ def get_writer(trainer: Trainer):
         if isinstance(callback, TensorBoardCallback):
             if callback.tb_writer is not None:
                 return callback.tb_writer
-            
     return None
 
 
@@ -79,12 +78,12 @@ class MultimodalGenerationCallback(TrainerCallback):
         self.trainer: Optional[Trainer] = None
         self.tokenizer = tokenizer
         self.text_only_prompts = text_only_prompts
-        self.step_offset = step_offset,
+        self.step_offset = step_offset
         self.generation_steps = generation_steps
 
-        self.test_audio_waveforms, self.sample_rate = torchaudio.load("test_alm.mp3")
+        self.test_audio_waveforms, self.sample_rate = torchaudio.load(os.path.join('inference', 'examples', 'test_alm.mp3'))
         self.test_audio_waveforms = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000)(self.test_audio_waveforms)
-        self.test_audio_mels = audio_loading.extract_audio_features(
+        self.test_audio_mels = audio_loading.extract_mels(
             self.test_audio_waveforms,
             audio_sample_rate,
             audio_n_mels,
@@ -94,7 +93,7 @@ class MultimodalGenerationCallback(TrainerCallback):
         self.test_audio_prompt_text = "It is from Westport, above the villages of Murrisk and Lecanvey."
         self.test_audio_prompt = tokenizer(self.test_audio_prompt_text, return_tensors="pt")
 
-        self.test_image: Any = Image.open("test_vlm.png").convert("RGB")
+        self.test_image: Any = Image.open(os.path.join('inference', 'examples', 'test_vlm1.png')).convert("RGB")
         self.test_image = transforms.ToTensor()(self.test_image)
         self.test_image_prompt_text = "A man ironing a shirt while strapped to the back of a taxi."
         self.test_image_prompt = tokenizer(self.test_image_prompt_text, return_tensors="pt")
@@ -233,23 +232,24 @@ class MultimodalGenerationCallback(TrainerCallback):
 
                     # test just vocoder by inputing ground truth mel specs and taking output as waveform reconstruction
                     # no idea what the conditioning should be for this
-                    audio_waveforms = model.output_transform.audio_decoder.vocoder(test_audio.squeeze(1).view(-1, test_audio.shape[-2], test_audio.shape[-1]))
-                    audio_waveforms = torch.clamp(audio_waveforms, -1.0, 1.0)[0].to(torch.float64).cpu()
+                    if not isinstance(model.output_transform.audio_decoder, megatransformer_audio_decoder.PreTrainedAudioDecoderWrapper):
+                        audio_waveforms = model.output_transform.audio_decoder.vocoder(test_audio.squeeze(1).view(-1, test_audio.shape[-2], test_audio.shape[-1]))
+                        audio_waveforms = torch.clamp(audio_waveforms, -1.0, 1.0)[0].to(torch.float64).cpu()
 
-                    audio_waveforms_filepath = os.path.join(self.trainer.args.output_dir, f"generated_audio_vocoder_step_{global_step}.wav")
-                    self.save_audio_to_file(
-                        audio_waveforms,
-                        audio_waveforms_filepath,
-                        sample_rate=model.config.audio_sample_rate,
-                        normalize=True,
-                    )
+                        audio_waveforms_filepath = os.path.join(self.trainer.args.output_dir, f"generated_audio_vocoder_step_{global_step}.wav")
+                        self.save_audio_to_file(
+                            audio_waveforms,
+                            audio_waveforms_filepath,
+                            sample_rate=model.config.audio_sample_rate,
+                            normalize=True,
+                        )
 
-                    writer.add_audio(
-                        f"generated_audio_vocoder/sample",
-                        audio_waveforms,
-                        global_step,
-                        sample_rate=model.config.audio_sample_rate,
-                    )
+                        writer.add_audio(
+                            f"generated_audio_vocoder/sample",
+                            audio_waveforms,
+                            global_step,
+                            sample_rate=model.config.audio_sample_rate,
+                        )
 
                     begin_image_token = torch.tensor(model.config.begin_image_token_id).unsqueeze(0).unsqueeze(0).to(model.device)
 
@@ -268,7 +268,6 @@ class MultimodalGenerationCallback(TrainerCallback):
 
                     # images are in shape (batch_size, channels, height, width)
                     image_output = image_generation_outputs.image_outputs[0].cpu()
-                    image_intermediate_outputs = image_generation_outputs.intermediate_image_outputs[0]
 
                     # Save image
                     image_filepath = os.path.join(self.trainer.args.output_dir, f"generated_image_step_{global_step}.png")
@@ -280,13 +279,33 @@ class MultimodalGenerationCallback(TrainerCallback):
                         image_output.squeeze(0),
                         global_step,
                     )
-                    for i, timestep_image in enumerate(image_intermediate_outputs):
-                        timestep_image = timestep_image.cpu()
-                        writer.add_image(
-                            f"generated_image/timestep_{i}",
-                            timestep_image.squeeze(0),
-                            global_step,
-                        )
+
+                    if image_generation_outputs.intermediate_image_outputs is not None:
+                        noise_preds = image_generation_outputs.intermediate_image_outputs[0]
+                        x_start_preds = image_generation_outputs.intermediate_image_outputs[1]
+                        if noise_preds is not None and x_start_preds is not None:
+                            noise_preds = noise_preds[0]
+                            x_start_preds = x_start_preds[0]
+                            if noise_preds is not None and x_start_preds is not None:
+                                for i, noise_pred, x_start_pred in zip(reversed(range(len(noise_preds))), noise_preds, x_start_preds):
+                                    noise_pred = noise_pred.cpu()
+                                    x_start_pred = x_start_pred.cpu()
+
+                                    noise_pred = torchvision.utils.make_grid(noise_pred, nrow=2, padding=1)
+                                    x_start_pred = torchvision.utils.make_grid(x_start_pred, nrow=2, padding=1)
+
+                                    writer.add_image(
+                                        f"generated_image/timestep_{i}_noise",
+                                        noise_pred.squeeze(0),
+                                        global_step,
+                                    )
+
+                                    writer.add_image(
+                                        f"generated_image/timestep_{i}_x_start",
+                                        x_start_pred.squeeze(0),
+                                        global_step,
+                                    )
+
                     writer.add_text(
                         "generated_image/prompt",
                         self.test_image_prompt_text,
@@ -464,8 +483,8 @@ class ImageGenerationCallback(TrainerCallback):
         self.step_offset = step_offset
         self.generation_steps = generation_steps
 
-        self.test_image1: Any = Image.open("test_vlm1.png").convert("RGB")
-        self.test_image2: Any = Image.open("test_vlm2.png").convert("RGB")
+        self.test_image1: Any = Image.open(os.path.join('inference', 'examples', 'test_vlm1_x256.png')).convert("RGB")
+        self.test_image2: Any = Image.open(os.path.join('inference', 'examples', 'test_vlm2_x256.png')).convert("RGB")
         self.test_images = [
             transforms.ToTensor()(self.test_image1),
             transforms.ToTensor()(self.test_image1),
@@ -480,7 +499,7 @@ class ImageGenerationCallback(TrainerCallback):
         ]
         self.test_image_prompt = tokenizer(self.test_image_prompt_text, return_tensors="pt", padding=True)
 
-    def on_step_end(self, args, state, control, model: megatransformer_image_decoder.ImageDiffusionSingleTaskModel=None, **kwargs):
+    def on_step_end(self, args, state, control, model: megatransformer_image_decoder.ImageReconstructionSingleTaskModel=None, **kwargs):
         global_step = state.global_step + self.step_offset
 
         if ((global_step == 1) or (global_step % self.generation_steps == 0)) and state.is_world_process_zero:
@@ -501,7 +520,8 @@ class ImageGenerationCallback(TrainerCallback):
             with torch.no_grad():
                 with autocast(device.type, dtype=torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32):
                     self.log_generate(model, state, writer, None, device, "linear")
-                    self.log_generate(model, state, writer, 50, device, "ddim")
+                    if not isinstance(model.image_recon, megatransformer_image_decoder.ImageVAE):
+                        self.log_generate(model, state, writer, 50, device, "ddim")
                     label_grid = torchvision.utils.make_grid(self.test_images, nrow=2, padding=1)
                     writer.add_image(
                         f"generated_image/label",
@@ -509,7 +529,7 @@ class ImageGenerationCallback(TrainerCallback):
                         global_step,
                     )
 
-    def log_generate(self, model: megatransformer_image_decoder.ImageDiffusionSingleTaskModel, state, writer, ddim_steps, device, sample_type):
+    def log_generate(self, model: megatransformer_image_decoder.ImageReconstructionSingleTaskModel, state, writer, ddim_steps, device, sample_type):
         global_step = state.global_step + self.step_offset
 
         diffusion_generator = torch.Generator(device=device)
@@ -534,34 +554,35 @@ class ImageGenerationCallback(TrainerCallback):
 
         # Save image
         image_filepath = os.path.join(self.trainer.args.output_dir, f"generated_image_step_{global_step}_{sample_type}.png")
-        image = transforms.ToPILImage()(image_output.squeeze(0))
+        image = transforms.ToPILImage()(image_output.squeeze(0).to(torch.float32))
         image = image.convert("RGB")
         image.save(image_filepath)
-
 
         writer.add_image(
             f"generated_image/sample_{sample_type}",
             image_output.squeeze(0),
             global_step,
         )
-        for i, noise_pred, x_start_pred in zip(reversed(range(len(noise_preds))), noise_preds, x_start_preds):
-            noise_pred = noise_pred.cpu()
-            x_start_pred = x_start_pred.cpu()
 
-            noise_pred = torchvision.utils.make_grid(noise_pred, nrow=2, padding=1)
-            x_start_pred = torchvision.utils.make_grid(x_start_pred, nrow=2, padding=1)
+        if noise_preds is not None and x_start_preds is not None:
+            for i, noise_pred, x_start_pred in zip(reversed(range(len(noise_preds))), noise_preds, x_start_preds):
+                noise_pred = noise_pred.cpu()
+                x_start_pred = x_start_pred.cpu()
 
-            writer.add_image(
-                f"generated_image/timestep_{i}_{sample_type}_noise",
-                noise_pred.squeeze(0),
-                global_step,
-            )
+                noise_pred = torchvision.utils.make_grid(noise_pred, nrow=2, padding=1)
+                x_start_pred = torchvision.utils.make_grid(x_start_pred, nrow=2, padding=1)
 
-            writer.add_image(
-                f"generated_image/timestep_{i}_{sample_type}_x_start",
-                x_start_pred.squeeze(0),
-                global_step,
-            )
+                writer.add_image(
+                    f"generated_image/timestep_{i}_{sample_type}_noise",
+                    noise_pred.squeeze(0),
+                    global_step,
+                )
+
+                writer.add_image(
+                    f"generated_image/timestep_{i}_{sample_type}_x_start",
+                    x_start_pred.squeeze(0),
+                    global_step,
+                )
 
         for i, text in enumerate(self.test_image_prompt_text):
             writer.add_text(
@@ -571,9 +592,10 @@ class ImageGenerationCallback(TrainerCallback):
             )
 
 class MetricsCallback(TrainerCallback):
-    def __init__(self, step_offset):
+    def __init__(self, step_offset, is_add_perplexity=True):
         self.trainer: Optional[Trainer] = None
         self.step_offset = step_offset
+        self.is_add_perplexity = is_add_perplexity
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         global_step = state.global_step + self.step_offset
@@ -587,7 +609,8 @@ class MetricsCallback(TrainerCallback):
             print("No TensorBoard writer found, skipping...")
             return
 
-        self.add_perplexity(writer, logs, global_step)
+        if self.is_add_perplexity:
+            self.add_perplexity(writer, logs, global_step)
 
         model = kwargs.get("model", None)
         tokenizer = kwargs.get("processing_class", None)

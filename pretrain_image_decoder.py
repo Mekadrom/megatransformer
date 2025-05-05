@@ -31,7 +31,7 @@ if args.local_rank == 0 or not args.use_deepspeed:
     print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
 
     print(f"model.text_recurrent parameters: {(sum(p.numel() for p in model.text_recurrent.parameters())):,}")
-    print(f"model.diffuser parameters: {(sum(p.numel() for p in model.diffuser.parameters())):,}")
+    print(f"model.image_recon parameters: {(sum(p.numel() for p in model.image_recon.parameters())):,}")
 
     print(f"modified tokenizer: {tokenizer}")
     print(f"special tokens: {tokenizer.special_tokens_map}")
@@ -106,7 +106,7 @@ data_collator = multimodal_dataset.DataCollatorForMultimodalLanguageModeling(
 
 optimizer = torch.optim.AdamW([
     {'params': model.text_recurrent.parameters(), 'lr': 1e-4},
-    {'params': model.diffuser.parameters(), 'lr': 1e-4},
+    {'params': model.image_recon.parameters(), 'lr': 1e-4},
 ], weight_decay=args.weight_decay)
 
 trainer = custom_trainers.trainer_lookup(args, args.trainer)(
@@ -127,7 +127,7 @@ generation_callback = custom_callbacks.ImageGenerationCallback(
 trainer.add_callback(generation_callback)
 generation_callback.trainer = trainer
 
-metrics_callback = custom_callbacks.MetricsCallback(step_offset=args.start_step,)
+metrics_callback = custom_callbacks.MetricsCallback(step_offset=args.start_step, is_add_perplexity=False)
 trainer.add_callback(metrics_callback)
 metrics_callback.trainer = trainer
 

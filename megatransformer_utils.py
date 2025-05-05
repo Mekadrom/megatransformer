@@ -9,6 +9,7 @@ from typing import Optional
 from model import megatransformer_modules
 
 import argparse
+import deepspeed
 import glob
 import math
 import numpy as np
@@ -19,11 +20,14 @@ import torch.distributed as dist
 import torch.nn as nn
 
 
+BEGIN_AUDIO_TOKEN = "<|AUDIO|>"
+END_AUDIO_TOKEN = "<|/AUDIO|>"
+
 BEGIN_IMAGE_TOKEN = "<|IMAGE|>"
 END_IMAGE_TOKEN = "<|/IMAGE|>"
 
-BEGIN_AUDIO_TOKEN = "<|AUDIO|>"
-END_AUDIO_TOKEN = "<|/AUDIO|>"
+BEGIN_VOICE_TOKEN = "<|VOICE|>"
+END_VOICE_TOKEN = "<|/VOICE|>"
 
 class KVCache:
     def __init__(self):
@@ -60,7 +64,6 @@ class KVCache:
     
     def __deepspeed_tensor_attributes__(self):
         return ['key', 'value']
-
 
 class PreAllocatedKVCache:
     def __init__(self, max_length, batch_size, n_heads, d_queries, d_values, dtype=torch.float32, device='cuda'):
@@ -172,6 +175,8 @@ class MegaTransformerConfig(PretrainedConfig):
         end_audio_token_id=50258,
         begin_image_token_id=50259,
         end_image_token_id=50260,
+        begin_voice_token_id=50261,
+        end_voice_token_id=50262,
 
         text_prelude_config=None,
 
@@ -183,7 +188,7 @@ class MegaTransformerConfig(PretrainedConfig):
         audio_max_duration=10.0, # used for trimming data/skipping examples that are too long
         audio_sample_rate=16000,
 
-        image_size=64,
+        image_size=256,
 
         audio_encoder_base_channels=32,
         audio_encoder_kernel_sizes=[3, 3, 3, 3, 3, 3],
@@ -319,6 +324,8 @@ class MegaTransformerConfig(PretrainedConfig):
         self.end_audio_token_id = end_audio_token_id
         self.begin_image_token_id = begin_image_token_id
         self.end_image_token_id = end_image_token_id
+        self.begin_voice_token_id = begin_voice_token_id
+        self.end_voice_token_id = end_voice_token_id
 
         self.text_prelude_config = text_prelude_config
 
@@ -491,22 +498,48 @@ def create_alibi_bias(n_heads, maxlen):
     bias = -torch.abs(diff).unsqueeze(0) * slopes.unsqueeze(-1).unsqueeze(-1)
     return bias  # [n_heads, seq_len, seq_len]
 
-def create_sinusoidal_embedding(max_position_embeddings, hidden_size, dims=1):
-    if dims == 1:
-        positional_encoding = torch.zeros((max_position_embeddings, hidden_size)) # (max_length, d_model)
-        for i in range(max_position_embeddings):
-            for k in range(hidden_size):
-                if k % 2 == 0:
-                    positional_encoding[i, k] = math.sin(i / math.pow(10000, k / hidden_size))
-                else:
-                    positional_encoding[i, k] = math.cos(i / math.pow(10000, (k - 1) / hidden_size))
-        return positional_encoding.unsqueeze(0) # (1, max_length, d_model)
-    elif dims == 2:
-        positional_encoding_2d = PositionalEncoding2D(hidden_size)
-        positional_encoding = torch.zeros((1, max_position_embeddings, max_position_embeddings, hidden_size))
-        return positional_encoding_2d(positional_encoding)
-    else:
-        raise ValueError("dims must be 1 or 2")
+def create_sinusoidal_2d_pos_encoding(h, w, channels, device):
+        """Creates 2D sinusoidal positional encodings"""
+        h_pos = torch.arange(h, device=device).float()
+        w_pos = torch.arange(w, device=device).float()
+        
+        # Normalize positions to [0, 1] range
+        h_pos = h_pos / h
+        w_pos = w_pos / w
+        
+        # Create 2D positional grid
+        h_pos, w_pos = torch.meshgrid(h_pos, w_pos, indexing='ij')
+        
+        # Calculate encoding frequencies (log-spaced)
+        freq_bands = torch.exp(
+            torch.linspace(
+                0., math.log(10000), channels//4, device=device
+            )
+        )
+        
+        # Create positional encodings
+        pos_enc = torch.zeros(1, channels, h, w, device=device)
+        
+        # Fill with sine and cosine patterns
+        for i, freq in enumerate(freq_bands):
+            pos_enc[:, 4*i:4*i+4, :, :] = torch.stack([
+                torch.sin(h_pos * freq),
+                torch.cos(h_pos * freq),
+                torch.sin(w_pos * freq),
+                torch.cos(w_pos * freq),
+            ], dim=0).unsqueeze(0)
+            
+        return pos_enc
+
+def create_sinusoidal_1d_pos_encoding(max_position_embeddings, hidden_size):
+    positional_encoding = torch.zeros((max_position_embeddings, hidden_size)) # (max_length, d_model)
+    for i in range(max_position_embeddings):
+        for k in range(hidden_size):
+            if k % 2 == 0:
+                positional_encoding[i, k] = math.sin(i / math.pow(10000, k / hidden_size))
+            else:
+                positional_encoding[i, k] = math.cos(i / math.pow(10000, (k - 1) / hidden_size))
+    return positional_encoding.unsqueeze(0) # (1, max_length, d_model)
 
 def get_activation_type(activation_function_name):
     if activation_function_name == 'relu':
@@ -807,7 +840,7 @@ def embedding_weight_init(hidden_size):
     def init_weights(module):
         if isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=hidden_size ** -0.5)
-            if module.bias is not None:
+            if hasattr(module, 'bias') and module.bias is not None:
                 module.bias.data.zero_()
     return init_weights
 
@@ -817,14 +850,26 @@ def transformer_weight_init():
             nn.init.xavier_normal_(module.weight, gain=0.02)
     return init_weights
 
+def conv2d_weight_init():
+    def init_weights(module):
+        if isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if hasattr(module, 'bias') and module.bias is not None:
+                module.bias.data.zero_()
+    return init_weights
+
 def print_debug_tensor(pre: str, tensor: torch.Tensor):
     if tensor is None:
         print(f"{pre}: None")
     elif tensor.dtype in [torch.float16, torch.float32, torch.float64, torch.bfloat16]:
-        print(f"{pre}:\n\tdtype: {tensor.dtype}\n\tshape: {tensor.shape}\n\tmean: {tensor.mean()}\n\tstd: {tensor.std()}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tnorm: {tensor.norm()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
+        print(f"{pre}:\n\tdtype: {tensor.dtype}\n\tdevice: {tensor.device}\n\tshape: {tensor.shape}\n\tmean: {tensor.mean()}\n\tstd: {tensor.std()}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tnorm: {tensor.norm()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
+        if tensor.numel() < 100:
+            print(f"\t{tensor}")
     else:
         # non-float tensors
-        print(f"{pre}:\n\tdtype: {tensor.dtype}\n\tshape: {tensor.shape}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
+        print(f"{pre}:\n\tdtype: {tensor.dtype}\n\tdevice: {tensor.device}\n\tshape: {tensor.shape}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
+        if tensor.numel() < 100:
+            print(f"\t{tensor}")
 
 def sanitize_model(model):
     if isinstance(model, DistributedDataParallel):
@@ -833,4 +878,6 @@ def sanitize_model(model):
         return sanitize_model(model._orig_mod)
     if isinstance(model, DataParallel):
         return sanitize_model(model.module)
+    if isinstance(model, deepspeed.runtime.engine.DeepSpeedEngine):
+        return model.module
     return model

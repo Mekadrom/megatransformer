@@ -7,30 +7,42 @@ from typing import Optional
 import requests
 import torch
 
+
+misses = 0
+
+class DropAlpha(object):
+    def __call__(self, tensor):
+        if tensor.shape[0] == 4:  # If RGBA
+            return tensor[:3]
+        return tensor
+
 def get_transform(image_size):
     if image_size is None:
         raise ValueError("Image size must be specified for image transformations")
     return transforms.Compose([
         # transforms.Resize((image_size, image_size)),
-        transforms.RandomResizedCrop((image_size, image_size), scale=(0.8, 1.0)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        # transforms.RandomResizedCrop((image_size, image_size), scale=(0.8, 1.0)),
+        # transforms.RandomHorizontalFlip(),
+        # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0]),
+        DropAlpha(),
+        transforms.Normalize(
+            mean=[0.5, 0.5, 0.5],
+            std=[0.5, 0.5, 0.5]
+        ),
     ])
 
 def fetch_and_transform_image(image_url, transform):
     try:
         image = Image.open(requests.get(
             image_url,
-            timeout=10,
-            stream=True
+            timeout=(1, 5),
         ).raw)
-        image = image.convert("RGB")
-        image = transform(image)
-        return image
+        return transform(image)
     except Exception as e:
         # print(f"Error fetching or transforming image: {e} for URL {image_url}")
+        global misses
+        misses += 1
         return None
     
 def load_image_dataset(dataset_name: str,
@@ -96,4 +108,5 @@ def load_image_dataset(dataset_name: str,
             "image_raw_inputs": all_image_raw_inputs,
             "image_labels": all_image_raw_inputs,
         }
-    return dataset.map(process_function, batched=True, batch_size=200, remove_columns=dataset.column_names)
+
+    return dataset.map(process_function, batched=True, batch_size=256, remove_columns=dataset.column_names)
