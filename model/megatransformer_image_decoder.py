@@ -1,9 +1,9 @@
 from diffusers import DiffusionPipeline
-from model import megatransformer_diffusion, megatransformer_modules, megatransformer_recurrent
-from pytorch_msssim import SSIM, MS_SSIM
+from pytorch_msssim import MS_SSIM
 from transformers import PreTrainedTokenizer
 from typing import Optional
 
+from model import megatransformer_diffusion, megatransformer_modules, megatransformer_recurrent, megatransformer_text_encoder
 import megatransformer_utils
 
 import math
@@ -251,12 +251,14 @@ class PatchSelfAttentionBlock(nn.Module):
         self.dropout_p = dropout_p
         self.is_linear_attention = is_linear_attention
 
-        self.register_buffer("pos_embed", None)
+        self.qk_pos_embed = megatransformer_utils.create_sinusoidal_2d_pos_encoding(n_heads*d_queries)
+        self.v_pos_embed = megatransformer_utils.create_sinusoidal_2d_pos_encoding(n_heads*d_values)
 
-        self.q_proj = nn.Conv2d(hidden_size, n_heads*d_queries, kernel_size=1, bias=False)
-        self.k_proj = nn.Conv2d(hidden_size, n_heads*d_queries, kernel_size=1, bias=False)
-        self.v_proj = nn.Conv2d(hidden_size, n_heads*d_values, kernel_size=1, bias=False)
-        self.out_proj = nn.Conv2d(n_heads*d_values, hidden_size, kernel_size=1)
+        # patch embeddings
+        self.q_proj = nn.Conv2d(hidden_size, n_heads*d_queries, kernel_size=16, stride=16, bias=False)
+        self.k_proj = nn.Conv2d(hidden_size, n_heads*d_queries, kernel_size=16, stride=16, bias=False)
+        self.v_proj = nn.Conv2d(hidden_size, n_heads*d_values, kernel_size=16, stride=16, bias=False)
+        self.out_proj = nn.ConvTranspose2d(n_heads*d_values, hidden_size, kernel_size=16, stride=16)
 
         self.dropout = nn.Dropout(dropout_p)
 
@@ -268,14 +270,16 @@ class PatchSelfAttentionBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.size()
 
-        if self.pos_embed is None or self.pos_embed.shape[-2:] != (H, W):
-            self.register_buffer("pos_embed", megatransformer_utils.create_sinusoidal_2d_pos_encoding(H, W, C, device=self.q_proj.weight.device))
-
-        x = x + self.pos_embed[:, :, :H, :W]
+        # megatransformer_utils.print_debug_tensor("x", x)
 
         q: torch.Tensor = self.q_proj(x)  # [B, n_heads*d_queries, H, W]
+        q = q + self.qk_pos_embed(q)  # positional embedding after patch embeddings/query extraction
+
         k: torch.Tensor = self.k_proj(x)  # [B, n_heads*d_queries, H, W]
+        k = k + self.qk_pos_embed(k)  # positional embedding after patch embeddings/query extraction
+
         v: torch.Tensor = self.v_proj(x)  # [B, n_heads*d_queries, H, W]
+        v = v + self.v_pos_embed(v)  # positional embedding after patch embeddings/query extraction
 
         q = q.view(B, self.n_heads, self.d_queries, -1).transpose(-2, -1)  # [B, n_heads, seq_len, d_queries]
         k = k.view(B, self.n_heads, self.d_queries, -1).transpose(-2, -1)  # [B, n_heads, seq_len, d_queries]
@@ -302,8 +306,17 @@ class PatchSelfAttentionBlock(nn.Module):
                 attn_weights = self.dropout(attn_weights)
                 output = torch.matmul(attn_weights, v)  # [B, n_heads, seq_len, d_values]
 
+        # megatransformer_utils.print_debug_tensor("output", output)
+
         # Reshape back to image format
         output = output.transpose(-2, -1).contiguous()  # [B, n_heads, d_values, seq_len]
+
+        # megatransformer_utils.print_debug_tensor("output_tranposed", output)
+
+        seq_len = output.size(-1)
+
+        H = W = math.floor(math.sqrt(seq_len))  # Assuming square patches
+
         output = output.view(B, self.n_heads * self.d_values, H, W)  # [B, n_heads*d_values, H, W]
         output = self.out_proj(output)  # [B, C, H, W]
 
@@ -321,12 +334,12 @@ class ImageCrossAttentionBlock(nn.Module):
         self.dropout_p = dropout_p
         self.is_linear_attention = is_linear_attention
 
-        self.register_buffer("pos_embed", None)
+        self.q_pos_embed = megatransformer_utils.create_sinusoidal_2d_pos_encoding(n_heads*d_queries)
 
-        self.q_proj = nn.Conv2d(hidden_size, n_heads*d_queries, kernel_size=1, bias=False)
+        self.q_proj = nn.Conv2d(hidden_size, n_heads*d_queries, kernel_size=16, stride=16, bias=False)
         self.k_proj = nn.Linear(self.context_dim, n_heads*d_queries, bias=False)
         self.v_proj = nn.Linear(self.context_dim, n_heads*d_values, bias=False)
-        self.out_proj = nn.Conv2d(n_heads*d_values, hidden_size, kernel_size=1)
+        self.out_proj = nn.ConvTranspose2d(n_heads*d_values, hidden_size, kernel_size=16, stride=16)
 
         self.dropout = nn.Dropout(dropout_p)
 
@@ -340,14 +353,12 @@ class ImageCrossAttentionBlock(nn.Module):
         BC, T, CC = context.size()
         ctxt_seq_len = T
 
-        if self.pos_embed is None or self.pos_embed.shape[-2:] != (H, W):
-            self.register_buffer("pos_embed", megatransformer_utils.create_sinusoidal_2d_pos_encoding(H, W, C, device=self.q_proj.weight.device))
-
-        x = x + self.pos_embed[:, :, :H, :W]
-
         assert B == BC, f"Batch size mismatch: {B} vs {BC}"
 
         q: torch.Tensor = self.q_proj(x)        # [B, n_heads*d_queries, H, W]
+
+        q = q + self.q_pos_embed(q) # positional embedding after patch embeddings/query extraction
+
         k: torch.Tensor = self.k_proj(context)  # [B, ctxt_seq_len, n_heads*d_queries]
         v: torch.Tensor = self.v_proj(context)  # [B, ctxt_seq_len, n_heads*d_values]
 
@@ -378,19 +389,35 @@ class ImageCrossAttentionBlock(nn.Module):
 
         # Reshape back to image format
         output = output.transpose(-2, -1).contiguous()  # [B, n_heads, d_values, seq_len]
+
+        seq_len = output.size(-1)
+
+        H = W = math.floor(math.sqrt(seq_len))  # Assuming square patches
+
         output = output.view(B, self.n_heads * self.d_values, H, W)  # [B, n_heads*d_values, H, W]
         output = self.out_proj(output)  # [B, C, H, W]
 
         return output
 
 class ImageVAE(nn.Module):
-    def __init__(self, config, encoder, decoder):
+    def __init__(self, config, encoder, decoder, kl_beta=1e-4):
         super().__init__()
         self.config = config
         self.encoder = encoder
         self.decoder = decoder
 
-        self.z_proj = nn.Sequential(
+        self.kl_beta = kl_beta
+
+        self.mu_proj = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.LayerNorm(config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.LayerNorm(config.hidden_size),
+            nn.GELU()
+        )
+
+        self.logvar_proj = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.LayerNorm(config.hidden_size),
             nn.GELU(),
@@ -418,38 +445,79 @@ class ImageVAE(nn.Module):
     def forward(self, image_labels=None, condition=None):
         if image_labels is not None:
             mu, logvar = self.encoder(image_labels)
-            z = self.reparameterize(mu, logvar)
+            encoder_z = self.reparameterize(mu, logvar)
+            if condition is not None:
+                pooled_embeds = torch.mean(condition, dim=1)
+                mu_pooled_embeds = self.mu_proj(pooled_embeds)
+                logvar_pooled_embeds = self.logvar_proj(pooled_embeds)
+                pooled_embeds_z = self.reparameterize(mu_pooled_embeds, logvar_pooled_embeds)
+            else:
+                pooled_embeds_z = None
         else:
-            # pool condition for z
+            assert condition is not None, "Condition must be provided if image_labels is None"
+            encoder_z = None
             pooled_embeds = torch.mean(condition, dim=1)
-            z = self.z_proj(pooled_embeds)
+            mu_pooled_embeds = self.mu_proj(pooled_embeds)
+            logvar_pooled_embeds = self.logvar_proj(pooled_embeds)
+            pooled_embeds_z = self.reparameterize(mu_pooled_embeds, logvar_pooled_embeds)
         
-        reconstructed_image, vae_loss = self.decoder(z, condition=condition, image_labels=image_labels)
+        if encoder_z is not None:
+            reconstructed_image, reconstruction_loss, ssim_loss = self.decoder(encoder_z, condition=condition, image_labels=image_labels)
+        else:
+            reconstructed_image = None
+            reconstruction_loss = None
+            ssim_loss = None
 
-        if vae_loss is not None:
-            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-            return reconstructed_image, vae_loss + kl_loss
+        if pooled_embeds_z is not None:
+            conditioned_image, _, _ = self.decoder(pooled_embeds_z, condition=condition)
+        else:
+            conditioned_image = None
 
-        return reconstructed_image, None
+        all_losses = []
+        if reconstruction_loss is not None:
+            all_losses.append(reconstruction_loss)
+        if ssim_loss is not None:
+            all_losses.append(ssim_loss)
+        
+        if encoder_z is not None:
+            kl_loss = self.kl_beta * (-0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()))
+            all_losses.append(kl_loss)
+
+            if pooled_embeds_z is not None:
+                # loss between mu and logvar for encoder and condition pooler
+                mu_mse = F.mse_loss(mu, mu_pooled_embeds)
+                logvar_mse = F.mse_loss(logvar, logvar_pooled_embeds)
+                all_losses.append(mu_mse)
+                all_losses.append(logvar_mse)
+
+        if len(all_losses) > 0:
+            # add device num dimension for gather to concat across; requires custom trainer for handling
+            all_losses = torch.stack(all_losses).unsqueeze(0)
+
+        return all_losses, reconstructed_image, conditioned_image
     
     def sample(self, device, batch_size: int, condition: Optional[torch.Tensor]=None, **kwargs) -> torch.Tensor:
         if condition is None:
             condition = torch.randn(batch_size, self.config.hidden_size, device=device)
         
         pooled_embeds = torch.mean(condition, dim=1)
-        z = self.z_proj(pooled_embeds)
+        mu_pooled_embeds = self.mu_proj(pooled_embeds)
+        logvar_pooled_embeds = self.logvar_proj(pooled_embeds)
+        pooled_embeds_z = self.reparameterize(mu_pooled_embeds, logvar_pooled_embeds)
 
-        reconstructed_image, _ = self.decoder(z, condition=condition)
+        conditioned_image, _, _ = self.decoder(pooled_embeds_z, condition=condition)
 
-        return reconstructed_image, None, None
+        return None, conditioned_image, None
 
 class ImageVAEEncoder(nn.Module):
-    def __init__(self, config, features=[16, 32, 64, 128, 256, 512], self_attns=None, dropout_p=0.1):
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig, features=[16, 32, 64, 128, 256, 512], self_attns=None, dropout_p=0.1):
         super().__init__()
         self.config = config
 
         if self_attns is None:
-            self_attns = [False] * (len(features) - 1)
+            self_attns = [False] * len(features)
+
+        self.expected_image_sizes = [config.image_size // (2 ** (i+1)) for i in range(0, len(features))]
 
         def conv_downsample_block(in_channels, out_channels):
             return nn.Sequential(
@@ -462,17 +530,33 @@ class ImageVAEEncoder(nn.Module):
         self.initial_conv = conv_downsample_block(3, features[0])
 
         self.convs = nn.ModuleList([conv_downsample_block(in_f, out_f) for in_f, out_f in zip(features[:-1], features[1:])])
-        self.self_attns = nn.ModuleList([PatchSelfAttentionBlock(out_f, dropout_p=dropout_p) if use else nn.Identity() for out_f, use in zip(features[1:], self_attns)])
+        self.self_attns = nn.ModuleList([PatchSelfAttentionBlock(out_f, config.image_decoder_down_block_self_attn_n_heads, dropout_p=dropout_p) if use else nn.Identity() for out_f, use in zip(features, self_attns)])
         self.pool = megatransformer_modules.AvgMaxAdaptivePool2d()
 
         # AvgMaxAdaptivePool2d will output a tensor of shape (B, features[-1]*2, 1, 1) due to concatentating max and avg pools
         self.fc_mu = nn.Linear(features[-1]*2, config.hidden_size)
         self.fc_logvar = nn.Linear(features[-1]*2, config.hidden_size)
 
+    def _init_weights(self):
+        self.apply(megatransformer_utils.conv2d_weight_init())
+        self.fc_mu.weight.data.normal_(mean=0.0, std=0.02)
+        self.fc_logvar.weight.data.normal_(mean=0.0, std=0.02)
+        self.fc_mu.bias.data.zero_()
+        self.fc_logvar.bias.data.zero_()
+
     def forward(self, x: torch.Tensor):
         x = self.initial_conv(x)
-        for conv, self_attn in zip(self.convs, self.self_attns):
+
+        if self.self_attns[0] is not None and not isinstance(self.self_attns[0], nn.Identity):
+            x = x + self.self_attns[0](x)
+
+        assert x.shape[2:] == (self.expected_image_sizes[0], self.expected_image_sizes[0]), f"Expected {self.expected_image_sizes[0]}x{self.expected_image_sizes[0]} but got {x.shape[2:]} from layer {self.initial_conv}"
+
+        for conv, self_attn, expected_image_size in zip(self.convs, self.self_attns[1:], self.expected_image_sizes[1:]):
             x = conv(x)
+
+            assert x.shape[2:] == (expected_image_size, expected_image_size), f"Expected {expected_image_size}x{expected_image_size} but got {x.shape[2:]} from layer {conv}"
+
             if self_attn is not None and not isinstance(self_attn, nn.Identity):
                 x = x + self_attn(x)
 
@@ -483,18 +567,24 @@ class ImageVAEEncoder(nn.Module):
         return mu, logvar
 
 class ImageVAEDecoder(nn.Module):
-    def __init__(self, config, features=[512, 256, 128, 64, 32, 16], self_attns=None, cross_attns=None, self_attn_patch_sizes=None, dropout_p=0.1):
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig, features=[512, 256, 128, 64, 32, 16], self_attns=None, cross_attns=None, self_attn_patch_sizes=None, dropout_p=0.1, recon_beta=100.0, ssim_beta=50.0):
         super().__init__()
         self.config = config
 
+        self.recon_beta = recon_beta
+        self.ssim_beta = ssim_beta
+
         if self_attns is None:
-            self_attns = [False] * (len(features) - 1)
+            self_attns = [False] * len(features)
 
         if cross_attns is None:
-            self_attns = [True] * (len(features) - 1)
+            self_attns = [True] * len(features)
 
         if self_attn_patch_sizes is None:
             self_attn_patch_sizes = [4] * len(self_attns)
+
+        self.expected_image_sizes = [config.image_size // (2 ** i) for i in range(len(features) - 1, -1, -1)]
+        print(f"expected image sizes: {self.expected_image_sizes}")
 
         print(f"creating decoder with {features} features, {self_attns} self-attentions, {cross_attns} cross-attentions, {self_attn_patch_sizes} self-attn patch sizes")
 
@@ -505,57 +595,101 @@ class ImageVAEDecoder(nn.Module):
                 nn.Dropout2d(dropout_p),
                 nn.BatchNorm2d(out_channels)
             )
+        
+        def conv_refine_block(channels):
+            return nn.Sequential(
+                nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),
+                nn.GELU(),
+                nn.Dropout2d(dropout_p),
+                nn.BatchNorm2d(channels)
+            )
 
-        self.fc = nn.Linear(config.hidden_size, features[0] * 4 * 4)
-        self.unflatten = nn.Unflatten(1, (features[0], 4, 4))
+        self.fc = nn.Linear(config.hidden_size, features[0] * self.expected_image_sizes[0] * self.expected_image_sizes[0])
+        self.unflatten = nn.Unflatten(1, (features[0], self.expected_image_sizes[0], self.expected_image_sizes[0]))
         self.convs = nn.ModuleList([conv_upsample_block(in_f, out_f) for in_f, out_f in zip(features[:-1], features[1:])])
-        self.self_attns = nn.ModuleList([PatchSelfAttentionBlock(out_f, dropout_p=dropout_p) if use else nn.Identity() for out_f, use in zip(features[1:], self_attns)])
-        self.cross_attns = nn.ModuleList([ImageCrossAttentionBlock(out_f, context_dim=config.hidden_size, dropout_p=dropout_p) if use else nn.Identity() for out_f, use in zip(features[1:], cross_attns)])
+        self.self_attns = nn.ModuleList([
+            PatchSelfAttentionBlock(
+                out_f,
+                n_heads=config.image_decoder_up_block_self_attn_n_heads,
+                dropout_p=dropout_p
+            )
+            if use else nn.Identity() 
+            for out_f, use in zip(features, self_attns)
+        ])
+        self.cross_attns = nn.ModuleList([
+            ImageCrossAttentionBlock(
+                out_f,
+                n_heads=config.image_decoder_cross_attn_n_heads,
+                context_dim=config.hidden_size,
+                dropout_p=dropout_p
+            )
+            if use else nn.Identity()
+            for out_f, use in zip(features, cross_attns)
+        ])
+        self.refines = nn.ModuleList([conv_refine_block(out_f) for out_f in features[1:]])
 
         self.final_conv = nn.Conv2d(features[-1], 3, kernel_size=3, stride=1, padding=1)
-        self.normalize = nn.Tanh()
+        self.clamp_act = nn.Sigmoid()
 
-        self.mse_loss = nn.MSELoss(reduction="mean")
+        self.vae_loss_fn = F.mse_loss
         self.perceptual_loss = PerceptualLoss()
 
     def forward(self, z, condition=None, image_labels=None):
         features = self.fc(z)
         features = self.unflatten(features)
 
-        for layer, self_attn, cross_attn in zip(self.convs, self.self_attns, self.cross_attns):
+        assert features.shape[2:] == (self.expected_image_sizes[0], self.expected_image_sizes[0]), f"Expected {self.expected_image_sizes[0]}x{self.expected_image_sizes[0]} but got {features.shape[2:]} from layer {self.unflatten}"
+
+        assert len(self.convs) == len(self.self_attns) - 1 == len(self.cross_attns) - 1 == len(self.refines), f"Mismatch in number of layers: {len(self.convs)}, {len(self.self_attns)}, {len(self.cross_attns)}, {len(self.refines)}"
+
+        if self.self_attns[0] is not None and not isinstance(self.self_attns[0], nn.Identity):
+            features = features + self.self_attns[0](features)
+        if condition is not None and self.cross_attns[0] is not None and not isinstance(self.cross_attns[0], nn.Identity):
+            features = features + self.cross_attns[0](features, condition)
+
+        for layer, self_attn, cross_attn, refine, expected_image_size in zip(self.convs, self.self_attns[1:], self.cross_attns[1:], self.refines, self.expected_image_sizes[1:]):
             features = layer(features)
+
+            assert features.shape[2:] == (expected_image_size, expected_image_size), f"Expected {expected_image_size}x{expected_image_size} but got {features.shape[2:]} from layer {layer}"
+
             if self_attn is not None and not isinstance(self_attn, nn.Identity):
                 features = features + self_attn(features)
             if condition is not None and cross_attn is not None and not isinstance(cross_attn, nn.Identity):
                 features = features + cross_attn(features, condition)
+            if refine is not None:
+                features = features + refine(features)
 
         reconstructed_image = self.final_conv(features)
-        reconstructed_image = self.normalize(reconstructed_image)
+        reconstructed_image = self.clamp_act(reconstructed_image)
+
+        # output is on [-1, 1] range; scale to [0, 1]
+        if isinstance(self.clamp_act, nn.Tanh):
+            reconstructed_image = (reconstructed_image + 1) / 2
+            reconstructed_image = torch.clamp(reconstructed_image, 0, 1)
 
         if image_labels is not None:
             assert reconstructed_image.shape == image_labels.shape, f"Shape mismatch: {reconstructed_image.shape} vs {image_labels.shape}"
-            mse_loss = self.mse_loss(reconstructed_image, image_labels)
-            perceptual_loss = self.perceptual_loss(reconstructed_image, image_labels)
-            vae_loss = mse_loss + perceptual_loss
-            return reconstructed_image, vae_loss
-        return reconstructed_image, None
+            recon_loss = self.recon_beta * self.vae_loss_fn(reconstructed_image, image_labels)
+            perceptual_loss = self.ssim_beta * self.perceptual_loss(reconstructed_image, image_labels)
+            return reconstructed_image, recon_loss, perceptual_loss
+        return reconstructed_image, None, None
 
 class ImageReconstructionSingleTaskModel(nn.Module):
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig, image_recon):
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig, text_recurrent, image_recon):
         super().__init__()
         self.config = config
 
-        self.text_recurrent = megatransformer_recurrent.MegaTransformerRecurrentCausalModel(config)
+        self.text_encoder = text_recurrent
         self.image_recon = image_recon
 
     def gradient_checkpointing_enable(self, **kwargs):
         self.image_recon.unet.use_gradient_checkpointing = True
 
     def get_input_embeddings(self):
-        return self.text_recurrent.wte
+        return self.text_encoder.get_input_embeddings()
     
     def set_input_embeddings(self, new_embeddings):
-        self.text_recurrent.wte = new_embeddings
+        self.text_encoder.set_input_embeddings(new_embeddings)
     
     def forward(
         self,
@@ -570,7 +704,8 @@ class ImageReconstructionSingleTaskModel(nn.Module):
         output_hidden_states=None,
         return_dict=None):
         # recurrent model (for enriching the text embeddings as conditioning for the image diffuser)
-        recurrent_outputs = self.text_recurrent(
+
+        text_outputs = self.text_encoder(
             input_ids, 
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -581,41 +716,40 @@ class ImageReconstructionSingleTaskModel(nn.Module):
             return_dict=True,
         )
 
-        logits = recurrent_outputs.logits
-        all_hidden_states = recurrent_outputs.hidden_states
-        all_attentions = recurrent_outputs.attentions
+        logits = text_outputs['logits']
+        all_hidden_states = text_outputs['hidden_states']
+        all_attentions = text_outputs['attentions']
 
         if len(image_labels.shape) == 5:
             # for singular image diffusion, example dimension is unnecessary
             B, E, C, H, W = image_labels.shape
             image_labels = image_labels.view(B, C, H, W)
 
-        # reconstruction, loss
-        image_outputs, loss = self.image_recon(
+        loss, reconstruction, conditional_generation = self.image_recon(
             image_labels,
             condition=logits,
         )
 
         if not return_dict:
             outputs = (
-                image_outputs,
+                reconstruction,
                 past_key_values,
                 all_hidden_states,
                 all_attentions,
-                recurrent_outputs.n_steps_no_grad,
-                recurrent_outputs.k_steps_grad,
+                text_outputs['n_steps_no_grad'] if 'n_steps_no_grad' in text_outputs else None,
+                text_outputs['k_steps_grad'] if 'k_steps_grad' in text_outputs else None,
             )
             outputs = ((loss,) + outputs) if loss is not None else outputs
         else:
             outputs = megatransformer_utils.MegaTransformerMultimodalOutput(
                 loss=loss,
-                logits=image_outputs,
-                image_raw_outputs=image_outputs,
+                logits=reconstruction,
+                image_raw_outputs=[reconstruction, conditional_generation],
                 past_key_values=past_key_values,
                 hidden_states=all_hidden_states,
                 attentions=all_attentions,
-                n_steps_no_grad=recurrent_outputs.n_steps_no_grad,
-                k_steps_grad=recurrent_outputs.k_steps_grad,
+                n_steps_no_grad=text_outputs['n_steps_no_grad'] if 'n_steps_no_grad' in text_outputs else None,
+                k_steps_grad=text_outputs['k_steps_grad'] if 'k_steps_grad' in text_outputs else None,
             )
         return outputs
     
@@ -636,7 +770,7 @@ class ImageReconstructionSingleTaskModel(nn.Module):
     ):
 
         # recurrent model (for enriching the text embeddings as conditioning for the image diffuser)
-        text_embeddings = self.text_recurrent(
+        text_embeddings = self.text_encoder(
             input_ids, 
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -651,21 +785,34 @@ class ImageReconstructionSingleTaskModel(nn.Module):
             # repeat text embeddings for each sample along the batch dimension if num_samples > 1
             text_embeddings = text_embeddings.repeat_interleave(num_samples, dim=0)
 
-        pred_x0, noise_preds, x_start_preds = self.image_recon.sample(
-            device=text_embeddings.device,
-            condition=text_embeddings,
-            batch_size=num_samples,
-            image_size=image_size,
-            return_intermediate=True,
-            override_ddim_sampling_steps=override_ddim_sampling_steps,
-            generator=diffusion_generator,
-        )
+        if isinstance(self.image_recon, ImageVAE):
+            _, conditioned_image_recon, _ = self.image_recon.sample(
+                device=text_embeddings.device,
+                condition=text_embeddings,
+                batch_size=num_samples,
+                image_size=image_size,
+                return_intermediate=True,
+                override_ddim_sampling_steps=override_ddim_sampling_steps,
+                generator=diffusion_generator,
+            )
+            noise_preds = None
+            x_start_preds = None
+        else:
+            conditioned_image_recon, noise_preds, x_start_preds = self.image_recon.sample(
+                device=text_embeddings.device,
+                condition=text_embeddings,
+                batch_size=num_samples,
+                image_size=image_size,
+                return_intermediate=True,
+                override_ddim_sampling_steps=override_ddim_sampling_steps,
+                generator=diffusion_generator,
+            )
         if return_dict_in_generate:
             return megatransformer_utils.MultimodalGenerationOutput(
-                image_outputs=[pred_x0],
+                image_outputs=[conditioned_image_recon],
                 intermediate_image_outputs=(noise_preds, x_start_preds),
             )
-        return ([pred_x0], (noise_preds, x_start_preds))
+        return ([conditioned_image_recon], (noise_preds, x_start_preds))
 
 def gaussian_diffusion_image_model(config: megatransformer_utils.MegaTransformerConfig):
     return megatransformer_diffusion.GaussianDiffusion(
@@ -833,7 +980,7 @@ def create_test_tiny_image_diffusion_model(tokenizer: PreTrainedTokenizer, max_p
 
     return ImageReconstructionSingleTaskModel(config, gaussian_diffusion_image_model(config))
 
-def create_test_conv_transpose_model(tokenizer: PreTrainedTokenizer, max_position_embeddings, use_gradient_checkpointing):
+def create_conv_transpose_model(tokenizer: PreTrainedTokenizer, text_model_cls, max_position_embeddings, use_gradient_checkpointing):
     tokenizer.add_special_tokens({
         "additional_special_tokens": [
             megatransformer_utils.BEGIN_AUDIO_TOKEN,
@@ -930,26 +1077,44 @@ def create_test_conv_transpose_model(tokenizer: PreTrainedTokenizer, max_positio
 
     return ImageReconstructionSingleTaskModel(
         config,
+        text_model_cls(config),
         ImageVAE(
             config,
             ImageVAEEncoder(
                 config,
                 features=features,
-                self_attns=[False, False] + ([False] * (len(features) - 3)),
+                self_attns=[True, True, True] + ([False] * (len(features) - 3)),
             ),
             ImageVAEDecoder(
                 config,
                 features=list(reversed(features)),
-                self_attns=[False, False] + ([False] * (len(features) - 3)),
-                cross_attns=[False, False] + ([True] * (len(features) - 3)),
+                self_attns=[False, False, False, False] + ([True] * (len(features) - 4)),
+                cross_attns=[False, False, False, False] + ([True] * (len(features) - 4)),
             )
         )
+    )
+
+def create_test_conv_transpose_model(tokenizer: PreTrainedTokenizer, max_position_embeddings, use_gradient_checkpointing):
+    return create_conv_transpose_model(
+        tokenizer,
+        megatransformer_recurrent.MegaTransformerRecurrentCausalModel,
+        max_position_embeddings,
+        use_gradient_checkpointing
+    )
+
+def create_test_t5_conv_transpose_model(tokenizer: PreTrainedTokenizer, max_position_embeddings, use_gradient_checkpointing):
+    return create_conv_transpose_model(
+        tokenizer,
+        megatransformer_text_encoder.T5TextEncoder,
+        max_position_embeddings,
+        use_gradient_checkpointing
     )
 
 lookup = {
     "small": create_small_image_diffusion_model,
     "test_tiny": create_test_tiny_image_diffusion_model,
-    "test_conv_transpose": create_test_conv_transpose_model
+    "test_conv_transpose": create_test_conv_transpose_model,
+    "test_t5_conv_transpose": create_test_t5_conv_transpose_model,
 }
 
 def model_config_lookup(config):
