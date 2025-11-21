@@ -32,11 +32,12 @@ The following papers were used as a reference for feature implementations:
 ## Usage
 To train using deepspeed with ZeRO-2 (best compatibility and performance trade-off), use the following command:
 ```bash
-deepspeed --num_gpus=2 train.py \
+deepspeed --num_gpus=2 pretrain_wm.py \
     --use_deepspeed \
     --bf16 \
     --run_name my_run_name \
-    --config modern \
+    --config gpt2_small \
+    --max_steps 100000 \
     --deepspeed_config ds_config_zero-2.json
 ```
 

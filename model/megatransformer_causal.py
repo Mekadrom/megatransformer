@@ -114,7 +114,8 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
                 past_key_values=past_key_value,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
             )
 
             hidden_states = outputs.hidden_states

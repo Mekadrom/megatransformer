@@ -30,8 +30,11 @@ if args.local_rank == 0 or not args.use_deepspeed:
     print(f"model parameters: {(sum(p.numel() for p in model.parameters())):,}")
     print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
 
-    print(f"model.text_recurrent parameters: {(sum(p.numel() for p in model.text_recurrent.parameters())):,}")
+    print(f"model.text_recurrent parameters: {(sum(p.numel() for p in model.text_encoder.parameters())):,}")
     print(f"model.image_recon parameters: {(sum(p.numel() for p in model.image_recon.parameters())):,}")
+    if isinstance(model.image_recon, megatransformer_image_decoder.ImageVAE):
+        print(f"model.image_recon.encoder.parameters: {(sum(p.numel() for p in model.image_recon.encoder.parameters())):,}")
+        print(f"model.image_recon.decoder.parameters: {(sum(p.numel() for p in model.image_recon.decoder.parameters())):,}")
 
     print(f"modified tokenizer: {tokenizer}")
     print(f"special tokens: {tokenizer.special_tokens_map}")
@@ -105,7 +108,7 @@ data_collator = multimodal_dataset.DataCollatorForMultimodalLanguageModeling(
 )
 
 optimizer = torch.optim.AdamW([
-    {'params': model.text_recurrent.parameters(), 'lr': 1e-4},
+    {'params': model.text_encoder.parameters(), 'lr': 1e-4},
     {'params': model.image_recon.parameters(), 'lr': 1e-4},
 ], weight_decay=args.weight_decay)
 

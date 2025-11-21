@@ -1,3 +1,4 @@
+from transformers import T5Model, T5Config, T5Tokenizer
 from typing import Optional, Union
 
 from model import megatransformer_modules
@@ -6,6 +7,81 @@ import megatransformer_utils
 import torch
 import torch.nn as nn
 
+
+class T5TextEncoder(nn.Module):
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
+        super().__init__()
+        self.config = config
+
+        # Use T5 base model - you can change this to other sizes as needed
+        self.t5_model_name = "google-t5/t5-small"  # 220M parameters
+        self.t5_model = T5Model.from_pretrained(self.t5_model_name).encoder
+        
+        # Freeze T5 parameters (optional - can be made configurable)
+        for param in self.t5_model.parameters():
+            param.requires_grad = False
+            
+        # Projection layer to map T5 encoder hidden states to model hidden dimension
+        self.h_proj = nn.Linear(
+            self.t5_model.config.d_model,  # T5-base uses 768 as hidden size
+            config.hidden_size
+        )
+
+        # Initialize projection with suitable values
+        nn.init.normal_(self.h_proj.weight, std=0.02)
+        nn.init.zeros_(self.h_proj.bias)
+
+    def get_input_embeddings(self):
+        return self.t5_model.get_input_embeddings()
+    
+    def set_input_embeddings(self, new_embeddings):
+        self.t5_model.set_input_embeddings(new_embeddings)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask=None,
+        past_key_values=None,
+        use_cache=False,
+        head_mask=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        """
+        Process input text through T5's encoder.
+        Returns embeddings compatible with the rest of the model.
+        """
+        # Process through T5's encoder only
+        with torch.no_grad():
+            encoder_outputs = self.t5_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=output_hidden_states,
+                return_dict=True
+            )
+        
+        # Get the sequence of hidden states from the encoder
+        hidden_states = encoder_outputs.last_hidden_state
+        
+        # Project to match the model's hidden dimension
+        projected_hidden_states = self.h_proj(hidden_states)
+        
+        # Package the outputs to match expected format
+        if not return_dict:
+            return (
+                projected_hidden_states,
+                past_key_values,
+                encoder_outputs.hidden_states if output_hidden_states else None,
+                encoder_outputs.attentions if output_attentions else None,
+            )
+        else:
+            return megatransformer_utils.MegaTransformerCausalOutput(
+                logits=projected_hidden_states,
+                past_key_values=past_key_values,
+                hidden_states=encoder_outputs.hidden_states if output_hidden_states else None,
+                attentions=encoder_outputs.attentions if output_attentions else None,
+            )
 
 class TextFeatureExtractor(nn.Module):
     def __init__(self, config: megatransformer_utils.MegaTransformerConfig):

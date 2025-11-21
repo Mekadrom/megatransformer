@@ -231,33 +231,33 @@ class MegaTransformerRecurrentCausalModel(PreTrainedModel, GenerationMixin):
             head_mask=head_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True,
         )
 
         if all_hidden_states is not None:
-            all_hidden_states.extend(recurrent_outputs[2] if not return_dict else recurrent_outputs.all_hidden_states)
-            all_hidden_states.append(recurrent_outputs[0] if not return_dict else recurrent_outputs.hidden_states)
+            all_hidden_states.extend(recurrent_outputs.all_hidden_states)
+            all_hidden_states.append(recurrent_outputs.hidden_states)
 
         if all_attentions is not None:
-            all_attentions.extend(recurrent_outputs[3] if not return_dict else recurrent_outputs.all_attentions)
+            all_attentions.extend(recurrent_outputs.all_attentions)
 
         if not return_dict:
             return (
-                recurrent_outputs[0],
+                recurrent_outputs.logits,
                 past_key_values,
                 all_hidden_states,
                 all_attentions,
-                recurrent_outputs[-2] if recurrent_outputs is not None else None,
-                recurrent_outputs[-1] if recurrent_outputs is not None else None,
+                recurrent_outputs.n_steps_no_grad,
+                recurrent_outputs.k_steps_grad,
             )
         
         return megatransformer_utils.MegaTransformerCausalOutput(
-            logits=recurrent_outputs.hidden_states,
+            logits=recurrent_outputs.logits,
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
-            n_steps_no_grad=recurrent_outputs.n_steps_no_grad if recurrent_outputs is not None else None,
-            k_steps_grad=recurrent_outputs.k_steps_grad if recurrent_outputs is not None else None,
+            n_steps_no_grad=recurrent_outputs.n_steps_no_grad,
+            k_steps_grad=recurrent_outputs.k_steps_grad,
         )
     
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask: torch.Tensor=None, **kwargs):

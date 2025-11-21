@@ -559,7 +559,7 @@ class ImageGenerationCallback(TrainerCallback):
         image.save(image_filepath)
 
         writer.add_image(
-            f"generated_image/sample_{sample_type}",
+            f"generated_image/sample_conditioned",
             image_output.squeeze(0),
             global_step,
         )
@@ -620,13 +620,15 @@ class MetricsCallback(TrainerCallback):
             sorted_vocab = sorted(vocab.items(), key=lambda x: x[1])
             tokens = [token for token, _ in sorted_vocab]
 
-            assert len(tokens) == embedding_weights.shape[0], f"Mismatch between tokens and embedding weights: {len(tokens)} vs {embedding_weights.shape[0]}"
-            writer.add_embedding(
-                mat=embedding_weights,
-                metadata=tokens,
-                tag='token_embeddings',
-                global_step=global_step,
-            )
+            if len(tokens) != embedding_weights.shape[0]:
+                print(f"Mismatch between tokens and embedding weights: {len(tokens)} vs {embedding_weights.shape[0]}, not logging embeddings")
+            else:
+                writer.add_embedding(
+                    mat=embedding_weights,
+                    metadata=tokens,
+                    tag='token_embeddings',
+                    global_step=global_step,
+                )
         else:
             print("Model or tokenizer not found, skipping embedding logging...")
 

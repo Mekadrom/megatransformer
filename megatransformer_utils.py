@@ -1,5 +1,5 @@
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
-from positional_encodings.torch_encodings import PositionalEncoding2D
+from positional_encodings.torch_encodings import PositionalEncodingPermute2D
 from torch.nn import DataParallel
 from torch.nn.parallel import DistributedDataParallel
 from transformers import PretrainedConfig
@@ -498,38 +498,8 @@ def create_alibi_bias(n_heads, maxlen):
     bias = -torch.abs(diff).unsqueeze(0) * slopes.unsqueeze(-1).unsqueeze(-1)
     return bias  # [n_heads, seq_len, seq_len]
 
-def create_sinusoidal_2d_pos_encoding(h, w, channels, device):
-        """Creates 2D sinusoidal positional encodings"""
-        h_pos = torch.arange(h, device=device).float()
-        w_pos = torch.arange(w, device=device).float()
-        
-        # Normalize positions to [0, 1] range
-        h_pos = h_pos / h
-        w_pos = w_pos / w
-        
-        # Create 2D positional grid
-        h_pos, w_pos = torch.meshgrid(h_pos, w_pos, indexing='ij')
-        
-        # Calculate encoding frequencies (log-spaced)
-        freq_bands = torch.exp(
-            torch.linspace(
-                0., math.log(10000), channels//4, device=device
-            )
-        )
-        
-        # Create positional encodings
-        pos_enc = torch.zeros(1, channels, h, w, device=device)
-        
-        # Fill with sine and cosine patterns
-        for i, freq in enumerate(freq_bands):
-            pos_enc[:, 4*i:4*i+4, :, :] = torch.stack([
-                torch.sin(h_pos * freq),
-                torch.cos(h_pos * freq),
-                torch.sin(w_pos * freq),
-                torch.cos(w_pos * freq),
-            ], dim=0).unsqueeze(0)
-            
-        return pos_enc
+def create_sinusoidal_2d_pos_encoding(channels):
+    return PositionalEncodingPermute2D(channels)
 
 def create_sinusoidal_1d_pos_encoding(max_position_embeddings, hidden_size):
     positional_encoding = torch.zeros((max_position_embeddings, hidden_size)) # (max_length, d_model)

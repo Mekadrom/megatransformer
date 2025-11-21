@@ -5,6 +5,7 @@ from transformers.integrations import TensorBoardCallback
 from typing import Optional, Literal
 
 from dataset_loading import image_loading
+from model import megatransformer_image_decoder
 
 import megatransformer_utils
 import torch
@@ -130,6 +131,13 @@ class DefaultTrainer(Trainer):
 
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
 
+        if len(loss.shape) > 1:
+            # multiple trackable losses stacked
+            multiple_losses = loss.clone().detach()
+            loss = loss.sum(dim=-1)
+        else:
+            multiple_losses = None
+
         if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
 
@@ -139,6 +147,12 @@ class DefaultTrainer(Trainer):
                 self.log_steps(prefix, outputs.n_steps_no_grad, outputs.k_steps_grad)
             elif isinstance(outputs, tuple):
                 self.log_steps(prefix, outputs[-2], outputs[-1])
+                if multiple_losses is not None:
+                    self.writer.add_scalar(f"{prefix}recon_loss", multiple_losses[:, 0].mean(dim=0).item(), self.state.global_step)
+                    self.writer.add_scalar(f"{prefix}ssim_loss", multiple_losses[:, 1].mean(dim=0).item(), self.state.global_step)
+                    self.writer.add_scalar(f"{prefix}kl_loss", multiple_losses[:, 2].mean(dim=0).item(), self.state.global_step)
+                    self.writer.add_scalar(f"{prefix}mu_loss", multiple_losses[:, 3].mean(dim=0).item(), self.state.global_step)
+                    self.writer.add_scalar(f"{prefix}logvar_loss", multiple_losses[:, 4].mean(dim=0).item(), self.state.global_step)
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
                 for i, hidden_state in enumerate(outputs.hidden_states):
                     token_correlation = megatransformer_utils.get_token_correlation(hidden_state)

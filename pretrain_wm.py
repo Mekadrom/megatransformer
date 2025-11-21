@@ -47,7 +47,7 @@ if args.local_rank == 0 or not args.use_deepspeed:
 
         print(f"model.input_transform.audio_embedding parameters: {(sum(p.numel() for p in model.input_transform.audio_embedding.parameters())):,}")
 
-        print(f"model.input_transform.image_embedding parame~ters: {(sum(p.numel() for p in model.input_transform.image_embedding.parameters())):,}")
+        print(f"model.input_transform.image_embedding parameters: {(sum(p.numel() for p in model.input_transform.image_embedding.parameters())):,}")
         print(f"model.world_model parameters: {(sum(p.numel() for p in model.world_model.parameters())):,}")
 
         print(f"model.output_transform.text_coda parameters: {(sum(p.numel() for p in model.output_transform.text_coda.parameters())):,}")
@@ -193,7 +193,7 @@ else:
     generation_callback = custom_callbacks.GenerationCallback(
         tokenizer=tokenizer,
         prompts=prompts,
-        step_offset=args.start_steps,
+        step_offset=args.start_step,
         generation_steps=args.generation_steps,
     )
     trainer.add_callback(generation_callback)
