@@ -3,11 +3,13 @@
 ## Executive Summary
 This document provides a comprehensive code review of the MegaTransformer repository, covering TODOs, unimplemented functionality, incorrectly implemented functionality, missing concepts, performance concerns, and other notable issues.
 
-**Repository Stats:**
+**Repository Stats (as of review date: November 21, 2025):**
 - Total Python files: 34
 - Total lines of code: ~10,405
 - Total functions: 208+
 - Print/logging statements: 199
+
+*Note: Line numbers referenced throughout this document may change as the codebase evolves. Function/class names are provided where possible for easier location.*
 
 ## 1. TODOs and Unimplemented Functionality
 
@@ -780,10 +782,18 @@ self.k_proj = nn.Linear(config.hidden_size, self.n_heads * self.d_queries, bias=
 ## 17. Critical Bugs to Fix Immediately
 
 ### Priority: CRITICAL
-1. **Recurrent block passing wrong variable to thinking layers** (`model/megatransformer_blocks.py:342`)
-2. **Alibi bias slicing incorrect for KV caching** (`model/megatransformer_attn.py:118`)
-3. **Past key values iteration bug** (`model/megatransformer_causal.py:106`)
-4. **Silent type conversion of parameters** (`custom_trainers.py:126`)
+1. **Recurrent block passing wrong variable to thinking layers** 
+   - Location: `MegaTransformerRecurrentBlock.apply_thinking_layers()` in `model/megatransformer_blocks.py`
+   - Search for: `outputs = thinking_layer(hidden_states,`
+2. **Alibi bias slicing incorrect for KV caching** 
+   - Location: `MegaTransformerSelfAttention.forward()` in `model/megatransformer_attn.py`
+   - Search for: `self.alibi_bias[:, :t, :t]`
+3. **Past key values iteration bug** 
+   - Location: `MegaTransformerSimpleCausalModel.forward()` in `model/megatransformer_causal.py`
+   - Search for: `for i, (block, past_key_value) in enumerate(zip(`
+4. **Silent type conversion of parameters** 
+   - Location: `DefaultTrainer.compute_loss()` in `custom_trainers.py`
+   - Search for: `if param.dtype == torch.long`
 
 ### Priority: HIGH
 5. **KV caching not implemented for recurrent blocks**
