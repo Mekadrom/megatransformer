@@ -28,6 +28,14 @@ class MegaTransformerRawEmbedsRecurrentCausalModel(PreTrainedModel, GenerationMi
         else:
             self.norm_final = None
 
+    def gradient_checkpointing_enable(self, **kwargs):
+        print(f"Enabling gradient checkpointing with kwargs: {kwargs}")
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self, **kwargs):
+        print(f"Disabling gradient checkpointing with kwargs: {kwargs}")
+        self.gradient_checkpointing = False
+
     def forward(
         self,
         inputs_embeds,
@@ -53,19 +61,32 @@ class MegaTransformerRawEmbedsRecurrentCausalModel(PreTrainedModel, GenerationMi
 
         for i, block in enumerate(self.transformer):
             past_key_value = past_key_values[i] if past_key_values is not None else None
-            if all_hidden_states is not None:
+            if not self.training and all_hidden_states is not None:
                 all_hidden_states.append(hidden_states)
             
-            outputs = block(
-                hidden_states,
-                attention_mask=attention_mask,
-                head_mask=head_mask,
-                past_key_values=past_key_value,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
+            if self.gradient_checkpointing and self.training:
+                outputs = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    attention_mask,
+                    head_mask,
+                    past_key_value,
+                    use_cache,
+                    output_attentions,
+                    output_hidden_states,
+                    return_dict,
+                )
+            else:
+                outputs = block(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask,
+                    past_key_values=past_key_value,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                )
 
             if not return_dict:
                 hidden_states = outputs[0]
@@ -78,27 +99,25 @@ class MegaTransformerRawEmbedsRecurrentCausalModel(PreTrainedModel, GenerationMi
 
             if isinstance(block, megatransformer_blocks.MegaTransformerRecurrentBlock):
                 if not return_dict:
-                    n_steps_no_grad = outputs[4]
-                    k_steps_grad = outputs[5]
+                    n_steps_no_grad = outputs[5]
+                    k_steps_grad = outputs[6]
                 else:
                     n_steps_no_grad = outputs.n_steps_no_grad
                     k_steps_grad = outputs.k_steps_grad
-            else:
-                n_steps_no_grad = None
-                k_steps_grad = None
 
-            if hasattr(outputs, "all_hidden_states") and all_hidden_states is not None:
-                all_hidden_states.extend(outputs.all_hidden_states)
-            elif hasattr(outputs, "hidden_states") and all_hidden_states is not None:
-                all_hidden_states.append(outputs.hidden_states)
+            if not self.training:
+                if hasattr(outputs, "all_hidden_states") and all_hidden_states is not None:
+                    all_hidden_states.extend(outputs.all_hidden_states)
+                elif hasattr(outputs, "hidden_states") and all_hidden_states is not None:
+                    all_hidden_states.append(outputs.hidden_states)
             
-            if all_attentions:
-                all_attentions.append(attention_probs)
+                if all_attentions:
+                    all_attentions.append(attention_probs)
         
         if self.norm_final is not None:
             hidden_states = self.norm_final(hidden_states)
         
-        if all_hidden_states is not None:
+        if not self.training and all_hidden_states is not None:
             all_hidden_states.append(hidden_states)
         
         if not return_dict:
@@ -120,6 +139,17 @@ class MegaTransformerRawEmbedsRecurrentCausalModel(PreTrainedModel, GenerationMi
             k_steps_grad=k_steps_grad,
         )
     
+    def _gradient_checkpointing_func(self, module, *args, **kwargs):
+        """Wrapper for gradient checkpointing."""
+        def custom_forward(*inputs):
+            return module(*inputs)
+        
+        return torch.utils.checkpoint.checkpoint(
+            custom_forward,
+            *args,
+            use_reentrant=True,
+        )
+
     def prepare_inputs_for_generation(self, inputs_embeds, past_key_values=None, attention_mask: torch.Tensor=None, **kwargs):
         if past_key_values is not None and past_key_values[0] is not None:
             inputs_embeds = inputs_embeds[:, -1:]
@@ -159,6 +189,14 @@ class MegaTransformerRecurrentCausalModel(PreTrainedModel, GenerationMixin):
         self.recurrent = MegaTransformerRawEmbedsRecurrentCausalModel(config)
         
         self.apply(self._init_weights)
+
+    def gradient_checkpointing_enable(self, **kwargs):
+        print(f"Enabling gradient checkpointing with kwargs: {kwargs}")
+        self.recurrent.gradient_checkpointing_enable(**kwargs)
+
+    def gradient_checkpointing_disable(self, **kwargs):
+        print(f"Disabling gradient checkpointing with kwargs: {kwargs}")
+        self.recurrent.gradient_checkpointing_disable(**kwargs)
 
     def _init_weights(self, module):
         """Initialize weights as in the original implementation"""
@@ -234,12 +272,12 @@ class MegaTransformerRecurrentCausalModel(PreTrainedModel, GenerationMixin):
             return_dict=True,
         )
 
-        if all_hidden_states is not None:
-            all_hidden_states.extend(recurrent_outputs.all_hidden_states)
-            all_hidden_states.append(recurrent_outputs.hidden_states)
-
-        if all_attentions is not None:
-            all_attentions.extend(recurrent_outputs.all_attentions)
+        if not self.training:
+            if all_hidden_states is not None:
+                all_hidden_states.extend(recurrent_outputs.all_hidden_states)
+                all_hidden_states.append(recurrent_outputs.hidden_states)
+            if all_attentions is not None:
+                all_attentions.extend(recurrent_outputs.all_attentions)
 
         if not return_dict:
             return (

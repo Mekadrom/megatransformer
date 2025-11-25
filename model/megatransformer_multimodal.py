@@ -219,14 +219,12 @@ class MegaTransformerMultimodalDecoder(nn.Module):
         else:
             # (batch, example, seq_len, hidden_size)
             B1, E1, H1, W1 = audio_hidden_states.shape
+
             audio_hidden_states, audio_mel_spec_labels, audio_waveform_labels = self.audio_coda_forward(
                 audio_hidden_states,
                 audio_mel_spec_labels,
                 audio_waveform_labels,
             )
-
-            megatransformer_utils.print_debug_tensor('audio_mel_spec_labels', audio_mel_spec_labels)
-            megatransformer_utils.print_debug_tensor('audio_hidden_states', audio_hidden_states)
 
             mel_spec_reconstructions, audio_reconstruction_loss, audio_waveforms = self.audio_decoder(
                 audio_mel_spec_labels,
@@ -273,6 +271,16 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         self.input_transform = MegaTransformerMultimodalEncoder(config, text_embedding, audio_embedding, image_embedding)
         self.world_model = world_model
         self.output_transform = MegaTransformerMultimodalDecoder(config, text_decoder, audio_decoder, image_decoder)
+
+    def gradient_checkpointing_enable(self, **kwargs):
+        print(f"Enabling gradient checkpointing with kwargs: {kwargs}")
+        self.world_model.gradient_checkpointing_enable(**kwargs)
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self, **kwargs):
+        print(f"Disabling gradient checkpointing with kwargs: {kwargs}")
+        self.world_model.gradient_checkpointing_disable(**kwargs)
+        self.gradient_checkpointing = False
 
     def get_input_embeddings(self):
         return self.input_transform.text_embedding.wte
@@ -659,7 +667,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        past_key_values = past_key_values if past_key_values is not None else [None] * (self.config.n_prelude_layers + 1 + self.config.n_coda_layers)
+        past_key_values = past_key_values if past_key_values is not None else None#[None] * (self.config.n_prelude_layers + 1 + self.config.n_coda_layers)
 
         # if use_cache:
         #     # initialize kv caches for prelude layers as past_key_values[0:n_prelude_layers] = KVCache()
@@ -688,7 +696,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                     input_ids,
                     audio_raw_inputs,
                     image_raw_inputs,
-                    text_past_key_values=past_key_values[:self.config.n_prelude_layers],
+                    text_past_key_values=past_key_values[:self.config.n_prelude_layers] if past_key_values is not None else None,
                     audio_waveform_labels=audio_waveform_labels,
                 )
             else:
@@ -738,26 +746,32 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         else:
             output_text_logits = None
 
-        if torch.count_nonzero(audio_hidden_states) != 0:
-            _, output_audio, _, audio_reconstruction_loss, *_ = self.output_transform(
-                audio_hidden_states=audio_hidden_states,
-                audio_mel_spec_labels=audio_mel_spec_labels,
-                audio_waveform_labels=audio_waveform_labels,
-            )
-        else:
-            # output dummy audio so huggingface data parallelization doesn't have a conniption
-            output_audio = torch.zeros_like(audio_raw_inputs)
-            audio_reconstruction_loss = None
+        audio_reconstruction_losses = None
+        output_audio = None
+        if "audio" in self.config.include_modes:
+            # if torch.count_nonzero(audio_hidden_states) != 0:
+            if audio_hidden_states is not None and not any(dim == 0 for dim in audio_hidden_states.shape):
+                _, output_audio, _, audio_reconstruction_losses, *_ = self.output_transform(
+                    audio_hidden_states=audio_hidden_states,
+                    audio_mel_spec_labels=audio_mel_spec_labels,
+                    audio_waveform_labels=audio_waveform_labels,
+                )
+            else:
+                # output dummy audio so huggingface data parallelization doesn't have a conniption
+                output_audio = torch.zeros_like(audio_raw_inputs)
 
-        if torch.count_nonzero(image_hidden_states) != 0:
-            *_, output_images, image_reconstruction_loss = self.output_transform(
-                image_hidden_states=image_hidden_states,
-                image_labels=image_labels,
-            )
-        else:
-            # output dummy images so huggingface data parallelization doesn't have a conniption
-            output_images = torch.zeros_like(image_raw_inputs)
-            image_reconstruction_loss = None
+        image_reconstruction_losses = None
+        output_images = None
+        if "image" in self.config.include_modes:
+            # if torch.count_nonzero(image_hidden_states) != 0:
+            if image_hidden_states is not None and not any(dim == 0 for dim in image_hidden_states.shape):
+                *_, output_images, image_reconstruction_losses = self.output_transform(
+                    image_hidden_states=image_hidden_states,
+                    image_labels=image_labels,
+                )
+            else:
+                # output dummy images so huggingface data parallelization doesn't have a conniption
+                output_images = torch.zeros_like(image_raw_inputs)
 
         text_loss = None
         if labels is not None:
@@ -767,22 +781,30 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
             loss_fct = nn.CrossEntropyLoss()
             text_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-        total_loss = None
+        all_loss = []
         if text_loss is not None:
-            total_loss = text_loss
+            all_loss.append(text_loss)
 
-        if audio_reconstruction_loss is not None:
-            if total_loss is None:
-                total_loss = audio_reconstruction_loss
-            else:
-                total_loss = total_loss + audio_reconstruction_loss
+        if audio_reconstruction_losses is not None:
+            _, mel_l1_loss, waveform_l1, sc_loss, mag_loss = audio_reconstruction_losses
+            all_loss.append(mel_l1_loss)
+            all_loss.append(waveform_l1)
+            all_loss.append(sc_loss)
+            all_loss.append(mag_loss)
+        else:
+            all_loss.append(torch.tensor(0.0, device=inputs_embeds.device))
+            all_loss.append(torch.tensor(0.0, device=inputs_embeds.device))
+            all_loss.append(torch.tensor(0.0, device=inputs_embeds.device))
+            all_loss.append(torch.tensor(0.0, device=inputs_embeds.device))
 
-        if image_reconstruction_loss is not None:
-            if total_loss is None:
-                total_loss = image_reconstruction_loss
-            else:
-                total_loss = total_loss + image_reconstruction_loss
-        
+        if image_reconstruction_losses is not None:
+            mse_recon_loss = image_reconstruction_losses[0]
+            all_loss.append(mse_recon_loss)
+        else:
+            all_loss.append(torch.tensor(0.0, device=inputs_embeds.device))
+
+        all_loss = torch.stack(all_loss) if len(all_loss) > 0 else None
+
         if not return_dict:
             outputs = (
                 output_text_logits,
@@ -790,10 +812,10 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                 output_images,
                 *transformer_outputs[1:]
             )
-            outputs = ((total_loss,) + outputs) if total_loss is not None else outputs
+            outputs = ((all_loss,) + outputs) if all_loss is not None else outputs
         else:
             outputs = megatransformer_utils.MegaTransformerMultimodalOutput(
-                loss=total_loss,
+                loss=all_loss,
                 logits=output_text_logits,
                 audio_raw_outputs=output_audio,
                 image_raw_outputs=output_images,
@@ -947,13 +969,14 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                 if not in_audio_generation[i] and not in_image_generation[i] and text_token_id == self.config.begin_audio_token_id:
                     in_audio_generation[i] = True
                     current_modal_tokens[i] = []
-                elif in_audio_generation[i] and i in current_modal_tokens and (text_token_id == self.config.end_audio_token_id or len(current_modal_tokens[i]) > self.config.audio_max_frames):
+                elif in_audio_generation[i] and i in current_modal_tokens and len(current_modal_tokens[i]) > 0 and (text_token_id == self.config.end_audio_token_id or len(current_modal_tokens[i]) >= self.config.audio_max_frames):
                     in_audio_generation[i] = False
 
                     # Process collected audio tokens through audio generator
                     # add batch dimension and example dimension
                     audio_hidden_states = torch.cat(current_modal_tokens[i]).unsqueeze(0).unsqueeze(0)
 
+                    # audio_hidden_states: [1, 1, seq_len, hidden_size]
                     audio_coda_outputs, _, _ = self.output_transform.audio_coda_forward(audio_hidden_states)
 
                     outputs = self.output_transform.audio_decoder.sample(
@@ -966,8 +989,10 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                     if isinstance(outputs, tuple):
                         audio_mel_specs, audio_waveforms = outputs
                     else:
+                        audio_mel_specs = outputs.squeeze(1).permute(0, 2, 1)  # [1, n_mels, T_mel]
+
                         # remove singleton channel dimension from mel specs
-                        audio_waveforms = self.output_transform.audio_decoder.vocoder(audio_mel_specs.squeeze(1), audio_coda_outputs.permute(0, 2, 1))
+                        audio_waveforms = self.output_transform.audio_decoder.vocoder(audio_mel_specs, audio_coda_outputs)
 
                     all_audio_mel_specs.append(audio_mel_specs)
 
@@ -982,7 +1007,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                 elif not in_audio_generation[i] and not in_image_generation[i] and text_token_id == self.config.begin_image_token_id:
                     in_image_generation[i] = True
                     current_modal_tokens[i] = []
-                elif in_image_generation[i] and i in current_modal_tokens and (text_token_id == self.config.end_image_token_id or len(current_modal_tokens[i]) >= (self.config.image_size // self.config.image_encoder_patch_size) ** 2):
+                elif in_image_generation[i] and i in current_modal_tokens and len(current_modal_tokens[i]) > 0 and (text_token_id == self.config.end_image_token_id or len(current_modal_tokens[i]) >= (self.config.image_size // self.config.image_encoder_patch_size) ** 2):
                     in_image_generation[i] = False
                     
                     # Process collected image tokens through image generator
@@ -1132,7 +1157,7 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         return inputs
 
 
-def make_audio_decoder(config):
+def make_audio_decoder(config: megatransformer_utils.MegaTransformerConfig):
     return megatransformer_audio_decoder.AudioConditionalGaussianDiffusion(
         config=config,  # for vocoder to grab its details from
         hidden_size=config.hidden_size,
@@ -1148,7 +1173,7 @@ def make_audio_decoder(config):
         time_embedding_dim=config.audio_decoder_time_embedding_dim,
         num_res_blocks=config.audio_decoder_num_res_blocks,
         has_condition=True,
-        unet_dropout=config.audio_decoder_unet_dropout,
+        unet_dropout_p=config.audio_decoder_unet_dropout_p,
         betas_schedule=config.audio_decoder_betas_schedule,
         down_block_self_attn_n_heads=config.audio_decoder_down_block_self_attn_n_heads,
         down_block_self_attn_d_queries=config.audio_decoder_down_block_self_attn_d_queries,
@@ -1180,7 +1205,7 @@ def make_image_decoder(config):
         time_embedding_dim=config.image_decoder_time_embedding_dim,
         num_res_blocks=config.image_decoder_num_res_blocks,
         has_condition=True,
-        unet_dropout=config.image_decoder_unet_dropout,
+        unet_dropout_p=config.image_decoder_unet_dropout_p,
         betas_schedule=config.image_decoder_betas_schedule,
         down_block_self_attn_n_heads=config.image_decoder_down_block_self_attn_n_heads,
         down_block_self_attn_d_queries=config.image_decoder_down_block_self_attn_d_queries,
@@ -1221,11 +1246,13 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
     config = megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size + 6,
         max_position_embeddings=max_position_embeddings,
+        hidden_size=256,
         n_layers=None,
-        n_prelude_layers=2,
+        n_prelude_layers=1,
         n_recurrent_layers=2,
-        n_coda_layers=2,
+        n_coda_layers=1,
         intermediate_activation="swiglu",
+        intermediate_size=1024,
         norm_type="rmsnorm",
         ffn_type="mlp",
         use_positional_embedding=False,
@@ -1244,27 +1271,79 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
         begin_voice_token_id=begin_voice_token_id,
         end_voice_token_id=end_voice_token_id,
 
-        audio_decoder_model_channels=64,
-        audio_decoder_time_embedding_dim=64,
+        audio_encoder_base_channels=48,
+
+        audio_decoder_model_channels=32,
+        audio_decoder_time_embedding_dim=32,
         audio_decoder_num_res_blocks=2,
         audio_decoder_betas_schedule="cosine",
         audio_decoder_down_block_self_attn_n_heads=4,
         audio_decoder_up_block_self_attn_n_heads=4,
         audio_decoder_cross_attn_n_heads=4,
 
-        image_decoder_model_channels=64,
-        image_decoder_time_embedding_dim=64,
+        audio_vocoder_hidden_channels=1536,
+
+        image_decoder_model_channels=32,
+        image_decoder_time_embedding_dim=32,
         image_decoder_num_res_blocks=2,
         image_decoder_betas_schedule="cosine",
+
+        image_decoder_cross_attn_n_heads=4,
+        image_decoder_cross_attn_d_queries=32,
+        image_decoder_cross_attn_d_values=32,
     )
 
-    config.text_prelude_config = config
-    config.audio_prelude_config = config
-    config.image_prelude_config = config
+    config.text_prelude_config = megatransformer_utils.MegaTransformerConfig(
+        hidden_size=config.hidden_size,
+        n_prelude_layers=2,
+        d_queries=32,
+        d_values=32,
+        n_query_groups=4,
+        n_heads=4,
+        intermediate_size=config.intermediate_size,
+        use_cache=False,
+    )
+    config.audio_prelude_config = megatransformer_utils.MegaTransformerConfig(
+        hidden_size=config.hidden_size,
+        n_prelude_layers=2,
+        d_queries=32,
+        d_values=32,
+        n_query_groups=4,
+        n_heads=4,
+        intermediate_size=config.intermediate_size,
+        use_cache=False,
+    )
+    config.image_prelude_config = megatransformer_utils.MegaTransformerConfig(
+        hidden_size=config.hidden_size,
+        n_prelude_layers=3,
+        d_queries=64,
+        d_values=64,
+        n_query_groups=8,
+        n_heads=8,
+        intermediate_size=3072,
+        use_rotary_embedding=False,
+        use_alibi_bias=False,
+        use_cache=False,
+    )
 
-    config.text_coda_config = config
-    config.audio_coda_config = config
-    config.image_coda_config = config
+    config.text_coda_config = megatransformer_utils.MegaTransformerConfig(
+        hidden_size=config.hidden_size,
+        n_coda_layers=3,
+        intermediate_size=config.intermediate_size,
+        use_cache=False,
+    )
+    config.audio_coda_config = megatransformer_utils.MegaTransformerConfig(
+        hidden_size=config.hidden_size,
+        n_coda_layers=3,
+        intermediate_size=config.intermediate_size,
+        use_cache=False,
+    )
+    config.image_coda_config = megatransformer_utils.MegaTransformerConfig(
+        hidden_size=config.hidden_size,
+        n_coda_layers=3,
+        intermediate_size=config.intermediate_size,
+        use_cache=False,
+    )
 
     text_embedding = megatransformer_text_encoder.TextFeatureExtractor(config)
     audio_embedding = megatransformer_audio_encoder.AudioFeatureExtractor(config)

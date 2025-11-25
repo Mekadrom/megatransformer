@@ -1,9 +1,11 @@
+from io import BytesIO
 from datasets import load_dataset
 from PIL import Image
 from transformers import PreTrainedTokenizer
 from torchvision import transforms
 from typing import Optional
 
+import os
 import requests
 import torch
 
@@ -20,7 +22,7 @@ def get_transform(image_size):
     if image_size is None:
         raise ValueError("Image size must be specified for image transformations")
     return transforms.Compose([
-        # transforms.Resize((image_size, image_size)),
+        transforms.Resize((image_size, image_size)),
         # transforms.RandomResizedCrop((image_size, image_size), scale=(0.8, 1.0)),
         # transforms.RandomHorizontalFlip(),
         # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
@@ -33,19 +35,54 @@ def get_transform(image_size):
         ),
     ])
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 def fetch_and_transform_image(image_url, transform):
     try:
-        image = Image.open(requests.get(
-            image_url,
-            timeout=(1, 5),
-        ).raw)
+        response = requests.get(image_url, timeout=(1, 5), headers=HEADERS)
+        response.raise_for_status()  # Catch HTTP errors like 404, 403
+        image = Image.open(BytesIO(response.content)).convert('RGB')
         return transform(image)
     except Exception as e:
         # print(f"Error fetching or transforming image: {e} for URL {image_url}")
         global misses
         misses += 1
         return None
-    
+
+def hash_url(url: str) -> str:
+    replaced = url.replace("/", "_").replace(":", "_")
+    return str(abs(hash(replaced)))
+
+def cache_or_fetch_and_transform_image(dataset_name, dataset_config_name, image_url, transform):
+    cache_dir = os.path.join("image_cache", dataset_name.replace("/", "_"))
+    if dataset_config_name:
+        cache_dir = os.path.join(cache_dir, dataset_config_name)
+    os.makedirs(cache_dir, exist_ok=True)
+    image_filename = os.path.join(cache_dir, hash_url(image_url) + ".png")
+    if os.path.exists(image_filename):
+        try:
+            image = Image.open(image_filename).convert('RGB')
+            return transform(image)
+        except Exception as e:
+            print(f"Error loading cached image: {e} for file {image_filename}")
+            global misses
+            misses += 1
+            return None
+    else:
+        image_tensor = fetch_and_transform_image(image_url, transform)
+        if image_tensor is not None:
+            try:
+                # Save the image to cache
+                image = transforms.ToPILImage()(image_tensor)
+                image.save(image_filename)
+            except Exception as e:
+                print(f"Error saving image to cache: {e} for file {image_filename}")
+        return image_tensor
+
 def load_image_dataset(dataset_name: str,
                        dataset_config_name: Optional[str],
                        split: str,
@@ -74,7 +111,7 @@ def load_image_dataset(dataset_name: str,
         all_image_raw_inputs = []
 
         for caption, image_url in zip(captions, image_urls):
-            image_raw_input = fetch_and_transform_image(image_url, transform)
+            image_raw_input = cache_or_fetch_and_transform_image(dataset_name, dataset_config_name, image_url, transform)
             if caption is None or image_raw_input is None:
                 # add dummy example
                 image_raw_input = torch.zeros((3, image_size, image_size), dtype=torch.float32)

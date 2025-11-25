@@ -165,17 +165,23 @@ class ImageRMSNorm(nn.Module):
         self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
 
     def forward(self, x):
-        return F.normalize(x, dim=1) * self.g * (x.shape[-1] ** 0.5)
+        # x: [B, H, W, C]
+        x = x.permute(0, 3, 1, 2).contiguous()  # to [B, C, H, W]
+        x_norm = F.normalize(x, dim=1)
+        shift = x.shape[-1] ** 0.5
+        norm = x_norm * self.g * shift
+        norm = norm.permute(0, 2, 3, 1).contiguous()  # back to [B, H, W, C]
+        return norm
 
 class ImageSelfAttentionBlock(nn.Module):
-    def __init__(self, hidden_size, n_heads, d_queries, d_values, use_flash_attention=True, dropout=0.1, is_linear_attention=False):
+    def __init__(self, hidden_size, n_heads, d_queries, d_values, use_flash_attention=True, dropout_p=0.1, is_linear_attention=False):
         super().__init__()
         self.hidden_dim = hidden_size
         self.n_heads = n_heads
         self.d_queries = d_queries
         self.d_values = d_values
         self.use_flash_attention = use_flash_attention
-        self.dropout_p = dropout
+        self.dropout_p = dropout_p
         self.is_linear_attention = is_linear_attention
 
         self.q_proj = nn.Conv2d(hidden_size, d_queries * n_heads, kernel_size=1, bias=False)
@@ -183,7 +189,7 @@ class ImageSelfAttentionBlock(nn.Module):
         self.v_proj = nn.Conv2d(hidden_size, d_values * n_heads, kernel_size=1, bias=False)
         self.out_proj = nn.Conv2d(self.d_values * n_heads, hidden_size, kernel_size=1)
         
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout_p)
 
         self._init_weights()
 
@@ -830,7 +836,7 @@ def gaussian_diffusion_image_model(config: megatransformer_utils.MegaTransformer
         time_embedding_dim=config.image_decoder_time_embedding_dim,
         num_res_blocks=config.image_decoder_num_res_blocks,
         has_condition=True,
-        unet_dropout=config.image_decoder_unet_dropout,
+        unet_dropout=config.image_decoder_unet_dropout_p,
         betas_schedule=config.image_decoder_betas_schedule,
         down_block_self_attn_n_heads=config.image_decoder_down_block_self_attn_n_heads,
         down_block_self_attn_d_queries=config.image_decoder_down_block_self_attn_d_queries,

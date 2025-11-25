@@ -93,7 +93,7 @@ class MultimodalGenerationCallback(TrainerCallback):
         self.test_audio_prompt_text = "It is from Westport, above the villages of Murrisk and Lecanvey."
         self.test_audio_prompt = tokenizer(self.test_audio_prompt_text, return_tensors="pt")
 
-        self.test_image: Any = Image.open(os.path.join('inference', 'examples', 'test_vlm1.png')).convert("RGB")
+        self.test_image: Any = Image.open(os.path.join('inference', 'examples', 'test_vlm1_x256.png')).convert("RGB")
         self.test_image = transforms.ToTensor()(self.test_image)
         self.test_image_prompt_text = "A man ironing a shirt while strapped to the back of a taxi."
         self.test_image_prompt = tokenizer(self.test_image_prompt_text, return_tensors="pt")

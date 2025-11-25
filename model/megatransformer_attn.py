@@ -63,7 +63,7 @@ class MegaTransformerSelfAttention(nn.Module):
             "causal_mask",
             torch.tril(torch.ones(max_positions, max_positions)).view(1, 1, max_positions, max_positions),
         )
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -94,7 +94,7 @@ class MegaTransformerSelfAttention(nn.Module):
         values_to_cache = values.view(N, -1, self.n_heads, self.d_values).permute(0, 2, 1, 3).contiguous()
 
         # cache keys and values in the shape (B, N, S, H/N) where N is the number of heads
-        if past_key_values is not None:
+        if past_key_values is not None and not self.training:
             past_key, past_value = past_key_values
             keys = torch.cat([past_key, keys_to_cache], dim=-2)
             values = torch.cat([past_value, values_to_cache], dim=-2)
@@ -102,7 +102,7 @@ class MegaTransformerSelfAttention(nn.Module):
             keys = keys_to_cache
             values = values_to_cache
 
-        if use_cache:
+        if use_cache and not self.training:
             if past_key_values is None:
                 past_key_values = megatransformer_utils.KVCache()
             past_key_values.update(key=keys_to_cache, value=values_to_cache)
@@ -160,11 +160,11 @@ class MegaTransformerSelfAttention(nn.Module):
             return (
                 output,
                 past_key_values,
-                attention_probs if output_attentions else None,
+                attention_probs if output_attentions and not self.training else None,
             )
         
         return MegaTransformerSelfAttentionOutput(
             hidden_states=output,
             past_key_values=past_key_values,
-            attention_probs=attention_probs if output_attentions else None,
+            attention_probs=attention_probs if output_attentions and not self.training else None,
         )

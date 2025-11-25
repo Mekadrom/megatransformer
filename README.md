@@ -37,7 +37,9 @@ deepspeed --num_gpus=2 pretrain_wm.py \
     --bf16 \
     --run_name my_run_name \
     --config gpt2_small \
-    --max_steps 100000 \
+    --max_steps 300000 \
+    --gradient_accumulation_steps 8 \
+    --use_gradient_checkpointing \
     --deepspeed_config ds_config_zero-2.json
 ```
 

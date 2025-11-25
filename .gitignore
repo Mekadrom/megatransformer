@@ -134,6 +134,8 @@ cached_datasets/
 runs/
 runs.bak/
 runs.bak.bak/
+runs.bak.bak.bak/
 .gradio/
 inference/generated/
 checkpoints/
+image_cache/

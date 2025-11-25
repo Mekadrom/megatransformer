@@ -23,8 +23,13 @@ class Block(nn.Module):
         self.act = activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(in_channels)
 
     def forward(self, x, time_embedding=None):
+        # x: [B, C, H, W]
         x = self.proj(x)
+        # switch channel to last dimension (now [B, H, W, C])
+        x = x.permute(0, 2, 3, 1).contiguous()
         x = self.norm(x)
+        # switch back to [B, C, H, W]
+        x = x.permute(0, 3, 1, 2).contiguous()
 
         if time_embedding is not None:
             x = x + time_embedding
@@ -88,7 +93,7 @@ class DownBlock(nn.Module):
                  norm_class,
                  has_attn: bool=False,
                  num_res_blocks: int=2,
-                 dropout: float=0.1,
+                 dropout_p: float=0.1,
                  self_attn_n_heads=6,
                  self_attn_d_queries=64,
                  self_attn_d_values=64,
@@ -107,7 +112,7 @@ class DownBlock(nn.Module):
 
         self.attn_blocks = nn.ModuleList([
             self_attn_class(
-                out_channels, self_attn_n_heads, self_attn_d_queries, self_attn_d_values, use_flash_attention=self_attn_use_flash_attention, dropout=dropout
+                out_channels, self_attn_n_heads, self_attn_d_queries, self_attn_d_values, use_flash_attention=self_attn_use_flash_attention, dropout_p=dropout_p
             ) if has_attn else nn.Identity()
             for _ in range(num_res_blocks)
         ])
@@ -121,11 +126,12 @@ class DownBlock(nn.Module):
         self.downsample.bias.data.zero_()
 
     def forward(self, x: torch.Tensor, time_embedding: Optional[torch.Tensor]=None, condition=None) -> tuple[torch.Tensor, torch.Tensor]:
+        # x: [B, C, H, W]
         for norm, res_block, attn_block in zip(self.norms, self.res_blocks, self.attn_blocks):
-            # switch channel and last dimension
+            # switch channel to last dimension (now [B, H, W, C])
             x = x.permute(0, 2, 3, 1).contiguous()
             x = norm(x)
-            # switch back
+            # switch back to [B, C, H, W]
             x = x.permute(0, 3, 1, 2).contiguous()
             x = res_block(x, time_embedding)
             x = attn_block(x)
@@ -145,7 +151,7 @@ class UpBlock(nn.Module):
                  has_attn: bool=False,
                  has_condition: bool=False,
                  num_res_blocks: int=2,
-                 dropout: float=0.1,
+                 dropout_p: float=0.1,
                  self_attn_n_heads=6,
                  self_attn_d_queries=64,
                  self_attn_d_values=64,
@@ -173,14 +179,14 @@ class UpBlock(nn.Module):
 
         self.attn_blocks = nn.ModuleList([
             self_attn_class(
-                out_channels, self_attn_n_heads, self_attn_d_queries, self_attn_d_values, use_flash_attention=self_attn_use_flash_attention, dropout=dropout
+                out_channels, self_attn_n_heads, self_attn_d_queries, self_attn_d_values, use_flash_attention=self_attn_use_flash_attention, dropout_p=dropout_p
             ) if has_attn else nn.Identity()
             for _ in range(num_res_blocks)
         ])
 
         self.cross_attn_blocks = nn.ModuleList([
             cross_attn_class(
-                out_channels, cross_attn_n_heads, cross_attn_d_queries, cross_attn_d_values, context_dim=hidden_size, use_flash_attention=cross_attn_use_flash_attention, dropout=dropout
+                out_channels, cross_attn_n_heads, cross_attn_d_queries, cross_attn_d_values, context_dim=hidden_size, use_flash_attention=cross_attn_use_flash_attention, dropout_p=dropout_p
             ) if has_attn and has_condition else nn.Identity()
             for _ in range(num_res_blocks)
         ])
@@ -223,7 +229,7 @@ class UNet(nn.Module):
             time_embedding_dim: int = 256,
             attention_levels: list[bool] = [False, False, True, True],
             num_res_blocks: int = 2,
-            dropout: float = 0.1,
+            dropout_p: float = 0.1,
             has_condition: bool = False,
             down_block_self_attn_n_heads=6,
             down_block_self_attn_d_queries=64,
@@ -242,8 +248,8 @@ class UNet(nn.Module):
         self.use_gradient_checkpointing = False
 
         activation_type = megatransformer_utils.get_activation_type(activation)
-        self.time_embedding = nn.Sequential(
-            megatransformer_modules.SinusoidalPositionEmbeddings(model_channels),
+        self.time_embedding = megatransformer_modules.SinusoidalPositionEmbeddings(model_channels)
+        self.time_transform = nn.Sequential(
             nn.Linear(model_channels, time_embedding_dim),
             activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(time_embedding_dim),
             nn.Linear(time_embedding_dim, time_embedding_dim),
@@ -268,7 +274,7 @@ class UNet(nn.Module):
                     norm_class,
                     has_attn=attention_levels[i],
                     num_res_blocks=num_res_blocks,
-                    dropout=dropout,
+                    dropout_p=dropout_p,
                     self_attn_n_heads=down_block_self_attn_n_heads,
                     self_attn_d_queries=down_block_self_attn_d_queries,
                     self_attn_d_values=down_block_self_attn_d_values,
@@ -281,7 +287,7 @@ class UNet(nn.Module):
         )
         self.middle_attn_norm = megatransformer_modules.RMSNorm(channels[-1])
         self.middle_attn_block = self_attn_class(
-            channels[-1], down_block_self_attn_n_heads, down_block_self_attn_d_queries, down_block_self_attn_d_values, use_flash_attention=down_block_self_attn_use_flash_attention, dropout=dropout, is_linear_attention=False
+            channels[-1], down_block_self_attn_n_heads, down_block_self_attn_d_queries, down_block_self_attn_d_values, use_flash_attention=down_block_self_attn_use_flash_attention, dropout_p=dropout_p, is_linear_attention=False
         )
         self.middle_res_block2 = ResidualBlock(
             channels[-1], channels[-1], time_embedding_dim, activation, norm_class
@@ -302,7 +308,7 @@ class UNet(nn.Module):
                     norm_class,
                     has_attn=attention_levels[i],
                     num_res_blocks=num_res_blocks,
-                    dropout=dropout,
+                    dropout_p=dropout_p,
                     has_condition=has_condition,
                     self_attn_n_heads=up_block_self_attn_n_heads,
                     self_attn_d_queries=up_block_self_attn_d_queries,
@@ -330,6 +336,9 @@ class UNet(nn.Module):
 
     def forward(self, x: torch.Tensor, timesteps: torch.Tensor, condition=None) -> torch.Tensor:
         time_embedding = self.time_embedding(timesteps)
+        time_embedding = self.time_transform(time_embedding.to(x.dtype))
+
+        assert len(x.shape) == 4, f"expected 4 dimensions (batch, channel, height, width), got {len(x.shape)}"
 
         h = self.init_conv(x)
         initial_h = h
@@ -379,7 +388,7 @@ class GaussianDiffusion(nn.Module):
             beta_end: float = 0.02,
             num_timesteps: int = 1000,
             has_condition: bool = False,
-            unet_dropout: float = 0.1,
+            unet_dropout_p: float = 0.1,
             betas_schedule="linear",
             down_block_self_attn_n_heads=6,
             down_block_self_attn_d_queries=64,
@@ -428,7 +437,7 @@ class GaussianDiffusion(nn.Module):
             out_channels=out_channels,
             time_embedding_dim=time_embedding_dim,
             num_res_blocks=num_res_blocks,
-            dropout=unet_dropout,
+            dropout_p=unet_dropout_p,
             has_condition=has_condition,
             down_block_self_attn_n_heads=down_block_self_attn_n_heads,
             down_block_self_attn_d_queries=down_block_self_attn_d_queries,
@@ -684,8 +693,8 @@ class GaussianDiffusion(nn.Module):
         if self.normalize:
             x_0 = self.normalize_to_neg_one_to_one(x_0)
 
-        model_output, mel_l1_loss = self.p_losses(x_0, t, condition=condition)
+        model_output, mse_loss = self.p_losses(x_0, t, condition=condition)
         if e is not None:
             # restore model example dimension
             model_output = model_output.view(b, e, c, h, w)
-        return model_output, mel_l1_loss
+        return model_output, [mse_loss]

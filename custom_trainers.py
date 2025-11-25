@@ -129,14 +129,7 @@ class DefaultTrainer(Trainer):
         sanitized_model.config.current_epoch = self.state.epoch
         sanitized_model.config.current_global_step = self.state.global_step
 
-        loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
-
-        if len(loss.shape) > 1:
-            # multiple trackable losses stacked
-            multiple_losses = loss.clone().detach()
-            loss = loss.sum(dim=-1)
-        else:
-            multiple_losses = None
+        stacked_losses, outputs = super().compute_loss(model, inputs, return_outputs=True)
 
         if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
@@ -147,18 +140,40 @@ class DefaultTrainer(Trainer):
                 self.log_steps(prefix, outputs.n_steps_no_grad, outputs.k_steps_grad)
             elif isinstance(outputs, tuple):
                 self.log_steps(prefix, outputs[-2], outputs[-1])
-                if multiple_losses is not None:
-                    self.writer.add_scalar(f"{prefix}recon_loss", multiple_losses[:, 0].mean(dim=0).item(), self.state.global_step)
-                    self.writer.add_scalar(f"{prefix}ssim_loss", multiple_losses[:, 1].mean(dim=0).item(), self.state.global_step)
-                    self.writer.add_scalar(f"{prefix}kl_loss", multiple_losses[:, 2].mean(dim=0).item(), self.state.global_step)
-                    self.writer.add_scalar(f"{prefix}mu_loss", multiple_losses[:, 3].mean(dim=0).item(), self.state.global_step)
-                    self.writer.add_scalar(f"{prefix}logvar_loss", multiple_losses[:, 4].mean(dim=0).item(), self.state.global_step)
+                if stacked_losses is not None:
+                    if stacked_losses.ndim == 2 and stacked_losses.shape[1] == 5:
+                        self.optional_log_loss(f"{prefix}recon_loss", stacked_losses[:, 0].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}ssim_loss", stacked_losses[:, 1].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}kl_loss", stacked_losses[:, 2].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}mu_loss", stacked_losses[:, 3].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}logvar_loss", stacked_losses[:, 4].mean(dim=0).item(), self.state.global_step)
+                    if stacked_losses.ndim == 1 and stacked_losses.shape[0] == 6:
+                        self.optional_log_loss(f"{prefix}text_loss", stacked_losses[0].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}text_loss", stacked_losses[0].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}mel_l1_loss", stacked_losses[1].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}waveform_l1_loss", stacked_losses[2].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}sc_loss", stacked_losses[3].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}mag_loss", stacked_losses[4].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}image_mse_loss", stacked_losses[5].mean(dim=0).item(), self.state.global_step)
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
                 for i, hidden_state in enumerate(outputs.hidden_states):
                     token_correlation = megatransformer_utils.get_token_correlation(hidden_state)
                     self.writer.add_scalar(f"{prefix}token_correlation_{i}", token_correlation, self.state.global_step)
-        return (loss, outputs) if return_outputs else loss
+        
+        actual_loss = (
+            (stacked_losses[0].mean() * 1.0) # text loss
+                + (stacked_losses[1].mean() * 5.0) # audio mel l1 loss
+                + (stacked_losses[2].mean() * 0.5) # audio waveform l1 loss
+                + (stacked_losses[3].mean() * 0.1) # audio spectral convergence loss
+                + (stacked_losses[4].mean() * 0.15) # audio log magnitude loss
+                + (stacked_losses[5].mean() * 5.0) # image mse loss
+        ) if stacked_losses is not None else outputs.loss
+        return (actual_loss, outputs) if return_outputs else actual_loss
     
+    def optional_log_loss(self, tag, value, step):
+        if value != 0.0:
+            self.writer.add_scalar(tag, value, step)
+
     def log_steps(self, prefix, n_steps_no_grad, k_steps_grad):
         if n_steps_no_grad is None or k_steps_grad is None:
             return

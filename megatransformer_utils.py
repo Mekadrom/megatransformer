@@ -113,6 +113,7 @@ class MegaTransformerConfig(PretrainedConfig):
     
     def __init__(
         self,
+        include_modes=["text", "audio", "image"],
         vocab_size=50257,
         max_position_embeddings=1024,
         hidden_size=768,
@@ -215,7 +216,7 @@ class MegaTransformerConfig(PretrainedConfig):
         audio_decoder_activation="silu",
         audio_decoder_dropout=0.1,
 
-        audio_decoder_unet_dropout=0.1,
+        audio_decoder_unet_dropout_p=0.1,
         audio_decoder_betas_schedule="linear",
         audio_decoder_down_block_self_attn_n_heads=8,
         audio_decoder_down_block_self_attn_d_queries=64,
@@ -237,12 +238,12 @@ class MegaTransformerConfig(PretrainedConfig):
         image_coda_config=None,
 
         image_decoder_model_channels=128,
-        image_decoder_time_embedding_dim=256,
+        image_decoder_time_embedding_dim=128,
         image_decoder_num_res_blocks=4,
         image_decoder_activation="silu",
         image_decoder_dropout=0.1,
 
-        image_decoder_unet_dropout=0.1,
+        image_decoder_unet_dropout_p=0.1,
         image_decoder_betas_schedule="linear",
         image_decoder_down_block_self_attn_n_heads=8,
         image_decoder_down_block_self_attn_d_queries=64,
@@ -260,6 +261,7 @@ class MegaTransformerConfig(PretrainedConfig):
         **kwargs
     ):
         super().__init__(**kwargs)
+        self.include_modes = include_modes
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -367,7 +369,7 @@ class MegaTransformerConfig(PretrainedConfig):
         self.audio_decoder_num_res_blocks = audio_decoder_num_res_blocks
         self.audio_decoder_dropout = audio_decoder_dropout
 
-        self.audio_decoder_unet_dropout = audio_decoder_unet_dropout
+        self.audio_decoder_unet_dropout_p = audio_decoder_unet_dropout_p
         self.audio_decoder_betas_schedule = audio_decoder_betas_schedule
         self.audio_decoder_down_block_self_attn_n_heads = audio_decoder_down_block_self_attn_n_heads
         self.audio_decoder_down_block_self_attn_d_queries = audio_decoder_down_block_self_attn_d_queries
@@ -394,7 +396,7 @@ class MegaTransformerConfig(PretrainedConfig):
         self.image_decoder_num_res_blocks = image_decoder_num_res_blocks
         self.image_decoder_dropout = image_decoder_dropout
 
-        self.image_decoder_unet_dropout = image_decoder_unet_dropout
+        self.image_decoder_unet_dropout_p = image_decoder_unet_dropout_p
         self.image_decoder_betas_schedule = image_decoder_betas_schedule
         self.image_decoder_down_block_self_attn_n_heads = image_decoder_down_block_self_attn_n_heads
         self.image_decoder_down_block_self_attn_d_queries = image_decoder_down_block_self_attn_d_queries
@@ -831,8 +833,10 @@ def conv2d_weight_init():
 def print_debug_tensor(pre: str, tensor: torch.Tensor):
     if tensor is None:
         print(f"{pre}: None")
+    elif tensor.numel() == 0:
+        print(f"{pre}: empty tensor with shape {tensor.shape}")
     elif tensor.dtype in [torch.float16, torch.float32, torch.float64, torch.bfloat16]:
-        print(f"{pre}:\n\tdtype: {tensor.dtype}\n\tdevice: {tensor.device}\n\tshape: {tensor.shape}\n\tmean: {tensor.mean()}\n\tstd: {tensor.std()}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tnorm: {tensor.norm()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
+        print(f"{pre}:\n\tptr: {tensor.data_ptr()}\n\tdtype: {tensor.dtype}\n\tdevice: {tensor.device}\n\tshape: {tensor.shape}\n\tmean: {tensor.mean()}\n\tstd: {tensor.std()}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tnorm: {tensor.norm()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
         if tensor.numel() < 100:
             print(f"\t{tensor}")
     else:

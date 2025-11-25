@@ -11,17 +11,17 @@ text_validation_dataset_name = "wikitext"
 text_validation_dataset_config_name = "wikitext-2-v1"
 text_validation_split = "validation"
 
-audio_train_dataset_name = "mozilla-foundation/common_voice_11_0"
+audio_train_dataset_name = "fixie-ai/common_voice_17_0"
 # audio_train_dataset_name = "facebook/voxpopuli"
 audio_train_dataset_config_name = "en"
 audio_train_split = "train"
 
-audio_validation_dataset_name = "mozilla-foundation/common_voice_11_0"
+audio_validation_dataset_name = "fixie-ai/common_voice_17_0"
 # audio_validation_dataset_name = "facebook/voxpopuli"
 audio_validation_dataset_config_name = "en"
 audio_validation_split = "validation"
 
-image_train_dataset_name = "laion/laion400m"
+image_train_dataset_name = "laion/relaion400m"
 image_train_dataset_config_name = None
 image_train_split = "train"
 
@@ -81,7 +81,7 @@ def load_text_only_dataset(tokenizer, max_position_embeddings, dataset_name, dat
     return dataset
 
 def load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, max_frames, tokenizer, dataset_name, dataset_config_name, dataset_split, streaming=False, cache_dir=None):
-    if "mozilla" in dataset_name.lower() or "commonvoice" in dataset_name.lower() or "voxpopuli" in dataset_name.lower():
+    if "mozilla" in dataset_name.lower() or "common_voice" in dataset_name.lower() or "voxpopuli" in dataset_name.lower():
         dataset = audio_loading.load_audio_dataset(
             dataset_name,
             dataset_config_name,

@@ -73,7 +73,7 @@ class SimpleBlock(nn.Module):
         super().__init__()
         self.config = config
         self.name = name
-        self.prelude = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(n_layers)])
+        self.transformer = nn.ModuleList([megatransformer_blocks.MegaTransformerBlock(config) for _ in range(n_layers)])
         self.dropout = nn.Dropout(dropout)
 
     def forward(
@@ -90,9 +90,9 @@ class SimpleBlock(nn.Module):
         all_hidden_states: Optional[list] = [] if output_hidden_states else None
         all_attentions: Optional[list] = [] if output_attentions else None
 
-        for i, block in enumerate(self.prelude):
+        for i, block in enumerate(self.transformer):
             past_key_value = past_key_values[i] if past_key_values is not None else None
-            if all_hidden_states is not None:
+            if not self.training and all_hidden_states is not None:
                 all_hidden_states.append(hidden_states)
 
             outputs = block(
@@ -112,10 +112,10 @@ class SimpleBlock(nn.Module):
                 hidden_states = outputs.hidden_states
                 attention_probs = outputs.attention_probs
 
-            if all_attentions is not None:
+            if not self.training and all_attentions is not None:
                 all_attentions.append(attention_probs)
 
-        if all_hidden_states is not None:
+        if not self.training and all_hidden_states is not None:
             all_hidden_states.append(hidden_states)
 
         hidden_states = self.dropout(hidden_states)

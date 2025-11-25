@@ -33,7 +33,17 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         else:
             self.norm_final = None
         
+        self.gradient_checkpointing = False
+
         self.apply(self._init_weights)
+
+    def gradient_checkpointing_enable(self, **kwargs):
+        print(f"Unexpected kwargs in gradient_checkpointing_enable: {kwargs}")
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self, **kwargs):
+        print(f"Unexpected kwargs in gradient_checkpointing_disable: {kwargs}")
+        self.gradient_checkpointing = False
 
     def _init_weights(self, module):
         """Initialize weights as in the original implementation"""
@@ -104,35 +114,49 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
         all_attentions: Optional[list] = [] if output_attentions else None
         
         for i, (block, past_key_value) in enumerate(zip(self.transformer, past_key_values)):
-            if all_hidden_states is not None:
-                all_hidden_states.append(hidden_states)
-            
-            outputs = block(
-                hidden_states,
-                attention_mask=attention_mask,
-                head_mask=head_mask[i] if head_mask is not None else None,
-                past_key_values=past_key_value,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
+            if self.gradient_checkpointing and self.training:
+                outputs = self._gradient_checkpointing_func(
+                    block.__call__,
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask[i] if head_mask is not None else None,
+                    past_key_values=past_key_value,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                )
+            else:
+                if not self.training and all_hidden_states is not None:
+                    all_hidden_states.append(hidden_states)
+                
+                outputs = block(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask[i] if head_mask is not None else None,
+                    past_key_values=past_key_value,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                )
 
             hidden_states = outputs.hidden_states
             attention_probs = outputs.attention_probs
 
-            if hasattr(outputs, "all_hidden_states") and all_hidden_states is not None:
-                all_hidden_states.extend(outputs.all_hidden_states)
-            elif hasattr(outputs, "hidden_states") and all_hidden_states is not None:
-                all_hidden_states.append(outputs.hidden_states)
-            
-            if all_attentions:
-                all_attentions.append(attention_probs)
+            if not self.training:
+                if hasattr(outputs, "all_hidden_states") and all_hidden_states is not None:
+                    all_hidden_states.extend(outputs.all_hidden_states)
+                elif hasattr(outputs, "hidden_states") and all_hidden_states is not None:
+                    all_hidden_states.append(outputs.hidden_states)
+                
+                if all_attentions:
+                    all_attentions.append(attention_probs)
         
         if self.norm_final is not None:
             hidden_states = self.norm_final(hidden_states)
         
-        if all_hidden_states is not None:
+        if not self.training and all_hidden_states is not None:
             all_hidden_states.append(hidden_states)
         
         if not return_dict:
@@ -150,6 +174,20 @@ class MegaTransformerSimpleCausalModel(PreTrainedModel, GenerationMixin):
             attentions=all_attentions,
         )
     
+    def _gradient_checkpointing_func(self, module_call, *args, **kwargs):
+        """Wrapper for gradient checkpointing."""
+        def create_custom_forward(module):
+            def custom_forward(*inputs, **kwargs):
+                return module(*inputs, **kwargs)
+            return custom_forward
+        
+        return torch.utils.checkpoint.checkpoint(
+            create_custom_forward(module_call),
+            *args,
+            **kwargs,
+            use_reentrant=True
+        )
+
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask: torch.Tensor=None, **kwargs):
         if past_key_values is not None and past_key_values[0] is not None:
             input_ids = input_ids[:, -1:]
@@ -176,12 +214,24 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.transformer = MegaTransformerSimpleCausalModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        self.gradient_checkpointing = False
         
         self.apply(self._init_weights)
         
         if config.tie_word_embeddings:
             self.tie_weights()
     
+    def gradient_checkpointing_enable(self, **kwargs):
+        print(f"Unexpected kwargs in gradient_checkpointing_enable: {kwargs}")
+        self.transformer.gradient_checkpointing_enable()
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self, **kwargs):
+        print(f"Unexpected kwargs in gradient_checkpointing_disable: {kwargs}")
+        self.transformer.gradient_checkpointing_disable()
+        self.gradient_checkpointing = False
+
     def tie_weights(self):
         self._tie_or_clone_weights(self.lm_head, self.transformer.get_input_embeddings())
     
@@ -279,11 +329,32 @@ class MegaTransformerCausalLMHead(PreTrainedModel, GenerationMixin):
         return self.transformer.prepare_inputs_for_generation(input_ids, **kwargs)
 
 
+def create_gpt2_tiny_model(tokenizer, max_position_embeddings):
+    # debug model size, ~9.5M params
+    return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        max_position_embeddings=max_position_embeddings,
+        hidden_size=64,
+        n_layers=12,
+        d_queries=64,
+        d_values=64,
+        n_query_groups=12,
+        n_heads=12,
+        intermediate_size=3072,
+        intermediate_activation="relu",
+        use_qkv_bias=False,
+        use_cache=False,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    ))
+
 def create_gpt2_small_model(tokenizer, max_position_embeddings):
     # gpt2-small closest equivalent (~124M params)
     return MegaTransformerCausalLMHead(megatransformer_utils.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size,
         max_position_embeddings=max_position_embeddings,
+        use_cache=False,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
@@ -358,6 +429,7 @@ def create_test_tiny_model(tokenizer, max_position_embeddings):
     ))
 
 lookup = { 
+    "gpt2_tiny": create_gpt2_tiny_model,
     "gpt2_small": create_gpt2_small_model,
     "modern_small": create_modern_small_model,
     "modern_medium": create_modern_medium_model,

@@ -86,7 +86,11 @@ class MultimodalDataset(IterableDataset):
 
         self.seed_epoch = 0
 
-        self.rng = random.Random(seed)
+        self.dataset_names = [
+            "text",
+            "audio",
+            "image",
+        ]
 
         self.delegate_datasets = []
         weights = []
@@ -173,7 +177,9 @@ class MultimodalDataset(IterableDataset):
                 # All processes will choose the same dataset
                 dataset_idx = random.Random(seed).choices(range(self.num_datasets), weights=self.weights, k=1)[0]
                 # if torch.distributed.is_initialized():
-                #     print(f"Rank {torch.distributed.get_rank()} - epoch {self.epoch} - iter {iteration} - dataset {dataset_idx} - seed {seed}")
+                #     print(f"Rank {torch.distributed.get_rank()} - iter {iteration} - dataset {self.dataset_names[dataset_idx]} - seed {seed}")
+                if torch.distributed.get_rank() == 1:
+                    next(self.iterators[dataset_idx])  # make device 1 skip ahead by one to stay out of sync with device 0
                 yield next(self.iterators[dataset_idx])
             except StopIteration:
                 # Handle iterator exhaustion

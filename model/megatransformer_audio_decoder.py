@@ -336,7 +336,7 @@ class PreTrainedAudioDecoderWrapper(nn.Module):
         return spectrogram, outputs
 
 class AudioDiffusionSelfAttentionBlock(nn.Module):
-    def __init__(self, hidden_size, n_heads, d_queries, d_values, use_flash_attention=True, dropout=0.1, is_linear_attention=False):
+    def __init__(self, hidden_size, n_heads, d_queries, d_values, use_flash_attention=True, dropout_p=0.1, is_linear_attention=False):
         super().__init__()
         self.hidden_dim = hidden_size
         self.n_heads = n_heads
@@ -350,7 +350,7 @@ class AudioDiffusionSelfAttentionBlock(nn.Module):
         
         self.out_proj = nn.Linear(self.d_values * n_heads, hidden_size)
         
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout_p)
 
         self._init_weights()
 
@@ -420,7 +420,7 @@ class AudioDiffusionSelfAttentionBlock(nn.Module):
         return output
 
 class AudioDiffusionCrossAttentionBlock(nn.Module):
-    def __init__(self, hidden_size, n_heads, d_queries, d_values, context_dim=None, use_flash_attention=True, dropout=0.1):
+    def __init__(self, hidden_size, n_heads, d_queries, d_values, context_dim=None, use_flash_attention=True, dropout_p=0.1):
         super().__init__()
         self.hidden_size = hidden_size
         self.n_heads = n_heads
@@ -435,7 +435,7 @@ class AudioDiffusionCrossAttentionBlock(nn.Module):
         
         self.out_proj = nn.Linear(n_heads*d_values, hidden_size)
 
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout_p)
 
         self._init_weights()
 
@@ -670,7 +670,7 @@ class AudioVocoder(nn.Module):
             nn.LeakyReLU(leaky_relu_slope),
             nn.Conv1d(
                 current_channels, 
-                1,  # Single channel output for waveform
+                1,  # Single channel output for mono waveform
                 kernel_size=3, 
                 padding=1
             ),
@@ -717,8 +717,8 @@ class AudioVocoder(nn.Module):
             mel_spec = mel_spec.squeeze(1)  # [B, n_mels, T_mel]
 
         # Initial processing
-        x = self.initial_conv(mel_spec)
-        
+        x = self.initial_conv(mel_spec)  # [B, hidden_channels, T_mel]
+
         # Upsampling
         for i, upsample in enumerate(self.upsample_blocks):
             x = upsample(x)
@@ -726,15 +726,16 @@ class AudioVocoder(nn.Module):
         # Apply conditioning if provided
         if self.has_condition and condition is not None:
             # Reshape conditioning to match the mel sequence length
-            if condition.size(2) != x.size(2):
-                condition = F.interpolate(
-                    condition,
-                    size=x.size(2),
-                    mode='nearest'
-                )
-            
-            cond = self.conditioning_layer(condition)
-            x = x + cond
+            condition_upsample = F.interpolate(
+                condition.permute(0, 2, 1),  # [B, T_cond, C] -> [B, C, T_cond]
+                size=x.size(2),
+                mode='linear',
+                align_corners=False
+            )
+
+            cond_proj = self.conditioning_layer(condition_upsample)
+
+            x = x + cond_proj
         
         # Apply residual blocks
         for i, res_block in enumerate(self.residual_blocks):
@@ -908,8 +909,8 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         super().__init__(*args, **kwargs)
 
         self.vocoder = AudioVocoder(
-            in_channels=self.config.audio_n_mels,
             hidden_channels=self.config.audio_vocoder_hidden_channels,
+            in_channels=self.config.audio_n_mels,
             conditioning_channels=self.config.hidden_size,
             upsample_factors=self.config.audio_vocoder_upsample_factors,
             n_residual_layers=self.config.audio_vocoder_n_residual_layers,
@@ -935,7 +936,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         loss = reduce(loss, 'b ... -> b', 'mean')
 
         loss = loss * self._extract(self.loss_weight, t, loss.shape)
-        return loss.mean()
+        return model_out, loss.mean()
 
     def forward(self, x_0, condition=None, waveform_labels=None):
         if len(x_0.shape) == 5:
@@ -965,6 +966,9 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             # leave loss alone, already means across combined batch and example dimension
 
         total_loss = mel_l1_loss
+        waveform_l1 = None
+        sc_loss = None
+        mag_loss = None
 
         if waveform_labels is not None:
             # do vocoder forward and loss using waveform labels and clean mel specs (x_0)
@@ -981,18 +985,18 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
                 1.5 * (sc_loss + mag_loss)
             )
 
-        return mel_l1_outputs, total_loss, pred_waveform
+        return mel_l1_outputs, [total_loss, mel_l1_loss, waveform_l1, sc_loss, mag_loss], pred_waveform
 
     @torch.no_grad()
     def sample(self, device, batch_size: int, condition: Optional[torch.Tensor]=None, return_intermediate: bool=False, override_ddim_sampling_steps: Optional[int]=None, generator=None, **kwargs) -> torch.Tensor:
-        x = torch.randn(batch_size, 1, condition.shape[-1], device=device, generator=generator)
+        x = torch.randn(batch_size, 1, self.config.audio_max_frames, self.config.audio_n_mels, device=device, generator=generator)
 
         if self.is_ddim_sampling or override_ddim_sampling_steps is not None:
             x = self.ddim_sample_loop(x, condition=condition, return_intermediate=return_intermediate, override_sampling_steps=override_ddim_sampling_steps)
         else:
             x = self.p_sample_loop(x, condition=condition, return_intermediate=return_intermediate)
 
-        if return_intermediate:
+        if isinstance(x, tuple):
             audio = x[0]
         else:
             audio = x

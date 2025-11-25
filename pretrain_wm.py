@@ -6,7 +6,7 @@ os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ['NCCL_TIMEOUT'] = '1200000'
 
-from transformers import AutoTokenizer, TrainingArguments, DataCollatorForLanguageModeling
+from transformers import AutoTokenizer, TrainingArguments, DataCollatorForLanguageModeling, TrainerCallback
 
 from dataset_loading import multimodal_dataset
 from model import megatransformer_audio_decoder, megatransformer_audio_encoder, megatransformer_causal, megatransformer_image_decoder, megatransformer_image_encoder, megatransformer_multimodal, megatransformer_recurrent, megatransformer_text_encoder
@@ -43,23 +43,71 @@ if args.local_rank == 0 or not args.use_deepspeed:
     print(f"trainable model parameters: {(sum(p.numel() for p in model.parameters() if p.requires_grad)):,}")
 
     if len(args.include_modes) > 1 or "text" not in args.include_modes:
-        print(f"model.input_transform.text_embedding parameters: {(sum(p.numel() for p in model.input_transform.text_embedding.parameters())):,}")
+        print(f"\tmodel.input_transform parameters: {(sum(p.numel() for p in model.input_transform.parameters())):,}")
+        print(f"\t\tmodel.input_transform.text_embedding parameters: {(sum(p.numel() for p in model.input_transform.text_embedding.parameters())):,}")
+        print(f"\t\t\tmodel.input_transform.text_embedding.wte parameters: {(sum(p.numel() for p in model.input_transform.text_embedding.wte.parameters())):,}")
+        print(f"\t\t\tmodel.input_transform.text_embedding.prelude parameters: {(sum(p.numel() for p in model.input_transform.text_embedding.prelude.parameters())):,}")
 
-        print(f"model.input_transform.audio_embedding parameters: {(sum(p.numel() for p in model.input_transform.audio_embedding.parameters())):,}")
+        print(f"\t\tmodel.input_transform.audio_embedding parameters: {(sum(p.numel() for p in model.input_transform.audio_embedding.parameters())):,}")
+        print(f"\t\t\tmodel.input_transform.audio_embedding.conv_feature_extractor parameters: {(sum(p.numel() for p in model.input_transform.audio_embedding.conv_feature_extractor.parameters())):,}")
+        print(f"\t\t\tmodel.input_transform.audio_embedding.conv_projection parameters: {(sum(p.numel() for p in model.input_transform.audio_embedding.conv_projection.parameters())):,}")
+        print(f"\t\t\tmodel.input_transform.audio_embedding.prelude parameters: {(sum(p.numel() for p in model.input_transform.audio_embedding.prelude.parameters())):,}")
 
-        print(f"model.input_transform.image_embedding parameters: {(sum(p.numel() for p in model.input_transform.image_embedding.parameters())):,}")
-        print(f"model.world_model parameters: {(sum(p.numel() for p in model.world_model.parameters())):,}")
+        print(f"\t\tmodel.input_transform.image_embedding parameters: {(sum(p.numel() for p in model.input_transform.image_embedding.parameters())):,}")
+        print(f"\t\t\tmodel.input_transform.image_embedding.patch_embed parameters: {(sum(p.numel() for p in model.input_transform.image_embedding.patch_embed.parameters())):,}")
+        print(f"\t\t\tmodel.input_transform.image_embedding.prelude parameters: {(sum(p.numel() for p in model.input_transform.image_embedding.prelude.parameters())):,}")
 
-        print(f"model.output_transform.text_coda parameters: {(sum(p.numel() for p in model.output_transform.text_coda.parameters())):,}")
-        print(f"model.output_transform.text_decoder parameters: {(sum(p.numel() for p in model.output_transform.text_decoder.parameters())):,}")
+        print(f"\tmodel.world_model parameters: {(sum(p.numel() for p in model.world_model.parameters())):,}")
 
-        print(f"model.output_transform.audio_coda parameters: {(sum(p.numel() for p in model.output_transform.audio_coda.parameters())):,}")
-        print(f"model.output_transform.audio_decoder parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.parameters())):,}")
+        print(f"\tmodel.output_transform parameters: {(sum(p.numel() for p in model.output_transform.parameters())):,}")
+        print(f"\t\tmodel.output_transform.text_coda parameters: {(sum(p.numel() for p in model.output_transform.text_coda.parameters())):,}")
+        print(f"\t\tmodel.output_transform.text_decoder parameters: {(sum(p.numel() for p in model.output_transform.text_decoder.parameters())):,}")
+
+        print(f"\t\tmodel.output_transform.audio_coda parameters: {(sum(p.numel() for p in model.output_transform.audio_coda.parameters())):,}")
+        print(f"\t\tmodel.output_transform.audio_decoder parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.parameters())):,}")
         if hasattr(model.output_transform.audio_decoder, "vocoder"):
-            print(f"model.output_transform.audio_decoder.vocoder parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.vocoder.parameters())):,}")
+            print(f"\t\t\tmodel.output_transform.audio_decoder.vocoder parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.vocoder.parameters())):,}")
+        print(f"\t\t\tmodel.output_transform.audio_decoder.unet parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.unet.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.audio_decoder.unet.time_transform parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.unet.time_transform.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.audio_decoder.unet.init_conv parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.unet.init_conv.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.audio_decoder.unet.down_blocks parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.unet.down_blocks.parameters())):,}")
+        for d, down_block in enumerate(model.output_transform.audio_decoder.unet.down_blocks):
+            print(f"\t\t\t\t\tmodel.output_transform.audio_decoder.unet.down_blocks[{d}] parameters: {(sum(p.numel() for p in down_block.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.audio_decoder.unet.middle_res_block parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.unet.middle_res_block.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.audio_decoder.unet.middle_attn_block parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.unet.middle_attn_block.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.audio_decoder.unet.middle_res_block2 parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.unet.middle_res_block2.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.audio_decoder.unet.up_blocks parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.unet.up_blocks.parameters())):,}")
+        for u, up_block in enumerate(model.output_transform.audio_decoder.unet.up_blocks):
+            print(f"\t\t\t\t\tmodel.output_transform.audio_decoder.unet.up_blocks[{u}] parameters: {(sum(p.numel() for p in up_block.parameters())):,}")
+            print(f"\t\t\t\t\t\tmodel.output_transform.audio_decoder.unet.up_blocks[{u}].upsample parameters: {(sum(p.numel() for p in up_block.upsample.parameters())):,}")
+            print(f"\t\t\t\t\t\tmodel.output_transform.audio_decoder.unet.up_blocks[{u}].res_blocks parameters: {(sum(p.numel() for p in up_block.res_blocks.parameters())):,}")
+            print(f"\t\t\t\t\t\tmodel.output_transform.audio_decoder.unet.up_blocks[{u}].attn_blocks parameters: {(sum(p.numel() for p in up_block.attn_blocks.parameters())):,}")
+            print(f"\t\t\t\t\t\tmodel.output_transform.audio_decoder.unet.up_blocks[{u}].cross_attn_blocks parameters: {(sum(p.numel() for p in up_block.cross_attn_blocks.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.audio_decoder.unet.final_res_block parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.unet.final_res_block.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.audio_decoder.unet.final_conv parameters: {(sum(p.numel() for p in model.output_transform.audio_decoder.unet.final_conv.parameters())):,}")
 
-        print(f"model.output_transform.image_coda parameters: {(sum(p.numel() for p in model.output_transform.image_coda.parameters())):,}")
-        print(f"model.output_transform.image_decoder parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.parameters())):,}")
+        print(f"\t\tmodel.output_transform.image_coda parameters: {(sum(p.numel() for p in model.output_transform.image_coda.parameters())):,}")
+        print(f"\t\tmodel.output_transform.image_decoder parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.parameters())):,}")
+        print(f"\t\t\tmodel.output_transform.image_decoder.unet parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.unet.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.image_decoder.unet.time_transform parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.unet.time_transform.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.image_decoder.unet.init_conv parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.unet.init_conv.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.image_decoder.unet.down_blocks parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.unet.down_blocks.parameters())):,}")
+        for d, down_block in enumerate(model.output_transform.image_decoder.unet.down_blocks):
+            print(f"\t\t\t\t\tmodel.output_transform.image_decoder.unet.down_blocks[{d}] parameters: {(sum(p.numel() for p in down_block.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.image_decoder.unet.middle_res_block parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.unet.middle_res_block.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.image_decoder.unet.middle_attn_block parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.unet.middle_attn_block.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.image_decoder.unet.middle_res_block2 parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.unet.middle_res_block2.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.image_decoder.unet.up_blocks parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.unet.up_blocks.parameters())):,}")
+        for u, up_block in enumerate(model.output_transform.image_decoder.unet.up_blocks):
+            print(f"\t\t\t\t\tmodel.output_transform.image_decoder.unet.up_blocks[{u}] parameters: {(sum(p.numel() for p in up_block.parameters())):,}")
+            print(f"\t\t\t\t\t\tmodel.output_transform.image_decoder.unet.up_blocks[{u}].upsample parameters: {(sum(p.numel() for p in up_block.upsample.parameters())):,}")
+            print(f"\t\t\t\t\t\tmodel.output_transform.image_decoder.unet.up_blocks[{u}].res_blocks parameters: {(sum(p.numel() for p in up_block.res_blocks.parameters())):,}")
+            print(f"\t\t\t\t\t\tmodel.output_transform.image_decoder.unet.up_blocks[{u}].attn_blocks parameters: {(sum(p.numel() for p in up_block.attn_blocks.parameters())):,}")
+            print(f"\t\t\t\t\t\tmodel.output_transform.image_decoder.unet.up_blocks[{u}].cross_attn_blocks parameters: {(sum(p.numel() for p in up_block.cross_attn_blocks.parameters())):,}")
+            for c, cross_attn_block in enumerate(up_block.cross_attn_blocks):
+                print(f"\t\t\t\t\t\t\tmodel.output_transform.image_decoder.unet.up_blocks[{u}].cross_attn_blocks[{c}] parameters: {(sum(p.numel() for p in cross_attn_block.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.image_decoder.unet.final_res_block parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.unet.final_res_block.parameters())):,}")
+        print(f"\t\t\t\tmodel.output_transform.image_decoder.unet.final_conv parameters: {(sum(p.numel() for p in model.output_transform.image_decoder.unet.final_conv.parameters())):,}")
 
     print(f"modified tokenizer: {tokenizer}")
     print(f"special tokens: {tokenizer.special_tokens_map}")
@@ -105,6 +153,8 @@ training_args = TrainingArguments(
     local_rank=args.local_rank,
 )
 
+# print(f"Training arguments: {training_args}")
+
 text_weight = 1.0 if "text" in args.include_modes else 0.0
 audio_weight = 1.0 if "audio" in args.include_modes else 0.0
 image_weight = 1.0 if "image" in args.include_modes else 0.0
@@ -128,24 +178,26 @@ train_dataset = multimodal_dataset.MultimodalDataset(
     max_position_embeddings=args.max_position_embeddings,
 )
 
-# validation_dataset = multimodal_dataset.MultimodalDataset(
-#     approximated_length=200_000,
-#     tokenizer=tokenizer,
-#     sample_rate=model.config.audio_sample_rate,
-#     n_mels=model.config.audio_n_mels,
-#     n_fft=model.config.audio_n_fft,
-#     hop_length=model.config.audio_hop_length,
-#     audio_max_frames=model.config.audio_max_frames,
-#     image_size=model.config.image_size,
-#     cache_dir=args.dataset_cache_dir,
-#     text_weight=0.0, # no text in validation
-#     audio_weight=audio_weight,
-#     image_weight=image_weight,
-#     split="validation",
-#     seed=args.seed,
-#     max_position_embeddings=args.max_position_embeddings,
-# )
+validation_dataset = multimodal_dataset.MultimodalDataset(
+    model.config,
+    approximated_length=200_000,
+    tokenizer=tokenizer,
+    sample_rate=model.config.audio_sample_rate,
+    n_mels=model.config.audio_n_mels,
+    n_fft=model.config.audio_n_fft,
+    hop_length=model.config.audio_hop_length,
+    audio_max_frames=model.config.audio_max_frames,
+    image_size=model.config.image_size,
+    cache_dir=args.dataset_cache_dir,
+    text_weight=0.0, # no text in validation
+    audio_weight=audio_weight,
+    image_weight=image_weight,
+    split="validation",
+    seed=args.seed,
+    max_position_embeddings=args.max_position_embeddings,
+)
 
+data_collator: DataCollatorForLanguageModeling
 if 'multimodal' in args.config.lower():
     data_collator = multimodal_dataset.DataCollatorForMultimodalLanguageModeling(
         tokenizer=tokenizer,
@@ -168,10 +220,12 @@ trainer = custom_trainers.trainer_lookup(args, args.trainer)(
     args=training_args,
     data_collator=data_collator,
     train_dataset=train_dataset,
-    # eval_dataset=validation_dataset,
+    eval_dataset=validation_dataset,
     processing_class=tokenizer,
     optimizers=(optimizer, None)
 )
+
+model.config.include_modes = args.include_modes.split(",") if isinstance(args.include_modes, str) else args.include_modes
 
 prompts = [
     "In this paper, we propose a novel approach to",
@@ -179,6 +233,8 @@ prompts = [
     "The capital of France is",
     "2 + 2 ="
 ]
+
+generation_callback: TrainerCallback
 if 'multimodal' in args.config.lower():
     generation_callback = custom_callbacks.MultimodalGenerationCallback(
         tokenizer=tokenizer,
@@ -199,7 +255,7 @@ else:
     trainer.add_callback(generation_callback)
     generation_callback.trainer = trainer
 
-metrics_callback = custom_callbacks.MetricsCallback(step_offset=args.start_step,)
+metrics_callback = custom_callbacks.MetricsCallback(step_offset=args.start_step)
 trainer.add_callback(metrics_callback)
 metrics_callback.trainer = trainer
 
