@@ -2,7 +2,7 @@ from datasets import load_dataset
 from einops import reduce
 from model import megatransformer_diffusion
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, SpeechT5HifiGan, WhisperForConditionalGeneration
-from typing import Optional
+from typing import Literal, Optional
 
 import megatransformer_utils
 
@@ -591,52 +591,146 @@ class VocoderUpsampleBlock(nn.Module):
         return features
 
 
+class VocoderCrossAttention(nn.Module):
+    """
+    Cross-attention module for conditioning the vocoder on text embeddings.
+    Applied at mel-spectrogram resolution for efficiency.
+    Uses F.scaled_dot_product_attention for Flash Attention support.
+    """
+    def __init__(
+        self,
+        audio_channels: int,
+        conditioning_channels: int,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = audio_channels // n_heads
+        self.dropout_p = dropout
+
+        assert audio_channels % n_heads == 0, "audio_channels must be divisible by n_heads"
+
+        # Project audio features to queries
+        self.to_q = nn.Conv1d(audio_channels, audio_channels, 1)
+        # Project conditioning to keys and values
+        self.to_k = nn.Linear(conditioning_channels, audio_channels)
+        self.to_v = nn.Linear(conditioning_channels, audio_channels)
+        # Output projection
+        self.to_out = nn.Conv1d(audio_channels, audio_channels, 1)
+
+        # Layer norm for stability
+        self.norm_audio = nn.GroupNorm(1, audio_channels)  # equivalent to LayerNorm for conv
+        self.norm_cond = nn.LayerNorm(conditioning_channels)
+
+    def forward(
+        self,
+        audio_features: torch.Tensor,   # [B, C, T_audio]
+        condition: torch.Tensor,         # [B, T_text, C_cond]
+        condition_mask: Optional[torch.Tensor] = None  # [B, T_text], True for valid tokens
+    ) -> torch.Tensor:
+        B, C, T_audio = audio_features.shape
+        T_text = condition.shape[1]
+
+        # Normalize inputs
+        audio_norm = self.norm_audio(audio_features)
+        cond_norm = self.norm_cond(condition)
+
+        # Queries from audio: [B, C, T_audio] -> [B, heads, T_audio, head_dim]
+        q = self.to_q(audio_norm)
+        q = q.view(B, self.n_heads, self.head_dim, T_audio).transpose(2, 3)
+
+        # Keys and values from text: [B, T_text, C] -> [B, heads, T_text, head_dim]
+        k = self.to_k(cond_norm).view(B, T_text, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.to_v(cond_norm).view(B, T_text, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Create attention mask for scaled_dot_product_attention
+        # SDPA expects: True = masked (ignore), so we invert our mask
+        attn_mask = None
+        if condition_mask is not None:
+            # [B, T_text] -> [B, 1, 1, T_text] broadcast to [B, heads, T_audio, T_text]
+            attn_mask = ~condition_mask[:, None, None, :]
+
+        # Flash attention / memory efficient attention
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+        )  # [B, heads, T_audio, head_dim]
+
+        # Reshape back: [B, heads, T_audio, head_dim] -> [B, C, T_audio]
+        out = out.transpose(2, 3).reshape(B, C, T_audio)
+
+        # Residual connection
+        return audio_features + self.to_out(out)
+
+
 class AudioVocoder(nn.Module):
     """
     Neural vocoder that converts mel spectrograms to audio waveforms.
-    
+
     This vocoder can be trained alongside the diffusion model and is designed
     to efficiently convert mel spectrograms to high-quality audio waveforms.
+
+    Supports two conditioning modes:
+    - 'interpolate': Linear interpolation of conditioning to waveform resolution (default, legacy)
+    - 'attention': Cross-attention at mel-spectrogram resolution (more flexible, efficient)
     """
     def __init__(
         self,
         hidden_channels,
         in_channels: int,  # Number of mel bands
         conditioning_channels: int,
-        upsample_factors: list[int] = [8, 8, 8],  # Total upsampling of 256 (matching hop_length)
-        n_residual_layers: int = 4, 
+        upsample_factors: list[int] = [8, 8, 8],  # Total upsampling of 512 (matching hop_length)
+        n_residual_layers: int = 4,
         dilation_cycle: int = 4,
         kernel_size: int = 3,
         leaky_relu_slope: float = 0.1,
-        conditioning_enabled: bool = True
+        conditioning_enabled: bool = True,
+        conditioning_mode: Literal['interpolate', 'attention'] = 'interpolate',  # 'interpolate' or 'attention'
+        attention_n_heads: int = 4,
+        attention_dropout: float = 0.1,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.hidden_channels = hidden_channels
         self.has_condition = conditioning_enabled
-        
+        self.conditioning_mode = conditioning_mode
+
+        assert conditioning_mode in ('interpolate', 'attention'), \
+            f"conditioning_mode must be 'interpolate' or 'attention', got {conditioning_mode}"
+
         # Initial convolution
         self.initial_conv = nn.Conv1d(
-            in_channels, 
-            hidden_channels, 
-            kernel_size=7, 
+            in_channels,
+            hidden_channels,
+            kernel_size=7,
             padding=3
         )
-        
+
+        # Conditioning at mel resolution (before upsampling) for attention mode
+        if conditioning_enabled and conditioning_mode == 'attention':
+            self.conditioning_attention = VocoderCrossAttention(
+                audio_channels=hidden_channels,
+                conditioning_channels=conditioning_channels,
+                n_heads=attention_n_heads,
+                dropout=attention_dropout,
+            )
+
         # Upsampling blocks
         self.upsample_blocks = nn.ModuleList()
         current_channels = hidden_channels
         for factor in upsample_factors:
             self.upsample_blocks.append(
                 VocoderUpsampleBlock(
-                    current_channels, 
-                    current_channels // 2, 
+                    current_channels,
+                    current_channels // 2,
                     upsample_factor=factor,
                     leaky_relu_slope=leaky_relu_slope
                 )
             )
             current_channels //= 2
-            
+
         # Residual blocks with increasing dilation
         self.residual_blocks = nn.ModuleList()
         for i in range(n_residual_layers):
@@ -649,34 +743,34 @@ class AudioVocoder(nn.Module):
                     leaky_relu_slope=leaky_relu_slope
                 )
             )
-        
-        # Optional conditioning layer
-        if conditioning_enabled:
+
+        # Conditioning layer for interpolate mode (applied after upsampling)
+        if conditioning_enabled and conditioning_mode == 'interpolate':
             self.conditioning_layer = nn.Conv1d(
                 conditioning_channels,
                 current_channels,
                 kernel_size=1
             )
-        
+
         # Final output layers
         self.final_layers = nn.Sequential(
             nn.LeakyReLU(leaky_relu_slope),
             nn.Conv1d(
-                current_channels, 
-                current_channels, 
-                kernel_size=3, 
+                current_channels,
+                current_channels,
+                kernel_size=3,
                 padding=1
             ),
             nn.LeakyReLU(leaky_relu_slope),
             nn.Conv1d(
-                current_channels, 
+                current_channels,
                 1,  # Single channel output for mono waveform
-                kernel_size=3, 
+                kernel_size=3,
                 padding=1
             ),
             nn.Tanh()  # Output in range [-1, 1]
         )
-        
+
         self._init_weights()
 
     def _init_weights(self):
@@ -684,28 +778,30 @@ class AudioVocoder(nn.Module):
         nn.init.kaiming_normal_(self.initial_conv.weight, nonlinearity='leaky_relu')
         if self.initial_conv.bias is not None:
             nn.init.zeros_(self.initial_conv.bias)
-        
+
         for layer in self.final_layers:
             if isinstance(layer, nn.Conv1d):
                 nn.init.kaiming_normal_(layer.weight, nonlinearity='leaky_relu')
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
-    
+
     def forward(
-        self, 
-        mel_spec: torch.Tensor, 
-        condition: Optional[torch.Tensor] = None
+        self,
+        mel_spec: torch.Tensor,
+        condition: Optional[torch.Tensor] = None,
+        condition_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass of the vocoder.
-        
+
         Args:
             mel_spec: [B, n_mels, T_mel] Mel spectrogram
-            conditioning: Optional [B, C, T_cond] additional conditioning
-                          from the language model or diffusion model
-            
+            condition: Optional [B, T_cond, C] text/conditioning embeddings
+            condition_mask: Optional [B, T_cond] boolean mask where True = valid token
+                           (only used for attention mode)
+
         Returns:
-            [B, 1, T_audio] Audio waveform
+            [B, T_audio] Audio waveform
         """
         if torch.isnan(mel_spec).any():
             print("NaN detected in mel_spec input to vocoder")
@@ -719,13 +815,17 @@ class AudioVocoder(nn.Module):
         # Initial processing
         x = self.initial_conv(mel_spec)  # [B, hidden_channels, T_mel]
 
+        # Apply attention conditioning at mel resolution (before upsampling)
+        if self.has_condition and self.conditioning_mode == 'attention' and condition is not None:
+            x = self.conditioning_attention(x, condition, condition_mask)
+
         # Upsampling
         for i, upsample in enumerate(self.upsample_blocks):
             x = upsample(x)
-        
-        # Apply conditioning if provided
-        if self.has_condition and condition is not None:
-            # Reshape conditioning to match the mel sequence length
+
+        # Apply interpolation conditioning at waveform resolution (after upsampling)
+        if self.has_condition and self.conditioning_mode == 'interpolate' and condition is not None:
+            # Reshape conditioning to match the waveform sequence length
             condition_upsample = F.interpolate(
                 condition.permute(0, 2, 1),  # [B, T_cond, C] -> [B, C, T_cond]
                 size=x.size(2),
@@ -736,11 +836,11 @@ class AudioVocoder(nn.Module):
             cond_proj = self.conditioning_layer(condition_upsample)
 
             x = x + cond_proj
-        
+
         # Apply residual blocks
         for i, res_block in enumerate(self.residual_blocks):
             x = res_block(x)
-        
+
         # Final layers
         waveform = self.final_layers(x)
         waveform = waveform.squeeze(1)  # Remove channel dimension

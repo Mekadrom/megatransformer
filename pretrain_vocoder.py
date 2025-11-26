@@ -29,6 +29,48 @@ import torchaudio
 
 
 # ============================================================================
+# Discriminator using periodic convolutions
+# ============================================================================
+
+class PeriodDiscriminator(nn.Module):
+    def __init__(self, period):
+        self.period = period
+        self.convs = nn.ModuleList([
+            nn.Conv2d(1, 32, (5, 1), (3, 1), padding=(2, 0)),
+            nn.Conv2d(32, 128, (5, 1), (3, 1), padding=(2, 0)),
+            nn.Conv2d(128, 512, (5, 1), (3, 1), padding=(2, 0)),
+            nn.Conv2d(512, 1024, (5, 1), (3, 1), padding=(2, 0)),
+            nn.Conv2d(1024, 1, (3, 1), padding=(1, 0)),
+        ])
+    
+    def forward(self, x):
+        features = []
+        # Reshape: [B, T] -> [B, 1, T//period, period]
+        b, t = x.shape
+        pad = (self.period - (t % self.period)) % self.period
+        x = F.pad(x, (0, pad))
+        x = x.view(b, 1, -1, self.period)
+        
+        for conv in self.convs:
+            x = F.leaky_relu(conv(x), 0.1)
+            features.append(x)
+        return x, features
+
+class MultiPeriodDiscriminator(nn.Module):
+    def __init__(self):
+        self.discriminators = nn.ModuleList([
+            PeriodDiscriminator(p) for p in [2, 3, 5, 7, 11]
+        ])
+    
+    def forward(self, x):
+        outputs, all_features = [], []
+        for d in self.discriminators:
+            out, feats = d(x)
+            outputs.append(out)
+            all_features.append(feats)
+        return outputs, all_features
+
+# ============================================================================
 # Vocoder Model Wrapper with T5 Text Conditioning
 # ============================================================================
 
@@ -36,9 +78,19 @@ class VocoderWithT5Conditioning(nn.Module):
     """
     Wrapper model that combines AudioVocoder with frozen T5 text embeddings for conditioning.
     """
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig, t5_model_name: str = "google/t5-v1_1-base"):
+    def __init__(self,
+                 config: megatransformer_utils.MegaTransformerConfig,
+                 sc_loss_weight: float = 1.0,
+                 mag_loss_weight: float = 3.0,
+                 waveform_l1_loss_weight: float = 0.1,
+                 mel_recon_loss_weight: float = 1.0,
+                 t5_model_name: str = "google/t5-v1_1-base"):
         super().__init__()
         self.config = config
+        self.sc_loss_weight = sc_loss_weight
+        self.mag_loss_weight = mag_loss_weight
+        self.waveform_l1_loss_weight = waveform_l1_loss_weight
+        self.mel_recon_loss_weight = mel_recon_loss_weight
 
         # Frozen T5 encoder for text conditioning
         self.t5_tokenizer = T5Tokenizer.from_pretrained(t5_model_name)
@@ -62,10 +114,21 @@ class VocoderWithT5Conditioning(nn.Module):
             upsample_factors=config.audio_vocoder_upsample_factors,
             n_residual_layers=config.audio_vocoder_n_residual_layers,
             conditioning_enabled=True,
+            conditioning_mode='attention',
+            attention_n_heads=4,
         )
 
         # Loss functions
         self.stft_loss = MultiResolutionSTFTLoss()
+
+        # Mel spectrogram extractor for reconstruction loss
+        self.mel_spec_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=config.audio_sample_rate,
+            n_fft=config.audio_n_fft,
+            hop_length=config.audio_hop_length,
+            n_mels=config.audio_n_mels,
+            power=1.0,  # Magnitude spectrogram
+        )
 
     def get_text_embeddings(self, text_input_ids: torch.Tensor, text_attention_mask: torch.Tensor) -> torch.Tensor:
         """Get frozen T5 embeddings for text conditioning."""
@@ -125,14 +188,33 @@ class VocoderWithT5Conditioning(nn.Module):
                 waveform_labels_aligned.unsqueeze(1) if waveform_labels_aligned.dim() == 2 else waveform_labels_aligned
             )
 
+            # Mel reconstruction loss: extract mel from predicted waveform and compare to input mel
+            # This ensures round-trip consistency: mel -> waveform -> mel
+            # Note: cuFFT doesn't support bfloat16, so we cast to float32 for mel extraction
+            # We also need to temporarily move the mel transform to float32 for the filterbank matmul
+            orig_dtype = pred_waveform_aligned.dtype
+            self.mel_spec_transform = self.mel_spec_transform.float()
+            pred_mel_from_waveform = self.mel_spec_transform(pred_waveform_aligned.float()).to(orig_dtype)
+            self.mel_spec_transform = self.mel_spec_transform.to(orig_dtype)
+            # Align mel lengths (may differ slightly due to padding/edge effects)
+            mel_min_len = min(pred_mel_from_waveform.shape[-1], mel_spec.shape[-1])
+            pred_mel_aligned = pred_mel_from_waveform[..., :mel_min_len]
+            input_mel_aligned = mel_spec[..., :mel_min_len]
+            # Log-scale mel comparison (more perceptually meaningful)
+            mel_recon_loss = F.l1_loss(
+                torch.log(pred_mel_aligned.clamp(min=1e-5)),
+                torch.log(input_mel_aligned.clamp(min=1e-5))
+            )
+
             # Total loss
-            total_loss = waveform_l1 + 1.5 * (sc_loss + mag_loss)
+            total_loss = (self.sc_loss_weight * sc_loss) + (self.mag_loss_weight * mag_loss) + (self.waveform_l1_loss_weight * waveform_l1) + (self.mel_recon_loss_weight * mel_recon_loss)
 
             outputs.update({
                 "loss": total_loss,
                 "waveform_l1": waveform_l1,
                 "sc_loss": sc_loss,
                 "mag_loss": mag_loss,
+                "mel_recon_loss": mel_recon_loss,
             })
 
         return outputs
@@ -142,7 +224,7 @@ class VocoderWithT5Conditioning(nn.Module):
 # Model Creation Functions
 # ============================================================================
 
-def create_small_vocoder_model() -> VocoderWithT5Conditioning:
+def create_small_vocoder_model(sc_loss_weight, mag_loss_weight, waveform_l1_loss_weight, mel_recon_loss_weight) -> VocoderWithT5Conditioning:
     """Create a small vocoder model for testing."""
     config = megatransformer_utils.MegaTransformerConfig(
         hidden_size=256,
@@ -155,7 +237,14 @@ def create_small_vocoder_model() -> VocoderWithT5Conditioning:
         audio_vocoder_upsample_factors=[8, 8, 8],
         audio_vocoder_n_residual_layers=3,
     )
-    return VocoderWithT5Conditioning(config, t5_model_name="google/t5-v1_1-small")
+    return VocoderWithT5Conditioning(
+        config,
+        sc_loss_weight=sc_loss_weight,
+        mag_loss_weight=mag_loss_weight,
+        waveform_l1_loss_weight=waveform_l1_loss_weight,
+        mel_recon_loss_weight=mel_recon_loss_weight,
+        t5_model_name="google/t5-v1_1-small"
+    )
 
 
 def create_medium_vocoder_model() -> VocoderWithT5Conditioning:
@@ -596,10 +685,18 @@ class VocoderReconstructionCallback(TrainerCallback):
 
     def _visualize_mel_spec(self, mel_spec: np.ndarray, sample_rate: int) -> np.ndarray:
         """Generate mel spectrogram visualization for TensorBoard."""
+        # Handle tensor input
+        if hasattr(mel_spec, 'numpy'):
+            mel_spec = mel_spec.numpy()
+
+        # Ensure 2D
+        if mel_spec.ndim == 3:
+            mel_spec = mel_spec.squeeze(0)
+
         # Normalize to [0, 1] range
         mel_spec_norm = (mel_spec - mel_spec.min()) / (mel_spec.max() - mel_spec.min() + 1e-8)
 
-        # Create figure
+        # Create figure with Agg backend to avoid display issues
         fig, ax = plt.subplots(figsize=(10, 4))
         img = librosa.display.specshow(
             mel_spec_norm,
@@ -613,15 +710,16 @@ class VocoderReconstructionCallback(TrainerCallback):
         plt.title('Mel Spectrogram')
         plt.tight_layout()
 
-        # Convert figure to numpy array
+        # Convert figure to numpy array using Agg renderer
         fig.canvas.draw()
-        data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        width, height = fig.canvas.get_width_height()
+        data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        data = data.reshape((height, width, 4))[:, :, :3]  # Drop alpha channel
 
         plt.close(fig)
 
-        # Add batch dimension
-        data = np.expand_dims(data, axis=0)
+        # TensorBoard expects (C, H, W) for add_image
+        data = data.transpose(2, 0, 1)  # (H, W, C) -> (C, H, W)
 
         return data
 
@@ -651,6 +749,7 @@ class VocoderTrainer(Trainer):
             self._log_scalar(f"{prefix}waveform_l1", outputs.get("waveform_l1", 0))
             self._log_scalar(f"{prefix}sc_loss", outputs.get("sc_loss", 0))
             self._log_scalar(f"{prefix}mag_loss", outputs.get("mag_loss", 0))
+            self._log_scalar(f"{prefix}mel_recon_loss", outputs.get("mel_recon_loss", 0))
 
         return (loss, outputs) if return_outputs else loss
 
@@ -685,7 +784,14 @@ def main():
     if args.config not in model_config_lookup:
         raise ValueError(f"Unknown vocoder config: {args.config}. Available: {list(model_config_lookup.keys())}")
 
-    model = model_config_lookup[args.config]()
+    unk_dict = {}
+    for i in range(0, len(unk), 2):
+        unk_dict[unk[i]] = unk[i+1]
+
+    model = model_config_lookup[args.config](unk_dict.get("sc_loss_weight", 1.0),
+                                            unk_dict.get("mag_loss_weight", 3.0),
+                                            unk_dict.get("waveform_l1_loss_weight", 0.1),
+                                            unk_dict.get("mel_recon_loss_weight", 1.0))
     model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
 
     if args.local_rank == 0 or not args.use_deepspeed:
@@ -737,7 +843,7 @@ def main():
     train_dataset = VocoderDataset(
         config=model.config,
         t5_tokenizer=model.t5_tokenizer,
-        approximated_length=300_000,
+        approximated_length=1_100_000,
         sample_rate=model.config.audio_sample_rate,
         n_mels=model.config.audio_n_mels,
         n_fft=model.config.audio_n_fft,
@@ -750,7 +856,7 @@ def main():
     eval_dataset = VocoderDataset(
         config=model.config,
         t5_tokenizer=model.t5_tokenizer,
-        approximated_length=10_000,
+        approximated_length=16_400,
         sample_rate=model.config.audio_sample_rate,
         n_mels=model.config.audio_n_mels,
         n_fft=model.config.audio_n_fft,
