@@ -163,7 +163,7 @@ def load_audio_dataset(
         }
     
     logger.info("Processing dataset with custom feature extraction...")
-    dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
     
     dataset = dataset.map(
         process_audio,

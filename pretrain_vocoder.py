@@ -1,19 +1,3 @@
-"""
-Standalone vocoder pretraining script.
-
-This script trains a vocoder model to convert mel spectrograms to raw audio waveforms.
-Uses Common Voice dataset and the existing vocoder architecture with SC, logmag, and l1 losses.
-
-Usage:
-    deepspeed --num_gpus=2 pretrain_vocoder.py \
-        --use_deepspeed \
-        --bf16 \
-        --run_name vocoder_pretrain \
-        --max_steps 100000 \
-        --gradient_accumulation_steps 8 \
-        --deepspeed_config ds_config_zero-2.json
-"""
-
 import os
 
 os.environ["DEEPSPEED_UNIT_TEST"] = "1"
@@ -22,666 +6,709 @@ os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ['NCCL_TIMEOUT'] = '1200000'
 
-import argparse
-import logging
-import random
-
-import librosa
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from datasets import load_dataset, Audio
-from torch.utils.data import Dataset
-from transformers import Trainer, TrainerCallback, TrainingArguments, set_seed as hf_set_seed
+from torch import nn
+from torch.amp import autocast
+from torch.utils.data import IterableDataset
+from torch.utils.tensorboard import SummaryWriter
+from transformers import TrainingArguments, Trainer, TrainerCallback, T5EncoderModel, T5Tokenizer
 from transformers.integrations import TensorBoardCallback
+from typing import Iterator, Any, List, Dict, Optional
 
+from dataset_loading import audio_loading
 from model.megatransformer_audio_decoder import AudioVocoder, MultiResolutionSTFTLoss
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import megatransformer_utils
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torchaudio
 
 
 # ============================================================================
-# Configuration
+# Vocoder Model Wrapper with T5 Text Conditioning
 # ============================================================================
 
-class VocoderConfig:
+class VocoderWithT5Conditioning(nn.Module):
     """
-    Configuration for the vocoder model.
-
-    Default values match MegaTransformerConfig and create_small_multimodal_model
-    to ensure compatibility when loading pretrained vocoder into world model training.
+    Wrapper model that combines AudioVocoder with frozen T5 text embeddings for conditioning.
     """
-    def __init__(
-        self,
-        # Audio parameters (from MegaTransformerConfig defaults)
-        sample_rate: int = 16000,
-        n_mels: int = 128,
-        n_fft: int = 1024,
-        hop_length: int = 512,
-        max_audio_duration: float = 10.0,
-
-        # Vocoder architecture (from MegaTransformerConfig / create_small_multimodal_model)
-        # Note: create_small_multimodal_model uses 1536, MegaTransformerConfig default is 2048
-        hidden_channels: int = 2048,
-        upsample_factors: list = None,  # Default [8, 8, 8] set below
-        n_residual_layers: int = 4,
-        dilation_cycle: int = 4,
-        kernel_size: int = 3,
-        leaky_relu_slope: float = 0.1,
-
-        # Loss weights
-        waveform_l1_weight: float = 1.0,
-        sc_loss_weight: float = 1.5,
-        mag_loss_weight: float = 1.5,
-    ):
-        self.sample_rate = sample_rate
-        self.n_mels = n_mels
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.max_audio_duration = max_audio_duration
-        self.max_waveform_length = int(max_audio_duration * sample_rate)
-        self.max_mel_frames = int(self.max_waveform_length / hop_length)
-
-        self.hidden_channels = hidden_channels
-        self.upsample_factors = upsample_factors or [8, 8, 8]
-        self.n_residual_layers = n_residual_layers
-        self.dilation_cycle = dilation_cycle
-        self.kernel_size = kernel_size
-        self.leaky_relu_slope = leaky_relu_slope
-
-        self.waveform_l1_weight = waveform_l1_weight
-        self.sc_loss_weight = sc_loss_weight
-        self.mag_loss_weight = mag_loss_weight
-
-
-# ============================================================================
-# Dataset
-# ============================================================================
-
-def extract_waveform(audio, sr=16000):
-    """Extract waveform from audio data."""
-    if isinstance(audio, dict) and 'array' in audio:
-        y = audio['array']
-        orig_sr = audio['sampling_rate']
-        if orig_sr != sr:
-            y = librosa.resample(y, orig_sr=orig_sr, target_sr=sr)
-    elif isinstance(audio, torch.Tensor):
-        y = audio.numpy()
-    else:
-        y, _ = librosa.load(audio, sr=sr)
-
-    return torch.tensor(y, dtype=torch.float32)
-
-
-def extract_mel(y, sr=16000, n_mels=128, n_fft=1024, hop_length=512):
-    """Extract mel spectrogram from waveform."""
-    if isinstance(y, torch.Tensor):
-        y = y.numpy()
-
-    mel_spec = librosa.feature.melspectrogram(
-        y=y, sr=sr, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length
-    )
-    log_mel_spec = librosa.power_to_db(mel_spec)
-
-    return torch.tensor(log_mel_spec, dtype=torch.float32)
-
-
-class CommonVoiceVocoderDataset(Dataset):
-    """Dataset for vocoder training using Common Voice."""
-
-    def __init__(
-        self,
-        config: VocoderConfig,
-        split: str = "train",
-        language: str = "en",
-        cache_dir: str = None,
-        max_samples: int = None,
-    ):
-        self.config = config
-        self.split = split
-
-        logger.info(f"Loading Common Voice dataset (language={language}, split={split})...")
-
-        # Load Common Voice dataset
-        self.dataset = load_dataset(
-            "mozilla-foundation/common_voice_17_0",
-            language,
-            split=split,
-            cache_dir=cache_dir,
-            trust_remote_code=True,
-        )
-
-        # Cast audio column to the target sample rate
-        self.dataset = self.dataset.cast_column("audio", Audio(sampling_rate=config.sample_rate))
-
-        if max_samples is not None:
-            self.dataset = self.dataset.select(range(min(max_samples, len(self.dataset))))
-
-        logger.info(f"Loaded {len(self.dataset)} samples")
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        audio = item["audio"]
-
-        # Extract waveform
-        waveform = extract_waveform(audio, sr=self.config.sample_rate)
-
-        # Truncate or skip if too long
-        max_len = self.config.max_waveform_length
-        if len(waveform) > max_len:
-            # Random crop
-            start = random.randint(0, len(waveform) - max_len)
-            waveform = waveform[start:start + max_len]
-
-        # Extract mel spectrogram
-        mel_spec = extract_mel(
-            waveform,
-            sr=self.config.sample_rate,
-            n_mels=self.config.n_mels,
-            n_fft=self.config.n_fft,
-            hop_length=self.config.hop_length,
-        )
-
-        return {
-            "mel_spec": mel_spec,  # [n_mels, T_mel]
-            "waveform": waveform,   # [T_audio]
-        }
-
-
-class VocoderDataCollator:
-    """Data collator that pads mel spectrograms and waveforms."""
-
-    def __init__(self, config: VocoderConfig):
-        self.config = config
-
-    def __call__(self, features):
-        mel_specs = [f["mel_spec"] for f in features]
-        waveforms = [f["waveform"] for f in features]
-
-        # Pad mel spectrograms to max length in batch
-        max_mel_len = max(m.shape[1] for m in mel_specs)
-        padded_mels = []
-        for mel in mel_specs:
-            pad_len = max_mel_len - mel.shape[1]
-            if pad_len > 0:
-                mel = F.pad(mel, (0, pad_len), value=-80.0)  # Pad with silence (low dB)
-            padded_mels.append(mel)
-
-        # Pad waveforms to match mel length after upsampling
-        expected_waveform_len = max_mel_len * self.config.hop_length
-        padded_waveforms = []
-        for wf in waveforms:
-            pad_len = expected_waveform_len - len(wf)
-            if pad_len > 0:
-                wf = F.pad(wf, (0, pad_len), value=0.0)
-            elif pad_len < 0:
-                wf = wf[:expected_waveform_len]
-            padded_waveforms.append(wf)
-
-        return {
-            "mel_spec": torch.stack(padded_mels),      # [B, n_mels, T_mel]
-            "waveform": torch.stack(padded_waveforms), # [B, T_audio]
-        }
-
-
-# ============================================================================
-# Model Wrapper
-# ============================================================================
-
-class VocoderForTraining(nn.Module):
-    """Wrapper around AudioVocoder for HuggingFace Trainer compatibility."""
-
-    def __init__(self, config: VocoderConfig):
+    def __init__(self, config: megatransformer_utils.MegaTransformerConfig, t5_model_name: str = "google/t5-v1_1-base"):
         super().__init__()
         self.config = config
 
-        # Create vocoder
+        # Frozen T5 encoder for text conditioning
+        self.t5_tokenizer = T5Tokenizer.from_pretrained(t5_model_name)
+        self.t5_encoder = T5EncoderModel.from_pretrained(t5_model_name)
+
+        # Freeze T5 parameters
+        for param in self.t5_encoder.parameters():
+            param.requires_grad = False
+
+        # Get T5 hidden size
+        self.t5_hidden_size = self.t5_encoder.config.d_model
+
+        # Project T5 embeddings to vocoder conditioning size
+        self.condition_proj = nn.Linear(self.t5_hidden_size, config.hidden_size)
+
+        # AudioVocoder from megatransformer_audio_decoder
         self.vocoder = AudioVocoder(
-            hidden_channels=config.hidden_channels,
-            in_channels=config.n_mels,
-            conditioning_channels=config.hidden_channels,  # Not used, but required
-            upsample_factors=config.upsample_factors,
-            n_residual_layers=config.n_residual_layers,
-            dilation_cycle=config.dilation_cycle,
-            kernel_size=config.kernel_size,
-            leaky_relu_slope=config.leaky_relu_slope,
-            conditioning_enabled=False,  # No conditioning for standalone vocoder
+            hidden_channels=config.audio_vocoder_hidden_channels,
+            in_channels=config.audio_n_mels,
+            conditioning_channels=config.hidden_size,
+            upsample_factors=config.audio_vocoder_upsample_factors,
+            n_residual_layers=config.audio_vocoder_n_residual_layers,
+            conditioning_enabled=True,
         )
 
         # Loss functions
         self.stft_loss = MultiResolutionSTFTLoss()
 
-        # Store loss weights
-        self.waveform_l1_weight = config.waveform_l1_weight
-        self.sc_loss_weight = config.sc_loss_weight
-        self.mag_loss_weight = config.mag_loss_weight
+    def get_text_embeddings(self, text_input_ids: torch.Tensor, text_attention_mask: torch.Tensor) -> torch.Tensor:
+        """Get frozen T5 embeddings for text conditioning."""
+        with torch.no_grad():
+            t5_outputs = self.t5_encoder(
+                input_ids=text_input_ids,
+                attention_mask=text_attention_mask,
+            )
+            text_embeddings = t5_outputs.last_hidden_state
 
-    def forward(self, mel_spec, waveform, **kwargs):
+        # Project to vocoder conditioning dimension
+        text_embeddings = self.condition_proj(text_embeddings)
+        return text_embeddings
+
+    def forward(
+        self,
+        mel_spec: torch.Tensor,
+        text_input_ids: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        waveform_labels: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass.
+        Forward pass of the vocoder with T5 text conditioning.
 
         Args:
-            mel_spec: [B, n_mels, T_mel] - Input mel spectrogram
-            waveform: [B, T_audio] - Target waveform
+            mel_spec: [B, n_mels, T_mel] Mel spectrogram input
+            text_input_ids: [B, seq_len] T5 tokenized text
+            text_attention_mask: [B, seq_len] Attention mask for T5
+            waveform_labels: [B, T_audio] Target waveform for training
 
         Returns:
-            loss: Combined loss value
-            pred_waveform: Predicted waveform
+            Dictionary with loss and outputs
         """
-        # Vocoder forward
-        pred_waveform = self.vocoder(mel_spec, condition=None)  # [B, T_audio]
+        # Get text conditioning from frozen T5
+        text_condition = self.get_text_embeddings(text_input_ids, text_attention_mask)
 
-        # Ensure same length
-        min_len = min(pred_waveform.shape[-1], waveform.shape[-1])
-        pred_waveform_aligned = pred_waveform[..., :min_len]
-        waveform_aligned = waveform[..., :min_len]
+        # Generate waveform through vocoder
+        pred_waveform = self.vocoder(mel_spec, condition=text_condition)
 
-        # L1 waveform loss
-        waveform_l1 = F.l1_loss(pred_waveform_aligned, waveform_aligned)
+        outputs = {"pred_waveform": pred_waveform}
 
-        # Multi-resolution STFT loss (SC and log magnitude)
-        # Need to add channel dimension for STFT loss
-        pred_for_stft = pred_waveform_aligned.unsqueeze(1)  # [B, 1, T]
-        target_for_stft = waveform_aligned.unsqueeze(1)     # [B, 1, T]
-        sc_loss, mag_loss = self.stft_loss(pred_for_stft, target_for_stft)
+        if waveform_labels is not None:
+            # Ensure waveform_labels has batch dimension to match pred_waveform
+            if waveform_labels.dim() == 1:
+                waveform_labels = waveform_labels.unsqueeze(0)
 
-        # Combined loss
-        total_loss = (
-            self.waveform_l1_weight * waveform_l1 +
-            self.sc_loss_weight * sc_loss +
-            self.mag_loss_weight * mag_loss
-        )
+            # Align waveform lengths
+            min_len = min(pred_waveform.shape[-1], waveform_labels.shape[-1])
+            pred_waveform_aligned = pred_waveform[..., :min_len]
+            waveform_labels_aligned = waveform_labels[..., :min_len]
 
-        return total_loss, {
-            "loss": total_loss,
-            "waveform_l1": waveform_l1,
-            "sc_loss": sc_loss,
-            "mag_loss": mag_loss,
-            "pred_waveform": pred_waveform,
-        }
+            # Compute losses
+            waveform_l1 = F.l1_loss(pred_waveform_aligned, waveform_labels_aligned)
+            # STFT loss expects [B, 1, T] shape
+            sc_loss, mag_loss = self.stft_loss(
+                pred_waveform_aligned.unsqueeze(1) if pred_waveform_aligned.dim() == 2 else pred_waveform_aligned,
+                waveform_labels_aligned.unsqueeze(1) if waveform_labels_aligned.dim() == 2 else waveform_labels_aligned
+            )
+
+            # Total loss
+            total_loss = waveform_l1 + 1.5 * (sc_loss + mag_loss)
+
+            outputs.update({
+                "loss": total_loss,
+                "waveform_l1": waveform_l1,
+                "sc_loss": sc_loss,
+                "mag_loss": mag_loss,
+            })
+
+        return outputs
 
 
 # ============================================================================
-# Custom Trainer
+# Model Creation Functions
+# ============================================================================
+
+def create_small_vocoder_model() -> VocoderWithT5Conditioning:
+    """Create a small vocoder model for testing."""
+    config = megatransformer_utils.MegaTransformerConfig(
+        hidden_size=256,
+        audio_n_mels=128,
+        audio_n_fft=1024,
+        audio_hop_length=512,
+        audio_max_duration=10.0,
+        audio_sample_rate=16000,
+        audio_vocoder_hidden_channels=512,
+        audio_vocoder_upsample_factors=[8, 8, 8],
+        audio_vocoder_n_residual_layers=3,
+    )
+    return VocoderWithT5Conditioning(config, t5_model_name="google/t5-v1_1-small")
+
+
+def create_medium_vocoder_model() -> VocoderWithT5Conditioning:
+    """Create a medium vocoder model."""
+    config = megatransformer_utils.MegaTransformerConfig(
+        hidden_size=512,
+        audio_n_mels=128,
+        audio_n_fft=1024,
+        audio_hop_length=512,
+        audio_max_duration=10.0,
+        audio_sample_rate=16000,
+        audio_vocoder_hidden_channels=1024,
+        audio_vocoder_upsample_factors=[8, 8, 8],
+        audio_vocoder_n_residual_layers=4,
+    )
+    return VocoderWithT5Conditioning(config, t5_model_name="google/t5-v1_1-base")
+
+
+def create_large_vocoder_model() -> VocoderWithT5Conditioning:
+    """Create a large vocoder model."""
+    config = megatransformer_utils.MegaTransformerConfig(
+        hidden_size=768,
+        audio_n_mels=128,
+        audio_n_fft=1024,
+        audio_hop_length=512,
+        audio_max_duration=10.0,
+        audio_sample_rate=16000,
+        audio_vocoder_hidden_channels=2048,
+        audio_vocoder_upsample_factors=[8, 8, 8],
+        audio_vocoder_n_residual_layers=6,
+    )
+    return VocoderWithT5Conditioning(config, t5_model_name="google/t5-v1_1-large")
+
+
+model_config_lookup = {
+    "small_vocoder": create_small_vocoder_model,
+    "medium_vocoder": create_medium_vocoder_model,
+    "large_vocoder": create_large_vocoder_model,
+}
+
+
+# ============================================================================
+# Dataset Loading
+# ============================================================================
+
+class VocoderDataset(IterableDataset):
+    """
+    Dataset for vocoder training that loads audio with transcriptions.
+    Returns mel spectrograms, waveforms, and text for T5 conditioning.
+    """
+    def __init__(
+        self,
+        config: megatransformer_utils.MegaTransformerConfig,
+        t5_tokenizer: T5Tokenizer,
+        approximated_length: int,
+        sample_rate: int,
+        n_mels: int,
+        n_fft: int,
+        hop_length: int,
+        audio_max_frames: int,
+        cache_dir: str = "cached_datasets",
+        split: str = "train",
+        dataset_name: str = "fixie-ai/common_voice_17_0",
+        dataset_config: str = "en",
+        max_text_length: int = 256,
+    ):
+        self.config = config
+        self.t5_tokenizer = t5_tokenizer
+        self.approximated_length = approximated_length
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.audio_max_frames = audio_max_frames
+        self.cache_dir = cache_dir
+        self.split = split
+        self.dataset_name = dataset_name
+        self.dataset_config = dataset_config
+        self.max_text_length = max_text_length
+
+        # Load the base audio dataset
+        self.dataset = load_dataset(
+            dataset_name,
+            dataset_config,
+            cache_dir=cache_dir,
+            split=split,
+            streaming=True,
+            trust_remote_code=True,
+        )
+        self.dataset = self.dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
+
+    def __len__(self) -> int:
+        return self.approximated_length
+
+    def __iter__(self) -> Iterator[Any]:
+        for example in self.dataset:
+            try:
+                processed = self._process_example(example)
+                if processed is not None:
+                    yield processed
+            except Exception as e:
+                print(f"Error processing example: {e}")
+                continue
+
+    def _process_example(self, example: Dict) -> Optional[Dict]:
+        """Process a single example into vocoder training format."""
+        # Get text - handle different column names
+        text = example.get("text") or example.get("sentence") or example.get("caption")
+        if text is None:
+            return None
+
+        # Get audio
+        audio = example["audio"]
+
+        # Extract waveform and mel spectrogram
+        waveforms, y, _ = audio_loading.extract_waveforms(audio, sr=self.sample_rate)
+        mel_spec = audio_loading.extract_mels(
+            y,
+            sr=self.sample_rate,
+            n_mels=self.n_mels,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+        )
+
+        # Skip if mel spectrogram is too long
+        if mel_spec.shape[-1] > self.audio_max_frames:
+            return None
+
+        # Tokenize text for T5
+        text_encoding = self.t5_tokenizer(
+            text,
+            max_length=self.max_text_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        return {
+            "mel_spec": mel_spec,
+            "waveform_labels": waveforms,
+            "text_input_ids": text_encoding["input_ids"].squeeze(0),
+            "text_attention_mask": text_encoding["attention_mask"].squeeze(0),
+        }
+
+
+class VocoderDataCollator:
+    """Data collator for vocoder training."""
+
+    def __init__(
+        self,
+        audio_max_frames: int,
+        audio_max_waveform_length: int,
+        n_mels: int,
+    ):
+        self.audio_max_frames = audio_max_frames
+        self.audio_max_waveform_length = audio_max_waveform_length
+        self.n_mels = n_mels
+
+    def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
+        # Pad mel spectrograms
+        mel_specs = []
+        for ex in examples:
+            mel = ex["mel_spec"]
+            if mel.shape[-1] < self.audio_max_frames:
+                mel = F.pad(mel, (0, self.audio_max_frames - mel.shape[-1]), value=0)
+            mel_specs.append(mel)
+
+        # Pad waveforms
+        waveforms = []
+        for ex in examples:
+            wav = ex["waveform_labels"]
+            if wav.shape[-1] < self.audio_max_waveform_length:
+                wav = F.pad(wav, (0, self.audio_max_waveform_length - wav.shape[-1]), value=0)
+            elif wav.shape[-1] > self.audio_max_waveform_length:
+                wav = wav[..., :self.audio_max_waveform_length]
+            waveforms.append(wav)
+
+        # Stack tensors
+        batch = {
+            "mel_spec": torch.stack(mel_specs),
+            "waveform_labels": torch.stack(waveforms),
+            "text_input_ids": torch.stack([ex["text_input_ids"] for ex in examples]),
+            "text_attention_mask": torch.stack([ex["text_attention_mask"] for ex in examples]),
+        }
+
+        return batch
+
+
+# ============================================================================
+# Vocoder Reconstruction Callback
+# ============================================================================
+
+def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
+    """Get TensorBoard writer from trainer callbacks."""
+    for callback in trainer.callback_handler.callbacks:
+        if isinstance(callback, TensorBoardCallback):
+            if callback.tb_writer is not None:
+                return callback.tb_writer
+    return None
+
+
+class VocoderReconstructionCallback(TrainerCallback):
+    """
+    Callback for logging vocoder audio reconstruction during training.
+    Periodically generates audio from test mel spectrograms and logs to TensorBoard.
+    """
+
+    def __init__(
+        self,
+        t5_tokenizer: T5Tokenizer,
+        step_offset: int = 0,
+        generation_steps: int = 1000,
+        audio_sample_rate: int = 16000,
+        audio_n_mels: int = 128,
+        audio_n_fft: int = 1024,
+        audio_hop_length: int = 512,
+        test_audio_path: Optional[str] = None,
+        test_audio_text: Optional[str] = None,
+    ):
+        self.trainer: Optional[Trainer] = None
+        self.t5_tokenizer = t5_tokenizer
+        self.step_offset = step_offset
+        self.generation_steps = generation_steps
+        self.audio_sample_rate = audio_sample_rate
+        self.audio_n_mels = audio_n_mels
+        self.audio_n_fft = audio_n_fft
+        self.audio_hop_length = audio_hop_length
+
+        # Load test audio
+        if test_audio_path is not None and os.path.exists(test_audio_path):
+            self.test_audio_waveforms, orig_sr = torchaudio.load(test_audio_path)
+            if orig_sr != audio_sample_rate:
+                self.test_audio_waveforms = torchaudio.transforms.Resample(
+                    orig_freq=orig_sr, new_freq=audio_sample_rate
+                )(self.test_audio_waveforms)
+        else:
+            # Default test audio path
+            default_path = os.path.join('inference', 'examples', 'test_alm.mp3')
+            if os.path.exists(default_path):
+                self.test_audio_waveforms, orig_sr = torchaudio.load(default_path)
+                self.test_audio_waveforms = torchaudio.transforms.Resample(
+                    orig_freq=orig_sr, new_freq=audio_sample_rate
+                )(self.test_audio_waveforms)
+            else:
+                # Generate synthetic test audio (sine wave)
+                print("No test audio found, generating synthetic sine wave...")
+                duration = 3.0  # seconds
+                freq = 440.0  # Hz (A4 note)
+                t = torch.linspace(0, duration, int(audio_sample_rate * duration))
+                self.test_audio_waveforms = torch.sin(2 * np.pi * freq * t).unsqueeze(0)
+
+        # Extract mel spectrogram from test audio
+        self.test_mel_spec = audio_loading.extract_mels(
+            self.test_audio_waveforms[0].numpy(),
+            sr=audio_sample_rate,
+            n_mels=audio_n_mels,
+            n_fft=audio_n_fft,
+            hop_length=audio_hop_length,
+        )
+
+        # Test text for conditioning
+        self.test_text = test_audio_text or "It is from Westport, above the villages of Murrisk and Lecanvey."
+        self.test_text_encoding = t5_tokenizer(
+            self.test_text,
+            max_length=256,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+    def on_step_end(self, args, state, control, model: VocoderWithT5Conditioning = None, **kwargs):
+        global_step = state.global_step + self.step_offset
+
+        if ((global_step == 1) or (global_step % self.generation_steps == 0)) and state.is_world_process_zero:
+            writer = get_writer(self.trainer)
+            if writer is None:
+                print("No TensorBoard writer found, skipping audio reconstruction...")
+                return
+
+            print(f"Reconstructing audio at step {global_step}...")
+
+            # Determine device
+            if torch.distributed.is_initialized():
+                device = torch.device(f"cuda:{torch.distributed.get_rank()}")
+            elif torch.cuda.is_available():
+                device = torch.device("cuda")
+            else:
+                device = torch.device("cpu")
+
+            # Move test data to device
+            test_mel = self.test_mel_spec.unsqueeze(0).to(device)
+            test_text_ids = self.test_text_encoding["input_ids"].to(device)
+            test_text_mask = self.test_text_encoding["attention_mask"].to(device)
+            test_waveform = self.test_audio_waveforms.to(device)
+
+            with torch.no_grad():
+                dtype = torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32
+                with autocast(device.type, dtype=dtype):
+                    # Generate waveform from mel spectrogram
+                    outputs = model(
+                        mel_spec=test_mel,
+                        text_input_ids=test_text_ids,
+                        text_attention_mask=test_text_mask,
+                        waveform_labels=test_waveform[0] if test_waveform.dim() > 1 else test_waveform,
+                    )
+
+                    pred_waveform = outputs["pred_waveform"]
+
+                    # Clip waveform to valid range
+                    pred_waveform = torch.clamp(pred_waveform, -1.0, 1.0)
+                    pred_waveform_cpu = pred_waveform[0].to(torch.float64).cpu()
+
+                    # Log conditioning text
+                    writer.add_text(
+                        "vocoder_reconstruction/conditioning_text",
+                        self.test_text,
+                        global_step,
+                    )
+
+                    # Log ground truth audio
+                    gt_waveform = self.test_audio_waveforms[0].to(torch.float64)
+                    writer.add_audio(
+                        "vocoder_reconstruction/ground_truth",
+                        gt_waveform,
+                        global_step,
+                        sample_rate=self.audio_sample_rate,
+                    )
+
+                    # Log reconstructed audio
+                    writer.add_audio(
+                        "vocoder_reconstruction/predicted",
+                        pred_waveform_cpu,
+                        global_step,
+                        sample_rate=self.audio_sample_rate,
+                    )
+
+                    # Save reconstructed audio to file
+                    if self.trainer is not None and hasattr(self.trainer.args, "output_dir"):
+                        audio_filepath = os.path.join(
+                            self.trainer.args.output_dir,
+                            f"reconstructed_audio_step_{global_step}.wav"
+                        )
+                        self._save_audio_to_file(
+                            pred_waveform_cpu,
+                            audio_filepath,
+                            sample_rate=self.audio_sample_rate,
+                        )
+
+                    # Log mel spectrogram visualizations
+                    try:
+                        # Ground truth mel spectrogram
+                        writer.add_image(
+                            "vocoder_reconstruction/mel_spec_input",
+                            self._visualize_mel_spec(
+                                self.test_mel_spec.numpy(),
+                                self.audio_sample_rate
+                            ),
+                            global_step,
+                        )
+
+                        # Reconstructed waveform's mel spectrogram
+                        reconstructed_mel = audio_loading.extract_mels(
+                            pred_waveform_cpu.numpy(),
+                            sr=self.audio_sample_rate,
+                            n_mels=self.audio_n_mels,
+                            n_fft=self.audio_n_fft,
+                            hop_length=self.audio_hop_length,
+                        )
+                        writer.add_image(
+                            "vocoder_reconstruction/mel_spec_output",
+                            self._visualize_mel_spec(
+                                reconstructed_mel.numpy(),
+                                self.audio_sample_rate
+                            ),
+                            global_step,
+                        )
+                    except Exception as e:
+                        writer.add_text(
+                            "vocoder_reconstruction/mel_spec_error",
+                            f"Error visualizing mel spec: {e}",
+                            global_step,
+                        )
+
+                    # Log losses
+                    if "loss" in outputs:
+                        writer.add_scalar(
+                            "vocoder_reconstruction/loss",
+                            outputs["loss"].item(),
+                            global_step,
+                        )
+                    if "waveform_l1" in outputs:
+                        writer.add_scalar(
+                            "vocoder_reconstruction/waveform_l1",
+                            outputs["waveform_l1"].item(),
+                            global_step,
+                        )
+                    if "sc_loss" in outputs:
+                        writer.add_scalar(
+                            "vocoder_reconstruction/sc_loss",
+                            outputs["sc_loss"].item(),
+                            global_step,
+                        )
+                    if "mag_loss" in outputs:
+                        writer.add_scalar(
+                            "vocoder_reconstruction/mag_loss",
+                            outputs["mag_loss"].item(),
+                            global_step,
+                        )
+
+    def _save_audio_to_file(
+        self,
+        waveform: torch.Tensor,
+        filepath: str,
+        sample_rate: int,
+        normalize: bool = True,
+        bits_per_sample: int = 16,
+    ):
+        """Save waveform to audio file."""
+        if not isinstance(waveform, torch.Tensor):
+            waveform = torch.tensor(waveform)
+
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+
+        if normalize:
+            waveform = waveform / (torch.max(torch.abs(waveform)) + 1e-8)
+
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+
+        torchaudio.save(
+            filepath,
+            waveform.cpu(),
+            sample_rate,
+            bits_per_sample=bits_per_sample,
+            format="wav",
+        )
+        print(f"Audio saved to {filepath}")
+
+    def _visualize_mel_spec(self, mel_spec: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Generate mel spectrogram visualization for TensorBoard."""
+        # Normalize to [0, 1] range
+        mel_spec_norm = (mel_spec - mel_spec.min()) / (mel_spec.max() - mel_spec.min() + 1e-8)
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 4))
+        img = librosa.display.specshow(
+            mel_spec_norm,
+            x_axis='time',
+            y_axis='mel',
+            sr=sample_rate,
+            fmax=8000,
+            ax=ax,
+        )
+        plt.colorbar(img, format='%+2.0f dB')
+        plt.title('Mel Spectrogram')
+        plt.tight_layout()
+
+        # Convert figure to numpy array
+        fig.canvas.draw()
+        data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+
+        plt.close(fig)
+
+        # Add batch dimension
+        data = np.expand_dims(data, axis=0)
+
+        return data
+
+
+# ============================================================================
+# Custom Trainer for Vocoder
 # ============================================================================
 
 class VocoderTrainer(Trainer):
-    """Custom trainer for vocoder training."""
-
-    def __init__(self, vocoder_config: VocoderConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.vocoder_config = vocoder_config
-        self.writer = None
+    """Custom trainer for vocoder that handles the specific loss computation."""
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        mel_spec = inputs["mel_spec"]
-        waveform = inputs["waveform"]
+        self._ensure_tensorboard_writer()
 
-        loss, outputs = model(mel_spec=mel_spec, waveform=waveform)
+        outputs = model(
+            mel_spec=inputs["mel_spec"],
+            text_input_ids=inputs["text_input_ids"],
+            text_attention_mask=inputs["text_attention_mask"],
+            waveform_labels=inputs["waveform_labels"],
+        )
 
-        # Log individual losses to tensorboard
-        if self.state.global_step % self.args.logging_steps == 0:
-            self._ensure_tensorboard_writer()
-            if self.writer is not None:
-                prefix = "train/" if model.training else "eval/"
-                self.writer.add_scalar(f"{prefix}waveform_l1", outputs["waveform_l1"].item(), self.state.global_step)
-                self.writer.add_scalar(f"{prefix}sc_loss", outputs["sc_loss"].item(), self.state.global_step)
-                self.writer.add_scalar(f"{prefix}mag_loss", outputs["mag_loss"].item(), self.state.global_step)
+        loss = outputs["loss"]
+
+        # Log individual losses
+        if self.state.global_step % self.args.logging_steps == 0 and hasattr(self, "writer") and self.writer is not None:
+            prefix = "train/" if model.training else "eval/"
+            self._log_scalar(f"{prefix}waveform_l1", outputs.get("waveform_l1", 0))
+            self._log_scalar(f"{prefix}sc_loss", outputs.get("sc_loss", 0))
+            self._log_scalar(f"{prefix}mag_loss", outputs.get("mag_loss", 0))
 
         return (loss, outputs) if return_outputs else loss
 
+    def _log_scalar(self, tag, value):
+        if hasattr(self, "writer") and self.writer is not None:
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            if value != 0.0:
+                self.writer.add_scalar(tag, value, self.state.global_step)
+
     def _ensure_tensorboard_writer(self):
-        if self.writer is None:
-            for callback in self.callback_handler.callbacks:
-                if isinstance(callback, TensorBoardCallback):
-                    self.writer = callback.tb_writer
-                    break
-
-
-class VocoderCheckpointCallback(TrainerCallback):
-    """
-    Callback to save vocoder weights separately for easy loading in world model training.
-
-    Saves to: {output_dir}/vocoder_checkpoint/vocoder.pt
-
-    The saved checkpoint contains:
-        - 'vocoder_state_dict': The vocoder model weights
-        - 'config': VocoderConfig parameters as a dict
-        - 'step': Training step when saved
-    """
-
-    def __init__(self, config: VocoderConfig, save_every_n_steps: int = 1000):
-        self.config = config
-        self.save_every_n_steps = save_every_n_steps
-        self.output_dir = None
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        self.output_dir = args.output_dir
-
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if state.global_step % self.save_every_n_steps != 0:
+        if hasattr(self, "writer"):
             return
 
-        self._save_vocoder(model, state.global_step)
+        for callback in self.callback_handler.callbacks:
+            if isinstance(callback, TensorBoardCallback):
+                self.writer = callback.tb_writer
+                return
 
-    def on_train_end(self, args, state, control, model=None, **kwargs):
-        # Always save at end of training
-        self._save_vocoder(model, state.global_step, final=True)
-
-    def _save_vocoder(self, model, step, final=False):
-        if model is None or self.output_dir is None:
-            return
-
-        # Handle DeepSpeed/DDP wrapped models
-        if hasattr(model, 'module'):
-            vocoder = model.module.vocoder
-        else:
-            vocoder = model.vocoder
-
-        # Create checkpoint directory
-        checkpoint_dir = os.path.join(self.output_dir, "vocoder_checkpoint")
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-        # Save vocoder weights and config
-        checkpoint = {
-            'vocoder_state_dict': vocoder.state_dict(),
-            'config': {
-                'sample_rate': self.config.sample_rate,
-                'n_mels': self.config.n_mels,
-                'n_fft': self.config.n_fft,
-                'hop_length': self.config.hop_length,
-                'hidden_channels': self.config.hidden_channels,
-                'upsample_factors': self.config.upsample_factors,
-                'n_residual_layers': self.config.n_residual_layers,
-                'dilation_cycle': self.config.dilation_cycle,
-                'kernel_size': self.config.kernel_size,
-                'leaky_relu_slope': self.config.leaky_relu_slope,
-            },
-            'step': step,
-        }
-
-        # Save with step number and also as 'latest'
-        save_path = os.path.join(checkpoint_dir, f"vocoder_step_{step}.pt")
-        latest_path = os.path.join(checkpoint_dir, "vocoder.pt")
-
-        torch.save(checkpoint, save_path)
-        torch.save(checkpoint, latest_path)
-
-        if final:
-            final_path = os.path.join(checkpoint_dir, "vocoder_final.pt")
-            torch.save(checkpoint, final_path)
-
-        logger.info(f"Saved vocoder checkpoint to {save_path}")
-
-
-def load_pretrained_vocoder(checkpoint_path: str, device: str = 'cuda') -> AudioVocoder:
-    """
-    Load a pretrained vocoder from a checkpoint saved by VocoderCheckpointCallback.
-
-    This function is designed to be used when loading a frozen vocoder for world model training.
-
-    Args:
-        checkpoint_path: Path to vocoder checkpoint (e.g., 'runs/vocoder/my_run/vocoder_checkpoint/vocoder.pt')
-        device: Device to load the model to
-
-    Returns:
-        AudioVocoder model with loaded weights, set to eval mode with frozen parameters
-
-    Example usage in world model training:
-        ```python
-        from pretrain_vocoder import load_pretrained_vocoder
-
-        vocoder = load_pretrained_vocoder('runs/vocoder/my_run/vocoder_checkpoint/vocoder.pt')
-        # vocoder is already frozen and in eval mode
-
-        # Use in your audio decoder:
-        model.output_transform.audio_decoder.vocoder = vocoder
-        ```
-    """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    config = checkpoint['config']
-
-    vocoder = AudioVocoder(
-        hidden_channels=config['hidden_channels'],
-        in_channels=config['n_mels'],
-        conditioning_channels=config['hidden_channels'],  # Not used when conditioning_enabled=False
-        upsample_factors=config['upsample_factors'],
-        n_residual_layers=config['n_residual_layers'],
-        dilation_cycle=config.get('dilation_cycle', 4),
-        kernel_size=config.get('kernel_size', 3),
-        leaky_relu_slope=config.get('leaky_relu_slope', 0.1),
-        conditioning_enabled=False,
-    )
-
-    vocoder.load_state_dict(checkpoint['vocoder_state_dict'])
-
-    # Freeze and set to eval mode for inference
-    vocoder.eval()
-    for param in vocoder.parameters():
-        param.requires_grad = False
-
-    vocoder.to(device)
-
-    logger.info(f"Loaded pretrained vocoder from {checkpoint_path} (step {checkpoint['step']})")
-
-    return vocoder
-
-
-class AudioSampleCallback(TrainerCallback):
-    """Callback to log audio samples during training."""
-
-    def __init__(self, dataset, config: VocoderConfig, num_samples: int = 3, log_every_n_steps: int = 1000):
-        self.dataset = dataset
-        self.config = config
-        self.num_samples = num_samples
-        self.log_every_n_steps = log_every_n_steps
         self.writer = None
-        self.trainer = None
-
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if state.global_step % self.log_every_n_steps != 0:
-            return
-
-        if self.writer is None:
-            return
-
-        model.eval()
-        device = next(model.parameters()).device
-
-        with torch.no_grad():
-            for i in range(min(self.num_samples, len(self.dataset))):
-                sample = self.dataset[i]
-                mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
-                waveform_gt = sample["waveform"]
-
-                # Generate
-                pred_waveform = model.module.vocoder(mel_spec, condition=None) if hasattr(model, 'module') else model.vocoder(mel_spec, condition=None)
-                pred_waveform = pred_waveform.squeeze(0).cpu()
-
-                # Log to tensorboard
-                self.writer.add_audio(
-                    f"sample_{i}/predicted",
-                    pred_waveform.numpy(),
-                    state.global_step,
-                    sample_rate=self.config.sample_rate
-                )
-                self.writer.add_audio(
-                    f"sample_{i}/ground_truth",
-                    waveform_gt.numpy(),
-                    state.global_step,
-                    sample_rate=self.config.sample_rate
-                )
-
-        model.train()
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        # Get tensorboard writer from trainer
-        if self.trainer is not None:
-            for callback in self.trainer.callback_handler.callbacks:
-                if isinstance(callback, TensorBoardCallback):
-                    self.writer = callback.tb_writer
-                    break
 
 
 # ============================================================================
-# Argument Parsing
-# ============================================================================
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Pretrain vocoder on Common Voice dataset")
-
-    # Run configuration
-    parser.add_argument('--run_name', type=str, required=True, help='Name of the run')
-    parser.add_argument('--logging_base_dir', type=str, default=os.path.join('runs', 'vocoder'), help='Base directory for logging')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--resume_from_checkpoint', action='store_true', help='Resume from checkpoint')
-
-    # Data configuration
-    parser.add_argument('--language', type=str, default='en', help='Common Voice language code')
-    parser.add_argument('--dataset_cache_dir', type=str, default='cached_datasets', help='Dataset cache directory')
-    parser.add_argument('--max_train_samples', type=int, default=None, help='Maximum training samples')
-    parser.add_argument('--max_eval_samples', type=int, default=1000, help='Maximum evaluation samples')
-
-    # Audio configuration
-    parser.add_argument('--sample_rate', type=int, default=16000, help='Audio sample rate')
-    parser.add_argument('--n_mels', type=int, default=128, help='Number of mel bands')
-    parser.add_argument('--n_fft', type=int, default=1024, help='FFT size')
-    parser.add_argument('--hop_length', type=int, default=512, help='Hop length')
-    parser.add_argument('--max_audio_duration', type=float, default=10.0, help='Maximum audio duration in seconds')
-
-    # Model configuration (defaults match MegaTransformerConfig)
-    # Note: create_small_multimodal_model uses 1536, use --hidden_channels=1536 for that config
-    parser.add_argument('--hidden_channels', type=int, default=2048, help='Vocoder hidden channels (MegaTransformerConfig default: 2048, small_multimodal: 1536)')
-    parser.add_argument('--n_residual_layers', type=int, default=4, help='Number of residual layers')
-
-    # Loss weights
-    parser.add_argument('--waveform_l1_weight', type=float, default=1.0, help='Weight for L1 waveform loss')
-    parser.add_argument('--sc_loss_weight', type=float, default=1.5, help='Weight for spectral convergence loss')
-    parser.add_argument('--mag_loss_weight', type=float, default=1.5, help='Weight for log magnitude loss')
-
-    # Training configuration
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size per device')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='Gradient accumulation steps')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
-    parser.add_argument('--warmup_ratio', type=float, default=0.03, help='Warmup ratio')
-    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm')
-    parser.add_argument('--num_train_epochs', type=int, default=-1, help='Number of training epochs')
-    parser.add_argument('--max_steps', type=int, default=100000, help='Max training steps')
-
-    # Precision
-    parser.add_argument('--fp16', action='store_true', help='Use FP16')
-    parser.add_argument('--bf16', action='store_true', help='Use BF16')
-
-    # Logging
-    parser.add_argument('--logging_steps', type=int, default=100, help='Logging frequency')
-    parser.add_argument('--save_steps', type=int, default=1000, help='Checkpoint save frequency')
-    parser.add_argument('--eval_steps', type=int, default=1000, help='Evaluation frequency')
-    parser.add_argument('--audio_log_steps', type=int, default=2000, help='Audio sample logging frequency')
-
-    # DeepSpeed
-    parser.add_argument('--use_deepspeed', action='store_true', help='Use DeepSpeed')
-    parser.add_argument('--deepspeed_config', type=str, default=None, help='DeepSpeed config file')
-    parser.add_argument('--local_rank', type=int, default=-1, help='Local rank for distributed training')
-
-    # Other
-    parser.add_argument('--cpu', action='store_true', help='Use CPU')
-    parser.add_argument('--log_level', type=str, default='warning', help='Log level')
-
-    args, _ = parser.parse_known_args()
-
-    # Validation
-    if args.num_train_epochs == -1 and args.max_steps == -1:
-        raise ValueError("Either num_train_epochs or max_steps must be specified.")
-
-    if args.use_deepspeed and args.deepspeed_config:
-        if not os.path.exists(args.deepspeed_config):
-            raise FileNotFoundError(f"DeepSpeed config not found: {args.deepspeed_config}")
-
-    return args
-
-
-def set_seed_everywhere(seed: int):
-    """Set seed for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    hf_set_seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-
-
-# ============================================================================
-# Main
+# Main Training Script
 # ============================================================================
 
 def main():
-    args = parse_args()
-
-    set_seed_everywhere(args.seed)
-
+    args, unk = megatransformer_utils.parse_args()
     run_dir = os.path.join(args.logging_base_dir, args.run_name)
-    if not os.path.exists(run_dir):
-        os.makedirs(run_dir)
 
-    # Create config
-    vocoder_config = VocoderConfig(
-        sample_rate=args.sample_rate,
-        n_mels=args.n_mels,
-        n_fft=args.n_fft,
-        hop_length=args.hop_length,
-        max_audio_duration=args.max_audio_duration,
-        hidden_channels=args.hidden_channels,
-        n_residual_layers=args.n_residual_layers,
-        waveform_l1_weight=args.waveform_l1_weight,
-        sc_loss_weight=args.sc_loss_weight,
-        mag_loss_weight=args.mag_loss_weight,
-    )
+    # Select model configuration
+    if args.config not in model_config_lookup:
+        raise ValueError(f"Unknown vocoder config: {args.config}. Available: {list(model_config_lookup.keys())}")
 
-    # Create model
-    model = VocoderForTraining(vocoder_config)
+    model = model_config_lookup[args.config]()
+    model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
 
     if args.local_rank == 0 or not args.use_deepspeed:
         print(f"Model structure: {model}")
-        print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
         print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+        print(f"  Vocoder parameters: {sum(p.numel() for p in model.vocoder.parameters()):,}")
+        print(f"  Condition projection parameters: {sum(p.numel() for p in model.condition_proj.parameters()):,}")
+        print(f"  T5 parameters (frozen): {sum(p.numel() for p in model.t5_encoder.parameters()):,}")
 
-    # Create datasets
-    train_dataset = CommonVoiceVocoderDataset(
-        config=vocoder_config,
-        split="train",
-        language=args.language,
-        cache_dir=args.dataset_cache_dir,
-        max_samples=args.max_train_samples,
-    )
+    model = megatransformer_utils.setup_int8_training(args, model)
 
-    eval_dataset = CommonVoiceVocoderDataset(
-        config=vocoder_config,
-        split="validation",
-        language=args.language,
-        cache_dir=args.dataset_cache_dir,
-        max_samples=args.max_eval_samples,
-    )
-
-    # Create data collator
-    data_collator = VocoderDataCollator(vocoder_config)
+    if not os.path.exists(run_dir):
+        os.makedirs(run_dir)
 
     # Training arguments
     training_args = TrainingArguments(
+        tpu_num_cores=8 if args.use_xla else None,
         output_dir=run_dir,
         overwrite_output_dir=True,
         lr_scheduler_type="cosine",
-        warmup_ratio=args.warmup_ratio,
         learning_rate=args.learning_rate,
+        warmup_ratio=args.warmup_ratio,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -691,23 +718,57 @@ def main():
         report_to="tensorboard",
         logging_dir=run_dir,
         logging_steps=args.logging_steps,
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
+        eval_strategy="no",
         save_safetensors=False,
         save_steps=args.save_steps,
+        gradient_checkpointing=args.use_gradient_checkpointing,
         bf16=args.bf16,
         fp16=args.fp16,
         max_grad_norm=args.max_grad_norm,
-        deepspeed=args.deepspeed_config if args.use_deepspeed else None,
+        torch_compile=args.compile_model and not args.use_deepspeed and not args.use_xla,
+        deepspeed=args.deepspeed_config if args.use_deepspeed and not args.use_xla else None,
         use_cpu=args.cpu,
         log_level=args.log_level,
         logging_first_step=True,
         local_rank=args.local_rank,
     )
 
+    # Create datasets
+    train_dataset = VocoderDataset(
+        config=model.config,
+        t5_tokenizer=model.t5_tokenizer,
+        approximated_length=300_000,
+        sample_rate=model.config.audio_sample_rate,
+        n_mels=model.config.audio_n_mels,
+        n_fft=model.config.audio_n_fft,
+        hop_length=model.config.audio_hop_length,
+        audio_max_frames=model.config.audio_max_frames,
+        cache_dir=args.dataset_cache_dir,
+        split="train",
+    )
+
+    eval_dataset = VocoderDataset(
+        config=model.config,
+        t5_tokenizer=model.t5_tokenizer,
+        approximated_length=10_000,
+        sample_rate=model.config.audio_sample_rate,
+        n_mels=model.config.audio_n_mels,
+        n_fft=model.config.audio_n_fft,
+        hop_length=model.config.audio_hop_length,
+        audio_max_frames=model.config.audio_max_frames,
+        cache_dir=args.dataset_cache_dir,
+        split="validation",
+    )
+
+    # Create data collator
+    data_collator = VocoderDataCollator(
+        audio_max_frames=model.config.audio_max_frames,
+        audio_max_waveform_length=model.config.audio_max_waveform_length,
+        n_mels=model.config.audio_n_mels,
+    )
+
     # Create trainer
     trainer = VocoderTrainer(
-        vocoder_config=vocoder_config,
         model=model,
         args=training_args,
         data_collator=data_collator,
@@ -715,25 +776,20 @@ def main():
         eval_dataset=eval_dataset,
     )
 
-    # Add vocoder checkpoint callback (saves vocoder weights separately for world model training)
-    vocoder_checkpoint_callback = VocoderCheckpointCallback(
-        config=vocoder_config,
-        save_every_n_steps=args.save_steps,
+    # Add reconstruction callback for monitoring training progress
+    reconstruction_callback = VocoderReconstructionCallback(
+        t5_tokenizer=model.t5_tokenizer,
+        step_offset=args.start_step,
+        generation_steps=args.generation_steps,
+        audio_sample_rate=model.config.audio_sample_rate,
+        audio_n_mels=model.config.audio_n_mels,
+        audio_n_fft=model.config.audio_n_fft,
+        audio_hop_length=model.config.audio_hop_length,
     )
-    trainer.add_callback(vocoder_checkpoint_callback)
+    trainer.add_callback(reconstruction_callback)
+    reconstruction_callback.trainer = trainer
 
-    # Add audio sample callback
-    audio_callback = AudioSampleCallback(
-        dataset=eval_dataset,
-        config=vocoder_config,
-        num_samples=3,
-        log_every_n_steps=args.audio_log_steps,
-    )
-    trainer.add_callback(audio_callback)
-    audio_callback.trainer = trainer
-
-    # Train
-    print(f"Starting training with {sum(p.numel() for p in model.parameters()):,} parameters")
+    print(f"Starting vocoder training with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters")
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
 

@@ -1285,10 +1285,10 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
 
         image_decoder_model_channels=32,
         image_decoder_time_embedding_dim=32,
-        image_decoder_num_res_blocks=2,
+        image_decoder_num_res_blocks=1,
         image_decoder_betas_schedule="cosine",
 
-        image_decoder_cross_attn_n_heads=4,
+        image_decoder_cross_attn_n_heads=3,
         image_decoder_cross_attn_d_queries=32,
         image_decoder_cross_attn_d_values=32,
     )
