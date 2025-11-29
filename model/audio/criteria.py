@@ -290,10 +290,11 @@ class AudioGenerationLoss(nn.Module):
             total_loss = total_loss + self.waveform_loss_weight * waveform_loss
             
             # Multi-resolution STFT loss
-            sc_loss, mag_loss = self.stft_loss(pred_waveform, target_waveform)
+            sc_loss, mag_loss, complex_stft_loss = self.stft_loss(pred_waveform, target_waveform)
             losses["sc"] = sc_loss
             losses["mag"] = mag_loss
-            total_loss = total_loss + self.stft_loss_weight * (sc_loss + mag_loss)
+            losses["complex_stft"] = complex_stft_loss
+            total_loss = total_loss + self.stft_loss_weight * (sc_loss + mag_loss + complex_stft_loss)
         
         return total_loss, losses
 

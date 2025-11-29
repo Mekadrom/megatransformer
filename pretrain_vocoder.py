@@ -803,6 +803,7 @@ class VocoderGANTrainer(Trainer):
                 if self.discriminator_optimizer is not None:
                     self.discriminator_optimizer.zero_grad()
                     d_loss.backward()
+                    self.discriminator_optimizer.step()
             # ============ Generator GAN Loss ============
             # Get discriminator outputs for fake (for generator update)
             device_type = pred_waveform.device.type
@@ -811,7 +812,7 @@ class VocoderGANTrainer(Trainer):
                 disc_real = self.discriminator(waveform_labels_aligned.detach())
                 disc_fake = self.discriminator(pred_waveform_aligned)
 
-            g_losses = compute_generator_losses(disc_real, disc_fake)
+            g_losses = compute_generator_losses(disc_fake, disc_real)
 
             # Generator adversarial loss
             g_adv_mpd = g_losses["g_adv_mpd"]
@@ -835,7 +836,7 @@ class VocoderGANTrainer(Trainer):
             self._log_scalar("train/g_loss_total", g_loss_gan)
 
         # Total generator loss
-        total_loss = recon_loss + self.gan_loss_weight * g_loss_gan + self.feature_matching_loss_weight * g_loss_fm
+        total_loss = recon_loss + self.gan_loss_weight * g_loss_gan
 
         # Log individual losses
         if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
