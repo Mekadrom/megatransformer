@@ -7,6 +7,9 @@ import megatransformer_utils
 import torch
 import torch.nn.functional as F
 
+from model.audio.diffusion import AudioConditionalGaussianDiffusion, AudioDiffusionCrossAttentionBlock, AudioDiffusionSelfAttentionBlock
+from model.audio.feature_extractors import AudioFeatureExtractor
+
 
 class MegaTransformerMultimodalEncoder(nn.Module):
     def __init__(self, config, text_embedding, audio_embedding, image_embedding):
@@ -1158,14 +1161,14 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
 
 
 def make_audio_decoder(config: megatransformer_utils.MegaTransformerConfig):
-    return megatransformer_audio_decoder.AudioConditionalGaussianDiffusion(
+    return AudioConditionalGaussianDiffusion(
         config=config,  # for vocoder to grab its details from
         hidden_size=config.hidden_size,
         activation=config.audio_decoder_activation,
         scale_factor=(2, 1),
         stride=(2, 1),
-        self_attn_class=megatransformer_audio_decoder.AudioDiffusionSelfAttentionBlock,
-        cross_attn_class=megatransformer_audio_decoder.AudioDiffusionCrossAttentionBlock,
+        self_attn_class=AudioDiffusionSelfAttentionBlock,
+        cross_attn_class=AudioDiffusionCrossAttentionBlock,
         norm_class=megatransformer_modules.RMSNorm,
         in_channels=1,
         model_channels=config.audio_decoder_model_channels,
@@ -1346,7 +1349,7 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
     )
 
     text_embedding = megatransformer_text_encoder.TextFeatureExtractor(config)
-    audio_embedding = megatransformer_audio_encoder.AudioFeatureExtractor(config)
+    audio_embedding = AudioFeatureExtractor(config)
     image_embedding = megatransformer_image_encoder.ImageViTFeatureExtractor(config)
     world_model = megatransformer_recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
     text_decoder = nn.Linear(config.hidden_size, config.vocab_size)

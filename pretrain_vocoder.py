@@ -1,12 +1,16 @@
 import os
 
+from model.audio.criteria import MultiResolutionSTFTLoss, compute_discriminator_losses, compute_generator_losses, discriminator_loss, feature_matching_loss, generator_loss
+from model.audio.discriminators import CombinedDiscriminator
+from model.audio.vocoders import AudioVocoder
+
 os.environ["DEEPSPEED_UNIT_TEST"] = "1"
 os.environ["NCCL_DEBUG"] = "INFO"
 os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ['NCCL_TIMEOUT'] = '1200000'
 
-from datasets import load_dataset, Audio
+from datasets import load_dataset, load_from_disk, Audio
 from torch import nn
 from torch.amp import autocast
 from torch.utils.data import IterableDataset
@@ -16,7 +20,6 @@ from transformers.integrations import TensorBoardCallback
 from typing import Iterator, Any, List, Dict, Optional
 
 from dataset_loading import audio_loading
-from model.megatransformer_audio_decoder import AudioVocoder, MultiResolutionSTFTLoss
 
 import librosa
 import librosa.display
@@ -28,52 +31,6 @@ import torch.nn.functional as F
 import torchaudio
 
 
-# ============================================================================
-# Discriminator using periodic convolutions
-# ============================================================================
-
-class PeriodDiscriminator(nn.Module):
-    def __init__(self, period):
-        self.period = period
-        self.convs = nn.ModuleList([
-            nn.Conv2d(1, 32, (5, 1), (3, 1), padding=(2, 0)),
-            nn.Conv2d(32, 128, (5, 1), (3, 1), padding=(2, 0)),
-            nn.Conv2d(128, 512, (5, 1), (3, 1), padding=(2, 0)),
-            nn.Conv2d(512, 1024, (5, 1), (3, 1), padding=(2, 0)),
-            nn.Conv2d(1024, 1, (3, 1), padding=(1, 0)),
-        ])
-    
-    def forward(self, x):
-        features = []
-        # Reshape: [B, T] -> [B, 1, T//period, period]
-        b, t = x.shape
-        pad = (self.period - (t % self.period)) % self.period
-        x = F.pad(x, (0, pad))
-        x = x.view(b, 1, -1, self.period)
-        
-        for conv in self.convs:
-            x = F.leaky_relu(conv(x), 0.1)
-            features.append(x)
-        return x, features
-
-class MultiPeriodDiscriminator(nn.Module):
-    def __init__(self):
-        self.discriminators = nn.ModuleList([
-            PeriodDiscriminator(p) for p in [2, 3, 5, 7, 11]
-        ])
-    
-    def forward(self, x):
-        outputs, all_features = [], []
-        for d in self.discriminators:
-            out, feats = d(x)
-            outputs.append(out)
-            all_features.append(feats)
-        return outputs, all_features
-
-# ============================================================================
-# Vocoder Model Wrapper with T5 Text Conditioning
-# ============================================================================
-
 class VocoderWithT5Conditioning(nn.Module):
     """
     Wrapper model that combines AudioVocoder with frozen T5 text embeddings for conditioning.
@@ -84,6 +41,7 @@ class VocoderWithT5Conditioning(nn.Module):
                  mag_loss_weight: float = 3.0,
                  waveform_l1_loss_weight: float = 0.1,
                  mel_recon_loss_weight: float = 1.0,
+                 complex_stft_loss_weight: float = 2.0,
                  t5_model_name: str = "google/t5-v1_1-base"):
         super().__init__()
         self.config = config
@@ -91,6 +49,7 @@ class VocoderWithT5Conditioning(nn.Module):
         self.mag_loss_weight = mag_loss_weight
         self.waveform_l1_loss_weight = waveform_l1_loss_weight
         self.mel_recon_loss_weight = mel_recon_loss_weight
+        self.complex_stft_loss_weight = complex_stft_loss_weight
 
         # Frozen T5 encoder for text conditioning
         self.t5_tokenizer = T5Tokenizer.from_pretrained(t5_model_name)
@@ -183,7 +142,7 @@ class VocoderWithT5Conditioning(nn.Module):
             # Compute losses
             waveform_l1 = F.l1_loss(pred_waveform_aligned, waveform_labels_aligned)
             # STFT loss expects [B, 1, T] shape
-            sc_loss, mag_loss = self.stft_loss(
+            sc_loss, mag_loss, complex_stft_loss = self.stft_loss(
                 pred_waveform_aligned.unsqueeze(1) if pred_waveform_aligned.dim() == 2 else pred_waveform_aligned,
                 waveform_labels_aligned.unsqueeze(1) if waveform_labels_aligned.dim() == 2 else waveform_labels_aligned
             )
@@ -207,7 +166,7 @@ class VocoderWithT5Conditioning(nn.Module):
             )
 
             # Total loss
-            total_loss = (self.sc_loss_weight * sc_loss) + (self.mag_loss_weight * mag_loss) + (self.waveform_l1_loss_weight * waveform_l1) + (self.mel_recon_loss_weight * mel_recon_loss)
+            total_loss = (self.sc_loss_weight * sc_loss) + (self.mag_loss_weight * mag_loss) + (self.complex_stft_loss_weight * complex_stft_loss) + (self.waveform_l1_loss_weight * waveform_l1) + (self.mel_recon_loss_weight * mel_recon_loss)
 
             outputs.update({
                 "loss": total_loss,
@@ -215,16 +174,13 @@ class VocoderWithT5Conditioning(nn.Module):
                 "sc_loss": sc_loss,
                 "mag_loss": mag_loss,
                 "mel_recon_loss": mel_recon_loss,
+                "complex_stft_loss": complex_stft_loss,
             })
 
         return outputs
 
 
-# ============================================================================
-# Model Creation Functions
-# ============================================================================
-
-def create_small_vocoder_model(sc_loss_weight, mag_loss_weight, waveform_l1_loss_weight, mel_recon_loss_weight) -> VocoderWithT5Conditioning:
+def create_small_vocoder_model(sc_loss_weight, mag_loss_weight, waveform_l1_loss_weight, mel_recon_loss_weight, complex_stft_loss_weight) -> VocoderWithT5Conditioning:
     """Create a small vocoder model for testing."""
     config = megatransformer_utils.MegaTransformerConfig(
         hidden_size=256,
@@ -243,6 +199,7 @@ def create_small_vocoder_model(sc_loss_weight, mag_loss_weight, waveform_l1_loss
         mag_loss_weight=mag_loss_weight,
         waveform_l1_loss_weight=waveform_l1_loss_weight,
         mel_recon_loss_weight=mel_recon_loss_weight,
+        complex_stft_loss_weight=complex_stft_loss_weight,
         t5_model_name="google/t5-v1_1-small"
     )
 
@@ -286,10 +243,6 @@ model_config_lookup = {
 }
 
 
-# ============================================================================
-# Dataset Loading
-# ============================================================================
-
 class VocoderDataset(IterableDataset):
     """
     Dataset for vocoder training that loads audio with transcriptions.
@@ -326,13 +279,16 @@ class VocoderDataset(IterableDataset):
         self.max_text_length = max_text_length
 
         # Load the base audio dataset
-        self.dataset = load_dataset(
-            dataset_name,
-            dataset_config,
-            cache_dir=cache_dir,
-            split=split,
-            streaming=True,
-            trust_remote_code=True,
+        # self.dataset = load_dataset(
+        #     dataset_name,
+        #     dataset_config,
+        #     cache_dir=cache_dir,
+        #     split=split,
+        #     streaming=True,
+        #     trust_remote_code=True,
+        # )
+        self.dataset = load_from_disk(
+            "./cached_datasets/cv17_local"
         )
         self.dataset = self.dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
 
@@ -389,7 +345,6 @@ class VocoderDataset(IterableDataset):
             "text_attention_mask": text_encoding["attention_mask"].squeeze(0),
         }
 
-
 class VocoderDataCollator:
     """Data collator for vocoder training."""
 
@@ -433,10 +388,6 @@ class VocoderDataCollator:
         return batch
 
 
-# ============================================================================
-# Vocoder Reconstruction Callback
-# ============================================================================
-
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
     """Get TensorBoard writer from trainer callbacks."""
     for callback in trainer.callback_handler.callbacks:
@@ -444,7 +395,6 @@ def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
             if callback.tb_writer is not None:
                 return callback.tb_writer
     return None
-
 
 class VocoderReconstructionCallback(TrainerCallback):
     """
@@ -653,6 +603,18 @@ class VocoderReconstructionCallback(TrainerCallback):
                             outputs["mag_loss"].item(),
                             global_step,
                         )
+                    if "mel_recon_loss" in outputs:
+                        writer.add_scalar(
+                            "vocoder_reconstruction/mel_recon_loss",
+                            outputs["mel_recon_loss"].item(),
+                            global_step,
+                        )
+                    if "complex_stft_loss" in outputs:
+                        writer.add_scalar(
+                            "vocoder_reconstruction/complex_stft_loss",
+                            outputs["complex_stft_loss"].item(),
+                            global_step,
+                        )
 
     def _save_audio_to_file(
         self,
@@ -724,16 +686,36 @@ class VocoderReconstructionCallback(TrainerCallback):
         return data
 
 
-# ============================================================================
-# Custom Trainer for Vocoder
-# ============================================================================
+class VocoderGANTrainer(Trainer):
+    """
+    Custom trainer for vocoder with GAN training.
+    Handles alternating generator/discriminator updates.
+    """
 
-class VocoderTrainer(Trainer):
-    """Custom trainer for vocoder that handles the specific loss computation."""
+    def __init__(
+        self,
+        *args,
+        discriminator: Optional[CombinedDiscriminator] = None,
+        discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
+        gan_loss_weight: float = 1.0,
+        feature_matching_loss_weight: float = 2.0,
+        discriminator_update_frequency: int = 1,
+        gan_start_step: int = 0,
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.discriminator = discriminator
+        self.discriminator_optimizer = discriminator_optimizer
+        self.gan_loss_weight = gan_loss_weight
+        self.feature_matching_loss_weight = feature_matching_loss_weight
+        self.discriminator_update_frequency = discriminator_update_frequency
+        self.gan_start_step = gan_start_step
+        self.writer = None
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self._ensure_tensorboard_writer()
 
+        # Forward pass through generator (vocoder)
         outputs = model(
             mel_spec=inputs["mel_spec"],
             text_input_ids=inputs["text_input_ids"],
@@ -741,27 +723,148 @@ class VocoderTrainer(Trainer):
             waveform_labels=inputs["waveform_labels"],
         )
 
-        loss = outputs["loss"]
+        # Get reconstruction losses from model
+        recon_loss = outputs["loss"]
+        pred_waveform = outputs["pred_waveform"]
+        waveform_labels = inputs["waveform_labels"]
+
+        # Ensure waveform_labels has correct shape
+        if waveform_labels.dim() == 1:
+            waveform_labels = waveform_labels.unsqueeze(0)
+
+        # Align lengths
+        min_len = min(pred_waveform.shape[-1], waveform_labels.shape[-1])
+        pred_waveform_aligned = pred_waveform[..., :min_len]
+        waveform_labels_aligned = waveform_labels[..., :min_len]
+
+        # GAN losses (only after gan_start_step)
+        gan_enabled = (
+            self.discriminator is not None and
+            self.state.global_step >= self.gan_start_step
+        )
+
+        g_loss_gan = torch.tensor(0.0, device=pred_waveform.device)
+        g_loss_fm = torch.tensor(0.0, device=pred_waveform.device)
+        d_loss = torch.tensor(0.0, device=pred_waveform.device)
+
+        if gan_enabled:
+            # ============ Discriminator Update ============
+            if self.state.global_step % self.discriminator_update_frequency == 0:
+                self.discriminator.train()
+
+                # Detach generator outputs for discriminator update
+                with torch.no_grad():
+                    pred_waveform_detached = pred_waveform_aligned.detach()
+
+                # Get discriminator outputs for real and fake
+                # autocast needs to be used here
+                device_type = pred_waveform.device.type
+                dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
+                with autocast(device_type, dtype=dtype, enabled=self.args.fp16 or self.args.bf16):
+                    disc_real = self.discriminator(waveform_labels_aligned)
+                    disc_fake = self.discriminator(pred_waveform_detached)
+
+                d_losses = compute_discriminator_losses(disc_real, disc_fake)
+
+                for o, output in enumerate(disc_real["mpd"][0]):
+                    self._log_scalar(f"train/disc_real_mpd/{o}/avg", output.mean())
+
+                for o, output in enumerate(disc_fake["mpd"][0]):
+                    self._log_scalar(f"train/disc_fake_mpd/{o}/avg", output.mean())
+
+                for o, output in enumerate(disc_real["msd"][0]):
+                    self._log_scalar(f"train/disc_real_msd/{o}/avg", output.mean())
+
+                for o, output in enumerate(disc_fake["msd"][0]):
+                    self._log_scalar(f"train/disc_fake_msd/{o}/avg", output.mean())
+
+                for o, output in enumerate(disc_real["mrsd"][0]):
+                    self._log_scalar(f"train/disc_real_mrsd/{o}/avg", output.mean())
+
+                for o, output in enumerate(disc_fake["mrsd"][0]):
+                    self._log_scalar(f"train/disc_fake_mrsd/{o}/avg", output.mean())
+
+                # Compute discriminator losses
+                d_loss_mpd = d_losses["d_loss_mpd"]
+                self._log_scalar("train/d_loss_mpd", d_loss_mpd)
+                d_loss_msd = d_losses["d_loss_msd"]
+                self._log_scalar("train/d_loss_msd", d_loss_msd)
+                d_loss_mrsd = d_losses["d_loss_mrsd"]
+                self._log_scalar("train/d_loss_mrsd", d_loss_mrsd)
+                d_loss = d_losses["d_loss_total"]
+                self._log_scalar("train/d_loss_total", d_loss)
+
+                # d_real_mean = d_metrics["d_real_mean"]
+                # self._log_scalar("train/d_real_mean", d_real_mean)
+                # d_fake_mean = d_metrics["d_fake_mean"]
+                # self._log_scalar("train/d_fake_mean", d_fake_mean)
+
+                # Update discriminator
+                if self.discriminator_optimizer is not None:
+                    self.discriminator_optimizer.zero_grad()
+                    d_loss.backward()
+            # ============ Generator GAN Loss ============
+            # Get discriminator outputs for fake (for generator update)
+            device_type = pred_waveform.device.type
+            dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
+            with autocast(device_type, dtype=dtype, enabled=self.args.fp16 or self.args.bf16):
+                disc_real = self.discriminator(waveform_labels_aligned.detach())
+                disc_fake = self.discriminator(pred_waveform_aligned)
+
+            g_losses = compute_generator_losses(disc_real, disc_fake)
+
+            # Generator adversarial loss
+            g_adv_mpd = g_losses["g_adv_mpd"]
+            self._log_scalar("train/g_adv_mpd", g_adv_mpd)
+            g_fm_mpd = g_losses["g_fm_mpd"]
+            self._log_scalar("train/g_fm_mpd", g_fm_mpd)
+            g_adv_msd = g_losses["g_adv_msd"]
+            self._log_scalar("train/g_adv_msd", g_adv_msd)
+            g_fm_msd = g_losses["g_fm_msd"]
+            self._log_scalar("train/g_fm_msd", g_fm_msd)
+            g_adv_mrsd = g_losses["g_adv_mrsd"]
+            self._log_scalar("train/g_adv_mrsd", g_adv_mrsd)
+            g_fm_mrsd = g_losses["g_fm_mrsd"]
+            self._log_scalar("train/g_fm_mrsd", g_fm_mrsd)
+
+            g_loss_adv = g_losses["g_adv_total"]
+            self._log_scalar("train/g_adv_total", g_loss_adv)
+            g_loss_fm = g_losses["g_fm_total"]
+            self._log_scalar("train/g_fm_total", g_loss_fm)
+            g_loss_gan = g_losses["g_loss_total"]
+            self._log_scalar("train/g_loss_total", g_loss_gan)
+
+        # Total generator loss
+        total_loss = recon_loss + self.gan_loss_weight * g_loss_gan + self.feature_matching_loss_weight * g_loss_fm
 
         # Log individual losses
-        if self.state.global_step % self.args.logging_steps == 0 and hasattr(self, "writer") and self.writer is not None:
+        if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
             self._log_scalar(f"{prefix}waveform_l1", outputs.get("waveform_l1", 0))
             self._log_scalar(f"{prefix}sc_loss", outputs.get("sc_loss", 0))
             self._log_scalar(f"{prefix}mag_loss", outputs.get("mag_loss", 0))
             self._log_scalar(f"{prefix}mel_recon_loss", outputs.get("mel_recon_loss", 0))
+            self._log_scalar(f"{prefix}complex_stft_loss", outputs.get("complex_stft_loss", 0))
+            self._log_scalar(f"{prefix}recon_loss", recon_loss)
+            self._log_scalar(f"{prefix}total_loss", total_loss)
 
-        return (loss, outputs) if return_outputs else loss
+        # outputs["loss"] = total_loss
+        # outputs["g_loss_gan"] = g_loss_gan
+        # outputs["g_loss_adv"] = g_loss_adv
+        # outputs["g_loss_fm"] = g_loss_fm
+        # outputs["d_loss"] = d_loss
+
+        return (total_loss, outputs) if return_outputs else total_loss
 
     def _log_scalar(self, tag, value):
-        if hasattr(self, "writer") and self.writer is not None:
+        if self.writer is not None:
             if isinstance(value, torch.Tensor):
                 value = value.item()
             if value != 0.0:
                 self.writer.add_scalar(tag, value, self.state.global_step)
 
     def _ensure_tensorboard_writer(self):
-        if hasattr(self, "writer"):
+        if hasattr(self, "writer") and self.writer is not None:
             return
 
         for callback in self.callback_handler.callbacks:
@@ -771,10 +874,52 @@ class VocoderTrainer(Trainer):
 
         self.writer = None
 
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        """Save both generator and discriminator."""
+        super().save_model(output_dir, _internal_call)
 
-# ============================================================================
-# Main Training Script
-# ============================================================================
+        if output_dir is None:
+            output_dir = self.args.output_dir
+
+        gan_enabled = (
+            self.discriminator is not None and
+            self.state.global_step >= self.gan_start_step
+        )
+
+        # Save discriminator
+        if gan_enabled:
+            discriminator_path = os.path.join(output_dir, "discriminator.pt")
+            torch.save({
+                "discriminator_state_dict": self.discriminator.state_dict(),
+                "discriminator_optimizer_state_dict": (
+                    self.discriminator_optimizer.state_dict()
+                    if self.discriminator_optimizer is not None else None
+                ),
+            }, discriminator_path)
+            print(f"Discriminator saved to {discriminator_path}")
+
+
+def load_discriminator(
+    run_dir: str,
+    discriminator: CombinedDiscriminator,
+    discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[CombinedDiscriminator, Optional[torch.optim.Optimizer], bool]:
+    """Load discriminator from checkpoint if it exists."""
+    discriminator_path = os.path.join(run_dir, "discriminator.pt")
+
+    if os.path.exists(discriminator_path):
+        print(f"Loading discriminator from {discriminator_path}")
+        checkpoint = torch.load(discriminator_path, map_location=device)
+        discriminator.load_state_dict(checkpoint["discriminator_state_dict"])
+
+        if discriminator_optimizer is not None and checkpoint.get("discriminator_optimizer_state_dict"):
+            discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer_state_dict"])
+
+        return discriminator, discriminator_optimizer, True
+
+    return discriminator, discriminator_optimizer, False
+
 
 def main():
     args, unk = megatransformer_utils.parse_args()
@@ -784,15 +929,63 @@ def main():
     if args.config not in model_config_lookup:
         raise ValueError(f"Unknown vocoder config: {args.config}. Available: {list(model_config_lookup.keys())}")
 
+    # Parse extra arguments
     unk_dict = {}
     for i in range(0, len(unk), 2):
-        unk_dict[unk[i]] = unk[i+1]
+        unk_dict[unk[i].lstrip('-')] = unk[i+1]
 
-    model = model_config_lookup[args.config](unk_dict.get("sc_loss_weight", 1.0),
-                                            unk_dict.get("mag_loss_weight", 3.0),
-                                            unk_dict.get("waveform_l1_loss_weight", 0.1),
-                                            unk_dict.get("mel_recon_loss_weight", 1.0))
+    # Loss weights
+    sc_loss_weight = float(unk_dict.get("sc_loss_weight", 1.0))
+    mag_loss_weight = float(unk_dict.get("mag_loss_weight", 3.0))
+    waveform_l1_loss_weight = float(unk_dict.get("waveform_l1_loss_weight", 0.1))
+    mel_recon_loss_weight = float(unk_dict.get("mel_recon_loss_weight", 1.0))
+    complex_stft_loss_weight = float(unk_dict.get("complex_stft_loss_weight", 1.0))
+
+    # GAN training settings
+    use_gan = unk_dict.get("use_gan", "false").lower() == "true"
+    gan_loss_weight = float(unk_dict.get("gan_loss_weight", 1.0))
+    feature_matching_loss_weight = float(unk_dict.get("feature_matching_loss_weight", 2.0))
+    discriminator_lr = float(unk_dict.get("discriminator_lr", 2e-4))
+    gan_start_step = int(unk_dict.get("gan_start_step", 0))
+
+    model = model_config_lookup[args.config](
+        sc_loss_weight,
+        mag_loss_weight,
+        waveform_l1_loss_weight,
+        mel_recon_loss_weight,
+        complex_stft_loss_weight,
+    )
     model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+
+    # Determine device for discriminator
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.local_rank}" if args.local_rank >= 0 else "cuda")
+    else:
+        device = torch.device("cpu")
+
+    # Create discriminator if GAN training is enabled
+    discriminator = None
+    discriminator_optimizer = None
+    if use_gan:
+        discriminator = CombinedDiscriminator(
+            mpd_periods=[2, 3, 5, 7],
+            n_msd_scales=2,
+            mrsd_resolutions=[
+                (2048, 512, 2048),
+                (512, 128, 512),
+            ]
+        ).to(device)
+        discriminator_optimizer = torch.optim.AdamW(
+            discriminator.parameters(),
+            lr=discriminator_lr,
+            betas=(0.8, 0.99),
+        )
+        # Try to load existing discriminator checkpoint
+        discriminator, discriminator_optimizer, disc_loaded = load_discriminator(
+            run_dir, discriminator, discriminator_optimizer, device
+        )
+        if disc_loaded:
+            print("Loaded discriminator from checkpoint")
 
     if args.local_rank == 0 or not args.use_deepspeed:
         print(f"Model structure: {model}")
@@ -801,6 +994,15 @@ def main():
         print(f"  Vocoder parameters: {sum(p.numel() for p in model.vocoder.parameters()):,}")
         print(f"  Condition projection parameters: {sum(p.numel() for p in model.condition_proj.parameters()):,}")
         print(f"  T5 parameters (frozen): {sum(p.numel() for p in model.t5_encoder.parameters()):,}")
+        if use_gan and discriminator is not None:
+            print(f"Discriminator structure: {discriminator}")
+            print(f"  Discriminator parameters: {sum(p.numel() for p in discriminator.parameters()):,}")
+        print(f"GAN training: {'enabled' if use_gan else 'disabled'}")
+        if use_gan:
+            print(f"  GAN loss weight: {gan_loss_weight}")
+            print(f"  Feature matching loss weight: {feature_matching_loss_weight}")
+            print(f"  Discriminator LR: {discriminator_lr}")
+            print(f"  GAN start step: {gan_start_step}")
 
     model = megatransformer_utils.setup_int8_training(args, model)
 
@@ -873,13 +1075,18 @@ def main():
         n_mels=model.config.audio_n_mels,
     )
 
-    # Create trainer
-    trainer = VocoderTrainer(
+    # Create trainer (with or without GAN)
+    trainer = VocoderGANTrainer(
         model=model,
         args=training_args,
         data_collator=data_collator,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        discriminator=discriminator if use_gan else None,
+        discriminator_optimizer=discriminator_optimizer if use_gan else None,
+        gan_loss_weight=gan_loss_weight,
+        feature_matching_loss_weight=feature_matching_loss_weight,
+        gan_start_step=gan_start_step,
     )
 
     # Add reconstruction callback for monitoring training progress

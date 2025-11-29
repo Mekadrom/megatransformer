@@ -1,34 +1,8 @@
 from model import megatransformer_modules
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-
 import megatransformer_utils
 import torch
 import torch.nn as nn
-import transformers
 
-
-class PreTrainedAudioFeatureExtractorWrapper(nn.Module):
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
-        super().__init__()
-        self.config = config
-
-        transformers.models.whisper.feature_extraction_whisper.WhisperFeatureExtractor
-
-        model_id = "openai/whisper-small"
-        self.processor = WhisperProcessor.from_pretrained(model_id)
-        self.model = WhisperForConditionalGeneration.from_pretrained(model_id)
-        self.model.requires_grad = False
-
-    def forward(self, audio_raw_inputs, audio_waveform_labels):
-        # audio_raw_inputs: [batch_size, channels, length]
-        # audio_waveform_labels = audio_waveform_labels.permute(0, 2, 1)  # [batch_size, length, channels]
-        audio_waveform_labels = audio_waveform_labels.squeeze(1)  # [batch_size, length]
-        megatransformer_utils.print_debug_tensor('audio_waveform_labels', audio_waveform_labels)
-        inputs = self.processor(audio_waveform_labels.detach().cpu().numpy(), sampling_rate=self.config.audio_sample_rate, return_tensors="pt")
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
-        outputs = self.model(**inputs)
-        audio_features = outputs.last_hidden_state
-        return audio_features
 
 class AudioConv(nn.Module):
     def __init__(self, input_channels=1, base_channels=32, kernel_sizes=[3, 3, 3, 3, 3], dropout=0.1, activation="gelu"):
