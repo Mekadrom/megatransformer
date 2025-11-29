@@ -1,6 +1,6 @@
 from torch import nn
 
-from model import megatransformer_modules
+from model import activations
 
 import megatransformer_utils
 
@@ -12,8 +12,8 @@ class SimpleFFN(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         activation_type = megatransformer_utils.get_activation_type(config.intermediate_activation)
-        if activation_type == megatransformer_modules.SwiGLU:
-            self.activation = megatransformer_modules.SwiGLU(config.intermediate_size)
+        if activation_type == activations.SwiGLU:
+            self.activation = activations.SwiGLU(config.intermediate_size)
         else:
             self.activation = activation_type()
     

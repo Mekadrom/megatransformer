@@ -1,7 +1,7 @@
 from torch import nn
 from transformers import GenerationMixin, PreTrainedModel, PreTrainedTokenizer, GPT2LMHeadModel, GPT2Config
 
-from model import megatransformer_audio_decoder, megatransformer_recurrent, megatransformer_audio_encoder, megatransformer_diffusion, megatransformer_image_encoder, megatransformer_image_decoder, megatransformer_modules, megatransformer_text_encoder
+from model import megatransformer_audio_decoder, megatransformer_recurrent, megatransformer_audio_encoder, megatransformer_diffusion, megatransformer_image_encoder, megatransformer_image_decoder, megatransformer_modules, megatransformer_text_encoder, norms
 
 import megatransformer_utils
 import torch
@@ -1169,7 +1169,7 @@ def make_audio_decoder(config: megatransformer_utils.MegaTransformerConfig):
         stride=(2, 1),
         self_attn_class=AudioDiffusionSelfAttentionBlock,
         cross_attn_class=AudioDiffusionCrossAttentionBlock,
-        norm_class=megatransformer_modules.RMSNorm,
+        norm_class=norms.RMSNorm,
         in_channels=1,
         model_channels=config.audio_decoder_model_channels,
         out_channels=1,

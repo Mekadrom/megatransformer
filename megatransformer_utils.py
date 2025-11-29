@@ -6,8 +6,6 @@ from transformers import PretrainedConfig
 from transformers import set_seed as hf_set_seed
 from typing import Optional
 
-from model import megatransformer_modules
-
 import argparse
 import deepspeed
 import glob
@@ -18,6 +16,8 @@ import random
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+from model import activations, norms
 
 
 BEGIN_AUDIO_TOKEN = "<|AUDIO|>"
@@ -533,7 +533,7 @@ def get_activation_type(activation_function_name):
     elif activation_function_name == 'sigmoid':
         return nn.Sigmoid
     elif activation_function_name == 'swiglu':
-        return megatransformer_modules.SwiGLU
+        return activations.SwiGLU
     elif activation_function_name == 'none':
         return nn.Identity
     else:
@@ -543,7 +543,7 @@ def create_norm(hidden_size, norm_type, norm_eps):
     if norm_type == "layernorm":
         return nn.LayerNorm(hidden_size, eps=norm_eps)
     elif norm_type == "rmsnorm":
-        return megatransformer_modules.RMSNorm(hidden_size, eps=norm_eps)
+        return norms.RMSNorm(hidden_size, eps=norm_eps)
     else:
         raise Exception(f"Unknown normalization type {norm_type}")
 
@@ -607,7 +607,7 @@ def parse_args():
     argparser.add_argument('--max_position_embeddings', type=int, default=4096, help='Max position embeddings (maximum sequence length)')
     argparser.add_argument('--cpu', action='store_true', help='Use CPU for training')
     argparser.add_argument('--log_level', type=str, default='warning', help='Logging level: debug, info, warning, error, critical')
-    argparser.add_argument('--resume_from_checkpoint', action='store_true', help='Resume from checkpoint')
+    argparser.add_argument('--resume_from_checkpoint', type=str, help='Resume from checkpoint at this path')
     argparser.add_argument('--start_step', type=int, default=0, help='Start step for training')
 
     # efficiency params
@@ -653,6 +653,9 @@ def parse_args():
     argparser.add_argument('--eval_steps', type=int, default=1000, help='Evaluation steps')
     argparser.add_argument('--save_steps', type=int, default=500, help='Save steps')
     argparser.add_argument('--generation_steps', type=int, default=1000, help='Generation steps')
+
+    argparser.add_argument('--adam_beta1', type=float, default=0.9, help='Adam optimizer beta1')
+    argparser.add_argument('--adam_beta2', type=float, default=0.999, help='Adam optimizer beta2')
 
     args, unk = argparser.parse_known_args()
 

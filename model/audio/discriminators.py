@@ -60,7 +60,7 @@ class ScaleDiscriminator(nn.Module):
     """Single scale discriminator operating on raw or downsampled audio."""
     def __init__(self, use_spectral_norm: bool = False):
         super().__init__()
-        norm_f = nn.utils.spectral_norm if use_spectral_norm else nn.utils.weight_norm
+        norm_f = nn.utils.spectral_norm if use_spectral_norm else nn.utils.parametrizations.weight_norm
 
         self.convs = nn.ModuleList([
             norm_f(nn.Conv1d(1, 64, 15, 1, padding=7)),

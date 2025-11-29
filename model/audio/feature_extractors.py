@@ -1,4 +1,4 @@
-from model import megatransformer_modules
+from model import activations
 import megatransformer_utils
 import torch
 import torch.nn as nn
@@ -18,7 +18,7 @@ class AudioConv(nn.Module):
             self.conv_layers.append(nn.Sequential(
                 nn.Conv2d(channels[i], out_channels, kernel_size=kernel_sizes[i], stride=(2, 1), padding=1),
                 nn.BatchNorm2d(out_channels),
-                activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(out_channels),
+                activation_type() if activation_type is not activations.SwiGLU else activations.SwiGLU(out_channels),
                 nn.Dropout2d(dropout)
             ))
 

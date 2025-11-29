@@ -1,4 +1,5 @@
 from datasets import load_dataset, Audio
+import numpy as np
 from transformers import PreTrainedTokenizer
 from typing import Literal, Optional
 
@@ -55,7 +56,10 @@ def extract_mels(y, sr=16000, n_mels=128, n_fft=1024, hop_length=512):
     )
 
     # Convert to log scale (dB)
-    log_mel_spec = librosa.power_to_db(mel_spec)
+    # log_mel_spec = librosa.power_to_db(mel_spec)
+
+    # converts to log scale, with clipping to avoid log(0)
+    log_mel_spec = np.log(np.clip(mel_spec, a_min=1e-5, a_max=None))
 
     mels = torch.tensor(log_mel_spec, dtype=torch.float32)
     

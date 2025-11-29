@@ -1,8 +1,8 @@
 from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
-from typing import Optional, Union
+from typing import Union
 
-from model import megatransformer_modules
+from model import activations
 
 import math
 import megatransformer_utils
@@ -38,8 +38,8 @@ class MegaTransformerSelfAttention(nn.Module):
         self.heads_activation = None
         if config.heads_activation is not None:
             activation_type = megatransformer_utils.get_activation_type(config.heads_activation)
-            if activation_type == megatransformer_modules.SwiGLU:
-                self.heads_activation = megatransformer_modules.SwiGLU(config.d_values)
+            if activation_type == activations.SwiGLU:
+                self.heads_activation = activations.SwiGLU(config.d_values)
             else:
                 self.heads_activation = activation_type()
 

@@ -211,11 +211,12 @@ class MultiResolutionSTFTLoss(nn.Module):
             )
             
             # Spectral convergence loss
-            sc_loss += torch.norm(target_mag - pred_mag, p="fro") / (torch.norm(target_mag, p="fro") + 1e-7)
+            target_norm = torch.norm(target_mag, p="fro").clamp(min=0.1)
+            sc_loss += torch.norm(target_mag - pred_mag, p="fro") / target_norm
             
             # Log magnitude loss
-            log_pred_mag = torch.log(pred_mag.clamp(min=1e-7))
-            log_target_mag = torch.log(target_mag.clamp(min=1e-7))
+            log_pred_mag = torch.log(pred_mag.clamp(min=1e-5))
+            log_target_mag = torch.log(target_mag.clamp(min=1e-5))
             mag_loss += F.l1_loss(log_pred_mag, log_target_mag)
 
             # Complex STFT loss
@@ -298,6 +299,50 @@ class AudioGenerationLoss(nn.Module):
         
         return total_loss, losses
 
+class StableMelSpectrogramLoss(nn.Module):
+    def __init__(self, sample_rate, n_fft, hop_length, n_mels):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        
+        # Pre-compute mel filterbank (no grad needed)
+        mel_fb = torchaudio.functional.melscale_fbanks(
+            n_freqs=n_fft // 2 + 1,
+            f_min=0.0,
+            f_max=sample_rate / 2,
+            n_mels=n_mels,
+            sample_rate=sample_rate,
+        )
+        self.register_buffer('mel_fb', mel_fb)
+        self.register_buffer('window', torch.hann_window(n_fft))
+    
+    def forward(self, pred_waveform, target_log_mel):
+        orig_dtype = pred_waveform.dtype
+        # STFT
+        stft = torch.stft(
+            pred_waveform.float(),
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=self.window,
+            return_complex=True,
+        )
+        
+        # Stable magnitude with epsilon INSIDE sqrt
+        magnitude_sq = (stft.real.pow(2) + stft.imag.pow(2)).to(orig_dtype)
+        magnitude = torch.sqrt(magnitude_sq + 1e-6)  # Epsilon inside sqrt!
+        
+        # Mel filterbank
+        mel = torch.matmul(magnitude.transpose(-1, -2), self.mel_fb).transpose(-1, -2)
+
+        # Log with clamp
+        log_mel = torch.log(mel.clamp(min=1e-5))
+        
+        # Match lengths
+        min_len = min(log_mel.shape[-1], target_log_mel.shape[-1])
+        
+        return F.l1_loss(log_mel[..., :min_len], target_log_mel[..., :min_len])
+
+
 def discriminator_loss(
     disc_real_outputs: list[torch.Tensor],
     disc_fake_outputs: list[torch.Tensor],
@@ -346,16 +391,13 @@ def compute_discriminator_losses(
 ) -> dict[str, torch.Tensor]:
     """Compute discriminator losses for all discriminator types."""
     losses = {}
-    total_loss = 0.0
     
     for key in disc_outputs_real:
         real_outs, _ = disc_outputs_real[key]
         fake_outs, _ = disc_outputs_fake[key]
         loss = discriminator_loss(real_outs, fake_outs)
         losses[f"d_loss_{key}"] = loss
-        total_loss += loss
     
-    losses["d_loss_total"] = total_loss
     return losses
 
 
@@ -366,8 +408,6 @@ def compute_generator_losses(
 ) -> dict[str, torch.Tensor]:
     """Compute generator adversarial and feature matching losses."""
     losses = {}
-    total_adv = 0.0
-    total_fm = 0.0
     
     for key in disc_outputs_fake:
         fake_outs, fake_feats = disc_outputs_fake[key]
@@ -378,10 +418,5 @@ def compute_generator_losses(
         
         losses[f"g_adv_{key}"] = adv_loss
         losses[f"g_fm_{key}"] = fm_loss
-        total_adv += adv_loss
-        total_fm += fm_loss
     
-    losses["g_adv_total"] = total_adv
-    losses["g_fm_total"] = total_fm
-    losses["g_loss_total"] = total_adv + fm_weight * total_fm
     return losses

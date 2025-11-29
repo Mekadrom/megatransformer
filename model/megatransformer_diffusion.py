@@ -2,7 +2,7 @@ from functools import partial
 from torch.amp import autocast
 from typing import Optional, Union
 
-from model import megatransformer_modules
+from model import megatransformer_modules, norms
 
 import math
 import megatransformer_utils
@@ -20,7 +20,7 @@ class Block(nn.Module):
 
         self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.norm = norm(out_channels)
-        self.act = activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(in_channels)
+        self.act = activation_type() if activation_type is not activations.SwiGLU else activations.SwiGLU(in_channels)
 
     def forward(self, x, time_embedding=None):
         # x: [B, C, H, W]
@@ -47,7 +47,7 @@ class ResidualBlock(nn.Module):
 
         if time_embedding_dim is not None:
             self.time_mlp = nn.Sequential(
-                activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(time_embedding_dim),
+                activation_type() if activation_type is not activations.SwiGLU else activations.SwiGLU(time_embedding_dim),
                 nn.Linear(time_embedding_dim, out_channels),
             )
 
@@ -101,7 +101,7 @@ class DownBlock(nn.Module):
         super().__init__()
 
         self.norms = nn.ModuleList([
-            megatransformer_modules.RMSNorm(in_channels if i == 0 else out_channels)
+            norms.RMSNorm(in_channels if i == 0 else out_channels)
             for i in range(num_res_blocks)
         ])
 
@@ -168,7 +168,7 @@ class UpBlock(nn.Module):
         )
 
         self.norms = nn.ModuleList([
-            megatransformer_modules.RMSNorm(in_channels*2 if i == 0 else out_channels)
+            norms.RMSNorm(in_channels*2 if i == 0 else out_channels)
             for i in range(num_res_blocks)
         ])
 
@@ -251,7 +251,7 @@ class UNet(nn.Module):
         self.time_embedding = megatransformer_modules.SinusoidalPositionEmbeddings(model_channels)
         self.time_transform = nn.Sequential(
             nn.Linear(model_channels, time_embedding_dim),
-            activation_type() if activation_type is not megatransformer_modules.SwiGLU else megatransformer_modules.SwiGLU(time_embedding_dim),
+            activation_type() if activation_type is not activations.SwiGLU else activations.SwiGLU(time_embedding_dim),
             nn.Linear(time_embedding_dim, time_embedding_dim),
         )
 
@@ -285,7 +285,7 @@ class UNet(nn.Module):
         self.middle_res_block = ResidualBlock(
             channels[-1], channels[-1], time_embedding_dim, activation, norm_class
         )
-        self.middle_attn_norm = megatransformer_modules.RMSNorm(channels[-1])
+        self.middle_attn_norm = norms.RMSNorm(channels[-1])
         self.middle_attn_block = self_attn_class(
             channels[-1], down_block_self_attn_n_heads, down_block_self_attn_d_queries, down_block_self_attn_d_values, use_flash_attention=down_block_self_attn_use_flash_attention, dropout_p=dropout_p, is_linear_attention=False
         )
