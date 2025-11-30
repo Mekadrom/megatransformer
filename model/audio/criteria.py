@@ -375,14 +375,19 @@ def feature_matching_loss(
     disc_fake_features: list[list[torch.Tensor]],
 ) -> torch.Tensor:
     """
-    Feature matching loss: L1 distance between real and fake intermediate features.
-    This stabilizes GAN training by providing additional gradients to the generator.
+    Feature matching loss with proper normalization.
     """
     loss = 0.0
+    num_layers = 0
+    
     for real_feats, fake_feats in zip(disc_real_features, disc_fake_features):
         for real_feat, fake_feat in zip(real_feats, fake_feats):
-            loss += F.l1_loss(fake_feat, real_feat.detach())
-    return loss
+            # Normalize by feature magnitude to make loss scale-invariant
+            loss += F.l1_loss(fake_feat, real_feat.detach()) / (real_feat.detach().abs().mean() + 1e-7)
+            num_layers += 1
+    
+    # Average over layers
+    return loss / num_layers if num_layers > 0 else loss
 
 
 def compute_discriminator_losses(
