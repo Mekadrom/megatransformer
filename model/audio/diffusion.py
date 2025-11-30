@@ -188,28 +188,39 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             conditioning_enabled=True
         )
 
+        self.mel_min = -11.5  # log(1e-5)
+        self.mel_max = 5.0    # typical max for speech
+
         self.stft_loss = MultiResolutionSTFTLoss()
     
+    def normalize(self, x_0):
+        return 2 * (x_0 - self.mel_min) / (self.mel_max - self.mel_min) - 1
+    
+    def unnormalize(self, x):
+        return (x + 1) / 2 * (self.mel_max - self.mel_min) + self.mel_min
+
     def p_losses(self, x_start: torch.Tensor, t: torch.Tensor, noise=None, condition=None):
-        b, c, h, w = x_start.shape
         if noise is None:
             noise = torch.randn_like(x_start)
 
         # noise sample
 
-        x_start = self.q_sample(x_start=x_start, t=t, noise=noise)
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        model_out = self.unet(x_start, t, condition)
+        model_out = self.unet(x_noisy, t, condition)
 
         target = noise
 
-        loss = F.l1_loss(model_out, target, reduction='none')
+        loss = F.mse_loss(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b', 'mean')
 
         loss = loss * self._extract(self.loss_weight, t, loss.shape)
         return model_out, loss.mean()
 
     def forward(self, x_0, condition=None, waveform_labels=None):
+        if x_0.dim() == 3:
+            x_0 = x_0.unsqueeze(1)
+
         if len(x_0.shape) == 5:
             # squish batch and example dimensions if necessary
             b, e, c, h, w = x_0.shape
@@ -224,10 +235,10 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
                 *_, c, h, w = condition.shape
                 condition = condition.view(-1, c, h, w)
 
-        t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device= x_0.device).long()
+        t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device = x_0.device).long()
 
         if self.normalize:
-            x_0 = self.normalize_to_neg_one_to_one(x_0)
+            x_0 = self.normalize(x_0)
 
         mel_l1_outputs, mel_l1_loss = self.p_losses(x_0, t, condition=condition)
 
@@ -243,7 +254,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
 
         if waveform_labels is not None:
             # do vocoder forward and loss using waveform labels and clean mel specs (x_0)
-            pred_waveform = self.vocoder(x_0, condition=condition)
+            pred_waveform = self.vocoder(mel_l1_outputs, condition=condition)
 
             pred_waveform = F.pad(pred_waveform, (0, waveform_labels.shape[-1] - pred_waveform.shape[-1]), value=0)
 
@@ -260,7 +271,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
 
     @torch.no_grad()
     def sample(self, device, batch_size: int, condition: Optional[torch.Tensor]=None, return_intermediate: bool=False, override_ddim_sampling_steps: Optional[int]=None, generator=None, **kwargs) -> torch.Tensor:
-        x = torch.randn(batch_size, 1, self.config.audio_max_frames, self.config.audio_n_mels, device=device, generator=generator)
+        x = torch.randn(batch_size, 1, self.config.audio_n_mels, self.config.audio_max_frames, device=device, generator=generator)
 
         if self.is_ddim_sampling or override_ddim_sampling_steps is not None:
             x = self.ddim_sample_loop(x, condition=condition, return_intermediate=return_intermediate, override_sampling_steps=override_ddim_sampling_steps)
@@ -273,6 +284,6 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             audio = x
 
         if self.normalize:
-            audio = self.unnormalize_to_zero_to_one(audio)
+            audio = self.unnormalize(audio)
 
         return (audio, *x[1:]) if return_intermediate else audio

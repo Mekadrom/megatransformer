@@ -823,6 +823,8 @@ def transformer_weight_init():
     def init_weights(module):
         if isinstance(module, nn.Linear):
             nn.init.xavier_normal_(module.weight, gain=0.02)
+            if hasattr(module, 'bias') and module.bias is not None:
+                module.bias.data.zero_()
     return init_weights
 
 def conv2d_weight_init():

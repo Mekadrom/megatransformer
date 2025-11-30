@@ -2,7 +2,7 @@ from functools import partial
 from torch.amp import autocast
 from typing import Optional, Union
 
-from model import megatransformer_modules, norms
+from model import activations, megatransformer_modules, norms
 
 import math
 import megatransformer_utils
@@ -511,10 +511,10 @@ class GaussianDiffusion(nn.Module):
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
         return torch.clip(betas, 0, 0.999)
 
-    def normalize_to_neg_one_to_one(self, x_0):
+    def normalize(self, x_0):
         return x_0 * 2 - 1
 
-    def unnormalize_to_zero_to_one(self, x):
+    def unnormalize(self, x):
         return (x + 1) * 0.5
 
     def _extract(self, a: torch.Tensor, t: torch.Tensor, shape: tuple) -> torch.Tensor:
@@ -638,7 +638,7 @@ class GaussianDiffusion(nn.Module):
             img = x
 
         if self.normalize:
-            img = self.unnormalize_to_zero_to_one(img)
+            img = self.unnormalize(img)
 
         return (img, *x[1:]) if return_intermediate else img
     
@@ -653,7 +653,6 @@ class GaussianDiffusion(nn.Module):
         )
 
     def p_losses(self, x_start: torch.Tensor, t: torch.Tensor, noise=None, condition=None):
-        b, c, h, w = x_start.shape
         if noise is None:
             noise = torch.randn_like(x_start)
 
@@ -691,7 +690,7 @@ class GaussianDiffusion(nn.Module):
         t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device= x_0.device).long()
 
         if self.normalize:
-            x_0 = self.normalize_to_neg_one_to_one(x_0)
+            x_0 = self.normalize(x_0)
 
         model_output, mse_loss = self.p_losses(x_0, t, condition=condition)
         if e is not None:

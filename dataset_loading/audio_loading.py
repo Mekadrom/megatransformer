@@ -1,5 +1,6 @@
 from datasets import load_dataset, Audio
 import numpy as np
+import torchaudio
 from transformers import PreTrainedTokenizer
 from typing import Literal, Optional
 
@@ -64,6 +65,14 @@ def extract_mels(y, sr=16000, n_mels=128, n_fft=1024, hop_length=512):
     mels = torch.tensor(log_mel_spec, dtype=torch.float32)
     
     return mels
+
+def remove_mains_hum(waveform, sample_rate, frequencies=[60, 120, 180, 240]):
+    """Remove mains hum and harmonics."""
+    for freq in frequencies:
+        waveform = torchaudio.functional.bandreject_biquad(
+            waveform, sample_rate, central_freq=freq, Q=30.0
+        )
+    return waveform
 
 def load_audio_dataset(
     dataset_name,
@@ -143,6 +152,10 @@ def load_audio_dataset(
                 n_fft=n_fft,
                 hop_length=hop_length,
             )
+
+            # filter mains hum
+            waveforms = remove_mains_hum(waveforms.unsqueeze(0), sample_rate).squeeze(0)
+
             if audio_mels.shape[-1] > max_frames:
                 continue
             all_audio_raw_inputs.append(audio_mels)

@@ -316,6 +316,14 @@ class StableMelSpectrogramLoss(nn.Module):
         self.register_buffer('mel_fb', mel_fb)
         self.register_buffer('window', torch.hann_window(n_fft))
     
+    def weighted_mel_loss(self, pred_mel, target_mel, low_freq_weight=2.0, cutoff_bin=20):
+        """Weight low frequency bins more heavily."""
+        weights = torch.ones(pred_mel.shape[-2], device=pred_mel.device)
+        weights[:cutoff_bin] = low_freq_weight
+        weights = weights.view(1, -1, 1)  # (1, n_mels, 1)
+        
+        return (F.l1_loss(pred_mel, target_mel, reduction='none') * weights).mean()
+
     def forward(self, pred_waveform, target_log_mel):
         orig_dtype = pred_waveform.dtype
         # STFT
@@ -329,18 +337,17 @@ class StableMelSpectrogramLoss(nn.Module):
         
         # Stable magnitude with epsilon INSIDE sqrt
         magnitude_sq = (stft.real.pow(2) + stft.imag.pow(2)).to(orig_dtype)
-        magnitude = torch.sqrt(magnitude_sq + 1e-6)  # Epsilon inside sqrt!
         
         # Mel filterbank
-        mel = torch.matmul(magnitude.transpose(-1, -2), self.mel_fb).transpose(-1, -2)
+        mel_power = torch.matmul(magnitude_sq.transpose(-1, -2), self.mel_fb).transpose(-1, -2)
 
         # Log with clamp
-        log_mel = torch.log(mel.clamp(min=1e-5))
+        log_mel = torch.log(mel_power.clamp(min=1e-5))
         
         # Match lengths
         min_len = min(log_mel.shape[-1], target_log_mel.shape[-1])
         
-        return F.l1_loss(log_mel[..., :min_len], target_log_mel[..., :min_len])
+        return self.weighted_mel_loss(log_mel[..., :min_len], target_log_mel[..., :min_len])
 
 
 def discriminator_loss(

@@ -491,27 +491,28 @@ class VocoderGANTrainer(Trainer):
                 
                 d_loss = self.mpd_loss_weight * d_loss_mpd + self.msd_loss_weight * d_loss_msd + self.mrsd_loss_weight * d_loss_mrsd
 
-                for o, output in enumerate(disc_real["mpd"][0]):
-                    self._log_scalar(f"train/disc_real_mpd/{o}/avg", output.mean())
+                if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
+                    for o, output in enumerate(disc_real["mpd"][0]):
+                        self._log_scalar(f"train/disc_real_mpd/{o}/avg", output.mean())
 
-                for o, output in enumerate(disc_fake["mpd"][0]):
-                    self._log_scalar(f"train/disc_fake_mpd/{o}/avg", output.mean())
+                    for o, output in enumerate(disc_fake["mpd"][0]):
+                        self._log_scalar(f"train/disc_fake_mpd/{o}/avg", output.mean())
 
-                for o, output in enumerate(disc_real["msd"][0]):
-                    self._log_scalar(f"train/disc_real_msd/{o}/avg", output.mean())
+                    for o, output in enumerate(disc_real["msd"][0]):
+                        self._log_scalar(f"train/disc_real_msd/{o}/avg", output.mean())
 
-                for o, output in enumerate(disc_fake["msd"][0]):
-                    self._log_scalar(f"train/disc_fake_msd/{o}/avg", output.mean())
+                    for o, output in enumerate(disc_fake["msd"][0]):
+                        self._log_scalar(f"train/disc_fake_msd/{o}/avg", output.mean())
 
-                for o, output in enumerate(disc_real["mrsd"][0]):
-                    self._log_scalar(f"train/disc_real_mrsd/{o}/avg", output.mean())
+                    for o, output in enumerate(disc_real["mrsd"][0]):
+                        self._log_scalar(f"train/disc_real_mrsd/{o}/avg", output.mean())
 
-                for o, output in enumerate(disc_fake["mrsd"][0]):
-                    self._log_scalar(f"train/disc_fake_mrsd/{o}/avg", output.mean())
-                    self._log_scalar("train/d_loss_mpd", d_loss_mpd)
-                    self._log_scalar("train/d_loss_msd", d_loss_msd)
-                    self._log_scalar("train/d_loss_mrsd", d_loss_mrsd)
-                    self._log_scalar("train/d_loss_total", d_loss)
+                    for o, output in enumerate(disc_fake["mrsd"][0]):
+                        self._log_scalar(f"train/disc_fake_mrsd/{o}/avg", output.mean())
+                        self._log_scalar("train/d_loss_mpd", d_loss_mpd)
+                        self._log_scalar("train/d_loss_msd", d_loss_msd)
+                        self._log_scalar("train/d_loss_mrsd", d_loss_mrsd)
+                        self._log_scalar("train/d_loss_total", d_loss)
 
                 # Update discriminator
                 if self.discriminator_optimizer is not None:
@@ -541,27 +542,29 @@ class VocoderGANTrainer(Trainer):
             g_loss_fm = self.mpd_fm_loss_weight * g_fm_mpd + self.msd_fm_loss_weight * g_fm_msd + self.mrsd_fm_loss_weight * g_fm_mrsd
             g_loss_gan = self.gan_adv_loss_weight * g_loss_adv + self.gan_feature_matching_loss_weight * g_loss_fm
 
-            self._log_scalar("train/g_adv_mpd", g_adv_mpd)
-            self._log_scalar("train/g_fm_mpd", g_fm_mpd)
-            self._log_scalar("train/g_adv_msd", g_adv_msd)
-            self._log_scalar("train/g_fm_msd", g_fm_msd)
-            self._log_scalar("train/g_adv_mrsd", g_adv_mrsd)
-            self._log_scalar("train/g_fm_mrsd", g_fm_mrsd)
-            self._log_scalar("train/g_adv_total", g_loss_adv)
-            self._log_scalar("train/g_fm_total", g_loss_fm)
-            self._log_scalar("train/g_loss_total", g_loss_gan)
+            if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
+                self._log_scalar("train/g_adv_mpd", g_adv_mpd)
+                self._log_scalar("train/g_fm_mpd", g_fm_mpd)
+                self._log_scalar("train/g_adv_msd", g_adv_msd)
+                self._log_scalar("train/g_fm_msd", g_fm_msd)
+                self._log_scalar("train/g_adv_mrsd", g_adv_mrsd)
+                self._log_scalar("train/g_fm_mrsd", g_fm_mrsd)
+                self._log_scalar("train/g_adv_total", g_loss_adv)
+                self._log_scalar("train/g_fm_total", g_loss_fm)
+                self._log_scalar("train/g_loss_total", g_loss_gan)
         # Total generator loss
         total_loss = recon_loss + g_loss_gan
 
         # Log individual losses
-        prefix = "train/" if model.training else "eval/"
-        self._log_scalar(f"{prefix}waveform_l1", outputs.get("waveform_l1", 0))
-        self._log_scalar(f"{prefix}sc_loss", outputs.get("sc_loss", 0))
-        self._log_scalar(f"{prefix}mag_loss", outputs.get("mag_loss", 0))
-        self._log_scalar(f"{prefix}mel_recon_loss", outputs.get("mel_recon_loss", 0))
-        self._log_scalar(f"{prefix}complex_stft_loss", outputs.get("complex_stft_loss", 0))
-        self._log_scalar(f"{prefix}recon_loss", recon_loss)
-        self._log_scalar(f"{prefix}total_loss", total_loss)
+        if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
+            prefix = "train/" if model.training else "eval/"
+            self._log_scalar(f"{prefix}waveform_l1", outputs.get("waveform_l1", 0))
+            self._log_scalar(f"{prefix}sc_loss", outputs.get("sc_loss", 0))
+            self._log_scalar(f"{prefix}mag_loss", outputs.get("mag_loss", 0))
+            self._log_scalar(f"{prefix}mel_recon_loss", outputs.get("mel_recon_loss", 0))
+            self._log_scalar(f"{prefix}complex_stft_loss", outputs.get("complex_stft_loss", 0))
+            self._log_scalar(f"{prefix}recon_loss", recon_loss)
+            self._log_scalar(f"{prefix}total_loss", total_loss)
 
         return (total_loss, outputs) if return_outputs else total_loss
 
@@ -597,6 +600,7 @@ class VocoderGANTrainer(Trainer):
 
         # Save discriminator
         if gan_enabled:
+            os.makedirs(output_dir, exist_ok=True)
             discriminator_path = os.path.join(output_dir, "discriminator.pt")
             torch.save({
                 "discriminator_state_dict": self.discriminator.state_dict(),
