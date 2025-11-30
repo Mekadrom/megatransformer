@@ -210,7 +210,7 @@ class MultiResolutionSpectrogramDiscriminator(nn.Module):
             (2048, 512, 2048),   # Low frequency detail, coarse time
             (512, 128, 512),     # High frequency detail, fine time
         ],
-        channels: list[int] = [32, 64, 128, 256, 512],
+        channels: list[int] = [16, 32, 64, 128, 256],
     ):
         super().__init__()
         self.discriminators = nn.ModuleList([

@@ -182,10 +182,8 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         self.vocoder = AudioVocoder(
             hidden_channels=self.config.audio_vocoder_hidden_channels,
             in_channels=self.config.audio_n_mels,
-            conditioning_channels=self.config.hidden_size,
             upsample_factors=self.config.audio_vocoder_upsample_factors,
             n_residual_layers=self.config.audio_vocoder_n_residual_layers,
-            conditioning_enabled=True
         )
 
         self.mel_min = -11.5  # log(1e-5)
