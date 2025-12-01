@@ -1,3 +1,4 @@
+import math
 from model import activations, megatransformer_attn, megatransformer_modules
 import megatransformer_utils
 import torch
@@ -118,7 +119,6 @@ class ImprovedAudioFeatureExtractor(nn.Module):
         # --- Patch embedding (AST-style) instead of sequential conv ---
         # Treats mel spectrogram more like ViT treats images
         self.patch_size = (16, 4)  # (freq_bins, time_frames)
-        patch_dim = self.patch_size[0] * self.patch_size[1]
         
         self.patch_embed = nn.Sequential(
             nn.Conv2d(1, config.hidden_size, 
