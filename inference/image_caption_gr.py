@@ -1,11 +1,12 @@
-from io import BytesIO
-from PIL import Image
-from transformers import Blip2Processor, Blip2ForConditionalGeneration
-
 import gradio as gr
 import os
 import requests
 import torch
+
+from io import BytesIO
+from PIL import Image
+from transformers import Blip2Processor, Blip2ForConditionalGeneration
+
 
 model_id = "Salesforce/blip2-opt-2.7b"  # ViT-G/14 variant
 processor = Blip2Processor.from_pretrained(model_id)
@@ -13,6 +14,7 @@ model = Blip2ForConditionalGeneration.from_pretrained(model_id, torch_dtype=torc
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = model.to(device)
+
 
 def caption_image(image, prompt="", max_length=30, num_beams=5):
     """

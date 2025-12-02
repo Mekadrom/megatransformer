@@ -2,6 +2,8 @@ from dataset_loading import audio_loading, generic_text, image_loading, wikitext
 from transformers import PreTrainedTokenizer
 from typing import Literal
 
+from model.audio.shared_window_buffer import SharedWindowBuffer
+
 
 text_train_dataset_name = "gair-prox/FineWeb-pro"
 text_train_dataset_config_name = None
@@ -80,13 +82,14 @@ def load_text_only_dataset(tokenizer, max_position_embeddings, dataset_name, dat
         )
     return dataset
 
-def load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, max_frames, tokenizer, dataset_name, dataset_config_name, dataset_split, streaming=False, cache_dir=None):
+def load_audio_dataset(shared_window_buffer, sample_rate, n_mels, n_fft, hop_length, max_frames, tokenizer, dataset_name, dataset_config_name, dataset_split, streaming=False, cache_dir=None):
     if "mozilla" in dataset_name.lower() or "common_voice" in dataset_name.lower() or "voxpopuli" in dataset_name.lower():
         dataset = audio_loading.load_audio_dataset(
             dataset_name,
             dataset_config_name,
             dataset_split,
             tokenizer,
+            shared_window_buffer=shared_window_buffer,
             sample_rate=sample_rate,
             n_mels=n_mels,
             n_fft=n_fft,
@@ -129,6 +132,7 @@ def load_dataset(
     image_size: int = None,
     streaming: bool = False,
     cache_dir: str = None,
+    shared_window_buffer: SharedWindowBuffer = None,
 ):
     lookup_prefix = "" if split == "train" else "validation_"
 
@@ -140,7 +144,8 @@ def load_dataset(
     if dataset_type == "text":
         return load_text_only_dataset(tokenizer, max_position_embeddings, dataset_name, dataset_config_name, split, streaming=streaming, cache_dir=cache_dir)
     elif dataset_type == "audio":
-        return load_audio_dataset(sample_rate, n_mels, n_fft, hop_length, audio_max_frames, tokenizer, dataset_name, dataset_config_name, split, streaming=streaming, cache_dir=cache_dir)
+        assert shared_window_buffer is not None, "shared_window_buffer must be provided for audio dataset loading"
+        return load_audio_dataset(shared_window_buffer, sample_rate, n_mels, n_fft, hop_length, audio_max_frames, tokenizer, dataset_name, dataset_config_name, split, streaming=streaming, cache_dir=cache_dir)
     elif dataset_type == "image":
         return load_image_dataset(tokenizer, dataset_name, dataset_config_name, split, image_size, streaming=streaming, cache_dir=cache_dir)
     else:

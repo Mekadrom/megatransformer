@@ -1,16 +1,14 @@
-from einops import reduce
-from model import megatransformer_diffusion
-from typing import Optional
-
-import megatransformer_utils
-
 import math
+import megatransformer_utils
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from einops import reduce
+from model import megatransformer_diffusion
 from model.audio.criteria import MultiResolutionSTFTLoss
 from model.audio.vocoders import AudioVocoder
+from typing import Optional
 
 
 class AudioDiffusionSelfAttentionBlock(nn.Module):
@@ -179,6 +177,9 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        shared_window_buffer = kwargs.get('shared_window_buffer', None)
+        assert shared_window_buffer is not None, "shared_window_buffer must be provided by kwargs to AudioConditionalGaussianDiffusion"
+
         self.vocoder = AudioVocoder(
             hidden_channels=self.config.audio_vocoder_hidden_channels,
             in_channels=self.config.audio_n_mels,
@@ -189,7 +190,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         self.mel_min = -11.5  # log(1e-5)
         self.mel_max = 5.0    # typical max for speech
 
-        self.stft_loss = MultiResolutionSTFTLoss()
+        self.stft_loss = MultiResolutionSTFTLoss(shared_window_buffer)
     
     def normalize(self, x_0):
         return 2 * (x_0 - self.mel_min) / (self.mel_max - self.mel_min) - 1

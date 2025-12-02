@@ -1,5 +1,7 @@
 import os
 
+from model.audio.shared_window_buffer import SharedWindowBuffer
+
 os.environ["DEEPSPEED_UNIT_TEST"] = "1"
 os.environ["NCCL_DEBUG"] = "INFO"
 os.environ["NCCL_IB_DISABLE"] = "1"
@@ -33,6 +35,8 @@ elif 'recurrent' in args.config:
     model_maker = megatransformer_recurrent
 else:
     model_maker = megatransformer_causal
+
+shared_window_buffer = SharedWindowBuffer()
 
 model = model_maker.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
 model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
@@ -176,6 +180,7 @@ train_dataset = multimodal_dataset.MultimodalDataset(
     split="train",
     seed=args.seed,
     max_position_embeddings=args.max_position_embeddings,
+    shared_window_buffer=shared_window_buffer
 )
 
 validation_dataset = multimodal_dataset.MultimodalDataset(

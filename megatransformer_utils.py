@@ -183,12 +183,11 @@ class MegaTransformerConfig(PretrainedConfig):
 
         audio_prelude_config=None,
 
-        audio_n_mels=128,
+        audio_n_mels=80,
         audio_n_fft=1024,
-        audio_hop_length=512,
+        audio_hop_length=256,
         audio_max_duration=10.0, # used for trimming data/skipping examples that are too long
         audio_sample_rate=16000,
-
         image_size=256,
 
         audio_encoder_base_channels=32,
@@ -232,7 +231,7 @@ class MegaTransformerConfig(PretrainedConfig):
         audio_decoder_cross_attn_use_flash_attention=True,
 
         audio_vocoder_hidden_channels=2048,
-        audio_vocoder_upsample_factors=[8, 8, 8],
+        audio_vocoder_upsample_factors=[8, 8, 4],
         audio_vocoder_n_residual_layers=4,
 
         image_coda_config=None,
@@ -335,7 +334,6 @@ class MegaTransformerConfig(PretrainedConfig):
 
         self.audio_n_mels = audio_n_mels
         self.audio_n_fft = audio_n_fft
-        self.audio_n_stft = audio_n_fft // 2 + 1
         self.audio_hop_length = audio_hop_length
         self.audio_max_duration = audio_max_duration
         self.audio_max_waveform_length = round(self.audio_max_duration * audio_sample_rate)

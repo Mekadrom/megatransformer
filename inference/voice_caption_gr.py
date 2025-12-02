@@ -1,9 +1,10 @@
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-
 import gradio as gr
 import numpy as np
 import os
 import torch
+
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
+
 
 processor = WhisperProcessor.from_pretrained("openai/whisper-small")
 model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")

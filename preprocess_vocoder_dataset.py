@@ -6,6 +6,7 @@ from datasets import load_dataset, Audio
 import json
 
 from dataset_loading.audio_loading import extract_waveforms, extract_mels, remove_mains_hum
+from model.audio.shared_window_buffer import SharedWindowBuffer
 
 
 def preprocess_and_cache_dataset(
@@ -14,13 +15,13 @@ def preprocess_and_cache_dataset(
     dataset_config: str = "clean",
     split: str = "train.360",
     sample_rate: int = 16000,
-    n_mels: int = 128,
+    n_mels: int = 80,
     n_fft: int = 1024,
-    hop_length: int = 512,
-    audio_max_frames: int = 312,
-    max_text_length: int = 256,
+    hop_length: int = 256,
+    audio_max_frames: int = 626,
     segment_length_sec: float = 10.0,
     segment_overlap_sec: float = 1.0,
+    mel_window: str = "hann_window",
 ):
     """
     Preprocess dataset and save as individual .pt files.
@@ -47,6 +48,8 @@ def preprocess_and_cache_dataset(
     overlap_samples = int(segment_overlap_sec * sample_rate)
     stride = max_samples - overlap_samples
 
+    shared_window_buffer = SharedWindowBuffer()
+
     # Process each example
     print("Processing examples...")
     for idx in tqdm(range(len(dataset))):
@@ -56,7 +59,7 @@ def preprocess_and_cache_dataset(
             # Extract waveform
             audio = example["audio"]
             waveforms, y, _ = extract_waveforms(audio, sr=sample_rate)
-            
+
             # Skip low-energy audio
             if waveforms.abs().max() < 0.05 or waveforms.std() < 0.02:
                 stats["skipped_silent"] += 1
@@ -78,15 +81,17 @@ def preprocess_and_cache_dataset(
             for seg_idx, segment in enumerate(segments):
                 # Extract mel spectrogram (use filtered waveform)
                 mel_spec = extract_mels(
-                    segment.numpy(),
+                    shared_window_buffer,
+                    segment,
                     sr=sample_rate,
                     n_mels=n_mels,
                     n_fft=n_fft,
                     hop_length=hop_length,
                 )
-                
+
                 # Skip if too long
                 if mel_spec.shape[-1] > audio_max_frames + 1:
+                    print(f"Skipping sample {idx} segment {seg_idx} - too long ({mel_spec.shape[-1]} frames)")
                     stats["skipped_too_long"] += 1
                     continue
             
@@ -94,12 +99,21 @@ def preprocess_and_cache_dataset(
                 if speaker_id is None:
                     stats["no_speaker_id"] += 1
                     speaker_id = -1
+
+                stft = torch.stft(
+                    segment,
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    window=shared_window_buffer.get_window(n_fft, segment.device),
+                    return_complex=True,
+                )
                 
                 # Save to file
                 save_path = os.path.join(output_dir, f"{idx:08d}_{seg_idx:02d}.pt")
                 torch.save({
                     "mel_spec": mel_spec,
                     "waveform_labels": segment,
+                    "target_complex_stfts": stft,
                     "speaker_id": speaker_id,
                 }, save_path)
                 
@@ -121,7 +135,6 @@ def preprocess_and_cache_dataset(
         "n_fft": n_fft,
         "hop_length": hop_length,
         "audio_max_frames": audio_max_frames,
-        "max_text_length": max_text_length,
         "stats": stats,
     }
     
@@ -141,16 +154,18 @@ def preprocess_and_cache_dataset(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--dataset_name", type=str, default="openslr/librispeech_asr")
     parser.add_argument("--dataset_config", type=str, default="clean")
     parser.add_argument("--split", type=str, default="train.360")
     parser.add_argument("--sample_rate", type=int, default=16000)
-    parser.add_argument("--n_mels", type=int, default=128)
+    parser.add_argument("--n_mels", type=int, default=80)
     parser.add_argument("--n_fft", type=int, default=1024)
-    parser.add_argument("--hop_length", type=int, default=512)
-    parser.add_argument("--audio_max_frames", type=int, default=312)
-    parser.add_argument("--max_text_length", type=int, default=256)
+    parser.add_argument("--hop_length", type=int, default=256)
+    parser.add_argument("--audio_max_frames", type=int, default=626)
+    parser.add_argument("--mel_window", type=str, default="hann_window")
+
     args = parser.parse_args()
     
     preprocess_and_cache_dataset(
@@ -163,5 +178,5 @@ if __name__ == "__main__":
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         audio_max_frames=args.audio_max_frames,
-        max_text_length=args.max_text_length,
+        mel_window=args.mel_window,
     )

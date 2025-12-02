@@ -1,9 +1,10 @@
-from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
-
 import gradio as gr
 import torch
 import random
 import os
+
+from diffusers import DiffusionPipeline
+
 
 # Create directory for saved images
 os.makedirs("generated_images", exist_ok=True)

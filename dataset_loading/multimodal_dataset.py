@@ -1,11 +1,13 @@
 from torch.utils.data import IterableDataset
 from transformers import DataCollatorForLanguageModeling, PreTrainedTokenizer
 from typing import Iterator, Any, List, Dict, Union, Optional
+from dataset_loading import load_dataset
 
-import dataset_loading
 import random
 import time
 import torch
+
+from model.audio.shared_window_buffer import SharedWindowBuffer
 
 
 class LimitedStreamDataset(IterableDataset):
@@ -63,6 +65,7 @@ class MultimodalDataset(IterableDataset):
         hop_length: int,
         audio_max_frames: float,
         image_size: int,
+        shared_window_buffer: SharedWindowBuffer,
         cache_dir: str = "cached_datasets",
         text_weight: float = 1.0,
         audio_weight: float = 1.0,
@@ -96,7 +99,7 @@ class MultimodalDataset(IterableDataset):
         weights = []
 
         if self.text_weight > 0:
-            dataset = dataset_loading.load_dataset(
+            dataset = load_dataset(
                 self.tokenizer,
                 self.max_position_embeddings,
                 split,
@@ -110,7 +113,7 @@ class MultimodalDataset(IterableDataset):
             weights.append(self.text_weight)
 
         if self.audio_weight > 0:
-            dataset = dataset_loading.load_dataset(
+            dataset = load_dataset(
                 self.tokenizer,
                 self.max_position_embeddings,
                 split,
@@ -122,6 +125,7 @@ class MultimodalDataset(IterableDataset):
                 audio_max_frames=audio_max_frames,
                 streaming=True,
                 cache_dir=self.cache_dir,
+                shared_window_buffer=shared_window_buffer
             )
 
             if audio_examples > 0:
@@ -130,7 +134,7 @@ class MultimodalDataset(IterableDataset):
             weights.append(self.audio_weight)
 
         if self.image_weight > 0:
-            dataset = dataset_loading.load_dataset(
+            dataset = load_dataset(
                 self.tokenizer,
                 self.max_position_embeddings,
                 split,

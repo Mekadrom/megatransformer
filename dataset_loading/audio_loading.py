@@ -1,39 +1,43 @@
 from datasets import load_dataset, Audio
-import numpy as np
 import torchaudio
 from transformers import PreTrainedTokenizer
 from typing import Literal, Optional
 
-import librosa
 import logging
 import torch
+
+from model.audio import configurable_mel_spectrogram
+from model.audio.shared_window_buffer import SharedWindowBuffer
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 def extract_waveforms(audio, sr=16000):
     # Check if audio is already processed
     if isinstance(audio, dict) and 'array' in audio:
-        y = audio['array']
         orig_sr = audio['sampling_rate']
         
-        # Resample if needed
-        if orig_sr != sr:
-            y = librosa.resample(y, orig_freq=orig_sr, target_freq=sr)
+        waveforms = torch.tensor(audio['array'], dtype=torch.float32).unsqueeze(0)
     elif isinstance(audio, torch.Tensor):
         # waveform as tensor
-        y = audio.numpy()
+        waveforms = audio if audio.dim() == 2 else audio.unsqueeze(0)
         # assume default sample rate
         orig_sr = sr
     else:
         # Fallback for direct file paths
-        y, orig_sr = librosa.load(audio, sr=sr)
+        waveforms, orig_sr = torchaudio.load(audio)
 
-    waveforms = torch.tensor(y, dtype=torch.float32)
+    # Resample if needed
+    if orig_sr != sr:
+        waveforms = torchaudio.transforms.Resample(orig_sr, sr)(waveforms)
+    waveforms = waveforms.squeeze(0)
+    y = waveforms.numpy()
+
     return waveforms, y, orig_sr
 
-def extract_mels(y, sr=16000, n_mels=128, n_fft=1024, hop_length=512):
+def extract_mels(shared_window_buffer: SharedWindowBuffer, y, sr=16000, n_mels=80, n_fft=1024, hop_length=256):
     """
     Extract audio features from loaded audio data.
     
@@ -46,25 +50,30 @@ def extract_mels(y, sr=16000, n_mels=128, n_fft=1024, hop_length=512):
         
     Returns:
         log_mel_spec: Log mel spectrogram features
-        y: Raw audio waveform
     """
-    if isinstance(y, torch.Tensor):
-        y = y.numpy()
-
     # Extract mel spectrogram
-    mel_spec = librosa.feature.melspectrogram(
-        y=y, sr=sr, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length
+    mel_spec, _ = configurable_mel_spectrogram(
+        audio=y.squeeze(),
+        sample_rate=sr,
+        hop_length=hop_length,
+        win_length=1024,
+        n_mels=n_mels,
+        n_fft=n_fft,
+        f_min=0.0,
+        f_max=8000.0,
+        power=1,
+        normalized=False,
+        min_max_energy_norm=False,
+        norm="slaney",
+        mel_scale="slaney",
+        compression=False,
+        window_provider=lambda win_size: shared_window_buffer.get_window(win_size, device=y.device)
     )
 
-    # Convert to log scale (dB)
-    # log_mel_spec = librosa.power_to_db(mel_spec)
-
     # converts to log scale, with clipping to avoid log(0)
-    log_mel_spec = np.log(np.clip(mel_spec, a_min=1e-5, a_max=None))
+    log_mel_spec = torch.log(mel_spec.clamp(min=1e-5))
 
-    mels = torch.tensor(log_mel_spec, dtype=torch.float32)
-    
-    return mels
+    return log_mel_spec
 
 def remove_mains_hum(waveform, sample_rate, frequencies=[60, 120, 180, 240]):
     """Remove mains hum and harmonics."""
@@ -84,6 +93,7 @@ def load_audio_dataset(
     n_fft: int,
     hop_length: int,
     max_frames: int,
+    shared_window_buffer: SharedWindowBuffer,
     is_voice: bool = True,
     batch_size: int = 100,
     streaming: bool = False,
@@ -134,6 +144,7 @@ def load_audio_dataset(
         all_input_ids = []
         all_audio_raw_inputs = []
         all_audio_waveform_labels = []
+        all_target_complex_stfts = []
         for text, audio in zip(texts, audios):
             tokenized = tokenizer(text=text, add_special_tokens=True)
             input_ids = tokenized.input_ids
@@ -146,7 +157,8 @@ def load_audio_dataset(
 
             # Extract features
             audio_mels = extract_mels(
-                y,
+                shared_window_buffer,
+                waveforms,
                 sr=sample_rate,
                 n_mels=n_mels,
                 n_fft=n_fft,
@@ -166,6 +178,10 @@ def load_audio_dataset(
 
             all_audio_waveform_labels.append(waveforms)
             all_audio_waveform_labels.append(waveforms)
+            all_target_complex_stfts.append(torch.stft(
+                waveforms, n_fft, hop_length,
+                window=torch.hann_window(n_fft), return_complex=True
+            ))
 
         # Pad sequences to the same length
         max_length = max([len(ids) for ids in all_input_ids])
@@ -177,6 +193,7 @@ def load_audio_dataset(
             "audio_raw_inputs": all_audio_raw_inputs,
             "audio_mel_spec_labels": all_audio_raw_inputs,
             "audio_waveform_labels": all_audio_waveform_labels,
+            "audio_waveform_labels_complex_stft": all_target_complex_stfts,
         }
     
     logger.info("Processing dataset with custom feature extraction...")

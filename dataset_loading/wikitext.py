@@ -1,7 +1,7 @@
+import re
+
 from datasets import load_dataset
 
-
-import re
 
 
 def clean_wikitext_examples(examples):

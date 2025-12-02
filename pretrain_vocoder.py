@@ -2,8 +2,10 @@ import os
 
 from dataset_loading.vocoder_dataset import CachedVocoderDataset
 from model.audio import vocoders
+from model.audio import discriminators
 from model.audio.criteria import compute_discriminator_losses, compute_generator_losses
 from model.audio.discriminators import CombinedDiscriminator
+from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders import VocoderWithLoss
 
 os.environ["DEEPSPEED_UNIT_TEST"] = "1"
@@ -16,7 +18,7 @@ from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments, Trainer, TrainerCallback
 from transformers.integrations import TensorBoardCallback
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Mapping, Optional, Union
 
 from dataset_loading import audio_loading
 
@@ -44,34 +46,42 @@ class VocoderDataCollator:
         self.n_mels = n_mels
 
     def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
-        # Pad mel spectrograms
         mel_specs = []
+        waveforms = []
+        target_complex_stfts = []
         for ex in examples:
             if ex is None:
                 continue
+
             mel = ex["mel_spec"]
             if mel.shape[-1] < self.audio_max_frames:
                 mel = F.pad(mel, (0, self.audio_max_frames - mel.shape[-1]), value=0)
             elif mel.shape[-1] > self.audio_max_frames:
                 mel = mel[..., :self.audio_max_frames]
-            mel_specs.append(mel)
 
-        # Pad waveforms
-        waveforms = []
-        for ex in examples:
-            if ex is None:
-                continue
             wav = ex["waveform_labels"]
             if wav.shape[-1] < self.audio_max_waveform_length:
                 wav = F.pad(wav, (0, self.audio_max_waveform_length - wav.shape[-1]), value=0)
             elif wav.shape[-1] > self.audio_max_waveform_length:
                 wav = wav[..., :self.audio_max_waveform_length]
+            
+            target_complex_stft = ex["target_complex_stfts"]
+            if target_complex_stft.shape[-1] < self.audio_max_frames:
+                target_complex_stft = F.pad(target_complex_stft, (0, self.audio_max_frames - target_complex_stft.shape[-1]), value=0)
+            elif target_complex_stft.shape[-1] > self.audio_max_frames:
+                target_complex_stft = target_complex_stft[..., :self.audio_max_frames]
+
+            assert target_complex_stft.shape[-1] == mel.shape[-1], f"Mismatch in mel frames and stft frames: {mel.shape} vs {target_complex_stft.shape}. Max frames: {self.audio_max_frames}"
+
+            mel_specs.append(mel)
             waveforms.append(wav)
+            target_complex_stfts.append(target_complex_stft)
 
         # Stack tensors
         batch = {
             "mel_spec": torch.stack(mel_specs),
             "waveform_labels": torch.stack(waveforms),
+            "target_complex_stfts": torch.stack(target_complex_stfts),
         }
 
         return batch
@@ -94,13 +104,13 @@ class VocoderReconstructionCallback(TrainerCallback):
 
     def __init__(
         self,
+        shared_window_buffer: SharedWindowBuffer,
         step_offset: int = 0,
         generation_steps: int = 1000,
         audio_sample_rate: int = 16000,
-        audio_n_mels: int = 128,
+        audio_n_mels: int = 80,
         audio_n_fft: int = 1024,
-        audio_hop_length: int = 512,
-        test_audio_path: Optional[str] = None,
+        audio_hop_length: int = 256,
     ):
         self.trainer: Optional[Trainer] = None
         self.step_offset = step_offset
@@ -110,37 +120,35 @@ class VocoderReconstructionCallback(TrainerCallback):
         self.audio_n_fft = audio_n_fft
         self.audio_hop_length = audio_hop_length
 
-        # Load test audio
-        if test_audio_path is not None and os.path.exists(test_audio_path):
-            self.test_audio_waveforms, orig_sr = torchaudio.load(test_audio_path)
-            if orig_sr != audio_sample_rate:
-                self.test_audio_waveforms = torchaudio.transforms.Resample(
-                    orig_freq=orig_sr, new_freq=audio_sample_rate
-                )(self.test_audio_waveforms)
-        else:
-            # Default test audio path
-            default_path = os.path.join('inference', 'examples', 'test_alm.mp3')
-            if os.path.exists(default_path):
-                self.test_audio_waveforms, orig_sr = torchaudio.load(default_path)
-                self.test_audio_waveforms = torchaudio.transforms.Resample(
-                    orig_freq=orig_sr, new_freq=audio_sample_rate
-                )(self.test_audio_waveforms)
-            else:
-                # Generate synthetic test audio (sine wave)
-                print("No test audio found, generating synthetic sine wave...")
-                duration = 3.0  # seconds
-                freq = 440.0  # Hz (A4 note)
-                t = torch.linspace(0, duration, int(audio_sample_rate * duration))
-                self.test_audio_waveforms = torch.sin(2 * np.pi * freq * t).unsqueeze(0)
+        test_audio_paths = [
+            os.path.join('inference', 'examples', 'test_alm_1.mp3'),
+            os.path.join('inference', 'examples', 'test_alm_2.mp3'),
+        ]
+        self.test_mel_specs = []
+        self.test_audio_waveforms = []
 
-        # Extract mel spectrogram from test audio
-        self.test_mel_spec = audio_loading.extract_mels(
-            self.test_audio_waveforms[0].numpy(),
-            sr=audio_sample_rate,
-            n_mels=audio_n_mels,
-            n_fft=audio_n_fft,
-            hop_length=audio_hop_length,
-        )
+        self.shared_window_buffer = shared_window_buffer
+
+        for test_audio_path in test_audio_paths:
+            # Load test audio
+            if test_audio_path is not None and os.path.exists(test_audio_path):
+                test_audio_waveforms, orig_sr = torchaudio.load(test_audio_path)
+                if orig_sr != audio_sample_rate:
+                    test_audio_waveforms = torchaudio.transforms.Resample(
+                        orig_freq=orig_sr, new_freq=audio_sample_rate
+                    )(test_audio_waveforms)
+                test_audio_waveforms = test_audio_waveforms[0]
+                self.test_audio_waveforms.append(test_audio_waveforms)
+
+            # Extract mel spectrogram from test audio
+            self.test_mel_specs.append(audio_loading.extract_mels(
+                shared_window_buffer,
+                test_audio_waveforms.squeeze(0),
+                sr=audio_sample_rate,
+                n_mels=audio_n_mels,
+                n_fft=audio_n_fft,
+                hop_length=audio_hop_length,
+            ))
 
     def on_step_end(self, args, state, control, model: VocoderWithLoss = None, **kwargs):
         global_step = state.global_step + self.step_offset
@@ -161,90 +169,88 @@ class VocoderReconstructionCallback(TrainerCallback):
             else:
                 device = torch.device("cpu")
 
-            # Move test data to device
-            test_mel = self.test_mel_spec.unsqueeze(0).to(device)
-            test_waveform = self.test_audio_waveforms.to(device)
-
             with torch.no_grad():
                 dtype = torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32
                 with autocast(device.type, dtype=dtype):
-                    # Generate waveform from mel spectrogram
-                    outputs = model(
-                        mel_spec=test_mel,
-                        waveform_labels=test_waveform[0] if test_waveform.dim() > 1 else test_waveform,
-                    )
+                    for e, (test_mel_spec, test_audio_waveform) in enumerate(zip(self.test_mel_specs, self.test_audio_waveforms)):
+                        # Move test data to device
+                        test_mel = test_mel_spec.unsqueeze(0).to(device)
+                        test_waveform = test_audio_waveform.to(device)
 
-                    pred_waveform = outputs["pred_waveform"]
-
-                    # Clip waveform to valid range
-                    pred_waveform = torch.clamp(pred_waveform, -1.0, 1.0)
-                    pred_waveform_cpu = pred_waveform[0].to(torch.float64).cpu()
-
-                    # Log ground truth audio
-                    gt_waveform = self.test_audio_waveforms[0].to(torch.float64)
-                    writer.add_audio(
-                        "vocoder_reconstruction/ground_truth",
-                        gt_waveform,
-                        global_step,
-                        sample_rate=self.audio_sample_rate,
-                    )
-
-                    # Log reconstructed audio
-                    writer.add_audio(
-                        "vocoder_reconstruction/predicted",
-                        pred_waveform_cpu,
-                        global_step,
-                        sample_rate=self.audio_sample_rate,
-                    )
-
-                    # Save reconstructed audio to file
-                    if self.trainer is not None and hasattr(self.trainer.args, "output_dir"):
-                        audio_filepath = os.path.join(
-                            self.trainer.args.output_dir,
-                            f"reconstructed_audio_step_{global_step}.wav"
+                        # Generate waveform from mel spectrogram
+                        outputs = model(
+                            mel_spec=test_mel,
+                            waveform_labels=test_waveform[0] if test_waveform.dim() > 1 else test_waveform,
                         )
-                        self._save_audio_to_file(
-                            pred_waveform_cpu,
-                            audio_filepath,
+
+                        pred_waveform = outputs["pred_waveform"]
+
+                        # Clip waveform to valid range
+                        pred_waveform = torch.clamp(pred_waveform, -1.0, 1.0)
+                        pred_waveform_cpu = pred_waveform[0].to(torch.float64).cpu()
+
+                        # Log ground truth audio
+                        gt_waveform = self.test_audio_waveforms[e].to(torch.float64)
+                        writer.add_audio(
+                            f"vocoder_reconstruction/ground_truth/{e}",
+                            gt_waveform,
+                            global_step,
                             sample_rate=self.audio_sample_rate,
                         )
 
-                    # Log mel spectrogram visualizations
-                    try:
-                        # Ground truth mel spectrogram
-                        writer.add_image(
-                            "vocoder_reconstruction/mel_spec_input",
-                            self._visualize_mel_spec(
-                                self.test_mel_spec.numpy(),
-                                self.audio_sample_rate
-                            ),
+                        # Log reconstructed audio
+                        writer.add_audio(
+                            f"vocoder_reconstruction/predicted/{e}",
+                            pred_waveform_cpu,
                             global_step,
+                            sample_rate=self.audio_sample_rate,
                         )
 
-                        # Reconstructed waveform's mel spectrogram
-                        reconstructed_mel = audio_loading.extract_mels(
-                            pred_waveform_cpu.numpy(),
-                            sr=self.audio_sample_rate,
-                            n_mels=self.audio_n_mels,
-                            n_fft=self.audio_n_fft,
-                            hop_length=self.audio_hop_length,
-                        )
-                        writer.add_image(
-                            "vocoder_reconstruction/mel_spec_output",
-                            self._visualize_mel_spec(
-                                reconstructed_mel.numpy(),
-                                self.audio_sample_rate
-                            ),
-                            global_step,
-                        )
-                    except Exception as e:
-                        writer.add_text(
-                            "vocoder_reconstruction/mel_spec_error",
-                            f"Error visualizing mel spec: {e}",
-                            global_step,
-                        )
+                        # Save reconstructed audio to file
+                        if self.trainer is not None and hasattr(self.trainer.args, "output_dir"):
+                            audio_filepath = os.path.join(
+                                self.trainer.args.output_dir,
+                                f"reconstructed_audio_step_{global_step}.wav"
+                            )
+                            self._save_audio_to_file(
+                                pred_waveform_cpu,
+                                audio_filepath,
+                                sample_rate=self.audio_sample_rate,
+                            )
 
-                    # Log losses
+                        # Log mel spectrogram visualizations
+                        try:
+                            # Ground truth mel spectrogram
+                            writer.add_image(
+                                f"vocoder_reconstruction/mel_spec_input/{e}",
+                                self._visualize_mel_spec(
+                                    test_mel_spec.numpy(),
+                                    self.audio_sample_rate
+                                ),
+                                global_step,
+                            )
+
+                            # Reconstructed waveform's mel spectrogram
+                            reconstructed_mel = audio_loading.extract_mels(
+                                self.shared_window_buffer,
+                                pred_waveform_cpu,
+                                sr=self.audio_sample_rate,
+                                n_mels=self.audio_n_mels,
+                                n_fft=self.audio_n_fft,
+                                hop_length=self.audio_hop_length,
+                            )
+                            writer.add_image(
+                                f"vocoder_reconstruction/mel_spec_output/{e}",
+                                self._visualize_mel_spec(
+                                    reconstructed_mel.numpy(),
+                                    self.audio_sample_rate
+                                ),
+                                global_step,
+                            )
+                        except Exception as e:
+                            raise e
+
+                    # Log losses (uses last outputs from test examples above)
                     if "loss" in outputs:
                         writer.add_scalar(
                             "vocoder_reconstruction/loss",
@@ -328,9 +334,12 @@ class VocoderReconstructionCallback(TrainerCallback):
         fig, ax = plt.subplots(figsize=(10, 4))
         img = librosa.display.specshow(
             mel_spec_norm,
+            hop_length=self.audio_hop_length,
             x_axis='time',
             y_axis='mel',
             sr=sample_rate,
+            n_fft=self.audio_n_fft,
+            fmin=0,
             fmax=8000,
             ax=ax,
         )
@@ -361,6 +370,8 @@ class VocoderGANTrainer(Trainer):
     def __init__(
         self,
         *args,
+        n_fft,
+        hop_length,
         discriminator: Optional[CombinedDiscriminator] = None,
         discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
         gan_adv_loss_weight: float = 1.0,
@@ -379,6 +390,10 @@ class VocoderGANTrainer(Trainer):
         **kwargs
     ):
         super().__init__(*args, **kwargs)
+
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+
         self.discriminator = discriminator
         self.discriminator_optimizer = discriminator_optimizer
         self.gan_adv_loss_weight = gan_adv_loss_weight
@@ -396,19 +411,35 @@ class VocoderGANTrainer(Trainer):
         self.mrsd_fm_loss_weight = mrsd_fm_loss_weight
         self.writer = None
 
+    def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
+        """
+        Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
+        """
+        if isinstance(data, Mapping):
+            return type(data)({k: self._prepare_input(v) for k, v in data.items()})
+        elif isinstance(data, (tuple, list)):
+            return type(data)(self._prepare_input(v) for v in data)
+        elif isinstance(data, torch.Tensor):
+            kwargs = {"device": self.args.device}
+            if self.is_deepspeed_enabled and (torch.is_floating_point(data)):
+                kwargs.update({"dtype": self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()})
+            return data.to(**kwargs)
+        return data
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self._ensure_tensorboard_writer()
 
         # Forward pass through generator (vocoder)
+        waveform_labels = inputs["waveform_labels"]
         outputs = model(
             mel_spec=inputs["mel_spec"],
-            waveform_labels=inputs["waveform_labels"],
+            waveform_labels=waveform_labels,
+            target_complex_stfts = inputs["target_complex_stfts"],
         )
 
         # Get reconstruction losses from model
         recon_loss = outputs["loss"]
         pred_waveform = outputs["pred_waveform"]
-        waveform_labels = inputs["waveform_labels"]
 
         # Ensure waveform_labels has correct shape
         if waveform_labels.dim() == 1:
@@ -456,30 +487,21 @@ class VocoderGANTrainer(Trainer):
                 d_loss = self.mpd_loss_weight * d_loss_mpd + self.msd_loss_weight * d_loss_msd + self.mrsd_loss_weight * d_loss_mrsd
 
                 if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
-                    for o, output in enumerate(disc_real["mpd"][0]):
-                        self._log_scalar(f"train/disc_real_mpd/{o}/avg", output.mean())
+                    for disc_crit in disc_real.keys():
+                        for o, output in enumerate(disc_real[disc_crit][0]):
+                            self._log_scalar(f"train/disc_real_{disc_crit}/{o}/avg", output.mean())
 
-                    for o, output in enumerate(disc_fake["mpd"][0]):
-                        self._log_scalar(f"train/disc_fake_mpd/{o}/avg", output.mean())
-
-                    for o, output in enumerate(disc_real["msd"][0]):
-                        self._log_scalar(f"train/disc_real_msd/{o}/avg", output.mean())
-
-                    for o, output in enumerate(disc_fake["msd"][0]):
-                        self._log_scalar(f"train/disc_fake_msd/{o}/avg", output.mean())
-
-                    for o, output in enumerate(disc_real["mrsd"][0]):
-                        self._log_scalar(f"train/disc_real_mrsd/{o}/avg", output.mean())
-
-                    for o, output in enumerate(disc_fake["mrsd"][0]):
-                        self._log_scalar(f"train/disc_fake_mrsd/{o}/avg", output.mean())
-                        self._log_scalar("train/d_loss_mpd", d_loss_mpd)
-                        self._log_scalar("train/d_loss_msd", d_loss_msd)
-                        self._log_scalar("train/d_loss_mrsd", d_loss_mrsd)
-                        self._log_scalar("train/d_loss_total", d_loss)
+                    for disc_crit in disc_fake.keys():
+                        for o, output in enumerate(disc_fake[disc_crit][0]):
+                            self._log_scalar(f"train/disc_fake_{disc_crit}/{o}/avg", output.mean())
+                        
+                    self._log_scalar("train/d_loss_mpd", d_loss_mpd)
+                    self._log_scalar("train/d_loss_msd", d_loss_msd)
+                    self._log_scalar("train/d_loss_mrsd", d_loss_mrsd)
+                    self._log_scalar("train/d_loss_total", d_loss)
 
                 # Update discriminator
-                if self.discriminator_optimizer is not None:
+                if self.discriminator_optimizer is not None and self.discriminator.training:
                     self.discriminator_optimizer.zero_grad()
                     d_loss.backward()
                     self.discriminator_optimizer.step()
@@ -527,6 +549,11 @@ class VocoderGANTrainer(Trainer):
             self._log_scalar(f"{prefix}mag_loss", outputs.get("mag_loss", 0))
             self._log_scalar(f"{prefix}mel_recon_loss", outputs.get("mel_recon_loss", 0))
             self._log_scalar(f"{prefix}complex_stft_loss", outputs.get("complex_stft_loss", 0))
+            self._log_scalar(f"{prefix}phase_ip_loss", outputs.get("phase_ip_loss", 0))
+            self._log_scalar(f"{prefix}phase_iaf_loss", outputs.get("phase_iaf_loss", 0))
+            self._log_scalar(f"{prefix}phase_gd_loss", outputs.get("phase_gd_loss", 0))
+            self._log_scalar(f"{prefix}phase_loss", outputs.get("phase_loss", 0))
+            self._log_scalar(f"{prefix}high_freq_stft_loss", outputs.get("high_freq_stft_loss", 0))
             self._log_scalar(f"{prefix}recon_loss", recon_loss)
             self._log_scalar(f"{prefix}total_loss", total_loss)
 
@@ -577,14 +604,18 @@ class VocoderGANTrainer(Trainer):
 
 
 def load_discriminator(
-    run_dir: str,
+    resume_from_checkpoint: str,
     discriminator: CombinedDiscriminator,
     discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
     device: torch.device = torch.device("cpu"),
 ) -> tuple[CombinedDiscriminator, Optional[torch.optim.Optimizer], bool]:
     """Load discriminator from checkpoint if it exists."""
-    discriminator_path = os.path.join(run_dir, "discriminator.pt")
 
+    if resume_from_checkpoint is None:
+        print("No checkpoint path provided, training discriminator from scratch")
+        return discriminator, discriminator_optimizer, False
+    
+    discriminator_path = os.path.join(resume_from_checkpoint, "discriminator.pt")
     if os.path.exists(discriminator_path):
         print(f"Loading discriminator from {discriminator_path}")
         checkpoint = torch.load(discriminator_path, map_location=device)
@@ -594,7 +625,8 @@ def load_discriminator(
             discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer_state_dict"])
 
         return discriminator, discriminator_optimizer, True
-
+    
+    print("No existing discriminator checkpoint found, training from scratch")
     return discriminator, discriminator_optimizer, False
 
 
@@ -616,7 +648,15 @@ def main():
     mag_loss_weight = float(unk_dict.get("mag_loss_weight", 3.0))
     waveform_l1_loss_weight = float(unk_dict.get("waveform_l1_loss_weight", 0.1))
     mel_recon_loss_weight = float(unk_dict.get("mel_recon_loss_weight", 1.0))
+    mel_recon_loss_weight_linspace_max = float(unk_dict.get("mel_recon_loss_weight_linspace_max", 1.0))
     complex_stft_loss_weight = float(unk_dict.get("complex_stft_loss_weight", 1.0))
+    phase_loss_weight = float(unk_dict.get("phase_loss_weight", 0.0))
+    phase_ip_loss_weight = float(unk_dict.get("phase_ip_loss_weight", 0.0))
+    phase_iaf_loss_weight = float(unk_dict.get("phase_iaf_loss_weight", 0.0))
+    phase_gd_loss_weight = float(unk_dict.get("phase_gd_loss_weight", 0.0))
+    high_freq_stft_loss_weight = float(unk_dict.get("high_freq_stft_loss_weight", 0.0))
+    high_freq_stft_cutoff_bin = int(unk_dict.get("high_freq_stft_cutoff_bin", 256))
+    mel_window = unk_dict.get("mel_window", "hann_window")
 
     # GAN training settings
     use_gan = unk_dict.get("use_gan", "false").lower() == "true"
@@ -636,12 +676,24 @@ def main():
     msd_fm_loss_weight = float(unk_dict.get("msd_fm_loss_weight", 1.0))
     mrsd_fm_loss_weight = float(unk_dict.get("mrsd_fm_loss_weight", 1.0))
 
+    discriminator_config = unk_dict.get("discriminator_config", "combined_disc")
+    
+    shared_window_buffer = SharedWindowBuffer()
+
     model = vocoders.model_config_lookup[args.config](
+        shared_window_buffer,
         sc_loss_weight,
         mag_loss_weight,
         waveform_l1_loss_weight,
         mel_recon_loss_weight,
-        complex_stft_loss_weight
+        mel_recon_loss_weight_linspace_max,
+        complex_stft_loss_weight,
+        phase_loss_weight,
+        phase_ip_loss_weight,
+        phase_iaf_loss_weight,
+        phase_gd_loss_weight,
+        high_freq_stft_loss_weight,
+        high_freq_stft_cutoff_bin,
     )
     model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
 
@@ -655,14 +707,8 @@ def main():
     discriminator = None
     discriminator_optimizer = None
     if use_gan:
-        discriminator = CombinedDiscriminator(
-            mpd_periods=[2, 3, 5, 7, 11],
-            n_msd_scales=3,
-            mrsd_resolutions=[
-                (1024, 256, 1024),
-                (2048, 512, 2048),
-                (512, 128, 512),
-            ],
+        discriminator = discriminators.model_config_lookup[discriminator_config](
+            shared_window_buffer=shared_window_buffer
         ).to(device)
         discriminator_optimizer = torch.optim.AdamW(
             discriminator.parameters(),
@@ -672,7 +718,7 @@ def main():
         )
         # Try to load existing discriminator checkpoint
         discriminator, discriminator_optimizer, disc_loaded = load_discriminator(
-            run_dir, discriminator, discriminator_optimizer, device
+            args.resume_from_checkpoint, discriminator, discriminator_optimizer, device
         )
         if disc_loaded:
             print("Loaded discriminator from checkpoint")
@@ -681,6 +727,17 @@ def main():
         print(f"Model structure: {model}")
         if use_gan and discriminator is not None:
             print(f"Discriminator structure: {discriminator}")
+            print(f"GAN training: {'enabled' if use_gan else 'disabled'}")
+            print(f"  GAN loss weight: {gan_adv_loss_weight}")
+            print(f"  Feature matching loss weight: {gan_feature_matching_loss_weight}")
+            print(f"  MPD adversarial loss weight: {mpd_adv_loss_weight}")
+            print(f"  MSD adversarial loss weight: {msd_adv_loss_weight}")
+            print(f"  MRSD adversarial loss weight: {mrsd_adv_loss_weight}")
+            print(f"  MPD feature matching loss weight: {mpd_fm_loss_weight}")
+            print(f"  MSD feature matching loss weight: {msd_fm_loss_weight}")
+            print(f"  MRSD feature matching loss weight: {mrsd_fm_loss_weight}")
+            print(f"  Discriminator LR: {discriminator_lr}")
+            print(f"  GAN start step: {gan_start_step}")
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
         print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
         print(f"  Vocoder parameters: {sum(p.numel() for p in model.vocoder.parameters()):,}")
@@ -693,18 +750,6 @@ def main():
             print(f"    MPD parameters: {sum(p.numel() for p in discriminator.mpd.parameters()):,}")
             print(f"    MSD parameters: {sum(p.numel() for p in discriminator.msd.parameters()):,}")
             print(f"    MRSD parameters: {sum(p.numel() for p in discriminator.mrsd.parameters()):,}")
-        print(f"GAN training: {'enabled' if use_gan else 'disabled'}")
-        if use_gan:
-            print(f"  GAN loss weight: {gan_adv_loss_weight}")
-            print(f"  Feature matching loss weight: {gan_feature_matching_loss_weight}")
-            print(f"  MPD adversarial loss weight: {mpd_adv_loss_weight}")
-            print(f"  MSD adversarial loss weight: {msd_adv_loss_weight}")
-            print(f"  MRSD adversarial loss weight: {mrsd_adv_loss_weight}")
-            print(f"  MPD feature matching loss weight: {mpd_fm_loss_weight}")
-            print(f"  MSD feature matching loss weight: {msd_fm_loss_weight}")
-            print(f"  MRSD feature matching loss weight: {mrsd_fm_loss_weight}")
-            print(f"  Discriminator LR: {discriminator_lr}")
-            print(f"  GAN start step: {gan_start_step}")
 
     model = megatransformer_utils.setup_int8_training(args, model)
 
@@ -743,8 +788,8 @@ def main():
         report_to="tensorboard",
         logging_dir=run_dir,
         logging_steps=args.logging_steps,
-        eval_steps=args.eval_steps,
-        eval_strategy="epoch" if args.eval_steps == 0 else "steps",
+        # eval_steps=args.eval_steps,
+        # eval_strategy="epoch" if args.eval_steps == 0 else "steps",
         save_safetensors=False,
         save_steps=args.save_steps,
         gradient_checkpointing=args.use_gradient_checkpointing,
@@ -760,6 +805,7 @@ def main():
         adam_beta1=args.adam_beta1,
         adam_beta2=args.adam_beta2,
         ignore_data_skip=False,
+        remove_unused_columns=False
     )
 
     train_dataset = CachedVocoderDataset(
@@ -782,6 +828,8 @@ def main():
     # Create trainer (with or without GAN)
     trainer = VocoderGANTrainer(
         model=model,
+        n_fft=model.config.audio_n_fft,
+        hop_length=model.config.audio_hop_length,
         args=training_args,
         data_collator=data_collator,
         train_dataset=train_dataset,
@@ -804,6 +852,7 @@ def main():
 
     # Add reconstruction callback for monitoring training progress
     reconstruction_callback = VocoderReconstructionCallback(
+        shared_window_buffer,
         step_offset=args.start_step,
         generation_steps=args.generation_steps,
         audio_sample_rate=model.config.audio_sample_rate,

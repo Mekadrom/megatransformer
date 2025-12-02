@@ -59,7 +59,7 @@ model.load_state_dict(state_dict)
 model = model.to("cpu")
 model.train()
 
-default_path = os.path.join('inference', 'examples', 'test_alm.mp3')
+default_path = os.path.join('inference', 'examples', 'test_alm_1.mp3')
 
 dataset = VocoderDataset(
     config=model.config,

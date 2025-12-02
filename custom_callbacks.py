@@ -18,6 +18,8 @@ import torch
 import torchaudio
 import torchvision
 
+from model.audio.shared_window_buffer import SharedWindowBuffer
+
 
 def get_writer(trainer: Trainer):
     for callback in trainer.callback_handler.callbacks:
@@ -67,13 +69,14 @@ class GenerationCallback(TrainerCallback):
 
 class MultimodalGenerationCallback(TrainerCallback):
     def __init__(self,
+                 shared_window_buffer: SharedWindowBuffer,
                  tokenizer: PreTrainedTokenizer,
                  text_only_prompts,
                  step_offset,
                  audio_sample_rate: int = 16000,
-                 audio_n_mels: int = 128,
+                 audio_n_mels: int = 80,
                  audio_n_fft: int = 1024,
-                 audio_hop_length: int = 512,
+                 audio_hop_length: int = 256,
                  generation_steps=2000):
         self.trainer: Optional[Trainer] = None
         self.tokenizer = tokenizer
@@ -81,9 +84,10 @@ class MultimodalGenerationCallback(TrainerCallback):
         self.step_offset = step_offset
         self.generation_steps = generation_steps
 
-        self.test_audio_waveforms, self.sample_rate = torchaudio.load(os.path.join('inference', 'examples', 'test_alm.mp3'))
+        self.test_audio_waveforms, self.sample_rate = torchaudio.load(os.path.join('inference', 'examples', 'test_alm_1.mp3'))
         self.test_audio_waveforms = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000)(self.test_audio_waveforms)
         self.test_audio_mels = audio_loading.extract_mels(
+            shared_window_buffer,
             self.test_audio_waveforms,
             audio_sample_rate,
             audio_n_mels,

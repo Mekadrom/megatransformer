@@ -4,11 +4,11 @@ import torch.nn.functional as F
 from torch.nn.utils.parametrizations import weight_norm
 from typing import Dict, Optional, Literal
 
-from transformers import T5EncoderModel, T5Tokenizer
-
 import megatransformer_utils
-from model.audio.criteria import MultiResolutionSTFTLoss, StableMelSpectrogramLoss
+from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss
 from model.activations import Snake
+from model.audio.shared_window_buffer import SharedWindowBuffer
+
 
 class VocoderResidualBlock(nn.Module):
     """Residual block with dilated convolutions for the vocoder."""
@@ -153,7 +153,8 @@ class AudioVocoder(nn.Module):
         self,
         hidden_channels,
         in_channels: int,  # Number of mel bands
-        upsample_factors: list[int] = [8, 8, 8],  # Total upsampling of 512 (matching hop_length)
+        # Total upsampling of 256 (matching hop_length)
+        upsample_factors: list[int] = [8, 8, 4],
         n_residual_layers: int = 3,
         dilation_cycle: int = 4,
         kernel_size: int = 3,
@@ -282,19 +283,39 @@ class AudioVocoder(nn.Module):
 
 class VocoderWithLoss(nn.Module):
     def __init__(self,
+                 shared_window_buffer: SharedWindowBuffer,
                  config: megatransformer_utils.MegaTransformerConfig,
                  sc_loss_weight: float = 1.0,
                  mag_loss_weight: float = 3.0,
                  waveform_l1_loss_weight: float = 0.1,
                  mel_recon_loss_weight: float = 1.0,
-                 complex_stft_loss_weight: float = 2.0):
+                 mel_recon_loss_weight_linspace_max: float = 1.0,
+                 complex_stft_loss_weight: float = 2.0,
+                 phase_loss_weight: float = 1.0,
+                 phase_ip_loss_weight: float = 1.0,
+                 phase_iaf_loss_weight: float = 1.0,
+                 phase_gd_loss_weight: float = 1.0,
+                 high_freq_stft_loss_weight: float = 0.0,
+                 high_freq_stft_cutoff_bin: int = 256,
+    ):
         super().__init__()
         self.config = config
         self.sc_loss_weight = sc_loss_weight
         self.mag_loss_weight = mag_loss_weight
         self.waveform_l1_loss_weight = waveform_l1_loss_weight
         self.mel_recon_loss_weight = mel_recon_loss_weight
+        self.mel_recon_loss_weight_linspace_max = mel_recon_loss_weight_linspace_max
         self.complex_stft_loss_weight = complex_stft_loss_weight
+        self.phase_loss_weight = phase_loss_weight
+        self.phase_ip_loss_weight = phase_ip_loss_weight
+        self.phase_iaf_loss_weight = phase_iaf_loss_weight
+        self.phase_gd_loss_weight = phase_gd_loss_weight
+        self.high_freq_stft_loss_weight = high_freq_stft_loss_weight
+
+        self.n_fft = config.audio_n_fft
+        self.hop_length = config.audio_hop_length
+
+        self.shared_window_buffer = shared_window_buffer
 
         # AudioVocoder from megatransformer_audio_decoder
         self.vocoder = AudioVocoder(
@@ -305,18 +326,29 @@ class VocoderWithLoss(nn.Module):
         )
 
         # Loss functions
-        self.stft_loss = MultiResolutionSTFTLoss()
+        self.stft_loss = MultiResolutionSTFTLoss(shared_window_buffer=shared_window_buffer)
         self.mel_recon_loss = StableMelSpectrogramLoss(
+            shared_window_buffer=shared_window_buffer,
             sample_rate=config.audio_sample_rate,
-            n_fft=config.audio_n_fft,
-            hop_length=config.audio_hop_length,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
             n_mels=config.audio_n_mels,
+            mel_recon_loss_weight_linspace_max=self.mel_recon_loss_weight_linspace_max
         )
+        if phase_loss_weight > 0.0:
+            self.phase_loss = PhaseLoss(shared_window_buffer=shared_window_buffer, config=config)
+        else:
+            self.phase_loss = None
+        if high_freq_stft_loss_weight > 0.0:
+            self.high_freq_stft_loss = HighFreqSTFTLoss(shared_window_buffer=shared_window_buffer, n_fft=config.audio_n_fft, cutoff_bin=high_freq_stft_cutoff_bin)
+        else:
+            self.high_freq_stft_loss = None
 
     def forward(
         self,
         mel_spec: torch.Tensor,
         waveform_labels: Optional[torch.Tensor] = None,
+        target_complex_stfts: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         # Generate waveform through vocoder
         pred_waveform: torch.Tensor = self.vocoder(mel_spec)
@@ -341,42 +373,102 @@ class VocoderWithLoss(nn.Module):
                 waveform_labels_aligned.unsqueeze(1) if waveform_labels_aligned.dim() == 2 else waveform_labels_aligned
             )
 
-            mel_recon_loss = self.mel_recon_loss(pred_waveform_aligned, mel_spec)
+            mel_recon_loss_value = self.mel_recon_loss(pred_waveform_aligned, mel_spec)
 
-            total_loss = (self.sc_loss_weight * sc_loss) + (self.mag_loss_weight * mag_loss) + (self.complex_stft_loss_weight * complex_stft_loss) + (self.waveform_l1_loss_weight * waveform_l1) + (self.mel_recon_loss_weight * mel_recon_loss)
+            if target_complex_stfts is None:
+                target_complex_stfts = torch.stft(
+                    waveform_labels_aligned.to(torch.float32), self.n_fft, self.hop_length,
+                    window=self.shared_window_buffer.get_window(self.n_fft, waveform_labels_aligned.device), return_complex=True
+                )
+
+            if self.phase_loss is not None:
+                ip_loss, iaf_loss, gd_loss = self.phase_loss(
+                    pred_waveform_aligned,
+                    waveform_labels_aligned,
+                    target_complex_stfts=target_complex_stfts
+                )
+                phase_loss_value = (self.phase_ip_loss_weight * ip_loss +
+                                    self.phase_iaf_loss_weight * iaf_loss +
+                                    self.phase_gd_loss_weight * gd_loss)
+            else:
+                ip_loss = iaf_loss = gd_loss = phase_loss_value = 0.0
+
+            if self.high_freq_stft_loss is not None:
+                high_freq_stft_loss_value = self.high_freq_stft_loss(
+                    pred_waveform_aligned,
+                    waveform_labels_aligned,
+                    target_complex_stfts=target_complex_stfts
+                )
+            else:
+                high_freq_stft_loss_value = 0.0
+
+            total_loss = (self.sc_loss_weight * sc_loss +
+                          self.mag_loss_weight * mag_loss +
+                          self.complex_stft_loss_weight * complex_stft_loss +
+                          self.waveform_l1_loss_weight * waveform_l1 + 
+                          self.mel_recon_loss_weight * mel_recon_loss_value +
+                          self.phase_loss_weight * phase_loss_value +
+                          self.high_freq_stft_loss_weight * high_freq_stft_loss_value)
 
             outputs.update({
                 "loss": total_loss,
                 "waveform_l1": waveform_l1,
                 "sc_loss": sc_loss,
                 "mag_loss": mag_loss,
-                "mel_recon_loss": mel_recon_loss,
+                "mel_recon_loss": mel_recon_loss_value,
                 "complex_stft_loss": complex_stft_loss,
+                "phase_loss": phase_loss_value,
+                "phase_ip_loss": ip_loss,
+                "phase_iaf_loss": iaf_loss,
+                "phase_gd_loss": gd_loss,
+                "high_freq_stft_loss": high_freq_stft_loss_value,
             })
 
         return outputs
 
 
-def create_small_vocoder_model(sc_loss_weight, mag_loss_weight, waveform_l1_loss_weight, mel_recon_loss_weight, complex_stft_loss_weight) -> VocoderWithLoss:
+def create_small_vocoder_model(
+        shared_window_buffer: SharedWindowBuffer,
+        sc_loss_weight,
+        mag_loss_weight,
+        waveform_l1_loss_weight,
+        mel_recon_loss_weight,
+        mel_recon_loss_weight_linspace_max,
+        complex_stft_loss_weight,
+        phase_loss_weight,
+        phase_ip_loss_weight,
+        phase_iaf_loss_weight,
+        phase_gd_loss_weight,
+        high_freq_stft_loss_weight,
+        high_freq_stft_cutoff_bin,
+    ) -> VocoderWithLoss:
     """Create a small vocoder model for testing."""
     config = megatransformer_utils.MegaTransformerConfig(
         hidden_size=512,
-        audio_n_mels=128,
+        audio_n_mels=80,
         audio_n_fft=1024,
-        audio_hop_length=512,
+        audio_hop_length=256,
         audio_max_duration=10.0,
         audio_sample_rate=16000,
-        audio_vocoder_hidden_channels=384,
-        audio_vocoder_upsample_factors=[8, 8, 8],
-        audio_vocoder_n_residual_layers=3,
+        audio_vocoder_hidden_channels=256,
+        audio_vocoder_upsample_factors=[8, 8, 4],
+        audio_vocoder_n_residual_layers=4,
     )
     return VocoderWithLoss(
-        config,
+        shared_window_buffer=shared_window_buffer,
+        config=config,
         sc_loss_weight=sc_loss_weight,
         mag_loss_weight=mag_loss_weight,
         waveform_l1_loss_weight=waveform_l1_loss_weight,
         mel_recon_loss_weight=mel_recon_loss_weight,
+        mel_recon_loss_weight_linspace_max=mel_recon_loss_weight_linspace_max,
         complex_stft_loss_weight=complex_stft_loss_weight,
+        phase_loss_weight=phase_loss_weight,
+        phase_ip_loss_weight=phase_ip_loss_weight,
+        phase_iaf_loss_weight=phase_iaf_loss_weight,
+        phase_gd_loss_weight=phase_gd_loss_weight,
+        high_freq_stft_loss_weight=high_freq_stft_loss_weight,
+        high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
     )
 
 
