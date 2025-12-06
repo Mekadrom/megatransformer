@@ -1,8 +1,9 @@
+from typing import Literal
 import torch
 import torch.nn as nn
 
 import megatransformer_utils
-from model.activations import Snake
+from model.activations import Snake, SwiGLU
 from model.audio.shared_window_buffer import SharedWindowBuffer
 
 
@@ -11,18 +12,20 @@ class ConvNeXtBlock(nn.Module):
     ConvNeXt-style block - efficient and effective for audio.
     Depthwise conv -> pointwise expand -> pointwise contract
     """
-    
     def __init__(self, dim, kernel_size=7, expansion=4):
         super().__init__()
+         # depthwise conv1d
         self.dwconv = nn.Conv1d(
-            dim, dim, kernel_size, 
-            padding=kernel_size // 2, 
-            groups=dim  # Depthwise
+            dim, dim, kernel_size,
+            padding=kernel_size // 2,
+            groups=dim
         )
+        
+        # pointwise (linear is good enough)
         self.norm = nn.LayerNorm(dim)
-        self.pwconv1 = nn.Linear(dim, dim * expansion)  # Pointwise expand
+        self.pwconv1 = nn.Linear(dim, dim * expansion)
         self.act = nn.GELU()
-        self.pwconv2 = nn.Linear(dim * expansion, dim)  # Pointwise contract
+        self.pwconv2 = nn.Linear(dim * expansion, dim)
     
     def forward(self, x):
         # x: [B, C, T]
@@ -46,7 +49,6 @@ class FrequencyDomainVocoder(nn.Module):
     
     No upsampling needed - mel frames and STFT frames have same time resolution.
     """
-    
     def __init__(
         self,
         shared_window_buffer: SharedWindowBuffer,
@@ -55,34 +57,39 @@ class FrequencyDomainVocoder(nn.Module):
         hop_length: int = 256,
         hidden_dim: int = 512,
         num_layers: int = 8,
+        convnext_mult: int = 4,
+        phase_activation_fn: str = 'snake',
     ):
         super().__init__()
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.freq_bins = n_fft // 2 + 1  # 513 for n_fft=1024
         
-        # Input projection: mel bins -> hidden
+        # input projection: mel bins -> hidden
         self.input_proj = nn.Conv1d(n_mels, hidden_dim, kernel_size=7, padding=3)
         
-        # Backbone - no upsampling, just channel transformations
+        # backbone - no upsampling, just channel transformations
         self.backbone = nn.ModuleList([
-            ConvNeXtBlock(hidden_dim) for _ in range(num_layers)
+            ConvNeXtBlock(hidden_dim, expansion=convnext_mult) for _ in range(num_layers)
         ])
         
-        # Magnitude head - must output positive values
+        # magnitude head - must output positive values
         self.mag_head = nn.Sequential(
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=7, padding=3),
             nn.GELU(),
             nn.Conv1d(hidden_dim, self.freq_bins, kernel_size=7, padding=3),
-            nn.Softplus(),  # Ensures positive magnitude
+            nn.Softplus(),
         )
         
+        act_type = megatransformer_utils.get_activation_type(phase_activation_fn)
+        self.act: nn.Module = act_type(hidden_dim) if act_type in [Snake, SwiGLU] else act_type()
+
         # Phase head - outputs angle directly, then we use cos/sin for unit phasor
-        # Snake activation is periodic-aware, good for angle prediction
+        # Snake activation is periodic-aware, might be good for angle prediction
         self.phase_head = nn.Sequential(
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=7, padding=3),
-            Snake(hidden_dim),
-            nn.Conv1d(hidden_dim, self.freq_bins, kernel_size=7, padding=3),  # Just one output per bin (the angle)
+            self.act,
+            nn.Conv1d(hidden_dim, self.freq_bins, kernel_size=7, padding=3),  # just one output per bin (the angle)
         )
         
         # iSTFT window
@@ -123,7 +130,7 @@ class FrequencyDomainVocoder(nn.Module):
 
         # Debug: check input_proj weights
         # megatransformer_utils.print_debug_tensor('vocoder_input_proj_weight', self.input_proj.weight)
-        if self.input_proj.bias is not None:
+        # if self.input_proj.bias is not None:
             # megatransformer_utils.print_debug_tensor('vocoder_input_proj_bias', self.input_proj.bias)
 
         # Backbone

@@ -377,15 +377,15 @@ class VocoderWithLoss(nn.Module):
                           self.direct_mag_loss_weight * direct_mag_loss)
 
             # Debug: log all losses to catch spikes
-            megatransformer_utils.print_debug_tensor('loss_waveform_l1', waveform_l1)
-            megatransformer_utils.print_debug_tensor('loss_sc', sc_loss)
-            megatransformer_utils.print_debug_tensor('loss_mag', mag_loss)
-            megatransformer_utils.print_debug_tensor('loss_complex_stft', complex_stft_loss)
-            megatransformer_utils.print_debug_tensor('loss_mel_recon', mel_recon_loss_value)
-            megatransformer_utils.print_debug_tensor('loss_phase', phase_loss_value)
-            megatransformer_utils.print_debug_tensor('loss_high_freq_stft', high_freq_stft_loss_value)
-            megatransformer_utils.print_debug_tensor('loss_direct_mag', direct_mag_loss)
-            megatransformer_utils.print_debug_tensor('loss_total', total_loss)
+            # megatransformer_utils.print_debug_tensor('loss_waveform_l1', waveform_l1)
+            # megatransformer_utils.print_debug_tensor('loss_sc', sc_loss)
+            # megatransformer_utils.print_debug_tensor('loss_mag', mag_loss)
+            # megatransformer_utils.print_debug_tensor('loss_complex_stft', complex_stft_loss)
+            # megatransformer_utils.print_debug_tensor('loss_mel_recon', mel_recon_loss_value)
+            # megatransformer_utils.print_debug_tensor('loss_phase', phase_loss_value)
+            # megatransformer_utils.print_debug_tensor('loss_high_freq_stft', high_freq_stft_loss_value)
+            # megatransformer_utils.print_debug_tensor('loss_direct_mag', direct_mag_loss)
+            # megatransformer_utils.print_debug_tensor('loss_total', total_loss)
 
             outputs.update({
                 "loss": total_loss,
@@ -404,6 +404,18 @@ class VocoderWithLoss(nn.Module):
 
         return outputs
 
+
+really_tiny_freq_domain_config = megatransformer_utils.MegaTransformerConfig(
+    hidden_size=256,
+    audio_n_mels=80,
+    audio_n_fft=1024,
+    audio_hop_length=256,
+    audio_max_duration=10.0,
+    audio_sample_rate=16000,
+    audio_vocoder_hidden_channels=128,
+    audio_vocoder_upsample_factors=[8],  # this is the convnext mult instead
+    audio_vocoder_n_residual_layers=3,
+)
 
 tiny_config = megatransformer_utils.MegaTransformerConfig(
     hidden_size=256,
@@ -491,6 +503,7 @@ def create_freq_domain_vocoder(
             hop_length=config.audio_hop_length,
             hidden_dim=config.audio_vocoder_hidden_channels,
             num_layers=config.audio_vocoder_n_residual_layers,
+            convnext_mult=config.audio_vocoder_upsample_factors[-1],  # 4 most of the time
         ),
         shared_window_buffer=shared_window_buffer,
         config=config,
@@ -519,4 +532,9 @@ model_config_lookup = {
         config=tiny_config,
         **kwargs
     ),
+    "really_tiny_freq_domain_vocoder": lambda shared_window_buffer, **kwargs: create_freq_domain_vocoder(
+        shared_window_buffer=shared_window_buffer,
+        config=really_tiny_config,
+        **kwargs
+    )
 }

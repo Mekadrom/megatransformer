@@ -532,6 +532,8 @@ def get_activation_type(activation_function_name):
         return nn.Sigmoid
     elif activation_function_name == 'swiglu':
         return activations.SwiGLU
+    elif activation_function_name == 'snake':
+        return activations.Snake
     elif activation_function_name == 'none':
         return nn.Identity
     else:
