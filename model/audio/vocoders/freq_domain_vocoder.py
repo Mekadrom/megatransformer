@@ -85,7 +85,7 @@ class FrequencyDomainVocoder(nn.Module):
         )
         
         # iSTFT window
-        self.register_buffer('window', shared_window_buffer.get_window(n_fft))
+        self.register_buffer('window', shared_window_buffer.get_window(n_fft, torch.device('cpu')))
         
         self._init_weights()
     
@@ -146,10 +146,11 @@ class FrequencyDomainVocoder(nn.Module):
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             window=self.window.to(stft.device),
+            length=mel.size(-1) * self.hop_length,
             return_complex=False,
         )
         
-        return waveform
+        return waveform, stft
     
     def get_phase(self, stft):
         """Extract phase angle from predicted STFT for loss computation."""

@@ -139,7 +139,7 @@ class PhaseAwareSpectrogramDiscriminator(nn.Module):
             nn.Conv2d(channels[-1], 1, kernel_size=(3, 3), padding=(1, 1))
         )
 
-    def forward(self, x: torch.Tensor, spec: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Args:
             x: [B, T] waveform
@@ -149,24 +149,22 @@ class PhaseAwareSpectrogramDiscriminator(nn.Module):
         """
         # Compute STFT magnitude
         # x: [B, T] -> spec: [B, F, T']
-        if spec is None:
-            spec = torch.stft(
-                x,
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                win_length=self.win_length,
-                window=self.window[:self.win_length],
-                return_complex=True
-            )
-        spec = spec.abs()  # Magnitude spectrogram
+        spec = torch.stft(
+            x,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            return_complex=True
+        )
         x = torch.stack([spec.real, spec.imag], dim=1)
         
         features = []
         for conv in self.convs:
-            spec = conv(spec)
-            features.append(spec)
+            x = conv(x)
+            features.append(x)
         
-        out = self.conv_post(spec)
+        out = self.conv_post(x)
         features.append(out)
         
         return out.flatten(1, -1), features
@@ -228,7 +226,7 @@ class MultiResolutionSpectrogramDiscriminator(nn.Module):
         ])
 
     def forward(
-        self, x: torch.Tensor, pred_stft: Optional[torch.Tensor] = None
+        self, x: torch.Tensor
     ) -> tuple[list[torch.Tensor], list[list[torch.Tensor]]]:
         """
         Args:
@@ -241,7 +239,7 @@ class MultiResolutionSpectrogramDiscriminator(nn.Module):
         all_features = []
         
         for disc in self.discriminators:
-            out, feats = disc(x, pred_stft=pred_stft)
+            out, feats = disc(x)
             outputs.append(out)
             all_features.append(feats)
         
@@ -267,9 +265,7 @@ class CombinedDiscriminator(nn.Module):
         self.mpd = MultiPeriodDiscriminator(periods=mpd_periods)
         self.msd = MultiScaleDiscriminator(n_msd_scales)
         self.mrsd = MultiResolutionSpectrogramDiscriminator(shared_window_buffer=shared_window_buffer, resolutions=mrsd_resolutions, channels=mrsd_channels)
-    def forward(
-        self, x: torch.Tensor, pred_stft: Optional[torch.Tensor] = None
-    ) -> dict[str, tuple[list[torch.Tensor], list[list[torch.Tensor]]]]:
+    def forward(self, x: torch.Tensor) -> dict[str, tuple[list[torch.Tensor], list[list[torch.Tensor]]]]:
         """
         Args:
             x: [B, T] waveform
@@ -277,26 +273,12 @@ class CombinedDiscriminator(nn.Module):
             Dictionary with outputs and features from each discriminator type
         """
         results = {
-            "mpd": self.mpd(x, pred_stft=pred_stft),
-            "msd": self.msd(x, pred_stft=pred_stft),
-            "mrsd": self.mrsd(x, pred_stft=pred_stft),
+            "mpd": self.mpd(x),
+            "msd": self.msd(x),
+            "mrsd": self.mrsd(x),
         }
         return results
 
-
-def small_combined_disc_pre_2_1(shared_window_buffer: SharedWindowBuffer) -> CombinedDiscriminator:
-    """Creates a CombinedDiscriminator with pre-2.1 configuration."""
-    return CombinedDiscriminator(
-        shared_window_buffer=shared_window_buffer,
-        mpd_periods=[2, 3, 5, 7, 11],
-        n_msd_scales=3,
-        mrsd_resolutions=[
-            (1024, 256, 1024),
-            (2048, 512, 2048),
-            (512, 128, 512),
-            # (256, 64, 256),
-        ],
-    )
 
 def small_combined_disc(shared_window_buffer: SharedWindowBuffer) -> CombinedDiscriminator:
     """Creates a CombinedDiscriminator with updated configuration."""
@@ -314,6 +296,5 @@ def small_combined_disc(shared_window_buffer: SharedWindowBuffer) -> CombinedDis
     )
 
 model_config_lookup = {
-    "small_combined_disc_pre_2.1": small_combined_disc_pre_2_1,
     "small_combined_disc": small_combined_disc,
 }

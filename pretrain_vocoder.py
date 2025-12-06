@@ -1,11 +1,11 @@
 import os
 
 from dataset_loading.vocoder_dataset import CachedVocoderDataset, VocoderDataCollator
-from model.audio import vocoders
 from model.audio import discriminators
 from model.audio.criteria import compute_discriminator_losses, compute_generator_losses
 from model.audio.discriminators import CombinedDiscriminator
 from model.audio.shared_window_buffer import SharedWindowBuffer
+from model.audio.vocoders import vocoders
 from model.audio.vocoders.vocoders import VocoderWithLoss
 
 os.environ["DEEPSPEED_UNIT_TEST"] = "1"
@@ -468,8 +468,8 @@ class VocoderGANTrainer(Trainer):
                 device_type = pred_waveform.device.type
                 dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
                 with autocast(device_type, dtype=dtype, enabled=self.args.fp16 or self.args.bf16):
-                    disc_real = self.discriminator(waveform_labels_aligned, pred_stft=pred_stft)
-                    disc_fake = self.discriminator(pred_waveform_detached, pred_stf=pred_stft)
+                    disc_real = self.discriminator(waveform_labels_aligned)
+                    disc_fake = self.discriminator(pred_waveform_detached)
 
                 d_losses = compute_discriminator_losses(disc_real, disc_fake)
 
@@ -676,18 +676,18 @@ def main():
 
     model = vocoders.model_config_lookup[args.config](
         shared_window_buffer,
-        sc_loss_weight,
-        mag_loss_weight,
-        waveform_l1_loss_weight,
-        mel_recon_loss_weight,
-        mel_recon_loss_weight_linspace_max,
-        complex_stft_loss_weight,
-        phase_loss_weight,
-        phase_ip_loss_weight,
-        phase_iaf_loss_weight,
-        phase_gd_loss_weight,
-        high_freq_stft_loss_weight,
-        high_freq_stft_cutoff_bin,
+        sc_loss_weight=sc_loss_weight,
+        mag_loss_weight=mag_loss_weight,
+        waveform_l1_loss_weight=waveform_l1_loss_weight,
+        mel_recon_loss_weight=mel_recon_loss_weight,
+        mel_recon_loss_weight_linspace_max=mel_recon_loss_weight_linspace_max,
+        complex_stft_loss_weight=complex_stft_loss_weight,
+        phase_loss_weight=phase_loss_weight,
+        phase_ip_loss_weight=phase_ip_loss_weight,
+        phase_iaf_loss_weight=phase_iaf_loss_weight,
+        phase_gd_loss_weight=phase_gd_loss_weight,
+        high_freq_stft_loss_weight=high_freq_stft_loss_weight,
+        high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
     )
     model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
 

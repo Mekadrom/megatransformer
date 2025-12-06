@@ -28,13 +28,14 @@ class AntiAliasedUpsampleVocoderUpsampleBlock(nn.Module):
         
         self.lowpass_padding = num_taps // 2
         
+
+        # Channel projection
+        self.conv =  nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size // 2)
+
         # init before weight norm
         self._init_weights()
 
-        # Channel projection
-        self.conv = nn.utils.weight_norm(
-            nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size // 2)
-        )
+        self.conv = nn.utils.weight_norm(self.conv)
 
         self.act = Snake(out_channels)
 

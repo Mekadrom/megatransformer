@@ -8,6 +8,7 @@ from model.activations import Snake
 from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss
 from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders.convtranspose1d_vocoder import ConvTranspose1DVocoderUpsampleBlock, Vocoder
+from model.audio.vocoders.freq_domain_vocoder import FrequencyDomainVocoder
 from model.audio.vocoders.upsample_vocoder import AntiAliasedUpsampleVocoderUpsampleBlock
 
 
@@ -275,7 +276,12 @@ class VocoderWithLoss(nn.Module):
         else:
             self.phase_loss = None
         if high_freq_stft_loss_weight > 0.0:
-            self.high_freq_stft_loss = HighFreqSTFTLoss(shared_window_buffer=shared_window_buffer, n_fft=config.audio_n_fft, cutoff_bin=high_freq_stft_cutoff_bin)
+            self.high_freq_stft_loss = HighFreqSTFTLoss(
+                shared_window_buffer=shared_window_buffer,
+                n_fft=config.audio_n_fft,
+                hop_length=config.audio_hop_length,
+                cutoff_bin=high_freq_stft_cutoff_bin
+            )
         else:
             self.high_freq_stft_loss = None
 
@@ -330,8 +336,8 @@ class VocoderWithLoss(nn.Module):
                 ip_loss, iaf_loss, gd_loss = self.phase_loss(
                     pred_waveform_aligned,
                     waveform_labels_aligned,
-                    pred_stft=pred_stft,
-                    target_complex_stfts=target_complex_stfts
+                    target_complex_stfts=target_complex_stfts,
+                    precomputed_stft=pred_stft,
                 )
                 phase_loss_value = (self.phase_ip_loss_weight * ip_loss +
                                     self.phase_iaf_loss_weight * iaf_loss +
@@ -344,7 +350,7 @@ class VocoderWithLoss(nn.Module):
                     pred_waveform_aligned,
                     waveform_labels_aligned,
                     target_complex_stfts=target_complex_stfts,
-                    pred_stft=pred_stft
+                    precomputed_stft=pred_stft
                 )
             else:
                 high_freq_stft_loss_value = 0.0
@@ -374,34 +380,37 @@ class VocoderWithLoss(nn.Module):
         return outputs
 
 
-def create_small_convtranspose1d_vocoder_model(
+small_config = megatransformer_utils.MegaTransformerConfig(
+    hidden_size=512,
+    audio_n_mels=80,
+    audio_n_fft=1024,
+    audio_hop_length=256,
+    audio_max_duration=10.0,
+    audio_sample_rate=16000,
+    audio_vocoder_hidden_channels=256,
+    audio_vocoder_upsample_factors=[8, 8, 4],
+    audio_vocoder_n_residual_layers=4,
+)
+
+def create_vocoder(
+        vocoder: nn.Module,
         shared_window_buffer: SharedWindowBuffer,
-        sc_loss_weight,
-        mag_loss_weight,
-        waveform_l1_loss_weight,
-        mel_recon_loss_weight,
-        mel_recon_loss_weight_linspace_max,
-        complex_stft_loss_weight,
-        phase_loss_weight,
-        phase_ip_loss_weight,
-        phase_iaf_loss_weight,
-        phase_gd_loss_weight,
-        high_freq_stft_loss_weight,
-        high_freq_stft_cutoff_bin,
-    ) -> VocoderWithLoss:
-    """Create a small vocoder model for testing."""
-    config = megatransformer_utils.MegaTransformerConfig(
-        hidden_size=512,
-        audio_n_mels=80,
-        audio_n_fft=1024,
-        audio_hop_length=256,
-        audio_max_duration=10.0,
-        audio_sample_rate=16000,
-        audio_vocoder_hidden_channels=256,
-        audio_vocoder_upsample_factors=[8, 8, 4],
-        audio_vocoder_n_residual_layers=4,
-    )
+        config: megatransformer_utils.MegaTransformerConfig,
+        **kwargs,
+) -> VocoderWithLoss:
     return VocoderWithLoss(
+        vocoder=vocoder,
+        shared_window_buffer=shared_window_buffer,
+        config=config,
+        **kwargs,
+    )
+
+def create_convtranspose1d_vocoder(
+        shared_window_buffer: SharedWindowBuffer,
+        config: megatransformer_utils.MegaTransformerConfig,
+        **kwargs,
+) -> VocoderWithLoss:
+    return create_vocoder(
         vocoder=Vocoder(
             upsample_block_class=ConvTranspose1DVocoderUpsampleBlock,
             hidden_channels=config.audio_vocoder_hidden_channels,
@@ -411,49 +420,15 @@ def create_small_convtranspose1d_vocoder_model(
         ),
         shared_window_buffer=shared_window_buffer,
         config=config,
-        sc_loss_weight=sc_loss_weight,
-        mag_loss_weight=mag_loss_weight,
-        waveform_l1_loss_weight=waveform_l1_loss_weight,
-        mel_recon_loss_weight=mel_recon_loss_weight,
-        mel_recon_loss_weight_linspace_max=mel_recon_loss_weight_linspace_max,
-        complex_stft_loss_weight=complex_stft_loss_weight,
-        phase_loss_weight=phase_loss_weight,
-        phase_ip_loss_weight=phase_ip_loss_weight,
-        phase_iaf_loss_weight=phase_iaf_loss_weight,
-        phase_gd_loss_weight=phase_gd_loss_weight,
-        high_freq_stft_loss_weight=high_freq_stft_loss_weight,
-        high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
+        **kwargs,
     )
 
-
-def create_small_upsample_vocoder_model(
+def create_upsample_vocoder(
         shared_window_buffer: SharedWindowBuffer,
-        sc_loss_weight,
-        mag_loss_weight,
-        waveform_l1_loss_weight,
-        mel_recon_loss_weight,
-        mel_recon_loss_weight_linspace_max,
-        complex_stft_loss_weight,
-        phase_loss_weight,
-        phase_ip_loss_weight,
-        phase_iaf_loss_weight,
-        phase_gd_loss_weight,
-        high_freq_stft_loss_weight,
-        high_freq_stft_cutoff_bin,
-    ) -> VocoderWithLoss:
-    """Create a small vocoder model for testing."""
-    config = megatransformer_utils.MegaTransformerConfig(
-        hidden_size=512,
-        audio_n_mels=80,
-        audio_n_fft=1024,
-        audio_hop_length=256,
-        audio_max_duration=10.0,
-        audio_sample_rate=16000,
-        audio_vocoder_hidden_channels=256,
-        audio_vocoder_upsample_factors=[8, 8, 4],
-        audio_vocoder_n_residual_layers=4,
-    )
-    return VocoderWithLoss(
+        config: megatransformer_utils.MegaTransformerConfig,
+        **kwargs,
+) -> VocoderWithLoss:
+    return create_vocoder(
         vocoder=Vocoder(
             upsample_block_class=AntiAliasedUpsampleVocoderUpsampleBlock,
             hidden_channels=config.audio_vocoder_hidden_channels,
@@ -463,21 +438,61 @@ def create_small_upsample_vocoder_model(
         ),
         shared_window_buffer=shared_window_buffer,
         config=config,
-        sc_loss_weight=sc_loss_weight,
-        mag_loss_weight=mag_loss_weight,
-        waveform_l1_loss_weight=waveform_l1_loss_weight,
-        mel_recon_loss_weight=mel_recon_loss_weight,
-        mel_recon_loss_weight_linspace_max=mel_recon_loss_weight_linspace_max,
-        complex_stft_loss_weight=complex_stft_loss_weight,
-        phase_loss_weight=phase_loss_weight,
-        phase_ip_loss_weight=phase_ip_loss_weight,
-        phase_iaf_loss_weight=phase_iaf_loss_weight,
-        phase_gd_loss_weight=phase_gd_loss_weight,
-        high_freq_stft_loss_weight=high_freq_stft_loss_weight,
-        high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
+        **kwargs,
     )
+
+def create_freq_domain_vocoder(
+        shared_window_buffer: SharedWindowBuffer,
+        config: megatransformer_utils.MegaTransformerConfig,
+        **kwargs,
+) -> VocoderWithLoss:
+    return create_vocoder(
+        vocoder=FrequencyDomainVocoder(
+            shared_window_buffer,
+            n_mels=config.audio_n_mels,
+            n_fft=config.audio_n_fft,
+            hop_length=config.audio_hop_length,
+            hidden_dim=config.audio_vocoder_hidden_channels,
+            num_layers=config.audio_vocoder_n_residual_layers,
+        ),
+        shared_window_buffer=shared_window_buffer,
+        config=config,
+        **kwargs,
+    )
+
+def create_small_convtranspose1d_vocoder_model(
+        shared_window_buffer: SharedWindowBuffer,
+        **kwargs
+    ) -> VocoderWithLoss:
+    return create_convtranspose1d_vocoder(
+        shared_window_buffer=shared_window_buffer,
+        config=small_config,
+        **kwargs
+    )
+
+def create_small_upsample_vocoder_model(
+        shared_window_buffer: SharedWindowBuffer,
+        **kwargs
+    ) -> VocoderWithLoss:
+    return create_upsample_vocoder(
+        shared_window_buffer=shared_window_buffer,
+        config=small_config,
+        **kwargs
+    )
+
+def create_small_freq_domain_vocoder_model(
+        shared_window_buffer: SharedWindowBuffer,
+        **kwargs,
+    ) -> VocoderWithLoss:
+    return create_freq_domain_vocoder(
+        shared_window_buffer=shared_window_buffer,
+        config=small_config,
+        **kwargs
+    )
+
 
 model_config_lookup = {
     "small_vocoder_convtranspose1d": create_small_convtranspose1d_vocoder_model,
     "small_vocoder_upsample": create_small_upsample_vocoder_model,
+    "small_freq_domain_vocoder": create_small_freq_domain_vocoder_model,
 }

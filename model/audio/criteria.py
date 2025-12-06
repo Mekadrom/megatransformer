@@ -317,18 +317,19 @@ class PhaseLoss(nn.Module):
 
 
 class HighFreqSTFTLoss(nn.Module):
-    def __init__(self, shared_window_buffer: SharedWindowBuffer, n_fft, cutoff_bin=256):
+    def __init__(self, shared_window_buffer: SharedWindowBuffer, n_fft, hop_length, cutoff_bin=256):
         super().__init__()
         self.n_fft = n_fft
         self.cutoff_bin = cutoff_bin
-        self.register_buffer('window', shared_window_buffer.get_window(1024, torch.device('cpu')))
+        self.hop_length = hop_length
+        self.register_buffer('window', shared_window_buffer.get_window(n_fft, torch.device('cpu')))
 
     def forward(self, pred_wav, target_wav, target_complex_stfts, precomputed_stft: Optional[torch.Tensor] = None):
         pred_wav = pred_wav.to(torch.float32)
         target_wav = target_wav.to(torch.float32)
 
         if precomputed_stft is None:
-            pred_stft = torch.stft(pred_wav, self.n_fft, window=self.window[:self.n_fft], return_complex=True)
+            pred_stft = torch.stft(pred_wav, self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
         else:
             pred_stft = precomputed_stft
         
@@ -337,8 +338,14 @@ class HighFreqSTFTLoss(nn.Module):
         pred_stft = pred_stft[..., :min_frames]
         target_complex_stfts = target_complex_stfts[..., :min_frames]
 
-        # Only penalize bins above cutoff (e.g., 256 = 4kHz at 16kHz SR)
-        return F.l1_loss(pred_stft[..., self.cutoff_bin:, :].abs(), target_complex_stfts[..., self.cutoff_bin:, :].abs())
+        pred_hf = pred_stft[..., self.cutoff_bin:, :].abs()
+        target_hf = target_complex_stfts[..., self.cutoff_bin:, :].abs()
+
+        weights = target_hf / (target_hf.sum(dim=-2, keepdim=True) + 1e-8)
+
+        log_target_hf = torch.log(target_hf.clamp(min=1e-7))
+        log_pred_hf = torch.log(pred_hf.clamp(min=1e-7))
+        return F.l1_loss(log_pred_hf, log_target_hf)
 
 
 def discriminator_loss(
