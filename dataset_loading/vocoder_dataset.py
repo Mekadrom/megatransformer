@@ -1,4 +1,6 @@
+from typing import Dict, List
 import torch
+import torch.nn.functional as F
 import os
 import json
 
@@ -49,3 +51,58 @@ class CachedVocoderDataset(Dataset):
             "waveform_labels": data["waveform_labels"],
             "target_complex_stfts": data["target_complex_stfts"],
         }
+
+
+class VocoderDataCollator:
+    """Data collator for vocoder training."""
+
+    def __init__(
+        self,
+        audio_max_frames: int,
+        audio_max_waveform_length: int,
+        n_mels: int,
+    ):
+        self.audio_max_frames = audio_max_frames
+        self.audio_max_waveform_length = audio_max_waveform_length
+        self.n_mels = n_mels
+
+    def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
+        mel_specs = []
+        waveforms = []
+        target_complex_stfts = []
+        for ex in examples:
+            if ex is None:
+                continue
+
+            mel = ex["mel_spec"]
+            if mel.shape[-1] < self.audio_max_frames:
+                mel = F.pad(mel, (0, self.audio_max_frames - mel.shape[-1]), value=0)
+            elif mel.shape[-1] > self.audio_max_frames:
+                mel = mel[..., :self.audio_max_frames]
+
+            wav = ex["waveform_labels"]
+            if wav.shape[-1] < self.audio_max_waveform_length:
+                wav = F.pad(wav, (0, self.audio_max_waveform_length - wav.shape[-1]), value=0)
+            elif wav.shape[-1] > self.audio_max_waveform_length:
+                wav = wav[..., :self.audio_max_waveform_length]
+            
+            target_complex_stft = ex["target_complex_stfts"]
+            if target_complex_stft.shape[-1] < self.audio_max_frames:
+                target_complex_stft = F.pad(target_complex_stft, (0, self.audio_max_frames - target_complex_stft.shape[-1]), value=0)
+            elif target_complex_stft.shape[-1] > self.audio_max_frames:
+                target_complex_stft = target_complex_stft[..., :self.audio_max_frames]
+
+            assert target_complex_stft.shape[-1] == mel.shape[-1], f"Mismatch in mel frames and stft frames: {mel.shape} vs {target_complex_stft.shape}. Max frames: {self.audio_max_frames}"
+
+            mel_specs.append(mel)
+            waveforms.append(wav)
+            target_complex_stfts.append(target_complex_stft)
+
+        # Stack tensors
+        batch = {
+            "mel_spec": torch.stack(mel_specs),
+            "waveform_labels": torch.stack(waveforms),
+            "target_complex_stfts": torch.stack(target_complex_stfts),
+        }
+
+        return batch

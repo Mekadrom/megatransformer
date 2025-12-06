@@ -1,12 +1,12 @@
 import os
 
-from dataset_loading.vocoder_dataset import CachedVocoderDataset
+from dataset_loading.vocoder_dataset import CachedVocoderDataset, VocoderDataCollator
 from model.audio import vocoders
 from model.audio import discriminators
 from model.audio.criteria import compute_discriminator_losses, compute_generator_losses
 from model.audio.discriminators import CombinedDiscriminator
 from model.audio.shared_window_buffer import SharedWindowBuffer
-from model.audio.vocoders import VocoderWithLoss
+from model.audio.vocoders.vocoders import VocoderWithLoss
 
 os.environ["DEEPSPEED_UNIT_TEST"] = "1"
 os.environ["NCCL_DEBUG"] = "INFO"
@@ -30,61 +30,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
-
-
-class VocoderDataCollator:
-    """Data collator for vocoder training."""
-
-    def __init__(
-        self,
-        audio_max_frames: int,
-        audio_max_waveform_length: int,
-        n_mels: int,
-    ):
-        self.audio_max_frames = audio_max_frames
-        self.audio_max_waveform_length = audio_max_waveform_length
-        self.n_mels = n_mels
-
-    def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
-        mel_specs = []
-        waveforms = []
-        target_complex_stfts = []
-        for ex in examples:
-            if ex is None:
-                continue
-
-            mel = ex["mel_spec"]
-            if mel.shape[-1] < self.audio_max_frames:
-                mel = F.pad(mel, (0, self.audio_max_frames - mel.shape[-1]), value=0)
-            elif mel.shape[-1] > self.audio_max_frames:
-                mel = mel[..., :self.audio_max_frames]
-
-            wav = ex["waveform_labels"]
-            if wav.shape[-1] < self.audio_max_waveform_length:
-                wav = F.pad(wav, (0, self.audio_max_waveform_length - wav.shape[-1]), value=0)
-            elif wav.shape[-1] > self.audio_max_waveform_length:
-                wav = wav[..., :self.audio_max_waveform_length]
-            
-            target_complex_stft = ex["target_complex_stfts"]
-            if target_complex_stft.shape[-1] < self.audio_max_frames:
-                target_complex_stft = F.pad(target_complex_stft, (0, self.audio_max_frames - target_complex_stft.shape[-1]), value=0)
-            elif target_complex_stft.shape[-1] > self.audio_max_frames:
-                target_complex_stft = target_complex_stft[..., :self.audio_max_frames]
-
-            assert target_complex_stft.shape[-1] == mel.shape[-1], f"Mismatch in mel frames and stft frames: {mel.shape} vs {target_complex_stft.shape}. Max frames: {self.audio_max_frames}"
-
-            mel_specs.append(mel)
-            waveforms.append(wav)
-            target_complex_stfts.append(target_complex_stft)
-
-        # Stack tensors
-        batch = {
-            "mel_spec": torch.stack(mel_specs),
-            "waveform_labels": torch.stack(waveforms),
-            "target_complex_stfts": torch.stack(target_complex_stfts),
-        }
-
-        return batch
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -182,111 +127,159 @@ class VocoderReconstructionCallback(TrainerCallback):
                             mel_spec=test_mel,
                             waveform_labels=test_waveform[0] if test_waveform.dim() > 1 else test_waveform,
                         )
+                        pred_waveform = torch.clamp(outputs["pred_waveform"], -1.0, 1.0)[0].to(torch.float64).cpu()
 
-                        pred_waveform = outputs["pred_waveform"]
-
-                        # Clip waveform to valid range
-                        pred_waveform = torch.clamp(pred_waveform, -1.0, 1.0)
-                        pred_waveform_cpu = pred_waveform[0].to(torch.float64).cpu()
-
-                        # Log ground truth audio
                         gt_waveform = self.test_audio_waveforms[e].to(torch.float64)
-                        writer.add_audio(
-                            f"vocoder_reconstruction/ground_truth/{e}",
-                            gt_waveform,
-                            global_step,
-                            sample_rate=self.audio_sample_rate,
-                        )
 
-                        # Log reconstructed audio
-                        writer.add_audio(
-                            f"vocoder_reconstruction/predicted/{e}",
-                            pred_waveform_cpu,
-                            global_step,
-                            sample_rate=self.audio_sample_rate,
-                        )
+                        self.log_audio(writer, gt_waveform, global_step, tag=f"vocoder_reconstruction/waveform/target/{e}")
+                        self.log_audio(writer, pred_waveform, global_step, tag=f"vocoder_reconstruction/waveform/output/{e}")
 
                         # Save reconstructed audio to file
-                        if self.trainer is not None and hasattr(self.trainer.args, "output_dir"):
-                            audio_filepath = os.path.join(
-                                self.trainer.args.output_dir,
-                                f"reconstructed_audio_step_{global_step}.wav"
-                            )
-                            self._save_audio_to_file(
-                                pred_waveform_cpu,
-                                audio_filepath,
-                                sample_rate=self.audio_sample_rate,
-                            )
+                        audio_filepath = os.path.join(self.trainer.args.output_dir, f"reconstructed_audio_step_{global_step}.wav")
+                        self._save_audio_to_file(pred_waveform, audio_filepath, sample_rate=self.audio_sample_rate)
 
-                        # Log mel spectrogram visualizations
-                        try:
-                            # Ground truth mel spectrogram
-                            writer.add_image(
-                                f"vocoder_reconstruction/mel_spec_input/{e}",
-                                self._visualize_mel_spec(
-                                    test_mel_spec.numpy(),
-                                    self.audio_sample_rate
-                                ),
-                                global_step,
-                            )
+                        self.log_mel_spec_visualization(writer, test_mel_spec, global_step, tag=f"vocoder_reconstruction/mel_spec/target/{e}")
+                        # Reconstructed waveform's mel spectrogram
+                        reconstructed_mel = audio_loading.extract_mels(
+                            self.shared_window_buffer,
+                            pred_waveform,
+                            sr=self.audio_sample_rate,
+                            n_mels=self.audio_n_mels,
+                            n_fft=self.audio_n_fft,
+                            hop_length=self.audio_hop_length,
+                        )
+                        self.log_mel_spec_visualization(writer, reconstructed_mel, global_step, tag=f"vocoder_reconstruction/mel_spec/output/{e}")
 
-                            # Reconstructed waveform's mel spectrogram
-                            reconstructed_mel = audio_loading.extract_mels(
-                                self.shared_window_buffer,
-                                pred_waveform_cpu,
-                                sr=self.audio_sample_rate,
-                                n_mels=self.audio_n_mels,
-                                n_fft=self.audio_n_fft,
-                                hop_length=self.audio_hop_length,
-                            )
-                            writer.add_image(
-                                f"vocoder_reconstruction/mel_spec_output/{e}",
-                                self._visualize_mel_spec(
-                                    reconstructed_mel.numpy(),
-                                    self.audio_sample_rate
-                                ),
-                                global_step,
-                            )
-                        except Exception as e:
-                            raise e
+
+                        target_stft = torch.stft(
+                            gt_waveform,
+                            n_fft=self.audio_n_fft,
+                            hop_length=self.audio_hop_length,
+                            window=self.shared_window_buffer.get_window(self.audio_n_fft, pred_waveform.device),
+                            return_complex=True,
+                        )
+                        reconstructed_stft = torch.stft(
+                            pred_waveform,
+                            n_fft=self.audio_n_fft,
+                            hop_length=self.audio_hop_length,
+                            window=self.shared_window_buffer.get_window(self.audio_n_fft, pred_waveform.device),
+                            return_complex=True,
+                        )
+                        self.log_phase_error(writer, reconstructed_stft, target_stft, global_step, tag=f"vocoder_reconstruction/phase_comparison/{e}")
+                        self.log_instantaneous_frequency(writer, target_stft, global_step, tag=f"vocoder_reconstruction/instantaneous_frequency/target/{e}")
+                        self.log_instantaneous_frequency(writer, reconstructed_stft, global_step, tag=f"vocoder_reconstruction/instantaneous_frequency/output/{e}")
+
+                        self.log_if_comparison(writer, reconstructed_stft, target_stft, global_step, tag=f"vocoder_reconstruction/if_comparison/{e}")
+
 
                     # Log losses (uses last outputs from test examples above)
                     if "loss" in outputs:
-                        writer.add_scalar(
-                            "vocoder_reconstruction/loss",
-                            outputs["loss"].item(),
-                            global_step,
-                        )
+                        writer.add_scalar("vocoder_reconstruction/loss", outputs["loss"].item(), global_step)
                     if "waveform_l1" in outputs:
-                        writer.add_scalar(
-                            "vocoder_reconstruction/waveform_l1",
-                            outputs["waveform_l1"].item(),
-                            global_step,
-                        )
+                        writer.add_scalar("vocoder_reconstruction/waveform_l1", outputs["waveform_l1"].item(), global_step)
                     if "sc_loss" in outputs:
-                        writer.add_scalar(
-                            "vocoder_reconstruction/sc_loss",
-                            outputs["sc_loss"].item(),
-                            global_step,
-                        )
+                        writer.add_scalar("vocoder_reconstruction/sc_loss", outputs["sc_loss"].item(), global_step)
                     if "mag_loss" in outputs:
-                        writer.add_scalar(
-                            "vocoder_reconstruction/mag_loss",
-                            outputs["mag_loss"].item(),
-                            global_step,
-                        )
+                        writer.add_scalar("vocoder_reconstruction/mag_loss", outputs["mag_loss"].item(), global_step)
                     if "mel_recon_loss" in outputs:
-                        writer.add_scalar(
-                            "vocoder_reconstruction/mel_recon_loss",
-                            outputs["mel_recon_loss"].item(),
-                            global_step,
-                        )
+                        writer.add_scalar("vocoder_reconstruction/mel_recon_loss", outputs["mel_recon_loss"].item(), global_step)
                     if "complex_stft_loss" in outputs:
-                        writer.add_scalar(
-                            "vocoder_reconstruction/complex_stft_loss",
-                            outputs["complex_stft_loss"].item(),
-                            global_step,
-                        )
+                        writer.add_scalar("vocoder_reconstruction/complex_stft_loss", outputs["complex_stft_loss"].item(), global_step)
+
+    def log_audio(self, writer: SummaryWriter, waveform: torch.Tensor, global_step, tag: str):
+        writer.add_audio(tag, waveform, global_step, sample_rate=self.audio_sample_rate)
+
+    def log_mel_spec_visualization(self, writer: SummaryWriter, mel_spec: torch.Tensor, global_step: int, tag: str):
+        writer.add_image(tag, self._visualize_mel_spec(mel_spec.numpy(), self.audio_sample_rate), global_step)
+
+    def log_phase_error(self, writer: SummaryWriter, pred_stft, target_stft, global_step: int, tag: str):
+        """Log phase error map to tensorboard."""
+        pred_phase = torch.angle(pred_stft)
+        target_phase = torch.angle(target_stft)
+        
+        # Match lengths
+        min_t = min(pred_phase.shape[-1], target_phase.shape[-1])
+        pred_phase = pred_phase[..., :min_t]
+        target_phase = target_phase[..., :min_t]
+        
+        # Anti-wrapped error, 0 = perfect, π = worst
+        error = torch.atan2(
+            torch.sin(pred_phase - target_phase),
+            torch.cos(pred_phase - target_phase)
+        ).abs()
+        
+        fig, ax = plt.subplots(figsize=(10, 4))
+        im = ax.imshow(error.cpu().numpy(), aspect='auto', origin='lower', cmap='magma', vmin=0, vmax=np.pi)
+        plt.colorbar(im, ax=ax, label='Phase error (radians)')
+        ax.set_ylabel('Frequency bin')
+        ax.set_xlabel('Time frame')
+        ax.set_title('Phase Error Map')
+        
+        writer.add_figure(tag, fig, global_step)
+        plt.close(fig)
+
+    def log_instantaneous_frequency(self, writer: SummaryWriter, stft, global_step: int, tag: str):
+        """Log instantaneous frequency deviation to tensorboard."""
+        phase = torch.angle(stft)
+        
+        inst_freq = torch.diff(phase, dim=-1)
+        inst_freq = torch.atan2(torch.sin(inst_freq), torch.cos(inst_freq))
+        inst_freq_hz = inst_freq * self.audio_sample_rate / (2 * np.pi * self.audio_hop_length)
+        
+        # Correct range based on hop_length
+        max_if = self.audio_sample_rate / (2 * self.audio_hop_length)  # ~31 Hz for your params
+        
+        fig, ax = plt.subplots(figsize=(10, 4))
+        im = ax.imshow(inst_freq_hz.cpu().numpy(), aspect='auto', origin='lower',
+                    cmap='coolwarm', vmin=-max_if, vmax=max_if)
+        plt.colorbar(im, ax=ax, label='Frequency deviation (Hz)')
+        ax.set_ylabel('Frequency bin')
+        ax.set_xlabel('Time frame')
+        ax.set_title('Instantaneous Frequency Deviation')
+        
+        writer.add_figure(tag, fig, global_step)
+        plt.close(fig)
+
+    def log_if_comparison(self, writer: SummaryWriter, pred_stft, target_stft, global_step: int, tag: str):
+        def compute_if(stft):
+            phase = torch.angle(stft)
+            inst_freq = torch.diff(phase, dim=-1)
+            inst_freq = torch.atan2(torch.sin(inst_freq), torch.cos(inst_freq))
+            return inst_freq * self.audio_sample_rate / (2 * np.pi * self.audio_hop_length)
+        
+        pred_if = compute_if(pred_stft).cpu().numpy()
+        target_if = compute_if(target_stft).cpu().numpy()
+        
+        min_t = min(pred_if.shape[-1], target_if.shape[-1])
+        pred_if = pred_if[..., :min_t]
+        target_if = target_if[..., :min_t]
+        
+        max_if = self.audio_sample_rate / (2 * self.audio_hop_length)
+        
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        
+        im0 = axes[0].imshow(target_if, aspect='auto', origin='lower', cmap='coolwarm', vmin=-max_if, vmax=max_if)
+        axes[0].set_title('Target IF')
+        axes[0].set_ylabel('Frequency bin')
+        axes[0].set_xlabel('Time frame')
+        plt.colorbar(im0, ax=axes[0], label='Hz')
+        
+        im1 = axes[1].imshow(pred_if, aspect='auto', origin='lower', cmap='coolwarm', vmin=-max_if, vmax=max_if)
+        axes[1].set_title('Predicted IF')
+        axes[1].set_ylabel('Frequency bin')
+        axes[1].set_xlabel('Time frame')
+        plt.colorbar(im1, ax=axes[1], label='Hz')
+        
+        # Error map: use 0 to max_if since it's absolute difference
+        im2 = axes[2].imshow(np.abs(pred_if - target_if), aspect='auto', origin='lower', cmap='magma', vmin=0, vmax=max_if)
+        axes[2].set_title('IF Error')
+        axes[2].set_ylabel('Frequency bin')
+        axes[2].set_xlabel('Time frame')
+        plt.colorbar(im2, ax=axes[2], label='Hz')
+        
+        plt.tight_layout()
+        writer.add_figure(tag, fig, global_step)
+        plt.close(fig)
 
     def _save_audio_to_file(
         self,
@@ -440,6 +433,7 @@ class VocoderGANTrainer(Trainer):
         # Get reconstruction losses from model
         recon_loss = outputs["loss"]
         pred_waveform = outputs["pred_waveform"]
+        pred_stft = outputs.get("pred_stft", None)
 
         # Ensure waveform_labels has correct shape
         if waveform_labels.dim() == 1:
@@ -474,8 +468,8 @@ class VocoderGANTrainer(Trainer):
                 device_type = pred_waveform.device.type
                 dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
                 with autocast(device_type, dtype=dtype, enabled=self.args.fp16 or self.args.bf16):
-                    disc_real = self.discriminator(waveform_labels_aligned)
-                    disc_fake = self.discriminator(pred_waveform_detached)
+                    disc_real = self.discriminator(waveform_labels_aligned, pred_stft=pred_stft)
+                    disc_fake = self.discriminator(pred_waveform_detached, pred_stf=pred_stft)
 
                 d_losses = compute_discriminator_losses(disc_real, disc_fake)
 

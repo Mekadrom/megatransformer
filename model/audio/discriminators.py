@@ -1,3 +1,4 @@
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -90,7 +91,7 @@ class ScaleDiscriminator(nn.Module):
         return x.flatten(1, -1), features
 
 
-class SpectrogramDiscriminator(nn.Module):
+class PhaseAwareSpectrogramDiscriminator(nn.Module):
     """
     Single spectrogram discriminator operating on STFT magnitudes.
     Uses 2D convolutions on the [frequency, time] spectrogram.
@@ -113,8 +114,8 @@ class SpectrogramDiscriminator(nn.Module):
         # Register window buffer
         self.register_buffer('window', shared_window_buffer.get_window(win_length, torch.device('cpu')))
         
-        # Input channels = 1 (magnitude spectrogram)
-        in_ch = 1
+        # Input channels = 2 (real and imaginary parts)
+        in_ch = 2
         self.convs = nn.ModuleList()
         
         for out_ch in channels:
@@ -138,7 +139,7 @@ class SpectrogramDiscriminator(nn.Module):
             nn.Conv2d(channels[-1], 1, kernel_size=(3, 3), padding=(1, 1))
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, spec: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Args:
             x: [B, T] waveform
@@ -148,18 +149,17 @@ class SpectrogramDiscriminator(nn.Module):
         """
         # Compute STFT magnitude
         # x: [B, T] -> spec: [B, F, T']
-        spec = torch.stft(
-            x,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window[:self.win_length],
-            return_complex=True
-        )
+        if spec is None:
+            spec = torch.stft(
+                x,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=self.window[:self.win_length],
+                return_complex=True
+            )
         spec = spec.abs()  # Magnitude spectrogram
-        
-        # Add channel dim: [B, F, T'] -> [B, 1, F, T']
-        spec = spec.unsqueeze(1)
+        x = torch.stack([spec.real, spec.imag], dim=1)
         
         features = []
         for conv in self.convs:
@@ -217,7 +217,7 @@ class MultiResolutionSpectrogramDiscriminator(nn.Module):
     ):
         super().__init__()
         self.discriminators = nn.ModuleList([
-            SpectrogramDiscriminator(
+            PhaseAwareSpectrogramDiscriminator(
                 shared_window_buffer=shared_window_buffer,
                 n_fft=n_fft,
                 hop_length=hop,
@@ -228,7 +228,7 @@ class MultiResolutionSpectrogramDiscriminator(nn.Module):
         ])
 
     def forward(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, pred_stft: Optional[torch.Tensor] = None
     ) -> tuple[list[torch.Tensor], list[list[torch.Tensor]]]:
         """
         Args:
@@ -241,7 +241,7 @@ class MultiResolutionSpectrogramDiscriminator(nn.Module):
         all_features = []
         
         for disc in self.discriminators:
-            out, feats = disc(x)
+            out, feats = disc(x, pred_stft=pred_stft)
             outputs.append(out)
             all_features.append(feats)
         
@@ -268,7 +268,7 @@ class CombinedDiscriminator(nn.Module):
         self.msd = MultiScaleDiscriminator(n_msd_scales)
         self.mrsd = MultiResolutionSpectrogramDiscriminator(shared_window_buffer=shared_window_buffer, resolutions=mrsd_resolutions, channels=mrsd_channels)
     def forward(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, pred_stft: Optional[torch.Tensor] = None
     ) -> dict[str, tuple[list[torch.Tensor], list[list[torch.Tensor]]]]:
         """
         Args:
@@ -277,11 +277,12 @@ class CombinedDiscriminator(nn.Module):
             Dictionary with outputs and features from each discriminator type
         """
         results = {
-            "mpd": self.mpd(x),
-            "msd": self.msd(x),
-            "mrsd": self.mrsd(x),
+            "mpd": self.mpd(x, pred_stft=pred_stft),
+            "msd": self.msd(x, pred_stft=pred_stft),
+            "mrsd": self.mrsd(x, pred_stft=pred_stft),
         }
         return results
+
 
 def small_combined_disc_pre_2_1(shared_window_buffer: SharedWindowBuffer) -> CombinedDiscriminator:
     """Creates a CombinedDiscriminator with pre-2.1 configuration."""

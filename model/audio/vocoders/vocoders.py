@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.parametrizations import weight_norm
 from typing import Dict, Optional, Literal
 
 import megatransformer_utils
-from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss
 from model.activations import Snake
+from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss
 from model.audio.shared_window_buffer import SharedWindowBuffer
+from model.audio.vocoders.convtranspose1d_vocoder import ConvTranspose1DVocoderUpsampleBlock, Vocoder
+from model.audio.vocoders.upsample_vocoder import AntiAliasedUpsampleVocoderUpsampleBlock
 
 
 class VocoderResidualBlock(nn.Module):
@@ -85,75 +86,14 @@ class VocoderResidualBlock(nn.Module):
         gate = torch.sigmoid(self.gate_conv(residual))
         return residual + gate * features
 
-class VocoderUpsampleBlock(nn.Module):
-    """Upsampling block for the vocoder."""
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        upsample_factor: int,
-        kernel_size: int = 8,
-        activation_fn: Literal["leaky_relu", "snake"] = 'leaky_relu',
-        snake_alpha_init: float = 1.0,
-        leaky_relu_slope: float = 0.1,
-        norm_type: Literal['batch', 'weight', 'group'] = 'weight'
-    ):
-        super().__init__()
-        self.activation_fn = activation_fn
-        self.leaky_relu_slope = leaky_relu_slope
-        
-        # Transposed convolution for upsampling
-        self.conv = nn.ConvTranspose1d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=upsample_factor,
-            padding=(kernel_size - upsample_factor) // 2
-        )
 
-        match activation_fn:
-            case 'leaky_relu':
-                self.act1 = nn.LeakyReLU(negative_slope=leaky_relu_slope)
-            case 'snake':
-                self.act1 = Snake(out_channels, snake_alpha_init)
-            case _:
-                raise ValueError(f"Unsupported activation function: {activation_fn}")
-
-        if norm_type == 'batch':
-            self.norm = nn.BatchNorm1d(out_channels)
-            self._init_weights()
-        elif norm_type == 'weight':
-            self.conv = weight_norm(self.conv)
-        elif norm_type == 'group':
-            # num_groups=32 is common, but adjust if out_channels isn't divisible
-            num_groups = min(32, out_channels)
-            self.norm = nn.GroupNorm(num_groups, out_channels)
-            self._init_weights()
-        else:
-            raise ValueError(f"Unsupported norm_type: {norm_type}")
-
-    def _init_weights(self):
-        if self.activation_fn == 'snake':
-            nn.init.xavier_uniform_(self.conv.weight, gain=1.0)
-        else:
-            nn.init.kaiming_normal_(self.conv.weight, a=self.leaky_relu_slope, mode='fan_out', nonlinearity='leaky_relu')
-        if self.conv.bias is not None:
-            nn.init.zeros_(self.conv.bias)
-        
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        features = self.conv(features)
-        if hasattr(self, "norm"):
-            features = self.norm(features)
-        features = self.act1(features)
-        return features
-
-
-class AudioVocoder(nn.Module):
+class Vocoder(nn.Module):
     def __init__(
         self,
         hidden_channels,
         in_channels: int,  # Number of mel bands
-        # Total upsampling of 256 (matching hop_length)
+        upsample_block_class,
+        residual_block_class = VocoderResidualBlock,
         upsample_factors: list[int] = [8, 8, 4],
         n_residual_layers: int = 3,
         dilation_cycle: int = 4,
@@ -181,7 +121,7 @@ class AudioVocoder(nn.Module):
 
         for factor in upsample_factors:
             self.upsample_blocks.append(
-                VocoderUpsampleBlock(
+                upsample_block_class(
                     current_channels,
                     current_channels // 2,
                     upsample_factor=factor,
@@ -195,7 +135,7 @@ class AudioVocoder(nn.Module):
             for i in range(n_residual_layers):
                 dilation = 2 ** (i % dilation_cycle)
                 scale_residual_blocks.append(
-                    VocoderResidualBlock(
+                    residual_block_class(
                         channels=current_channels,
                         dilation=dilation,
                         kernel_size=kernel_size,
@@ -283,6 +223,7 @@ class AudioVocoder(nn.Module):
 
 class VocoderWithLoss(nn.Module):
     def __init__(self,
+                 vocoder: nn.Module,
                  shared_window_buffer: SharedWindowBuffer,
                  config: megatransformer_utils.MegaTransformerConfig,
                  sc_loss_weight: float = 1.0,
@@ -299,6 +240,7 @@ class VocoderWithLoss(nn.Module):
                  high_freq_stft_cutoff_bin: int = 256,
     ):
         super().__init__()
+        self.vocoder = vocoder
         self.config = config
         self.sc_loss_weight = sc_loss_weight
         self.mag_loss_weight = mag_loss_weight
@@ -317,13 +259,6 @@ class VocoderWithLoss(nn.Module):
 
         self.shared_window_buffer = shared_window_buffer
 
-        # AudioVocoder from megatransformer_audio_decoder
-        self.vocoder = AudioVocoder(
-            hidden_channels=config.audio_vocoder_hidden_channels,
-            in_channels=config.audio_n_mels,
-            upsample_factors=config.audio_vocoder_upsample_factors,
-            n_residual_layers=config.audio_vocoder_n_residual_layers,
-        )
 
         # Loss functions
         self.stft_loss = MultiResolutionSTFTLoss(shared_window_buffer=shared_window_buffer)
@@ -351,9 +286,18 @@ class VocoderWithLoss(nn.Module):
         target_complex_stfts: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         # Generate waveform through vocoder
-        pred_waveform: torch.Tensor = self.vocoder(mel_spec)
+        o = self.vocoder(mel_spec)
+
+        if isinstance(o, tuple):
+            pred_waveform = o[0]
+            pred_stft = o[1]
+        else:
+            pred_waveform = o
+            pred_stft = None
 
         outputs = {"pred_waveform": pred_waveform}
+        if pred_stft is not None:
+            outputs["pred_stft"] = pred_stft
 
         if waveform_labels is not None:
             # Ensure waveform_labels has batch dimension to match pred_waveform
@@ -370,7 +314,8 @@ class VocoderWithLoss(nn.Module):
             # STFT loss expects [B, 1, T] shape
             sc_loss, mag_loss, complex_stft_loss = self.stft_loss(
                 pred_waveform_aligned.unsqueeze(1) if pred_waveform_aligned.dim() == 2 else pred_waveform_aligned,
-                waveform_labels_aligned.unsqueeze(1) if waveform_labels_aligned.dim() == 2 else waveform_labels_aligned
+                waveform_labels_aligned.unsqueeze(1) if waveform_labels_aligned.dim() == 2 else waveform_labels_aligned,
+                pred_stft=pred_stft
             )
 
             mel_recon_loss_value = self.mel_recon_loss(pred_waveform_aligned, mel_spec)
@@ -385,6 +330,7 @@ class VocoderWithLoss(nn.Module):
                 ip_loss, iaf_loss, gd_loss = self.phase_loss(
                     pred_waveform_aligned,
                     waveform_labels_aligned,
+                    pred_stft=pred_stft,
                     target_complex_stfts=target_complex_stfts
                 )
                 phase_loss_value = (self.phase_ip_loss_weight * ip_loss +
@@ -397,7 +343,8 @@ class VocoderWithLoss(nn.Module):
                 high_freq_stft_loss_value = self.high_freq_stft_loss(
                     pred_waveform_aligned,
                     waveform_labels_aligned,
-                    target_complex_stfts=target_complex_stfts
+                    target_complex_stfts=target_complex_stfts,
+                    pred_stft=pred_stft
                 )
             else:
                 high_freq_stft_loss_value = 0.0
@@ -427,7 +374,7 @@ class VocoderWithLoss(nn.Module):
         return outputs
 
 
-def create_small_vocoder_model(
+def create_small_convtranspose1d_vocoder_model(
         shared_window_buffer: SharedWindowBuffer,
         sc_loss_weight,
         mag_loss_weight,
@@ -455,6 +402,13 @@ def create_small_vocoder_model(
         audio_vocoder_n_residual_layers=4,
     )
     return VocoderWithLoss(
+        vocoder=Vocoder(
+            upsample_block_class=ConvTranspose1DVocoderUpsampleBlock,
+            hidden_channels=config.audio_vocoder_hidden_channels,
+            in_channels=config.audio_n_mels,
+            upsample_factors=config.audio_vocoder_upsample_factors,
+            n_residual_layers=config.audio_vocoder_n_residual_layers,
+        ),
         shared_window_buffer=shared_window_buffer,
         config=config,
         sc_loss_weight=sc_loss_weight,
@@ -472,6 +426,58 @@ def create_small_vocoder_model(
     )
 
 
+def create_small_upsample_vocoder_model(
+        shared_window_buffer: SharedWindowBuffer,
+        sc_loss_weight,
+        mag_loss_weight,
+        waveform_l1_loss_weight,
+        mel_recon_loss_weight,
+        mel_recon_loss_weight_linspace_max,
+        complex_stft_loss_weight,
+        phase_loss_weight,
+        phase_ip_loss_weight,
+        phase_iaf_loss_weight,
+        phase_gd_loss_weight,
+        high_freq_stft_loss_weight,
+        high_freq_stft_cutoff_bin,
+    ) -> VocoderWithLoss:
+    """Create a small vocoder model for testing."""
+    config = megatransformer_utils.MegaTransformerConfig(
+        hidden_size=512,
+        audio_n_mels=80,
+        audio_n_fft=1024,
+        audio_hop_length=256,
+        audio_max_duration=10.0,
+        audio_sample_rate=16000,
+        audio_vocoder_hidden_channels=256,
+        audio_vocoder_upsample_factors=[8, 8, 4],
+        audio_vocoder_n_residual_layers=4,
+    )
+    return VocoderWithLoss(
+        vocoder=Vocoder(
+            upsample_block_class=AntiAliasedUpsampleVocoderUpsampleBlock,
+            hidden_channels=config.audio_vocoder_hidden_channels,
+            in_channels=config.audio_n_mels,
+            upsample_factors=config.audio_vocoder_upsample_factors,
+            n_residual_layers=config.audio_vocoder_n_residual_layers,
+        ),
+        shared_window_buffer=shared_window_buffer,
+        config=config,
+        sc_loss_weight=sc_loss_weight,
+        mag_loss_weight=mag_loss_weight,
+        waveform_l1_loss_weight=waveform_l1_loss_weight,
+        mel_recon_loss_weight=mel_recon_loss_weight,
+        mel_recon_loss_weight_linspace_max=mel_recon_loss_weight_linspace_max,
+        complex_stft_loss_weight=complex_stft_loss_weight,
+        phase_loss_weight=phase_loss_weight,
+        phase_ip_loss_weight=phase_ip_loss_weight,
+        phase_iaf_loss_weight=phase_iaf_loss_weight,
+        phase_gd_loss_weight=phase_gd_loss_weight,
+        high_freq_stft_loss_weight=high_freq_stft_loss_weight,
+        high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
+    )
+
 model_config_lookup = {
-    "small_vocoder": create_small_vocoder_model,
+    "small_vocoder_convtranspose1d": create_small_convtranspose1d_vocoder_model,
+    "small_vocoder_upsample": create_small_upsample_vocoder_model,
 }

@@ -45,34 +45,42 @@ class MultiResolutionSTFTLoss(nn.Module):
         x: torch.Tensor,
         fft_size: int,
         hop_size: int,
-        win_length: int
+        win_length: int,
+        precomputed_stft: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Calculate STFT magnitude."""
 
         # stft requires float32 input
         x_float32 = x.float()
-        x_stft = torch.stft(
-            x_float32.squeeze(1),
-            fft_size,
-            hop_size,
-            win_length,
-            self.buffer_lookup[str(win_length)].to(x_float32.dtype).to(x_float32.device),
-            return_complex=True
-        )
+        if precomputed_stft is None:
+            x_stft = torch.stft(
+                x_float32.squeeze(1),
+                fft_size,
+                hop_size,
+                win_length,
+                self.buffer_lookup[str(win_length)].to(x_float32.dtype).to(x_float32.device),
+                return_complex=True
+            )
+        else:
+            x_stft = precomputed_stft
         return torch.abs(x_stft).to(x.dtype)
     
-    def complex_stft_loss(self, pred, target_complex_stft, fft_size, hop_size, win_length):
-        pred_stft = torch.stft(
-            pred.float(), fft_size, hop_size, win_length,
-            self.buffer_lookup[str(win_length)].to(pred.dtype).to(pred.device),
-            return_complex=True
-        )
+    def complex_stft_loss(self, pred, target_complex_stft, fft_size, hop_size, win_length, precomputed_stft: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if precomputed_stft is None:
+            pred_stft = torch.stft(
+                pred.float(), fft_size, hop_size, win_length,
+                self.buffer_lookup[str(win_length)].to(pred.dtype).to(pred.device),
+                return_complex=True
+            )
+        else:
+            pred_stft = precomputed_stft
         return F.l1_loss(pred_stft.real, target_complex_stft.real) + F.l1_loss(pred_stft.imag, target_complex_stft.imag)
 
     def forward(
         self, 
         pred_waveform: torch.Tensor, 
         target_waveform: torch.Tensor,
+        pred_stft: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Calculate multi-resolution STFT loss.
@@ -80,6 +88,7 @@ class MultiResolutionSTFTLoss(nn.Module):
         Args:
             pred_waveform: [B, 1, T] Predicted waveform
             target_waveform: [B, 1, T] Target waveform
+            pred_stft: Optional[torch.Tensor] = None Precomputed STFT of predicted waveform (for models that directly predict STFT for iSTFT conversion to waveforms)
             
         Returns:
             Tuple of (sc_loss, mag_loss) - spectral convergence and magnitude losses
@@ -92,7 +101,7 @@ class MultiResolutionSTFTLoss(nn.Module):
             self.fft_sizes, self.hop_sizes, self.win_lengths
         ):
             pred_mag = self.stft_magnitude(
-                pred_waveform, fft_size, hop_size, win_length
+                pred_waveform, fft_size, hop_size, win_length, precomputed_stft=pred_stft
             )
             target_mag = self.stft_magnitude(
                 target_waveform, fft_size, hop_size, win_length
@@ -263,37 +272,49 @@ class PhaseLoss(nn.Module):
         """Map phase difference to [-pi, pi]"""
         return torch.atan2(torch.sin(x), torch.cos(x))
 
-    def forward(self, pred_wav, target_wav, target_complex_stfts):
+    def forward(self, pred_wav, target_wav, target_complex_stfts, precomputed_stft: Optional[torch.Tensor] = None):
         orig_dtype = pred_wav.dtype
         pred_wav = pred_wav.to(torch.float32)
 
-        pred_stft = torch.stft(
-            pred_wav, self.n_fft, self.hop_length, 
-            window=self.window.to(pred_wav.device), return_complex=True
-        )
+        if precomputed_stft is None:
+            pred_stft = torch.stft(pred_wav, self.n_fft, self.hop_length, window=self.window, return_complex=True)
+        else:
+            pred_stft = precomputed_stft
         
         pred_phase = torch.angle(pred_stft)
         target_phase = torch.angle(target_complex_stfts)
         
-        # make sure pred_phase and target_phase have the same shape
-        min_frames = min(pred_phase.shape[-1], target_phase.shape[-1])
-        pred_phase = pred_phase[..., :min_frames]
-        target_phase = target_phase[..., :min_frames]
-
-        # Instantaneous phase loss (point-wise)
-        ip_loss = self.anti_wrap(pred_phase - target_phase).abs().mean().to(orig_dtype)
+        # Energy mask - ignore silent regions
+        target_mag = target_complex_stfts.abs()
+        energy_threshold = target_mag.max() * 0.01  # Bottom 1% = silence
+        mask = (target_mag > energy_threshold).float()
         
-        # Instantaneous angular frequency loss (time derivative)
+        # Match lengths
+        min_t = min(pred_phase.shape[-1], target_phase.shape[-1])
+        pred_phase = pred_phase[..., :min_t]
+        target_phase = target_phase[..., :min_t]
+        mask = mask[..., :min_t]
+        
+        # IP loss - masked
+        phase_diff = self.anti_wrap(pred_phase - target_phase)
+        ip_loss = (phase_diff.abs() * mask).sum() / (mask.sum() + 1e-8)
+        
+        # IAF loss - masked
         pred_iaf = torch.diff(pred_phase, dim=-1)
         target_iaf = torch.diff(target_phase, dim=-1)
-        iaf_loss = self.anti_wrap(pred_iaf - target_iaf).abs().mean().to(orig_dtype)
+        iaf_diff = self.anti_wrap(pred_iaf - target_iaf)
+        mask_iaf = mask[..., 1:]  # Diff reduces length by 1
+        iaf_loss = (iaf_diff.abs() * mask_iaf).sum() / (mask_iaf.sum() + 1e-8)
         
-        # Group delay loss (frequency derivative)  
+        # GD loss - masked  
         pred_gd = torch.diff(pred_phase, dim=-2)
         target_gd = torch.diff(target_phase, dim=-2)
-        gd_loss = self.anti_wrap(pred_gd - target_gd).abs().mean().to(orig_dtype)
+        gd_diff = self.anti_wrap(pred_gd - target_gd)
+        mask_gd = mask[..., 1:, :]  # Diff reduces freq dim by 1
+        gd_loss = (gd_diff.abs() * mask_gd).sum() / (mask_gd.sum() + 1e-8)
         
         return ip_loss, iaf_loss, gd_loss
+
 
 class HighFreqSTFTLoss(nn.Module):
     def __init__(self, shared_window_buffer: SharedWindowBuffer, n_fft, cutoff_bin=256):
@@ -302,12 +323,15 @@ class HighFreqSTFTLoss(nn.Module):
         self.cutoff_bin = cutoff_bin
         self.register_buffer('window', shared_window_buffer.get_window(1024, torch.device('cpu')))
 
-    def forward(self, pred_wav, target_wav, target_complex_stfts):
+    def forward(self, pred_wav, target_wav, target_complex_stfts, precomputed_stft: Optional[torch.Tensor] = None):
         pred_wav = pred_wav.to(torch.float32)
         target_wav = target_wav.to(torch.float32)
 
-        pred_stft = torch.stft(pred_wav, self.n_fft, window=self.window[:self.n_fft], return_complex=True)
-
+        if precomputed_stft is None:
+            pred_stft = torch.stft(pred_wav, self.n_fft, window=self.window[:self.n_fft], return_complex=True)
+        else:
+            pred_stft = precomputed_stft
+        
         # make sure pred_stft and target_complex_stfts have the same shape
         min_frames = min(pred_stft.shape[-1], target_complex_stfts.shape[-1])
         pred_stft = pred_stft[..., :min_frames]
