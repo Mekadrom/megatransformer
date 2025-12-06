@@ -380,6 +380,7 @@ class VocoderGANTrainer(Trainer):
         mpd_fm_loss_weight: float = 1.0,
         msd_fm_loss_weight: float = 1.0,
         mrsd_fm_loss_weight: float = 1.0,
+        direct_mag_loss_weight: float = 0.0,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -402,6 +403,7 @@ class VocoderGANTrainer(Trainer):
         self.mpd_fm_loss_weight = mpd_fm_loss_weight
         self.msd_fm_loss_weight = msd_fm_loss_weight
         self.mrsd_fm_loss_weight = mrsd_fm_loss_weight
+        self.direct_mag_loss_weight = direct_mag_loss_weight
         self.writer = None
 
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
@@ -669,6 +671,7 @@ def main():
     mpd_fm_loss_weight = float(unk_dict.get("mpd_fm_loss_weight", 1.0))
     msd_fm_loss_weight = float(unk_dict.get("msd_fm_loss_weight", 1.0))
     mrsd_fm_loss_weight = float(unk_dict.get("mrsd_fm_loss_weight", 1.0))
+    direct_mag_loss_weight = float(unk_dict.get("direct_mag_loss_weight", 0.0))
 
     discriminator_config = unk_dict.get("discriminator_config", "combined_disc")
     
@@ -688,6 +691,7 @@ def main():
         phase_gd_loss_weight=phase_gd_loss_weight,
         high_freq_stft_loss_weight=high_freq_stft_loss_weight,
         high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
+        direct_mag_loss_weight=direct_mag_loss_weight,
     )
     model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
 
@@ -735,10 +739,8 @@ def main():
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
         print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
         print(f"  Vocoder parameters: {sum(p.numel() for p in model.vocoder.parameters()):,}")
-        print(f"    Vocoder initial_conv parameters: {sum(p.numel() for p in model.vocoder.initial_conv.parameters()):,}")
-        print(f"    Vocoder upsample_blocks parameters: {sum(p.numel() for p in model.vocoder.upsample_blocks.parameters()):,}")
-        print(f"    Vocoder residual_blocks parameters: {sum(p.numel() for p in model.vocoder.residual_blocks.parameters()):,}")
-        print(f"    Vocoder final_layers parameters: {sum(p.numel() for p in model.vocoder.final_layers.parameters()):,}")
+        for name, module in model.vocoder.named_children():
+            print(f"    {name} parameters: {sum(p.numel() for p in module.parameters()):,}")
         if use_gan and discriminator is not None:
             print(f"  Discriminator parameters: {sum(p.numel() for p in discriminator.parameters()):,}")
             print(f"    MPD parameters: {sum(p.numel() for p in discriminator.mpd.parameters()):,}")
@@ -842,6 +844,7 @@ def main():
         mpd_fm_loss_weight=mpd_fm_loss_weight,
         msd_fm_loss_weight=msd_fm_loss_weight,
         mrsd_fm_loss_weight=mrsd_fm_loss_weight,
+        direct_mag_loss_weight=direct_mag_loss_weight,
     )
 
     # Add reconstruction callback for monitoring training progress

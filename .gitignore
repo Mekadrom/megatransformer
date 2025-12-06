@@ -139,3 +139,5 @@ runs.bak.bak.bak/
 inference/generated/
 checkpoints/
 image_cache/
+
+logs/

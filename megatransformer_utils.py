@@ -834,10 +834,14 @@ def conv2d_weight_init():
     return init_weights
 
 def print_debug_tensor(pre: str, tensor: torch.Tensor):
+    # avoid printing on devices other than cuda:0
+    if not isinstance(tensor, torch.Tensor):
+        print(f"{pre}:\n\tNot a tensor {type(tensor)}")
+        return
     if tensor is None:
-        print(f"{pre}: None")
+        print(f"{pre}: None\n\t")
     elif tensor.numel() == 0:
-        print(f"{pre}: empty tensor with shape {tensor.shape}")
+        print(f"{pre}: empty tensor\n\tshape {tensor.shape}")
     elif tensor.dtype in [torch.float16, torch.float32, torch.float64, torch.bfloat16]:
         print(f"{pre}:\n\tptr: {tensor.data_ptr()}\n\tdtype: {tensor.dtype}\n\tdevice: {tensor.device}\n\tshape: {tensor.shape}\n\tmean: {tensor.mean()}\n\tstd: {tensor.std()}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tnorm: {tensor.norm()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
         if tensor.numel() < 100:

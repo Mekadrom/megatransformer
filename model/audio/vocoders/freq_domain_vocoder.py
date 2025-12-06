@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+import megatransformer_utils
+from model.activations import Snake
 from model.audio.shared_window_buffer import SharedWindowBuffer
 
 
@@ -76,12 +77,12 @@ class FrequencyDomainVocoder(nn.Module):
             nn.Softplus(),  # Ensures positive magnitude
         )
         
-        # Phase head - outputs (real, imag) of unit phasor
-        # Predicting unit phasor avoids phase wrapping issues
+        # Phase head - outputs angle directly, then we use cos/sin for unit phasor
+        # Snake activation is periodic-aware, good for angle prediction
         self.phase_head = nn.Sequential(
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=7, padding=3),
-            nn.GELU(),
-            nn.Conv1d(hidden_dim, self.freq_bins * 2, kernel_size=7, padding=3),
+            Snake(hidden_dim),
+            nn.Conv1d(hidden_dim, self.freq_bins, kernel_size=7, padding=3),  # Just one output per bin (the angle)
         )
         
         # iSTFT window
@@ -113,33 +114,51 @@ class FrequencyDomainVocoder(nn.Module):
         """
         Args:
             mel: [B, n_mels, T] log mel spectrogram
-            
+
         Returns:
             waveform: [B, T * hop_length]
             stft: [B, freq_bins, T] complex - for loss computation
         """
+        # megatransformer_utils.print_debug_tensor('vocoder_input_mel', mel)
+
+        # Debug: check input_proj weights
+        # megatransformer_utils.print_debug_tensor('vocoder_input_proj_weight', self.input_proj.weight)
+        if self.input_proj.bias is not None:
+            # megatransformer_utils.print_debug_tensor('vocoder_input_proj_bias', self.input_proj.bias)
+
         # Backbone
         x = self.input_proj(mel)
+        # megatransformer_utils.print_debug_tensor('vocoder_after_input_proj', x)
+
         for block in self.backbone:
             x = x + block(x)  # Residual
-        
+        # megatransformer_utils.print_debug_tensor('vocoder_after_backbone', x)
+
         # Predict magnitude: [B, 513, T]
-        mag = self.mag_head(x)
-        
-        # Predict phase as unit phasor (real, imag): [B, 1026, T]
-        phase_ri = self.phase_head(x)
-        phase_real, phase_imag = phase_ri.chunk(2, dim=1)  # [B, 513, T] each
-        
-        # Normalize to unit circle - ensures valid phase representation
-        norm = torch.sqrt(phase_real**2 + phase_imag**2).clamp(min=1e-8)
-        phase_real = phase_real / norm
-        phase_imag = phase_imag / norm
-        
+        # Clamp to minimum value for numerical stability (Softplus can produce tiny values)
+        mag_pre_clamp = self.mag_head(x)
+        # megatransformer_utils.print_debug_tensor('vocoder_mag_pre_clamp', mag_pre_clamp)
+        mag = mag_pre_clamp.clamp(min=1e-5)
+        # megatransformer_utils.print_debug_tensor('vocoder_mag', mag)
+
+        # Predict phase angle directly: [B, 513, T]
+        # Then use cos/sin to get unit phasor - always valid, no normalization needed
+        phase_angle = self.phase_head(x)
+        # megatransformer_utils.print_debug_tensor('vocoder_phase_angle', phase_angle)
+
+        # Convert angle to unit phasor via cos/sin - guaranteed to be on unit circle
+        phase_real = torch.cos(phase_angle)
+        phase_imag = torch.sin(phase_angle)
+        # megatransformer_utils.print_debug_tensor('vocoder_phase_real', phase_real)
+        # megatransformer_utils.print_debug_tensor('vocoder_phase_imag', phase_imag)
+
         # Construct complex STFT: magnitude * e^(i*phase)
         stft_real = mag * phase_real
         stft_imag = mag * phase_imag
-        stft = torch.complex(stft_real, stft_imag)
-        
+        # megatransformer_utils.print_debug_tensor('vocoder_stft_real', stft_real)
+        # megatransformer_utils.print_debug_tensor('vocoder_stft_imag', stft_imag)
+        stft = torch.complex(stft_real.to(torch.float32), stft_imag.to(torch.float32))
+
         # iSTFT to waveform - this is pure math, lossless
         waveform = torch.istft(
             stft,
@@ -149,7 +168,8 @@ class FrequencyDomainVocoder(nn.Module):
             length=mel.size(-1) * self.hop_length,
             return_complex=False,
         )
-        
+        # megatransformer_utils.print_debug_tensor('vocoder_waveform', waveform)
+
         return waveform, stft
     
     def get_phase(self, stft):

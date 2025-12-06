@@ -22,9 +22,9 @@ class MultiResolutionSTFTLoss(nn.Module):
     def __init__(
         self,
         shared_window_buffer: SharedWindowBuffer,
-        fft_sizes: list[int] = [512, 1024, 2048],
-        hop_sizes: list[int] = [128, 256, 512],
-        win_lengths: list[int] = [512, 1024, 2048],
+        fft_sizes: list[int] = [256, 512, 1024, 2048],
+        hop_sizes: list[int] = [64, 128, 256, 512],
+        win_lengths: list[int] = [256, 512, 1024, 2048],
     ):
         super().__init__()
         assert len(fft_sizes) == len(hop_sizes) == len(win_lengths)
@@ -46,34 +46,27 @@ class MultiResolutionSTFTLoss(nn.Module):
         fft_size: int,
         hop_size: int,
         win_length: int,
-        precomputed_stft: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Calculate STFT magnitude."""
 
         # stft requires float32 input
         x_float32 = x.float()
-        if precomputed_stft is None:
-            x_stft = torch.stft(
-                x_float32.squeeze(1),
-                fft_size,
-                hop_size,
-                win_length,
-                self.buffer_lookup[str(win_length)].to(x_float32.dtype).to(x_float32.device),
-                return_complex=True
-            )
-        else:
-            x_stft = precomputed_stft
+        x_stft = torch.stft(
+            x_float32.squeeze(1),
+            fft_size,
+            hop_size,
+            win_length,
+            self.buffer_lookup[str(win_length)].to(x_float32.dtype).to(x_float32.device),
+            return_complex=True
+        )
         return torch.abs(x_stft).to(x.dtype)
     
-    def complex_stft_loss(self, pred, target_complex_stft, fft_size, hop_size, win_length, precomputed_stft: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if precomputed_stft is None:
-            pred_stft = torch.stft(
-                pred.float(), fft_size, hop_size, win_length,
-                self.buffer_lookup[str(win_length)].to(pred.dtype).to(pred.device),
-                return_complex=True
+    def complex_stft_loss(self, pred, target_complex_stft, fft_size, hop_size, win_length) -> torch.Tensor:
+        pred_stft = torch.stft(
+            pred.float(), fft_size, hop_size, win_length,
+            self.buffer_lookup[str(win_length)].to(pred.dtype).to(pred.device),
+            return_complex=True
             )
-        else:
-            pred_stft = precomputed_stft
         return F.l1_loss(pred_stft.real, target_complex_stft.real) + F.l1_loss(pred_stft.imag, target_complex_stft.imag)
 
     def forward(
@@ -101,7 +94,7 @@ class MultiResolutionSTFTLoss(nn.Module):
             self.fft_sizes, self.hop_sizes, self.win_lengths
         ):
             pred_mag = self.stft_magnitude(
-                pred_waveform, fft_size, hop_size, win_length, precomputed_stft=pred_stft
+                pred_waveform, fft_size, hop_size, win_length
             )
             target_mag = self.stft_magnitude(
                 target_waveform, fft_size, hop_size, win_length
@@ -341,7 +334,7 @@ class HighFreqSTFTLoss(nn.Module):
         pred_hf = pred_stft[..., self.cutoff_bin:, :].abs()
         target_hf = target_complex_stfts[..., self.cutoff_bin:, :].abs()
 
-        weights = target_hf / (target_hf.sum(dim=-2, keepdim=True) + 1e-8)
+        weights = target_hf / (target_hf.sum(dim=-2, keepdim=True) + 1e-5)
 
         log_target_hf = torch.log(target_hf.clamp(min=1e-7))
         log_pred_hf = torch.log(pred_hf.clamp(min=1e-7))
@@ -388,7 +381,7 @@ def feature_matching_loss(
     for real_feats, fake_feats in zip(disc_real_features, disc_fake_features):
         for real_feat, fake_feat in zip(real_feats, fake_feats):
             # Normalize by feature magnitude to make loss scale-invariant
-            loss += F.l1_loss(fake_feat, real_feat.detach()) / (real_feat.detach().abs().mean() + 1e-7)
+            loss += F.l1_loss(fake_feat, real_feat.detach()) / (real_feat.detach().abs().mean() + 1e-5)
             num_layers += 1
     
     # Average over layers

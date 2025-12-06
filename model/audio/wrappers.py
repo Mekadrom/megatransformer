@@ -124,7 +124,7 @@ class PreTrainedAudioDecoderWrapper(nn.Module):
         """Calculate SNR loss between generated and reference audio"""
         signal_power = torch.mean(reference_audio**2)
         noise_power = torch.mean((generated_audio - reference_audio)**2)
-        snr = 10 * torch.log10(signal_power / (noise_power + 1e-10))
+        snr = 10 * torch.log10(signal_power / (noise_power + 1e-5))
         return -snr  # Negative because we want to maximize SNR
 
     def sample(self,
