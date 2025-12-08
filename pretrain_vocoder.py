@@ -41,6 +41,15 @@ def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
                     return callback.tb_writer
     return None
 
+class VocoderEarlyStoppingCallback(TrainerCallback):
+    def __init__(self, stop_step: int):
+        self.stop_step = stop_step
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if self.stop_step > 0 and state.global_step >= self.stop_step:
+            print(f"Early stopping at step {state.global_step} as per stop_step={self.stop_step}.")
+            control.should_training_stop = True
+
 class VocoderReconstructionCallback(TrainerCallback):
     """
     Callback for logging vocoder audio reconstruction during training.
@@ -135,8 +144,8 @@ class VocoderReconstructionCallback(TrainerCallback):
                         self.log_audio(writer, pred_waveform, global_step, tag=f"vocoder_reconstruction/waveform/output/{e}")
 
                         # Save reconstructed audio to file
-                        audio_filepath = os.path.join(self.trainer.args.output_dir, f"reconstructed_audio_step_{global_step}.wav")
-                        self._save_audio_to_file(pred_waveform, audio_filepath, sample_rate=self.audio_sample_rate)
+                        # audio_filepath = os.path.join(self.trainer.args.output_dir, f"reconstructed_audio_step_{e}_{global_step}.wav")
+                        # self._save_audio_to_file(pred_waveform, audio_filepath, sample_rate=self.audio_sample_rate)
 
                         self.log_mel_spec_visualization(writer, test_mel_spec, global_step, tag=f"vocoder_reconstruction/mel_spec/target/{e}")
                         # Reconstructed waveform's mel spectrogram
@@ -171,7 +180,6 @@ class VocoderReconstructionCallback(TrainerCallback):
 
                         self.log_if_comparison(writer, reconstructed_stft, target_stft, global_step, tag=f"vocoder_reconstruction/if_comparison/{e}")
 
-
                     # Log losses (uses last outputs from test examples above)
                     if "loss" in outputs:
                         writer.add_scalar("vocoder_reconstruction/loss", outputs["loss"].item(), global_step)
@@ -193,90 +201,117 @@ class VocoderReconstructionCallback(TrainerCallback):
         writer.add_image(tag, self._visualize_mel_spec(mel_spec.numpy(), self.audio_sample_rate), global_step)
 
     def log_phase_error(self, writer: SummaryWriter, pred_stft, target_stft, global_step: int, tag: str):
-        """Log phase error map to tensorboard."""
+        """Log magnitude-weighted phase error map to tensorboard."""
         pred_phase = torch.angle(pred_stft)
         target_phase = torch.angle(target_stft)
-        
+        pred_mag = torch.abs(pred_stft)
+
         # Match lengths
         min_t = min(pred_phase.shape[-1], target_phase.shape[-1])
         pred_phase = pred_phase[..., :min_t]
         target_phase = target_phase[..., :min_t]
-        
-        # Anti-wrapped error, 0 = perfect, π = worst
+        pred_mag = pred_mag[..., :min_t]
+
+        # Wrapped phase error, 0 = perfect, π = worst
         error = torch.atan2(
             torch.sin(pred_phase - target_phase),
             torch.cos(pred_phase - target_phase)
         ).abs()
-        
+
+        # Weight by magnitude - only show error where there's actual signal
+        mag_normalized = pred_mag / (pred_mag.max() + 1e-8)
+        error_weighted = error * mag_normalized
+
         fig, ax = plt.subplots(figsize=(10, 4))
-        im = ax.imshow(error.cpu().numpy(), aspect='auto', origin='lower', cmap='magma', vmin=0, vmax=np.pi)
-        plt.colorbar(im, ax=ax, label='Phase error (radians)')
+        im = ax.imshow(error_weighted.cpu().numpy(), aspect='auto', origin='lower', cmap='magma', vmin=0, vmax=np.pi * 0.5)
+        plt.colorbar(im, ax=ax, label='Magnitude-weighted phase error')
         ax.set_ylabel('Frequency bin')
         ax.set_xlabel('Time frame')
-        ax.set_title('Phase Error Map')
-        
+        ax.set_title('Phase Error Map (weighted by magnitude)')
+
         writer.add_figure(tag, fig, global_step)
         plt.close(fig)
 
     def log_instantaneous_frequency(self, writer: SummaryWriter, stft, global_step: int, tag: str):
-        """Log instantaneous frequency deviation to tensorboard."""
+        """Log instantaneous frequency deviation to tensorboard, masked by magnitude."""
         phase = torch.angle(stft)
-        
+        mag = torch.abs(stft)
+
         inst_freq = torch.diff(phase, dim=-1)
         inst_freq = torch.atan2(torch.sin(inst_freq), torch.cos(inst_freq))
         inst_freq_hz = inst_freq * self.audio_sample_rate / (2 * np.pi * self.audio_hop_length)
-        
-        # Correct range based on hop_length
-        max_if = self.audio_sample_rate / (2 * self.audio_hop_length)  # ~31 Hz for your params
-        
+
+        # Mask out low-energy regions to reduce noise
+        mag_for_weight = mag[..., :-1]  # align with diff output
+        mag_normalized = mag_for_weight / (mag_for_weight.max() + 1e-8)
+        threshold = 0.01
+        inst_freq_masked = torch.where(mag_normalized > threshold, inst_freq_hz, torch.full_like(inst_freq_hz, float('nan')))
+
+        max_if = self.audio_sample_rate / (2 * self.audio_hop_length)
+
         fig, ax = plt.subplots(figsize=(10, 4))
-        im = ax.imshow(inst_freq_hz.cpu().numpy(), aspect='auto', origin='lower',
-                    cmap='coolwarm', vmin=-max_if, vmax=max_if)
+        im = ax.imshow(inst_freq_masked.cpu().numpy(), aspect='auto', origin='lower',
+                       cmap='coolwarm', vmin=-max_if, vmax=max_if)
         plt.colorbar(im, ax=ax, label='Frequency deviation (Hz)')
         ax.set_ylabel('Frequency bin')
         ax.set_xlabel('Time frame')
-        ax.set_title('Instantaneous Frequency Deviation')
-        
+        ax.set_title('Instantaneous Frequency Deviation (magnitude-masked)')
+
         writer.add_figure(tag, fig, global_step)
         plt.close(fig)
 
     def log_if_comparison(self, writer: SummaryWriter, pred_stft, target_stft, global_step: int, tag: str):
-        def compute_if(stft):
+        def compute_if_masked(stft, threshold=0.01):
             phase = torch.angle(stft)
+            mag = torch.abs(stft)
             inst_freq = torch.diff(phase, dim=-1)
             inst_freq = torch.atan2(torch.sin(inst_freq), torch.cos(inst_freq))
-            return inst_freq * self.audio_sample_rate / (2 * np.pi * self.audio_hop_length)
-        
-        pred_if = compute_if(pred_stft).cpu().numpy()
-        target_if = compute_if(target_stft).cpu().numpy()
-        
+            inst_freq_hz = inst_freq * self.audio_sample_rate / (2 * np.pi * self.audio_hop_length)
+
+            # Mask by magnitude
+            mag_for_weight = mag[..., :-1]
+            mag_normalized = mag_for_weight / (mag_for_weight.max() + 1e-8)
+            inst_freq_masked = torch.where(mag_normalized > threshold, inst_freq_hz, torch.full_like(inst_freq_hz, float('nan')))
+            return inst_freq_masked, mag_normalized
+
+        pred_if, pred_mag = compute_if_masked(pred_stft)
+        target_if, target_mag = compute_if_masked(target_stft)
+
+        pred_if = pred_if.cpu().numpy()
+        target_if = target_if.cpu().numpy()
+        pred_mag = pred_mag.cpu().numpy()
+
         min_t = min(pred_if.shape[-1], target_if.shape[-1])
         pred_if = pred_if[..., :min_t]
         target_if = target_if[..., :min_t]
-        
+        pred_mag = pred_mag[..., :min_t]
+
         max_if = self.audio_sample_rate / (2 * self.audio_hop_length)
-        
+
         fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-        
+
         im0 = axes[0].imshow(target_if, aspect='auto', origin='lower', cmap='coolwarm', vmin=-max_if, vmax=max_if)
-        axes[0].set_title('Target IF')
+        axes[0].set_title('Target IF (masked)')
         axes[0].set_ylabel('Frequency bin')
         axes[0].set_xlabel('Time frame')
         plt.colorbar(im0, ax=axes[0], label='Hz')
-        
+
         im1 = axes[1].imshow(pred_if, aspect='auto', origin='lower', cmap='coolwarm', vmin=-max_if, vmax=max_if)
-        axes[1].set_title('Predicted IF')
+        axes[1].set_title('Predicted IF (masked)')
         axes[1].set_ylabel('Frequency bin')
         axes[1].set_xlabel('Time frame')
         plt.colorbar(im1, ax=axes[1], label='Hz')
-        
-        # Error map: use 0 to max_if since it's absolute difference
-        im2 = axes[2].imshow(np.abs(pred_if - target_if), aspect='auto', origin='lower', cmap='magma', vmin=0, vmax=max_if)
-        axes[2].set_title('IF Error')
+
+        # Error map: magnitude-weighted absolute difference
+        if_error = np.abs(pred_if - target_if)
+        # Weight error by magnitude so low-energy errors don't dominate
+        if_error_weighted = if_error * pred_mag
+        im2 = axes[2].imshow(if_error_weighted, aspect='auto', origin='lower', cmap='magma', vmin=0, vmax=max_if * 0.5)
+        axes[2].set_title('IF Error (mag-weighted)')
         axes[2].set_ylabel('Frequency bin')
         axes[2].set_xlabel('Time frame')
         plt.colorbar(im2, ax=axes[2], label='Hz')
-        
+
         plt.tight_layout()
         writer.add_figure(tag, fig, global_step)
         plt.close(fig)
@@ -805,12 +840,12 @@ def main():
     )
 
     train_dataset = CachedVocoderDataset(
-        cache_dir="./cached_datasets/librispeech_train_cached",
+        cache_dir="./cached_datasets/librispeech_train_vocoder_cached",
         audio_max_frames=model.config.audio_max_frames,
     )
 
     eval_dataset = CachedVocoderDataset(
-        cache_dir="./cached_datasets/librispeech_val_cached",
+        cache_dir="./cached_datasets/librispeech_val_vocoder_cached",
         audio_max_frames=model.config.audio_max_frames,
     )
 
@@ -858,6 +893,11 @@ def main():
         audio_hop_length=model.config.audio_hop_length,
     )
     trainer.add_callback(reconstruction_callback)
+
+    if args.stop_step > 0:
+        early_stopping_callback = VocoderEarlyStoppingCallback(stop_step=args.stop_step)
+        trainer.add_callback(early_stopping_callback)
+    
     reconstruction_callback.trainer = trainer
 
     if hasattr(trainer, 'deepspeed') and trainer.deepspeed is not None:

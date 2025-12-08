@@ -8,7 +8,7 @@ from model.activations import Snake
 from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss
 from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders.convtranspose1d_vocoder import ConvTranspose1DVocoderUpsampleBlock
-from model.audio.vocoders.freq_domain_vocoder import FrequencyDomainVocoder
+from model.audio.vocoders.freq_domain_vocoder import HeavyHeadedFrequencyDomainVocoder, LightHeadedFrequencyDomainVocoder, SplitBandFrequencyDomainVocoder
 from model.audio.vocoders.upsample_vocoder import AntiAliasedUpsampleVocoderUpsampleBlock
 
 
@@ -417,6 +417,18 @@ really_tiny_freq_domain_config = megatransformer_utils.MegaTransformerConfig(
     audio_vocoder_n_residual_layers=3,
 )
 
+tiny_freq_domain_config = megatransformer_utils.MegaTransformerConfig(
+    hidden_size=256,
+    audio_n_mels=80,
+    audio_n_fft=1024,
+    audio_hop_length=256,
+    audio_max_duration=10.0,
+    audio_sample_rate=16000,
+    audio_vocoder_hidden_channels=128,
+    audio_vocoder_upsample_factors=[8],  # this is the convnext mult instead
+    audio_vocoder_n_residual_layers=3,
+)
+
 tiny_config = megatransformer_utils.MegaTransformerConfig(
     hidden_size=256,
     audio_n_mels=80,
@@ -490,13 +502,13 @@ def create_upsample_vocoder(
         **kwargs,
     )
 
-def create_freq_domain_vocoder(
+def create_heavy_headed_freq_domain_vocoder(
         shared_window_buffer: SharedWindowBuffer,
         config: megatransformer_utils.MegaTransformerConfig,
         **kwargs,
 ) -> VocoderWithLoss:
     return create_vocoder(
-        vocoder=FrequencyDomainVocoder(
+        vocoder=HeavyHeadedFrequencyDomainVocoder(
             shared_window_buffer,
             n_mels=config.audio_n_mels,
             n_fft=config.audio_n_fft,
@@ -504,6 +516,53 @@ def create_freq_domain_vocoder(
             hidden_dim=config.audio_vocoder_hidden_channels,
             num_layers=config.audio_vocoder_n_residual_layers,
             convnext_mult=config.audio_vocoder_upsample_factors[-1],  # 4 most of the time
+        ),
+        shared_window_buffer=shared_window_buffer,
+        config=config,
+        **kwargs,
+    )
+
+def create_light_headed_freq_domain_vocoder(
+        shared_window_buffer: SharedWindowBuffer,
+        config: megatransformer_utils.MegaTransformerConfig,
+        **kwargs,
+) -> VocoderWithLoss:
+    return create_vocoder(
+        vocoder=LightHeadedFrequencyDomainVocoder(
+            shared_window_buffer,
+            n_mels=config.audio_n_mels,
+            n_fft=config.audio_n_fft,
+            hop_length=config.audio_hop_length,
+            hidden_dim=config.audio_vocoder_hidden_channels,
+            num_layers=config.audio_vocoder_n_residual_layers,
+            convnext_mult=config.audio_vocoder_upsample_factors[0],  # 8 most of the time
+        ),
+        shared_window_buffer=shared_window_buffer,
+        config=config,
+        **kwargs,
+    )
+
+
+def create_split_band_freq_domain_vocoder(
+        shared_window_buffer: SharedWindowBuffer,
+        config: megatransformer_utils.MegaTransformerConfig,
+        cutoff_bin: int = 128,
+        low_freq_kernel: int = 7,
+        high_freq_kernel: int = 3,
+        **kwargs,
+) -> VocoderWithLoss:
+    return create_vocoder(
+        vocoder=SplitBandFrequencyDomainVocoder(
+            shared_window_buffer,
+            n_mels=config.audio_n_mels,
+            n_fft=config.audio_n_fft,
+            hop_length=config.audio_hop_length,
+            hidden_dim=config.audio_vocoder_hidden_channels,
+            num_layers=config.audio_vocoder_n_residual_layers,
+            convnext_mult=config.audio_vocoder_upsample_factors[0],  # 8 most of the time
+            cutoff_bin=cutoff_bin,
+            low_freq_kernel=low_freq_kernel,
+            high_freq_kernel=high_freq_kernel,
         ),
         shared_window_buffer=shared_window_buffer,
         config=config,
@@ -522,19 +581,29 @@ model_config_lookup = {
         config=small_config,
         **kwargs
     ),
-    "small_freq_domain_vocoder": lambda shared_window_buffer, **kwargs: create_freq_domain_vocoder(
+    "small_freq_domain_vocoder": lambda shared_window_buffer, **kwargs: create_heavy_headed_freq_domain_vocoder(
         shared_window_buffer=shared_window_buffer,
         config=small_config,
         **kwargs
     ),
-    "tiny_freq_domain_vocoder": lambda shared_window_buffer, **kwargs: create_freq_domain_vocoder(
+    "tiny_freq_domain_vocoder": lambda shared_window_buffer, **kwargs: create_heavy_headed_freq_domain_vocoder(
         shared_window_buffer=shared_window_buffer,
         config=tiny_config,
         **kwargs
     ),
-    "really_tiny_freq_domain_vocoder": lambda shared_window_buffer, **kwargs: create_freq_domain_vocoder(
+    "really_tiny_freq_domain_vocoder": lambda shared_window_buffer, **kwargs: create_heavy_headed_freq_domain_vocoder(
         shared_window_buffer=shared_window_buffer,
-        config=really_tiny_config,
+        config=really_tiny_freq_domain_config,
         **kwargs
-    )
+    ),
+    "tiny_lightheaded_freq_domain_vocoder": lambda shared_window_buffer, **kwargs: create_light_headed_freq_domain_vocoder(
+        shared_window_buffer=shared_window_buffer,
+        config=tiny_config,
+        **kwargs
+    ),
+    "tiny_splitband_freq_domain_vocoder": lambda shared_window_buffer, **kwargs: create_split_band_freq_domain_vocoder(
+        shared_window_buffer=shared_window_buffer,
+        config=tiny_config,
+        **kwargs
+    ),
 }

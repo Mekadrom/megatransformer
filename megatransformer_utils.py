@@ -657,6 +657,8 @@ def parse_args():
     argparser.add_argument('--adam_beta1', type=float, default=0.9, help='Adam optimizer beta1')
     argparser.add_argument('--adam_beta2', type=float, default=0.999, help='Adam optimizer beta2')
 
+    argparser.add_argument('--stop_step', type=int, default=-1, help='Step to stop training at. For preserving the LR schedule while not training further.')
+
     args, unk = argparser.parse_known_args()
 
     setattr(args, 'include_modes', args.include_modes.split(','))

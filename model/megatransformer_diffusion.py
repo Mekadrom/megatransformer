@@ -74,7 +74,6 @@ class ResidualBlock(nn.Module):
             self.shortcut.bias.data.zero_()
 
     def forward(self, x: torch.Tensor, time_embedding: Optional[torch.Tensor]=None) -> torch.Tensor:
-        time_embedding = None
         if self.time_embedding_dim is not None and time_embedding is not None:
             time_embedding = self.time_mlp(time_embedding)
 
@@ -413,7 +412,7 @@ class GaussianDiffusion(nn.Module):
         self.config = config
 
         self.num_timesteps = num_timesteps
-        self.normalize = normalize
+        self.is_normalize = normalize
         self.ddim_sampling_eta = ddim_sampling_eta
 
         if sampling_timesteps is None:
@@ -637,7 +636,7 @@ class GaussianDiffusion(nn.Module):
         else:
             img = x
 
-        if self.normalize:
+        if self.is_normalize:
             img = self.unnormalize(img)
 
         return (img, *x[1:]) if return_intermediate else img
@@ -689,7 +688,7 @@ class GaussianDiffusion(nn.Module):
 
         t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device= x_0.device).long()
 
-        if self.normalize:
+        if self.is_normalize:
             x_0 = self.normalize(x_0)
 
         model_output, mse_loss = self.p_losses(x_0, t, condition=condition)

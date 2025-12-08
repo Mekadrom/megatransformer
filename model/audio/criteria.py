@@ -128,72 +128,6 @@ class MultiResolutionSTFTLoss(nn.Module):
         return sc_loss, mag_loss, complex_stft_loss
 
 
-class AudioGenerationLoss(nn.Module):
-    """
-    Combined loss function for training both diffusion model and vocoder.
-    """
-    def __init__(
-        self,
-        shared_window_buffer: SharedWindowBuffer,
-        diffusion_loss_weight: float = 1.0,
-        mel_loss_weight: float = 10.0,
-        waveform_loss_weight: float = 1.0,
-        stft_loss_weight: float = 2.0,
-    ):
-        super().__init__()
-        self.diffusion_loss_weight = diffusion_loss_weight
-        self.mel_loss_weight = mel_loss_weight
-        self.waveform_loss_weight = waveform_loss_weight
-        self.stft_loss_weight = stft_loss_weight
-        
-        self.stft_loss = MultiResolutionSTFTLoss(shared_window_buffer)
-    
-    def forward(
-        self,
-        pred_noise: torch.Tensor,
-        noise: torch.Tensor,
-        pred_mel: Optional[torch.Tensor] = None,
-        target_mel: Optional[torch.Tensor] = None,
-        pred_waveform: Optional[torch.Tensor] = None,
-        target_waveform: Optional[torch.Tensor] = None,
-        target_complex_stft: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, dict]:
-        """
-        Calculate the combined loss.
-        
-        Returns:
-            Tuple of (total_loss, loss_components_dict)
-        """
-        losses = {}
-        
-        # Diffusion loss (noise prediction)
-        diffusion_loss = F.mse_loss(pred_noise, noise)
-        losses["diffusion"] = diffusion_loss
-        
-        total_loss = self.diffusion_loss_weight * diffusion_loss
-        
-        # Optional mel loss
-        if pred_mel is not None and target_mel is not None:
-            mel_loss = F.l1_loss(pred_mel, target_mel)
-            losses["mel"] = mel_loss
-            total_loss = total_loss + self.mel_loss_weight * mel_loss
-        
-        # Optional waveform and STFT losses
-        if pred_waveform is not None and target_waveform is not None:
-            # Direct waveform loss
-            waveform_loss = F.l1_loss(pred_waveform, target_waveform)
-            losses["waveform"] = waveform_loss
-            total_loss = total_loss + self.waveform_loss_weight * waveform_loss
-            
-            # Multi-resolution STFT loss
-            sc_loss, mag_loss, complex_stft_loss = self.stft_loss(pred_waveform, target_waveform)
-            losses["sc"] = sc_loss
-            losses["mag"] = mag_loss
-            losses["complex_stft"] = complex_stft_loss
-            total_loss = total_loss + self.stft_loss_weight * (sc_loss + mag_loss + complex_stft_loss)
-        
-        return total_loss, losses
-
 class StableMelSpectrogramLoss(nn.Module):
     def __init__(self, shared_window_buffer: SharedWindowBuffer, sample_rate, n_fft, hop_length, n_mels, mel_recon_loss_weight_linspace_max: float = 1.0):
         super().__init__()
@@ -334,11 +268,15 @@ class HighFreqSTFTLoss(nn.Module):
         pred_hf = pred_stft[..., self.cutoff_bin:, :].abs()
         target_hf = target_complex_stfts[..., self.cutoff_bin:, :].abs()
 
-        weights = target_hf / (target_hf.sum(dim=-2, keepdim=True) + 1e-5)
-
         log_target_hf = torch.log(target_hf.clamp(min=1e-7))
         log_pred_hf = torch.log(pred_hf.clamp(min=1e-7))
-        return F.l1_loss(log_pred_hf, log_target_hf)
+
+        # Weight by target magnitude - emphasize bins with actual signal
+        # Normalize per-frame so weights sum to 1 across frequency bins
+        weights = target_hf / (target_hf.sum(dim=-2, keepdim=True) + 1e-5)
+
+        weighted_loss = weights * (log_pred_hf - log_target_hf).abs()
+        return weighted_loss.sum(dim=-2).mean()  # sum over freq, mean over batch/time
 
 
 def discriminator_loss(
