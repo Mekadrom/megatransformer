@@ -12,6 +12,7 @@ import glob
 import math
 import numpy as np
 import os
+import psutil
 import random
 import torch
 import torch.distributed as dist
@@ -589,6 +590,17 @@ def set_seed_everywhere(seed: int):
     # For good measure, set the Python hash seed
     os.environ['PYTHONHASHSEED'] = str(seed)
 
+def get_process_cmdline(pid):
+    """
+    Retrieves the command line arguments for a process given its PID.
+    Returns a list of strings representing the command line, or None if the process is not found.
+    """
+    try:
+        process = psutil.Process(pid)
+        return process.cmdline()
+    except psutil.NoSuchProcess:
+        return None
+
 def parse_args():
     is_tpu_available = check_tpu_availability()
     print(f"TPU available: {is_tpu_available}")
@@ -658,8 +670,12 @@ def parse_args():
     argparser.add_argument('--adam_beta2', type=float, default=0.999, help='Adam optimizer beta2')
 
     argparser.add_argument('--stop_step', type=int, default=-1, help='Step to stop training at. For preserving the LR schedule while not training further.')
+    argparser.add_argument('--commit_hash', type=str, default='', help='Git commit hash for this run. Logged in tensorboard.')
 
     args, unk = argparser.parse_known_args()
+
+    current_process_pid = psutil.Process().pid
+    setattr(args, 'cmdline', " ".join(get_process_cmdline(current_process_pid)))
 
     setattr(args, 'include_modes', args.include_modes.split(','))
 

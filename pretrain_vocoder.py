@@ -400,6 +400,8 @@ class VocoderGANTrainer(Trainer):
         *args,
         n_fft,
         hop_length,
+        cmdline,
+        git_commit_hash,
         discriminator: Optional[CombinedDiscriminator] = None,
         discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
         gan_adv_loss_weight: float = 1.0,
@@ -422,6 +424,8 @@ class VocoderGANTrainer(Trainer):
 
         self.n_fft = n_fft
         self.hop_length = hop_length
+        self.cmdline = cmdline
+        self.git_commit_hash = git_commit_hash
 
         self.discriminator = discriminator
         self.discriminator_optimizer = discriminator_optimizer
@@ -458,6 +462,10 @@ class VocoderGANTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self._ensure_tensorboard_writer()
+
+        if self.state.global_step == 0 and self.writer is not None:
+            self.writer.add_text("training/command_line", self.cmdline, 0)
+            self.writer.add_text("training/git_commit_hash", self.git_commit_hash, 0)
 
         # Forward pass through generator (vocoder)
         waveform_labels = inputs["waveform_labels"]
@@ -861,6 +869,8 @@ def main():
         model=model,
         n_fft=model.config.audio_n_fft,
         hop_length=model.config.audio_hop_length,
+        cmdline=args.cmdline,
+        git_commit_hash=args.commit_hash,
         args=training_args,
         data_collator=data_collator,
         train_dataset=train_dataset,
