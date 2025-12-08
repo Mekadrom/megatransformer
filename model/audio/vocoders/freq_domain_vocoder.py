@@ -104,11 +104,11 @@ class FrequencyDomainVocoderBase(nn.Module):
         for block in self.backbone:
             x = block(x)  # Residual is applied in the block forward
 
-        # Predict log-magnitude: [B, 513, T]
-        # Network outputs log-magnitude, we exponentiate to get magnitude
-        # Clamp log-mag to prevent explosion (exp(10) ~ 22k, exp(-10) ~ 4e-5)
-        log_mag = self.mag_head(x).clamp(min=-10, max=10)
-        mag = torch.exp(log_mag)
+        # Predict magnitude via ELU + 1: outputs in (0, ∞)
+        # ELU + 1 has softplus-like bounded gradients but no floor artifact
+        # At x=0: output=1, at x=-∞: output→0, at x=+∞: linear growth
+        mag_pre = self.mag_head(x)
+        mag = F.elu(mag_pre, alpha=1.0) + 1.0
 
         # Predict phase angle directly: [B, 513, T]
         # Then use cos/sin to get unit phasor - always valid, no normalization needed
@@ -331,14 +331,14 @@ class SplitBandFrequencyDomainVocoder(FrequencyDomainVocoderBase):
         for block in self.backbone:
             x = block(x)
 
-        # ============ Magnitude prediction (log-domain) ============
-        log_mag_low = self.mag_head_low(x)    # [B, n_low_bins, T]
-        log_mag_high = self.mag_head_high(x)  # [B, n_high_bins, T]
+        # ============ Magnitude prediction via ELU + 1 ============
+        # ELU + 1 has softplus-like bounded gradients but no floor artifact
+        mag_pre_low = self.mag_head_low(x)    # [B, n_low_bins, T]
+        mag_pre_high = self.mag_head_high(x)  # [B, n_high_bins, T]
 
-        # Concatenate bands and convert from log to linear
-        log_mag = torch.cat([log_mag_low, log_mag_high], dim=1)  # [B, freq_bins, T]
-        log_mag = log_mag.clamp(min=-10, max=10)  # Prevent explosion
-        mag = torch.exp(log_mag)
+        # Concatenate bands and apply ELU + 1
+        mag_pre = torch.cat([mag_pre_low, mag_pre_high], dim=1)  # [B, freq_bins, T]
+        mag = F.elu(mag_pre, alpha=1.0) + 1.0
 
         # ============ Phase prediction ============
         phase_low = self.phase_head_low(x)    # [B, n_low_bins, T]

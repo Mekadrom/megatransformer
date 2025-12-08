@@ -61,10 +61,12 @@ class VocoderDataCollator:
         audio_max_frames: int,
         audio_max_waveform_length: int,
         n_mels: int,
+        input_noise_std: float = 0.0,
     ):
         self.audio_max_frames = audio_max_frames
         self.audio_max_waveform_length = audio_max_waveform_length
         self.n_mels = n_mels
+        self.input_noise_std = input_noise_std
 
     def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
         mel_specs = []
@@ -99,8 +101,14 @@ class VocoderDataCollator:
             target_complex_stfts.append(target_complex_stft)
 
         # Stack tensors
+        mel_batch = torch.stack(mel_specs)
+
+        # Add input noise for regularization (only to mel specs, not targets)
+        if self.input_noise_std > 0.0:
+            mel_batch = mel_batch + torch.randn_like(mel_batch) * self.input_noise_std
+
         batch = {
-            "mel_spec": torch.stack(mel_specs),
+            "mel_spec": mel_batch,
             "waveform_labels": torch.stack(waveforms),
             "target_complex_stfts": torch.stack(target_complex_stfts),
         }

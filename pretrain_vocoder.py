@@ -696,6 +696,7 @@ def main():
     high_freq_stft_loss_weight = float(unk_dict.get("high_freq_stft_loss_weight", 0.0))
     high_freq_stft_cutoff_bin = int(unk_dict.get("high_freq_stft_cutoff_bin", 256))
     mel_window = unk_dict.get("mel_window", "hann_window")
+    input_noise_std = float(unk_dict.get("input_noise_std", 0.0))
 
     # GAN training settings
     use_gan = unk_dict.get("use_gan", "false").lower() == "true"
@@ -862,7 +863,11 @@ def main():
         audio_max_frames=model.config.audio_max_frames,
         audio_max_waveform_length=model.config.audio_max_waveform_length,
         n_mels=model.config.audio_n_mels,
+        input_noise_std=input_noise_std,
     )
+
+    if input_noise_std > 0.0:
+        print(f"Input noise regularization enabled: std={input_noise_std}")
 
     # Create trainer (with or without GAN)
     trainer = VocoderGANTrainer(
