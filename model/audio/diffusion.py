@@ -191,8 +191,6 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         if noise is None:
             noise = torch.randn_like(x_start)
 
-        # noise sample
-
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
         model_out = self.unet(x_noisy, t, condition)
@@ -200,7 +198,12 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         # megatransformer_utils.print_debug_tensor("noise", noise)
         # megatransformer_utils.print_debug_tensor("model_out", model_out)
 
-        target = noise
+        if self.prediction_type == "v":
+            # Model predicts v, target is v
+            target = self.get_v_target(x_start, noise, t)
+        else:
+            # Model predicts noise (epsilon)
+            target = noise
 
         loss = F.mse_loss(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b', 'mean')
@@ -296,6 +299,20 @@ tiny_audio_diffusion_config = megatransformer_utils.MegaTransformerConfig(
     audio_decoder_model_channels=32,
     audio_decoder_time_embedding_dim=32,
     audio_decoder_num_res_blocks=2,
+
+    audio_decoder_activation="silu",
+    audio_decoder_dropout=0.1,
+
+    audio_decoder_unet_dropout_p=0.1,
+    audio_decoder_down_block_self_attn_n_heads=4,
+    audio_decoder_down_block_self_attn_d_queries=32,
+    audio_decoder_down_block_self_attn_d_values=32,
+    audio_decoder_up_block_self_attn_n_heads=4,
+    audio_decoder_up_block_self_attn_d_queries=32,
+    audio_decoder_up_block_self_attn_d_values=32,
+    audio_decoder_cross_attn_n_heads=4,
+    audio_decoder_cross_attn_d_queries=32,
+    audio_decoder_cross_attn_d_values=32,
 )
 
 small_audio_diffusion_config = megatransformer_utils.MegaTransformerConfig(
@@ -332,6 +349,7 @@ def create_audio_diffusion_model(
     normalize: bool = True,
     min_snr_loss_weight: bool = True,
     min_snr_gamma: float = 5.0,
+    prediction_type: str = "epsilon",  # "epsilon" or "v"
 ) -> AudioConditionalGaussianDiffusion:
     """Create an audio diffusion model from config."""
     model = AudioConditionalGaussianDiffusion(
@@ -368,6 +386,7 @@ def create_audio_diffusion_model(
         min_snr_gamma=min_snr_gamma,
         normalize=normalize,
         sampling_timesteps=sampling_timesteps,
+        prediction_type=prediction_type,
     )
 
     return model
@@ -384,6 +403,11 @@ model_config_lookup = {
     ),
     "medium_audio_diffusion": lambda **kwargs: create_audio_diffusion_model(
         config=medium_audio_diffusion_config,
+        **kwargs
+    ),
+    "tiny_v_audio_diffusion": lambda **kwargs: create_audio_diffusion_model(
+        config=tiny_audio_diffusion_config,
+        prediction_type="v",
         **kwargs
     ),
 }

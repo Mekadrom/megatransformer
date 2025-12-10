@@ -410,6 +410,7 @@ class GaussianDiffusion(nn.Module):
             normalize: bool = True,
             ddim_sampling_eta = 0.0,
             sampling_timesteps=None,
+            prediction_type: str = "epsilon",  # "epsilon" or "v"
     ):
         super().__init__()
 
@@ -496,6 +497,9 @@ class GaussianDiffusion(nn.Module):
 
         self.register_buffer('loss_weight', loss_weight)
 
+        # Prediction type: "epsilon" (predict noise) or "v" (predict velocity)
+        self.prediction_type = prediction_type
+
     def cosine_beta_schedule(self, timesteps, s=0.008):
         steps = timesteps + 1
         t = torch.linspace(0, timesteps, steps) / timesteps
@@ -526,19 +530,56 @@ class GaussianDiffusion(nn.Module):
         return out.reshape(b, *((1,) * (len(shape) - 1))).to(t.device)
 
     def predict_start_from_noise(self, x_t: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """Predict x_0 from x_t and predicted noise (epsilon prediction)."""
         return (
-            self._extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - 
+            self._extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             self._extract(self.sqrt_recip1m_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def predict_start_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Predict x_0 from x_t and predicted v (v prediction).
+
+        v = sqrt(alpha_cumprod) * noise - sqrt(1 - alpha_cumprod) * x_0
+        Solving for x_0:
+        x_0 = sqrt(alpha_cumprod) * x_t - sqrt(1 - alpha_cumprod) * v
+        """
+        return (
+            self._extract(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t -
+            self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
+        )
+
+    def predict_noise_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Predict noise (epsilon) from x_t and predicted v.
+
+        v = sqrt(alpha_cumprod) * noise - sqrt(1 - alpha_cumprod) * x_0
+        noise = sqrt(1 - alpha_cumprod) * x_t + sqrt(alpha_cumprod) * v
+        """
+        return (
+            self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * x_t +
+            self._extract(self.sqrt_alphas_cumprod, t, x_t.shape) * v
+        )
+
+    def get_v_target(self, x_start: torch.Tensor, noise: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Compute v target for training: v = sqrt(alpha_cumprod) * noise - sqrt(1 - alpha_cumprod) * x_0"""
+        return (
+            self._extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
+            self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
         )
 
     def model_predictions(self, x, t, condition=None, clip_x_start=False):
         model_output = self.unet(x, t, condition)
         maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_x_start else nn.Identity()
 
-        pred_noise = model_output
-        x_start = self.predict_start_from_noise(x, t, pred_noise)
+        if self.prediction_type == "v":
+            # Model predicts v, convert to x_start and noise
+            x_start = self.predict_start_from_v(x, t, model_output)
+            pred_noise = self.predict_noise_from_v(x, t, model_output)
+        else:
+            # Model predicts noise (epsilon)
+            pred_noise = model_output
+            x_start = self.predict_start_from_noise(x, t, pred_noise)
 
-        megatransformer_utils.print_debug_tensor("x_start before clip", x_start)
+        # megatransformer_utils.print_debug_tensor("x_start before clip", x_start)
 
         x_start = maybe_clip(x_start)
 
@@ -664,14 +705,21 @@ class GaussianDiffusion(nn.Module):
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        predicted_noise  = self.unet(x_noisy, t, condition)
+        model_output = self.unet(x_noisy, t, condition)
 
-        loss = F.mse_loss(predicted_noise , noise, reduction='none')
+        if self.prediction_type == "v":
+            # Model predicts v, target is v
+            target = self.get_v_target(x_start, noise, t)
+        else:
+            # Model predicts noise (epsilon)
+            target = noise
+
+        loss = F.mse_loss(model_output, target, reduction='none')
         loss = loss.mean(dim=[1, 2, 3])
 
         loss = loss * self._extract(self.loss_weight, t, loss.shape)
 
-        return predicted_noise, loss.mean()
+        return model_output, loss.mean()
 
     def forward(self, x_0, condition=None):
         """

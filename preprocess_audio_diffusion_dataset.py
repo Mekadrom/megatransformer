@@ -9,9 +9,18 @@ from dataset_loading.audio_loading import extract_waveforms, extract_mels, remov
 from model.audio.shared_window_buffer import SharedWindowBuffer
 from transformers import T5Tokenizer, T5EncoderModel
 
+# Optional: speechbrain for speaker embeddings
+try:
+    from speechbrain.inference.speaker import EncoderClassifier
+    SPEECHBRAIN_AVAILABLE = True
+except ImportError:
+    SPEECHBRAIN_AVAILABLE = False
+    print("Warning: speechbrain not available. Speaker embeddings will not be computed.")
+
 
 """
 Uses T5-small to produce and cache text embeddings alongside mel spectrograms.
+Optionally uses ECAPA-TDNN (via SpeechBrain) for speaker embeddings.
 """
 
 def preprocess_and_cache_dataset(
@@ -30,6 +39,7 @@ def preprocess_and_cache_dataset(
     segment_overlap_sec: float = 1.0,
     mel_window: str = "hann_window",
     enable_segmentation: bool = False,
+    compute_speaker_embeddings: bool = True,
 ):
     """
     Preprocess dataset and save as individual .pt files.
@@ -63,6 +73,19 @@ def preprocess_and_cache_dataset(
     text_model = T5EncoderModel.from_pretrained(huggingface_text_model)
     text_tokenizer = T5Tokenizer.from_pretrained(huggingface_text_model)
     text_model.eval()
+
+    # Initialize speaker encoder (ECAPA-TDNN)
+    speaker_encoder = None
+    if compute_speaker_embeddings and SPEECHBRAIN_AVAILABLE:
+        print("Loading ECAPA-TDNN speaker encoder...")
+        speaker_encoder = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir="pretrained_models/spkrec-ecapa-voxceleb",
+            run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+        )
+        stats["speaker_embeddings_computed"] = 0
+    elif compute_speaker_embeddings and not SPEECHBRAIN_AVAILABLE:
+        print("Warning: Speaker embeddings requested but speechbrain not available. Skipping.")
 
     # Process each example
     print("Processing examples...")
@@ -140,14 +163,27 @@ def preprocess_and_cache_dataset(
                 text_embeddings = text_model(**text_inputs).last_hidden_state.squeeze(0)
                 text_attention_mask = text_inputs['attention_mask'].squeeze(0)  # Remove batch dim
 
+                # Compute speaker embedding if available
+                speaker_embedding = None
+                if speaker_encoder is not None:
+                    with torch.no_grad():
+                        # ECAPA-TDNN expects [batch, time] waveform
+                        speaker_embedding = speaker_encoder.encode_batch(
+                            segment.unsqueeze(0)
+                        ).squeeze(0).cpu()  # [192] embedding
+                        stats["speaker_embeddings_computed"] += 1
+
                 # Save to file
                 save_path = os.path.join(output_dir, f"{idx:08d}_{seg_idx:02d}.pt")
-                torch.save({
+                save_dict = {
                     "text_embeddings": text_embeddings,
                     "text_attention_mask": text_attention_mask,
                     "mel_spec": mel_spec,
                     "speaker_id": speaker_id,
-                }, save_path)
+                }
+                if speaker_embedding is not None:
+                    save_dict["speaker_embedding"] = speaker_embedding
+                torch.save(save_dict, save_path)
                 
                 stats["saved_segments"] += 1
             stats["saved_samples"] += 1
@@ -201,9 +237,11 @@ if __name__ == "__main__":
     parser.add_argument("--mel_window", type=str, default="hann_window")
     parser.add_argument("--max_conditions", type=int, default=512)
     parser.add_argument("--enable_segmentation", action="store_true")
+    parser.add_argument("--compute_speaker_embeddings", action="store_true", default=True)
+    parser.add_argument("--no_speaker_embeddings", action="store_false", dest="compute_speaker_embeddings")
 
     args = parser.parse_args()
-    
+
     preprocess_and_cache_dataset(
         output_dir=args.output_dir,
         dataset_name=args.dataset_name,
@@ -217,4 +255,5 @@ if __name__ == "__main__":
         max_conditions=args.max_conditions,
         mel_window=args.mel_window,
         enable_segmentation=args.enable_segmentation,
+        compute_speaker_embeddings=args.compute_speaker_embeddings,
     )

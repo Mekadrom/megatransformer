@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 import megatransformer_utils
 import numpy as np
 import torch
+import torch.nn as nn
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -37,6 +38,21 @@ def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
                     return callback.tb_writer
     return None
 
+
+class AudioDiffusionModelWithT5ConditioningAdapter(nn.Module):
+    """Wrapper for AudioConditionalGaussianDiffusion to add T5 text conditioning adapter."""
+    def __init__(self, model: AudioConditionalGaussianDiffusion, context_dim: int):
+        super().__init__()
+        self.model = model
+        self.context_dim = context_dim
+
+        self.condition_adapter = nn.Linear(context_dim, context_dim)
+
+    def forward(self, x_0: torch.Tensor, condition: Optional[torch.Tensor] = None):
+        # condition is expected to be T5 text embeddings of shape [B, T_text, context_dim]
+        # this can be switched out after pretraining to take other condition embedding spaces with retraining
+        condition = self.condition_adapter(condition)
+        return self.model(x_0=x_0, condition=condition)
 
 class AudioDiffusionVisualizationCallback(TrainerCallback):
     """
@@ -80,10 +96,10 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
         t5_model.eval()
         self.t5_model = t5_model
 
-        self.text = "The quick brown fox jumps over the lazy dog."
+        self.text = "It is from Westport, above the villages of Murrisk and Lecanvey."
         self.text_inputs = t5_tokenizer(
             [self.text],
-            max_length=32,
+            max_length=1024,
             padding="max_length",
             truncation=True,
             return_tensors="pt",
@@ -450,8 +466,7 @@ class AudioDiffusionTrainer(Trainer):
         # Forward pass through diffusion model
         predicted_noise, loss = model(
             x_0=mel_spec,
-            # condition=text_embeddings,
-            condition=None,  # unconditional training TODO remove
+            condition=text_embeddings,
         )
 
         # Log losses
@@ -508,8 +523,8 @@ def main():
     min_snr_gamma = float(unk_dict.get("min_snr_gamma", 5.0))
 
     # Dataset settings
-    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/librispeech_train_diffusion_cached")
-    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/librispeech_val_diffusion_cached")
+    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/librispeech_train_diffusion_full_cached")
+    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/librispeech_val_diffusion_full_cached")
     audio_max_frames = int(unk_dict.get("audio_max_frames", 1875))
     max_conditions = int(unk_dict.get("max_conditions", 1024))
     n_mels = int(unk_dict.get("n_mels", 80))
@@ -624,6 +639,8 @@ def main():
         )
         if args.local_rank == 0 or not args.use_deepspeed:
             print(f"EMA enabled: decay={ema_decay}, update_after_step={ema_update_after_step}")
+
+    model = AudioDiffusionModelWithT5ConditioningAdapter(model, context_dim=context_dim)
 
     # Create trainer
     trainer = AudioDiffusionTrainer(
