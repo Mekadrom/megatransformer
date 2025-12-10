@@ -16,7 +16,7 @@ class CachedAudioDiffusionDataset(Dataset):
     def __init__(
         self,
         cache_dir: str,
-        audio_max_frames: int = 626,
+        audio_max_frames: int = 1875,
     ):
         self.cache_dir = cache_dir
         self.audio_max_frames = audio_max_frames

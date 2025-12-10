@@ -24,11 +24,12 @@ def preprocess_and_cache_dataset(
     n_mels: int = 80,
     n_fft: int = 1024,
     hop_length: int = 256,
-    audio_max_frames: int = 626,
+    audio_max_frames: int = 1875,
     max_conditions: int = 1024,  # max text embeddings sequence length
-    segment_length_sec: float = 10.0,
+    segment_length_sec: float = 30.0,
     segment_overlap_sec: float = 1.0,
     mel_window: str = "hann_window",
+    enable_segmentation: bool = False,
 ):
     """
     Preprocess dataset and save as individual .pt files.
@@ -81,14 +82,19 @@ def preprocess_and_cache_dataset(
             # Remove mains hum
             waveforms = remove_mains_hum(waveforms.unsqueeze(0), sample_rate).squeeze(0)
 
-            # Break into 10s segments
             if len(waveforms) > max_samples:
-                segments = []
-                for start in range(0, len(waveforms) - max_samples + 1, stride):
-                    segments.append(waveforms[start:start + max_samples])
-                # Include final segment if there's leftover
-                if len(waveforms) % stride != 0:
-                    segments.append(waveforms[-max_samples:])
+                if enable_segmentation:
+                    # Break into segments
+                    segments = []
+                    for start in range(0, len(waveforms) - max_samples + 1, stride):
+                        segments.append(waveforms[start:start + max_samples])
+                    # Include final segment if there's leftover
+                    if len(waveforms) % stride != 0:
+                        segments.append(waveforms[-max_samples:])
+                else:
+                    # skip too long
+                    stats["skipped_too_long"] += 1
+                    continue
             else:
                 segments = [waveforms]
             
@@ -191,9 +197,10 @@ if __name__ == "__main__":
     parser.add_argument("--n_mels", type=int, default=80)
     parser.add_argument("--n_fft", type=int, default=1024)
     parser.add_argument("--hop_length", type=int, default=256)
-    parser.add_argument("--audio_max_frames", type=int, default=626)
+    parser.add_argument("--audio_max_frames", type=int, default=1875)
     parser.add_argument("--mel_window", type=str, default="hann_window")
     parser.add_argument("--max_conditions", type=int, default=512)
+    parser.add_argument("--enable_segmentation", action="store_true")
 
     args = parser.parse_args()
     
@@ -209,4 +216,5 @@ if __name__ == "__main__":
         audio_max_frames=args.audio_max_frames,
         max_conditions=args.max_conditions,
         mel_window=args.mel_window,
+        enable_segmentation=args.enable_segmentation,
     )

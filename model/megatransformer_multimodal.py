@@ -1163,7 +1163,6 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
 def make_audio_decoder(config: megatransformer_utils.MegaTransformerConfig):
     return AudioConditionalGaussianDiffusion(
         config=config,  # for vocoder to grab its details from
-        hidden_size=config.hidden_size,
         activation=config.audio_decoder_activation,
         scale_factor=(2, 1),
         stride=(2, 1),

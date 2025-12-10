@@ -24,18 +24,24 @@ class Block(nn.Module):
 
     def forward(self, x, time_embedding=None):
         # x: [B, C, H, W]
+        # where:
+        # C = hidden_size/hidden_channels
+        # H = n_mels
+        # W = time_frames
+
         x = self.proj(x)
-        # switch channel to last dimension (now [B, H, W, C])
+        # switch channel to last dimension (now [B, H;;, W, C])
         x = x.permute(0, 2, 3, 1).contiguous()
         x = self.norm(x)
         # switch back to [B, C, H, W]
-        x = x.permute(0, 3, 1, 2).contiguous()
 
         if time_embedding is not None:
-            x = x + time_embedding
+            # x is [B, H, W, C]
+            # time_embedding is [B, C]
+            x = x + time_embedding[:, None, None, :]
 
+        x = x.permute(0, 3, 1, 2).contiguous()
         x = self.act(x)
-
         return x
 
 class ResidualBlock(nn.Module):
@@ -138,7 +144,6 @@ class DownBlock(nn.Module):
 
 class UpBlock(nn.Module):
     def __init__(self,
-                 hidden_size,
                  in_channels: int,
                  out_channels: int,
                  time_embedding_dim: int,
@@ -149,6 +154,7 @@ class UpBlock(nn.Module):
                  norm_class,
                  has_attn: bool=False,
                  has_condition: bool=False,
+                 context_dim: Optional[int]=None,
                  num_res_blocks: int=2,
                  dropout_p: float=0.1,
                  self_attn_n_heads=6,
@@ -161,10 +167,7 @@ class UpBlock(nn.Module):
                  cross_attn_use_flash_attention=True):
         super().__init__()
 
-        self.upsample = nn.Sequential(
-            nn.Upsample(scale_factor=scale_factor, mode="nearest"),
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
-        )
+        self.upsample_conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
 
         self.norms = nn.ModuleList([
             norms.RMSNorm(in_channels*2 if i == 0 else out_channels)
@@ -185,7 +188,7 @@ class UpBlock(nn.Module):
 
         self.cross_attn_blocks = nn.ModuleList([
             cross_attn_class(
-                out_channels, cross_attn_n_heads, cross_attn_d_queries, cross_attn_d_values, context_dim=hidden_size, use_flash_attention=cross_attn_use_flash_attention, dropout_p=dropout_p
+                out_channels, cross_attn_n_heads, cross_attn_d_queries, cross_attn_d_values, context_dim=context_dim, use_flash_attention=cross_attn_use_flash_attention, dropout_p=dropout_p
             ) if has_attn and has_condition else nn.Identity()
             for _ in range(num_res_blocks)
         ])
@@ -193,11 +196,12 @@ class UpBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.kaiming_normal_(self.upsample[1].weight, a=0.2)
-        self.upsample[1].bias.data.zero_()
+        nn.init.kaiming_normal_(self.upsample_conv.weight, a=0.2)
+        self.upsample_conv.bias.data.zero_()
 
-    def forward(self, x: torch.Tensor, skip: list[torch.Tensor], time_embedding: torch.Tensor, condition=None) -> torch.Tensor:
-        x = self.upsample(x)
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, time_embedding: torch.Tensor, condition=None) -> torch.Tensor:
+        x = F.interpolate(x, size=skip.shape[2:], mode="nearest")
+        x = self.upsample_conv(x)
         x = torch.cat([x, skip], dim=1)
         for norm, res_block, attn_block, cross_attn_block in zip(self.norms, self.res_blocks, self.attn_blocks, self.cross_attn_blocks):
             # switch channel and last dimension
@@ -214,7 +218,6 @@ class UpBlock(nn.Module):
 class UNet(nn.Module):
     def __init__(
             self,
-            hidden_size,
             activation,
             self_attn_class,
             cross_attn_class,
@@ -230,6 +233,7 @@ class UNet(nn.Module):
             num_res_blocks: int = 2,
             dropout_p: float = 0.1,
             has_condition: bool = False,
+            context_dim: Optional[int] = None,
             down_block_self_attn_n_heads=6,
             down_block_self_attn_d_queries=64,
             down_block_self_attn_d_values=64,
@@ -296,7 +300,6 @@ class UNet(nn.Module):
         for i in reversed(range(len(channel_multipliers))):
             self.up_blocks.append(
                 UpBlock(
-                    hidden_size,
                     channels[i + 1],
                     channels[i],
                     time_embedding_dim,
@@ -309,6 +312,7 @@ class UNet(nn.Module):
                     num_res_blocks=num_res_blocks,
                     dropout_p=dropout_p,
                     has_condition=has_condition,
+                    context_dim=context_dim,
                     self_attn_n_heads=up_block_self_attn_n_heads,
                     self_attn_d_queries=up_block_self_attn_d_queries,
                     self_attn_d_values=up_block_self_attn_d_values,
@@ -371,7 +375,6 @@ class GaussianDiffusion(nn.Module):
     def __init__(
             self,
             config: megatransformer_utils.MegaTransformerConfig,
-            hidden_size,
             activation,
             scale_factor,
             stride,
@@ -389,6 +392,7 @@ class GaussianDiffusion(nn.Module):
             has_condition: bool = False,
             unet_dropout_p: float = 0.1,
             betas_schedule="linear",
+            context_dim: Optional[int] = None,
             down_block_self_attn_n_heads=6,
             down_block_self_attn_d_queries=64,
             down_block_self_attn_d_values=64,
@@ -424,7 +428,6 @@ class GaussianDiffusion(nn.Module):
             self.is_ddim_sampling = sampling_timesteps < num_timesteps
 
         self.unet = UNet(
-            hidden_size,
             activation,
             scale_factor=scale_factor,
             stride=stride,
@@ -438,6 +441,7 @@ class GaussianDiffusion(nn.Module):
             num_res_blocks=num_res_blocks,
             dropout_p=unet_dropout_p,
             has_condition=has_condition,
+            context_dim=context_dim,
             down_block_self_attn_n_heads=down_block_self_attn_n_heads,
             down_block_self_attn_d_queries=down_block_self_attn_d_queries,
             down_block_self_attn_d_values=down_block_self_attn_d_values,
@@ -533,6 +537,9 @@ class GaussianDiffusion(nn.Module):
 
         pred_noise = model_output
         x_start = self.predict_start_from_noise(x, t, pred_noise)
+
+        megatransformer_utils.print_debug_tensor("x_start before clip", x_start)
+
         x_start = maybe_clip(x_start)
 
         return pred_noise, x_start

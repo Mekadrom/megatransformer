@@ -262,7 +262,6 @@ class SplitBandFrequencyDomainVocoder(FrequencyDomainVocoderBase):
 
         head_input_dim = hidden_dim // 2
 
-        # ============ Magnitude Heads ============
         # Single-layer heads to match LightHeaded parameter count
         # Low-freq: larger kernel for frequency resolution
         self.mag_head_low = nn.Conv1d(
@@ -276,18 +275,18 @@ class SplitBandFrequencyDomainVocoder(FrequencyDomainVocoderBase):
             kernel_size=high_freq_kernel, padding=high_freq_kernel // 2
         )
 
-        # ============ Phase Heads ============
         # Low-freq: larger kernel for phase coherence, SiLU for smooth output
+        # Also deeper because low-freq phase is more important perceptually
         self.phase_head_low = nn.Sequential(
+            nn.Conv1d(head_input_dim, head_input_dim, kernel_size=low_freq_kernel, padding=low_freq_kernel // 2),
+            Snake(head_input_dim),
             nn.Conv1d(head_input_dim, self.n_low_bins, kernel_size=low_freq_kernel, padding=low_freq_kernel // 2),
-            nn.SiLU(),
         )
 
         # High-freq: smaller kernel, Snake for periodic inductive bias
-        self.phase_head_high_snake = Snake(head_input_dim)
-        self.phase_head_high_conv = nn.Conv1d(
-            head_input_dim, self.n_high_bins,
-            kernel_size=high_freq_kernel, padding=high_freq_kernel // 2
+        self.phase_head_high = nn.Sequential(
+            Snake(head_input_dim),
+            nn.Conv1d(head_input_dim, self.n_high_bins, kernel_size=high_freq_kernel, padding=high_freq_kernel // 2)
         )
 
         self._init_weights()
@@ -313,9 +312,23 @@ class SplitBandFrequencyDomainVocoder(FrequencyDomainVocoderBase):
                     nn.init.zeros_(m.bias)
 
         # High-freq phase head conv
-        nn.init.xavier_uniform_(self.phase_head_high_conv.weight, gain=0.1)
-        if self.phase_head_high_conv.bias is not None:
-            nn.init.zeros_(self.phase_head_high_conv.bias)
+        for m in self.phase_head_high:
+            if isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def predict_phase(self, x):
+        phase_low = self.phase_head_low(x)    # [B, n_low_bins, T]
+        phase_high = self.phase_head_high(x)  # [B, n_high_bins, T]
+
+        # Concatenate bands
+        phase_angle = torch.cat([phase_low, phase_high], dim=1)  # [B, freq_bins, T]
+
+        # Convert angle to unit phasor
+        phase_real = torch.cos(phase_angle)
+        phase_imag = torch.sin(phase_angle)
+        return phase_real, phase_imag
 
     def forward(self, mel):
         """
@@ -331,8 +344,7 @@ class SplitBandFrequencyDomainVocoder(FrequencyDomainVocoderBase):
         for block in self.backbone:
             x = block(x)
 
-        # ============ Magnitude prediction via ELU + 1 ============
-        # ELU + 1 has softplus-like bounded gradients but no floor artifact
+        # ELU + 1 has softplus-like bounded gradients but no floor artifact (~0.62 at x=0)
         mag_pre_low = self.mag_head_low(x)    # [B, n_low_bins, T]
         mag_pre_high = self.mag_head_high(x)  # [B, n_high_bins, T]
 
@@ -340,10 +352,124 @@ class SplitBandFrequencyDomainVocoder(FrequencyDomainVocoderBase):
         mag_pre = torch.cat([mag_pre_low, mag_pre_high], dim=1)  # [B, freq_bins, T]
         mag = F.elu(mag_pre, alpha=1.0) + 1.0
 
-        # ============ Phase prediction ============
-        phase_low = self.phase_head_low(x)    # [B, n_low_bins, T]
-        # High-freq phase: Snake activation then conv
-        phase_high = self.phase_head_high_conv(self.phase_head_high_snake(x))  # [B, n_high_bins, T]
+        phase_real, phase_imag = self.predict_phase(x)
+
+        # Construct complex STFT
+        stft_real = mag * phase_real
+        stft_imag = mag * phase_imag
+        stft = torch.complex(stft_real.to(torch.float32), stft_imag.to(torch.float32))
+
+        # iSTFT to waveform
+        waveform = torch.istft(
+            stft,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=self.window.to(stft.device),
+            length=mel.size(-1) * self.hop_length,
+            return_complex=False,
+        )
+
+        return waveform, stft
+
+
+class SplitBandLowFreqMeanFreqDomainVocoder(FrequencyDomainVocoderBase):
+    """Experimental: Split-band vocoder predicting instantaneous frequency instead of phase angle."""
+    def __init__(
+        self,
+        shared_window_buffer: SharedWindowBuffer,
+        n_mels: int = 80,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        hidden_dim: int = 512,
+        num_layers: int = 8,
+        convnext_mult: int = 4,
+        cutoff_bin: int = 128,  # ~2kHz at 16kHz sample rate with n_fft=1024
+        low_freq_kernel: int = 7,
+        high_freq_kernel: int = 3,
+    ):
+        super().__init__(shared_window_buffer, n_mels, n_fft, hop_length, hidden_dim)
+
+        self.cutoff_bin = cutoff_bin
+        self.n_low_bins = cutoff_bin
+        self.n_high_bins = self.freq_bins - cutoff_bin
+
+        # Backbone - same as LightHeaded
+        backbone_layers = [
+            ConvNeXtBlock(hidden_dim, expansion=convnext_mult) for _ in range(num_layers - 1)
+        ]
+        backbone_layers.append(ConvNeXtBlock(hidden_dim, ovr_out_dim=hidden_dim // 2, expansion=convnext_mult))
+        self.backbone = nn.ModuleList(backbone_layers)
+
+        head_input_dim = hidden_dim // 2
+
+        # Single-layer heads to match LightHeaded parameter count
+        # Low-freq: larger kernel for frequency resolution
+        self.mag_head_low = nn.Conv1d(
+            head_input_dim, self.n_low_bins,
+            kernel_size=low_freq_kernel, padding=low_freq_kernel // 2
+        )
+
+        # High-freq: smaller kernel for temporal precision
+        self.mag_head_high = nn.Conv1d(
+            head_input_dim, self.n_high_bins,
+            kernel_size=high_freq_kernel, padding=high_freq_kernel // 2
+        )
+
+        self.phase_act_low = Snake(head_input_dim)
+        self.phase_head_low_large = nn.Sequential(
+            nn.Conv1d(head_input_dim, self.n_low_bins, kernel_size=low_freq_kernel, padding=low_freq_kernel // 2)
+        )
+        self.phase_head_low_small = nn.Sequential(
+            nn.Conv1d(head_input_dim, self.n_low_bins, kernel_size=high_freq_kernel, padding=high_freq_kernel // 2)
+        )
+
+        self.phase_head_high = nn.Sequential(
+            Snake(head_input_dim),
+            nn.Conv1d(head_input_dim, self.n_high_bins, kernel_size=high_freq_kernel, padding=high_freq_kernel // 2)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Input projection
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        if self.input_proj.bias is not None:
+            nn.init.zeros_(self.input_proj.bias)
+
+        # Magnitude heads - small init for stable start
+        for head in [self.mag_head_low, self.mag_head_high]:
+            nn.init.xavier_uniform_(head.weight, gain=0.1)
+            if head.bias is not None:
+                nn.init.zeros_(head.bias)
+
+        # Phase heads - small init
+        # Low-freq phase head (Sequential with conv)
+        for m in self.phase_head_low_large:
+            if isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        for m in self.phase_head_low_small:
+            if isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # High-freq phase head conv
+        for m in self.phase_head_high:
+            if isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def predict_phase(self, x):
+        low_snake = self.phase_act_low(x)
+        phase_low_large = self.phase_head_low_large(low_snake)  # [B, n_low_bins, T]
+        phase_low_small = self.phase_head_low_small(low_snake)  # [B, n_low_bins, T]
+        
+        phase_low = (phase_low_large + phase_low_small) / 2.0  # [B, n_low_bins, T]
+        phase_high = self.phase_head_high(x)  # [B, n_high_bins, T]
 
         # Concatenate bands
         phase_angle = torch.cat([phase_low, phase_high], dim=1)  # [B, freq_bins, T]
@@ -351,6 +477,31 @@ class SplitBandFrequencyDomainVocoder(FrequencyDomainVocoderBase):
         # Convert angle to unit phasor
         phase_real = torch.cos(phase_angle)
         phase_imag = torch.sin(phase_angle)
+        return phase_real, phase_imag
+
+    def forward(self, mel):
+        """
+        Args:
+            mel: [B, n_mels, T] log mel spectrogram
+
+        Returns:
+            waveform: [B, T * hop_length]
+            stft: [B, freq_bins, T] complex - for loss computation
+        """
+        # Backbone
+        x = self.input_proj(mel)
+        for block in self.backbone:
+            x = block(x)
+
+        # ELU + 1 has softplus-like bounded gradients but no floor artifact (~0.62 at x=0)
+        mag_pre_low = self.mag_head_low(x)    # [B, n_low_bins, T]
+        mag_pre_high = self.mag_head_high(x)  # [B, n_high_bins, T]
+
+        # Concatenate bands and apply ELU + 1
+        mag_pre = torch.cat([mag_pre_low, mag_pre_high], dim=1)  # [B, freq_bins, T]
+        mag = F.elu(mag_pre, alpha=1.0) + 1.0
+
+        phase_real, phase_imag = self.predict_phase(x)
 
         # Construct complex STFT
         stft_real = mag * phase_real

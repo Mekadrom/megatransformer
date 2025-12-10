@@ -4,11 +4,13 @@ from torch.nn import DataParallel
 from torch.nn.parallel import DistributedDataParallel
 from transformers import PretrainedConfig
 from transformers import set_seed as hf_set_seed
+from transformers.trainer_callback import TrainerCallback
 from typing import Optional
 
 import argparse
 import deepspeed
 import glob
+import json
 import math
 import numpy as np
 import os
@@ -187,7 +189,7 @@ class MegaTransformerConfig(PretrainedConfig):
         audio_n_mels=80,
         audio_n_fft=1024,
         audio_hop_length=256,
-        audio_max_duration=10.0, # used for trimming data/skipping examples that are too long
+        audio_max_duration=30.0, # used for trimming data/skipping examples that are too long
         audio_sample_rate=16000,
         image_size=256,
 
@@ -490,6 +492,16 @@ class MultimodalGenerationOutput:
         self.image_outputs = image_outputs
         self.intermediate_image_outputs = intermediate_image_outputs
 
+class EarlyStoppingCallback(TrainerCallback):
+    def __init__(self, stop_step: int):
+        self.stop_step = stop_step
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if self.stop_step > 0 and state.global_step >= self.stop_step:
+            print(f"Early stopping at step {state.global_step} as per stop_step={self.stop_step}.")
+            control.should_training_stop = True
+
+
 def create_alibi_bias(n_heads, maxlen):
     slopes = torch.pow(2, -torch.arange(1, n_heads + 1) * 8 / n_heads)
     # Create position differences matrix
@@ -620,7 +632,9 @@ def parse_args():
     argparser.add_argument('--cpu', action='store_true', help='Use CPU for training')
     argparser.add_argument('--log_level', type=str, default='warning', help='Logging level: debug, info, warning, error, critical')
     argparser.add_argument('--resume_from_checkpoint', type=str, help='Resume from checkpoint at this path')
-    argparser.add_argument('--start_step', type=int, default=0, help='Start step for training')
+    argparser.add_argument('--start_step', type=int, default=None, help='Start step for training')
+    argparser.add_argument('--lr_scheduler_type', type=str, default='cosine', help='Learning rate scheduler type')
+    argparser.add_argument('--lr_scheduler_kwargs', type=str, default=None, help='Additional kwargs for LR scheduler as a JSON stringified dict')
 
     # efficiency params
     argparser.add_argument('--compile_model', action='store_true', help='Whether to compile the model')
@@ -699,6 +713,11 @@ def parse_args():
         args.num_train_epochs = -1
 
     set_seed_everywhere(args.seed)
+
+    if args.lr_scheduler_kwargs is None:
+        args.lr_scheduler_kwargs = {}
+    else:
+        args.lr_scheduler_kwargs = json.loads(args.lr_scheduler_kwargs)
 
     # make sure deepspeed config specified exists
     if args.use_deepspeed:

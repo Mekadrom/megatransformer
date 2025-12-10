@@ -473,8 +473,8 @@ def prune_split_band_vocoder(
     new_snake.alpha.data = old_snake.alpha.data[head_indices]
     new_model.phase_head_high_snake = new_snake
 
-    new_model.phase_head_high_conv = prune_conv1d(
-        old_model.phase_head_high_conv, head_indices, None
+    new_model.phase_head_high = prune_conv1d(
+        old_model.phase_head_high, head_indices, None
     )
 
     return new_model

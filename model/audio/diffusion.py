@@ -187,6 +187,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         return (x + 1) / 2 * (self.mel_max - self.mel_min) + self.mel_min
 
     def p_losses(self, x_start: torch.Tensor, t: torch.Tensor, noise=None, condition=None):
+
         if noise is None:
             noise = torch.randn_like(x_start)
 
@@ -196,12 +197,18 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
 
         model_out = self.unet(x_noisy, t, condition)
 
+        # megatransformer_utils.print_debug_tensor("noise", noise)
+        # megatransformer_utils.print_debug_tensor("model_out", model_out)
+
         target = noise
 
         loss = F.mse_loss(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b', 'mean')
+        # print(f"loss before weighting: {loss.mean().item()}")
 
         loss = loss * self._extract(self.loss_weight, t, loss.shape)
+        # print(f"loss after weighting: {loss.mean().item()}")
+        # print(f"loss_weight: {self._extract(self.loss_weight, t, loss.shape).tolist()}")
         return model_out, loss.mean()
 
     def forward(self, x_0, condition=None):
@@ -232,11 +239,13 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
                 # squish batch and example dimensions if necessary
                 *_, c, h, w = condition.shape
                 condition = condition.view(-1, c, h, w)
+            # megatransformer_utils.print_debug_tensor("condition", condition)
 
         t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device=x_0.device).long()
 
         if self.is_normalize:
             x_0 = self.normalize(x_0)
+            # megatransformer_utils.print_debug_tensor("x_0 after normalize", x_0)
 
         predicted_noise, loss = self.p_losses(x_0, t, condition=condition)
 
@@ -257,35 +266,44 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
 
         if isinstance(x, tuple):
             audio = x[0]
+            noise_preds = x[1]
+            x_start_preds = x[2]
         else:
             audio = x
+            noise_preds = None
+            x_start_preds = None
 
         if self.is_normalize:
             audio = self.unnormalize(audio)
+            # Also unnormalize intermediate x_start predictions
+            if x_start_preds is not None:
+                x_start_preds = [self.unnormalize(x_start) for x_start in x_start_preds]
 
-        return (audio, *x[1:]) if return_intermediate else audio
+        if return_intermediate:
+            return audio, noise_preds, x_start_preds
+        return audio
 
 
 # Pre-defined configurations
-# audio_max_duration is set to produce exactly 626 frames: 626 * 256 / 16000 = 10.016 seconds
+# audio_max_duration is set to produce exactly 1875.0*256.0/16000.0 = 30.0 seconds of audio
 tiny_audio_diffusion_config = megatransformer_utils.MegaTransformerConfig(
     hidden_size=128,
     audio_n_mels=80,
     audio_n_fft=1024,
     audio_hop_length=256,
-    audio_max_duration=10.016,  # 626 frames at 16000 Hz with hop_length 256
+    audio_max_duration=1875.0*256.0/16000.0,
     audio_sample_rate=16000,
-    audio_decoder_model_channels=64,
-    audio_decoder_time_embedding_dim=128,
+    audio_decoder_model_channels=32,
+    audio_decoder_time_embedding_dim=32,
     audio_decoder_num_res_blocks=2,
 )
 
 small_audio_diffusion_config = megatransformer_utils.MegaTransformerConfig(
-    hidden_size=256,
+    hidden_size=512,
     audio_n_mels=80,
     audio_n_fft=1024,
     audio_hop_length=256,
-    audio_max_duration=10.016,  # 626 frames at 16000 Hz with hop_length 256
+    audio_max_duration=1875.0*256.0/16000.0,
     audio_sample_rate=16000,
     audio_decoder_model_channels=128,
     audio_decoder_time_embedding_dim=256,
@@ -297,7 +315,7 @@ medium_audio_diffusion_config = megatransformer_utils.MegaTransformerConfig(
     audio_n_mels=80,
     audio_n_fft=1024,
     audio_hop_length=256,
-    audio_max_duration=10.016,  # 626 frames at 16000 Hz with hop_length 256
+    audio_max_duration=1875.0*256.0/16000.0,
     audio_sample_rate=16000,
     audio_decoder_model_channels=256,
     audio_decoder_time_embedding_dim=512,
@@ -316,17 +334,14 @@ def create_audio_diffusion_model(
     min_snr_gamma: float = 5.0,
 ) -> AudioConditionalGaussianDiffusion:
     """Create an audio diffusion model from config."""
-    from model import norms
-
     model = AudioConditionalGaussianDiffusion(
         config=config,
-        hidden_size=config.hidden_size,
         activation=config.audio_decoder_activation if hasattr(config, 'audio_decoder_activation') else "silu",
         scale_factor=2,
         stride=(2, 2),
         self_attn_class=AudioDiffusionSelfAttentionBlock,
         cross_attn_class=AudioDiffusionCrossAttentionBlock,
-        norm_class=norms.LayerNorm,
+        norm_class=nn.LayerNorm,
         in_channels=1,  # Single channel mel spectrogram
         model_channels=config.audio_decoder_model_channels,
         out_channels=1,
@@ -336,7 +351,7 @@ def create_audio_diffusion_model(
         num_timesteps=num_timesteps,
         betas_schedule=betas_schedule,
         has_condition=True,
-        context_dim=context_dim,
+        context_dim=context_dim,  # T5-small embedding dimension
         down_block_self_attn_n_heads=config.audio_decoder_down_block_self_attn_n_heads,
         down_block_self_attn_d_queries=config.audio_decoder_down_block_self_attn_d_queries,
         down_block_self_attn_d_values=config.audio_decoder_down_block_self_attn_d_values,

@@ -8,7 +8,7 @@ from model.activations import Snake
 from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss
 from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders.convtranspose1d_vocoder import ConvTranspose1DVocoderUpsampleBlock
-from model.audio.vocoders.freq_domain_vocoder import HeavyHeadedFrequencyDomainVocoder, LightHeadedFrequencyDomainVocoder, SplitBandFrequencyDomainVocoder
+from model.audio.vocoders.freq_domain_vocoder import SplitBandLowFreqMeanFreqDomainVocoder, HeavyHeadedFrequencyDomainVocoder, LightHeadedFrequencyDomainVocoder, SplitBandFrequencyDomainVocoder
 from model.audio.vocoders.upsample_vocoder import AntiAliasedUpsampleVocoderUpsampleBlock
 
 
@@ -569,6 +569,32 @@ def create_split_band_freq_domain_vocoder(
         **kwargs,
     )
 
+def create_experimental_vocoder(
+        shared_window_buffer: SharedWindowBuffer,
+        config: megatransformer_utils.MegaTransformerConfig,
+        cutoff_bin: int = 128,
+        low_freq_kernel: int = 7,
+        high_freq_kernel: int = 3,
+        **kwargs,
+) -> VocoderWithLoss:
+    return create_vocoder(
+        vocoder=SplitBandLowFreqMeanFreqDomainVocoder(
+            shared_window_buffer,
+            n_mels=config.audio_n_mels,
+            n_fft=config.audio_n_fft,
+            hop_length=config.audio_hop_length,
+            hidden_dim=config.audio_vocoder_hidden_channels,
+            num_layers=config.audio_vocoder_n_residual_layers,
+            convnext_mult=config.audio_vocoder_upsample_factors[0],  # 8 most of the time
+            cutoff_bin=cutoff_bin,
+            low_freq_kernel=low_freq_kernel,
+            high_freq_kernel=high_freq_kernel,
+        ),
+        shared_window_buffer=shared_window_buffer,
+        config=config,
+        **kwargs,
+    )
+
 
 model_config_lookup = {
     "small_vocoder_convtranspose1d": lambda shared_window_buffer, **kwargs: create_convtranspose1d_vocoder(
@@ -606,4 +632,9 @@ model_config_lookup = {
         config=tiny_config,
         **kwargs
     ),
+    "experimental": lambda shared_window_buffer, **kwargs: create_experimental_vocoder(
+        shared_window_buffer=shared_window_buffer,
+        config=tiny_config,
+        **kwargs,
+    )
 }

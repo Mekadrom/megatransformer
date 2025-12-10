@@ -41,14 +41,6 @@ def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
                     return callback.tb_writer
     return None
 
-class VocoderEarlyStoppingCallback(TrainerCallback):
-    def __init__(self, stop_step: int):
-        self.stop_step = stop_step
-
-    def on_step_begin(self, args, state, control, **kwargs):
-        if self.stop_step > 0 and state.global_step >= self.stop_step:
-            print(f"Early stopping at step {state.global_step} as per stop_step={self.stop_step}.")
-            control.should_training_stop = True
 
 class VocoderReconstructionCallback(TrainerCallback):
     """
@@ -67,7 +59,7 @@ class VocoderReconstructionCallback(TrainerCallback):
         audio_hop_length: int = 256,
     ):
         self.trainer: Optional[Trainer] = None
-        self.step_offset = step_offset
+        self.step_offset = self.step_offset = step_offset if step_offset is not None else 0
         self.generation_steps = generation_steps
         self.audio_sample_rate = audio_sample_rate
         self.audio_n_mels = audio_n_mels
@@ -398,6 +390,7 @@ class VocoderGANTrainer(Trainer):
     def __init__(
         self,
         *args,
+        step_offset,
         n_fft,
         hop_length,
         cmdline,
@@ -422,6 +415,7 @@ class VocoderGANTrainer(Trainer):
     ):
         super().__init__(*args, **kwargs)
 
+        self.step_offset = step_offset if step_offset is not None else 0
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.cmdline = cmdline
@@ -461,11 +455,13 @@ class VocoderGANTrainer(Trainer):
         return data
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        global_step = self.state.global_step + self.step_offset
+
         self._ensure_tensorboard_writer()
 
-        if self.state.global_step == 0 and self.writer is not None:
-            self.writer.add_text("training/command_line", self.cmdline, 0)
-            self.writer.add_text("training/git_commit_hash", self.git_commit_hash, 0)
+        if global_step == 0 and self.writer is not None:
+            self.writer.add_text("training/command_line", self.cmdline, global_step)
+            self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
 
         # Forward pass through generator (vocoder)
         waveform_labels = inputs["waveform_labels"]
@@ -492,7 +488,7 @@ class VocoderGANTrainer(Trainer):
         # GAN losses (only after gan_start_step)
         gan_enabled = (
             self.discriminator is not None and
-            self.state.global_step >= self.gan_start_step
+            global_step >= self.gan_start_step
         )
 
         g_loss_gan = torch.tensor(0.0, device=pred_waveform.device)
@@ -501,7 +497,7 @@ class VocoderGANTrainer(Trainer):
 
         if gan_enabled:
             # Discriminator Update
-            if self.state.global_step % self.discriminator_update_frequency == 0:
+            if global_step % self.discriminator_update_frequency == 0:
                 self.discriminator.train()
 
                 # Detach generator outputs for discriminator update
@@ -525,7 +521,7 @@ class VocoderGANTrainer(Trainer):
                 
                 d_loss = self.mpd_loss_weight * d_loss_mpd + self.msd_loss_weight * d_loss_msd + self.mrsd_loss_weight * d_loss_mrsd
 
-                if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
+                if global_step % self.args.logging_steps == 0 and self.writer is not None:
                     for disc_crit in disc_real.keys():
                         for o, output in enumerate(disc_real[disc_crit][0]):
                             self._log_scalar(f"train/disc_real_{disc_crit}/{o}/avg", output.mean())
@@ -567,7 +563,7 @@ class VocoderGANTrainer(Trainer):
             g_loss_fm = self.mpd_fm_loss_weight * g_fm_mpd + self.msd_fm_loss_weight * g_fm_msd + self.mrsd_fm_loss_weight * g_fm_mrsd
             g_loss_gan = self.gan_adv_loss_weight * g_loss_adv + self.gan_feature_matching_loss_weight * g_loss_fm
 
-            if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
+            if global_step % self.args.logging_steps == 0 and self.writer is not None:
                 self._log_scalar("train/g_adv_mpd", g_adv_mpd)
                 self._log_scalar("train/g_fm_mpd", g_fm_mpd)
                 self._log_scalar("train/g_adv_msd", g_adv_msd)
@@ -581,7 +577,7 @@ class VocoderGANTrainer(Trainer):
         total_loss = recon_loss + g_loss_gan
 
         # Log individual losses
-        if self.state.global_step % self.args.logging_steps == 0 and self.writer is not None:
+        if global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
             self._log_scalar(f"{prefix}waveform_l1", outputs.get("waveform_l1", 0))
             self._log_scalar(f"{prefix}sc_loss", outputs.get("sc_loss", 0))
@@ -599,11 +595,12 @@ class VocoderGANTrainer(Trainer):
         return (total_loss, outputs) if return_outputs else total_loss
 
     def _log_scalar(self, tag, value):
+        global_step = self.state.global_step + self.step_offset
         if self.writer is not None:
             if isinstance(value, torch.Tensor):
                 value = value.item()
             if value != 0.0:
-                self.writer.add_scalar(tag, value, self.state.global_step)
+                self.writer.add_scalar(tag, value, global_step)
 
     def _ensure_tensorboard_writer(self):
         if hasattr(self, "writer") and self.writer is not None:
@@ -620,12 +617,14 @@ class VocoderGANTrainer(Trainer):
         """Save both generator and discriminator."""
         super().save_model(output_dir, _internal_call)
 
+        global_step = self.state.global_step + self.step_offset
+
         if output_dir is None:
             output_dir = self.args.output_dir
 
         gan_enabled = (
             self.discriminator is not None and
-            self.state.global_step >= self.gan_start_step
+            global_step >= self.gan_start_step
         )
 
         # Save discriminator
@@ -737,7 +736,7 @@ def main():
         high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
         direct_mag_loss_weight=direct_mag_loss_weight,
     )
-    model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+    model, model_loaded = megatransformer_utils.load_model(args.start_step is not None, model, run_dir)
 
     # Determine device for discriminator
     if torch.cuda.is_available():
@@ -816,7 +815,8 @@ def main():
         tpu_num_cores=8 if args.use_xla else None,
         output_dir=run_dir,
         overwrite_output_dir=True,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=args.lr_scheduler_type,
+        lr_scheduler_kwargs=args.lr_scheduler_kwargs,
         learning_rate=args.learning_rate,
         warmup_ratio=args.warmup_ratio,
         per_device_train_batch_size=args.batch_size,
@@ -872,6 +872,7 @@ def main():
     # Create trainer (with or without GAN)
     trainer = VocoderGANTrainer(
         model=model,
+        step_offset=args.start_step,
         n_fft=model.config.audio_n_fft,
         hop_length=model.config.audio_hop_length,
         cmdline=args.cmdline,
@@ -910,7 +911,7 @@ def main():
     trainer.add_callback(reconstruction_callback)
 
     if args.stop_step > 0:
-        early_stopping_callback = VocoderEarlyStoppingCallback(stop_step=args.stop_step)
+        early_stopping_callback = megatransformer_utils.EarlyStoppingCallback(stop_step=args.stop_step)
         trainer.add_callback(early_stopping_callback)
     
     reconstruction_callback.trainer = trainer
