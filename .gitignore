@@ -141,3 +141,5 @@ checkpoints/
 image_cache/
 
 logs/
+
+pretrained_models/

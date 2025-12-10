@@ -416,6 +416,7 @@ class GaussianDiffusion(nn.Module):
 
         self.config = config
 
+        self.in_channels = in_channels
         self.num_timesteps = num_timesteps
         self.is_normalize = normalize
         self.ddim_sampling_eta = ddim_sampling_eta
@@ -672,7 +673,7 @@ class GaussianDiffusion(nn.Module):
     def sample(self, device, batch_size: int, condition: Optional[torch.Tensor]=None, return_intermediate: bool=False, override_ddim_sampling_steps: Optional[int]=None, generator=None, **kwargs) -> torch.Tensor:
         image_size = kwargs.get('image_size', self.config.image_size)
 
-        x = torch.randn(batch_size, 3, image_size, image_size, device=device, generator=generator)
+        x = torch.randn(batch_size, self.in_channels, image_size, image_size, device=device, generator=generator)
 
         if self.is_ddim_sampling or override_ddim_sampling_steps is not None:
             x = self.ddim_sample_loop(x, condition=condition, return_intermediate=return_intermediate, override_sampling_steps=override_ddim_sampling_steps)

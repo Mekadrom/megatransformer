@@ -390,7 +390,7 @@ def evaluate_vocoder(
 
     data_collator = VocoderDataCollator(
         audio_max_frames=10000,
-        audio_max_waveform_length=sample_rate * 10,  # 10 seconds max
+        audio_max_waveform_length=sample_rate * 30,  # 10 seconds max
         n_mels=n_mels,
         training=False,
     )
