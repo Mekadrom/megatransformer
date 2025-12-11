@@ -2,11 +2,10 @@ import torch.nn as nn
 import megatransformer_utils
 
 from model import activations
-from model.megatransformer_image_decoder import ImageVAEDecoder
 from model.vae import VAE
 
 
-class ImageVAEEncoder(nn.Module):
+class AudioVAEEncoder(nn.Module):
     def __init__(self, in_channels=3, latent_channels=4, intermediate_channels=[32, 64, 128], activation_fn: str = "silu"):
         super().__init__()
 
@@ -40,7 +39,7 @@ class ImageVAEEncoder(nn.Module):
         return mu, logvar
 
 
-class ImageVAEDecoder(nn.Module):
+class AudioVAEDecoder(nn.Module):
     def __init__(self, latent_channels=4, out_channels=3, intermediate_channels=[128, 64, 32], activation_fn: str = "silu"):
         super().__init__()
 
@@ -74,13 +73,13 @@ class ImageVAEDecoder(nn.Module):
 
 model_config_lookup = {
     "tiny": lambda latent_channels, **kwargs: VAE(
-        encoder=ImageVAEEncoder(
+        encoder=AudioVAEEncoder(
             in_channels=3,
             latent_channels=latent_channels,
             intermediate_channels=[32, 64],
             activation_fn="silu"
         ),
-        decoder=ImageVAEDecoder(
+        decoder=AudioVAEDecoder(
             latent_channels=latent_channels,
             out_channels=3,
             intermediate_channels=[64, 32],
@@ -89,13 +88,13 @@ model_config_lookup = {
         **kwargs
     ),
     "mini": lambda latent_channels, **kwargs: VAE(
-        encoder=ImageVAEEncoder(
+        encoder=AudioVAEEncoder(
             in_channels=3,
             latent_channels=latent_channels,
             intermediate_channels=[32, 64, 128],
             activation_fn="silu"
         ),
-        decoder=ImageVAEDecoder(
+        decoder=AudioVAEDecoder(
             latent_channels=latent_channels,
             out_channels=3,
             intermediate_channels=[128, 64, 32],
