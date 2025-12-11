@@ -43,9 +43,175 @@ from model.audio.vocoders.freq_domain_vocoder import (
     ConvNeXtBlock,
     LightHeadedFrequencyDomainVocoder,
     SplitBandFrequencyDomainVocoder,
+    SplitBandLowFreqMeanFreqDomainVocoder,
 )
 from model.audio.vocoders.vocoders import VocoderWithLoss, model_config_lookup
-from pretrain_vocoder import CachedVocoderDataset, collate_fn
+import megatransformer_utils
+
+# Import lazily to avoid circular imports during script execution
+CachedVocoderDataset = None
+VocoderDataCollator = None
+
+def _lazy_import_dataset():
+    global CachedVocoderDataset, VocoderDataCollator
+    if CachedVocoderDataset is None:
+        from dataset_loading.vocoder_dataset import CachedVocoderDataset as _CachedVocoderDataset
+        from dataset_loading.vocoder_dataset import VocoderDataCollator as _VocoderDataCollator
+        CachedVocoderDataset = _CachedVocoderDataset
+        VocoderDataCollator = _VocoderDataCollator
+
+
+def extract_vocoder_config(vocoder: nn.Module) -> dict:
+    """
+    Extract the configuration needed to reconstruct a vocoder.
+    Returns a dict that can be saved in the checkpoint.
+    """
+    config = {
+        'vocoder_class': type(vocoder).__name__,
+        'n_mels': vocoder.input_proj.in_channels,
+        'n_fft': vocoder.n_fft,
+        'hop_length': vocoder.hop_length,
+        'hidden_dim': vocoder.input_proj.out_channels,
+        'num_layers': len(vocoder.backbone),
+        'convnext_mult': vocoder.backbone[0].pwconv1.out_features // vocoder.backbone[0].pwconv1.in_features,
+    }
+
+    # Add class-specific config
+    if isinstance(vocoder, (SplitBandFrequencyDomainVocoder, SplitBandLowFreqMeanFreqDomainVocoder)):
+        config['cutoff_bin'] = vocoder.cutoff_bin
+
+    if isinstance(vocoder, SplitBandLowFreqMeanFreqDomainVocoder):
+        config['low_freq_kernel'] = vocoder.phase_head_low_large[0].kernel_size[0]
+        config['high_freq_kernel'] = vocoder.phase_head_high[1].kernel_size[0]
+
+    return config
+
+
+def extract_loss_config(model_with_loss: VocoderWithLoss) -> dict:
+    """Extract loss weights from VocoderWithLoss."""
+    return {
+        'sc_loss_weight': model_with_loss.sc_loss_weight,
+        'mag_loss_weight': model_with_loss.mag_loss_weight,
+        'waveform_l1_loss_weight': model_with_loss.waveform_l1_loss_weight,
+        'mel_recon_loss_weight': model_with_loss.mel_recon_loss_weight,
+        'mel_recon_loss_weight_linspace_max': model_with_loss.mel_recon_loss_weight_linspace_max,
+        'complex_stft_loss_weight': model_with_loss.complex_stft_loss_weight,
+        'phase_loss_weight': model_with_loss.phase_loss_weight,
+        'phase_ip_loss_weight': model_with_loss.phase_ip_loss_weight,
+        'phase_iaf_loss_weight': model_with_loss.phase_iaf_loss_weight,
+        'phase_gd_loss_weight': model_with_loss.phase_gd_loss_weight,
+        'high_freq_stft_loss_weight': model_with_loss.high_freq_stft_loss_weight,
+        'direct_mag_loss_weight': model_with_loss.direct_mag_loss_weight,
+    }
+
+
+def create_vocoder_from_config(
+    vocoder_config: dict,
+    shared_window_buffer: SharedWindowBuffer | None = None,
+) -> nn.Module:
+    """
+    Create a vocoder instance from a config dict.
+    This is used to load pruned checkpoints.
+    """
+    if shared_window_buffer is None:
+        shared_window_buffer = SharedWindowBuffer()
+
+    vocoder_class_name = vocoder_config['vocoder_class']
+
+    common_args = {
+        'shared_window_buffer': shared_window_buffer,
+        'n_mels': vocoder_config['n_mels'],
+        'n_fft': vocoder_config['n_fft'],
+        'hop_length': vocoder_config['hop_length'],
+        'hidden_dim': vocoder_config['hidden_dim'],
+        'num_layers': vocoder_config['num_layers'],
+        'convnext_mult': vocoder_config['convnext_mult'],
+    }
+
+    if vocoder_class_name == 'LightHeadedFrequencyDomainVocoder':
+        return LightHeadedFrequencyDomainVocoder(**common_args)
+
+    elif vocoder_class_name == 'SplitBandFrequencyDomainVocoder':
+        return SplitBandFrequencyDomainVocoder(
+            **common_args,
+            cutoff_bin=vocoder_config['cutoff_bin'],
+        )
+
+    elif vocoder_class_name == 'SplitBandLowFreqMeanFreqDomainVocoder':
+        return SplitBandLowFreqMeanFreqDomainVocoder(
+            **common_args,
+            cutoff_bin=vocoder_config['cutoff_bin'],
+            low_freq_kernel=vocoder_config['low_freq_kernel'],
+            high_freq_kernel=vocoder_config['high_freq_kernel'],
+        )
+
+    else:
+        raise ValueError(f"Unknown vocoder class: {vocoder_class_name}")
+
+
+def load_pruned_vocoder(
+    checkpoint_path: str,
+    device: str | torch.device = 'cpu',
+    shared_window_buffer: SharedWindowBuffer | None = None,
+) -> VocoderWithLoss:
+    """
+    Load a pruned vocoder checkpoint.
+
+    This function automatically reconstructs the model architecture from the
+    saved config, so you don't need to know the exact dimensions.
+
+    Usage:
+        model = load_pruned_vocoder('runs/my_vocoder_pruned/pruned_checkpoint.pt')
+        model.eval()
+        with torch.no_grad():
+            waveform, stft = model.vocoder(mel_spec)
+
+    Args:
+        checkpoint_path: Path to the pruned checkpoint
+        device: Device to load the model to
+        shared_window_buffer: Optional shared buffer (created if not provided)
+
+    Returns:
+        VocoderWithLoss model with loaded weights
+    """
+    if shared_window_buffer is None:
+        shared_window_buffer = SharedWindowBuffer()
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Check if this is a pruned checkpoint with embedded config
+    if 'vocoder_config' not in checkpoint:
+        raise ValueError(
+            f"Checkpoint at {checkpoint_path} does not contain 'vocoder_config'. "
+            "This checkpoint was likely created before config embedding was added. "
+            "You'll need to manually create the model with the correct hidden_dim."
+        )
+
+    vocoder_config = checkpoint['vocoder_config']
+    loss_config = checkpoint.get('loss_config', {})
+
+    # Create vocoder from config
+    vocoder = create_vocoder_from_config(vocoder_config, shared_window_buffer)
+
+    # Create MegaTransformerConfig for VocoderWithLoss
+    mt_config = megatransformer_utils.MegaTransformerConfig(
+        audio_n_mels=vocoder_config['n_mels'],
+        audio_n_fft=vocoder_config['n_fft'],
+        audio_hop_length=vocoder_config['hop_length'],
+    )
+
+    # Create VocoderWithLoss wrapper
+    model_with_loss = VocoderWithLoss(
+        vocoder=vocoder,
+        shared_window_buffer=shared_window_buffer,
+        config=mt_config,
+        **loss_config,
+    )
+
+    # Load state dict
+    model_with_loss.load_state_dict(checkpoint['model_state_dict'])
+
+    return model_with_loss.to(device)
 
 
 def compute_magnitude_importance(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -119,7 +285,8 @@ def compute_gradient_importance(
 
     samples_processed = 0
 
-    for batch in tqdm(dataloader, desc="Computing gradient importance", total=num_samples):
+    num_batches = (num_samples + dataloader.batch_size - 1) // dataloader.batch_size
+    for batch in tqdm(dataloader, desc="Computing gradient importance", total=num_batches):
         if samples_processed >= num_samples:
             break
 
@@ -305,29 +472,32 @@ def prune_convnext_block(
     new_block.norm = prune_layernorm(old_block.norm, in_indices)
 
     # Prune pointwise convs (Linear layers)
-    # pwconv1: [dim, dim * expansion] -> [in_dim, in_dim * expansion]
-    # We need to figure out which expanded channels to keep
-    # For simplicity, keep channels corresponding to kept input channels
-    expanded_in_indices = torch.arange(in_dim * expansion, device=in_indices.device)
+    # pwconv1: [old_dim * expansion, old_dim] -> [in_dim * expansion, in_dim]
+    # pwconv2: [old_dim or ovr_out_dim, old_dim * expansion] -> [out_dim, in_dim * expansion]
+    #
+    # We need to prune both input and intermediate (expanded) dimensions.
+    # Strategy: keep the first in_dim * expansion intermediate channels.
+    # This maintains the expansion ratio while reducing total parameters.
+    old_expansion_dim = old_block.pwconv1.out_features
+    new_expansion_dim = in_dim * expansion
+    expanded_indices = torch.arange(new_expansion_dim, device=in_indices.device)
 
-    # Actually we need to slice the input dim only, output is new
-    new_block.pwconv1 = prune_linear(old_block.pwconv1, in_indices, None)
-    # Resize to correct expansion
-    new_pwconv1 = nn.Linear(in_dim, in_dim * expansion)
-    new_pwconv1.weight.data = old_block.pwconv1.weight.data[:, in_indices]
+    # pwconv1: prune input channels (in_indices) and output channels (expanded_indices)
+    new_pwconv1 = nn.Linear(in_dim, new_expansion_dim)
+    new_pwconv1.weight.data = old_block.pwconv1.weight.data[expanded_indices][:, in_indices]
     if old_block.pwconv1.bias is not None:
-        new_pwconv1.bias.data = old_block.pwconv1.bias.data
+        new_pwconv1.bias.data = old_block.pwconv1.bias.data[expanded_indices]
     new_block.pwconv1 = new_pwconv1
 
-    # pwconv2: [dim * expansion, dim] or [dim * expansion, ovr_out_dim]
+    # pwconv2: prune input channels (expanded_indices) and output channels (out_indices or in_indices)
     if out_indices is not None:
-        new_pwconv2 = nn.Linear(in_dim * expansion, out_dim)
-        new_pwconv2.weight.data = old_block.pwconv2.weight.data[out_indices]
+        new_pwconv2 = nn.Linear(new_expansion_dim, out_dim)
+        new_pwconv2.weight.data = old_block.pwconv2.weight.data[out_indices][:, expanded_indices]
         if old_block.pwconv2.bias is not None:
             new_pwconv2.bias.data = old_block.pwconv2.bias.data[out_indices]
     else:
-        new_pwconv2 = nn.Linear(in_dim * expansion, in_dim)
-        new_pwconv2.weight.data = old_block.pwconv2.weight.data[in_indices]
+        new_pwconv2 = nn.Linear(new_expansion_dim, in_dim)
+        new_pwconv2.weight.data = old_block.pwconv2.weight.data[in_indices][:, expanded_indices]
         if old_block.pwconv2.bias is not None:
             new_pwconv2.bias.data = old_block.pwconv2.bias.data[in_indices]
     new_block.pwconv2 = new_pwconv2
@@ -480,6 +650,122 @@ def prune_split_band_vocoder(
     return new_model
 
 
+def prune_split_band_low_freq_mean_vocoder(
+    old_model: SplitBandLowFreqMeanFreqDomainVocoder,
+    importance: dict[str, torch.Tensor],
+    target_hidden_dim: int,
+    convnext_mult: int = 8,
+) -> SplitBandLowFreqMeanFreqDomainVocoder:
+    """
+    Prune a SplitBandLowFreqMeanFreqDomainVocoder to target_hidden_dim.
+
+    This vocoder has a unique phase head structure:
+    - phase_act_low: standalone Snake activation
+    - phase_head_low_large: Sequential with Conv1d (large kernel)
+    - phase_head_low_small: Sequential with Conv1d (small kernel)
+    - phase_head_high: Sequential with Snake + Conv1d
+    """
+    from model.activations import Snake
+
+    # Same backbone pruning logic as other split-band vocoders
+    backbone_importance = torch.stack([
+        importance[f'backbone.{i}'] for i in range(len(old_model.backbone) - 1)
+    ]).mean(dim=0)
+
+    backbone_indices = get_channels_to_keep(backbone_importance, target_hidden_dim)
+
+    old_head_dim = old_model.backbone[-1].ovr_out_dim
+    target_head_dim = target_hidden_dim // 2
+
+    # Debug: print dimensions
+    print(f"  old_head_dim (from backbone[-1].ovr_out_dim): {old_head_dim}")
+    print(f"  target_head_dim: {target_head_dim}")
+    print(f"  phase_act_low.alpha size: {old_model.phase_act_low.alpha.shape}")
+
+    if target_head_dim > old_head_dim:
+        raise ValueError(
+            f"target_head_dim ({target_head_dim}) > old_head_dim ({old_head_dim}). "
+            f"Cannot expand dimensions during pruning. Use target_hidden_dim <= {old_head_dim * 2}."
+        )
+
+    last_block_key = f'backbone.{len(old_model.backbone) - 1}.out'
+    if last_block_key in importance:
+        importance_tensor = importance[last_block_key]
+        print(f"  importance[{last_block_key}] size: {importance_tensor.shape}")
+        head_indices = get_channels_to_keep(importance_tensor, target_head_dim)
+        print(f"  head_indices: min={head_indices.min().item()}, max={head_indices.max().item()}, len={len(head_indices)}")
+    else:
+        print(f"  WARNING: {last_block_key} not in importance dict, using fallback")
+        # Fallback: just take first target_head_dim indices
+        head_indices = torch.arange(target_head_dim)
+
+    # Get kernel sizes from original model
+    low_freq_kernel = old_model.phase_head_low_large[0].kernel_size[0]
+    high_freq_kernel = old_model.phase_head_high[1].kernel_size[0]  # Conv is after Snake
+
+    # Create new model
+    shared_buffer = SharedWindowBuffer()
+    new_model = SplitBandLowFreqMeanFreqDomainVocoder(
+        shared_window_buffer=shared_buffer,
+        n_mels=old_model.input_proj.in_channels,
+        n_fft=old_model.n_fft,
+        hop_length=old_model.hop_length,
+        hidden_dim=target_hidden_dim,
+        num_layers=len(old_model.backbone),
+        convnext_mult=convnext_mult,
+        cutoff_bin=old_model.cutoff_bin,
+        low_freq_kernel=low_freq_kernel,
+        high_freq_kernel=high_freq_kernel,
+    )
+
+    # Prune input projection
+    new_model.input_proj = prune_conv1d(old_model.input_proj, None, backbone_indices)
+
+    # Prune backbone blocks
+    new_backbone = nn.ModuleList()
+    for i, old_block in enumerate(old_model.backbone):
+        if i < len(old_model.backbone) - 1:
+            new_block = prune_convnext_block(
+                old_block, backbone_indices, None, expansion=convnext_mult
+            )
+        else:
+            new_block = prune_convnext_block(
+                old_block, backbone_indices, head_indices, expansion=convnext_mult
+            )
+        new_backbone.append(new_block)
+    new_model.backbone = new_backbone
+
+    # Prune magnitude heads
+    new_model.mag_head_low = prune_conv1d(old_model.mag_head_low, head_indices, None)
+    new_model.mag_head_high = prune_conv1d(old_model.mag_head_high, head_indices, None)
+
+    # Prune phase_act_low (standalone Snake)
+    # Snake alpha has shape [1, channels, 1], so index on dim 1
+    new_snake_low = Snake(target_head_dim)
+    new_snake_low.alpha.data = old_model.phase_act_low.alpha.data[:, head_indices, :]
+    new_model.phase_act_low = new_snake_low
+
+    # Prune phase_head_low_large (Sequential with Conv1d)
+    new_phase_low_large_conv = prune_conv1d(old_model.phase_head_low_large[0], head_indices, None)
+    new_model.phase_head_low_large = nn.Sequential(new_phase_low_large_conv)
+
+    # Prune phase_head_low_small (Sequential with Conv1d)
+    new_phase_low_small_conv = prune_conv1d(old_model.phase_head_low_small[0], head_indices, None)
+    new_model.phase_head_low_small = nn.Sequential(new_phase_low_small_conv)
+
+    # Prune phase_head_high (Sequential with Snake + Conv1d)
+    # Snake is index 0, Conv1d is index 1
+    # Snake alpha has shape [1, channels, 1], so index on dim 1
+    old_snake_high = old_model.phase_head_high[0]
+    new_snake_high = Snake(target_head_dim)
+    new_snake_high.alpha.data = old_snake_high.alpha.data[:, head_indices, :]
+
+    new_phase_high_conv = prune_conv1d(old_model.phase_head_high[1], head_indices, None)
+    new_model.phase_head_high = nn.Sequential(new_snake_high, new_phase_high_conv)
+
+    return new_model
+
+
 def main():
     parser = argparse.ArgumentParser(description="Prune a frequency-domain vocoder")
     parser.add_argument("--checkpoint", type=str, required=True,
@@ -516,12 +802,14 @@ def main():
 
     # Load checkpoint
     print(f"Loading checkpoint from {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location='cpu')
 
     # Create model from config
     shared_buffer = SharedWindowBuffer()
     model_with_loss = model_config_lookup[args.vocoder_type](shared_buffer)
-    model_with_loss.load_state_dict(checkpoint['model_state_dict'])
+    
+    model_with_loss, model_loaded = megatransformer_utils.load_model(False, model_with_loss, args.checkpoint)
+
+    print(model_with_loss)
 
     vocoder = model_with_loss.vocoder
     old_hidden_dim = vocoder.input_proj.out_channels
@@ -544,7 +832,24 @@ def main():
     else:
         print("Computing gradient-based importance...")
         # Load calibration data
+        _lazy_import_dataset()
         dataset = CachedVocoderDataset(args.calibration_data)
+
+        # Get audio parameters from the model config
+        n_mels = vocoder.input_proj.in_channels
+        hop_length = vocoder.hop_length
+        # Default max frames - should be sufficient for calibration
+        audio_max_frames = 626
+        audio_max_waveform_length = audio_max_frames * hop_length
+
+        collate_fn = VocoderDataCollator(
+            audio_max_frames=audio_max_frames,
+            audio_max_waveform_length=audio_max_waveform_length,
+            n_mels=n_mels,
+            input_noise_std=0.0,  # No noise for importance computation
+            training=False,
+        )
+
         dataloader = DataLoader(
             dataset, batch_size=8, shuffle=True,
             collate_fn=collate_fn, num_workers=2
@@ -558,16 +863,22 @@ def main():
     importance = {k: v.cpu() for k, v in importance.items()}
 
     # Determine vocoder type and prune
-    if isinstance(vocoder, SplitBandFrequencyDomainVocoder):
+    # Note: Check SplitBandLowFreqMeanFreqDomainVocoder before SplitBandFrequencyDomainVocoder
+    # since it inherits from FrequencyDomainVocoderBase but has similar structure
+    convnext_mult = vocoder.backbone[0].pwconv1.out_features // vocoder.backbone[0].pwconv1.in_features
+
+    if isinstance(vocoder, SplitBandLowFreqMeanFreqDomainVocoder):
+        print("Pruning SplitBandLowFreqMeanFreqDomainVocoder...")
+        new_vocoder = prune_split_band_low_freq_mean_vocoder(
+            vocoder, importance, target_hidden_dim, convnext_mult
+        )
+    elif isinstance(vocoder, SplitBandFrequencyDomainVocoder):
         print("Pruning SplitBandFrequencyDomainVocoder...")
-        # Get convnext_mult from first backbone block
-        convnext_mult = vocoder.backbone[0].pwconv1.out_features // vocoder.backbone[0].pwconv1.in_features
         new_vocoder = prune_split_band_vocoder(
             vocoder, importance, target_hidden_dim, convnext_mult
         )
     elif isinstance(vocoder, LightHeadedFrequencyDomainVocoder):
         print("Pruning LightHeadedFrequencyDomainVocoder...")
-        convnext_mult = vocoder.backbone[0].pwconv1.out_features // vocoder.backbone[0].pwconv1.in_features
         new_vocoder = prune_light_headed_vocoder(
             vocoder, importance, target_hidden_dim, convnext_mult
         )
@@ -598,10 +909,16 @@ def main():
         direct_mag_loss_weight=model_with_loss.direct_mag_loss_weight,
     )
 
-    # Save pruned checkpoint
+    # Extract configs from the pruned model for easy loading later
+    vocoder_config = extract_vocoder_config(new_vocoder)
+    loss_config = extract_loss_config(new_model_with_loss)
+
+    # Save pruned checkpoint with embedded config
     output_path = os.path.join(args.output_dir, "pruned_checkpoint.pt")
     torch.save({
         'model_state_dict': new_model_with_loss.state_dict(),
+        'vocoder_config': vocoder_config,
+        'loss_config': loss_config,
         'pruning_config': {
             'original_checkpoint': args.checkpoint,
             'original_hidden_dim': old_hidden_dim,

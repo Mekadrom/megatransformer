@@ -9,13 +9,7 @@ from dataset_loading.audio_loading import extract_waveforms, extract_mels, remov
 from model.audio.shared_window_buffer import SharedWindowBuffer
 from transformers import T5Tokenizer, T5EncoderModel
 
-# Optional: speechbrain for speaker embeddings
-try:
-    from speechbrain.inference.speaker import EncoderClassifier
-    SPEECHBRAIN_AVAILABLE = True
-except ImportError:
-    SPEECHBRAIN_AVAILABLE = False
-    print("Warning: speechbrain not available. Speaker embeddings will not be computed.")
+from speechbrain.inference.speaker import EncoderClassifier
 
 
 """
@@ -76,7 +70,7 @@ def preprocess_and_cache_dataset(
 
     # Initialize speaker encoder (ECAPA-TDNN)
     speaker_encoder = None
-    if compute_speaker_embeddings and SPEECHBRAIN_AVAILABLE:
+    if compute_speaker_embeddings:
         print("Loading ECAPA-TDNN speaker encoder...")
         speaker_encoder = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
@@ -84,7 +78,7 @@ def preprocess_and_cache_dataset(
             run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
         )
         stats["speaker_embeddings_computed"] = 0
-    elif compute_speaker_embeddings and not SPEECHBRAIN_AVAILABLE:
+    elif compute_speaker_embeddings:
         print("Warning: Speaker embeddings requested but speechbrain not available. Skipping.")
 
     # Process each example

@@ -48,6 +48,7 @@ class CachedAudioDiffusionDataset(Dataset):
             "text_attention_mask": data["text_attention_mask"],
             "text_embeddings": data["text_embeddings"],
             "mel_spec": data["mel_spec"],
+            "speaker_embedding": data["speaker_embedding"]
         }
 
 
@@ -67,6 +68,7 @@ class AudioDiffusionDataCollator:
         attention_masks = []
         text_embeddings = []
         mel_specs = []
+        speaker_embeddings = []
         for ex in examples:
             if ex is None:
                 continue
@@ -90,12 +92,14 @@ class AudioDiffusionDataCollator:
             attention_masks.append(attention_mask)
             text_embeddings.append(text_embedding)
             mel_specs.append(mel)
+            speaker_embeddings.append(ex["speaker_embedding"])
 
         # Stack tensors
         batch = {
             "attention_mask": torch.stack(attention_masks),
             "text_embeddings": torch.stack(text_embeddings),
             "mel_spec": torch.stack(mel_specs),
+            "speaker_embedding": torch.stack(speaker_embeddings),
         }
 
         return batch

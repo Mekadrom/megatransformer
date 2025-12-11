@@ -1,5 +1,7 @@
 import os
 
+import torchaudio
+
 from dataset_loading.audio_diffusion_dataset import CachedAudioDiffusionDataset, AudioDiffusionDataCollator
 from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.diffusion import AudioConditionalGaussianDiffusion, model_config_lookup
@@ -12,6 +14,7 @@ os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ['NCCL_TIMEOUT'] = '1200000'
 
+from speechbrain.inference.speaker import EncoderClassifier
 from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments, Trainer, TrainerCallback, T5EncoderModel, T5Tokenizer
@@ -44,15 +47,20 @@ class AudioDiffusionModelWithT5ConditioningAdapter(nn.Module):
     def __init__(self, model: AudioConditionalGaussianDiffusion, context_dim: int):
         super().__init__()
         self.model = model
+        self.config = model.config
         self.context_dim = context_dim
 
         self.condition_adapter = nn.Linear(context_dim, context_dim)
 
-    def forward(self, x_0: torch.Tensor, condition: Optional[torch.Tensor] = None):
+    def forward(self, x_0: torch.Tensor, speaker_embedding, condition: Optional[torch.Tensor] = None, return_diagnostics: bool = False):
         # condition is expected to be T5 text embeddings of shape [B, T_text, context_dim]
         # this can be switched out after pretraining to take other condition embedding spaces with retraining
         condition = self.condition_adapter(condition)
-        return self.model(x_0=x_0, condition=condition)
+        return self.model(x_0=x_0, speaker_embedding=speaker_embedding, condition=condition, return_diagnostics=return_diagnostics)
+
+    def sample(self, *args, **kwargs):
+        return self.model.sample(*args, **kwargs)
+
 
 class AudioDiffusionVisualizationCallback(TrainerCallback):
     """
@@ -106,6 +114,26 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
         )
         self.text_embeddings = self.t5_model(**self.text_inputs).last_hidden_state
 
+        speaker_encoder = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir="pretrained_models/spkrec-ecapa-voxceleb",
+            run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+        )
+
+        test_audio_path = "inference/examples/test_alm_1.mp3"
+        test_audio_waveforms, orig_sr = torchaudio.load(test_audio_path)
+        if orig_sr != audio_sample_rate:
+            test_audio_waveforms = torchaudio.transforms.Resample(
+                orig_freq=orig_sr, new_freq=audio_sample_rate
+            )(test_audio_waveforms)
+        test_audio_waveforms = test_audio_waveforms[0]
+
+        with torch.no_grad():
+            # ECAPA-TDNN expects [batch, time] waveform
+            self.speaker_embedding = speaker_encoder.encode_batch(
+                test_audio_waveforms.unsqueeze(0)
+            ).squeeze(0).cpu()
+
     def _load_vocoder(self):
         """Lazily load vocoder on first use."""
         if self._vocoder_load_attempted:
@@ -125,15 +153,6 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
             vocoder = vocoder_config_lookup["experimental"](
                 shared_window_buffer=self.shared_window_buffer,
             )
-
-            # Load checkpoint
-            # checkpoint = torch.load(self.vocoder_checkpoint_path, map_location="cpu")
-            # if "model_state_dict" in checkpoint:
-            #     vocoder.load_state_dict(checkpoint["model_state_dict"])
-            # elif "state_dict" in checkpoint:
-            #     vocoder.load_state_dict(checkpoint["state_dict"])
-            # else:
-            #     vocoder.load_state_dict(checkpoint)
 
             megatransformer_utils.load_model(False, vocoder, self.vocoder_checkpoint_path)
 
@@ -179,6 +198,7 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
                         result = model.sample(
                             device=device,
                             batch_size=1,  # Single sample to reduce memory for intermediates
+                            speaker_embedding=self.speaker_embedding.to(device),
                             condition=None,
                             return_intermediate=True,
                             override_ddim_sampling_steps=self.ddim_sampling_steps,
@@ -195,6 +215,7 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
                         result = model.sample(
                             device=device,
                             batch_size=1,
+                            speaker_embedding=self.speaker_embedding.to(device),
                             condition=self.text_embeddings.to(device),
                             return_intermediate=True,
                             override_ddim_sampling_steps=self.ddim_sampling_steps,
@@ -459,20 +480,36 @@ class AudioDiffusionTrainer(Trainer):
             self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
 
         mel_spec = inputs["mel_spec"]
-        text_embeddings = inputs.get("text_embeddings", None)
+        text_embeddings = inputs["text_embeddings"]
+        speaker_embedding = inputs["speaker_embedding"]
 
-        # megatransformer_utils.print_debug_tensor("mel_spec", mel_spec)
+        # Request diagnostics every N steps for debugging
+        should_log_diagnostics = (global_step % (self.args.logging_steps * 10) == 0) and self.writer is not None
 
         # Forward pass through diffusion model
-        predicted_noise, loss = model(
-            x_0=mel_spec,
-            condition=text_embeddings,
-        )
+        if should_log_diagnostics:
+            predicted_noise, loss, diagnostics = model(
+                x_0=mel_spec,
+                speaker_embedding=speaker_embedding,
+                condition=text_embeddings,
+                return_diagnostics=True,
+            )
+        else:
+            predicted_noise, loss = model(
+                x_0=mel_spec,
+                speaker_embedding=speaker_embedding,
+                condition=text_embeddings,
+            )
+            diagnostics = None
 
         # Log losses
         if global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
             self._log_scalar(f"{prefix}diffusion_loss", loss, global_step)
+
+        # Log detailed diagnostics periodically
+        if should_log_diagnostics and diagnostics is not None:
+            self._log_diagnostics(diagnostics, global_step)
 
         outputs = {
             "loss": loss,
@@ -480,6 +517,52 @@ class AudioDiffusionTrainer(Trainer):
         }
 
         return (loss, outputs) if return_outputs else loss
+
+    def _log_diagnostics(self, diagnostics: dict, global_step: int):
+        """Log detailed training diagnostics to TensorBoard."""
+        if self.writer is None:
+            return
+
+        # Log mel spectrogram statistics
+        mel_stats = diagnostics.get("mel_stats", {})
+        if mel_stats:
+            self._log_scalar("diagnostics/mel_min", mel_stats.get("mel_min", 0), global_step)
+            self._log_scalar("diagnostics/mel_max", mel_stats.get("mel_max", 0), global_step)
+            self._log_scalar("diagnostics/mel_mean", mel_stats.get("mel_mean", 0), global_step)
+            self._log_scalar("diagnostics/mel_std", mel_stats.get("mel_std", 0), global_step)
+
+            if "mel_normalized_min" in mel_stats:
+                self._log_scalar("diagnostics/mel_normalized_min", mel_stats["mel_normalized_min"], global_step)
+                self._log_scalar("diagnostics/mel_normalized_max", mel_stats["mel_normalized_max"], global_step)
+                self._log_scalar("diagnostics/mel_normalized_mean", mel_stats["mel_normalized_mean"], global_step)
+                self._log_scalar("diagnostics/mel_normalized_std", mel_stats["mel_normalized_std"], global_step)
+
+        # Log per-timestep loss statistics
+        timesteps = diagnostics.get("timesteps")
+        loss_per_sample = diagnostics.get("loss_per_sample")
+        loss_weighted = diagnostics.get("loss_weighted_per_sample")
+
+        if timesteps is not None and loss_per_sample is not None:
+            # Bucket timesteps into ranges and compute mean loss per bucket
+            num_timesteps = 1000  # Assuming 1000 timesteps
+            num_buckets = 4
+            bucket_size = num_timesteps // num_buckets
+
+            for bucket_idx in range(num_buckets):
+                bucket_start = bucket_idx * bucket_size
+                bucket_end = (bucket_idx + 1) * bucket_size
+
+                # Find samples in this bucket
+                mask = (timesteps >= bucket_start) & (timesteps < bucket_end)
+                if mask.sum() > 0:
+                    bucket_loss = loss_per_sample[mask].mean().item()
+                    bucket_loss_weighted = loss_weighted[mask].mean().item() if loss_weighted is not None else 0
+
+                    self._log_scalar(f"diagnostics/loss_t_{bucket_start}_{bucket_end}", bucket_loss, global_step)
+                    self._log_scalar(f"diagnostics/loss_weighted_t_{bucket_start}_{bucket_end}", bucket_loss_weighted, global_step)
+
+            # Also log overall unweighted loss for comparison
+            self._log_scalar("diagnostics/loss_unweighted_mean", loss_per_sample.mean().item(), global_step)
 
     def _log_scalar(self, tag, value, global_step):
         if self.writer is not None:
@@ -523,8 +606,8 @@ def main():
     min_snr_gamma = float(unk_dict.get("min_snr_gamma", 5.0))
 
     # Dataset settings
-    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/librispeech_train_diffusion_full_cached")
-    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/librispeech_val_diffusion_full_cached")
+    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/librispeech_train_diffusion_full_speakers_cached")
+    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/librispeech_val_diffusion_full_speakers_cached")
     audio_max_frames = int(unk_dict.get("audio_max_frames", 1875))
     max_conditions = int(unk_dict.get("max_conditions", 1024))
     n_mels = int(unk_dict.get("n_mels", 80))
@@ -549,8 +632,12 @@ def main():
         min_snr_gamma=min_snr_gamma,
     )
 
-    # Try to load existing checkpoint
-    model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+    # Try to load existing checkpoint (only if not using resume_from_checkpoint,
+    # which handles loading itself with proper RNG state restoration)
+    if args.resume_from_checkpoint is None:
+        model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+    else:
+        model_loaded = False  # Let trainer.train(resume_from_checkpoint=...) handle it
 
     if args.local_rank == 0 or not args.use_deepspeed:
         print(f"Model structure: {model}")
@@ -580,7 +667,7 @@ def main():
         tpu_num_cores=8 if args.use_xla else None,
         output_dir=run_dir,
         overwrite_output_dir=True,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=args.lr_scheduler_type,
         learning_rate=args.learning_rate,
         warmup_ratio=args.warmup_ratio,
         per_device_train_batch_size=args.batch_size,

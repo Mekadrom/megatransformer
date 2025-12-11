@@ -12,15 +12,6 @@
             "weight_decay": "auto"
         }
     },
-    
-    "scheduler": {
-        "type": "WarmupCosineLR",
-        "params": {
-            "warmup_min_ratio": 0,
-            "warmup_num_steps": "auto",
-            "total_num_steps": "auto"
-        }
-    },
         
     "zero_optimization": {
         "stage": 2,

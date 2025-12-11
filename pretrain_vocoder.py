@@ -7,6 +7,7 @@ from model.audio.discriminators import CombinedDiscriminator
 from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders import vocoders
 from model.audio.vocoders.vocoders import VocoderWithLoss
+from prune_vocoder import load_pruned_vocoder
 
 os.environ["DEEPSPEED_UNIT_TEST"] = "1"
 os.environ["NCCL_DEBUG"] = "INFO"
@@ -672,10 +673,6 @@ def main():
     args, unk = megatransformer_utils.parse_args()
     run_dir = os.path.join(args.logging_base_dir, args.run_name)
 
-    # Select model configuration
-    if args.config not in vocoders.model_config_lookup:
-        raise ValueError(f"Unknown vocoder config: {args.config}. Available: {list(vocoders.model_config_lookup.keys())}")
-
     # Parse extra arguments
     unk_dict = {}
     for i in range(0, len(unk), 2):
@@ -717,26 +714,39 @@ def main():
     direct_mag_loss_weight = float(unk_dict.get("direct_mag_loss_weight", 0.0))
 
     discriminator_config = unk_dict.get("discriminator_config", "combined_disc")
-    
+
+    # Check for pruned checkpoint (passed via --pruned_checkpoint extra arg)
+    pruned_checkpoint = unk_dict.get("pruned_checkpoint", None)
+
     shared_window_buffer = SharedWindowBuffer()
 
-    model = vocoders.model_config_lookup[args.config](
-        shared_window_buffer,
-        sc_loss_weight=sc_loss_weight,
-        mag_loss_weight=mag_loss_weight,
-        waveform_l1_loss_weight=waveform_l1_loss_weight,
-        mel_recon_loss_weight=mel_recon_loss_weight,
-        mel_recon_loss_weight_linspace_max=mel_recon_loss_weight_linspace_max,
-        complex_stft_loss_weight=complex_stft_loss_weight,
-        phase_loss_weight=phase_loss_weight,
-        phase_ip_loss_weight=phase_ip_loss_weight,
-        phase_iaf_loss_weight=phase_iaf_loss_weight,
-        phase_gd_loss_weight=phase_gd_loss_weight,
-        high_freq_stft_loss_weight=high_freq_stft_loss_weight,
-        high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
-        direct_mag_loss_weight=direct_mag_loss_weight,
-    )
-    model, model_loaded = megatransformer_utils.load_model(args.start_step is not None, model, run_dir)
+    if pruned_checkpoint is not None:
+        # Load model from pruned checkpoint (architecture is embedded in checkpoint)
+        print(f"Loading pruned model from {pruned_checkpoint}")
+        model = load_pruned_vocoder(pruned_checkpoint, device='cpu', shared_window_buffer=shared_window_buffer)
+        model_loaded = True
+    else:
+        # Standard config-based model creation
+        if args.config not in vocoders.model_config_lookup:
+            raise ValueError(f"Unknown vocoder config: {args.config}. Available: {list(vocoders.model_config_lookup.keys())}")
+
+        model = vocoders.model_config_lookup[args.config](
+            shared_window_buffer,
+            sc_loss_weight=sc_loss_weight,
+            mag_loss_weight=mag_loss_weight,
+            waveform_l1_loss_weight=waveform_l1_loss_weight,
+            mel_recon_loss_weight=mel_recon_loss_weight,
+            mel_recon_loss_weight_linspace_max=mel_recon_loss_weight_linspace_max,
+            complex_stft_loss_weight=complex_stft_loss_weight,
+            phase_loss_weight=phase_loss_weight,
+            phase_ip_loss_weight=phase_ip_loss_weight,
+            phase_iaf_loss_weight=phase_iaf_loss_weight,
+            phase_gd_loss_weight=phase_gd_loss_weight,
+            high_freq_stft_loss_weight=high_freq_stft_loss_weight,
+            high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
+            direct_mag_loss_weight=direct_mag_loss_weight,
+        )
+        model, model_loaded = megatransformer_utils.load_model(args.start_step is not None, model, run_dir)
 
     # Determine device for discriminator
     if torch.cuda.is_available():

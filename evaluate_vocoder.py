@@ -20,10 +20,12 @@ Usage:
 
 import argparse
 import os
+import megatransformer_utils
 from dataclasses import dataclass
 
 import numpy as np
 import torch
+from scipy import signal
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -48,9 +50,12 @@ class EvaluationResults:
     mel_l1_std: float = 0.0
     stft_loss_mean: float = 0.0
     stft_loss_std: float = 0.0
+    alignment_lag_mean: float = 0.0
+    alignment_lag_std: float = 0.0
     num_samples: int = 0
 
     def __str__(self):
+        lag_ms = self.alignment_lag_mean / 16  # Assuming 16kHz sample rate
         return f"""
 Vocoder Evaluation Results ({self.num_samples} samples)
 {'=' * 50}
@@ -60,6 +65,7 @@ MCD   (↓ better):           {self.mcd_mean:.4f} ± {self.mcd_std:.4f}
 UTMOS (↑ better, max 5.0):  {self.utmos_mean:.4f} ± {self.utmos_std:.4f}
 Mel L1 (↓ better):          {self.mel_l1_mean:.4f} ± {self.mel_l1_std:.4f}
 STFT Loss (↓ better):       {self.stft_loss_mean:.4f} ± {self.stft_loss_std:.4f}
+Alignment lag (samples):    {self.alignment_lag_mean:.1f} ± {self.alignment_lag_std:.1f} ({lag_ms:.2f} ms)
 {'=' * 50}
 """
 
@@ -273,6 +279,70 @@ class VocoderEvaluator:
             print(f"Mel L1 computation failed: {e}")
             return 0.0
 
+    def align_signals(
+        self,
+        ref: np.ndarray,
+        deg: np.ndarray,
+        max_lag_ms: float = 50.0,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        """
+        Align degraded signal to reference using cross-correlation.
+
+        PESQ and other metrics are very sensitive to temporal misalignment.
+        Even a few samples of offset can significantly degrade scores.
+
+        Args:
+            ref: Reference signal
+            deg: Degraded signal
+            max_lag_ms: Maximum lag to search in milliseconds
+
+        Returns:
+            Tuple of (aligned_ref, aligned_deg, lag_samples)
+        """
+        max_lag_samples = int(max_lag_ms * self.sample_rate / 1000)
+
+        # Use a portion of the signal for faster correlation
+        # (full correlation can be slow for long signals)
+        search_len = min(len(ref), len(deg), self.sample_rate * 2)  # Max 2 seconds
+
+        ref_search = ref[:search_len]
+        deg_search = deg[:search_len]
+
+        # Compute cross-correlation
+        correlation = signal.correlate(ref_search, deg_search, mode='full')
+
+        # Find the lag (offset from center)
+        center = len(deg_search) - 1
+        search_range = slice(center - max_lag_samples, center + max_lag_samples + 1)
+
+        if search_range.start < 0:
+            search_range = slice(0, search_range.stop)
+        if search_range.stop > len(correlation):
+            search_range = slice(search_range.start, len(correlation))
+
+        lag_range = correlation[search_range]
+        lag = np.argmax(lag_range) + search_range.start - center
+
+        # Apply alignment
+        if lag > 0:
+            # deg is ahead of ref, shift deg back (or pad ref at start)
+            aligned_ref = ref
+            aligned_deg = np.pad(deg, (lag, 0), mode='constant')[:len(ref)]
+        elif lag < 0:
+            # deg is behind ref, shift ref back (or pad deg at start)
+            aligned_ref = np.pad(ref, (-lag, 0), mode='constant')[:len(deg)]
+            aligned_deg = deg
+        else:
+            aligned_ref = ref
+            aligned_deg = deg
+
+        # Final length alignment
+        min_len = min(len(aligned_ref), len(aligned_deg))
+        aligned_ref = aligned_ref[:min_len]
+        aligned_deg = aligned_deg[:min_len]
+
+        return aligned_ref, aligned_deg, lag
+
     def evaluate_sample(
         self,
         ref_wav: torch.Tensor,
@@ -281,9 +351,20 @@ class VocoderEvaluator:
         n_mels: int = 80,
         n_fft: int = 1024,
         hop_length: int = 256,
+        align: bool = True,
     ) -> dict:
-        """Evaluate a single sample."""
-        # Align lengths
+        """Evaluate a single sample.
+
+        Args:
+            ref_wav: Reference waveform
+            deg_wav: Degraded/predicted waveform
+            shared_window_buffer: Buffer for STFT windows
+            n_mels: Number of mel bins
+            n_fft: FFT size
+            hop_length: Hop length
+            align: Whether to align signals before computing metrics (recommended)
+        """
+        # Align lengths first
         min_len = min(ref_wav.shape[-1], deg_wav.shape[-1])
         ref_wav = ref_wav[..., :min_len]
         deg_wav = deg_wav[..., :min_len]
@@ -292,72 +373,25 @@ class VocoderEvaluator:
         ref_np = ref_wav.squeeze().cpu().numpy().astype(np.float64)
         deg_np = deg_wav.squeeze().cpu().numpy().astype(np.float64)
 
+        # Align signals temporally for better PESQ/STOI scores
+        lag = 0
+        if align:
+            ref_np_aligned, deg_np_aligned, lag = self.align_signals(ref_np, deg_np)
+        else:
+            ref_np_aligned, deg_np_aligned = ref_np, deg_np
+
         results = {
-            "pesq": self.compute_pesq(ref_np, deg_np),
-            "stoi": self.compute_stoi(ref_np, deg_np),
-            "mcd": self.compute_mcd(ref_np, deg_np),
-            "utmos": self.compute_utmos(deg_np),
+            "pesq": self.compute_pesq(ref_np_aligned, deg_np_aligned),
+            "stoi": self.compute_stoi(ref_np_aligned, deg_np_aligned),
+            "mcd": self.compute_mcd(ref_np_aligned, deg_np_aligned),
+            "utmos": self.compute_utmos(deg_np),  # UTMOS is reference-free, use original
             "mel_l1": self.compute_mel_l1(
                 ref_wav, deg_wav, shared_window_buffer, n_mels, n_fft, hop_length
             ),
+            "alignment_lag_samples": lag,
         }
 
         return results
-
-
-def load_vocoder(
-    checkpoint_path: str,
-    config_name: str,
-    device: str = "cuda",
-) -> tuple:
-    """Load vocoder from checkpoint."""
-    shared_window_buffer = SharedWindowBuffer()
-
-    if config_name not in vocoders.model_config_lookup:
-        raise ValueError(
-            f"Unknown vocoder config: {config_name}. "
-            f"Available: {list(vocoders.model_config_lookup.keys())}"
-        )
-
-    # Create model
-    model = vocoders.model_config_lookup[config_name](shared_window_buffer)
-
-    # Load checkpoint
-    if os.path.isdir(checkpoint_path):
-        # HuggingFace-style checkpoint directory
-        model_path = os.path.join(checkpoint_path, "pytorch_model.bin")
-        if not os.path.exists(model_path):
-            model_path = os.path.join(checkpoint_path, "model.safetensors")
-        if not os.path.exists(model_path):
-            # Try finding any .pt or .bin file
-            for f in os.listdir(checkpoint_path):
-                if f.endswith(('.pt', '.bin', '.safetensors')):
-                    model_path = os.path.join(checkpoint_path, f)
-                    break
-    else:
-        model_path = checkpoint_path
-
-    print(f"Loading model from: {model_path}")
-
-    if model_path.endswith('.safetensors'):
-        from safetensors.torch import load_file
-        state_dict = load_file(model_path)
-    else:
-        state_dict = torch.load(model_path, map_location=device)
-
-    # Handle potential wrapper keys
-    if 'state_dict' in state_dict:
-        state_dict = state_dict['state_dict']
-    if 'model_state_dict' in state_dict:
-        state_dict = state_dict['model_state_dict']
-
-    model.load_state_dict(state_dict, strict=False)
-    model = model.to(device)
-    model.eval()
-
-    print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
-
-    return model, shared_window_buffer
 
 
 def evaluate_vocoder(
@@ -411,6 +445,7 @@ def evaluate_vocoder(
         "utmos": [],
         "mel_l1": [],
         "stft_loss": [],
+        "alignment_lag_samples": [],
     }
 
     print(f"\nEvaluating {len(eval_dataset)} samples...")
@@ -476,16 +511,21 @@ def evaluate_vocoder(
         results.stft_loss_mean = np.mean(all_results["stft_loss"])
         results.stft_loss_std = np.std(all_results["stft_loss"])
 
+    if all_results["alignment_lag_samples"]:
+        # Use absolute value for mean lag to show typical offset magnitude
+        results.alignment_lag_mean = np.mean(np.abs(all_results["alignment_lag_samples"]))
+        results.alignment_lag_std = np.std(all_results["alignment_lag_samples"])
+
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate vocoder checkpoint")
     parser.add_argument(
-        "--checkpoint_path",
+        "--run_name",
         type=str,
         required=True,
-        help="Path to vocoder checkpoint (directory or file)",
+        help="Name of the run (used for logging and checkpoint directory)",
     )
     parser.add_argument(
         "--config",
@@ -534,15 +574,62 @@ def main():
         action="store_true",
         help="Disable UTMOS metric (avoids loading untrusted model weights)",
     )
-
-    args = parser.parse_args()
-
-    # Load model
-    model, shared_window_buffer = load_vocoder(
-        args.checkpoint_path,
-        args.config,
-        args.device,
+    parser.add_argument(
+        "--logging_base_dir",
+        type=str,
+        default="runs/vocoder",
+        help="Base directory for logging and checkpoints",
     )
+
+    args, unk = parser.parse_known_args()
+    run_dir = os.path.join(args.logging_base_dir, args.run_name)
+
+    # Select model configuration
+    if args.config not in vocoders.model_config_lookup:
+        raise ValueError(f"Unknown vocoder config: {args.config}. Available: {list(vocoders.model_config_lookup.keys())}")
+
+    # Parse extra arguments
+    unk_dict = {}
+    for i in range(0, len(unk), 2):
+        unk_dict[unk[i].lstrip('-')] = unk[i+1]
+
+    # Loss weights
+    sc_loss_weight = float(unk_dict.get("sc_loss_weight", 1.0))
+    mag_loss_weight = float(unk_dict.get("mag_loss_weight", 3.0))
+    waveform_l1_loss_weight = float(unk_dict.get("waveform_l1_loss_weight", 0.1))
+    mel_recon_loss_weight = float(unk_dict.get("mel_recon_loss_weight", 1.0))
+    mel_recon_loss_weight_linspace_max = float(unk_dict.get("mel_recon_loss_weight_linspace_max", 1.0))
+    complex_stft_loss_weight = float(unk_dict.get("complex_stft_loss_weight", 1.0))
+    phase_loss_weight = float(unk_dict.get("phase_loss_weight", 0.0))
+    phase_ip_loss_weight = float(unk_dict.get("phase_ip_loss_weight", 0.0))
+    phase_iaf_loss_weight = float(unk_dict.get("phase_iaf_loss_weight", 0.0))
+    phase_gd_loss_weight = float(unk_dict.get("phase_gd_loss_weight", 0.0))
+    high_freq_stft_loss_weight = float(unk_dict.get("high_freq_stft_loss_weight", 0.0))
+    high_freq_stft_cutoff_bin = int(unk_dict.get("high_freq_stft_cutoff_bin", 256))
+    direct_mag_loss_weight = float(unk_dict.get("direct_mag_loss_weight", 0.0))
+
+    shared_window_buffer = SharedWindowBuffer()
+
+    model = vocoders.model_config_lookup[args.config](
+        shared_window_buffer,
+        sc_loss_weight=sc_loss_weight,
+        mag_loss_weight=mag_loss_weight,
+        waveform_l1_loss_weight=waveform_l1_loss_weight,
+        mel_recon_loss_weight=mel_recon_loss_weight,
+        mel_recon_loss_weight_linspace_max=mel_recon_loss_weight_linspace_max,
+        complex_stft_loss_weight=complex_stft_loss_weight,
+        phase_loss_weight=phase_loss_weight,
+        phase_ip_loss_weight=phase_ip_loss_weight,
+        phase_iaf_loss_weight=phase_iaf_loss_weight,
+        phase_gd_loss_weight=phase_gd_loss_weight,
+        high_freq_stft_loss_weight=high_freq_stft_loss_weight,
+        high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
+        direct_mag_loss_weight=direct_mag_loss_weight,
+    )
+    model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+
+    model.eval()
+    model.to(args.device)
 
     # Get model config for mel params
     n_mels = model.config.audio_n_mels

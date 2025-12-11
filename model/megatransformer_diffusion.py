@@ -420,6 +420,7 @@ class GaussianDiffusion(nn.Module):
         self.num_timesteps = num_timesteps
         self.is_normalize = normalize
         self.ddim_sampling_eta = ddim_sampling_eta
+        self.context_dim = context_dim
 
         if sampling_timesteps is None:
             self.sampling_timesteps = num_timesteps

@@ -172,13 +172,15 @@ class AudioDiffusionCrossAttentionBlock(nn.Module):
         return output
 
 class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffusion):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, speaker_embedding_dim=192, **kwargs):
         # Remove shared_window_buffer from kwargs before passing to parent
         kwargs.pop('shared_window_buffer', None)
         super().__init__(*args, **kwargs)
 
         self.mel_min = -11.5  # log(1e-5)
-        self.mel_max = 5.0    # typical max for speech
+        self.mel_max = 2.0    # typical max for speech (empirically ~1.6, add small margin)
+
+        self.speaker_proj = nn.Linear(speaker_embedding_dim, self.context_dim)
     
     def normalize(self, x_0):
         return 2 * (x_0 - self.mel_min) / (self.mel_max - self.mel_min) - 1
@@ -186,17 +188,30 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
     def unnormalize(self, x):
         return (x + 1) / 2 * (self.mel_max - self.mel_min) + self.mel_min
 
-    def p_losses(self, x_start: torch.Tensor, t: torch.Tensor, noise=None, condition=None):
+    def p_losses(self, x_start: torch.Tensor, t: torch.Tensor, noise=None, condition=None, return_diagnostics=False):
 
         if noise is None:
             noise = torch.randn_like(x_start)
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
+        # NaN detection: check inputs to UNet
+        # if torch.isnan(x_noisy).any():
+        #     megatransformer_utils.print_debug_tensor("NaN detected in x_noisy", x_noisy)
+        #     megatransformer_utils.print_debug_tensor("  x_start was", x_start)
+        #     megatransformer_utils.print_debug_tensor("  noise was", noise)
+        #     print(f"  timesteps were: {t.tolist()}")
+
+        # if condition is not None and torch.isnan(condition).any():
+        #     megatransformer_utils.print_debug_tensor("NaN detected in condition", condition)
+
         model_out = self.unet(x_noisy, t, condition)
 
-        # megatransformer_utils.print_debug_tensor("noise", noise)
-        # megatransformer_utils.print_debug_tensor("model_out", model_out)
+        # NaN detection: check UNet output
+        # if torch.isnan(model_out).any():
+        #     megatransformer_utils.print_debug_tensor("NaN detected in model_out (UNet output)", model_out)
+        #     megatransformer_utils.print_debug_tensor("  x_noisy was", x_noisy)
+        #     print(f"  timesteps were: {t.tolist()}")
 
         if self.prediction_type == "v":
             # Model predicts v, target is v
@@ -206,25 +221,43 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             target = noise
 
         loss = F.mse_loss(model_out, target, reduction='none')
-        loss = reduce(loss, 'b ... -> b', 'mean')
-        # print(f"loss before weighting: {loss.mean().item()}")
+        loss_per_sample = reduce(loss, 'b ... -> b', 'mean')
 
-        loss = loss * self._extract(self.loss_weight, t, loss.shape)
-        # print(f"loss after weighting: {loss.mean().item()}")
-        # print(f"loss_weight: {self._extract(self.loss_weight, t, loss.shape).tolist()}")
-        return model_out, loss.mean()
+        # NaN detection: check loss
+        # if torch.isnan(loss_per_sample).any():
+        #     megatransformer_utils.print_debug_tensor("NaN detected in loss_per_sample", loss_per_sample)
+        #     megatransformer_utils.print_debug_tensor("  model_out was", model_out)
+        #     megatransformer_utils.print_debug_tensor("  target was", target)
 
-    def forward(self, x_0, condition=None):
+        loss_weighted = loss_per_sample * self._extract(self.loss_weight, t, loss_per_sample.shape)
+
+        # if torch.isnan(loss_weighted).any():
+        #     megatransformer_utils.print_debug_tensor("NaN detected in loss_weighted", loss_weighted)
+        #     print(f"  loss_weight values: {self._extract(self.loss_weight, t, loss_per_sample.shape).tolist()}")
+
+        if return_diagnostics:
+            diagnostics = {
+                "timesteps": t,
+                "loss_per_sample": loss_per_sample.detach(),
+                "loss_weighted_per_sample": loss_weighted.detach(),
+            }
+            return model_out, loss_weighted.mean(), diagnostics
+
+        return model_out, loss_weighted.mean()
+
+    def forward(self, x_0, speaker_embedding, condition=None, return_diagnostics=False):
         """
         Forward pass for audio diffusion training.
 
         Args:
             x_0: [B, n_mels, T] or [B, 1, n_mels, T] mel spectrogram (log scale)
             condition: Optional [B, N, C] conditioning embeddings (e.g., T5 embeddings)
+            return_diagnostics: If True, return additional diagnostic info for debugging
 
         Returns:
             predicted_noise: The noise predicted by the model
             loss: MSE loss between predicted and actual noise
+            diagnostics (optional): Dict with per-timestep loss info and mel statistics
         """
         if x_0.dim() == 3:
             x_0 = x_0.unsqueeze(1)
@@ -237,30 +270,73 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             b, c, h, w = x_0.shape
             e = None
 
+        # Capture mel statistics before normalization for diagnostics
+        mel_stats = None
+        if return_diagnostics:
+            mel_stats = {
+                "mel_min": x_0.min().item(),
+                "mel_max": x_0.max().item(),
+                "mel_mean": x_0.mean().item(),
+                "mel_std": x_0.std().item(),
+            }
+
+        speaker_cast = self.speaker_proj(speaker_embedding)
+
         if condition is not None:
             if len(condition.shape) == 5:
                 # squish batch and example dimensions if necessary
                 *_, c, h, w = condition.shape
                 condition = condition.view(-1, c, h, w)
             # megatransformer_utils.print_debug_tensor("condition", condition)
+            condition = torch.cat([speaker_cast, condition], dim=1)
+        else:
+            condition = speaker_cast.unsqueeze(1)
 
         t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device=x_0.device).long()
 
         if self.is_normalize:
             x_0 = self.normalize(x_0)
             # megatransformer_utils.print_debug_tensor("x_0 after normalize", x_0)
+            if return_diagnostics:
+                mel_stats["mel_normalized_min"] = x_0.min().item()
+                mel_stats["mel_normalized_max"] = x_0.max().item()
+                mel_stats["mel_normalized_mean"] = x_0.mean().item()
+                mel_stats["mel_normalized_std"] = x_0.std().item()
 
-        predicted_noise, loss = self.p_losses(x_0, t, condition=condition)
+        if return_diagnostics:
+            predicted_noise, loss, diagnostics = self.p_losses(x_0, t, condition=condition, return_diagnostics=True)
+            diagnostics["mel_stats"] = mel_stats
+        else:
+            predicted_noise, loss = self.p_losses(x_0, t, condition=condition)
 
         if e is not None:
             # restore batch and example dimensions
             predicted_noise = predicted_noise.view(b, e, c, h, w)
 
+        if return_diagnostics:
+            return predicted_noise, loss, diagnostics
         return predicted_noise, loss
 
     @torch.no_grad()
-    def sample(self, device, batch_size: int, condition: Optional[torch.Tensor]=None, return_intermediate: bool=False, override_ddim_sampling_steps: Optional[int]=None, generator=None, **kwargs) -> torch.Tensor:
+    def sample(
+        self,
+        device,
+        batch_size: int,
+        speaker_embedding: torch.Tensor,
+        condition: Optional[torch.Tensor]=None,
+        return_intermediate: bool=False,
+        override_ddim_sampling_steps: Optional[int]=None,
+        generator=None,
+        **kwargs
+    ) -> torch.Tensor:
         x = torch.randn(batch_size, 1, self.config.audio_n_mels, self.config.audio_max_frames, device=device, generator=generator)
+
+        speaker_cast = self.speaker_proj(speaker_embedding)
+
+        if condition is not None:
+            condition = torch.cat([speaker_cast.unsqueeze(1), condition], dim=1)
+        else:
+            condition = speaker_cast.unsqueeze(1)
 
         if self.is_ddim_sampling or override_ddim_sampling_steps is not None:
             x = self.ddim_sample_loop(x, condition=condition, return_intermediate=return_intermediate, override_sampling_steps=override_ddim_sampling_steps)
@@ -353,6 +429,7 @@ def create_audio_diffusion_model(
 ) -> AudioConditionalGaussianDiffusion:
     """Create an audio diffusion model from config."""
     model = AudioConditionalGaussianDiffusion(
+
         config=config,
         activation=config.audio_decoder_activation if hasattr(config, 'audio_decoder_activation') else "silu",
         scale_factor=2,
