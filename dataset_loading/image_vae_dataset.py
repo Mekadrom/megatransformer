@@ -36,23 +36,15 @@ class CachedImageVAEDataset(Dataset):
         data = torch.load(self.file_paths[idx])
         # Return in expected format
         return {
-            "images": data["images"],
+            "image": data["image"],
         }
 
 
 class ImageVAEDataCollator:
     def __init__(
         self,
-        audio_max_frames: int,
-        audio_max_waveform_length: int,
-        n_mels: int,
-        input_noise_std: float = 0.0,
         training: bool = True,
     ):
-        self.audio_max_frames = audio_max_frames
-        self.audio_max_waveform_length = audio_max_waveform_length
-        self.n_mels = n_mels
-        self.input_noise_std = input_noise_std
         self.training = training
 
     def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -61,14 +53,14 @@ class ImageVAEDataCollator:
             if ex is None:
                 continue
 
-            image = ex["images"]
+            image = ex["image"]
             images.append(image)
 
         # Stack tensors
         image_batch = torch.stack(images)
 
         batch = {
-            "images": image_batch,
+            "image": image_batch,
         }
 
         return batch

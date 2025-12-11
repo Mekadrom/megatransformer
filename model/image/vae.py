@@ -62,18 +62,65 @@ class VGGPerceptualLoss(nn.Module):
         return loss
 
 
+class LPIPSLoss(nn.Module):
+    """
+    LPIPS perceptual loss wrapper.
+
+    Requires: pip install lpips
+
+    Model sizes:
+        - 'alex' (AlexNet): ~9.1 MB, fastest, default
+        - 'squeeze' (SqueezeNet): ~2.8 MB, smallest
+        - 'vgg': ~58.9 MB, closest to traditional perceptual loss
+    """
+    def __init__(self, net: str = 'alex'):
+        super().__init__()
+        try:
+            import lpips
+        except ImportError:
+            raise ImportError("LPIPS not installed. Run: pip install lpips")
+
+        self.lpips = lpips.LPIPS(net=net, verbose=False)
+        self.lpips.requires_grad_(False)
+        self.lpips.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.lpips.eval()
+        return self
+
+    def forward(self, x, target):
+        """Expects inputs in [-1, 1] range."""
+        loss = self.lpips(x, target)
+        return loss.mean()
+
+
 class VAE(nn.Module):
-    def __init__(self, encoder, decoder, use_perceptual_loss=True, recon_loss_weight=1.0, perceptual_loss_weight=0.1, kl_divergence_loss_weight=0.01):
+    def __init__(
+        self,
+        encoder,
+        decoder,
+        perceptual_loss_type: str = "vgg",  # "vgg", "lpips", or "none"
+        lpips_net: str = "alex",
+        recon_loss_weight: float = 1.0,
+        l1_loss_weight: float = 0.0,
+        perceptual_loss_weight: float = 0.1,
+        kl_divergence_loss_weight: float = 0.01,
+    ):
         super().__init__()
 
         self.encoder = encoder
         self.decoder = decoder
         self.recon_loss_weight = recon_loss_weight
+        self.l1_loss_weight = l1_loss_weight
         self.perceptual_loss_weight = perceptual_loss_weight
         self.kl_divergence_loss_weight = kl_divergence_loss_weight
 
-        if use_perceptual_loss:
+        self.perceptual_loss_type = perceptual_loss_type
+        if perceptual_loss_type == "vgg":
             self.perceptual_loss = VGGPerceptualLoss()
+        elif perceptual_loss_type == "lpips":
+            self.perceptual_loss = LPIPSLoss(net=lpips_net)
         else:
             self.perceptual_loss = None
 
@@ -88,21 +135,32 @@ class VAE(nn.Module):
 
         recon_x = self.decoder(z)
 
-        kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1,2,3])
+        kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2, 3])
         kl_divergence = torch.mean(kl_divergence)
 
-        perceptual_loss = 0
-        recon_loss = F.mse_loss(recon_x, x, reduction='mean')
+        # Reconstruction losses
+        mse_loss = F.mse_loss(recon_x, x, reduction='mean')
+        l1_loss = F.l1_loss(recon_x, x, reduction='mean') if self.l1_loss_weight > 0 else torch.tensor(0.0, device=x.device)
+        recon_loss = mse_loss + self.l1_loss_weight * l1_loss
+
+        # Perceptual loss
+        perceptual_loss = torch.tensor(0.0, device=x.device)
         if self.perceptual_loss is not None:
             perceptual_loss = self.perceptual_loss(recon_x, x)
 
-        total_loss = self.recon_loss_weight * recon_loss + self.perceptual_loss_weight * perceptual_loss + self.kl_divergence_loss_weight * kl_divergence
-        
+        total_loss = (
+            self.recon_loss_weight * recon_loss
+            + self.perceptual_loss_weight * perceptual_loss
+            + self.kl_divergence_loss_weight * kl_divergence
+        )
+
         losses = {
             "total_loss": total_loss,
             "kl_divergence": kl_divergence,
             "recon_loss": recon_loss,
-            "perceptual_loss": perceptual_loss
+            "mse_loss": mse_loss,
+            "l1_loss": l1_loss,
+            "perceptual_loss": perceptual_loss,
         }
 
         return recon_x, mu, logvar, losses
@@ -143,7 +201,7 @@ class VAEEncoder(nn.Module):
 
 
 class VAEDecoder(nn.Module):
-    def __init__(self, latent_channels=4, out_channels=3, intermediate_channels=[128, 64, 32], activation_fn: str = "silu"):
+    def __init__(self, latent_channels=4, out_channels=3, intermediate_channels=[128, 64, 32], activation_fn: str = "silu", use_transpose: bool = False):
         super().__init__()
 
         activation_type = megatransformer_utils.get_activation_type(activation_fn)
@@ -154,14 +212,25 @@ class VAEDecoder(nn.Module):
 
         channels = [latent_channels] + intermediate_channels
 
-        self.channel_upsample = nn.ModuleList([
-            nn.Sequential(
-                nn.ConvTranspose2d(in_c, out_c, kernel_size=4, stride=2, padding=1),
-                nn.GroupNorm(out_c // 4, out_c),
-                activation(out_c),
-            )
-            for in_c, out_c in zip(channels[:-1], channels[1:])
-        ])
+        if use_transpose:
+            self.channel_upsample = nn.ModuleList([
+                nn.Sequential(
+                    nn.ConvTranspose2d(in_c, out_c, kernel_size=4, stride=2, padding=1),
+                    nn.GroupNorm(out_c // 4, out_c),
+                    activation(out_c),
+                )
+                for in_c, out_c in zip(channels[:-1], channels[1:])
+            ])
+        else:
+            self.channel_upsample = nn.ModuleList([
+                nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.Conv2d(in_c, out_c, kernel_size=3, padding=1),
+                    nn.GroupNorm(out_c // 4, out_c),
+                    activation(out_c),
+                )
+                for in_c, out_c in zip(channels[:-1], channels[1:])
+            ])
 
         self.final_conv = nn.Conv2d(channels[-1], out_channels, kernel_size=3, padding=1)
 
