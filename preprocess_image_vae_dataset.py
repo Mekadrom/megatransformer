@@ -64,7 +64,7 @@ def create_image_transforms(
     return transforms.Compose(transform_list)
 
 
-def download_image(url: str, timeout: int = 10) -> Optional[Image.Image]:
+def download_image(url: str, timeout: int = 1) -> Optional[Image.Image]:
     """
     Download image from URL.
 
@@ -183,6 +183,7 @@ def preprocess_and_cache_dataset(
     download_timeout: int = 10,
     # Resume options
     start_idx: int = 0,
+    num_expected_examples: Optional[int] = None,
 ):
     """
     Preprocess image dataset and save as individual .pt files.
@@ -250,7 +251,7 @@ def preprocess_and_cache_dataset(
         batch = []
         idx = start_idx
 
-        pbar = tqdm(desc="Processing images")
+        pbar = tqdm(desc="Processing images", total=num_expected_examples)
 
         for example in dataset:
             if start_idx > 0 and idx < start_idx:
@@ -523,6 +524,9 @@ if __name__ == "__main__":
                         help="Number of parallel download threads")
     parser.add_argument("--download_timeout", type=int, default=10,
                         help="Timeout for image downloads (seconds)")
+    
+    parser.add_argument("--num_expected_examples", type=int, default=None,
+                        help="Expected number of examples (for tqdm)")
 
     args = parser.parse_args()
 
@@ -555,4 +559,5 @@ if __name__ == "__main__":
             num_download_workers=args.num_download_workers,
             download_timeout=args.download_timeout,
             start_idx=args.start_idx,
+            num_expected_examples=args.num_expected_examples,
         )

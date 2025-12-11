@@ -103,6 +103,7 @@ class VAE(nn.Module):
         perceptual_loss_type: str = "vgg",  # "vgg", "lpips", or "none"
         lpips_net: str = "alex",
         recon_loss_weight: float = 1.0,
+        mse_loss_weight: float = 1.0,
         l1_loss_weight: float = 0.0,
         perceptual_loss_weight: float = 0.1,
         kl_divergence_loss_weight: float = 0.01,
@@ -112,6 +113,7 @@ class VAE(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.recon_loss_weight = recon_loss_weight
+        self.mse_loss_weight = mse_loss_weight
         self.l1_loss_weight = l1_loss_weight
         self.perceptual_loss_weight = perceptual_loss_weight
         self.kl_divergence_loss_weight = kl_divergence_loss_weight
@@ -141,7 +143,7 @@ class VAE(nn.Module):
         # Reconstruction losses
         mse_loss = F.mse_loss(recon_x, x, reduction='mean')
         l1_loss = F.l1_loss(recon_x, x, reduction='mean') if self.l1_loss_weight > 0 else torch.tensor(0.0, device=x.device)
-        recon_loss = mse_loss + self.l1_loss_weight * l1_loss
+        recon_loss = self.mse_loss_weight * mse_loss + self.l1_loss_weight * l1_loss
 
         # Perceptual loss
         perceptual_loss = torch.tensor(0.0, device=x.device)
@@ -254,6 +256,21 @@ model_config_lookup = {
             latent_channels=latent_channels,
             out_channels=3,
             intermediate_channels=[64, 32],
+            activation_fn="silu"
+        ),
+        **kwargs
+    ),
+    "mini": lambda latent_channels, **kwargs: VAE(
+        encoder=VAEEncoder(
+            in_channels=3,
+            latent_channels=latent_channels,
+            intermediate_channels=[32, 64, 128],
+            activation_fn="silu"
+        ),
+        decoder=VAEDecoder(
+            latent_channels=latent_channels,
+            out_channels=3,
+            intermediate_channels=[128, 64, 32],
             activation_fn="silu"
         ),
         **kwargs

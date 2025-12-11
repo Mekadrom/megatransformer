@@ -52,11 +52,15 @@ class ImageVAEReconstructionCallback(TrainerCallback):
         self.generation_steps = generation_steps
         self.image_size = image_size
 
-        self.example_paths = ["inference/examples/test_vlm1_x256.png", "inference/examples/test_vlm2_x256.png"]
+        self.example_paths = [
+            "inference/examples/test_vlm1_x256.png",
+            "inference/examples/test_vlm2_x256.png",
+            "inference/examples/test_vlm3_x256.png",
+        ]
 
         # VAE uses [-1, 1] normalization (for tanh output)
         transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
+            # transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),  # [0, 1]
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # [-1, 1]
         ])
@@ -70,7 +74,7 @@ class ImageVAEReconstructionCallback(TrainerCallback):
                 self.example_images.append(image_tensor)
                 # Store unnormalized version for visualization
                 unnorm_transform = transforms.Compose([
-                    transforms.Resize((image_size, image_size)),
+                    # transforms.Resize((image_size, image_size)),
                     transforms.ToTensor(),  # [0, 1] for direct visualization
                 ])
                 self.example_images_unnorm.append(unnorm_transform(image))
@@ -118,6 +122,11 @@ class ImageVAEReconstructionCallback(TrainerCallback):
                             if isinstance(loss_val, torch.Tensor):
                                 loss_val = loss_val.item()
                             writer.add_scalar(f"image_vae/example_{i}/{loss_name}", loss_val, global_step)
+
+                        # normalize and graph mu as latent_dim number of grayscale images
+                        mu_unnorm = (mu[0].float().cpu() - mu[0].float().cpu().min()) / (mu[0].float().cpu().max() - mu[0].float().cpu().min() + 1e-5)
+                        for c in range(mu_unnorm.shape[0]):
+                            writer.add_image(f"image_vae/example_{i}/mu_channel_{c}", mu_unnorm[c:c+1, :, :], global_step)
 
 
 class ImageVAEGANTrainer(Trainer):
@@ -351,6 +360,7 @@ def main():
 
     # VAE loss weights
     recon_loss_weight = float(unk_dict.get("recon_loss_weight", 1.0))
+    mse_loss_weight = float(unk_dict.get("mse_loss_weight", 1.0))
     l1_loss_weight = float(unk_dict.get("l1_loss_weight", 0.0))
     kl_divergence_loss_weight = float(unk_dict.get("kl_divergence_loss_weight", 0.001))
     perceptual_loss_weight = float(unk_dict.get("perceptual_loss_weight", 0.1))
@@ -372,6 +382,7 @@ def main():
         perceptual_loss_type=perceptual_loss_type,
         lpips_net=lpips_net,
         recon_loss_weight=recon_loss_weight,
+        mse_loss_weight=mse_loss_weight,
         l1_loss_weight=l1_loss_weight,
         kl_divergence_loss_weight=kl_divergence_loss_weight,
         perceptual_loss_weight=perceptual_loss_weight,
