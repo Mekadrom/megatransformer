@@ -112,9 +112,11 @@ class VAEEncoder(nn.Module):
     def __init__(self, in_channels=3, latent_channels=4, intermediate_channels=[32, 64, 128], activation_fn: str = "silu"):
         super().__init__()
 
-        activation = megatransformer_utils.get_activation_type(activation_fn)
-        if activation not in [activations.SwiGLU, activations.Snake]:
-            activation = lambda x: activation()  # drop unused arg
+        activation_type = megatransformer_utils.get_activation_type(activation_fn)
+        if activation_type not in [activations.SwiGLU, activations.Snake]:
+            activation = lambda _: activation_type()  # drop unused arg
+        else:
+            activation = activation_type
 
         channels = [in_channels] + intermediate_channels
 
@@ -144,9 +146,11 @@ class VAEDecoder(nn.Module):
     def __init__(self, latent_channels=4, out_channels=3, intermediate_channels=[128, 64, 32], activation_fn: str = "silu"):
         super().__init__()
 
-        activation = megatransformer_utils.get_activation_type(activation_fn)
-        if activation not in [activations.SwiGLU, activations.Snake]:
-            activation = lambda x: activation()  # drop unused arg
+        activation_type = megatransformer_utils.get_activation_type(activation_fn)
+        if activation_type not in [activations.SwiGLU, activations.Snake]:
+            activation = lambda _: activation_type()  # drop unused arg
+        else:
+            activation = activation_type
 
         channels = [latent_channels] + intermediate_channels
 

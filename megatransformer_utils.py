@@ -8,7 +8,6 @@ from transformers.trainer_callback import TrainerCallback
 from typing import Optional
 
 import argparse
-import deepspeed
 import glob
 import json
 import math
@@ -19,6 +18,11 @@ import random
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+try:
+    import deepspeed
+except ImportError:
+    deepspeed = None
 
 from model import activations, norms
 
@@ -898,6 +902,7 @@ def sanitize_model(model):
         return sanitize_model(model._orig_mod)
     if isinstance(model, DataParallel):
         return sanitize_model(model.module)
-    if isinstance(model, deepspeed.runtime.engine.DeepSpeedEngine):
-        return model.module
+    if deepspeed is not None:
+        if isinstance(model, deepspeed.runtime.engine.DeepSpeedEngine):
+            return model.module
     return model
