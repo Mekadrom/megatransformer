@@ -58,7 +58,7 @@ def hash_url(url: str) -> str:
     return str(abs(hash(replaced)))
 
 def cache_or_fetch_and_transform_image(dataset_name, dataset_config_name, image_url, transform):
-    cache_dir = os.path.join("image_cache", dataset_name.replace("/", "_"))
+    cache_dir = os.path.join("image_cache", dataset_name.replace(os.path.sep, "_"))
     if dataset_config_name:
         cache_dir = os.path.join(cache_dir, dataset_config_name)
     os.makedirs(cache_dir, exist_ok=True)

@@ -771,7 +771,7 @@ def load_model(finetune, model, run_dir):
         globbed_checkpoint_folders = glob.glob(os.path.join(run_dir, "checkpoint-*", "pytorch_model.bin"))
         # sort by step number (format checkpoint-<step>/pytorch_model.bin)
         if globbed_checkpoint_folders:
-            sorted_checkpoints = sorted(globbed_checkpoint_folders, key=lambda x: int(x.split("-")[-1].split("/")[0]))
+            sorted_checkpoints = sorted(globbed_checkpoint_folders, key=lambda x: int(x.split("-")[-1].split(os.path.sep)[0]))
             latest_checkpoint = sorted_checkpoints[-1]
             print(f"Loading model from {latest_checkpoint}")
             try:
