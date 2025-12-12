@@ -44,10 +44,13 @@ class CachedAudioDiffusionDataset(Dataset):
     def __getitem__(self, idx):
         data = torch.load(self.file_paths[idx])
         # Return in expected format
+        # mel_spec_length may not exist in older cached datasets
+        mel_spec_length = data.get("mel_spec_length", data["mel_spec"].shape[-1])
         return {
             "text_attention_mask": data["text_attention_mask"],
             "text_embeddings": data["text_embeddings"],
             "mel_spec": data["mel_spec"],
+            "mel_spec_length": mel_spec_length,
             "speaker_embedding": data["speaker_embedding"]
         }
 
@@ -68,16 +71,25 @@ class AudioDiffusionDataCollator:
         attention_masks = []
         text_embeddings = []
         mel_specs = []
+        mel_spec_masks = []
         speaker_embeddings = []
         for ex in examples:
             if ex is None:
                 continue
 
             mel = ex["mel_spec"]
+            mel_length = ex.get("mel_spec_length", mel.shape[-1])
+
+            # Create mel spec padding mask (1 = valid, 0 = padding)
+            mel_mask = torch.ones(self.audio_max_frames, dtype=torch.float32)
+            if mel_length < self.audio_max_frames:
+                mel_mask[mel_length:] = 0.0
+
             if mel.shape[-1] < self.audio_max_frames:
                 mel = F.pad(mel, (0, self.audio_max_frames - mel.shape[-1]), value=0)
             elif mel.shape[-1] > self.audio_max_frames:
                 mel = mel[..., :self.audio_max_frames]
+                mel_mask[:] = 1.0  # All valid if truncated
 
             text_embedding = ex["text_embeddings"]
             attention_mask = ex["text_attention_mask"]
@@ -88,10 +100,11 @@ class AudioDiffusionDataCollator:
             elif text_embedding.shape[0] > self.max_conditions:
                 text_embedding = text_embedding[:self.max_conditions, :]
                 attention_mask = attention_mask[:self.max_conditions]
-            
+
             attention_masks.append(attention_mask)
             text_embeddings.append(text_embedding)
             mel_specs.append(mel)
+            mel_spec_masks.append(mel_mask)
             speaker_embeddings.append(ex["speaker_embedding"])
 
         # Stack tensors
@@ -99,6 +112,7 @@ class AudioDiffusionDataCollator:
             "attention_mask": torch.stack(attention_masks),
             "text_embeddings": torch.stack(text_embeddings),
             "mel_spec": torch.stack(mel_specs),
+            "mel_spec_mask": torch.stack(mel_spec_masks),  # [B, T] mask for mel spectrogram
             "speaker_embedding": torch.stack(speaker_embeddings),
         }
 

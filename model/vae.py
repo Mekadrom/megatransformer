@@ -128,7 +128,22 @@ class VAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
+        """
+        Forward pass through VAE.
+
+        Args:
+            x: Input tensor [B, C, H, W] or [B, C, H, T] for audio
+            mask: Optional mask tensor [B, T] where 1 = valid, 0 = padding.
+                  If provided, reconstruction loss is only computed on valid regions.
+                  The mask is in the time dimension (last dim of x).
+
+        Returns:
+            recon_x: Reconstructed input
+            mu: Latent mean
+            logvar: Latent log variance
+            losses: Dictionary of loss components
+        """
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
 
@@ -137,12 +152,39 @@ class VAE(nn.Module):
         kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2, 3])
         kl_divergence = torch.mean(kl_divergence)
 
-        # Reconstruction losses
-        mse_loss = F.mse_loss(recon_x, x, reduction='mean')
-        l1_loss = F.l1_loss(recon_x, x, reduction='mean') if self.l1_loss_weight > 0 else torch.tensor(0.0, device=x.device)
+        # Reconstruction losses (with optional masking)
+        if mask is not None:
+            # Expand mask to match input shape: [B, T] -> [B, 1, 1, T] for 4D input
+            # or [B, 1, T] for 3D input
+            if x.dim() == 4:
+                mask_expanded = mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, T]
+            else:
+                mask_expanded = mask.unsqueeze(1)  # [B, 1, T]
+
+            # Masked MSE loss: only compute on valid positions
+            squared_error = (recon_x - x) ** 2
+            masked_squared_error = squared_error * mask_expanded
+            # Sum over all dims except batch, then divide by number of valid elements per sample
+            valid_elements = mask_expanded.sum(dim=list(range(1, mask_expanded.dim())), keepdim=False) * x.shape[1]
+            if x.dim() == 4:
+                valid_elements = valid_elements * x.shape[2]  # Account for H dimension
+            mse_loss = (masked_squared_error.sum(dim=list(range(1, masked_squared_error.dim()))) / (valid_elements + 1e-8)).mean()
+
+            # Masked L1 loss
+            if self.l1_loss_weight > 0:
+                abs_error = torch.abs(recon_x - x)
+                masked_abs_error = abs_error * mask_expanded
+                l1_loss = (masked_abs_error.sum(dim=list(range(1, masked_abs_error.dim()))) / (valid_elements + 1e-8)).mean()
+            else:
+                l1_loss = torch.tensor(0.0, device=x.device)
+        else:
+            # Standard unmasked losses
+            mse_loss = F.mse_loss(recon_x, x, reduction='mean')
+            l1_loss = F.l1_loss(recon_x, x, reduction='mean') if self.l1_loss_weight > 0 else torch.tensor(0.0, device=x.device)
+
         recon_loss = self.mse_loss_weight * mse_loss + self.l1_loss_weight * l1_loss
 
-        # Perceptual loss
+        # Perceptual loss (not masked - operates on full images/spectrograms)
         perceptual_loss = torch.tensor(0.0, device=x.device)
         if self.perceptual_loss is not None:
             perceptual_loss = self.perceptual_loss(recon_x, x)

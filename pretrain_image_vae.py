@@ -353,7 +353,7 @@ def main():
         unk_dict[unk[i].lstrip('-')] = unk[i+1]
 
     # Dataset settings
-    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/coco_val_vae_cached")
+    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/cc3m_train_vae_cached")
     val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/coco_val_vae_cached")
     image_size = int(unk_dict.get("image_size", 256))
     latent_channels = int(unk_dict.get("latent_channels", 4))

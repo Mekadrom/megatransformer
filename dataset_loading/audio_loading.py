@@ -42,7 +42,7 @@ def extract_mels(shared_window_buffer: SharedWindowBuffer, y, sr=16000, n_mels=8
     Extract audio features from loaded audio data.
     
     Args:
-        audio: Audio data loaded by datasets library (contains 'array' and 'sampling_rate')
+        y: Audio data as waveform
         sr: Target sampling rate
         n_mels: Number of mel bands
         n_fft: FFT window size

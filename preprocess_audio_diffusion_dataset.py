@@ -173,6 +173,7 @@ def preprocess_and_cache_dataset(
                     "text_embeddings": text_embeddings,
                     "text_attention_mask": text_attention_mask,
                     "mel_spec": mel_spec,
+                    "mel_spec_length": mel_spec.shape[-1],  # Original length before any padding
                     "speaker_id": speaker_id,
                 }
                 if speaker_embedding is not None:
