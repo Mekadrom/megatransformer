@@ -481,8 +481,7 @@ class MelPeriodSubDiscriminator(nn.Module):
         norm_f = nn.utils.spectral_norm if use_spectral_norm else lambda x: x
 
         self.layers = nn.ModuleList()
-        # After period reshape, input channels become in_channels * period
-        channels = in_channels * period
+        channels = in_channels
 
         for i in range(n_layers):
             out_channels = min(base_channels * (2 ** i), 512)
@@ -515,8 +514,7 @@ class MelPeriodSubDiscriminator(nn.Module):
         # Pad time dimension to be divisible by period
         if T % self.period != 0:
             pad_len = self.period - (T % self.period)
-            # For 4D tensors, use constant padding (replicate/reflect have dimension constraints)
-            x = F.pad(x, (0, pad_len), mode='constant', value=0)
+            x = F.pad(x, (0, pad_len), mode='reflect')
             T = T + pad_len
 
         # Reshape: [B, C, H, T] -> [B, C, H, T//period, period] -> [B, C*period, H, T//period]

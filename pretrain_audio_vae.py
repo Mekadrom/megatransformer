@@ -197,15 +197,11 @@ class AudioVAEReconstructionCallback(TrainerCallback):
         if not os.path.exists(self.vocoder_checkpoint_path):
             print(f"Vocoder checkpoint not found at {self.vocoder_checkpoint_path}")
             return
-        else:
-            print(f"Loading vocoder from {self.vocoder_checkpoint_path}...")
 
         try:
             vocoder = vocoder_config_lookup[self.vocoder_config](
                 shared_window_buffer=self.shared_window_buffer,
             )
-
-            print(f"Loading vocoder model from {self.vocoder_checkpoint_path}...")
 
             megatransformer_utils.load_model(False, vocoder, self.vocoder_checkpoint_path)
 
