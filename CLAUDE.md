@@ -45,6 +45,36 @@ python pretrain_audio_diffusion.py \
     --val_data_dir cached_datasets/librispeech_val_diffusion_cached
 ```
 
+**Audio VAE training (with speaker embedding conditioning):**
+```bash
+python pretrain_audio_vae.py \
+    --run_name audio_vae_run \
+    --config small \
+    --latent_channels 8 \
+    --speaker_embedding_dim 192 \
+    --train_cache_dir cached_datasets/librispeech_train_diffusion_cached \
+    --val_cache_dir cached_datasets/librispeech_val_diffusion_cached
+```
+
+**Image VAE training:**
+```bash
+python pretrain_image_vae.py \
+    --run_name image_vae_run \
+    --config gan_4_2 \
+    --train_data_dir cached_datasets/image_train_cached \
+    --val_data_dir cached_datasets/image_val_cached
+```
+
+**Image diffusion training (latent space):**
+```bash
+python pretrain_image_diffusion.py \
+    --run_name image_diffusion_run \
+    --diffusion_type small_dit \
+    --train_data_dir cached_datasets/image_train_diffusion_latents \
+    --val_data_dir cached_datasets/image_val_diffusion_latents \
+    --vae_checkpoint runs/image_vae_run/checkpoint-XXX
+```
+
 ### Dataset Preprocessing
 
 **Vocoder dataset:**
@@ -54,12 +84,27 @@ python preprocess_vocoder_dataset.py \
     --split train.360
 ```
 
-**Diffusion dataset:**
+**Audio diffusion dataset:**
 ```bash
 python preprocess_audio_diffusion_dataset.py \
     --output_dir cached_datasets/librispeech_train_diffusion_cached \
     --split train.360 \
     --max_conditions 512
+```
+
+**Image VAE dataset:**
+```bash
+python preprocess_image_vae_dataset.py \
+    --output_dir cached_datasets/image_train_cached \
+    --dataset_name your_dataset
+```
+
+**Image diffusion latent dataset (requires trained VAE):**
+```bash
+python preprocess_image_diffusion_dataset.py \
+    --output_dir cached_datasets/image_train_diffusion_latents \
+    --vae_checkpoint runs/image_vae_run/checkpoint-XXX \
+    --vae_config small
 ```
 
 ### Monitoring
@@ -78,7 +123,10 @@ Each model type has a `model_config_lookup` dictionary that maps config names to
 - `model/megatransformer_multimodal.py`: Multimodal model configs
 - `model/megatransformer_recurrent.py`: Recurrent transformer configs
 - `model/audio/vocoders/vocoders.py`: Vocoder configs like `tiny_lightheaded_freq_domain_vocoder`, `tiny_splitband_freq_domain_vocoder`
-- `model/audio/diffusion.py`: Diffusion model configs like `small_dit`, `medium_dit`
+- `model/audio/diffusion.py`: Audio diffusion configs like `small_dit`, `medium_dit`
+- `model/audio/vae.py`: Audio VAE configs like `small`, `small_wide`
+- `model/image/vae.py`: Image VAE configs like `gan_4_2`, `small_4_2`
+- `model/image/diffusion.py`: Image diffusion configs
 
 ### Training Script Selection (`pretrain_wm.py`)
 
@@ -102,6 +150,25 @@ The main training script auto-selects model type based on config:
 **Shared utilities:**
 - `SharedWindowBuffer`: Caches STFT windows across components
 - `model/audio/criteria.py`: Loss functions (mel reconstruction, phase-intransitive, discriminator losses)
+
+### VAE Architecture
+
+**Base VAE** (`model/vae.py`): Generic VAE wrapper combining encoder, decoder, and loss computation.
+
+**Audio VAE** (`model/audio/vae.py`):
+- Compresses mel spectrograms [1, 80, T] → latent [C, 10, T/75]
+- Speaker conditioning via FiLM (Feature-wise Linear Modulation) in decoder
+- Speaker embeddings from ECAPA-TDNN (192-dim) are NOT encoded in latent space
+
+**Image VAE** (`model/image/vae.py`):
+- Standard image VAE with optional GAN discriminator training
+
+### Image Pipeline
+
+**Image diffusion** (`model/image/diffusion.py`):
+- DiT-style architecture operating on VAE latents
+- Cross-attention for text conditioning
+- Uses `ImageCrossAttentionBlockSimple` with 1x1 convolutions for any spatial size
 
 ### Configuration System
 

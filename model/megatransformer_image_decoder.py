@@ -405,6 +405,95 @@ class ImageCrossAttentionBlock(nn.Module):
 
         return output
 
+
+class ImageCrossAttentionBlockSimple(nn.Module):
+    """
+    Simpler cross-attention block for image data that works with any spatial size.
+    Uses 1x1 convolutions for query projection (instead of large patch embeddings).
+    This is the standard approach used in UNet-based diffusion models like Stable Diffusion.
+    """
+    def __init__(self, hidden_size, n_heads=8, d_queries=64, d_values=64, context_dim=None, use_flash_attention=True, dropout_p=0.1, is_linear_attention=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.n_heads = n_heads
+        self.d_queries = d_queries
+        self.d_values = d_values
+        self.context_dim = context_dim or hidden_size
+        self.use_flash_attention = use_flash_attention
+        self.dropout_p = dropout_p
+        self.is_linear_attention = is_linear_attention
+
+        # Use 1x1 conv for query (works with any spatial size)
+        self.q_proj = nn.Conv2d(hidden_size, n_heads * d_queries, kernel_size=1, bias=False)
+        # Linear projections for context (key/value)
+        self.k_proj = nn.Linear(self.context_dim, n_heads * d_queries, bias=False)
+        self.v_proj = nn.Linear(self.context_dim, n_heads * d_values, bias=False)
+        # 1x1 conv for output projection
+        self.out_proj = nn.Conv2d(n_heads * d_values, hidden_size, kernel_size=1)
+
+        self.dropout = nn.Dropout(dropout_p)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        self.apply(megatransformer_utils.transformer_weight_init())
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """
+        Cross-attention between image features and context (e.g., text embeddings).
+
+        Args:
+            x: Image features [B, C, H, W]
+            context: Context embeddings [B, T, D] (e.g., text embeddings)
+
+        Returns:
+            output: [B, C, H, W] with cross-attended features
+        """
+        B, C, H, W = x.size()
+        BC, T, CC = context.size()
+
+        assert B == BC, f"Batch size mismatch: {B} vs {BC}"
+
+        # Query from image features
+        q = self.q_proj(x)  # [B, n_heads*d_queries, H, W]
+        q = q.view(B, self.n_heads, self.d_queries, -1).transpose(-2, -1)  # [B, n_heads, H*W, d_queries]
+
+        # Key and value from context
+        k = self.k_proj(context)  # [B, T, n_heads*d_queries]
+        v = self.v_proj(context)  # [B, T, n_heads*d_values]
+
+        k = k.view(B, T, self.n_heads, self.d_queries).transpose(1, 2)  # [B, n_heads, T, d_queries]
+        v = v.view(B, T, self.n_heads, self.d_values).transpose(1, 2)   # [B, n_heads, T, d_values]
+
+        output: torch.Tensor
+        if self.use_flash_attention:
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=False
+            )  # [B, n_heads, H*W, d_values]
+        else:
+            if self.is_linear_attention:
+                # Linear attention
+                kv = torch.matmul(k.transpose(-2, -1), v)  # [B, n_heads, d_queries, d_values]
+                output = torch.matmul(q, kv)  # [B, n_heads, H*W, d_values]
+            else:
+                # Standard attention
+                scale = 1.0 / math.sqrt(self.d_queries)
+                attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, n_heads, H*W, T]
+                attn_weights = F.softmax(attn_scores, dim=-1)
+                attn_weights = self.dropout(attn_weights)
+                output = torch.matmul(attn_weights, v)  # [B, n_heads, H*W, d_values]
+
+        # Reshape back to image format
+        output = output.transpose(2, 3).contiguous()  # [B, n_heads, d_values, H*W]
+        output = output.view(B, self.n_heads * self.d_values, H, W)  # [B, n_heads*d_values, H, W]
+        output = self.out_proj(output)  # [B, C, H, W]
+
+        return output
+
+
 class ImageVAE(nn.Module):
     def __init__(self, config, encoder, decoder, kl_beta=1e-4):
         super().__init__()
@@ -640,7 +729,7 @@ class ImageVAEDecoder(nn.Module):
         self.vae_loss_fn = F.mse_loss
         self.perceptual_loss = PerceptualLoss()
 
-    def forward(self, z, condition=None, image_labels=None):
+    def forward(self, z, condition=None, image_labels=None, speaker_embedding=None):
         features = self.fc(z)
         features = self.unflatten(features)
 

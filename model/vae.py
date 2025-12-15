@@ -128,7 +128,7 @@ class VAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, speaker_embedding=None):
         """
         Forward pass through VAE.
 
@@ -137,6 +137,8 @@ class VAE(nn.Module):
             mask: Optional mask tensor [B, T] where 1 = valid, 0 = padding.
                   If provided, reconstruction loss is only computed on valid regions.
                   The mask is in the time dimension (last dim of x).
+            speaker_embedding: Optional speaker embedding tensor [B, 1, D] or [B, D]
+                               for conditioning the decoder (audio VAE only)
 
         Returns:
             recon_x: Reconstructed input
@@ -147,7 +149,7 @@ class VAE(nn.Module):
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
 
-        recon_x = self.decoder(z)
+        recon_x = self.decoder(z, speaker_embedding=speaker_embedding)
 
         kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2, 3])
         kl_divergence = torch.mean(kl_divergence)

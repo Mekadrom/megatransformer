@@ -440,6 +440,7 @@ class GaussianDiffusion(nn.Module):
             in_channels=in_channels,
             model_channels=model_channels,
             out_channels=out_channels,
+            channel_multipliers=config.image_decoder_channel_multipliers,
             time_embedding_dim=time_embedding_dim,
             num_res_blocks=num_res_blocks,
             dropout_p=unet_dropout_p,
@@ -682,14 +683,17 @@ class GaussianDiffusion(nn.Module):
             x = self.p_sample_loop(x, condition=condition, return_intermediate=return_intermediate)
 
         if return_intermediate:
-            img = x[0]
+            img, noise_preds, x_start_preds = x
         else:
             img = x
 
         if self.is_normalize:
             img = self.unnormalize(img)
+            if return_intermediate:
+                # Also unnormalize intermediate x_start predictions
+                x_start_preds = [self.unnormalize(x_start) for x_start in x_start_preds]
 
-        return (img, *x[1:]) if return_intermediate else img
+        return (img, noise_preds, x_start_preds) if return_intermediate else img
     
     @autocast('cuda', enabled = False)
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor]=None) -> torch.Tensor:

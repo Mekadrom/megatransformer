@@ -46,13 +46,18 @@ class CachedAudioDiffusionDataset(Dataset):
         # Return in expected format
         # mel_spec_length may not exist in older cached datasets
         mel_spec_length = data.get("mel_spec_length", data["mel_spec"].shape[-1])
-        return {
+        result = {
             "text_attention_mask": data["text_attention_mask"],
             "text_embeddings": data["text_embeddings"],
             "mel_spec": data["mel_spec"],
             "mel_spec_length": mel_spec_length,
-            "speaker_embedding": data["speaker_embedding"]
+            "speaker_embedding": data["speaker_embedding"],
         }
+        # Include VAE latents if available (for latent diffusion)
+        if "latent_mu" in data:
+            result["latent_mu"] = data["latent_mu"]
+            result["latent_shape"] = data.get("latent_shape", list(data["latent_mu"].shape))
+        return result
 
 
 class AudioDiffusionDataCollator:
@@ -62,10 +67,14 @@ class AudioDiffusionDataCollator:
         audio_max_frames: int,
         max_conditions: int,
         n_mels: int,
+        use_latent_diffusion: bool = False,
+        latent_max_frames: int = 25,  # audio_max_frames / time_compression (e.g., 1875/75=25)
     ):
         self.audio_max_frames = audio_max_frames
         self.max_conditions = max_conditions
         self.n_mels = n_mels
+        self.use_latent_diffusion = use_latent_diffusion
+        self.latent_max_frames = latent_max_frames
 
     def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
         attention_masks = []
@@ -73,6 +82,9 @@ class AudioDiffusionDataCollator:
         mel_specs = []
         mel_spec_masks = []
         speaker_embeddings = []
+        latent_mus = []
+        has_latents = False
+
         for ex in examples:
             if ex is None:
                 continue
@@ -107,6 +119,17 @@ class AudioDiffusionDataCollator:
             mel_spec_masks.append(mel_mask)
             speaker_embeddings.append(ex["speaker_embedding"])
 
+            # Handle latent diffusion
+            if "latent_mu" in ex:
+                has_latents = True
+                latent = ex["latent_mu"]
+                # Pad or truncate latent time dimension
+                if latent.shape[-1] < self.latent_max_frames:
+                    latent = F.pad(latent, (0, self.latent_max_frames - latent.shape[-1]), value=0)
+                elif latent.shape[-1] > self.latent_max_frames:
+                    latent = latent[..., :self.latent_max_frames]
+                latent_mus.append(latent)
+
         # Stack tensors
         batch = {
             "attention_mask": torch.stack(attention_masks),
@@ -115,5 +138,9 @@ class AudioDiffusionDataCollator:
             "mel_spec_mask": torch.stack(mel_spec_masks),  # [B, T] mask for mel spectrogram
             "speaker_embedding": torch.stack(speaker_embeddings),
         }
+
+        # Add latents if available and requested
+        if has_latents and self.use_latent_diffusion:
+            batch["latent_mu"] = torch.stack(latent_mus)
 
         return batch

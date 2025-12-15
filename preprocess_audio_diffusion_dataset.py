@@ -15,7 +15,85 @@ from speechbrain.inference.speaker import EncoderClassifier
 """
 Uses T5-small to produce and cache text embeddings alongside mel spectrograms.
 Optionally uses ECAPA-TDNN (via SpeechBrain) for speaker embeddings.
+Optionally encodes mel spectrograms to VAE latents for latent diffusion.
 """
+
+
+def load_audio_vae(checkpoint_path: str, vae_config: str, latent_channels: int, device: str = "cuda"):
+    """
+    Load an audio VAE from a checkpoint.
+
+    Args:
+        checkpoint_path: Path to checkpoint directory (containing model.safetensors or pytorch_model.bin)
+        vae_config: Config name from model_config_lookup (e.g., "mini", "tiny", "mini_deep")
+        latent_channels: Number of latent channels the VAE was trained with
+        device: Device to load the model on
+
+    Returns:
+        VAE model in eval mode
+    """
+    from model.audio.vae import model_config_lookup
+
+    if vae_config not in model_config_lookup:
+        raise ValueError(f"Unknown VAE config: {vae_config}. Available: {list(model_config_lookup.keys())}")
+
+    # Create model with same config
+    model = model_config_lookup[vae_config](
+        latent_channels=latent_channels,
+        perceptual_loss_type="none",  # Don't need loss for inference
+    )
+
+    # Try to load from safetensors first, then pytorch_model.bin
+    safetensors_path = os.path.join(checkpoint_path, "model.safetensors")
+    pytorch_path = os.path.join(checkpoint_path, "pytorch_model.bin")
+
+    if os.path.exists(safetensors_path):
+        from safetensors.torch import load_file
+        state_dict = load_file(safetensors_path)
+        model.load_state_dict(state_dict)
+        print(f"Loaded VAE from {safetensors_path}")
+    elif os.path.exists(pytorch_path):
+        state_dict = torch.load(pytorch_path, map_location=device)
+        model.load_state_dict(state_dict)
+        print(f"Loaded VAE from {pytorch_path}")
+    else:
+        raise FileNotFoundError(
+            f"No model checkpoint found at {checkpoint_path}. "
+            f"Expected model.safetensors or pytorch_model.bin"
+        )
+
+    model = model.to(device)
+    model.eval()
+
+    return model
+
+
+@torch.no_grad()
+def encode_mel_to_latent(vae, mel_spec: torch.Tensor, device: str = "cuda") -> torch.Tensor:
+    """
+    Encode a mel spectrogram to VAE latent space.
+
+    Args:
+        vae: VAE model
+        mel_spec: Mel spectrogram tensor [n_mels, T] or [1, n_mels, T]
+        device: Device to run on
+
+    Returns:
+        Latent mu tensor [latent_channels, H', T']
+    """
+    # Ensure correct shape: [B, C, H, W] = [1, 1, n_mels, T]
+    if mel_spec.dim() == 2:
+        mel_spec = mel_spec.unsqueeze(0).unsqueeze(0)  # [n_mels, T] -> [1, 1, n_mels, T]
+    elif mel_spec.dim() == 3:
+        mel_spec = mel_spec.unsqueeze(0)  # [N, n_mels, T] -> [N, 1, n_mels, T]
+
+    mel_spec = mel_spec.to(device)
+
+    # Get mu from encoder (don't sample, use deterministic mean)
+    mu, _ = vae.encoder(mel_spec)
+
+    # Remove batch dimension: [1, C, H', T'] -> [C, H', T']
+    return mu.squeeze(0).cpu()
 
 def preprocess_and_cache_dataset(
     output_dir: str,
@@ -34,17 +112,33 @@ def preprocess_and_cache_dataset(
     mel_window: str = "hann_window",
     enable_segmentation: bool = False,
     compute_speaker_embeddings: bool = True,
+    # VAE encoding options
+    vae_checkpoint: str = None,
+    vae_config: str = "mini",
+    latent_channels: int = 16,
 ):
     """
     Preprocess dataset and save as individual .pt files.
+
+    If vae_checkpoint is provided, mel spectrograms are encoded to VAE latent space
+    and saved as 'latent_mu' for latent diffusion training.
     """
     os.makedirs(output_dir, exist_ok=True)
-    
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Load VAE if checkpoint provided
+    vae = None
+    if vae_checkpoint is not None:
+        print(f"Loading audio VAE from {vae_checkpoint}...")
+        vae = load_audio_vae(vae_checkpoint, vae_config, latent_channels, device)
+        print(f"  VAE config: {vae_config}, latent_channels: {latent_channels}")
+
     # Load dataset
     print(f"Loading dataset {dataset_name}/{dataset_config} split {split}...")
     dataset = load_dataset(dataset_name, dataset_config, split=split)
     dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
-    
+
     # Track statistics
     stats = {
         "total": len(dataset),
@@ -57,7 +151,9 @@ def preprocess_and_cache_dataset(
         "skipped_error": 0,
         "no_speaker_id": 0,
     }
-    
+    if vae is not None:
+        stats["latents_encoded"] = 0
+
     max_samples = int(segment_length_sec * sample_rate)
     overlap_samples = int(segment_overlap_sec * sample_rate)
     stride = max_samples - overlap_samples
@@ -75,7 +171,7 @@ def preprocess_and_cache_dataset(
         speaker_encoder = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
             savedir="pretrained_models/spkrec-ecapa-voxceleb",
-            run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+            run_opts={"device": device},
         )
         stats["speaker_embeddings_computed"] = 0
     elif compute_speaker_embeddings:
@@ -167,6 +263,12 @@ def preprocess_and_cache_dataset(
                         ).squeeze(0).cpu()  # [192] embedding
                         stats["speaker_embeddings_computed"] += 1
 
+                # Encode to VAE latent if VAE is provided
+                latent_mu = None
+                if vae is not None:
+                    latent_mu = encode_mel_to_latent(vae, mel_spec, device)
+                    stats["latents_encoded"] += 1
+
                 # Save to file
                 save_path = os.path.join(output_dir, f"{idx:08d}_{seg_idx:02d}.pt")
                 save_dict = {
@@ -178,6 +280,9 @@ def preprocess_and_cache_dataset(
                 }
                 if speaker_embedding is not None:
                     save_dict["speaker_embedding"] = speaker_embedding
+                if latent_mu is not None:
+                    save_dict["latent_mu"] = latent_mu
+                    save_dict["latent_shape"] = list(latent_mu.shape)  # [C, H', T']
                 torch.save(save_dict, save_path)
                 
                 stats["saved_segments"] += 1
@@ -200,10 +305,14 @@ def preprocess_and_cache_dataset(
         "audio_max_frames": audio_max_frames,
         "stats": stats,
     }
-    
+    if vae is not None:
+        config["vae_config"] = vae_config
+        config["vae_checkpoint"] = vae_checkpoint
+        config["latent_channels"] = latent_channels
+
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
-    
+
     print(f"\nPreprocessing complete!")
     print(f"  Saved samples: {stats['saved_samples']}")
     print(f"  Saved segments: {stats['saved_segments']}")
@@ -213,13 +322,15 @@ def preprocess_and_cache_dataset(
     print(f"  Skipped (no text): {stats['skipped_no_text']}")
     print(f"  Skipped (text too long): {stats['skipped_text_too_long']}")
     print(f"  No speaker ID: {stats['no_speaker_id']}")
+    if vae is not None:
+        print(f"  Latents encoded: {stats['latents_encoded']}")
     
     return stats
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    
+
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--dataset_name", type=str, default="openslr/librispeech_asr")
     parser.add_argument("--dataset_config", type=str, default="clean")
@@ -234,6 +345,14 @@ if __name__ == "__main__":
     parser.add_argument("--enable_segmentation", action="store_true")
     parser.add_argument("--compute_speaker_embeddings", action="store_true", default=True)
     parser.add_argument("--no_speaker_embeddings", action="store_false", dest="compute_speaker_embeddings")
+
+    # VAE encoding options for latent diffusion
+    parser.add_argument("--vae_checkpoint", type=str, default=None,
+                        help="Path to audio VAE checkpoint directory for latent encoding")
+    parser.add_argument("--vae_config", type=str, default="mini",
+                        help="VAE config name (tiny, mini, mini_deep)")
+    parser.add_argument("--latent_channels", type=int, default=16,
+                        help="Number of latent channels in the VAE")
 
     args = parser.parse_args()
 
@@ -251,4 +370,7 @@ if __name__ == "__main__":
         mel_window=args.mel_window,
         enable_segmentation=args.enable_segmentation,
         compute_speaker_embeddings=args.compute_speaker_embeddings,
+        vae_checkpoint=args.vae_checkpoint,
+        vae_config=args.vae_config,
+        latent_channels=args.latent_channels,
     )

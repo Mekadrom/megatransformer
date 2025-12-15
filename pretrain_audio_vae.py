@@ -50,13 +50,16 @@ class AudioVAEDataCollator:
         self,
         audio_max_frames: int = 1875,
         n_mels: int = 80,
+        speaker_embedding_dim: int = 192,
     ):
         self.audio_max_frames = audio_max_frames
         self.n_mels = n_mels
+        self.speaker_embedding_dim = speaker_embedding_dim
 
     def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
         mel_specs = []
         mel_spec_masks = []
+        speaker_embeddings = []
         for ex in examples:
             if ex is None:
                 continue
@@ -87,9 +90,21 @@ class AudioVAEDataCollator:
             mel_specs.append(mel)
             mel_spec_masks.append(mel_mask)
 
+            # Get speaker embedding if available
+            speaker_emb = ex.get("speaker_embedding", None)
+            if speaker_emb is not None:
+                # Ensure shape is [1, speaker_embedding_dim]
+                if speaker_emb.dim() == 1:
+                    speaker_emb = speaker_emb.unsqueeze(0)
+                speaker_embeddings.append(speaker_emb)
+            else:
+                # Use zeros if no speaker embedding
+                speaker_embeddings.append(torch.zeros(1, self.speaker_embedding_dim))
+
         batch = {
             "mel_spec": torch.stack(mel_specs),
             "mel_spec_mask": torch.stack(mel_spec_masks),  # [B, T] mask for mel spectrogram
+            "speaker_embedding": torch.stack(speaker_embeddings),  # [B, 1, speaker_embedding_dim]
         }
 
         return batch
@@ -500,9 +515,10 @@ class AudioVAEGANTrainer(Trainer):
 
         mel_spec = inputs["mel_spec"]
         mel_spec_mask = inputs.get("mel_spec_mask", None)
+        speaker_embedding = inputs.get("speaker_embedding", None)
 
         # Forward pass through VAE model (with optional mask for reconstruction loss)
-        recon, mu, logvar, losses = model(mel_spec, mask=mel_spec_mask)
+        recon, mu, logvar, losses = model(mel_spec, mask=mel_spec_mask, speaker_embedding=speaker_embedding)
 
         # Get VAE reconstruction loss
         vae_loss = losses["total_loss"]
@@ -570,6 +586,18 @@ class AudioVAEGANTrainer(Trainer):
             self._log_scalar(f"{prefix}vae_logvar_mean", logvar.mean(), global_step)
             self._log_scalar(f"{prefix}g_gan_loss", g_gan_loss, global_step)
             self._log_scalar(f"{prefix}total_loss", total_loss.mean(), global_step)
+
+            # Log speaker embedding statistics (before any normalization in model)
+            if speaker_embedding is not None:
+                # Flatten to [B, D] if needed
+                spk_emb = speaker_embedding.squeeze(1) if speaker_embedding.dim() == 3 else speaker_embedding
+                self._log_scalar(f"{prefix}speaker_emb/mean", spk_emb.mean(), global_step)
+                self._log_scalar(f"{prefix}speaker_emb/std", spk_emb.std(), global_step)
+                # L2 norm per sample, then average
+                l2_norms = torch.norm(spk_emb, p=2, dim=-1)
+                self._log_scalar(f"{prefix}speaker_emb/l2_norm_mean", l2_norms.mean(), global_step)
+                self._log_scalar(f"{prefix}speaker_emb/l2_norm_min", l2_norms.min(), global_step)
+                self._log_scalar(f"{prefix}speaker_emb/l2_norm_max", l2_norms.max(), global_step)
 
         outputs = {
             "loss": total_loss,
@@ -677,6 +705,14 @@ def main():
 
     # VAE settings
     latent_channels = int(unk_dict.get("latent_channels", 4))
+    speaker_embedding_dim = int(unk_dict.get("speaker_embedding_dim", 192))  # ECAPA-TDNN dim
+    normalize_speaker_embedding = unk_dict.get("normalize_speaker_embedding", "true").lower() == "true"
+    debug_film = unk_dict.get("debug_film", "false").lower() == "true"
+    # FiLM bounding - prevents extreme scale/shift values that can cause artifacts
+    # Scale bound of 0.5 means (1 + scale) ranges from 0.5 to 1.5 (never zeroes out)
+    # Set to 0 to disable bounding (unbounded FiLM)
+    film_scale_bound = float(unk_dict.get("film_scale_bound", 0.5))
+    film_shift_bound = float(unk_dict.get("film_shift_bound", 0.5))
 
     # VAE loss weights
     recon_loss_weight = float(unk_dict.get("recon_loss_weight", 1.0))
@@ -706,6 +742,11 @@ def main():
 
     model = model_config_lookup[args.config](
         latent_channels=latent_channels,
+        speaker_embedding_dim=speaker_embedding_dim,
+        normalize_speaker_embedding=normalize_speaker_embedding,
+        debug_film=debug_film,
+        film_scale_bound=film_scale_bound,
+        film_shift_bound=film_shift_bound,
         perceptual_loss_type=perceptual_loss_type,
         lpips_net=lpips_net,
         recon_loss_weight=recon_loss_weight,
@@ -760,6 +801,11 @@ def main():
         print(f"  Hop length: {audio_hop_length}")
         print(f"  Max frames: {audio_max_frames}")
         print(f"  Latent channels: {latent_channels}")
+        print(f"  Speaker embedding dim: {speaker_embedding_dim}")
+        print(f"  Normalize speaker embedding: {normalize_speaker_embedding}")
+        print(f"  Debug FiLM: {debug_film}")
+        print(f"  FiLM scale bound: {film_scale_bound} (0=unbounded)")
+        print(f"  FiLM shift bound: {film_shift_bound} (0=unbounded)")
         if use_gan and discriminator is not None:
             print(f"GAN training: enabled")
             print(f"  Discriminator config: {discriminator_config}")
@@ -824,6 +870,7 @@ def main():
     data_collator = AudioVAEDataCollator(
         audio_max_frames=audio_max_frames,
         n_mels=n_mels,
+        speaker_embedding_dim=speaker_embedding_dim,
     )
 
     # Create trainer

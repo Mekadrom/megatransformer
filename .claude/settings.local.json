@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "Bash(pip show:*)"
+      "Bash(pip show:*)",
+      "Bash(python count_model_params.py:*)"
     ],
     "deny": [],
     "ask": []

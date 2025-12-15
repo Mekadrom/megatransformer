@@ -263,6 +263,7 @@ class MegaTransformerConfig(PretrainedConfig):
         image_decoder_cross_attn_d_queries=64,
         image_decoder_cross_attn_d_values=64,
         image_decoder_cross_attn_use_flash_attention=True,
+        image_decoder_channel_multipliers=[2, 4, 8],
 
         **kwargs
     ):
@@ -415,6 +416,7 @@ class MegaTransformerConfig(PretrainedConfig):
         self.image_decoder_cross_attn_d_queries = image_decoder_cross_attn_d_queries
         self.image_decoder_cross_attn_d_values = image_decoder_cross_attn_d_values
         self.image_decoder_cross_attn_use_flash_attention = image_decoder_cross_attn_use_flash_attention
+        self.image_decoder_channel_multipliers = image_decoder_channel_multipliers
 
         self.current_epoch = 0
         self.current_global_step = 0

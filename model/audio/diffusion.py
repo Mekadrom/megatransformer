@@ -172,15 +172,13 @@ class AudioDiffusionCrossAttentionBlock(nn.Module):
         return output
 
 class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffusion):
-    def __init__(self, *args, speaker_embedding_dim=192, **kwargs):
+    def __init__(self, *args, **kwargs):
         # Remove shared_window_buffer from kwargs before passing to parent
         kwargs.pop('shared_window_buffer', None)
         super().__init__(*args, **kwargs)
 
         self.mel_min = -11.5  # log(1e-5)
         self.mel_max = 2.0    # typical max for speech (empirically ~1.6, add small margin)
-
-        self.speaker_proj = nn.Linear(speaker_embedding_dim, self.context_dim)
     
     def normalize(self, x_0):
         return 2 * (x_0 - self.mel_min) / (self.mel_max - self.mel_min) - 1
@@ -245,7 +243,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
 
         return model_out, loss_weighted.mean()
 
-    def forward(self, x_0, speaker_embedding, condition=None, return_diagnostics=False):
+    def forward(self, x_0, condition=None, return_diagnostics=False):
         """
         Forward pass for audio diffusion training.
 
@@ -280,17 +278,11 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
                 "mel_std": x_0.std().item(),
             }
 
-        speaker_cast = self.speaker_proj(speaker_embedding)
-
         if condition is not None:
             if len(condition.shape) == 5:
                 # squish batch and example dimensions if necessary
                 *_, c, h, w = condition.shape
                 condition = condition.view(-1, c, h, w)
-            # megatransformer_utils.print_debug_tensor("condition", condition)
-            condition = torch.cat([speaker_cast, condition], dim=1)
-        else:
-            condition = speaker_cast.unsqueeze(1)
 
         t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device=x_0.device).long()
 
@@ -322,7 +314,6 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         self,
         device,
         batch_size: int,
-        speaker_embedding: torch.Tensor,
         condition: Optional[torch.Tensor]=None,
         return_intermediate: bool=False,
         override_ddim_sampling_steps: Optional[int]=None,
@@ -330,13 +321,6 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         **kwargs
     ) -> torch.Tensor:
         x = torch.randn(batch_size, 1, self.config.audio_n_mels, self.config.audio_max_frames, device=device, generator=generator)
-
-        speaker_cast = self.speaker_proj(speaker_embedding)
-
-        if condition is not None:
-            condition = torch.cat([speaker_cast.unsqueeze(1), condition], dim=1)
-        else:
-            condition = speaker_cast.unsqueeze(1)
 
         if self.is_ddim_sampling or override_ddim_sampling_steps is not None:
             x = self.ddim_sample_loop(x, condition=condition, return_intermediate=return_intermediate, override_sampling_steps=override_ddim_sampling_steps)

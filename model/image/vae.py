@@ -64,7 +64,8 @@ class ImageVAEDecoder(nn.Module):
 
         self.final_conv = nn.Conv2d(channels[-1], out_channels, kernel_size=3, padding=1)
 
-    def forward(self, z):
+    def forward(self, z, speaker_embedding=None):
+        # speaker_embedding is ignored for image VAE (only used for audio VAE)
         for upsample in self.channel_upsample:
             z = upsample(z)
 
