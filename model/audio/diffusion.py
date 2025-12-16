@@ -191,7 +191,19 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         if noise is None:
             noise = torch.randn_like(x_start)
 
+        # Offset noise: add constant noise across spatial dimensions
+        if self.offset_noise_strength > 0 and self.training:
+            offset_noise = torch.randn(x_start.shape[0], x_start.shape[1], 1, 1, device=x_start.device)
+            noise = noise + self.offset_noise_strength * offset_noise
+
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+
+        # CFG: randomly drop conditioning during training
+        if condition is not None and self.cfg_dropout_prob > 0 and self.training:
+            batch_size = x_start.shape[0]
+            dropout_mask = torch.rand(batch_size, device=x_start.device) < self.cfg_dropout_prob
+            condition = condition.clone()
+            condition[dropout_mask] = 0.0
 
         # NaN detection: check inputs to UNet
         # if torch.isnan(x_noisy).any():
@@ -284,7 +296,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
                 *_, c, h, w = condition.shape
                 condition = condition.view(-1, c, h, w)
 
-        t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device=x_0.device).long()
+        t = self._sample_timesteps(x_0.shape[0], x_0.device)
 
         if self.is_normalize:
             x_0 = self.normalize(x_0)
@@ -316,16 +328,27 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         batch_size: int,
         condition: Optional[torch.Tensor]=None,
         return_intermediate: bool=False,
-        override_ddim_sampling_steps: Optional[int]=None,
+        override_sampling_steps: Optional[int]=None,
         generator=None,
+        guidance_scale: float=1.0,
+        sampler: str="dpm_solver_pp",
+        dpm_solver_order: int=2,
         **kwargs
     ) -> torch.Tensor:
         x = torch.randn(batch_size, 1, self.config.audio_n_mels, self.config.audio_max_frames, device=device, generator=generator)
 
-        if self.is_ddim_sampling or override_ddim_sampling_steps is not None:
-            x = self.ddim_sample_loop(x, condition=condition, return_intermediate=return_intermediate, override_sampling_steps=override_ddim_sampling_steps)
+        sampling_steps = override_sampling_steps if override_sampling_steps is not None else self.sampling_timesteps
+
+        if sampler == "dpm_solver_pp":
+            x = self.dpm_solver_pp_sample_loop(
+                x, condition=condition, return_intermediate=return_intermediate,
+                override_sampling_steps=sampling_steps, guidance_scale=guidance_scale,
+                order=dpm_solver_order
+            )
+        elif sampler == "ddim" or (self.is_ddim_sampling and sampler != "ddpm"):
+            x = self.ddim_sample_loop(x, condition=condition, return_intermediate=return_intermediate, override_sampling_steps=sampling_steps, guidance_scale=guidance_scale)
         else:
-            x = self.p_sample_loop(x, condition=condition, return_intermediate=return_intermediate)
+            x = self.p_sample_loop(x, condition=condition, return_intermediate=return_intermediate, guidance_scale=guidance_scale)
 
         if isinstance(x, tuple):
             audio = x[0]
@@ -410,6 +433,12 @@ def create_audio_diffusion_model(
     min_snr_loss_weight: bool = True,
     min_snr_gamma: float = 5.0,
     prediction_type: str = "epsilon",  # "epsilon" or "v"
+    cfg_dropout_prob: float = 0.1,  # Default 10% dropout for CFG training
+    zero_terminal_snr: bool = True,  # Recommended for audio generation
+    offset_noise_strength: float = 0.0,  # Less common for audio, default off
+    timestep_sampling: str = "logit_normal",  # "uniform" or "logit_normal"
+    logit_normal_mean: float = 0.0,  # Mean for logit-normal (0 = centered on middle timesteps)
+    logit_normal_std: float = 1.0,  # Std for logit-normal (lower = more peaked)
 ) -> AudioConditionalGaussianDiffusion:
     """Create an audio diffusion model from config."""
     model = AudioConditionalGaussianDiffusion(
@@ -448,6 +477,12 @@ def create_audio_diffusion_model(
         normalize=normalize,
         sampling_timesteps=sampling_timesteps,
         prediction_type=prediction_type,
+        cfg_dropout_prob=cfg_dropout_prob,
+        zero_terminal_snr=zero_terminal_snr,
+        offset_noise_strength=offset_noise_strength,
+        timestep_sampling=timestep_sampling,
+        logit_normal_mean=logit_normal_mean,
+        logit_normal_std=logit_normal_std,
     )
 
     return model

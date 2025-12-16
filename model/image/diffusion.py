@@ -51,7 +51,7 @@ class ImageConditionalGaussianDiffusion(GaussianDiffusion):
 
         return model_output, losses[0]
 
-    def sample(self, device, batch_size, condition=None, return_intermediate=False, override_ddim_sampling_steps=None, **kwargs):
+    def sample(self, device, batch_size, condition=None, return_intermediate=False, override_sampling_steps=None, guidance_scale=1.0, sampler="dpm_solver_pp", dpm_solver_order=2, **kwargs):
         """
         Sample from the diffusion model.
 
@@ -60,7 +60,10 @@ class ImageConditionalGaussianDiffusion(GaussianDiffusion):
             batch_size: Number of samples to generate
             condition: Text embeddings for conditioning
             return_intermediate: If True, return intermediate denoising steps
-            override_ddim_sampling_steps: Override DDIM sampling steps
+            override_sampling_steps: Override sampling steps
+            guidance_scale: Classifier-free guidance scale. 1.0 = no guidance, >1.0 = stronger conditioning.
+            sampler: Sampling algorithm ("dpm_solver_pp", "ddim", or "ddpm")
+            dpm_solver_order: Order for DPM-Solver++ (1, 2, or 3)
 
         Returns:
             samples: Generated latent samples [B, C, H, W]
@@ -72,7 +75,10 @@ class ImageConditionalGaussianDiffusion(GaussianDiffusion):
             batch_size=batch_size,
             condition=condition,
             return_intermediate=return_intermediate,
-            override_ddim_sampling_steps=override_ddim_sampling_steps,
+            override_sampling_steps=override_sampling_steps,
+            guidance_scale=guidance_scale,
+            sampler=sampler,
+            dpm_solver_order=dpm_solver_order,
             **kwargs
         )
 
@@ -104,6 +110,27 @@ tiny_image_diffusion_config = megatransformer_utils.MegaTransformerConfig(
     image_decoder_cross_attn_d_values=16,
     image_decoder_cross_attn_use_flash_attention=True,
     image_decoder_channel_multipliers=[2, 4],
+)
+
+tiny_deep_image_diffusion_config = megatransformer_utils.MegaTransformerConfig(
+    hidden_size=64,
+    image_size=32,  # Latent size (e.g., 256/8=32 with 8x compression VAE)
+    image_decoder_model_channels=64,
+    image_decoder_time_embedding_dim=64,
+    image_decoder_num_res_blocks=2,
+    image_decoder_down_block_self_attn_n_heads=2,
+    image_decoder_down_block_self_attn_d_queries=16,
+    image_decoder_down_block_self_attn_d_values=16,
+    image_decoder_down_block_self_attn_use_flash_attention=True,
+    image_decoder_up_block_self_attn_n_heads=2,
+    image_decoder_up_block_self_attn_d_queries=16,
+    image_decoder_up_block_self_attn_d_values=16,
+    image_decoder_up_block_self_attn_use_flash_attention=True,
+    image_decoder_cross_attn_n_heads=2,
+    image_decoder_cross_attn_d_queries=16,
+    image_decoder_cross_attn_d_values=16,
+    image_decoder_cross_attn_use_flash_attention=True,
+    image_decoder_channel_multipliers=[2, 4, 8],
 )
 
 small_image_diffusion_config = megatransformer_utils.MegaTransformerConfig(
@@ -158,6 +185,12 @@ def create_image_diffusion_model(
     min_snr_loss_weight: bool = True,
     min_snr_gamma: float = 5.0,
     prediction_type: str = "epsilon",
+    cfg_dropout_prob: float = 0.1,  # Default 10% dropout for CFG training
+    zero_terminal_snr: bool = True,  # Recommended for image generation
+    offset_noise_strength: float = 0.1,  # Recommended for image generation
+    timestep_sampling: str = "logit_normal",  # "uniform" or "logit_normal"
+    logit_normal_mean: float = 0.0,  # Mean for logit-normal (0 = centered on middle timesteps)
+    logit_normal_std: float = 1.0,  # Std for logit-normal (lower = more peaked)
 ) -> ImageConditionalGaussianDiffusion:
     """Create an image diffusion model from config."""
     model = ImageConditionalGaussianDiffusion(
@@ -195,6 +228,12 @@ def create_image_diffusion_model(
         normalize=normalize,
         sampling_timesteps=sampling_timesteps,
         prediction_type=prediction_type,
+        cfg_dropout_prob=cfg_dropout_prob,
+        zero_terminal_snr=zero_terminal_snr,
+        offset_noise_strength=offset_noise_strength,
+        timestep_sampling=timestep_sampling,
+        logit_normal_mean=logit_normal_mean,
+        logit_normal_std=logit_normal_std,
     )
 
     return model
@@ -215,6 +254,11 @@ model_config_lookup = {
     ),
     "tiny_v_image_diffusion": lambda **kwargs: create_image_diffusion_model(
         config=tiny_image_diffusion_config,
+        prediction_type="v",
+        **kwargs
+    ),
+    "tiny_deep_v_image_diffusion": lambda **kwargs: create_image_diffusion_model(
+        config=tiny_deep_image_diffusion_config,
         prediction_type="v",
         **kwargs
     ),

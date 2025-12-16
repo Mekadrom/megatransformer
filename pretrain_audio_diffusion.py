@@ -264,7 +264,10 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
                             batch_size=1,  # Single sample to reduce memory for intermediates
                             condition=None,
                             return_intermediate=True,
-                            override_ddim_sampling_steps=self.ddim_sampling_steps,
+                            override_sampling_steps=self.ddim_sampling_steps,
+                            guidance_scale=3.0,  # Moderate CFG for audio
+                            sampler="dpm_solver_pp",
+                            dpm_solver_order=2,
                         )
                         generated_mels, noise_preds, x_start_preds = result
 
@@ -284,7 +287,10 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
                             batch_size=1,
                             condition=self.text_embeddings.to(device),
                             return_intermediate=True,
-                            override_ddim_sampling_steps=self.ddim_sampling_steps,
+                            override_sampling_steps=self.ddim_sampling_steps,
+                            guidance_scale=3.0,  # Moderate CFG for audio
+                            sampler="dpm_solver_pp",
+                            dpm_solver_order=2,
                         )
                         generated_mels, noise_preds, x_start_preds = result
 

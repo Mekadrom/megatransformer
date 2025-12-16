@@ -141,9 +141,13 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
         t5_model.eval()
         self.t5_model = t5_model
 
-        self.text = "A photo of a cat sitting on a couch"
+        self.text = [
+            "A photo of a cat sitting on a couch",
+            "A man riding a horse in a field",
+            "A beautiful landscape with mountains and a lake",
+        ]
         self.text_inputs = t5_tokenizer(
-            [self.text],
+            self.text,
             max_length=512,
             padding="max_length",
             truncation=True,
@@ -184,43 +188,78 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
                             batch_size=1,
                             condition=None,
                             return_intermediate=True,
-                            override_ddim_sampling_steps=self.ddim_sampling_steps,
+                            override_sampling_steps=self.ddim_sampling_steps,
                             image_size=self.image_size,
+                            generator=torch.Generator(device).manual_seed(42),
+                            guidance_scale=7.5,
+                            sampler="dpm_solver_pp",
+                            dpm_solver_order=2,
                         )
                         generated_latents, noise_preds, x_start_preds = result
 
                         # Decode and log
                         self._log_generated_images(
                             generated_latents, writer, global_step,
-                            tag_prefix="image_diffusion/uncond"
+                            tag_prefix="example_uncond"
                         )
 
                         # Log intermediate denoising steps
                         self._log_intermediate_steps(
                             x_start_preds, writer, global_step,
-                            tag_prefix="image_diffusion/uncond_intermediate"
+                            tag_prefix="example_uncond_intermediate"
                         )
 
-                        # Generate from text conditions
-                        result = model.sample(
-                            device=device,
-                            batch_size=1,
-                            condition=self.text_embeddings.to(device),
-                            return_intermediate=True,
-                            override_ddim_sampling_steps=self.ddim_sampling_steps,
-                            image_size=self.image_size,
-                        )
-                        generated_latents, noise_preds, x_start_preds = result
+                        for i, text in enumerate(self.text_embeddings):
+                            # Generate from text conditions
+                            result = model.sample(
+                                device=device,
+                                batch_size=1,
+                                condition=text.unsqueeze(0).to(device),
+                                return_intermediate=True,
+                                override_sampling_steps=self.ddim_sampling_steps,
+                                image_size=self.image_size,
+                                generator=torch.Generator(device).manual_seed(42),
+                                guidance_scale=7.5,
+                                sampler="dpm_solver_pp",
+                                dpm_solver_order=2,
+                            )
+                            generated_latents, noise_preds, x_start_preds = result
 
-                        self._log_generated_images(
-                            generated_latents, writer, global_step,
-                            tag_prefix="image_diffusion/cond"
-                        )
+                            self._log_generated_images(
+                                generated_latents, writer, global_step,
+                                tag_prefix=f"example_{i}/cond"
+                            )
 
-                        self._log_intermediate_steps(
-                            x_start_preds, writer, global_step,
-                            tag_prefix="image_diffusion/cond_intermediate"
-                        )
+                            self._log_intermediate_steps(
+                                x_start_preds, writer, global_step,
+                                tag_prefix=f"example_{i}/cond_intermediate"
+                            )
+
+                        for guidance in [1.0, 3.0, 5.0, 7.5, 10.0]:
+                            # Generate with different guidance scales
+                            result = model.sample(
+                                device=device,
+                                batch_size=1,
+                                condition=self.text_embeddings[0:1].to(device),
+                                return_intermediate=True,
+                                override_sampling_steps=self.ddim_sampling_steps,
+                                image_size=self.image_size,
+                                generator=torch.Generator(device).manual_seed(42),
+                                guidance_scale=guidance,
+                                sampler="dpm_solver_pp",
+                                dpm_solver_order=2,
+                            )
+                            generated_latents, noise_preds, x_start_preds = result
+
+                            self._log_generated_images(
+                                generated_latents, writer, global_step,
+                                tag_prefix=f"example_guidance_{guidance:.1f}/cond"
+                            )
+
+                            self._log_intermediate_steps(
+                                x_start_preds, writer, global_step,
+                                tag_prefix=f"example_guidance_{guidance:.1f}/cond_intermediate"
+                            )
 
     def _log_intermediate_steps(self, x_start_preds, writer, global_step, tag_prefix="image_diffusion/intermediate"):
         """Log intermediate denoising steps to TensorBoard."""

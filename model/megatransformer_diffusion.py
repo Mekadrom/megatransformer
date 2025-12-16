@@ -411,8 +411,20 @@ class GaussianDiffusion(nn.Module):
             ddim_sampling_eta = 0.0,
             sampling_timesteps=None,
             prediction_type: str = "epsilon",  # "epsilon" or "v"
+            cfg_dropout_prob: float = 0.1,  # Probability of dropping conditioning during training for CFG
+            zero_terminal_snr: bool = True,  # Rescale schedule so final timestep has SNR=0
+            offset_noise_strength: float = 0.1,  # Strength of offset noise for better brightness range
+            timestep_sampling: str = "logit_normal",  # "uniform" or "logit_normal" (biased toward middle)
+            logit_normal_mean: float = 0.0,  # Mean for logit-normal sampling (0 = centered)
+            logit_normal_std: float = 1.0,  # Std for logit-normal sampling (lower = more peaked)
     ):
         super().__init__()
+
+        self.cfg_dropout_prob = cfg_dropout_prob
+        self.offset_noise_strength = offset_noise_strength
+        self.timestep_sampling = timestep_sampling
+        self.logit_normal_mean = logit_normal_mean
+        self.logit_normal_std = logit_normal_std
 
         self.config = config
 
@@ -473,6 +485,12 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer("alphas", alphas)
 
         alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+        # Apply zero terminal SNR rescaling if enabled
+        # This ensures the final timestep has SNR=0 (pure noise), fixing train/inference mismatch
+        if zero_terminal_snr:
+            alphas_cumprod = self._enforce_zero_terminal_snr(alphas_cumprod)
+
         self.register_buffer("alphas_cumprod", alphas_cumprod)
 
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
@@ -521,6 +539,31 @@ class GaussianDiffusion(nn.Module):
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
         return torch.clip(betas, 0, 0.999)
 
+    def _enforce_zero_terminal_snr(self, alphas_cumprod: torch.Tensor) -> torch.Tensor:
+        """
+        Rescale alphas_cumprod so that the final timestep has SNR=0 (pure noise).
+
+        Without this fix, standard schedules (cosine, linear) never reach SNR=0,
+        meaning during training the model never sees pure noise, but during
+        inference we start from pure noise. This mismatch causes issues with
+        generating very dark or very bright images.
+
+        Reference: "Common Diffusion Noise Schedules and Sample Steps are Flawed"
+        https://arxiv.org/abs/2305.08891
+        """
+        # Shift so last value becomes ~0 while preserving relative spacing
+        # Using sqrt rescaling to maintain signal-to-noise ratio relationships
+        alphas_cumprod_sqrt = torch.sqrt(alphas_cumprod)
+
+        # Shift so that the final value is a small epsilon (for numerical stability)
+        terminal_alpha = 1e-5
+        alphas_cumprod_sqrt = alphas_cumprod_sqrt - alphas_cumprod_sqrt[-1] + math.sqrt(terminal_alpha)
+
+        # Square back and clip for safety
+        alphas_cumprod = torch.clamp(alphas_cumprod_sqrt ** 2, min=terminal_alpha, max=1.0 - 1e-5)
+
+        return alphas_cumprod
+
     def normalize(self, x_0):
         return x_0 * 2 - 1
 
@@ -531,6 +574,30 @@ class GaussianDiffusion(nn.Module):
         b, *_ = t.shape
         out = a.gather(-1, t.long())
         return out.reshape(b, *((1,) * (len(shape) - 1))).to(t.device)
+
+    def _sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Sample timesteps for training based on the configured sampling strategy.
+
+        Args:
+            batch_size: Number of timesteps to sample
+            device: Device to create tensor on
+
+        Returns:
+            Tensor of shape (batch_size,) with timesteps in [0, num_timesteps)
+        """
+        if self.timestep_sampling == "logit_normal":
+            # Logit-normal distribution: sample from normal, apply sigmoid, scale to timesteps
+            # This biases sampling toward middle timesteps where learning signal is strongest
+            # Reference: "Scaling Rectified Flow Transformers for High-Resolution Image Synthesis"
+            u = torch.randn(batch_size, device=device) * self.logit_normal_std + self.logit_normal_mean
+            t = torch.sigmoid(u)  # Maps to (0, 1), concentrated around 0.5
+            t = (t * self.num_timesteps).long().clamp(0, self.num_timesteps - 1)
+        else:
+            # Default: uniform sampling
+            t = torch.randint(0, self.num_timesteps, (batch_size,), device=device).long()
+
+        return t
 
     def predict_start_from_noise(self, x_t: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """Predict x_0 from x_t and predicted noise (epsilon prediction)."""
@@ -569,8 +636,32 @@ class GaussianDiffusion(nn.Module):
             self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
         )
 
-    def model_predictions(self, x, t, condition=None, clip_x_start=False):
-        model_output = self.unet(x, t, condition)
+    def model_predictions(self, x, t, condition=None, clip_x_start=False, guidance_scale=1.0):
+        """
+        Get model predictions, optionally with classifier-free guidance.
+
+        Args:
+            x: Noisy input
+            t: Timesteps
+            condition: Conditioning (e.g., text embeddings)
+            clip_x_start: Whether to clip predicted x_start to [-1, 1]
+            guidance_scale: CFG scale. 1.0 = no guidance, >1.0 = stronger conditioning
+        """
+        # Apply classifier-free guidance if scale > 1 and we have conditioning
+        if guidance_scale != 1.0 and condition is not None:
+            # Run model twice: once unconditional, once conditional
+            uncond_condition = torch.zeros_like(condition)
+
+            # Unconditional prediction
+            uncond_output = self.unet(x, t, uncond_condition)
+            # Conditional prediction
+            cond_output = self.unet(x, t, condition)
+
+            # CFG interpolation: output = uncond + scale * (cond - uncond)
+            model_output = uncond_output + guidance_scale * (cond_output - uncond_output)
+        else:
+            model_output = self.unet(x, t, condition)
+
         maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_x_start else nn.Identity()
 
         if self.prediction_type == "v":
@@ -597,8 +688,8 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = self._extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, condition=None, clip_denoised=True):
-        _, x_start = self.model_predictions(x, t, condition=condition)
+    def p_mean_variance(self, x, t, condition=None, clip_denoised=True, guidance_scale=1.0):
+        _, x_start = self.model_predictions(x, t, condition=condition, guidance_scale=guidance_scale)
 
         if clip_denoised:
             x_start.clamp_(-1., 1.)
@@ -607,11 +698,11 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x: torch.Tensor, t: int, condition=None):
+    def p_sample(self, x: torch.Tensor, t: int, condition=None, guidance_scale=1.0):
         batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
 
         model_mean, variance, model_log_variance, x_start = self.p_mean_variance(
-            x = x, t = batched_times, condition=condition, clip_denoised=True
+            x = x, t = batched_times, condition=condition, clip_denoised=True, guidance_scale=guidance_scale
         )
 
         noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
@@ -621,18 +712,18 @@ class GaussianDiffusion(nn.Module):
         return pred_x0, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, x, condition=None, return_intermediate: bool=False):
+    def p_sample_loop(self, x, condition=None, return_intermediate: bool=False, guidance_scale=1.0):
         noise_preds = []
         x_start_preds = []
         for time_step in reversed(range(0, self.num_timesteps)):
-            x, x_start = self.p_sample(x, time_step, condition=condition)
+            x, x_start = self.p_sample(x, time_step, condition=condition, guidance_scale=guidance_scale)
             if return_intermediate:
                 noise_preds.append(x)
                 x_start_preds.append(x_start)
-        return x, noise_preds, x_start_preds if return_intermediate else x
+        return (x, noise_preds, x_start_preds) if return_intermediate else x
 
     @torch.no_grad()
-    def ddim_sample_loop(self, x, condition=None, return_intermediate=False, override_sampling_steps=None):
+    def ddim_sample_loop(self, x, condition=None, return_intermediate=False, override_sampling_steps=None, guidance_scale=1.0):
         sampling_timesteps = override_sampling_steps if override_sampling_steps is not None else self.sampling_timesteps
 
         times = torch.linspace(-1, self.num_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -647,7 +738,7 @@ class GaussianDiffusion(nn.Module):
         x_start = None
         for time, time_next in time_pairs:
             time_cond = torch.full((x.shape[0],), time, device=x.device, dtype = torch.long)
-            pred_noise, x_start = self.model_predictions(img, time_cond, condition=condition, clip_x_start=True)
+            pred_noise, x_start = self.model_predictions(img, time_cond, condition=condition, clip_x_start=True, guidance_scale=guidance_scale)
 
             if time_next < 0:
                 img = x_start
@@ -664,23 +755,193 @@ class GaussianDiffusion(nn.Module):
             img = x_start * alpha_next.sqrt() + \
                   c * pred_noise + \
                   sigma * noise
-            
+
             if return_intermediate:
                 noise_preds.append(img)
                 x_start_preds.append(x_start)
 
-        return img, noise_preds, x_start_preds if return_intermediate else img
+        return (img, noise_preds, x_start_preds) if return_intermediate else img
+
+    def _get_sigmas_from_alphas_cumprod(self) -> torch.Tensor:
+        """Convert alphas_cumprod to sigmas for DPM-Solver."""
+        return torch.sqrt((1 - self.alphas_cumprod) / self.alphas_cumprod)
+
+    def _get_lambdas_from_alphas_cumprod(self) -> torch.Tensor:
+        """Get log-SNR (lambda) values from alphas_cumprod."""
+        # lambda = log(alpha / sigma) = log(alpha / sqrt(1 - alpha^2))
+        # = 0.5 * log(alpha^2 / (1 - alpha^2)) = 0.5 * log(alpha_cumprod / (1 - alpha_cumprod))
+        return 0.5 * torch.log(self.alphas_cumprod / (1 - self.alphas_cumprod))
 
     @torch.no_grad()
-    def sample(self, device, batch_size: int, condition: Optional[torch.Tensor]=None, return_intermediate: bool=False, override_ddim_sampling_steps: Optional[int]=None, generator=None, **kwargs) -> torch.Tensor:
+    def dpm_solver_pp_sample_loop(
+        self,
+        x,
+        condition=None,
+        return_intermediate=False,
+        override_sampling_steps=None,
+        guidance_scale=1.0,
+        order=2,  # 1, 2, or 3
+    ):
+        """
+        DPM-Solver++ sampler for fast high-quality sampling.
+
+        Reference: "DPM-Solver++: Fast Solver for Guided Sampling of Diffusion Probabilistic Models"
+        https://arxiv.org/abs/2211.01095
+
+        Args:
+            x: Initial noise tensor (used for shape/device reference)
+            condition: Conditioning tensor
+            return_intermediate: Whether to return intermediate steps
+            override_sampling_steps: Number of sampling steps (default: self.sampling_timesteps)
+            guidance_scale: CFG guidance scale
+            order: Solver order (1=Euler, 2=second-order, 3=third-order). 2 is recommended.
+
+        Returns:
+            Denoised sample, optionally with intermediate predictions
+        """
+        sampling_timesteps = override_sampling_steps if override_sampling_steps is not None else self.sampling_timesteps
+        device = x.device
+
+        # Create timestep schedule (uniformly spaced in timestep space)
+        timesteps = torch.linspace(self.num_timesteps - 1, 0, sampling_timesteps + 1, device=device)
+        timesteps = timesteps.long()
+
+        # Get alpha and sigma values for the schedule (standard parameterization)
+        # alpha_t = sqrt(alpha_cumprod), sigma_t = sqrt(1 - alpha_cumprod)
+        alphas = torch.sqrt(self.alphas_cumprod[timesteps])
+        sigmas = torch.sqrt(1 - self.alphas_cumprod[timesteps])
+
+        # Initialize with noise
+        img = torch.randn_like(x, device=device)
+
+        noise_preds = []
+        x_start_preds = []
+
+        # For multistep methods, store previous model outputs (x_0 predictions)
+        model_outputs = []
+
+        for i in range(sampling_timesteps):
+            t_curr = timesteps[i]
+            t_next = timesteps[i + 1]
+
+            # Get current alpha/sigma
+            alpha_curr = alphas[i]
+            alpha_next = alphas[i + 1]
+            sigma_curr = sigmas[i]
+            sigma_next = sigmas[i + 1]
+
+            # Lambda (log-SNR) values: lambda = log(alpha/sigma)
+            lambda_curr = torch.log(alpha_curr / sigma_curr)
+            lambda_next = torch.log(alpha_next / sigma_next)
+            h = lambda_next - lambda_curr  # Step size in lambda space
+
+            # Get model prediction at current timestep
+            t_cond = torch.full((x.shape[0],), t_curr.item(), device=device, dtype=torch.long)
+            pred_noise, x_start = self.model_predictions(
+                img, t_cond, condition=condition, clip_x_start=True, guidance_scale=guidance_scale
+            )
+
+            # Store x_0 prediction for multistep
+            model_outputs.append(x_start)
+            if len(model_outputs) > order:
+                model_outputs.pop(0)
+
+            if return_intermediate:
+                noise_preds.append(img.clone())
+                x_start_preds.append(x_start)
+
+            # DPM-Solver++ update (data prediction formulation)
+            if order == 1 or len(model_outputs) == 1:
+                # First-order update: x_{t-1} = (sigma_{t-1}/sigma_t) * x_t + alpha_{t-1} * (1 - sigma_{t-1}/sigma_t) * x_0
+                # Simplified using exponential: ratio = sigma_next/sigma_curr = exp(lambda_curr - lambda_next) = exp(-h)
+                img = (sigma_next / sigma_curr) * img + alpha_next * (1 - sigma_next / sigma_curr) * x_start
+
+            elif order == 2 and len(model_outputs) >= 2:
+                # Second-order multistep (DPM-Solver++-2M)
+                x_start_prev = model_outputs[-2]
+
+                # Get previous lambda for ratio calculation
+                if i > 0:
+                    alpha_prev = alphas[i - 1]
+                    sigma_prev = sigmas[i - 1]
+                    lambda_prev = torch.log(alpha_prev / sigma_prev)
+                    h_prev = lambda_curr - lambda_prev
+                    r = h_prev / h if h != 0 else 1.0
+                else:
+                    r = 1.0
+
+                # Second-order correction term
+                D0 = x_start
+                D1 = (1 / (2 * r)) * (x_start - x_start_prev) if r != 0 else torch.zeros_like(x_start)
+
+                # Update
+                ratio = sigma_next / sigma_curr
+                img = ratio * img + alpha_next * (1 - ratio) * D0 + alpha_next * (1 - ratio) * D1
+
+            elif order == 3 and len(model_outputs) >= 3:
+                # Third-order - fall back to second order for simplicity
+                # Full third-order is complex and rarely needed
+                x_start_prev = model_outputs[-2]
+
+                if i > 0:
+                    alpha_prev = alphas[i - 1]
+                    sigma_prev = sigmas[i - 1]
+                    lambda_prev = torch.log(alpha_prev / sigma_prev)
+                    h_prev = lambda_curr - lambda_prev
+                    r = h_prev / h if h != 0 else 1.0
+                else:
+                    r = 1.0
+
+                D0 = x_start
+                D1 = (1 / (2 * r)) * (x_start - x_start_prev) if r != 0 else torch.zeros_like(x_start)
+
+                ratio = sigma_next / sigma_curr
+                img = ratio * img + alpha_next * (1 - ratio) * D0 + alpha_next * (1 - ratio) * D1
+
+            else:
+                # Fallback to first-order
+                img = (sigma_next / sigma_curr) * img + alpha_next * (1 - sigma_next / sigma_curr) * x_start
+
+        # img should now be close to x_0
+        return (img, noise_preds, x_start_preds) if return_intermediate else img
+
+    @torch.no_grad()
+    def sample(self, device, batch_size: int, condition: Optional[torch.Tensor]=None, return_intermediate: bool=False, override_sampling_steps: Optional[int]=None, generator=None, guidance_scale: float=1.0, sampler: str="dpm_solver_pp", dpm_solver_order: int=2, **kwargs) -> torch.Tensor:
+        """
+        Sample from the diffusion model.
+
+        Args:
+            device: Device to run on
+            batch_size: Number of samples to generate
+            condition: Conditioning tensor (e.g., text embeddings)
+            return_intermediate: If True, return intermediate denoising steps
+            override_sampling_steps: Override default sampling steps
+            generator: Optional random generator for reproducibility
+            guidance_scale: Classifier-free guidance scale. 1.0 = no guidance, >1.0 = stronger conditioning.
+                           Typical values are 3.0-15.0 for text-to-image.
+            sampler: Sampling algorithm. Options:
+                - "dpm_solver_pp": DPM-Solver++ (recommended, fast and high quality)
+                - "ddim": DDIM sampler
+                - "ddpm": Full DDPM sampler (slow, uses all timesteps)
+            dpm_solver_order: Order for DPM-Solver++ (1, 2, or 3). 2 is recommended.
+        """
         image_size = kwargs.get('image_size', self.config.image_size)
 
         x = torch.randn(batch_size, self.in_channels, image_size, image_size, device=device, generator=generator)
 
-        if self.is_ddim_sampling or override_ddim_sampling_steps is not None:
-            x = self.ddim_sample_loop(x, condition=condition, return_intermediate=return_intermediate, override_sampling_steps=override_ddim_sampling_steps)
+        sampling_steps = override_sampling_steps if override_sampling_steps is not None else self.sampling_timesteps
+
+        if sampler == "dpm_solver_pp":
+            x = self.dpm_solver_pp_sample_loop(
+                x, condition=condition, return_intermediate=return_intermediate,
+                override_sampling_steps=sampling_steps, guidance_scale=guidance_scale,
+                order=dpm_solver_order
+            )
+        elif sampler == "ddim" or (self.is_ddim_sampling and sampler != "ddpm"):
+            x = self.ddim_sample_loop(x, condition=condition, return_intermediate=return_intermediate, override_sampling_steps=sampling_steps, guidance_scale=guidance_scale)
         else:
-            x = self.p_sample_loop(x, condition=condition, return_intermediate=return_intermediate)
+            # ddpm - full sampling
+            x = self.p_sample_loop(x, condition=condition, return_intermediate=return_intermediate, guidance_scale=guidance_scale)
 
         if return_intermediate:
             img, noise_preds, x_start_preds = x
@@ -709,7 +970,26 @@ class GaussianDiffusion(nn.Module):
         if noise is None:
             noise = torch.randn_like(x_start)
 
+        # Offset noise: add constant noise across spatial dimensions to help model
+        # learn to generate images with varying overall brightness/darkness
+        # Reference: https://www.crosslabs.org/blog/diffusion-with-offset-noise
+        if self.offset_noise_strength > 0 and self.training:
+            # noise shape is [B, C, H, W] for images or [B, C, H, W] for audio
+            # We add noise that's constant across H, W dimensions
+            offset_noise = torch.randn(x_start.shape[0], x_start.shape[1], 1, 1, device=x_start.device)
+            noise = noise + self.offset_noise_strength * offset_noise
+
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+
+        # CFG: randomly drop conditioning during training
+        if condition is not None and self.cfg_dropout_prob > 0 and self.training:
+            # Create mask for which samples in batch should have conditioning dropped
+            batch_size = x_start.shape[0]
+            dropout_mask = torch.rand(batch_size, device=x_start.device) < self.cfg_dropout_prob
+            # Zero out conditioning for selected samples
+            # condition shape is typically [B, T, D] for text embeddings
+            condition = condition.clone()
+            condition[dropout_mask] = 0.0
 
         model_output = self.unet(x_noisy, t, condition)
 
@@ -747,7 +1027,7 @@ class GaussianDiffusion(nn.Module):
                 *_, c, h, w = condition.shape
                 condition = condition.view(-1, c, h, w)
 
-        t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device= x_0.device).long()
+        t = self._sample_timesteps(x_0.shape[0], x_0.device)
 
         if self.is_normalize:
             x_0 = self.normalize(x_0)
