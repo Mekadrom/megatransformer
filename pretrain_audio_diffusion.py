@@ -1,6 +1,27 @@
 import os
 
+os.environ["DEEPSPEED_UNIT_TEST"] = "1"
+os.environ["NCCL_DEBUG"] = "INFO"
+os.environ["NCCL_IB_DISABLE"] = "1"
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ['NCCL_TIMEOUT'] = '1200000'
+
+import numpy as np
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
 import torchaudio
+
+from contextlib import nullcontext
+from typing import Any, Mapping, Optional, Union
+
+from speechbrain.inference.speaker import EncoderClassifier
+from torch.amp import autocast
+from torch.utils.tensorboard import SummaryWriter
+from transformers import TrainingArguments, Trainer, TrainerCallback, T5EncoderModel, T5Tokenizer
+from transformers.integrations import TensorBoardCallback
 
 from dataset_loading.audio_diffusion_dataset import CachedAudioDiffusionDataset, AudioDiffusionDataCollator
 from model.audio.shared_window_buffer import SharedWindowBuffer
@@ -8,29 +29,7 @@ from model.audio.diffusion import AudioConditionalGaussianDiffusion, model_confi
 from model.audio.vocoders.vocoders import model_config_lookup as vocoder_config_lookup
 from model.audio.vae import model_config_lookup as audio_vae_config_lookup
 from model.ema import EMAModel
-
-os.environ["DEEPSPEED_UNIT_TEST"] = "1"
-os.environ["NCCL_DEBUG"] = "INFO"
-os.environ["NCCL_IB_DISABLE"] = "1"
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ['NCCL_TIMEOUT'] = '1200000'
-
-from speechbrain.inference.speaker import EncoderClassifier
-from torch.amp import autocast
-from torch.utils.tensorboard import SummaryWriter
-from transformers import TrainingArguments, Trainer, TrainerCallback, T5EncoderModel, T5Tokenizer
-from transformers.integrations import TensorBoardCallback
-from contextlib import nullcontext
-from typing import Any, Mapping, Optional, Union
-
-
-import librosa
-import librosa.display
-import matplotlib.pyplot as plt
-import megatransformer_utils
-import numpy as np
-import torch
-import torch.nn as nn
+from utils import megatransformer_utils
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -139,7 +138,7 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
         audio_n_fft: int = 1024,
         audio_hop_length: int = 256,
         audio_max_frames: int = 1875,
-        ddim_sampling_steps: int = 50,
+        ddim_sampling_steps: int = 20,  # 20 steps is sufficient for DPM-Solver++
         vocoder_checkpoint_path: Optional[str] = None,
         ema: Optional[EMAModel] = None,
         use_latent_diffusion: bool = False,

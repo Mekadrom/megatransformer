@@ -3,7 +3,10 @@
     "allow": [
       "WebSearch",
       "Bash(pip show:*)",
-      "Bash(python count_model_params.py:*)"
+      "Bash(python3:*)",
+      "Bash(grep:*)",
+      "Bash(tree:*)",
+      "Bash(cat:*)"
     ],
     "deny": [],
     "ask": []

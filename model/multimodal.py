@@ -1,14 +1,57 @@
-from torch import nn
-from transformers import GenerationMixin, PreTrainedModel, PreTrainedTokenizer, GPT2LMHeadModel, GPT2Config
-
-from model import megatransformer_audio_decoder, megatransformer_recurrent, megatransformer_audio_encoder, megatransformer_diffusion, megatransformer_image_encoder, megatransformer_image_decoder, megatransformer_modules, megatransformer_text_encoder, norms
-
-import megatransformer_utils
+from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from model.audio.diffusion import AudioConditionalGaussianDiffusion, AudioDiffusionCrossAttentionBlock, AudioDiffusionSelfAttentionBlock
-from model.audio.feature_extractors import AudioFeatureExtractor
+from torch import nn
+from transformers import GenerationMixin, PreTrainedModel, PreTrainedTokenizer
+
+from . import kv_cache, recurrent, SimpleBlock, text
+from utils import configuration, megatransformer_utils
+
+
+class MultimodalGenerationOutput:
+    """Output class for multimodal generation results."""
+    def __init__(self, sequences=None, audio_outputs=None, audio_mel_specs=None, image_outputs=None, intermediate_image_outputs=None):
+        self.sequences = sequences
+        self.audio_outputs = audio_outputs
+        self.audio_mel_specs = audio_mel_specs
+        self.image_outputs = image_outputs
+        self.intermediate_image_outputs = intermediate_image_outputs
+
+
+class MegaTransformerMultimodalOutput(dict):
+    def __init__(self,
+        loss: Optional[torch.Tensor]=None,
+        logits: Optional[torch.Tensor]=None,
+        image_raw_outputs: Optional[torch.Tensor]=None,
+        audio_raw_outputs: Optional[torch.Tensor]=None,
+        past_key_values: Optional[list[kv_cache.KVCache]]=None,
+        hidden_states: Optional[list]=None,
+        attentions: Optional[list]=None,
+        n_steps_no_grad: Optional[int]=None,
+        k_steps_grad: Optional[int]=None,
+    ):
+        self.loss = loss
+        self.logits = logits
+        self.image_raw_outputs = image_raw_outputs
+        self.audio_raw_outputs = audio_raw_outputs
+        self.past_key_values = past_key_values
+        self.hidden_states = hidden_states
+        self.attentions = attentions
+        self.n_steps_no_grad = n_steps_no_grad
+        self.k_steps_grad = k_steps_grad
+
+        super().__init__(
+            loss=loss,
+            logits=logits,
+            image_raw_outputs=image_raw_outputs,
+            audio_raw_outputs=audio_raw_outputs,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            attentions=attentions,
+            n_steps_no_grad=n_steps_no_grad,
+            k_steps_grad=k_steps_grad,
+        )
 
 
 class MegaTransformerMultimodalEncoder(nn.Module):
@@ -21,11 +64,11 @@ class MegaTransformerMultimodalEncoder(nn.Module):
         self.image_embedding = image_embedding
 
     def forward(self,
-                text_input_ids=None,
-                audio_raw_inputs=None,
-                image_raw_inputs=None,
-                text_past_key_values=None,
-                audio_waveform_labels=None,
+                text_input_ids: Optional[torch.Tensor]=None,
+                audio_raw_inputs: Optional[torch.Tensor]=None,
+                image_raw_inputs: Optional[torch.Tensor]=None,
+                text_past_key_values: Optional[torch.Tensor]=None,
+                audio_waveform_labels: Optional[torch.Tensor]=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if text_input_ids is None:
             text_prelude_outputs = None
@@ -163,17 +206,17 @@ class MegaTransformerMultimodalEncoder(nn.Module):
         return text_prelude_outputs, audio_prelude_outputs, image_prelude_outputs
 
 class MegaTransformerMultimodalDecoder(nn.Module):
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig, text_decoder, audio_decoder, image_decoder):
+    def __init__(self, config: configuration.MegaTransformerConfig, text_decoder, audio_decoder, image_decoder):
         super().__init__()
         self.config = config
 
-        self.text_coda = megatransformer_modules.SimpleBlock(config.text_coda_config, "text_coda", config.text_coda_config.n_coda_layers, config.hidden_dropout_prob)
+        self.text_coda = SimpleBlock(config.text_coda_config, "text_coda", config.text_coda_config.n_coda_layers, config.hidden_dropout_prob)
         self.text_decoder = text_decoder
 
-        self.audio_coda = megatransformer_modules.SimpleBlock(config.audio_coda_config, "audio_coda", config.audio_coda_config.n_coda_layers, config.audio_decoder_dropout)
+        self.audio_coda = SimpleBlock(config.audio_coda_config, "audio_coda", config.audio_coda_config.n_coda_layers, config.audio_decoder_dropout)
         self.audio_decoder = audio_decoder
 
-        self.image_coda = megatransformer_modules.SimpleBlock(config.image_coda_config, "image_coda", config.image_coda_config.n_coda_layers, config.image_decoder_dropout)
+        self.image_coda = SimpleBlock(config.image_coda_config, "image_coda", config.image_coda_config.n_coda_layers, config.image_decoder_dropout)
         self.image_decoder = image_decoder
 
     def audio_coda_forward(self, audio_hidden_states, audio_mel_spec_labels=None, audio_waveform_labels=None):
@@ -203,12 +246,12 @@ class MegaTransformerMultimodalDecoder(nn.Module):
         return self.image_coda(image_hidden_states)[0], image_labels
 
     def forward(self,
-                text_hidden_states=None,
-                image_hidden_states=None,
-                audio_hidden_states=None,
-                audio_mel_spec_labels=None,
-                audio_waveform_labels=None,
-                image_labels=None):
+                text_hidden_states: Optional[torch.Tensor]=None,
+                image_hidden_states: Optional[torch.Tensor]=None,
+                audio_hidden_states: Optional[torch.Tensor]=None,
+                audio_mel_spec_labels: Optional[torch.Tensor]=None,
+                audio_waveform_labels: Optional[torch.Tensor]=None,
+                image_labels: Optional[torch.Tensor]=None):
         if text_hidden_states is None:
             text_logits = None
         else:
@@ -261,10 +304,10 @@ class MegaTransformerMultimodalDecoder(nn.Module):
         return text_logits, mel_spec_reconstructions, audio_waveforms, audio_reconstruction_loss, image_outputs, image_reconstruction_loss
 
 class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
-    config_class = megatransformer_utils.MegaTransformerConfig
+    config_class = configuration.MegaTransformerConfig
     
     def __init__(self,
-                 config: megatransformer_utils.MegaTransformerConfig,
+                 config: configuration.MegaTransformerConfig,
                  text_embedding, audio_embedding, image_embedding,
                  world_model,
                  text_decoder, audio_decoder, image_decoder):
@@ -298,11 +341,11 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         self.output_transform.text_decoder = new_embeddings
 
     def interleave_batch_aligned_embeds(self,
-                                        text_input_ids,
-                                        audio_raw_inputs,
-                                        image_raw_inputs,
-                                        text_past_key_values=None,
-                                        audio_waveform_labels=None):
+                                        text_input_ids: torch.Tensor,
+                                        audio_raw_inputs: torch.Tensor,
+                                        image_raw_inputs: torch.Tensor,
+                                        text_past_key_values: Optional[torch.Tensor]=None,
+                                        audio_waveform_labels: Optional[torch.Tensor]=None):
         """
         Interleaves text, audio, and image embeddings based on special tokens in the text sequence.
         
@@ -341,10 +384,6 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         if image_prelude_outputs is not None:
             image_embeds = image_prelude_outputs[0] if isinstance(image_prelude_outputs, tuple) else image_prelude_outputs
 
-        # megatransformer_utils.print_debug_tensor('text_embeds', text_embeds)
-        # megatransformer_utils.print_debug_tensor('audio_embeds', audio_embeds)
-        # megatransformer_utils.print_debug_tensor('image_embeds', image_embeds)
-
         # Get batch size and device
         batch_size = text_input_ids.shape[0]
         device = text_input_ids.device
@@ -369,9 +408,6 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
             begin_audio_pos = begin_audio_mask.nonzero(as_tuple=True)[0]
             begin_image_pos = (batch_ids == self.config.begin_image_token_id).nonzero(as_tuple=True)[0]
 
-            # print(f"Batch {b}: Begin audio positions: {begin_audio_pos}")
-            # print(f"Batch {b}: Begin image positions: {begin_image_pos}")
-            
             segments = []
             current_pos = 0
             
@@ -405,11 +441,9 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
                     image_idx += 1
                 special_positions.append(tuple(special_position))
 
-            # print(f"Batch {b}: Special positions: {special_positions}")
-
             new_pos = 0
             # iterate over only valid special positions
-            for i, (idx, begin_pos, modal_type) in enumerate(special_positions):
+            for idx, begin_pos, modal_type in special_positions:
                 # Add text up to begin token
                 if begin_pos > current_pos:
                     text_segment = batch_embeds[current_pos:begin_pos]
@@ -459,15 +493,12 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
             
             # Add any remaining text
             if current_pos < batch_embeds.shape[0]:
-                # print(f"adding remaining text: {current_pos} to {batch_embeds.shape[0]}")
                 text_segment = batch_embeds[current_pos:]
                 segments.append(text_segment)
             
             total_length = 0
-            for s, segment in enumerate(segments):
+            for segment in segments:
                 total_length += segment.shape[0]
-
-            # print(f"Batch {b}: Total length of segments: {total_length}")
 
             # Concatenate all segments
             if segments:
@@ -644,8 +675,6 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         # Stack the hidden states for text
         text_hidden_states = torch.stack(text_hidden_states, dim=0)
 
-        # print(f"audio_hidden_states: {audio_hidden_states.shape}, image_hidden_states: {image_hidden_states.shape}, text_hidden_states: {text_hidden_states.shape}")
-        
         return text_hidden_states, audio_hidden_states, image_hidden_states
     
     def forward(
@@ -1160,69 +1189,6 @@ class MegaTransformerCausalWMHeads(PreTrainedModel, GenerationMixin):
         return inputs
 
 
-def make_audio_decoder(config: megatransformer_utils.MegaTransformerConfig):
-    return AudioConditionalGaussianDiffusion(
-        config=config,  # for vocoder to grab its details from
-        activation=config.audio_decoder_activation,
-        scale_factor=(2, 1),
-        stride=(2, 1),
-        self_attn_class=AudioDiffusionSelfAttentionBlock,
-        cross_attn_class=AudioDiffusionCrossAttentionBlock,
-        norm_class=norms.RMSNorm,
-        in_channels=1,
-        model_channels=config.audio_decoder_model_channels,
-        out_channels=1,
-        time_embedding_dim=config.audio_decoder_time_embedding_dim,
-        num_res_blocks=config.audio_decoder_num_res_blocks,
-        has_condition=True,
-        unet_dropout_p=config.audio_decoder_unet_dropout_p,
-        betas_schedule=config.audio_decoder_betas_schedule,
-        down_block_self_attn_n_heads=config.audio_decoder_down_block_self_attn_n_heads,
-        down_block_self_attn_d_queries=config.audio_decoder_down_block_self_attn_d_queries,
-        down_block_self_attn_d_values=config.audio_decoder_down_block_self_attn_d_values,
-        down_block_self_attn_use_flash_attention=config.audio_decoder_down_block_self_attn_use_flash_attention,
-        up_block_self_attn_n_heads=config.audio_decoder_up_block_self_attn_n_heads,
-        up_block_self_attn_d_queries=config.audio_decoder_up_block_self_attn_d_queries,
-        up_block_self_attn_d_values=config.audio_decoder_up_block_self_attn_d_values,
-        up_block_self_attn_use_flash_attention=config.audio_decoder_up_block_self_attn_use_flash_attention,
-        cross_attn_n_heads=config.audio_decoder_cross_attn_n_heads,
-        cross_attn_d_queries=config.audio_decoder_cross_attn_d_queries,
-        cross_attn_d_values=config.audio_decoder_cross_attn_d_values,
-        cross_attn_use_flash_attention=config.audio_decoder_cross_attn_use_flash_attention,
-    )
-
-def make_image_decoder(config):
-    return megatransformer_diffusion.GaussianDiffusion(
-        config=config,
-        hidden_size=config.hidden_size,
-        activation=config.image_decoder_activation,
-        scale_factor=(2, 2),
-        stride=(2, 2),
-        self_attn_class=megatransformer_image_decoder.ImageSelfAttentionBlock,
-        cross_attn_class=megatransformer_image_decoder.ImageCrossAttentionBlock,
-        norm_class=megatransformer_image_decoder.ImageRMSNorm,
-        in_channels=3,
-        model_channels=config.image_decoder_model_channels,
-        out_channels=3,
-        time_embedding_dim=config.image_decoder_time_embedding_dim,
-        num_res_blocks=config.image_decoder_num_res_blocks,
-        has_condition=True,
-        unet_dropout_p=config.image_decoder_unet_dropout_p,
-        betas_schedule=config.image_decoder_betas_schedule,
-        down_block_self_attn_n_heads=config.image_decoder_down_block_self_attn_n_heads,
-        down_block_self_attn_d_queries=config.image_decoder_down_block_self_attn_d_queries,
-        down_block_self_attn_d_values=config.image_decoder_down_block_self_attn_d_values,
-        down_block_self_attn_use_flash_attention=config.image_decoder_down_block_self_attn_use_flash_attention,
-        up_block_self_attn_n_heads=config.image_decoder_up_block_self_attn_n_heads,
-        up_block_self_attn_d_queries=config.image_decoder_up_block_self_attn_d_queries,
-        up_block_self_attn_d_values=config.image_decoder_up_block_self_attn_d_values,
-        up_block_self_attn_use_flash_attention=config.image_decoder_up_block_self_attn_use_flash_attention,
-        cross_attn_n_heads=config.image_decoder_cross_attn_n_heads,
-        cross_attn_d_queries=config.image_decoder_cross_attn_d_queries,
-        cross_attn_d_values=config.image_decoder_cross_attn_d_values,
-        cross_attn_use_flash_attention=config.image_decoder_cross_attn_use_flash_attention,
-    )
-
 def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     tokenizer.add_special_tokens({
         "additional_special_tokens": [
@@ -1245,7 +1211,7 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
     print(begin_audio_token_id, end_audio_token_id, begin_image_token_id, end_image_token_id, begin_voice_token_id, end_voice_token_id)
 
     # uses a recurrent approach to emulate a deeper model (~317M params)
-    config = megatransformer_utils.MegaTransformerConfig(
+    config = configuration.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size + 6,
         max_position_embeddings=max_position_embeddings,
         hidden_size=256,
@@ -1295,7 +1261,7 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
         image_decoder_cross_attn_d_values=32,
     )
 
-    config.text_prelude_config = megatransformer_utils.MegaTransformerConfig(
+    config.text_prelude_config = configuration.MegaTransformerConfig(
         hidden_size=config.hidden_size,
         n_prelude_layers=2,
         d_queries=32,
@@ -1305,7 +1271,7 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
         intermediate_size=config.intermediate_size,
         use_cache=False,
     )
-    config.audio_prelude_config = megatransformer_utils.MegaTransformerConfig(
+    config.audio_prelude_config = configuration.MegaTransformerConfig(
         hidden_size=config.hidden_size,
         n_prelude_layers=2,
         d_queries=32,
@@ -1315,7 +1281,7 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
         intermediate_size=config.intermediate_size,
         use_cache=False,
     )
-    config.image_prelude_config = megatransformer_utils.MegaTransformerConfig(
+    config.image_prelude_config = configuration.MegaTransformerConfig(
         hidden_size=config.hidden_size,
         n_prelude_layers=3,
         d_queries=64,
@@ -1328,33 +1294,34 @@ def create_small_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_e
         use_cache=False,
     )
 
-    config.text_coda_config = megatransformer_utils.MegaTransformerConfig(
+    config.text_coda_config = configuration.MegaTransformerConfig(
         hidden_size=config.hidden_size,
         n_coda_layers=3,
         intermediate_size=config.intermediate_size,
         use_cache=False,
     )
-    config.audio_coda_config = megatransformer_utils.MegaTransformerConfig(
+    config.audio_coda_config = configuration.MegaTransformerConfig(
         hidden_size=config.hidden_size,
         n_coda_layers=3,
         intermediate_size=config.intermediate_size,
         use_cache=False,
     )
-    config.image_coda_config = megatransformer_utils.MegaTransformerConfig(
+    config.image_coda_config = configuration.MegaTransformerConfig(
         hidden_size=config.hidden_size,
         n_coda_layers=3,
         intermediate_size=config.intermediate_size,
         use_cache=False,
     )
 
-    text_embedding = megatransformer_text_encoder.TextFeatureExtractor(config)
-    audio_embedding = AudioFeatureExtractor(config)
-    image_embedding = megatransformer_image_encoder.ImageViTFeatureExtractor(config)
-    world_model = megatransformer_recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
+    text_embedding = text.feature_extractors.TextFeatureExtractor(config)
+    audio_embedding = None  # TODO: create from config, load from checkpoint path
+    image_embedding = None  # TODO: create from config, load from checkpoint path
+    world_model = recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
     text_decoder = nn.Linear(config.hidden_size, config.vocab_size)
-    audio_decoder = make_audio_decoder(config)
-    image_decoder = make_image_decoder(config)
+    audio_decoder = None  # TODO: create from config, load from checkpoint path
+    image_decoder = None  # TODO: create from config, load from checkpoint path
     return MegaTransformerCausalWMHeads(config, text_embedding, audio_embedding, image_embedding, world_model, text_decoder, audio_decoder, image_decoder)
+
 
 def create_medium_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     tokenizer.add_special_tokens({
@@ -1378,7 +1345,7 @@ def create_medium_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_
     print(begin_audio_token_id, end_audio_token_id, begin_image_token_id, end_image_token_id, begin_voice_token_id, end_voice_token_id)
 
     # uses a recurrent approach to emulate a deeper model (~946M params)
-    config = megatransformer_utils.MegaTransformerConfig(
+    config = configuration.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size + 6,
         max_position_embeddings=max_position_embeddings,
         hidden_size=1024,
@@ -1420,14 +1387,15 @@ def create_medium_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_
     config.audio_coda_config = config
     config.image_coda_config = config
 
-    text_embedding = megatransformer_text_encoder.TextFeatureExtractor(config)
-    audio_embedding = megatransformer_audio_encoder.AudioFeatureExtractor(config)
-    image_embedding = megatransformer_image_encoder.ImageViTFeatureExtractor(config)
-    world_model = megatransformer_recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
+    text_embedding = text.feature_extractors.TextFeatureExtractor(config)
+    audio_embedding = None  # TODO: create from config, load from checkpoint path
+    image_embedding = None  # TODO: create from config, load from checkpoint path
+    world_model = recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
     text_decoder = nn.Linear(config.hidden_size, config.vocab_size)
-    audio_decoder = make_audio_decoder(config)
-    image_decoder = make_image_decoder(config)
+    audio_decoder = None  # TODO: create from config, load from checkpoint path
+    image_decoder = None  # TODO: create from config, load from checkpoint path
     return MegaTransformerCausalWMHeads(config, text_embedding, audio_embedding, image_embedding, world_model, text_decoder, audio_decoder, image_decoder)
+
 
 def create_normal_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     tokenizer.add_special_tokens({
@@ -1451,7 +1419,7 @@ def create_normal_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_
     print(begin_audio_token_id, end_audio_token_id, begin_image_token_id, end_image_token_id, begin_voice_token_id, end_voice_token_id)
 
     # uses a recurrent approach to emulate a deeper model (~13.4B params)
-    config = megatransformer_utils.MegaTransformerConfig(
+    config = configuration.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size + 6,
         max_position_embeddings=max_position_embeddings,
         hidden_size=5280,
@@ -1492,14 +1460,15 @@ def create_normal_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_
     config.audio_coda_config = config
     config.image_coda_config = config
 
-    text_embedding = megatransformer_text_encoder.TextFeatureExtractor(config)
-    audio_embedding = megatransformer_audio_encoder.AudioFeatureExtractor(config)
-    image_embedding = megatransformer_image_encoder.ImageViTFeatureExtractor(config)
-    world_model = megatransformer_recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
+    text_embedding = text.feature_extractors.TextFeatureExtractor(config)
+    audio_embedding = None  # TODO: create from config, load from checkpoint path
+    image_embedding = None  # TODO: create from config, load from checkpoint path
+    world_model = recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
     text_decoder = nn.Linear(config.hidden_size, config.vocab_size)
-    audio_decoder = make_audio_decoder(config)
-    image_decoder = make_image_decoder(config)
+    audio_decoder = None  # TODO: create from config, load from checkpoint path
+    image_decoder = None  # TODO: create from config, load from checkpoint path
     return MegaTransformerCausalWMHeads(config, text_embedding, audio_embedding, image_embedding, world_model, text_decoder, audio_decoder, image_decoder)
+
 
 def create_test_tiny_multimodal_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
     tokenizer.add_special_tokens({
@@ -1523,7 +1492,7 @@ def create_test_tiny_multimodal_model(tokenizer: PreTrainedTokenizer, max_positi
     print(begin_audio_token_id, end_audio_token_id, begin_image_token_id, end_image_token_id, begin_voice_token_id, end_voice_token_id)
 
     # uses a recurrent approach to emulate a deeper model (~M params)
-    config = megatransformer_utils.MegaTransformerConfig(
+    config = configuration.MegaTransformerConfig(
         vocab_size=tokenizer.vocab_size + 6,
         max_position_embeddings=max_position_embeddings,
         n_layers=None,
@@ -1592,174 +1561,28 @@ def create_test_tiny_multimodal_model(tokenizer: PreTrainedTokenizer, max_positi
     config.audio_coda_config = config
     config.image_coda_config = config
 
-    text_embedding = megatransformer_text_encoder.TextFeatureExtractor(config)
-    audio_embedding = megatransformer_audio_encoder.AudioFeatureExtractor(config)
-    image_embedding = megatransformer_image_encoder.ImageViTFeatureExtractor(config)
-    world_model = megatransformer_recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
+    text_embedding = text.feature_extractors.TextFeatureExtractor(config)
+    audio_embedding = None  # TODO: create from config, load from checkpoint path
+    image_embedding = None  # TODO: create from config, load from checkpoint path
+    world_model = recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
     text_decoder = nn.Linear(config.hidden_size, config.vocab_size)
-    audio_decoder = make_audio_decoder(config)
-    image_decoder = make_image_decoder(config)
+    audio_decoder = None  # TODO: create from config, load from checkpoint path
+    image_decoder = None  # TODO: create from config, load from checkpoint path
     return MegaTransformerCausalWMHeads(config, text_embedding, audio_embedding, image_embedding, world_model, text_decoder, audio_decoder, image_decoder)
 
-class SumEmbeddings(nn.Module):
-    def __init__(self, wte: nn.Embedding, wpe: nn.Embedding):
-        super().__init__()
-        self.wte = wte
-        self.wpe = wpe
 
-    def forward(self, input_ids: torch.Tensor, **kwargs):
-        embeddings = self.wte(input_ids)
-        position_ids = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0), -1)
-        position_embeddings = self.wpe(position_ids)
-        embeddings += position_embeddings
-        return embeddings
-
-def split_model(model: GPT2LMHeadModel, config):
-    text_encoder = SumEmbeddings(model.transformer.wte, model.transformer.wpe)
-    text_decoder = model.lm_head
-    world_model = model.transformer
-    return text_encoder, world_model, text_decoder
-
-def create_frankenstein_model(tokenizer: PreTrainedTokenizer, max_position_embeddings):
-    tokenizer.add_special_tokens({
-        "additional_special_tokens": [
-            megatransformer_utils.BEGIN_AUDIO_TOKEN,
-            megatransformer_utils.END_AUDIO_TOKEN,
-            megatransformer_utils.BEGIN_IMAGE_TOKEN,
-            megatransformer_utils.END_IMAGE_TOKEN,
-            megatransformer_utils.BEGIN_VOICE_TOKEN,
-            megatransformer_utils.END_VOICE_TOKEN,
-        ]
-    })
-
-    begin_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_AUDIO_TOKEN)
-    end_audio_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_AUDIO_TOKEN)
-    begin_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_IMAGE_TOKEN)
-    end_image_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_IMAGE_TOKEN)
-    begin_voice_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.BEGIN_VOICE_TOKEN)
-    end_voice_token_id = tokenizer.convert_tokens_to_ids(megatransformer_utils.END_VOICE_TOKEN)
-
-    print(begin_audio_token_id, end_audio_token_id, begin_image_token_id, end_image_token_id, begin_voice_token_id, end_voice_token_id)
-
-    # uses a recurrent approach to emulate a deeper model (~M params)
-    config = megatransformer_utils.MegaTransformerConfig(
-        vocab_size=tokenizer.vocab_size + 6,
-        max_position_embeddings=max_position_embeddings,
-        n_layers=None,
-        hidden_size=256,
-        d_queries=8,
-        d_values=8,
-        n_query_groups=2,
-        n_heads=2,
-        intermediate_size=64,
-        n_prelude_layers=1,
-        n_recurrent_layers=1,
-        n_coda_layers=1,
-        intermediate_activation="relu",
-        norm_type="layernorm",
-        ffn_type="mlp",
-        use_positional_embedding=False,
-        use_sinusoidal_embedding=False,
-        use_rotary_embedding=True,
-        rotary_embedding_dim=4,
-        use_alibi_bias=False,
-        use_qkv_bias=False,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-
-        begin_audio_token_id=begin_audio_token_id,
-        end_audio_token_id=end_audio_token_id,
-        begin_image_token_id=begin_image_token_id,
-        end_image_token_id=end_image_token_id,
-        begin_voice_token_id=begin_voice_token_id,
-        end_voice_token_id=end_voice_token_id,
-
-        audio_decoder_model_channels=32,
-
-        audio_decoder_down_block_self_attn_n_heads=2,
-        audio_decoder_down_block_self_attn_d_queries=16,
-        audio_decoder_down_block_self_attn_d_values=16,
-        audio_decoder_up_block_self_attn_n_heads=2,
-        audio_decoder_up_block_self_attn_d_queries=16,
-        audio_decoder_up_block_self_attn_d_values=16,
-        audio_decoder_cross_attn_n_heads=2,
-        audio_decoder_cross_attn_d_queries=16,
-        audio_decoder_cross_attn_d_values=16,
-
-        audio_vocoder_hidden_channels=16,
-        audio_vocoder_n_residual_layers=1,
-
-        image_decoder_model_channels=32,
-
-        image_decoder_down_block_self_attn_n_heads=2,
-        image_decoder_down_block_self_attn_d_queries=16,
-        image_decoder_down_block_self_attn_d_values=16,
-        image_decoder_up_block_self_attn_n_heads=2,
-        image_decoder_up_block_self_attn_d_queries=16,
-        image_decoder_up_block_self_attn_d_values=16,
-        image_decoder_cross_attn_n_heads=2,
-        image_decoder_cross_attn_d_queries=16,
-        image_decoder_cross_attn_d_values=16,
-    )
-
-    config.text_prelude_config = config
-    config.audio_prelude_config = config
-    config.image_prelude_config = config
-
-    config.text_coda_config = config
-    config.audio_coda_config = config
-    config.image_coda_config = config
-
-    gpt2_config = GPT2Config(
-        vocab_size=tokenizer.vocab_size + 6,
-        n_embd=config.hidden_size,
-        n_layer=config.n_recurrent_layers,
-        n_head=config.n_heads,
-        n_inner=config.intermediate_size,
-        activation_function=config.intermediate_activation,
-        resid_pdrop=0.0,
-        embd_pdrop=0.0,
-        attn_pdrop=0.0,
-        layer_norm_epsilon=config.norm_eps,
-        initializer_range=config.initializer_range,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id
-    )
-
-    text_embedding = megatransformer_text_encoder.TextFeatureExtractor(config)
-    # audio_embedding = megatransformer_audio_encoder.AudioFeatureExtractor(config)
-    # image_embedding = megatransformer_image_encoder.ImageViTFeatureExtractor(config)
-    world_model = megatransformer_recurrent.MegaTransformerRawEmbedsRecurrentCausalModel(config)
-    text_decoder = nn.Linear(config.hidden_size, config.vocab_size)
-    image_decoder = make_image_decoder(config)
-
-    # gpt2 = GPT2LMHeadModel(gpt2_config)
-    # text_embedding, world_model, text_decoder = split_model(gpt2, config)
-    audio_embedding = megatransformer_audio_encoder.PreTrainedAudioFeatureExtractorWrapper(config)
-    image_embedding = megatransformer_image_encoder.PreTrainedImageFeatureExtractorWrapper(config)
-    audio_decoder = megatransformer_audio_decoder.PreTrainedAudioDecoderWrapper(config)
-    image_decoder = megatransformer_image_decoder.PreTrainedImageDecoderWrapper(config)
-    return MegaTransformerCausalWMHeads(config, text_embedding, audio_embedding, image_embedding, world_model, text_decoder, audio_decoder, image_decoder)    
-
-lookup = {
+model_config_lookup = {
     "normal_multimodal": create_normal_multimodal_model,
     "medium_multimodal": create_medium_multimodal_model,
     "small_multimodal": create_small_multimodal_model,
     "test_tiny_multimodal": create_test_tiny_multimodal_model,
-    "frankenstein_multimodal": create_frankenstein_model,
 }
-
-def model_config_lookup(config):
-    if config not in lookup:
-        raise ValueError(f"Unknown model configuration: {config}")
-    return lookup[config]
 
 
 if __name__ == '__main__':
-    from transformers import AutoTokenizer
     import unittest
+
+    from transformers import AutoTokenizer
 
 
     class TestMegaTransformerMultimodalUtilityFunctions(unittest.TestCase):

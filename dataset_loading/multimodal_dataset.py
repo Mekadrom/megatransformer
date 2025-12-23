@@ -56,7 +56,7 @@ class LimitedStreamDataset(IterableDataset):
 class MultimodalDataset(IterableDataset):
     def __init__(
         self,
-        config,  # megatransformer_utils.MegaTransformerConfig,
+        config,  # configuration.MegaTransformerConfig,
         approximated_length: int,
         tokenizer: PreTrainedTokenizer,
         sample_rate: int,

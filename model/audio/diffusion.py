@@ -1,12 +1,15 @@
 import math
-import megatransformer_utils
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from einops import reduce
-from model import megatransformer_diffusion
 from typing import Optional
+
+from einops import reduce
+
+from model import diffusion
+from utils import configuration, megatransformer_utils
 
 
 class AudioDiffusionSelfAttentionBlock(nn.Module):
@@ -93,6 +96,7 @@ class AudioDiffusionSelfAttentionBlock(nn.Module):
         
         return output
 
+
 class AudioDiffusionCrossAttentionBlock(nn.Module):
     def __init__(self, hidden_size, n_heads, d_queries, d_values, context_dim=None, use_flash_attention=True, dropout_p=0.1):
         super().__init__()
@@ -112,10 +116,30 @@ class AudioDiffusionCrossAttentionBlock(nn.Module):
         self.dropout = nn.Dropout(dropout_p)
 
         self._init_weights()
+        self._init_context_projections()
 
     def _init_weights(self):
         self.apply(megatransformer_utils.transformer_weight_init())
-    
+
+    def _init_context_projections(self):
+        """
+        Properly initialize K/V projections for text conditioning.
+
+        Text embeddings (e.g., from T5) often have std ~0.2-0.3, not 1.0.
+        Standard xavier init results in very weak conditioning signal.
+
+        This ensures K/V outputs have std ≈ 1.0 for proper attention scaling.
+        """
+        assumed_input_std = 0.2  # Common for T5, CLIP embeddings
+
+        fan_in_k = self.context_dim
+        target_k_std = 1.0 / (assumed_input_std * math.sqrt(fan_in_k))
+        nn.init.normal_(self.k_proj.weight, mean=0.0, std=target_k_std)
+
+        fan_in_v = self.context_dim
+        target_v_std = 1.0 / (assumed_input_std * math.sqrt(fan_in_v))
+        nn.init.normal_(self.v_proj.weight, mean=0.0, std=target_v_std)
+
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         B, H, W, T = x.size()
         BC, N, CH = context.size()
@@ -171,7 +195,8 @@ class AudioDiffusionCrossAttentionBlock(nn.Module):
 
         return output
 
-class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffusion):
+
+class AudioConditionalGaussianDiffusion(diffusion.GaussianDiffusion):
     def __init__(self, *args, **kwargs):
         # Remove shared_window_buffer from kwargs before passing to parent
         kwargs.pop('shared_window_buffer', None)
@@ -205,23 +230,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
             condition = condition.clone()
             condition[dropout_mask] = 0.0
 
-        # NaN detection: check inputs to UNet
-        # if torch.isnan(x_noisy).any():
-        #     megatransformer_utils.print_debug_tensor("NaN detected in x_noisy", x_noisy)
-        #     megatransformer_utils.print_debug_tensor("  x_start was", x_start)
-        #     megatransformer_utils.print_debug_tensor("  noise was", noise)
-        #     print(f"  timesteps were: {t.tolist()}")
-
-        # if condition is not None and torch.isnan(condition).any():
-        #     megatransformer_utils.print_debug_tensor("NaN detected in condition", condition)
-
         model_out = self.unet(x_noisy, t, condition)
-
-        # NaN detection: check UNet output
-        # if torch.isnan(model_out).any():
-        #     megatransformer_utils.print_debug_tensor("NaN detected in model_out (UNet output)", model_out)
-        #     megatransformer_utils.print_debug_tensor("  x_noisy was", x_noisy)
-        #     print(f"  timesteps were: {t.tolist()}")
 
         if self.prediction_type == "v":
             # Model predicts v, target is v
@@ -233,17 +242,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         loss = F.mse_loss(model_out, target, reduction='none')
         loss_per_sample = reduce(loss, 'b ... -> b', 'mean')
 
-        # NaN detection: check loss
-        # if torch.isnan(loss_per_sample).any():
-        #     megatransformer_utils.print_debug_tensor("NaN detected in loss_per_sample", loss_per_sample)
-        #     megatransformer_utils.print_debug_tensor("  model_out was", model_out)
-        #     megatransformer_utils.print_debug_tensor("  target was", target)
-
         loss_weighted = loss_per_sample * self._extract(self.loss_weight, t, loss_per_sample.shape)
-
-        # if torch.isnan(loss_weighted).any():
-        #     megatransformer_utils.print_debug_tensor("NaN detected in loss_weighted", loss_weighted)
-        #     print(f"  loss_weight values: {self._extract(self.loss_weight, t, loss_per_sample.shape).tolist()}")
 
         if return_diagnostics:
             diagnostics = {
@@ -255,7 +254,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
 
         return model_out, loss_weighted.mean()
 
-    def forward(self, x_0, condition=None, return_diagnostics=False):
+    def forward(self, x_0: torch.Tensor, condition: Optional[torch.Tensor]=None, return_diagnostics: bool=False):
         """
         Forward pass for audio diffusion training.
 
@@ -300,7 +299,6 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
 
         if self.is_normalize:
             x_0 = self.normalize(x_0)
-            # megatransformer_utils.print_debug_tensor("x_0 after normalize", x_0)
             if return_diagnostics:
                 mel_stats["mel_normalized_min"] = x_0.min().item()
                 mel_stats["mel_normalized_max"] = x_0.max().item()
@@ -333,7 +331,7 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         guidance_scale: float=1.0,
         sampler: str="dpm_solver_pp",
         dpm_solver_order: int=2,
-        **kwargs
+        **_
     ) -> torch.Tensor:
         x = torch.randn(batch_size, 1, self.config.audio_n_mels, self.config.audio_max_frames, device=device, generator=generator)
 
@@ -370,96 +368,23 @@ class AudioConditionalGaussianDiffusion(megatransformer_diffusion.GaussianDiffus
         return audio
 
 
-# Pre-defined configurations
-# audio_max_duration is set to produce exactly 1875.0*256.0/16000.0 = 30.0 seconds of audio
-tiny_audio_diffusion_config = megatransformer_utils.MegaTransformerConfig(
-    hidden_size=128,
-    audio_n_mels=80,
-    audio_n_fft=1024,
-    audio_hop_length=256,
-    audio_max_duration=1875.0*256.0/16000.0,
-    audio_sample_rate=16000,
-    audio_decoder_model_channels=32,
-    audio_decoder_time_embedding_dim=32,
-    audio_decoder_num_res_blocks=2,
-
-    audio_decoder_activation="silu",
-    audio_decoder_dropout=0.1,
-
-    audio_decoder_unet_dropout_p=0.1,
-    audio_decoder_down_block_self_attn_n_heads=4,
-    audio_decoder_down_block_self_attn_d_queries=32,
-    audio_decoder_down_block_self_attn_d_values=32,
-    audio_decoder_up_block_self_attn_n_heads=4,
-    audio_decoder_up_block_self_attn_d_queries=32,
-    audio_decoder_up_block_self_attn_d_values=32,
-    audio_decoder_cross_attn_n_heads=4,
-    audio_decoder_cross_attn_d_queries=32,
-    audio_decoder_cross_attn_d_values=32,
-)
-
-small_audio_diffusion_config = megatransformer_utils.MegaTransformerConfig(
-    hidden_size=512,
-    audio_n_mels=80,
-    audio_n_fft=1024,
-    audio_hop_length=256,
-    audio_max_duration=1875.0*256.0/16000.0,
-    audio_sample_rate=16000,
-    audio_decoder_model_channels=128,
-    audio_decoder_time_embedding_dim=256,
-    audio_decoder_num_res_blocks=2,
-)
-
-medium_audio_diffusion_config = megatransformer_utils.MegaTransformerConfig(
-    hidden_size=512,
-    audio_n_mels=80,
-    audio_n_fft=1024,
-    audio_hop_length=256,
-    audio_max_duration=1875.0*256.0/16000.0,
-    audio_sample_rate=16000,
-    audio_decoder_model_channels=256,
-    audio_decoder_time_embedding_dim=512,
-    audio_decoder_num_res_blocks=3,
-)
-
-
-def create_audio_diffusion_model(
-    config: megatransformer_utils.MegaTransformerConfig,
-    num_timesteps: int = 1000,
-    sampling_timesteps: int = 50,
-    betas_schedule: str = "cosine",
-    context_dim: int = 512,
-    normalize: bool = True,
-    min_snr_loss_weight: bool = True,
-    min_snr_gamma: float = 5.0,
-    prediction_type: str = "epsilon",  # "epsilon" or "v"
-    cfg_dropout_prob: float = 0.1,  # Default 10% dropout for CFG training
-    zero_terminal_snr: bool = True,  # Recommended for audio generation
-    offset_noise_strength: float = 0.0,  # Less common for audio, default off
-    timestep_sampling: str = "logit_normal",  # "uniform" or "logit_normal"
-    logit_normal_mean: float = 0.0,  # Mean for logit-normal (0 = centered on middle timesteps)
-    logit_normal_std: float = 1.0,  # Std for logit-normal (lower = more peaked)
-) -> AudioConditionalGaussianDiffusion:
-    """Create an audio diffusion model from config."""
-    model = AudioConditionalGaussianDiffusion(
-
-        config=config,
+def create_unet(config: configuration.MegaTransformerConfig, context_dim: Optional[int] = None):
+    return diffusion.ConvDenoisingUNet(
         activation=config.audio_decoder_activation if hasattr(config, 'audio_decoder_activation') else "silu",
-        scale_factor=2,
         stride=(2, 2),
         self_attn_class=AudioDiffusionSelfAttentionBlock,
         cross_attn_class=AudioDiffusionCrossAttentionBlock,
         norm_class=nn.LayerNorm,
-        in_channels=1,  # Single channel mel spectrogram
+        in_channels=1,
         model_channels=config.audio_decoder_model_channels,
         out_channels=1,
+        channel_multipliers=config.audio_decoder_model_channels,
         time_embedding_dim=config.audio_decoder_time_embedding_dim,
+        attention_levels=config.audio_decoder_attention_levels,
         num_res_blocks=config.audio_decoder_num_res_blocks,
-        unet_dropout_p=config.audio_decoder_unet_dropout_p if hasattr(config, 'audio_decoder_unet_dropout_p') else 0.1,
-        num_timesteps=num_timesteps,
-        betas_schedule=betas_schedule,
         has_condition=True,
-        context_dim=context_dim,  # T5-small embedding dimension
+        context_dim=context_dim,
+        dropout_p=config.audio_decoder_unet_dropout_p,
         down_block_self_attn_n_heads=config.audio_decoder_down_block_self_attn_n_heads,
         down_block_self_attn_d_queries=config.audio_decoder_down_block_self_attn_d_queries,
         down_block_self_attn_d_values=config.audio_decoder_down_block_self_attn_d_values,
@@ -472,6 +397,54 @@ def create_audio_diffusion_model(
         cross_attn_d_queries=config.audio_decoder_cross_attn_d_queries,
         cross_attn_d_values=config.audio_decoder_cross_attn_d_values,
         cross_attn_use_flash_attention=config.audio_decoder_cross_attn_use_flash_attention,
+    )
+
+
+small_config = configuration.MegaTransformerConfig(
+    hidden_size=192,
+    audio_decoder_model_channels=80,
+    audio_decoder_time_embedding_dim=192,
+    audio_decoder_attention_levels=[False, True, True],
+    audio_decoder_num_res_blocks=2,
+    audio_decoder_down_block_self_attn_n_heads=4,
+    audio_decoder_down_block_self_attn_d_queries=48,
+    audio_decoder_down_block_self_attn_d_values=48,
+    audio_decoder_down_block_self_attn_use_flash_attention=True,
+    audio_decoder_up_block_self_attn_n_heads=4,
+    audio_decoder_up_block_self_attn_d_queries=48,
+    audio_decoder_up_block_self_attn_d_values=48,
+    audio_decoder_up_block_self_attn_use_flash_attention=True,
+    audio_decoder_cross_attn_n_heads=4,
+    audio_decoder_cross_attn_d_queries=48,
+    audio_decoder_cross_attn_d_values=48,
+    audio_decoder_cross_attn_use_flash_attention=True,
+    audio_decoder_channel_multipliers=[1, 2, 3],  # Gradual growth
+)
+
+
+def create_diffusion_model(
+    config: configuration.MegaTransformerConfig,
+    context_dim: int = 512,
+    num_timesteps: int = 1000,
+    sampling_timesteps: int = 50,
+    betas_schedule: str = "cosine",
+    normalize: bool = True,
+    min_snr_loss_weight: bool = True,
+    min_snr_gamma: float = 5.0,
+    prediction_type: str = "epsilon",  # "epsilon" or "v"
+    cfg_dropout_prob: float = 0.1,  # Default 10% dropout for CFG training
+    zero_terminal_snr: bool = True,  # Recommended for audio generation
+    offset_noise_strength: float = 0.0,  # Less common for audio, default off
+    timestep_sampling: str = "logit_normal",  # "uniform" or "logit_normal"
+    logit_normal_mean: float = 0.0,  # Mean for logit-normal (0 = centered on middle timesteps)
+    logit_normal_std: float = 1.0,  # Std for logit-normal (lower = more peaked)
+) -> AudioConditionalGaussianDiffusion:
+    return AudioConditionalGaussianDiffusion(
+        config,
+        create_unet(config, context_dim),
+        1,  # Single channel mel spectrogram
+        num_timesteps=num_timesteps,
+        betas_schedule=betas_schedule,
         min_snr_loss_weight=min_snr_loss_weight,
         min_snr_gamma=min_snr_gamma,
         normalize=normalize,
@@ -485,25 +458,10 @@ def create_audio_diffusion_model(
         logit_normal_std=logit_normal_std,
     )
 
-    return model
-
 
 model_config_lookup = {
-    "tiny_audio_diffusion": lambda **kwargs: create_audio_diffusion_model(
-        config=tiny_audio_diffusion_config,
+    "small": lambda **kwargs: create_diffusion_model(
+        config=small_config,
         **kwargs
-    ),
-    "small_audio_diffusion": lambda **kwargs: create_audio_diffusion_model(
-        config=small_audio_diffusion_config,
-        **kwargs
-    ),
-    "medium_audio_diffusion": lambda **kwargs: create_audio_diffusion_model(
-        config=medium_audio_diffusion_config,
-        **kwargs
-    ),
-    "tiny_v_audio_diffusion": lambda **kwargs: create_audio_diffusion_model(
-        config=tiny_audio_diffusion_config,
-        prediction_type="v",
-        **kwargs
-    ),
+    )
 }

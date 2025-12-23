@@ -1,13 +1,25 @@
-from rotary_embedding_torch import RotaryEmbedding
-from torch import nn
-from typing import Union
-
-from model import activations
-
 import math
-import megatransformer_utils
+
 import torch
 import torch.nn.functional as F
+
+from typing import Union
+
+from rotary_embedding_torch import RotaryEmbedding
+from torch import nn
+
+from . import activations, get_activation_type, kv_cache
+from utils import configuration
+
+
+def create_alibi_bias(n_heads, maxlen):
+    slopes = torch.pow(2, -torch.arange(1, n_heads + 1) * 8 / n_heads)
+    # Create position differences matrix
+    pos = torch.arange(maxlen)
+    diff = pos.unsqueeze(-1) - pos.unsqueeze(-2)  # [seq_len, seq_len]
+    # Calculate bias for each head
+    bias = -torch.abs(diff).unsqueeze(0) * slopes.unsqueeze(-1).unsqueeze(-1)
+    return bias  # [n_heads, seq_len, seq_len]
 
 
 class MegaTransformerSelfAttentionOutput:
@@ -20,7 +32,7 @@ class MegaTransformerSelfAttentionOutput:
         return ['hidden_states', 'attention_probs']
 
 class MegaTransformerSelfAttention(nn.Module):
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
+    def __init__(self, config: configuration.MegaTransformerConfig):
         super().__init__()
         self.n_heads = config.n_heads
         self.hidden_size = config.hidden_size
@@ -37,7 +49,7 @@ class MegaTransformerSelfAttention(nn.Module):
 
         self.heads_activation = None
         if config.heads_activation is not None:
-            activation_type = megatransformer_utils.get_activation_type(config.heads_activation)
+            activation_type = get_activation_type(config.heads_activation)
             if activation_type == activations.SwiGLU:
                 self.heads_activation = activations.SwiGLU(config.d_values)
             else:
@@ -48,7 +60,7 @@ class MegaTransformerSelfAttention(nn.Module):
             self.rotary_embedding = RotaryEmbedding(dim=config.rotary_embedding_dim, learned_freq=config.rotary_embedding_learnable)
 
         if bool(config.use_alibi_bias):
-            self.register_buffer('alibi_bias', megatransformer_utils.create_alibi_bias(n_heads=config.n_heads, maxlen=config.max_position_embeddings))
+            self.register_buffer('alibi_bias', create_alibi_bias(n_heads=config.n_heads, maxlen=config.max_position_embeddings))
         else:
             self.register_buffer('alibi_bias', None)
         
@@ -69,11 +81,11 @@ class MegaTransformerSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor=None,
         head_mask: torch.Tensor=None,
-        past_key_values: megatransformer_utils.KVCache=None,
+        past_key_values: kv_cache.KVCache=None,
         use_cache=False,
         output_attentions: bool=False,
         return_dict: bool=False,
-    ) -> Union[tuple[torch.Tensor, megatransformer_utils.KVCache, torch.Tensor], MegaTransformerSelfAttentionOutput]:
+    ) -> Union[tuple[torch.Tensor, kv_cache.KVCache, torch.Tensor], MegaTransformerSelfAttentionOutput]:
         N, _ = hidden_states.shape[:2]
 
         queries = self.q_proj(hidden_states)
@@ -104,7 +116,7 @@ class MegaTransformerSelfAttention(nn.Module):
 
         if use_cache and not self.training:
             if past_key_values is None:
-                past_key_values = megatransformer_utils.KVCache()
+                past_key_values = kv_cache.KVCache()
             past_key_values.update(key=keys_to_cache, value=values_to_cache)
 
         attention_scores = torch.matmul(queries, keys.transpose(-1, -2))

@@ -1,14 +1,34 @@
+
+import torch
+import torch.nn as nn
+
 from collections import deque
-from torch import nn
-from transformers import Trainer
-from transformers.integrations import TensorBoardCallback
 from typing import Optional, Literal
 
-from dataset_loading import image_loading
-from model import megatransformer_image_decoder
+from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
+from transformers import Trainer, TrainerCallback
+from transformers.integrations import TensorBoardCallback
 
-import megatransformer_utils
-import torch
+from dataset_loading import image_loading
+from utils.megatransformer_utils import sanitize_model
+
+
+def get_writer(trainer: Trainer):
+    for callback in trainer.callback_handler.callbacks:
+        if isinstance(callback, TensorBoardCallback):
+            if callback.tb_writer is not None:
+                return callback.tb_writer
+    return None
+
+
+class EarlyStoppingCallback(TrainerCallback):
+    def __init__(self, stop_step: int):
+        self.stop_step = stop_step
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if self.stop_step > 0 and state.global_step >= self.stop_step:
+            print(f"Early stopping at step {state.global_step} as per stop_step={self.stop_step}.")
+            control.should_training_stop = True
 
 
 class GrokFastMATrainer(Trainer):
@@ -119,7 +139,7 @@ class DefaultTrainer(Trainer):
         # inputs["output_hidden_states"] = True
         # inputs["return_dict"] = False
 
-        sanitized_model = megatransformer_utils.sanitize_model(model)
+        sanitized_model = sanitize_model(model)
 
         for name, param in sanitized_model.named_parameters():
             if param.dtype == torch.long or param.dtype == torch.int64:
@@ -144,7 +164,7 @@ class DefaultTrainer(Trainer):
                     if stacked_losses.ndim == 2 and stacked_losses.shape[1] == 5:
                         self.optional_log_loss(f"{prefix}recon_loss", stacked_losses[:, 0].mean(dim=0).item(), self.state.global_step)
                         self.optional_log_loss(f"{prefix}ssim_loss", stacked_losses[:, 1].mean(dim=0).item(), self.state.global_step)
-                        self.optional_log_loss(f"{prefix}kl_loss", stacked_losses[:, 2].mean(dim=0).item(), self.state.global_step)
+                        self.optional_log_loss(f"{prefix}kl_divergence", stacked_losses[:, 2].mean(dim=0).item(), self.state.global_step)
                         self.optional_log_loss(f"{prefix}mu_loss", stacked_losses[:, 3].mean(dim=0).item(), self.state.global_step)
                         self.optional_log_loss(f"{prefix}logvar_loss", stacked_losses[:, 4].mean(dim=0).item(), self.state.global_step)
                     if stacked_losses.ndim == 1 and stacked_losses.shape[0] == 6:
@@ -157,7 +177,7 @@ class DefaultTrainer(Trainer):
                         self.optional_log_loss(f"{prefix}image_mse_loss", stacked_losses[5].mean(dim=0).item(), self.state.global_step)
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
                 for i, hidden_state in enumerate(outputs.hidden_states):
-                    token_correlation = megatransformer_utils.get_token_correlation(hidden_state)
+                    token_correlation = get_token_correlation(hidden_state)
                     self.writer.add_scalar(f"{prefix}token_correlation_{i}", token_correlation, self.state.global_step)
         
         actual_loss = (
@@ -190,6 +210,7 @@ class DefaultTrainer(Trainer):
             print("Warning: No TensorBoard writer found. Please check your callback setup.")
             self.writer = None
 
+
 def trainer_lookup(argparser_args, trainer_name, default=DefaultTrainer):
     if trainer_name == "grokfast_ema":
         return lambda *args, **kwargs: GrokfastEMATrainer(
@@ -210,3 +231,65 @@ def trainer_lookup(argparser_args, trainer_name, default=DefaultTrainer):
     elif trainer_name == "debug":
         return DebugTrainer
     return default
+
+
+def setup_int8_training(args, model):
+    # Method 1: Using PEFT with Bits and Bytes quantization
+    if args.use_int8_peft:
+        print("Setting up INT8 training with PEFT/LoRA")
+        
+        model = prepare_model_for_kbit_training(model, args.use_gradient_checkpointing)
+        
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=["query", "key", "value", "dense"],
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+        
+        return model
+    
+    # Method 2: Using DeepSpeed ZeroQuant (configured in ds_config.json)
+    elif args.use_int8_deepspeed:
+        print("Using DeepSpeed for INT8 quantization during training")
+        return model
+    # No INT8 training
+    else:
+        return model
+
+
+def get_token_correlation(hidden_states):
+    x_c = hidden_states - hidden_states.mean(dim=1, keepdim=True)
+
+    normed_x = x_c / x_c.norm(dim=-1, keepdim=True)
+
+    token_correlation = (normed_x @ normed_x.transpose(1, 2)).mean() - (1 / hidden_states.shape[1])
+
+    return token_correlation
+
+
+def create_multimodal_optimizer(model, weight_decay):
+    audio_decoder_params = set(model.output_transform.audio_decoder.parameters())
+    vocoder_params = set(model.output_transform.audio_decoder.vocoder.parameters())
+
+    # Get parameters unique to audio_decoder (excluding vocoder)
+    audio_decoder_only_params = [p for p in audio_decoder_params if p not in vocoder_params]
+
+    # Create AdamW optimizer with these groups
+    optimizer = torch.optim.AdamW([
+        {'params': model.input_transform.parameters(), 'lr': 1e-4},
+        {'params': model.world_model.parameters(), 'lr': 5e-5},
+        {'params': model.output_transform.text_coda.parameters(), 'lr': 1e-4},
+        {'params': model.output_transform.text_decoder.parameters(), 'lr': 2e-4},
+        {'params': model.output_transform.audio_coda.parameters(), 'lr': 1e-4},
+        {'params': audio_decoder_only_params, 'lr': 2e-5},
+        {'params': model.output_transform.audio_decoder.vocoder.parameters(), 'lr': 3e-5},
+        {'params': model.output_transform.image_coda.parameters(), 'lr': 1e-4},
+        {'params': model.output_transform.image_decoder.parameters(), 'lr': 2e-5},
+    ], weight_decay=weight_decay)
+    return optimizer

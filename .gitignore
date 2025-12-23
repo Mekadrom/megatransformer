@@ -138,7 +138,6 @@ runs.bak.bak.bak/
 .gradio/
 inference/generated/
 checkpoints/
-image_cache/
 
 logs/
 

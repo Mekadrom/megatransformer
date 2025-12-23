@@ -1,7 +1,6 @@
 import torch.nn as nn
-import megatransformer_utils
 
-from model import activations
+from model import activations, get_activation_type
 from model.vae import VAE
 
 
@@ -17,7 +16,7 @@ class AudioVAEEncoder(nn.Module):
     ):
         super().__init__()
 
-        activation_type = megatransformer_utils.get_activation_type(activation_fn)
+        activation_type = get_activation_type(activation_fn)
         if activation_type not in [activations.SwiGLU, activations.Snake]:
             activation = lambda _: activation_type()  # drop unused arg
         else:
@@ -56,14 +55,11 @@ class AudioVAEEncoder(nn.Module):
         nn.init.zeros_(self.fc_logvar.bias)
 
     def forward(self, x):
-        # megatransformer_utils.print_debug_tensor("AudioVAEEncoder input", x)
         for upsample in self.channel_upsample:
             x = upsample(x)
 
         mu = self.fc_mu(x)
         logvar = self.fc_logvar(x)
-        # megatransformer_utils.print_debug_tensor("AudioVAEEncoder mu", mu)
-        # megatransformer_utils.print_debug_tensor("AudioVAEEncoder logvar", logvar)
 
         return mu, logvar
 
@@ -79,13 +75,12 @@ class AudioVAEDecoder(nn.Module):
             activation_fn: str = "silu",
             speaker_embedding_dim: int = 0,  # 0 = no speaker conditioning
             normalize_speaker_embedding: bool = True,  # L2 normalize speaker embeddings before FiLM
-            debug_film: bool = False,  # Enable debug printing for FiLM
             film_scale_bound: float = 0.5,  # Max absolute value for FiLM scale (0 = unbounded)
             film_shift_bound: float = 0.5,  # Max absolute value for FiLM shift (0 = unbounded)
         ):
         super().__init__()
 
-        activation_type = megatransformer_utils.get_activation_type(activation_fn)
+        activation_type = get_activation_type(activation_fn)
         if activation_type not in [activations.SwiGLU, activations.Snake]:
             activation = lambda _: activation_type()  # drop unused arg
         else:
@@ -94,7 +89,6 @@ class AudioVAEDecoder(nn.Module):
         channels = [latent_channels] + intermediate_channels
         self.speaker_embedding_dim = speaker_embedding_dim
         self.normalize_speaker_embedding = normalize_speaker_embedding
-        self.debug_film = debug_film
         self.film_scale_bound = film_scale_bound
         self.film_shift_bound = film_shift_bound
 
@@ -169,24 +163,17 @@ class AudioVAEDecoder(nn.Module):
         Returns:
             Reconstructed output [B, out_channels, H', W']
         """
-        # megatransformer_utils.print_debug_tensor("AudioVAEDecoder input", z)
-
         # Process speaker embedding if provided
         if speaker_embedding is not None and self.speaker_embedding_dim > 0:
             # Handle shape: [B, 1, dim] -> [B, dim]
             if speaker_embedding.dim() == 3:
                 speaker_embedding = speaker_embedding.squeeze(1)
 
-            if self.debug_film:
-                megatransformer_utils.print_debug_tensor("speaker_embedding (raw)", speaker_embedding)
-
             # L2 normalize speaker embeddings for more stable FiLM conditioning
             # ECAPA-TDNN embeddings can have varying magnitudes (typically L2 norm ~5-15)
             # Normalizing ensures consistent conditioning strength across samples
             if self.normalize_speaker_embedding:
                 speaker_embedding = nn.functional.normalize(speaker_embedding, p=2, dim=-1)
-                if self.debug_film:
-                    megatransformer_utils.print_debug_tensor("speaker_embedding (normalized)", speaker_embedding)
 
         for i, upsample in enumerate(self.channel_upsample):
             z_pre_film = upsample(z)
@@ -207,27 +194,16 @@ class AudioVAEDecoder(nn.Module):
                 if self.film_shift_bound > 0:
                     shift = self.film_shift_bound * nn.functional.tanh(shift)
 
-                if self.debug_film:
-                    megatransformer_utils.print_debug_tensor(f"FiLM layer {i} scale (bounded)", scale)
-                    megatransformer_utils.print_debug_tensor(f"FiLM layer {i} shift (bounded)", shift)
-                    megatransformer_utils.print_debug_tensor(f"z pre-FiLM layer {i}", z_pre_film)
-
                 z = z_pre_film * (1 + scale) + shift  # FiLM: y = gamma * x + beta
-
-                if self.debug_film:
-                    megatransformer_utils.print_debug_tensor(f"z post-FiLM layer {i}", z)
             else:
                 z = z_pre_film
 
-            # megatransformer_utils.print_debug_tensor(f"AudioVAEDecoder after layer {i}", z)
-
         recon_x = self.final_conv(z)
-        # megatransformer_utils.print_debug_tensor("AudioVAEDecoder output", recon_x)
         return recon_x
 
 
 model_config_lookup = {
-    "tiny": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, debug_film=False, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
+    "tiny": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
@@ -245,13 +221,12 @@ model_config_lookup = {
             activation_fn="silu",
             speaker_embedding_dim=speaker_embedding_dim,
             normalize_speaker_embedding=normalize_speaker_embedding,
-            debug_film=debug_film,
             film_scale_bound=film_scale_bound,
             film_shift_bound=film_shift_bound,
         ),
         **kwargs
     ),
-    "mini": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, debug_film=False, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
+    "mini": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
@@ -269,13 +244,12 @@ model_config_lookup = {
             activation_fn="silu",
             speaker_embedding_dim=speaker_embedding_dim,
             normalize_speaker_embedding=normalize_speaker_embedding,
-            debug_film=debug_film,
             film_scale_bound=film_scale_bound,
             film_shift_bound=film_shift_bound,
         ),
         **kwargs
     ),
-    "mini_deep": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, debug_film=False, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
+    "mini_deep": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
@@ -293,7 +267,6 @@ model_config_lookup = {
             activation_fn="silu",
             speaker_embedding_dim=speaker_embedding_dim,
             normalize_speaker_embedding=normalize_speaker_embedding,
-            debug_film=debug_film,
             film_scale_bound=film_scale_bound,
             film_shift_bound=film_shift_bound,
         ),
@@ -305,7 +278,7 @@ model_config_lookup = {
     #   Latent: [8, 10, 25] = 2,000 elements
     #   Compression: 150,000 / 2,000 = 75x
     # Use 12 channels for ~50x, 16 channels for ~37x
-    "small": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, debug_film=False, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
+    "small": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
@@ -323,14 +296,13 @@ model_config_lookup = {
             activation_fn="silu",
             speaker_embedding_dim=speaker_embedding_dim,
             normalize_speaker_embedding=normalize_speaker_embedding,
-            debug_film=debug_film,
             film_scale_bound=film_scale_bound,
             film_shift_bound=film_shift_bound,
         ),
         **kwargs
     ),
     # Higher capacity version for better reconstruction at high compression
-    "small_wide": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, debug_film=False, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
+    "small_wide": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
@@ -348,7 +320,6 @@ model_config_lookup = {
             activation_fn="silu",
             speaker_embedding_dim=speaker_embedding_dim,
             normalize_speaker_embedding=normalize_speaker_embedding,
-            debug_film=debug_film,
             film_scale_bound=film_scale_bound,
             film_shift_bound=film_shift_bound,
         ),

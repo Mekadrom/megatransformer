@@ -1,9 +1,11 @@
 import math
-from model import activations, megatransformer_attn, megatransformer_modules
-import megatransformer_utils
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from model import activations, attention, get_activation_type, SimpleBlock
+from utils import configuration
 
 
 class AudioConv(nn.Module):
@@ -11,7 +13,7 @@ class AudioConv(nn.Module):
         super().__init__()
         self.conv_layers = nn.ModuleList()
 
-        activation_type = megatransformer_utils.get_activation_type(activation)
+        activation_type = get_activation_type(activation)
 
         channels = [input_channels] + [base_channels * (2**i) for i in range(len(kernel_sizes))]
         for i in range(len(kernel_sizes)):
@@ -43,7 +45,7 @@ class AudioConv(nn.Module):
         return features
 
 class AudioFeatureExtractor(nn.Module):
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
+    def __init__(self, config: configuration.MegaTransformerConfig):
         super().__init__()
         self.config = config
 
@@ -62,7 +64,7 @@ class AudioFeatureExtractor(nn.Module):
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        self.prelude = megatransformer_modules.SimpleBlock(
+        self.prelude = SimpleBlock(
             config.audio_prelude_config, "audio_prelude", config.audio_prelude_config.n_prelude_layers, config.hidden_dropout_prob
         )
 
@@ -110,7 +112,7 @@ class ImprovedAudioFeatureExtractor(nn.Module):
     Inspired by Conformer and AST architectures.
     """
     
-    def __init__(self, config: megatransformer_utils.MegaTransformerConfig):
+    def __init__(self, config: configuration.MegaTransformerConfig):
         super().__init__()
         self.config = config
         
@@ -240,7 +242,7 @@ class ConformerBlock(nn.Module):
         # Multi-head self-attention
         self.attn_norm = nn.LayerNorm(hidden_size)
         self.attn = nn.MultiheadAttention(hidden_size, num_heads=8, dropout=dropout, batch_first=True)
-        self.attn = megatransformer_attn.MegaTransformerSelfAttention()
+        self.attn = attention.MegaTransformerSelfAttention()
         self.attn_dropout = nn.Dropout(dropout)
         
         # Depthwise separable convolution (local context)

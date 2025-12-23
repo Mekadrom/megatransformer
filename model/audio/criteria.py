@@ -2,12 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-import megatransformer_utils
 
-from model.audio import configurable_mel_spectrogram
 from typing import Optional
 
+from model.audio import configurable_mel_spectrogram
 from model.audio.shared_window_buffer import SharedWindowBuffer
+from utils import configuration
 
 
 # Multi-Resolution STFT Loss for better vocoder training
@@ -189,7 +189,7 @@ class StableMelSpectrogramLoss(nn.Module):
 
 
 class PhaseLoss(nn.Module):
-    def __init__(self, shared_window_buffer: SharedWindowBuffer, config: megatransformer_utils.MegaTransformerConfig):
+    def __init__(self, shared_window_buffer: SharedWindowBuffer, config: configuration.MegaTransformerConfig):
         super().__init__()
         self.n_fft = config.audio_n_fft
         self.hop_length = config.audio_hop_length

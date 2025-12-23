@@ -217,7 +217,162 @@ class DiscriminatorBlock(nn.Module):
         return (x + skip) / (2 ** 0.5)
 
 
+# =============================================================================
+# Regularization utilities
+# =============================================================================
+
+def add_instance_noise(
+    images: torch.Tensor,
+    std: float = 0.1,
+) -> torch.Tensor:
+    """
+    Add instance noise to images for discriminator regularization.
+
+    This prevents the discriminator from finding shortcuts based on artifacts
+    (blur, color shifts) and forces it to learn actual image structure.
+
+    Args:
+        images: [B, C, H, W] image tensor
+        std: Standard deviation of Gaussian noise (decay over training)
+
+    Returns:
+        Noisy images
+    """
+    if std <= 0:
+        return images
+    return images + std * torch.randn_like(images)
+
+
+def r1_gradient_penalty(
+    real_images: torch.Tensor,
+    discriminator: nn.Module,
+) -> torch.Tensor:
+    """
+    R1 gradient penalty (Mescheder et al., 2018).
+
+    Penalizes the gradient norm on real images, encouraging the discriminator
+    to have flat responses around real data. This stabilizes training and
+    prevents the discriminator from focusing only on detecting fake artifacts.
+
+    Args:
+        real_images: [B, C, H, W] real image tensor (will enable gradients)
+        discriminator: The discriminator module
+
+    Returns:
+        R1 penalty (scalar tensor)
+    """
+    real_images = real_images.detach().requires_grad_(True)
+
+    real_outputs, _ = discriminator(real_images)
+
+    # Handle multi-scale discriminators
+    if isinstance(real_outputs, list):
+        real_outputs = sum(r.sum() for r in real_outputs)
+    else:
+        real_outputs = real_outputs.sum()
+
+    # Compute gradients
+    grads = torch.autograd.grad(
+        outputs=real_outputs,
+        inputs=real_images,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    # R1 = E[||∇D(x)||²]
+    penalty = grads.pow(2).reshape(grads.size(0), -1).sum(1).mean()
+
+    return penalty
+
+
+def r2_gradient_penalty(
+    fake_images: torch.Tensor,
+    discriminator: nn.Module,
+) -> torch.Tensor:
+    """
+    R2 gradient penalty - same as R1 but on fake images.
+
+    Less commonly used than R1, but can help if generator is unstable.
+
+    Args:
+        fake_images: [B, C, H, W] fake image tensor (will enable gradients)
+        discriminator: The discriminator module
+
+    Returns:
+        R2 penalty (scalar tensor)
+    """
+    fake_images = fake_images.detach().requires_grad_(True)
+
+    fake_outputs, _ = discriminator(fake_images)
+
+    if isinstance(fake_outputs, list):
+        fake_outputs = sum(f.sum() for f in fake_outputs)
+    else:
+        fake_outputs = fake_outputs.sum()
+
+    grads = torch.autograd.grad(
+        outputs=fake_outputs,
+        inputs=fake_images,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    penalty = grads.pow(2).reshape(grads.size(0), -1).sum(1).mean()
+
+    return penalty
+
+
+class InstanceNoiseScheduler:
+    """
+    Scheduler for decaying instance noise over training.
+
+    Starts with high noise to prevent shortcut learning, then decays
+    to let the discriminator learn finer details.
+
+    Usage:
+        noise_scheduler = InstanceNoiseScheduler(initial_std=0.2, decay_steps=50000)
+        for step in range(num_steps):
+            noise_std = noise_scheduler.get_std(step)
+            real_noisy = add_instance_noise(real, noise_std)
+            fake_noisy = add_instance_noise(fake, noise_std)
+    """
+    def __init__(
+        self,
+        initial_std: float = 0.2,
+        final_std: float = 0.0,
+        decay_steps: int = 50000,
+        decay_type: str = "linear",  # "linear", "cosine", "exponential"
+    ):
+        self.initial_std = initial_std
+        self.final_std = final_std
+        self.decay_steps = decay_steps
+        self.decay_type = decay_type
+
+    def get_std(self, step: int) -> float:
+        if step >= self.decay_steps:
+            return self.final_std
+
+        progress = step / self.decay_steps
+
+        if self.decay_type == "linear":
+            return self.initial_std + (self.final_std - self.initial_std) * progress
+        elif self.decay_type == "cosine":
+            import math
+            return self.final_std + 0.5 * (self.initial_std - self.final_std) * (1 + math.cos(math.pi * progress))
+        elif self.decay_type == "exponential":
+            import math
+            # Exponential decay: std = initial * exp(-5 * progress)
+            # Factor of 5 means ~1% of initial at end
+            return self.final_std + (self.initial_std - self.final_std) * math.exp(-5 * progress)
+        else:
+            return self.initial_std
+
+
+# =============================================================================
 # Loss functions
+# =============================================================================
 
 def discriminator_loss(
     disc_real_outputs: list[torch.Tensor],
@@ -281,8 +436,8 @@ def compute_discriminator_loss(
         loss_dict: Dictionary with individual loss components
     """
     # Get discriminator outputs
-    real_outputs, real_features = discriminator(real_images)
-    fake_outputs, fake_features = discriminator(fake_images.detach())
+    real_outputs, _real_features = discriminator(real_images)
+    fake_outputs, _fake_features = discriminator(fake_images.detach())
 
     # Handle both single and multi-scale discriminators
     if not isinstance(real_outputs, list):
@@ -342,7 +497,7 @@ def compute_generator_gan_loss(
     # Feature matching loss (optional)
     if feature_matching_weight > 0:
         with torch.no_grad():
-            real_outputs, real_features = discriminator(real_images)
+            _real_outputs, real_features = discriminator(real_images)
             # Check if this is a multi-scale discriminator (list of lists) or single (list of tensors)
             if not isinstance(real_features[0], list):
                 real_features = [real_features]
@@ -388,12 +543,49 @@ def mini_multi_scale_discriminator() -> MultiScalePatchDiscriminator:
 
 
 def small_patch_discriminator() -> PatchDiscriminator:
-    """Small PatchGAN discriminator (~2.8M params)."""
+    """Small PatchGAN discriminator (~663K params)."""
     return PatchDiscriminator(
         in_channels=3,
         base_channels=64,
         n_layers=3,
         use_spectral_norm=True,
+    )
+
+
+def small_multi_scale_discriminator() -> MultiScalePatchDiscriminator:
+    """
+    Small multi-scale discriminator (~782K params).
+
+    Designed to match ~771K VAE (e.g., 'small' image VAE config).
+    Uses 3 scales to capture fine details, mid-level features, and global structure.
+    """
+    return MultiScalePatchDiscriminator(
+        in_channels=3,
+        base_channels=40,
+        n_layers=3,
+        n_scales=3,
+        use_spectral_norm=True,
+    )
+
+
+def small_multi_scale_discriminator_no_sn() -> MultiScalePatchDiscriminator:
+    """
+    Small multi-scale discriminator WITHOUT spectral norm (~782K params).
+
+    Use this when:
+    - Discriminator outputs are stuck near zero
+    - Using R1 gradient penalty (R1 provides regularization, so SN is redundant)
+    - Training with instance noise
+
+    Without spectral norm, the discriminator has more expressive capacity but
+    may require R1 penalty or other regularization for stability.
+    """
+    return MultiScalePatchDiscriminator(
+        in_channels=3,
+        base_channels=40,
+        n_layers=3,
+        n_scales=3,
+        use_spectral_norm=False,
     )
 
 
@@ -430,11 +622,21 @@ def stylegan_discriminator(image_size: int = 256) -> StyleGANDiscriminator:
 
 
 model_config_lookup = {
+    # ~50K params
     "tiny_patch": tiny_patch_discriminator,
+    # ~100K params
     "tiny_multi_scale": tiny_multi_scale_discriminator,
+    # ~168K params
     "mini_patch": mini_patch_discriminator,
+    # ~335K params
     "mini_multi_scale": mini_multi_scale_discriminator,
+    # ~663K params
     "small_patch": small_patch_discriminator,
+    # ~782K params - matches 'small' image VAE (~771K)
+    "small_multi_scale": small_multi_scale_discriminator,
+    # ~782K params - NO spectral norm (use with R1 penalty)
+    "small_multi_scale_no_sn": small_multi_scale_discriminator_no_sn,
+    # ~2.8M params
     "multi_scale": multi_scale_discriminator,
     "stylegan": stylegan_discriminator,
 }

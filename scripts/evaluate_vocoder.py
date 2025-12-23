@@ -17,14 +17,13 @@ Usage:
         --eval_dataset_path ./cached_datasets/librispeech_val_cached \
         --num_samples 100
 """
-
 import argparse
-import os
-import megatransformer_utils
-from dataclasses import dataclass
-
 import numpy as np
+import os
+
 import torch
+
+from dataclasses import dataclass
 from scipy import signal
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -33,6 +32,7 @@ from dataset_loading import audio_loading
 from dataset_loading.vocoder_dataset import CachedVocoderDataset, VocoderDataCollator
 from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders import vocoders
+from utils.model_loading_utils import load_model
 
 
 @dataclass
@@ -626,7 +626,7 @@ def main():
         high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
         direct_mag_loss_weight=direct_mag_loss_weight,
     )
-    model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+    model, model_loaded = load_model(False, model, run_dir)
 
     model.eval()
     model.to(args.device)

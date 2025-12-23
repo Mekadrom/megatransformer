@@ -6,23 +6,24 @@ os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ['NCCL_TIMEOUT'] = '1200000'
 
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+
+from contextlib import nullcontext
+from typing import Any, Mapping, Optional, Union
+
 from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments, Trainer, TrainerCallback, T5EncoderModel, T5Tokenizer
 from transformers.integrations import TensorBoardCallback
-from contextlib import nullcontext
-from typing import Any, Mapping, Optional, Union
 
 from dataset_loading.image_diffusion_dataset import CachedImageDiffusionDataset, ImageDiffusionDataCollator
+from model.ema import EMAModel
 from model.image.diffusion import ImageConditionalGaussianDiffusion, model_config_lookup
 from model.image.vae import model_config_lookup as image_vae_config_lookup
-from model.ema import EMAModel
-
-import matplotlib.pyplot as plt
-import megatransformer_utils
-import numpy as np
-import torch
-import torch.nn as nn
+from utils import megatransformer_utils
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -99,6 +100,21 @@ class ImageDiffusionModelWithT5ConditioningAdapter(nn.Module):
         self.context_dim = context_dim
 
         self.condition_adapter = nn.Linear(context_dim, context_dim)
+        self._init_adapter()
+
+    def _init_adapter(self):
+        """Initialize adapter to preserve input distribution.
+
+        Default PyTorch Linear init (kaiming uniform) with 512->512 has weight std ~0.025,
+        which shrinks std=0.2 input to std=0.12 output (40% reduction).
+
+        We use xavier uniform with gain=1.0 to approximately preserve variance.
+        For a 512->512 linear: output_std ≈ input_std * weight_std * sqrt(fan_in)
+        With xavier gain=1.0: weight_std ≈ sqrt(2 / (fan_in + fan_out)) ≈ 0.044
+        Output_std ≈ 0.2 * 0.044 * 22.6 ≈ 0.2 (preserved)
+        """
+        nn.init.xavier_uniform_(self.condition_adapter.weight, gain=1.0)
+        nn.init.zeros_(self.condition_adapter.bias)
 
     def forward(self, x_0: torch.Tensor, condition: Optional[torch.Tensor] = None, return_diagnostics: bool = False):
         if condition is not None:
@@ -106,6 +122,9 @@ class ImageDiffusionModelWithT5ConditioningAdapter(nn.Module):
         return self.model(x_0=x_0, condition=condition, return_diagnostics=return_diagnostics)
 
     def sample(self, *args, **kwargs):
+        # Apply adapter to condition if provided (fixes train/inference mismatch)
+        if 'condition' in kwargs and kwargs['condition'] is not None:
+            kwargs['condition'] = self.condition_adapter(kwargs['condition'])
         return self.model.sample(*args, **kwargs)
 
 
@@ -121,19 +140,21 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
         generation_steps: int = 1000,
         image_size: int = 32,
         latent_channels: int = 4,
-        ddim_sampling_steps: int = 50,
+        sampling_timesteps: int = 50,
         ema: Optional[EMAModel] = None,
         vae: Optional[nn.Module] = None,
+        train_dataset=None,  # Reference to training dataset for in-distribution sampling
     ):
         self.trainer: Optional[Trainer] = None
         self.step_offset = step_offset if step_offset is not None else 0
         self.generation_steps = generation_steps
         self.image_size = image_size
         self.latent_channels = latent_channels
-        self.ddim_sampling_steps = ddim_sampling_steps
+        self.sampling_timesteps = sampling_timesteps
 
         self.ema = ema
         self.vae = vae
+        self.train_dataset = train_dataset
 
         # Load T5 for text conditioning
         t5_model = T5EncoderModel.from_pretrained("t5-small")
@@ -177,6 +198,10 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
             with torch.no_grad():
                 dtype = torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32
 
+                # Set model to eval mode for sampling
+                was_training = model.training
+                model.eval()
+
                 # Use EMA weights for sampling if available
                 ema_context = self.ema.apply_ema() if self.ema is not None else nullcontext()
 
@@ -188,7 +213,7 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
                             batch_size=1,
                             condition=None,
                             return_intermediate=True,
-                            override_sampling_steps=self.ddim_sampling_steps,
+                            override_sampling_steps=self.sampling_timesteps,
                             image_size=self.image_size,
                             generator=torch.Generator(device).manual_seed(42),
                             guidance_scale=7.5,
@@ -216,7 +241,7 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
                                 batch_size=1,
                                 condition=text.unsqueeze(0).to(device),
                                 return_intermediate=True,
-                                override_sampling_steps=self.ddim_sampling_steps,
+                                override_sampling_steps=self.sampling_timesteps,
                                 image_size=self.image_size,
                                 generator=torch.Generator(device).manual_seed(42),
                                 guidance_scale=7.5,
@@ -235,6 +260,70 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
                                 tag_prefix=f"example_{i}/cond_intermediate"
                             )
 
+                        # Generate from TRAINING SET samples (in-distribution)
+                        # This helps verify if the model is learning the training data
+                        if self.train_dataset is not None and len(self.train_dataset) > 0:
+                            # Sample a few fixed indices from training set for consistent visualization
+                            num_train_samples = min(3, len(self.train_dataset))
+                            train_indices = [0, len(self.train_dataset) // 2, len(self.train_dataset) - 1][:num_train_samples]
+
+                            for idx in train_indices:
+                                try:
+                                    sample = self.train_dataset[idx]
+                                    train_latent = sample["latent_mu"].unsqueeze(0).to(device)
+                                    train_condition = sample["text_embeddings"].unsqueeze(0).to(device)
+
+                                    # Log ground truth (decoded from latent)
+                                    if self.vae is not None:
+                                        gt_decoded = self.vae.decoder(train_latent)
+                                        self._log_image_visualization(
+                                            writer, gt_decoded.squeeze(0).cpu(), global_step,
+                                            tag=f"train_sample_{idx}/ground_truth"
+                                        )
+
+                                    # Generate using training sample's conditioning
+                                    result = model.sample(
+                                        device=device,
+                                        batch_size=1,
+                                        condition=train_condition,
+                                        return_intermediate=True,
+                                        override_sampling_steps=self.sampling_timesteps,
+                                        image_size=self.image_size,
+                                        generator=torch.Generator(device).manual_seed(42),
+                                        guidance_scale=7.5,
+                                        sampler="dpm_solver_pp",
+                                        dpm_solver_order=2,
+                                    )
+                                    generated_latents, noise_preds, x_start_preds = result
+
+                                    self._log_generated_images(
+                                        generated_latents, writer, global_step,
+                                        tag_prefix=f"train_sample_{idx}/generated"
+                                    )
+
+                                    # Also try with guidance
+                                    result = model.sample(
+                                        device=device,
+                                        batch_size=1,
+                                        condition=train_condition,
+                                        return_intermediate=True,
+                                        override_sampling_steps=self.sampling_timesteps,
+                                        image_size=self.image_size,
+                                        generator=torch.Generator(device).manual_seed(42),
+                                        guidance_scale=7.5,
+                                        sampler="dpm_solver_pp",
+                                        dpm_solver_order=2,
+                                    )
+                                    generated_latents, noise_preds, x_start_preds = result
+
+                                    self._log_generated_images(
+                                        generated_latents, writer, global_step,
+                                        tag_prefix=f"train_sample_{idx}/generated_cfg7.5"
+                                    )
+
+                                except Exception as e:
+                                    print(f"Error sampling from training set index {idx}: {e}")
+
                         for guidance in [1.0, 3.0, 5.0, 7.5, 10.0]:
                             # Generate with different guidance scales
                             result = model.sample(
@@ -242,7 +331,7 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
                                 batch_size=1,
                                 condition=self.text_embeddings[0:1].to(device),
                                 return_intermediate=True,
-                                override_sampling_steps=self.ddim_sampling_steps,
+                                override_sampling_steps=self.sampling_timesteps,
                                 image_size=self.image_size,
                                 generator=torch.Generator(device).manual_seed(42),
                                 guidance_scale=guidance,
@@ -260,6 +349,10 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
                                 x_start_preds, writer, global_step,
                                 tag_prefix=f"example_guidance_{guidance:.1f}/cond_intermediate"
                             )
+
+                # Restore training mode
+                if was_training:
+                    model.train()
 
     def _log_intermediate_steps(self, x_start_preds, writer, global_step, tag_prefix="image_diffusion/intermediate"):
         """Log intermediate denoising steps to TensorBoard."""
@@ -404,7 +497,7 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
 
 
 class EMAUpdateCallback(TrainerCallback):
-    """Callback to update EMA weights after each training step."""
+    """Callback to update EMA weights after each training step and save/load EMA state."""
 
     def __init__(self, ema: Optional[EMAModel] = None):
         self.ema = ema
@@ -412,6 +505,39 @@ class EMAUpdateCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if self.ema is not None:
             self.ema.update()
+
+    def on_save(self, args, state, control, **kwargs):
+        """Save EMA weights alongside model checkpoint."""
+        if self.ema is None:
+            return
+
+        # Determine checkpoint directory
+        checkpoint_folder = f"checkpoint-{state.global_step}"
+        output_dir = os.path.join(args.output_dir, checkpoint_folder)
+
+        # Save EMA state dict
+        ema_path = os.path.join(output_dir, "ema_state.pt")
+        torch.save(self.ema.state_dict(), ema_path)
+        print(f"Saved EMA state to {ema_path}")
+
+
+def load_ema_state(ema: EMAModel, checkpoint_path: str) -> bool:
+    """Load EMA state from checkpoint if available.
+
+    Args:
+        ema: The EMA model to load state into
+        checkpoint_path: Path to checkpoint directory
+
+    Returns:
+        True if EMA state was loaded, False otherwise
+    """
+    ema_path = os.path.join(checkpoint_path, "ema_state.pt")
+    if os.path.exists(ema_path):
+        state_dict = torch.load(ema_path, map_location="cpu")
+        ema.load_state_dict(state_dict)
+        print(f"Loaded EMA state from {ema_path} (step {ema.step})")
+        return True
+    return False
 
 
 class ImageDiffusionTrainer(Trainer):
@@ -552,16 +678,32 @@ def main():
     # Diffusion-specific settings
     num_timesteps = int(unk_dict.get("num_timesteps", 1000))
     sampling_timesteps = int(unk_dict.get("sampling_timesteps", 50))
-    betas_schedule = unk_dict.get("betas_schedule", "cosine")
+    betas_schedule = unk_dict.get("betas_schedule", "karras")
     context_dim = int(unk_dict.get("context_dim", 512))  # T5-small
-    normalize = unk_dict.get("normalize", "true").lower() == "true"
+    # For latent diffusion, normalize should be False since VAE latents are already ~N(0,1)
+    # The normalize function does x*2-1 which is meant for pixel images in [0,1] range
+    normalize = unk_dict.get("normalize", "false").lower() == "true"
     min_snr_loss_weight = unk_dict.get("min_snr_loss_weight", "true").lower() == "true"
     min_snr_gamma = float(unk_dict.get("min_snr_gamma", 5.0))
 
+    # SOTA diffusion improvements (can be disabled for debugging)
+    cfg_dropout_prob = float(unk_dict.get("cfg_dropout_prob", 0.1))
+    zero_terminal_snr = unk_dict.get("zero_terminal_snr", "true").lower() == "true"
+    offset_noise_strength = float(unk_dict.get("offset_noise_strength", 0.1))
+    timestep_sampling = unk_dict.get("timestep_sampling", "logit_normal")  # "uniform" or "logit_normal"
+
+    # Debug mode - enable verbose tensor statistics logging
+    debug_diffusion = unk_dict.get("debug_diffusion", "false").lower() == "true"
+    debug_start_at_step = int(unk_dict.get("debug_start_at_step", 0))
+    if debug_diffusion:
+        from model.diffusion import set_debug_mode
+        set_debug_mode(True, start_at_step=debug_start_at_step, initial_steps=5)
+
     # Dataset settings
-    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/relaion_val_diffusion_latents_gan_4_2_checkpoint-238500")
-    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/relaion_val_diffusion_latents_gan_4_2_checkpoint-238500")
+    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/relaion_train_diffusion_latents_best_0_checkpoint-314000/")
+    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/cc3m_val_diffusion_latents_best_0_checkpoint-314000")
     max_conditions = int(unk_dict.get("max_conditions", 512))
+    max_train_samples = int(unk_dict.get("max_train_samples", -1))  # -1 means use all
 
     # EMA settings
     use_ema = unk_dict.get("use_ema", "true").lower() == "true"
@@ -590,6 +732,10 @@ def main():
         normalize=normalize,
         min_snr_loss_weight=min_snr_loss_weight,
         min_snr_gamma=min_snr_gamma,
+        cfg_dropout_prob=cfg_dropout_prob,
+        zero_terminal_snr=zero_terminal_snr,
+        offset_noise_strength=offset_noise_strength,
+        timestep_sampling=timestep_sampling,
     )
 
     # Try to load existing checkpoint
@@ -613,6 +759,13 @@ def main():
         print(f"  Context dim: {context_dim}")
         print(f"  Normalize: {normalize}")
         print(f"  Min SNR loss weight: {min_snr_loss_weight}")
+        print(f"SOTA improvements:")
+        print(f"  CFG dropout prob: {cfg_dropout_prob}")
+        print(f"  Zero Terminal SNR: {zero_terminal_snr}")
+        print(f"  Offset noise strength: {offset_noise_strength}")
+        print(f"  Timestep sampling: {timestep_sampling}")
+        print(f"Debug settings:")
+        print(f"  Debug diffusion: {debug_diffusion}")
         print(f"Latent diffusion settings:")
         print(f"  VAE checkpoint: {vae_checkpoint}")
         print(f"  VAE config: {vae_config}")
@@ -656,7 +809,7 @@ def main():
         adam_beta1=args.adam_beta1,
         adam_beta2=args.adam_beta2,
         ignore_data_skip=False,
-        remove_unused_columns=False
+        remove_unused_columns=False,
     )
 
     # Load datasets
@@ -664,9 +817,13 @@ def main():
         cache_dir=train_cache_dir,
     )
 
-    eval_dataset = CachedImageDiffusionDataset(
-        cache_dir=val_cache_dir,
-    )
+    # Subset training dataset if max_train_samples is specified
+    if max_train_samples > 0 and max_train_samples < len(train_dataset):
+        from torch.utils.data import Subset
+        original_size = len(train_dataset)
+        indices = list(range(max_train_samples))
+        train_dataset = Subset(train_dataset, indices)
+        print(f"Using subset of {max_train_samples} training samples (out of {original_size} available)")
 
     # Create data collator
     data_collator = ImageDiffusionDataCollator(
@@ -693,7 +850,6 @@ def main():
         args=training_args,
         data_collator=data_collator,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
         cmdline=args.cmdline,
         git_commit_hash=args.commit_hash,
         step_offset=args.start_step,
@@ -712,9 +868,10 @@ def main():
         generation_steps=args.generation_steps,
         image_size=image_size,
         latent_channels=latent_channels,
-        ddim_sampling_steps=sampling_timesteps,
+        sampling_timesteps=sampling_timesteps,
         ema=ema,
         vae=vae,
+        train_dataset=train_dataset,  # For in-distribution visualization
     )
     trainer.add_callback(visualization_callback)
 
@@ -742,6 +899,10 @@ def main():
     if checkpoint_path is not None:
         print(f"Rank {trainer.args.local_rank} Checkpoint exists: {os.path.exists(checkpoint_path)}")
         print(f"Rank {trainer.args.local_rank} Checkpoint contents: {os.listdir(checkpoint_path) if os.path.exists(checkpoint_path) else 'N/A'}")
+
+        # Load EMA state if available
+        if ema is not None:
+            load_ema_state(ema, checkpoint_path)
 
     print(f"Starting image diffusion training with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters")
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)

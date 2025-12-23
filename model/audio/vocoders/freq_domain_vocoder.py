@@ -1,10 +1,8 @@
-from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import megatransformer_utils
-from model.activations import Snake, SwiGLU
+from model import activations, get_activation_type
 from model.audio.shared_window_buffer import SharedWindowBuffer
 
 
@@ -176,8 +174,8 @@ class HeavyHeadedFrequencyDomainVocoder(FrequencyDomainVocoderBase):
             nn.Conv1d(hidden_dim, self.freq_bins, kernel_size=7, padding=3),
         )
 
-        act_type = megatransformer_utils.get_activation_type(phase_activation_fn)
-        self.act: nn.Module = act_type(hidden_dim) if act_type in [Snake, SwiGLU] else act_type()
+        act_type = get_activation_type(phase_activation_fn)
+        self.act: nn.Module = act_type(hidden_dim) if act_type in [activations.Snake, activations.SwiGLU] else act_type()
 
         # Phase head - outputs angle directly, then we use cos/sin for unit phasor
         # Snake activation is periodic-aware, might be good for angle prediction
@@ -279,13 +277,13 @@ class SplitBandFrequencyDomainVocoder(FrequencyDomainVocoderBase):
         # Also deeper because low-freq phase is more important perceptually
         self.phase_head_low = nn.Sequential(
             nn.Conv1d(head_input_dim, head_input_dim, kernel_size=low_freq_kernel, padding=low_freq_kernel // 2),
-            Snake(head_input_dim),
+            activations.Snake(head_input_dim),
             nn.Conv1d(head_input_dim, self.n_low_bins, kernel_size=low_freq_kernel, padding=low_freq_kernel // 2),
         )
 
         # High-freq: smaller kernel, Snake for periodic inductive bias
         self.phase_head_high = nn.Sequential(
-            Snake(head_input_dim),
+            activations.Snake(head_input_dim),
             nn.Conv1d(head_input_dim, self.n_high_bins, kernel_size=high_freq_kernel, padding=high_freq_kernel // 2)
         )
 
@@ -415,7 +413,7 @@ class SplitBandLowFreqMeanFreqDomainVocoder(FrequencyDomainVocoderBase):
             kernel_size=high_freq_kernel, padding=high_freq_kernel // 2
         )
 
-        self.phase_act_low = Snake(head_input_dim)
+        self.phase_act_low = activations.Snake(head_input_dim)
         self.phase_head_low_large = nn.Sequential(
             nn.Conv1d(head_input_dim, self.n_low_bins, kernel_size=low_freq_kernel, padding=low_freq_kernel // 2)
         )
@@ -424,7 +422,7 @@ class SplitBandLowFreqMeanFreqDomainVocoder(FrequencyDomainVocoderBase):
         )
 
         self.phase_head_high = nn.Sequential(
-            Snake(head_input_dim),
+            activations.Snake(head_input_dim),
             nn.Conv1d(head_input_dim, self.n_high_bins, kernel_size=high_freq_kernel, padding=high_freq_kernel // 2)
         )
 

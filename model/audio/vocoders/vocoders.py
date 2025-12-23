@@ -1,15 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from typing import Dict, Optional, Literal
 
-import megatransformer_utils
 from model.activations import Snake
 from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss
 from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders.convtranspose1d_vocoder import ConvTranspose1DVocoderUpsampleBlock
 from model.audio.vocoders.freq_domain_vocoder import SplitBandLowFreqMeanFreqDomainVocoder, HeavyHeadedFrequencyDomainVocoder, LightHeadedFrequencyDomainVocoder, SplitBandFrequencyDomainVocoder
 from model.audio.vocoders.upsample_vocoder import AntiAliasedUpsampleVocoderUpsampleBlock
+from utils import configuration
 
 
 class VocoderResidualBlock(nn.Module):
@@ -226,7 +227,7 @@ class VocoderWithLoss(nn.Module):
     def __init__(self,
                  vocoder: nn.Module,
                  shared_window_buffer: SharedWindowBuffer,
-                 config: megatransformer_utils.MegaTransformerConfig,
+                 config: configuration.MegaTransformerConfig,
                  sc_loss_weight: float = 1.0,
                  mag_loss_weight: float = 3.0,
                  waveform_l1_loss_weight: float = 0.1,
@@ -405,7 +406,7 @@ class VocoderWithLoss(nn.Module):
         return outputs
 
 
-really_tiny_freq_domain_config = megatransformer_utils.MegaTransformerConfig(
+really_tiny_freq_domain_config = configuration.MegaTransformerConfig(
     hidden_size=256,
     audio_n_mels=80,
     audio_n_fft=1024,
@@ -417,7 +418,7 @@ really_tiny_freq_domain_config = megatransformer_utils.MegaTransformerConfig(
     audio_vocoder_n_residual_layers=3,
 )
 
-tiny_freq_domain_config = megatransformer_utils.MegaTransformerConfig(
+tiny_freq_domain_config = configuration.MegaTransformerConfig(
     hidden_size=256,
     audio_n_mels=80,
     audio_n_fft=1024,
@@ -429,7 +430,7 @@ tiny_freq_domain_config = megatransformer_utils.MegaTransformerConfig(
     audio_vocoder_n_residual_layers=3,
 )
 
-tiny_config = megatransformer_utils.MegaTransformerConfig(
+tiny_config = configuration.MegaTransformerConfig(
     hidden_size=256,
     audio_n_mels=80,
     audio_n_fft=1024,
@@ -441,7 +442,7 @@ tiny_config = megatransformer_utils.MegaTransformerConfig(
     audio_vocoder_n_residual_layers=3,
 )
 
-small_config = megatransformer_utils.MegaTransformerConfig(
+small_config = configuration.MegaTransformerConfig(
     hidden_size=512,
     audio_n_mels=80,
     audio_n_fft=1024,
@@ -456,7 +457,7 @@ small_config = megatransformer_utils.MegaTransformerConfig(
 def create_vocoder(
         vocoder: nn.Module,
         shared_window_buffer: SharedWindowBuffer,
-        config: megatransformer_utils.MegaTransformerConfig,
+        config: configuration.MegaTransformerConfig,
         **kwargs,
 ) -> VocoderWithLoss:
     return VocoderWithLoss(
@@ -468,7 +469,7 @@ def create_vocoder(
 
 def create_convtranspose1d_vocoder(
         shared_window_buffer: SharedWindowBuffer,
-        config: megatransformer_utils.MegaTransformerConfig,
+        config: configuration.MegaTransformerConfig,
         **kwargs,
 ) -> VocoderWithLoss:
     return create_vocoder(
@@ -486,7 +487,7 @@ def create_convtranspose1d_vocoder(
 
 def create_upsample_vocoder(
         shared_window_buffer: SharedWindowBuffer,
-        config: megatransformer_utils.MegaTransformerConfig,
+        config: configuration.MegaTransformerConfig,
         **kwargs,
 ) -> VocoderWithLoss:
     return create_vocoder(
@@ -504,7 +505,7 @@ def create_upsample_vocoder(
 
 def create_heavy_headed_freq_domain_vocoder(
         shared_window_buffer: SharedWindowBuffer,
-        config: megatransformer_utils.MegaTransformerConfig,
+        config: configuration.MegaTransformerConfig,
         **kwargs,
 ) -> VocoderWithLoss:
     return create_vocoder(
@@ -524,7 +525,7 @@ def create_heavy_headed_freq_domain_vocoder(
 
 def create_light_headed_freq_domain_vocoder(
         shared_window_buffer: SharedWindowBuffer,
-        config: megatransformer_utils.MegaTransformerConfig,
+        config: configuration.MegaTransformerConfig,
         **kwargs,
 ) -> VocoderWithLoss:
     return create_vocoder(
@@ -545,7 +546,7 @@ def create_light_headed_freq_domain_vocoder(
 
 def create_split_band_freq_domain_vocoder(
         shared_window_buffer: SharedWindowBuffer,
-        config: megatransformer_utils.MegaTransformerConfig,
+        config: configuration.MegaTransformerConfig,
         cutoff_bin: int = 128,
         low_freq_kernel: int = 7,
         high_freq_kernel: int = 3,
@@ -571,7 +572,7 @@ def create_split_band_freq_domain_vocoder(
 
 def create_experimental_vocoder(
         shared_window_buffer: SharedWindowBuffer,
-        config: megatransformer_utils.MegaTransformerConfig,
+        config: configuration.MegaTransformerConfig,
         cutoff_bin: int = 128,
         low_freq_kernel: int = 7,
         high_freq_kernel: int = 3,

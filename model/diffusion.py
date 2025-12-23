@@ -1,45 +1,46 @@
-from functools import partial
-from torch.amp import autocast
-from typing import Optional, Union
-
-from model import activations, megatransformer_modules, norms
-
 import math
-import megatransformer_utils
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+
+from functools import partial
+from typing import Optional, Union
+
+from torch.amp import autocast
+
+from model import activations, get_activation_type, norms, SinusoidalPositionEmbeddings
+from utils import configuration
 
 
 class Block(nn.Module):
     def __init__(self, in_channels, out_channels, activation, norm):
         super().__init__()
 
-        activation_type = megatransformer_utils.get_activation_type(activation)
+        activation_type = get_activation_type(activation)
 
         self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.norm = norm(out_channels)
         self.act = activation_type() if activation_type is not activations.SwiGLU else activations.SwiGLU(in_channels)
 
-    def forward(self, x, time_embedding=None):
+    def forward(self, x: torch.Tensor, time_embedding: Optional[torch.Tensor]=None):
         # x: [B, C, H, W]
-        # where:
         # C = hidden_size/hidden_channels
-        # H = n_mels
-        # W = time_frames
+        # H = n_mels for audio, height for image
+        # W = time_frames for audio, width for image
 
         x = self.proj(x)
-        # switch channel to last dimension (now [B, H;;, W, C])
+        # switch channel to last dimension (now [B, H, W, C])
         x = x.permute(0, 2, 3, 1).contiguous()
         x = self.norm(x)
-        # switch back to [B, C, H, W]
 
         if time_embedding is not None:
             # x is [B, H, W, C]
             # time_embedding is [B, C]
             x = x + time_embedding[:, None, None, :]
 
+        # switch back to [B, C, H, W]
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.act(x)
         return x
@@ -49,7 +50,7 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.time_embedding_dim = time_embedding_dim
 
-        activation_type = megatransformer_utils.get_activation_type(activation)
+        activation_type = get_activation_type(activation)
 
         if time_embedding_dim is not None:
             self.time_mlp = nn.Sequential(
@@ -88,21 +89,30 @@ class ResidualBlock(nn.Module):
         return h + self.shortcut(x)
 
 class DownBlock(nn.Module):
-    def __init__(self,
-                 stride,
-                 in_channels: int,
-                 out_channels: int,
-                 time_embedding_dim: int,
-                 activation,
-                 self_attn_class,
-                 norm_class,
-                 has_attn: bool=False,
-                 num_res_blocks: int=2,
-                 dropout_p: float=0.1,
-                 self_attn_n_heads=6,
-                 self_attn_d_queries=64,
-                 self_attn_d_values=64,
-                 self_attn_use_flash_attention=True):
+    def __init__(
+            self,
+            stride,
+            in_channels: int,
+            out_channels: int,
+            time_embedding_dim: int,
+            activation,
+            self_attn_class,
+            cross_attn_class,
+            norm_class,
+            has_attn: bool=False,
+            has_condition: bool=False,
+            context_dim: Optional[int]=None,
+            num_res_blocks: int=2,
+            dropout_p: float=0.1,
+            self_attn_n_heads=6,
+            self_attn_d_queries=64,
+            self_attn_d_values=64,
+            self_attn_use_flash_attention=True,
+            cross_attn_n_heads=6,
+            cross_attn_d_queries=64,
+            cross_attn_d_values=64,
+            cross_attn_use_flash_attention=True
+    ):
         super().__init__()
 
         self.norms = nn.ModuleList([
@@ -122,6 +132,13 @@ class DownBlock(nn.Module):
             for _ in range(num_res_blocks)
         ])
 
+        self.cross_attn_blocks = nn.ModuleList([
+            cross_attn_class(
+                out_channels, cross_attn_n_heads, cross_attn_d_queries, cross_attn_d_values, context_dim=context_dim, use_flash_attention=cross_attn_use_flash_attention, dropout_p=dropout_p
+            ) if has_attn and has_condition else nn.Identity()
+            for _ in range(num_res_blocks)
+        ])
+
         self.downsample = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1)
 
         self._init_weights()
@@ -132,14 +149,16 @@ class DownBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, time_embedding: Optional[torch.Tensor]=None, condition=None) -> tuple[torch.Tensor, torch.Tensor]:
         # x: [B, C, H, W]
-        for norm, res_block, attn_block in zip(self.norms, self.res_blocks, self.attn_blocks):
+        for norm, res_block, attn_block, cross_attn_block in zip(self.norms, self.res_blocks, self.attn_blocks, self.cross_attn_blocks):
             # switch channel to last dimension (now [B, H, W, C])
             x = x.permute(0, 2, 3, 1).contiguous()
             x = norm(x)
             # switch back to [B, C, H, W]
             x = x.permute(0, 3, 1, 2).contiguous()
             x = res_block(x, time_embedding)
-            x = attn_block(x)
+            x = x + attn_block(x)
+            if condition is not None and not isinstance(cross_attn_block, nn.Identity):
+                x = x + cross_attn_block(x, condition)
         return self.downsample(x), x
 
 class UpBlock(nn.Module):
@@ -148,7 +167,6 @@ class UpBlock(nn.Module):
                  out_channels: int,
                  time_embedding_dim: int,
                  activation,
-                 scale_factor,
                  self_attn_class,
                  cross_attn_class,
                  norm_class,
@@ -210,19 +228,18 @@ class UpBlock(nn.Module):
             # switch back
             x = x.permute(0, 3, 1, 2).contiguous()
             x = res_block(x, time_embedding)
-            x = attn_block(x)
+            x = x + attn_block(x)
             if condition is not None and not isinstance(cross_attn_block, nn.Identity):
-                x = cross_attn_block(x, condition)
+                x = x + cross_attn_block(x, condition)
         return x
 
-class UNet(nn.Module):
+class ConvDenoisingUNet(nn.Module):
     def __init__(
             self,
             activation,
             self_attn_class,
             cross_attn_class,
             norm_class,
-            scale_factor: Union[int, tuple[int, int]] = 2,
             stride: Union[int, tuple[int, int]] = 1,
             in_channels: int = 3,
             model_channels: int = 64,
@@ -250,8 +267,8 @@ class UNet(nn.Module):
         super().__init__()
         self.use_gradient_checkpointing = False
 
-        activation_type = megatransformer_utils.get_activation_type(activation)
-        self.time_embedding = megatransformer_modules.SinusoidalPositionEmbeddings(model_channels)
+        activation_type = get_activation_type(activation)
+        self.time_embedding = SinusoidalPositionEmbeddings(model_channels)
         self.time_transform = nn.Sequential(
             nn.Linear(model_channels, time_embedding_dim),
             activation_type() if activation_type is not activations.SwiGLU else activations.SwiGLU(time_embedding_dim),
@@ -274,14 +291,21 @@ class UNet(nn.Module):
                     time_embedding_dim,
                     activation,
                     self_attn_class,
+                    cross_attn_class,
                     norm_class,
                     has_attn=attention_levels[i],
+                    has_condition=has_condition,
+                    context_dim=context_dim,
                     num_res_blocks=num_res_blocks,
                     dropout_p=dropout_p,
                     self_attn_n_heads=down_block_self_attn_n_heads,
                     self_attn_d_queries=down_block_self_attn_d_queries,
                     self_attn_d_values=down_block_self_attn_d_values,
                     self_attn_use_flash_attention=down_block_self_attn_use_flash_attention,
+                    cross_attn_n_heads=cross_attn_n_heads,
+                    cross_attn_d_queries=cross_attn_d_queries,
+                    cross_attn_d_values=cross_attn_d_values,
+                    cross_attn_use_flash_attention=cross_attn_use_flash_attention,
                 )
             )
 
@@ -289,9 +313,14 @@ class UNet(nn.Module):
             channels[-1], channels[-1], time_embedding_dim, activation, norm_class
         )
         self.middle_attn_norm = norms.RMSNorm(channels[-1])
-        self.middle_attn_block = self_attn_class(
+
+        self.middle_self_attn_block = self_attn_class(
             channels[-1], down_block_self_attn_n_heads, down_block_self_attn_d_queries, down_block_self_attn_d_values, use_flash_attention=down_block_self_attn_use_flash_attention, dropout_p=dropout_p, is_linear_attention=False
         )
+        self.middle_cross_attn_block = cross_attn_class(
+            channels[-1], cross_attn_n_heads, cross_attn_d_queries, cross_attn_d_values, context_dim=context_dim, use_flash_attention=cross_attn_use_flash_attention, dropout_p=dropout_p
+        ) if has_condition else nn.Identity()
+
         self.middle_res_block2 = ResidualBlock(
             channels[-1], channels[-1], time_embedding_dim, activation, norm_class
         )
@@ -304,7 +333,6 @@ class UNet(nn.Module):
                     channels[i],
                     time_embedding_dim,
                     activation,
-                    scale_factor,
                     self_attn_class,
                     cross_attn_class,
                     norm_class,
@@ -332,34 +360,47 @@ class UNet(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.init_conv.weight.data.normal_(0.0, 0.02)
+        # Initialize init_conv to preserve input variance
+        # For 3x3 conv with C_in channels: output_std = input_std × weight_std × sqrt(9 × C_in)
+        # To preserve std=1.0: weight_std = 1.0 / sqrt(9 × C_in)
+        # For C_in=4 (latent channels): weight_std = 1.0 / sqrt(36) = 0.167
+        # For C_in=3 (image channels): weight_std = 1.0 / sqrt(27) = 0.192
+        # Using 0.15 as a reasonable value that works for both
+        self.init_conv.weight.data.normal_(0.0, 0.15)
         self.init_conv.bias.data.zero_()
-        self.final_conv.weight.data.normal_(0.0, 0.02)
+        # Initialize final_conv to produce output with std ≈ 1.0
+        # For 3x3 conv with C_in=model_channels:
+        # weight_std = 1.0 / (input_std × sqrt(9 × C_in))
+        # Empirically: 0.028 gives output_std ≈ 1.22, so scale by 1.0/1.22 ≈ 0.82
+        # New weight_std = 0.028 × 0.82 ≈ 0.023
+        self.final_conv.weight.data.normal_(0.0, 0.023)
         self.final_conv.bias.data.zero_()
 
-    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, condition=None) -> torch.Tensor:
-        time_embedding = self.time_embedding(timesteps)
+    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, condition: Optional[torch.Tensor]=None) -> torch.Tensor:
+        time_embedding: torch.Tensor = self.time_embedding(timesteps)
         time_embedding = self.time_transform(time_embedding.to(x.dtype))
 
         assert len(x.shape) == 4, f"expected 4 dimensions (batch, channel, height, width), got {len(x.shape)}"
 
-        h = self.init_conv(x)
+        h: torch.Tensor = self.init_conv(x)
         initial_h = h
 
         skips = []
-        for i, down_block in enumerate(self.down_blocks):
+        for down_block in self.down_blocks:
             h, skip = down_block(h, time_embedding, condition=condition)
             skips.append(skip)
-        
+
         if self.use_gradient_checkpointing and self.training:
             h = checkpoint.checkpoint(self.middle_res_block, h, time_embedding)
         else:
             h = self.middle_res_block(h, time_embedding)
-        residual = h
+
         h = h.permute(0, 2, 3, 1).contiguous()
         h = self.middle_attn_norm(h)
         h = h.permute(0, 3, 1, 2).contiguous()
-        h = residual + self.middle_attn_block(h)
+        h = h + self.middle_self_attn_block(h)
+        if condition is not None:
+            h = h + self.middle_cross_attn_block(h, condition)
         h = self.middle_res_block2(h, time_embedding)
 
         for i, (up_block, skip) in enumerate(zip(self.up_blocks, reversed(skips))):
@@ -371,43 +412,20 @@ class UNet(nn.Module):
 
         return h
 
+
 class GaussianDiffusion(nn.Module):
     def __init__(
             self,
-            config: megatransformer_utils.MegaTransformerConfig,
-            activation,
-            scale_factor,
-            stride,
-            self_attn_class,
-            cross_attn_class,
-            norm_class,
+            config: configuration.MegaTransformerConfig,
+            unet: nn.Module,
             in_channels: int,
-            model_channels: int,
-            out_channels: int,
-            time_embedding_dim: int,
-            num_res_blocks: int,
             beta_start: float = 1e-4,
             beta_end: float = 0.02,
             num_timesteps: int = 1000,
-            has_condition: bool = False,
-            unet_dropout_p: float = 0.1,
             betas_schedule="linear",
-            context_dim: Optional[int] = None,
-            down_block_self_attn_n_heads=6,
-            down_block_self_attn_d_queries=64,
-            down_block_self_attn_d_values=64,
-            down_block_self_attn_use_flash_attention=True,
-            up_block_self_attn_n_heads=6,
-            up_block_self_attn_d_queries=64,
-            up_block_self_attn_d_values=64,
-            up_block_self_attn_use_flash_attention=True,
-            cross_attn_n_heads=6,
-            cross_attn_d_queries=64,
-            cross_attn_d_values=64,
-            cross_attn_use_flash_attention=True,
             min_snr_loss_weight: bool = False,
             min_snr_gamma: float = 5.0,
-            normalize: bool = True,
+            normalize: bool = False,
             ddim_sampling_eta = 0.0,
             sampling_timesteps=None,
             prediction_type: str = "epsilon",  # "epsilon" or "v"
@@ -432,7 +450,6 @@ class GaussianDiffusion(nn.Module):
         self.num_timesteps = num_timesteps
         self.is_normalize = normalize
         self.ddim_sampling_eta = ddim_sampling_eta
-        self.context_dim = context_dim
 
         if sampling_timesteps is None:
             self.sampling_timesteps = num_timesteps
@@ -442,40 +459,14 @@ class GaussianDiffusion(nn.Module):
             assert sampling_timesteps <= num_timesteps, f"Sampling timesteps {sampling_timesteps} must be less than or equal to total timesteps {num_timesteps}."
             self.is_ddim_sampling = sampling_timesteps < num_timesteps
 
-        self.unet = UNet(
-            activation,
-            scale_factor=scale_factor,
-            stride=stride,
-            self_attn_class=self_attn_class,
-            cross_attn_class=cross_attn_class,
-            norm_class=norm_class,
-            in_channels=in_channels,
-            model_channels=model_channels,
-            out_channels=out_channels,
-            channel_multipliers=config.image_decoder_channel_multipliers,
-            time_embedding_dim=time_embedding_dim,
-            num_res_blocks=num_res_blocks,
-            dropout_p=unet_dropout_p,
-            has_condition=has_condition,
-            context_dim=context_dim,
-            down_block_self_attn_n_heads=down_block_self_attn_n_heads,
-            down_block_self_attn_d_queries=down_block_self_attn_d_queries,
-            down_block_self_attn_d_values=down_block_self_attn_d_values,
-            down_block_self_attn_use_flash_attention=down_block_self_attn_use_flash_attention,
-            up_block_self_attn_n_heads=up_block_self_attn_n_heads,
-            up_block_self_attn_d_queries=up_block_self_attn_d_queries,
-            up_block_self_attn_d_values=up_block_self_attn_d_values,
-            up_block_self_attn_use_flash_attention=up_block_self_attn_use_flash_attention,
-            cross_attn_n_heads=cross_attn_n_heads,
-            cross_attn_d_queries=cross_attn_d_queries,
-            cross_attn_d_values=cross_attn_d_values,
-            cross_attn_use_flash_attention=cross_attn_use_flash_attention,
-        )
+        self.unet = unet
 
         if betas_schedule == "cosine":
             betas = self.cosine_beta_schedule(num_timesteps)
         elif betas_schedule == "sigmoid":
             betas = self.sigmoid_beta_schedule(num_timesteps)
+        elif betas_schedule == "karras":
+            betas = self.karras_beta_schedule(num_timesteps)
         else:
             betas = torch.linspace(beta_start, beta_end, num_timesteps)
 
@@ -500,7 +491,7 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1. - alphas_cumprod))
         self.register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
         self.register_buffer("sqrt_recip_alphas_cumprod", torch.sqrt(1. / alphas_cumprod))
-        self.register_buffer("sqrt_recip1m_alphas_cumprod", torch.sqrt(1. / (1. - alphas_cumprod)))
+        self.register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt((1. - alphas_cumprod) / alphas_cumprod))
 
         posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
         self.register_buffer("posterior_variance", posterior_variance)
@@ -538,6 +529,48 @@ class GaussianDiffusion(nn.Module):
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
         return torch.clip(betas, 0, 0.999)
+
+    def karras_beta_schedule(self, timesteps, sigma_min=0.002, sigma_max=80.0, rho=7.0):
+        """
+        Karras noise schedule from the EDM paper (Karras et al. 2022).
+
+        Creates sigmas evenly spaced in (sigma^(1/rho)) space, which gives
+        smooth transitions in log-SNR space - ideal for DPM-Solver++.
+
+        Reference: "Elucidating the Design Space of Diffusion-Based Generative Models"
+        https://arxiv.org/abs/2206.00364
+
+        Args:
+            timesteps: Number of diffusion timesteps
+            sigma_min: Minimum sigma (noise level at t=0), default 0.002 from EDM
+            sigma_max: Maximum sigma (noise level at t=T), default 80.0 from EDM
+            rho: Schedule curvature parameter, default 7.0 from EDM
+
+        Returns:
+            betas tensor of shape [timesteps]
+        """
+        # Create rho-spaced sigmas (evenly spaced in sigma^(1/rho) space)
+        ramp = torch.linspace(0, 1, timesteps + 1)
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+
+        # Reverse so sigma decreases with timestep (t=0 has lowest noise)
+        sigmas = sigmas.flip(0)
+
+        # Convert sigmas to alphas_cumprod: alpha = 1 / (1 + sigma^2)
+        alphas_cumprod = 1.0 / (1.0 + sigmas ** 2)
+
+        # Ensure proper boundaries
+        alphas_cumprod = torch.clamp(alphas_cumprod, min=1e-5, max=1.0 - 1e-5)
+
+        # Convert alphas_cumprod to betas
+        # alpha_cumprod[t] = prod(1 - beta[0:t])
+        # So: alpha[t] = alpha_cumprod[t] / alpha_cumprod[t-1] = 1 - beta[t]
+        alphas = alphas_cumprod[1:] / alphas_cumprod[:-1]
+        betas = 1.0 - alphas
+
+        return torch.clip(betas, 1e-5, 0.999)
 
     def _enforce_zero_terminal_snr(self, alphas_cumprod: torch.Tensor) -> torch.Tensor:
         """
@@ -600,10 +633,15 @@ class GaussianDiffusion(nn.Module):
         return t
 
     def predict_start_from_noise(self, x_t: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        """Predict x_0 from x_t and predicted noise (epsilon prediction)."""
+        """Predict x_0 from x_t and predicted noise (epsilon prediction).
+
+        x_t = sqrt(alpha) * x_0 + sqrt(1-alpha) * noise
+        x_0 = (x_t - sqrt(1-alpha) * noise) / sqrt(alpha)
+        x_0 = sqrt(1/alpha) * x_t - sqrt((1-alpha)/alpha) * noise
+        """
         return (
             self._extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
-            self._extract(self.sqrt_recip1m_alphas_cumprod, t, x_t.shape) * noise
+            self._extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
     def predict_start_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -673,8 +711,6 @@ class GaussianDiffusion(nn.Module):
             pred_noise = model_output
             x_start = self.predict_start_from_noise(x, t, pred_noise)
 
-        # megatransformer_utils.print_debug_tensor("x_start before clip", x_start)
-
         x_start = maybe_clip(x_start)
 
         return pred_noise, x_start
@@ -738,7 +774,11 @@ class GaussianDiffusion(nn.Module):
         x_start = None
         for time, time_next in time_pairs:
             time_cond = torch.full((x.shape[0],), time, device=x.device, dtype = torch.long)
-            pred_noise, x_start = self.model_predictions(img, time_cond, condition=condition, clip_x_start=True, guidance_scale=guidance_scale)
+            pred_noise, x_start = self.model_predictions(img, time_cond, condition=condition, clip_x_start=False, guidance_scale=guidance_scale)
+
+            # Clamp x_start to prevent sampling blowup
+            # For latent diffusion, latents typically range [-6, 6], so [-10, 10] is safe
+            x_start = torch.clamp(x_start, min=-10.0, max=10.0)
 
             if time_next < 0:
                 img = x_start
@@ -747,8 +787,10 @@ class GaussianDiffusion(nn.Module):
             alpha = self.alphas_cumprod[time]
             alpha_next = self.alphas_cumprod[time_next]
 
-            sigma = self.ddim_sampling_eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
+            # Clamp denominators to prevent division by zero at low timesteps (cosine schedule)
+            one_minus_alpha = (1 - alpha).clamp(min=1e-8)
+            sigma = self.ddim_sampling_eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / one_minus_alpha).sqrt()
+            c = (1 - alpha_next - sigma ** 2).clamp(min=0).sqrt()
 
             noise = torch.randn_like(img)
 
@@ -775,8 +817,8 @@ class GaussianDiffusion(nn.Module):
     @torch.no_grad()
     def dpm_solver_pp_sample_loop(
         self,
-        x,
-        condition=None,
+        x: torch.Tensor,
+        condition: Optional[torch.Tensor]=None,
         return_intermediate=False,
         override_sampling_steps=None,
         guidance_scale=1.0,
@@ -811,6 +853,12 @@ class GaussianDiffusion(nn.Module):
         alphas = torch.sqrt(self.alphas_cumprod[timesteps])
         sigmas = torch.sqrt(1 - self.alphas_cumprod[timesteps])
 
+        # Clamp both alphas and sigmas to avoid numerical issues
+        # When alpha -> 0 (at t=T with ZTSNR), log(alpha/sigma) -> -inf which breaks lambda
+        # When sigma -> 0 (at t=0), log(alpha/sigma) -> inf which also breaks lambda
+        alphas = alphas.clamp(min=1e-5)
+        sigmas = sigmas.clamp(min=1e-5)
+
         # Initialize with noise
         img = torch.randn_like(x, device=device)
 
@@ -837,9 +885,13 @@ class GaussianDiffusion(nn.Module):
 
             # Get model prediction at current timestep
             t_cond = torch.full((x.shape[0],), t_curr.item(), device=device, dtype=torch.long)
-            pred_noise, x_start = self.model_predictions(
-                img, t_cond, condition=condition, clip_x_start=True, guidance_scale=guidance_scale
+            _, x_start = self.model_predictions(
+                img, t_cond, condition=condition, clip_x_start=False, guidance_scale=guidance_scale
             )
+
+            # Clamp x_start to prevent sampling blowup
+            # For latent diffusion, latents typically range [-6, 6], so [-10, 10] is safe
+            x_start = torch.clamp(x_start, min=-10.0, max=10.0)
 
             # Store x_0 prediction for multistep
             model_outputs.append(x_start)
@@ -851,10 +903,18 @@ class GaussianDiffusion(nn.Module):
                 x_start_preds.append(x_start)
 
             # DPM-Solver++ update (data prediction formulation)
-            if order == 1 or len(model_outputs) == 1:
+            ratio = sigma_next / sigma_curr
+
+            # Handle degenerate case: when ratio ≈ 1.0, the update formula becomes img = img (no update)
+            # This happens with cosine schedule when sigma is clamped at low timesteps
+            # In this case, just use x_start directly since we're effectively at t=0
+            # Use strict threshold (0.9999) to only catch truly degenerate cases, not normal high-noise steps
+            if ratio > 0.9999:
+                img = x_start
+            elif order == 1 or len(model_outputs) == 1:
                 # First-order update: x_{t-1} = (sigma_{t-1}/sigma_t) * x_t + alpha_{t-1} * (1 - sigma_{t-1}/sigma_t) * x_0
                 # Simplified using exponential: ratio = sigma_next/sigma_curr = exp(lambda_curr - lambda_next) = exp(-h)
-                img = (sigma_next / sigma_curr) * img + alpha_next * (1 - sigma_next / sigma_curr) * x_start
+                img = ratio * img + alpha_next * (1 - ratio) * x_start
 
             elif order == 2 and len(model_outputs) >= 2:
                 # Second-order multistep (DPM-Solver++-2M)
@@ -875,7 +935,6 @@ class GaussianDiffusion(nn.Module):
                 D1 = (1 / (2 * r)) * (x_start - x_start_prev) if r != 0 else torch.zeros_like(x_start)
 
                 # Update
-                ratio = sigma_next / sigma_curr
                 img = ratio * img + alpha_next * (1 - ratio) * D0 + alpha_next * (1 - ratio) * D1
 
             elif order == 3 and len(model_outputs) >= 3:
@@ -895,12 +954,11 @@ class GaussianDiffusion(nn.Module):
                 D0 = x_start
                 D1 = (1 / (2 * r)) * (x_start - x_start_prev) if r != 0 else torch.zeros_like(x_start)
 
-                ratio = sigma_next / sigma_curr
                 img = ratio * img + alpha_next * (1 - ratio) * D0 + alpha_next * (1 - ratio) * D1
 
             else:
                 # Fallback to first-order
-                img = (sigma_next / sigma_curr) * img + alpha_next * (1 - sigma_next / sigma_curr) * x_start
+                img = ratio * img + alpha_next * (1 - ratio) * x_start
 
         # img should now be close to x_0
         return (img, noise_preds, x_start_preds) if return_intermediate else img
@@ -976,7 +1034,7 @@ class GaussianDiffusion(nn.Module):
         if self.offset_noise_strength > 0 and self.training:
             # noise shape is [B, C, H, W] for images or [B, C, H, W] for audio
             # We add noise that's constant across H, W dimensions
-            offset_noise = torch.randn(x_start.shape[0], x_start.shape[1], 1, 1, device=x_start.device)
+            offset_noise = torch.randn(x_start.shape[0], x_start.shape[1], 1, 1, device=x_start.device, dtype=x_start.dtype)
             noise = noise + self.offset_noise_strength * offset_noise
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -1001,18 +1059,21 @@ class GaussianDiffusion(nn.Module):
             target = noise
 
         loss = F.mse_loss(model_output, target, reduction='none')
-        loss = loss.mean(dim=[1, 2, 3])
+        loss_per_sample = loss.mean(dim=[1, 2, 3])
 
-        loss = loss * self._extract(self.loss_weight, t, loss.shape)
+        loss_weights = self._extract(self.loss_weight, t, loss_per_sample.shape)
 
-        return model_output, loss.mean()
+        loss_per_sample = loss_per_sample * loss_weights
 
-    def forward(self, x_0, condition=None):
+        final_loss = loss_per_sample.mean()
+
+        return model_output, final_loss
+
+    def forward(self, x_0: torch.Tensor, condition: Optional[torch.Tensor]=None):
         """
         default impl is image diffusion
         returns model output noises and noise reconstruction loss from `p_losses` function
         """
-
         if len(x_0.shape) == 5:
             # squish batch and example dimensions if necessary
             b, e, c, h, w = x_0.shape
@@ -1033,6 +1094,7 @@ class GaussianDiffusion(nn.Module):
             x_0 = self.normalize(x_0)
 
         model_output, mse_loss = self.p_losses(x_0, t, condition=condition)
+
         if e is not None:
             # restore model example dimension
             model_output = model_output.view(b, e, c, h, w)

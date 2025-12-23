@@ -1,6 +1,8 @@
-from prune_vocoder import load_pruned_vocoder
 import torch
 import torchaudio
+
+from utils.model_loading_utils import load_pruned_vocoder
+
 
 # Load the pruned model
 model = load_pruned_vocoder('runs/vocoder/splitband_lowfreq_mean_0_1/pruned_checkpoint.pt', device='cuda')

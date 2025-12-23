@@ -1,37 +1,37 @@
 import os
 
-import torchaudio
-
-from dataset_loading import audio_loading
-from dataset_loading.audio_diffusion_dataset import CachedAudioDiffusionDataset
-from model.audio.shared_window_buffer import SharedWindowBuffer
-from model.audio.vae import model_config_lookup
-from model.audio.vocoders.vocoders import model_config_lookup as vocoder_config_lookup
-from model.audio.discriminators import (
-    mel_discriminator_config_lookup,
-    compute_mel_discriminator_loss,
-    compute_mel_generator_gan_loss,
-)
-
 os.environ["DEEPSPEED_UNIT_TEST"] = "1"
 os.environ["NCCL_DEBUG"] = "INFO"
 os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ['NCCL_TIMEOUT'] = '1200000'
 
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torchaudio
+
+from typing import Any, Dict, List, Mapping, Optional, Union
+
 from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments, Trainer, TrainerCallback
 from transformers.integrations import TensorBoardCallback
-from typing import Any, Dict, List, Mapping, Optional, Union
 
-import librosa
-import librosa.display
-import matplotlib.pyplot as plt
-import megatransformer_utils
-import numpy as np
-import torch
-import torch.nn.functional as F
+from dataset_loading import audio_loading
+from dataset_loading.audio_diffusion_dataset import CachedAudioDiffusionDataset
+from model.audio.discriminators import (
+    mel_discriminator_config_lookup,
+    compute_mel_discriminator_loss,
+    compute_mel_generator_gan_loss,
+)
+from model.audio.shared_window_buffer import SharedWindowBuffer
+from model.audio.vae import model_config_lookup
+from model.audio.vocoders.vocoders import model_config_lookup as vocoder_config_lookup
+from utils import megatransformer_utils
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -707,7 +707,6 @@ def main():
     latent_channels = int(unk_dict.get("latent_channels", 4))
     speaker_embedding_dim = int(unk_dict.get("speaker_embedding_dim", 192))  # ECAPA-TDNN dim
     normalize_speaker_embedding = unk_dict.get("normalize_speaker_embedding", "true").lower() == "true"
-    debug_film = unk_dict.get("debug_film", "false").lower() == "true"
     # FiLM bounding - prevents extreme scale/shift values that can cause artifacts
     # Scale bound of 0.5 means (1 + scale) ranges from 0.5 to 1.5 (never zeroes out)
     # Set to 0 to disable bounding (unbounded FiLM)
@@ -744,7 +743,6 @@ def main():
         latent_channels=latent_channels,
         speaker_embedding_dim=speaker_embedding_dim,
         normalize_speaker_embedding=normalize_speaker_embedding,
-        debug_film=debug_film,
         film_scale_bound=film_scale_bound,
         film_shift_bound=film_shift_bound,
         perceptual_loss_type=perceptual_loss_type,
@@ -803,7 +801,6 @@ def main():
         print(f"  Latent channels: {latent_channels}")
         print(f"  Speaker embedding dim: {speaker_embedding_dim}")
         print(f"  Normalize speaker embedding: {normalize_speaker_embedding}")
-        print(f"  Debug FiLM: {debug_film}")
         print(f"  FiLM scale bound: {film_scale_bound} (0=unbounded)")
         print(f"  FiLM shift bound: {film_shift_bound} (0=unbounded)")
         if use_gan and discriminator is not None:

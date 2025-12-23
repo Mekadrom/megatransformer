@@ -184,6 +184,7 @@ def preprocess_and_cache_dataset(
     vae_checkpoint: str = None,
     vae_config: str = "mini",
     latent_channels: int = 4,
+    save_text: bool = False,
 ):
     """
     Preprocess image dataset and save as individual .pt files.
@@ -311,6 +312,9 @@ def preprocess_and_cache_dataset(
                 "text_embeddings": text_embeddings,
                 "text_attention_mask": text_attention_mask,
             }
+
+            if save_text:
+                save_dict["text"] = caption
 
             if latent_mu is not None:
                 save_dict["latent_mu"] = latent_mu
@@ -716,6 +720,8 @@ if __name__ == "__main__":
                         help="Index to start from, for resuming (for URL datasets)")
     parser.add_argument("--num_expected_examples", type=int, default=None,
                         help="Expected number of examples for progress bar (for URL datasets)")
+    parser.add_argument("--save_text", action="store_true",
+                        help="Whether to save original text captions along with embeddings")
 
     args = parser.parse_args()
 
@@ -757,4 +763,5 @@ if __name__ == "__main__":
             vae_checkpoint=args.vae_checkpoint,
             vae_config=args.vae_config,
             latent_channels=args.latent_channels,
+            save_text=args.save_text
         )
