@@ -30,18 +30,29 @@ The following papers were used as a reference for feature implementations:
     * Introduces the idea of using a recurrent central block of transformer decoder layers with a stochastic number of iterations that unrolls to a larger model depending on the complexity of the task
 
 ## Usage
-To train using deepspeed with ZeRO-2 (best compatibility and performance trade-off), use the following command:
+Recommended command to run pretraining with DeepSpeed:
 ```bash
-deepspeed --num_gpus=2 pretrain_wm.py \
+deepspeed --num_gpus=2 <pretrain_script> \
     --use_deepspeed \
     --bf16 \
     --run_name my_run_name \
-    --config gpt2_small \
-    --max_steps 300000 \
+    --config tiny \
+    --num_train_epoch 100 \  # or max_steps
+    --batch_size 64 \
+    --learning_rate 1e-4 \
     --gradient_accumulation_steps 8 \
     --use_gradient_checkpointing \
     --deepspeed_config ds_config_zero-2.json
 ```
+
+Pretraining scripts:
+* [Pretrain Image VAE](pretrain_image_vae.py)
+* [Pretrain Audio VAE](pretrain_audio_vae.py)
+* [Pretrain Image Diffusion](pretrain_image_diffusion.py) <- Requires a trained Image VAE checkpoint path + config: `--vae_checkpoint runs/image_vae/<run_name>/checkpoint-STEP/ --vae_config <vae_config>`
+* [Pretrain Audio Diffusion](pretrain_audio_diffusion.py) <- Requires a trained Audio VAE checkpoint path + config: `--vae_checkpoint runs/audio_vae/<run_name>/checkpoint-STEP/ --vae_config <vae_config>`
+* [Pretrain Image Feature Extractor](pretrain_image_feature_extractor.py) <- TODO: needs implemented
+* [Pretrain Audio Feature Extractor](pretrain_audio_feature_extractor.py) <- TODO: needs implemented
+* [Pretrain Multimodal World Model](pretrain_multimodal.py) <- TODO: needs work
 
 ## Contributing
 please do not touch anything
