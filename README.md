@@ -30,6 +30,20 @@ The following papers were used as a reference for feature implementations:
     * Introduces the idea of using a recurrent central block of transformer decoder layers with a stochastic number of iterations that unrolls to a larger model depending on the complexity of the task
 
 ## Usage
+
+Usage consists of preprocessing data and training models on that data.
+
+# Preprocessing Data
+Data preprocessing scripts:
+* [Preprocess Audio Data - Vocoder](preprocess_audio_vocoder_dataset.py) <- encodes audio into spectrograms and waveform labels
+* [Preprocess Audio Data - VAE](preprocess_audio_vae_dataset.py) <- encodes audio into spectrograms and saves them as labels
+* [Preprocess Audio Data - Diffusion](preprocess_audio_diffusion_dataset.py) <- uses a provided VAE checkpoint to encode audio into latent space and saves them with conditions
+* [Preprocess Image Data - VAE](preprocess_image_vae_dataset.py) <- crops/scales images and saves them as labels
+* [Preprocess Image Data - Diffusion](preprocess_image_diffusion_dataset.py) <- uses a provided VAE checkpoint to encode images into latent space and saves them with conditions
+
+All of the above save to a specified folder in an individual .pt file per sample. VAE datasets provide some options for data augmentation during preprocessing, which produces duplicate samples with the different augmentations.
+
+# Training Models
 Recommended command to run pretraining with DeepSpeed:
 ```bash
 deepspeed --num_gpus=2 <pretrain_script> \
@@ -46,13 +60,16 @@ deepspeed --num_gpus=2 <pretrain_script> \
 ```
 
 Pretraining scripts:
+* [Pretrain Vocoder](pretrain_vocoder.py)
+* [Pretrain Audio VAE](pretrain_audio_vae.py) <- Optionally uses a provided vocoder to convert decoded spectrograms back into waveforms for listening
+* [Pretrain Audio Diffusion](pretrain_audio_diffusion.py) <- Requires a trained Audio VAE checkpoint path + config: `--vae_checkpoint runs/audio_vae/<run_name>/checkpoint-STEP/ --vae_config <vae_config>`. Optionally uses a provided vocoder to convert decoded spectrograms back into waveforms for listening.
 * [Pretrain Image VAE](pretrain_image_vae.py)
-* [Pretrain Audio VAE](pretrain_audio_vae.py)
 * [Pretrain Image Diffusion](pretrain_image_diffusion.py) <- Requires a trained Image VAE checkpoint path + config: `--vae_checkpoint runs/image_vae/<run_name>/checkpoint-STEP/ --vae_config <vae_config>`
-* [Pretrain Audio Diffusion](pretrain_audio_diffusion.py) <- Requires a trained Audio VAE checkpoint path + config: `--vae_checkpoint runs/audio_vae/<run_name>/checkpoint-STEP/ --vae_config <vae_config>`
 * [Pretrain Image Feature Extractor](pretrain_image_feature_extractor.py) <- TODO: needs implemented
 * [Pretrain Audio Feature Extractor](pretrain_audio_feature_extractor.py) <- TODO: needs implemented
 * [Pretrain Multimodal World Model](pretrain_multimodal.py) <- TODO: needs work
+
+Take a look at `utils/megatransformer_utils.py` for more script args that are used in nearly all pretraining scripts, or each individual script for script-specific args.
 
 ## Contributing
 please do not touch anything
