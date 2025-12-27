@@ -10,8 +10,9 @@ from typing import Optional, Union
 
 from torch.amp import autocast
 
-from model import activations, get_activation_type, norms, SinusoidalPositionEmbeddings
+from model import activations, norms, SinusoidalPositionEmbeddings
 from utils import configuration
+from utils.model_utils import get_activation_type
 
 
 class Block(nn.Module):
@@ -411,6 +412,523 @@ class ConvDenoisingUNet(nn.Module):
         h = self.final_conv(h)
 
         return h
+
+
+class DiTModulation(nn.Module):
+    """
+    Modulation layer for DiT that produces scale and shift parameters from conditioning.
+    Used for adaLN-Zero: applies learned zero-initialized gating for stable training.
+
+    Reference: "Scalable Diffusion Models with Transformers" (Peebles & Xie, 2023)
+    """
+    def __init__(self, hidden_size: int, n_modulations: int = 6, activation_name: str = 'silu'):
+        super().__init__()
+        self.n_modulations = n_modulations
+        self.silu = get_activation_type(activation_name)()
+        self.linear = nn.Linear(hidden_size, n_modulations * hidden_size)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Zero-initialize the output projection for stable training
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, c: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """
+        Args:
+            c: Conditioning embedding [B, D]
+        Returns:
+            Tuple of n_modulations tensors, each [B, 1, D] for broadcasting
+        """
+        c = self.silu(c)
+        modulations: torch.Tensor = self.linear(c)  # [B, n_modulations * D]
+        modulations = modulations.chunk(self.n_modulations, dim=-1)
+        # Add sequence dimension for broadcasting: [B, D] -> [B, 1, D]
+        return tuple(m.unsqueeze(1) for m in modulations)
+
+
+class DiTBlock(nn.Module):
+    """
+    DiT Transformer block with adaLN-Zero conditioning and optional cross-attention.
+
+    Architecture:
+        1. Pre-norm with adaptive layer norm (modulated by timestep embedding)
+        2. Self-attention with zero-initialized output gating
+        3. Pre-norm with adaptive layer norm (if context provided)
+        4. Cross-attention to context sequence with zero-initialized output gating
+        5. Pre-norm with adaptive layer norm
+        6. MLP with zero-initialized output gating
+
+    The "Zero" in adaLN-Zero means the gate values are initialized to zero,
+    so at initialization the block is an identity function - this provides
+    stable training dynamics.
+
+    For text-to-image generation (Stable Diffusion style):
+        - Timestep conditions the block via adaLN (scale/shift/gate)
+        - Text conditions the block via cross-attention (patches attend to text tokens)
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        n_self_attn_heads: int,
+        n_cross_attn_heads: int,
+        context_dim: Optional[int] = None,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        use_flash_attention: bool = True,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.n_self_attn_heads = n_self_attn_heads
+        self.self_attn_head_dim = hidden_size // n_self_attn_heads
+        self.n_cross_attn_heads = n_cross_attn_heads
+        self.cross_attn_head_dim = hidden_size // n_cross_attn_heads
+        self.context_dim = context_dim
+        self.use_flash_attention = use_flash_attention
+
+        # Layer norms (will be modulated by adaLN)
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        # Self-attention
+        self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        self.attn_proj = nn.Linear(hidden_size, hidden_size)
+        self.attn_dropout = nn.Dropout(dropout)
+
+        # Cross-attention (for text/context conditioning)
+        if context_dim is not None:
+            self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.q_cross = nn.Linear(hidden_size, hidden_size, bias=True)
+            self.kv_cross = nn.Linear(context_dim, 2 * hidden_size, bias=True)
+            self.cross_attn_proj = nn.Linear(hidden_size, hidden_size)
+            self.cross_attn_dropout = nn.Dropout(dropout)
+        else:
+            self.norm_cross = None
+            self.q_cross = None
+            self.kv_cross = None
+            self.cross_attn_proj = None
+            self.cross_attn_dropout = None
+
+        # MLP
+        mlp_hidden = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden),
+            nn.GELU(approximate='tanh'),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, hidden_size),
+            nn.Dropout(dropout),
+        )
+
+        # Modulation from timestep embedding:
+        # - Self-attention: shift, scale, gate (3)
+        # - Cross-attention: shift, scale, gate (3) - only if context_dim is set
+        # - MLP: shift, scale, gate (3)
+        n_modulations = 9 if context_dim is not None else 6
+        self.adaLN_modulation = DiTModulation(hidden_size, n_modulations=n_modulations)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize self-attention
+        nn.init.xavier_uniform_(self.qkv.weight)
+        nn.init.zeros_(self.qkv.bias)
+        nn.init.xavier_uniform_(self.attn_proj.weight)
+        nn.init.zeros_(self.attn_proj.bias)
+
+        # Initialize cross-attention if present
+        if self.q_cross is not None:
+            nn.init.xavier_uniform_(self.q_cross.weight)
+            nn.init.zeros_(self.q_cross.bias)
+            nn.init.xavier_uniform_(self.kv_cross.weight)
+            nn.init.zeros_(self.kv_cross.bias)
+            nn.init.xavier_uniform_(self.cross_attn_proj.weight)
+            nn.init.zeros_(self.cross_attn_proj.bias)
+
+        # Initialize MLP
+        for module in self.mlp:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def _self_attention(self, x: torch.Tensor) -> torch.Tensor:
+        """Multi-head self-attention."""
+        B, N, C = x.shape
+
+        # Compute Q, K, V
+        qkv: torch.Tensor = self.qkv(x)  # [B, N, 3*C]
+        qkv = qkv.reshape(B, N, 3, self.n_self_attn_heads, self.self_attn_head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, N, D]
+        q, k, v = qkv.unbind(0)  # Each: [B, H, N, D]
+
+        # Scaled dot-product attention (uses flash attention when available)
+        if self.use_flash_attention and hasattr(F, 'scaled_dot_product_attention'):
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+            )
+        else:
+            # Manual attention
+            scale = self.self_attn_head_dim ** -0.5
+            attn: torch.Tensor = (q @ k.transpose(-2, -1)) * scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_dropout(attn)
+            attn_out = attn @ v
+
+        # Reshape and project
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, C)
+        attn_out = self.attn_proj(attn_out)
+
+        return attn_out
+
+    def _cross_attention(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """Multi-head cross-attention where x attends to context."""
+        B, N, C = x.shape
+        _, S, _ = context.shape  # S = context sequence length
+
+        # Compute Q from x, K/V from context
+        q: torch.Tensor = self.q_cross(x)  # [B, N, C]
+        kv: torch.Tensor = self.kv_cross(context)  # [B, S, 2*C]
+
+        q = q.reshape(B, N, self.n_cross_attn_heads, self.cross_attn_head_dim).transpose(1, 2)  # [B, H, N, D]
+        kv = kv.reshape(B, S, 2, self.n_cross_attn_heads, self.cross_attn_head_dim)
+        kv = kv.permute(2, 0, 3, 1, 4)  # [2, B, H, S, D]
+        k, v = kv.unbind(0)  # Each: [B, H, S, D]
+
+        # Scaled dot-product attention
+        if self.use_flash_attention and hasattr(F, 'scaled_dot_product_attention'):
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.cross_attn_dropout.p if self.training else 0.0,
+            )
+        else:
+            # Manual attention
+            scale = self.cross_attn_head_dim ** -0.5
+            attn: torch.Tensor = (q @ k.transpose(-2, -1)) * scale
+            attn = attn.softmax(dim=-1)
+            attn = self.cross_attn_dropout(attn)
+            attn_out = attn @ v
+
+        # Reshape and project
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, C)
+        attn_out = self.cross_attn_proj(attn_out)
+
+        return attn_out
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: Input tokens [B, N, D]
+            c: Timestep embedding [B, D] (used for adaLN modulation)
+            context: Optional context sequence [B, S, context_dim] for cross-attention
+        Returns:
+            Output tokens [B, N, D]
+        """
+        # Get modulation parameters from timestep embedding
+        modulations = self.adaLN_modulation(c)
+
+        if self.context_dim is not None:
+            shift1, scale1, gate1, shift_cross, scale_cross, gate_cross, shift2, scale2, gate2 = modulations
+        else:
+            shift1, scale1, gate1, shift2, scale2, gate2 = modulations
+
+        # Self-attention block with adaLN-Zero
+        x_norm = self.norm1(x)
+        x_norm = x_norm * (1 + scale1) + shift1  # Modulate
+        attn_out = self._self_attention(x_norm)
+        x = x + gate1 * attn_out  # Gated residual
+
+        # Cross-attention block with adaLN-Zero (if context provided)
+        if self.context_dim is not None and context is not None:
+            x_norm = self.norm_cross(x)
+            x_norm = x_norm * (1 + scale_cross) + shift_cross  # Modulate
+            cross_out = self._cross_attention(x_norm, context)
+            x = x + gate_cross * cross_out  # Gated residual
+
+        # MLP block with adaLN-Zero
+        x_norm = self.norm2(x)
+        x_norm = x_norm * (1 + scale2) + shift2  # Modulate
+        mlp_out = self.mlp(x_norm)
+        x = x + gate2 * mlp_out  # Gated residual
+
+        return x
+
+
+class DiTFinalLayer(nn.Module):
+    """
+    Final layer for DiT that projects back to patch space.
+    Uses adaLN for final modulation before the linear projection.
+    """
+    def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = DiTModulation(hidden_size, n_modulations=2)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
+
+        # Zero-initialize output for stable training
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tokens [B, N, D]
+            c: Conditioning embedding [B, D]
+        Returns:
+            Output patches [B, N, patch_size^2 * out_channels]
+        """
+        shift, scale = self.adaLN_modulation(c)
+        x = self.norm(x)
+        x = x * (1 + scale) + shift
+        x = self.linear(x)
+        return x
+
+
+def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int, cls_token: bool = False) -> torch.Tensor:
+    """
+    Generate 2D sine-cosine positional embeddings.
+
+    Args:
+        embed_dim: Embedding dimension (must be divisible by 2)
+        grid_size: Size of the 2D grid (assumes square)
+        cls_token: If True, add a position for cls token at the beginning
+
+    Returns:
+        Positional embeddings [grid_size^2, embed_dim] or [1 + grid_size^2, embed_dim]
+    """
+    grid_h = torch.arange(grid_size, dtype=torch.float32)
+    grid_w = torch.arange(grid_size, dtype=torch.float32)
+    grid = torch.stack(torch.meshgrid(grid_h, grid_w, indexing='ij'), dim=0)  # [2, H, W]
+    grid = grid.reshape(2, -1).T  # [H*W, 2]
+
+    # Split embedding dimension for height and width
+    half_dim = embed_dim // 2
+    omega = torch.arange(half_dim // 2, dtype=torch.float32) / (half_dim // 2)
+    omega = 1.0 / (10000 ** omega)  # [D/4]
+
+    # Compute embeddings for each dimension
+    pos_h = grid[:, 0:1] * omega  # [H*W, D/4]
+    pos_w = grid[:, 1:2] * omega  # [H*W, D/4]
+
+    pos_embed = torch.cat([
+        torch.sin(pos_h), torch.cos(pos_h),
+        torch.sin(pos_w), torch.cos(pos_w),
+    ], dim=-1)  # [H*W, D]
+
+    if cls_token:
+        cls_embed = torch.zeros(1, embed_dim)
+        pos_embed = torch.cat([cls_embed, pos_embed], dim=0)
+
+    return pos_embed
+
+
+class DiTBackbone(nn.Module):
+    """
+    Diffusion Transformer (DiT) backbone for image generation.
+
+    This implements the architecture from "Scalable Diffusion Models with Transformers"
+    (Peebles & Xie, 2023) with modern improvements:
+
+    - Patchification: Converts 2D images/latents into patch sequences
+    - 2D sine-cosine positional embeddings
+    - adaLN-Zero conditioning: Adaptive layer norm with zero-initialization
+    - Standard transformer blocks with GELU activation
+    - Unpatchification: Converts back to 2D spatial layout
+
+    The model conditions on timesteps via sinusoidal embeddings, and optionally
+    on additional context (e.g., text embeddings) via cross-attention or addition.
+
+    Args:
+        config: MegaTransformerConfig with the following relevant fields:
+            - hidden_size: Transformer hidden dimension
+            - n_layers: Number of transformer blocks
+            - n_heads: Number of attention heads
+            - hidden_dropout_prob: Dropout probability
+            - image_size: Input image/latent spatial size
+            - image_encoder_patch_size: Patch size for patchification
+    """
+    def __init__(self, hidden_size, n_layers, n_self_attn_heads, n_cross_attn_heads, dropout, mlp_ratio, patch_size, in_channels, context_dim, image_size):
+        super().__init__()
+        self.use_gradient_checkpointing = False
+
+        # Extract config values with defaults suitable for DiT
+        self.hidden_size = hidden_size
+        self.n_layers = n_layers
+        self.n_self_attn_heads = n_self_attn_heads
+        self.n_cross_attn_heads = n_cross_attn_heads
+        self.dropout = dropout
+        self.mlp_ratio = mlp_ratio
+
+        # Patch embedding parameters
+        self.patch_size = patch_size
+        self.in_channels = in_channels  # Latent channels from VAE
+        self.out_channels = self.in_channels  # Predict same number of channels
+
+        self.context_dim = context_dim
+
+        # Compute grid size (number of patches per side)
+        image_size = image_size  # Latent size, not full image
+        self.grid_size = image_size // self.patch_size
+        self.num_patches = self.grid_size ** 2
+
+        # Patch embedding: project patches to hidden dimension
+        self.patch_embed = nn.Conv2d(
+            self.in_channels,
+            self.hidden_size,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+        )
+
+        # Positional embeddings (2D sine-cosine, not learned)
+        pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
+        self.register_buffer('pos_embed', pos_embed.unsqueeze(0))  # [1, N, D]
+
+        # Timestep embedding
+        self.time_embed = nn.Sequential(
+            SinusoidalPositionEmbeddings(self.hidden_size),
+            nn.Linear(self.hidden_size, self.hidden_size * 4),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size * 4, self.hidden_size),
+        )
+
+        self.context_proj = nn.Linear(self.context_dim, self.hidden_size)
+
+        # Transformer blocks with optional cross-attention
+        # If context_dim is set, blocks will have cross-attention layers
+        cross_attn_dim = self.hidden_size if self.context_dim is not None else None
+        self.blocks = nn.ModuleList([
+            DiTBlock(
+                hidden_size=self.hidden_size,
+                n_self_attn_heads=self.n_self_attn_heads,
+                n_cross_attn_heads=self.n_cross_attn_heads,
+                context_dim=cross_attn_dim,
+                mlp_ratio=self.mlp_ratio,
+                dropout=self.dropout,
+                use_flash_attention=True,
+            )
+            for _ in range(self.n_layers)
+        ])
+
+        # Final layer
+        self.final_layer = DiTFinalLayer(
+            hidden_size=self.hidden_size,
+            patch_size=self.patch_size,
+            out_channels=self.out_channels,
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize patch embedding
+        w = self.patch_embed.weight.data
+        nn.init.xavier_uniform_(w.view(w.shape[0], -1))
+        nn.init.zeros_(self.patch_embed.bias)
+
+        # Initialize timestep embedding MLP
+        for module in self.time_embed:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+        nn.init.xavier_uniform_(self.context_proj.weight)
+        nn.init.zeros_(self.context_proj.bias)
+
+    def patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Convert image to patch sequence.
+
+        Args:
+            x: Input image [B, C, H, W]
+        Returns:
+            Patch sequence [B, N, D] where N = (H/P) * (W/P)
+        """
+        x = self.patch_embed(x)  # [B, D, H/P, W/P]
+        x = x.flatten(2).transpose(1, 2)  # [B, N, D]
+        return x
+
+    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Convert patch sequence back to image.
+
+        Args:
+            x: Patch sequence [B, N, patch_size^2 * C]
+        Returns:
+            Image [B, C, H, W]
+        """
+        B = x.shape[0]
+        x = x.reshape(B, self.grid_size, self.grid_size, self.patch_size, self.patch_size, self.out_channels)
+        x = x.permute(0, 5, 1, 3, 2, 4)  # [B, C, H/P, P, W/P, P]
+        x = x.reshape(B, self.out_channels, self.grid_size * self.patch_size, self.grid_size * self.patch_size)
+        return x
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        condition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass of DiT backbone.
+
+        Args:
+            x: Noisy input [B, C, H, W]
+            timesteps: Diffusion timesteps [B]
+            condition: Optional conditioning tensor. Can be:
+                - Class labels [B] (integers) if num_classes > 0
+                - Context embeddings [B, T, context_dim] if context_dim is set
+                  (will be projected and used for cross-attention)
+                - None for unconditional generation
+
+        Returns:
+            Predicted noise or v [B, C, H, W]
+        """
+        # Ensure input dtype matches model (for bf16/fp16 training with DeepSpeed)
+        model_dtype = self.patch_embed.weight.dtype
+        x = x.to(dtype=model_dtype)
+        if condition is not None:
+            condition = condition.to(dtype=model_dtype)
+
+        # Patchify input
+        x = self.patchify(x)  # [B, N, D]
+
+        # Add positional embeddings
+        x = x + self.pos_embed[:, :x.shape[1], :]
+
+        # Compute timestep embedding
+        t_emb = self.time_embed(timesteps.to(x.dtype))  # [B, D]
+
+        # Process conditioning
+        c = t_emb  # Timestep embedding for adaLN modulation
+        context = None  # Context sequence for cross-attention
+
+        # Text-conditional: condition is [B, T, context_dim]
+        # Project context sequence for cross-attention
+        if condition is not None and self.context_dim is not None:
+            context = self.context_proj(condition)  # [B, T, hidden_size]
+
+            # Also add pooled context to timestep embedding for global conditioning
+            pooled_context = context.mean(dim=1)  # [B, hidden_size]
+            c = c + pooled_context
+
+        # Apply transformer blocks with cross-attention
+        for block in self.blocks:
+            if self.use_gradient_checkpointing and self.training:
+                x = checkpoint.checkpoint(block, x, c, context, use_reentrant=False)
+            else:
+                x = block(x, c, context)
+
+        # Final layer
+        x = self.final_layer(x, c)  # [B, N, patch_size^2 * C]
+
+        # Unpatchify to image
+        x = self.unpatchify(x)  # [B, C, H, W]
+
+        return x
 
 
 class GaussianDiffusion(nn.Module):
@@ -1099,3 +1617,432 @@ class GaussianDiffusion(nn.Module):
             # restore model example dimension
             model_output = model_output.view(b, e, c, h, w)
         return model_output, [mse_loss]
+
+
+# =============================================================================
+# Flow Matching (Rectified Flow)
+# =============================================================================
+
+class FlowMatching(nn.Module):
+    """
+    Flow Matching / Rectified Flow implementation.
+
+    A simpler alternative to diffusion models that uses optimal transport paths
+    between noise and data distributions.
+
+    Key differences from GaussianDiffusion:
+    - Linear interpolation: x_t = (1-t)*x_0 + t*noise (no complex noise schedule)
+    - Velocity prediction: model predicts v = noise - x_0
+    - ODE sampling: deterministic integration from t=1 to t=0
+    - Simpler training objective, often faster convergence
+
+    Reference:
+    - "Flow Matching for Generative Modeling" (Lipman et al. 2022)
+    - "Rectified Flow" (Liu et al. 2022)
+
+    Usage:
+        model = FlowMatching(
+            config=config,
+            unet=DiTBackbone(config),
+            in_channels=4,
+        )
+
+        # Training
+        output, loss = model(latents, condition=text_embeddings)
+
+        # Sampling
+        samples = model.sample(device, batch_size=4, condition=text_embeddings)
+    """
+
+    def __init__(
+        self,
+        config: configuration.MegaTransformerConfig,
+        unet: nn.Module,
+        in_channels: int,
+        sigma_min: float = 0.0,  # Minimum noise level (0 = pure data at t=0)
+        cfg_dropout_prob: float = 0.1,
+        timestep_sampling: str = "logit_normal",
+        logit_normal_mean: float = 0.0,
+        logit_normal_std: float = 1.0,
+    ):
+        """
+        Args:
+            config: Model configuration
+            unet: Denoising backbone (DiTBackbone, ConvDenoisingUNet, etc.)
+            in_channels: Number of input channels (latent channels from VAE)
+            sigma_min: Minimum noise level at t=0 (usually 0)
+            cfg_dropout_prob: Probability of dropping conditioning for CFG
+            timestep_sampling: How to sample timesteps ("uniform" or "logit_normal")
+            logit_normal_mean: Mean for logit-normal sampling
+            logit_normal_std: Std for logit-normal sampling
+        """
+        super().__init__()
+
+        self.config = config
+        self.unet = unet
+        self.in_channels = in_channels
+        self.sigma_min = sigma_min
+        self.cfg_dropout_prob = cfg_dropout_prob
+        self.timestep_sampling = timestep_sampling
+        self.logit_normal_mean = logit_normal_mean
+        self.logit_normal_std = logit_normal_std
+
+    def _sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Sample timesteps t ∈ [0, 1] for training.
+
+        Args:
+            batch_size: Number of samples
+            device: Device to create tensor on
+
+        Returns:
+            Tensor of shape [batch_size] with values in [0, 1]
+        """
+        if self.timestep_sampling == "logit_normal":
+            # Logit-normal distribution biased toward middle timesteps
+            u = torch.randn(batch_size, device=device)
+            u = self.logit_normal_mean + self.logit_normal_std * u
+            t = torch.sigmoid(u)
+        else:
+            # Uniform sampling
+            t = torch.rand(batch_size, device=device)
+
+        # Clamp to avoid numerical issues at boundaries
+        t = t.clamp(min=1e-5, max=1.0 - 1e-5)
+
+        return t
+
+    def interpolate(
+        self,
+        x_0: torch.Tensor,
+        noise: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Linear interpolation between data and noise.
+
+        x_t = (1 - t) * x_0 + t * noise
+
+        Args:
+            x_0: Clean data [B, C, H, W]
+            noise: Gaussian noise [B, C, H, W]
+            t: Timesteps [B] in range [0, 1]
+
+        Returns:
+            Interpolated samples x_t [B, C, H, W]
+        """
+        t = t.view(-1, 1, 1, 1)  # [B, 1, 1, 1] for broadcasting
+        x_t = (1 - t) * x_0 + t * noise
+        return x_t
+
+    def get_velocity(
+        self,
+        x_0: torch.Tensor,
+        noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute target velocity for flow matching.
+
+        v = noise - x_0 (direction from data to noise)
+
+        The model learns to predict this velocity, which defines the flow field.
+
+        Args:
+            x_0: Clean data [B, C, H, W]
+            noise: Gaussian noise [B, C, H, W]
+
+        Returns:
+            Target velocity [B, C, H, W]
+        """
+        return noise - x_0
+
+    def predict_x0_from_velocity(
+        self,
+        x_t: torch.Tensor,
+        v: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Predict x_0 from current state and velocity.
+
+        Given: x_t = (1-t)*x_0 + t*noise, v = noise - x_0
+        Solve: x_0 = x_t - t*v
+
+        Args:
+            x_t: Current state [B, C, H, W]
+            v: Predicted velocity [B, C, H, W]
+            t: Timesteps [B]
+
+        Returns:
+            Predicted x_0 [B, C, H, W]
+        """
+        t = t.view(-1, 1, 1, 1)
+        x_0 = x_t - t * v
+        return x_0
+
+    def training_step(
+        self,
+        x_0: torch.Tensor,
+        condition: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute training loss for flow matching.
+
+        Args:
+            x_0: Clean data [B, C, H, W]
+            condition: Optional conditioning [B, T, D]
+
+        Returns:
+            Tuple of (model_output, loss)
+        """
+        batch_size = x_0.shape[0]
+        device = x_0.device
+
+        # Sample timesteps and noise
+        t = self._sample_timesteps(batch_size, device)
+        noise = torch.randn_like(x_0).to(x_0.dtype)
+
+        # Interpolate to get x_t
+        x_t = self.interpolate(x_0, noise, t)
+
+        # Get target velocity
+        velocity_target = self.get_velocity(x_0, noise)
+
+        # Apply CFG dropout (drop conditioning with some probability)
+        if condition is not None and self.cfg_dropout_prob > 0 and self.training:
+            dropout_mask = torch.rand(batch_size, device=device) < self.cfg_dropout_prob
+            condition = condition.clone()
+            condition[dropout_mask] = 0.0
+
+        # Model prediction
+        # Note: t needs to be passed in a format the model expects
+        # For DiT, we typically pass t as floats in [0, 1]
+        velocity_pred = self.unet(x_t, t, condition)
+
+        # MSE loss on velocity
+        loss = F.mse_loss(velocity_pred, velocity_target)
+
+        return velocity_pred, loss
+
+    @torch.no_grad()
+    def euler_step(
+        self,
+        x: torch.Tensor,
+        t_curr: float,
+        t_next: float,
+        condition: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Single Euler step for ODE integration.
+
+        dx/dt = v(x, t) => x_{t+dt} = x_t + dt * v(x_t, t)
+
+        For flow matching we integrate from t=1 (noise) to t=0 (data),
+        so dt is negative.
+
+        Args:
+            x: Current state [B, C, H, W]
+            t_curr: Current timestep
+            t_next: Next timestep
+            condition: Optional conditioning
+            guidance_scale: CFG scale (1.0 = no guidance)
+
+        Returns:
+            Updated state [B, C, H, W]
+        """
+        batch_size = x.shape[0]
+        device = x.device
+
+        # Time tensor
+        t = torch.full((batch_size,), t_curr, device=device, dtype=x.dtype)
+
+        # Predict velocity
+        if guidance_scale != 1.0 and condition is not None:
+            # Classifier-free guidance
+            v_cond = self.unet(x, t, condition)
+            v_uncond = self.unet(x, t, torch.zeros_like(condition))
+            v = v_uncond + guidance_scale * (v_cond - v_uncond)
+        else:
+            v = self.unet(x, t, condition)
+
+        # Euler step (note: t_next < t_curr when going from noise to data)
+        dt = t_next - t_curr
+        x_next = x + dt * v
+
+        return x_next
+
+    @torch.no_grad()
+    def heun_step(
+        self,
+        x: torch.Tensor,
+        t_curr: float,
+        t_next: float,
+        condition: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Heun's method (improved Euler) for more accurate ODE integration.
+
+        This is a second-order method that uses a predictor-corrector approach.
+
+        Args:
+            x: Current state [B, C, H, W]
+            t_curr: Current timestep
+            t_next: Next timestep
+            condition: Optional conditioning
+            guidance_scale: CFG scale
+
+        Returns:
+            Updated state [B, C, H, W]
+        """
+        batch_size = x.shape[0]
+        device = x.device
+        dt = t_next - t_curr
+
+        def get_velocity(x_in, t_val):
+            t = torch.full((batch_size,), t_val, device=device, dtype=x.dtype)
+            if guidance_scale != 1.0 and condition is not None:
+                v_cond = self.unet(x_in, t, condition)
+                v_uncond = self.unet(x_in, t, torch.zeros_like(condition))
+                return v_uncond + guidance_scale * (v_cond - v_uncond)
+            else:
+                return self.unet(x_in, t, condition)
+
+        # Predictor (Euler step)
+        v1 = get_velocity(x, t_curr)
+        x_pred = x + dt * v1
+
+        # Corrector
+        v2 = get_velocity(x_pred, t_next)
+        x_next = x + 0.5 * dt * (v1 + v2)
+
+        return x_next
+
+    @torch.no_grad()
+    def sample(
+        self,
+        device: torch.device,
+        batch_size: int,
+        condition: Optional[torch.Tensor] = None,
+        num_steps: int = 50,
+        guidance_scale: float = 1.0,
+        solver: str = "euler",  # "euler" or "heun"
+        generator: Optional[torch.Generator] = None,
+        return_intermediate: bool = False,
+        **kwargs,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, list]]:
+        """
+        Generate samples using ODE integration from noise to data.
+
+        Args:
+            device: Device to generate on
+            batch_size: Number of samples to generate
+            condition: Optional conditioning [B, T, D]
+            num_steps: Number of integration steps
+            guidance_scale: Classifier-free guidance scale
+            solver: ODE solver ("euler" or "heun")
+            generator: Optional random generator for reproducibility
+            return_intermediate: Return intermediate states
+
+        Returns:
+            Generated samples [B, C, H, W], optionally with intermediates
+        """
+        # Get image size from config or kwargs
+        image_size = kwargs.get('image_size', getattr(self.config, 'image_size', 32))
+
+        # Start from pure noise at t=1
+        if generator is not None:
+            x = torch.randn(
+                batch_size, self.in_channels, image_size, image_size,
+                device=device, generator=generator
+            )
+        else:
+            x = torch.randn(
+                batch_size, self.in_channels, image_size, image_size,
+                device=device
+            )
+
+        # Time steps from t=1 to t=0
+        timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+
+        intermediates = [x.clone()] if return_intermediate else None
+
+        # Choose solver
+        step_fn = self.heun_step if solver == "heun" else self.euler_step
+
+        # Integration loop
+        for i in range(num_steps):
+            t_curr = timesteps[i].item()
+            t_next = timesteps[i + 1].item()
+
+            x = step_fn(x, t_curr, t_next, condition, guidance_scale)
+
+            if return_intermediate:
+                intermediates.append(x.clone())
+
+        if return_intermediate:
+            return x, intermediates, None
+        return x
+
+    def forward(
+        self,
+        x_0: torch.Tensor,
+        condition: Optional[torch.Tensor] = None,
+        return_diagnostics: bool = False,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """
+        Forward pass for training.
+
+        Args:
+            x_0: Clean data [B, C, H, W] or [B, E, C, H, W]
+            condition: Optional conditioning
+
+        Returns:
+            Tuple of (model_output, [loss])
+        """
+        # Handle batched examples dimension
+        if len(x_0.shape) == 5:
+            b, e, c, h, w = x_0.shape
+            x_0 = x_0.view(-1, c, h, w)
+        else:
+            b, c, h, w = x_0.shape
+            e = None
+
+        if condition is not None and len(condition.shape) == 4:
+            condition = condition.view(-1, *condition.shape[2:])
+
+        model_output, loss = self.training_step(x_0, condition)
+
+        if e is not None:
+            model_output = model_output.view(b, e, c, h, w)
+
+        return model_output, loss, None
+
+
+def create_flow_matching_model(
+    config: configuration.MegaTransformerConfig,
+    unet: nn.Module,
+    latent_channels: int = 4,
+    cfg_dropout_prob: float = 0.1,
+    timestep_sampling: str = "logit_normal",
+) -> FlowMatching:
+    """
+    Create a Flow Matching model with DiT backbone.
+
+    Args:
+        config: Model configuration
+        latent_channels: Number of VAE latent channels
+        cfg_dropout_prob: CFG dropout probability
+        timestep_sampling: Timestep sampling strategy
+
+    Returns:
+        FlowMatching model
+    """
+    return FlowMatching(
+        config=config,
+        unet=unet,
+        in_channels=latent_channels,
+        cfg_dropout_prob=cfg_dropout_prob,
+        timestep_sampling=timestep_sampling,
+    )

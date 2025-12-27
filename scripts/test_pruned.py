@@ -1,6 +1,7 @@
 import torch
 import torchaudio
 
+from utils.audio_utils import SharedWindowBuffer
 from utils.model_loading_utils import load_pruned_vocoder
 
 
@@ -15,7 +16,6 @@ if sr != 16000:
     waveform = torchaudio.functional.resample(waveform, sr, 16000)
 
 # Compute mel spectrogram (you'll need your mel transform)
-from model.audio.shared_window_buffer import SharedWindowBuffer
 shared_buffer = SharedWindowBuffer()
 mel_transform = torchaudio.transforms.MelSpectrogram(
     sample_rate=16000,

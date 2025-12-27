@@ -1,9 +1,10 @@
-from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.audio.shared_window_buffer import SharedWindowBuffer
+from typing import Optional
+
+from utils.audio_utils import SharedWindowBuffer
 
 
 class PeriodDiscriminator(nn.Module):

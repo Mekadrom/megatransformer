@@ -1,7 +1,8 @@
 import torch.nn as nn
 
-from model import activations, get_activation_type
+from model import activations
 from model.vae import VAE
+from utils.model_utils import get_activation_type
 
 
 class ImageVAEEncoder(nn.Module):
@@ -115,6 +116,23 @@ model_config_lookup = {
             latent_channels=latent_channels,
             out_channels=3,
             intermediate_channels=[256, 128, 64],
+            activation_fn="silu"
+        ),
+        **kwargs
+    ),
+    # ~3M total params (~1.5M encoder, ~1.5M decoder)
+    "medium": lambda latent_channels, **kwargs: VAE(
+        # creates 16x16 latents for 256x256 images
+        encoder=ImageVAEEncoder(
+            in_channels=3,
+            latent_channels=latent_channels,
+            intermediate_channels=[128, 256, 512],
+            activation_fn="silu"
+        ),
+        decoder=ImageVAEDecoder(
+            latent_channels=latent_channels,
+            out_channels=3,
+            intermediate_channels=[512, 256, 128],
             activation_fn="silu"
         ),
         **kwargs

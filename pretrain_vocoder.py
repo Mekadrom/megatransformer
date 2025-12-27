@@ -25,11 +25,12 @@ from dataset_loading.vocoder_dataset import CachedVocoderDataset, VocoderDataCol
 from model.audio import discriminators
 from model.audio.criteria import compute_discriminator_losses, compute_generator_losses
 from model.audio.discriminators import CombinedDiscriminator
-from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders import vocoders
 from model.audio.vocoders.vocoders import VocoderWithLoss
 from utils import megatransformer_utils
-from utils.model_loading_utils import load_pruned_vocoder
+from utils.audio_utils import SharedWindowBuffer
+from utils.model_loading_utils import load_model, load_pruned_vocoder
+from utils.training_utils import EarlyStoppingCallback, setup_int8_training
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -745,7 +746,7 @@ def main():
             high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
             direct_mag_loss_weight=direct_mag_loss_weight,
         )
-        model, model_loaded = megatransformer_utils.load_model(args.start_step is not None, model, run_dir)
+        model, model_loaded = load_model(args.start_step is not None, model, run_dir)
 
     # Determine device for discriminator
     if torch.cuda.is_available():
@@ -799,7 +800,7 @@ def main():
             print(f"    MSD parameters: {sum(p.numel() for p in discriminator.msd.parameters()):,}")
             print(f"    MRSD parameters: {sum(p.numel() for p in discriminator.mrsd.parameters()):,}")
 
-    model = megatransformer_utils.setup_int8_training(args, model)
+    model = setup_int8_training(args, model)
 
     def check_weight_stats(model):
         """Print weight statistics to verify initialization."""
@@ -920,7 +921,7 @@ def main():
     trainer.add_callback(reconstruction_callback)
 
     if args.stop_step > 0:
-        early_stopping_callback = megatransformer_utils.EarlyStoppingCallback(stop_step=args.stop_step)
+        early_stopping_callback = EarlyStoppingCallback(stop_step=args.stop_step)
         trainer.add_callback(early_stopping_callback)
     
     reconstruction_callback.trainer = trainer

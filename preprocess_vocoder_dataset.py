@@ -10,7 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
 from dataset_loading.audio_loading import extract_waveforms, extract_mels, remove_mains_hum
-from model.audio.shared_window_buffer import SharedWindowBuffer
+from utils.audio_utils import SharedWindowBuffer
 
 
 def apply_augmentations_fast(

@@ -4,8 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model import activations, attention, get_activation_type, SimpleBlock
+from model import activations, attention, SimpleBlock
 from utils import configuration
+from utils.model_utils import get_activation_type
 
 
 class AudioConv(nn.Module):

@@ -6,8 +6,7 @@ from typing import Literal, Optional
 import logging
 import torch
 
-from model.audio import configurable_mel_spectrogram
-from model.audio.shared_window_buffer import SharedWindowBuffer
+from utils.audio_utils import configurable_mel_spectrogram, SharedWindowBuffer
 
 
 logging.basicConfig(level=logging.INFO)

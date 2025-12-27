@@ -8,8 +8,9 @@ from typing import Union
 from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
 
-from . import activations, get_activation_type, kv_cache
+from . import activations, kv_cache
 from utils import configuration
+from utils.model_utils import get_activation_type
 
 
 def create_alibi_bias(n_heads, maxlen):

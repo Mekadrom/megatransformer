@@ -3,9 +3,10 @@ import torch.nn as nn
 
 from typing import Optional, Union
 
-from model import create_sinusoidal_1d_pos_encoding, kv_cache, SimpleBlock
+from model import kv_cache, SimpleBlock
 from utils import configuration
 from utils.megatransformer_utils import embedding_weight_init
+from utils.model_utils import create_sinusoidal_1d_pos_encoding
 
 
 class TextFeatureExtractor(nn.Module):

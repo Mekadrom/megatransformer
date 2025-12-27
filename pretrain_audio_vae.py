@@ -28,10 +28,12 @@ from model.audio.discriminators import (
     compute_mel_discriminator_loss,
     compute_mel_generator_gan_loss,
 )
-from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vae import model_config_lookup
 from model.audio.vocoders.vocoders import model_config_lookup as vocoder_config_lookup
 from utils import megatransformer_utils
+from utils.audio_utils import SharedWindowBuffer
+from utils.model_loading_utils import load_model
+from utils.training_utils import EarlyStoppingCallback, setup_int8_training
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -218,7 +220,7 @@ class AudioVAEReconstructionCallback(TrainerCallback):
                 shared_window_buffer=self.shared_window_buffer,
             )
 
-            megatransformer_utils.load_model(False, vocoder, self.vocoder_checkpoint_path)
+            load_model(False, vocoder, self.vocoder_checkpoint_path)
 
             vocoder.eval()
             self.vocoder = vocoder
@@ -717,7 +719,7 @@ def main():
     recon_loss_weight = float(unk_dict.get("recon_loss_weight", 1.0))
     mse_loss_weight = float(unk_dict.get("mse_loss_weight", 1.0))
     l1_loss_weight = float(unk_dict.get("l1_loss_weight", 0.0))
-    kl_divergence_loss_weight = float(unk_dict.get("kl_divergence_loss_weight", 0.001))
+    kl_divergence_loss_weight = float(unk_dict.get("kl_divergence_loss_weight", 1e-3))
 
     # Perceptual loss type: "vgg", "lpips", or "none" EXPERIMENTAL
     perceptual_loss_weight = float(unk_dict.get("perceptual_loss_weight", 0.0))
@@ -755,7 +757,7 @@ def main():
     )
 
     # Try to load existing checkpoint
-    model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+    model, model_loaded = load_model(False, model, run_dir)
 
     # Determine device for discriminator
     if torch.cuda.is_available():
@@ -812,7 +814,7 @@ def main():
             print(f"  Discriminator LR: {discriminator_lr}")
             print(f"  GAN start step: {gan_start_step}")
 
-    model = megatransformer_utils.setup_int8_training(args, model)
+    model = setup_int8_training(args, model)
 
     if not os.path.exists(run_dir):
         os.makedirs(run_dir, exist_ok=True)
@@ -903,7 +905,7 @@ def main():
     trainer.add_callback(visualization_callback)
 
     if args.stop_step > 0:
-        early_stopping_callback = megatransformer_utils.EarlyStoppingCallback(stop_step=args.stop_step)
+        early_stopping_callback = EarlyStoppingCallback(stop_step=args.stop_step)
         trainer.add_callback(early_stopping_callback)
 
     visualization_callback.trainer = trainer

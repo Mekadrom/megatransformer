@@ -128,12 +128,19 @@ class VAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def forward(self, x, mask=None, speaker_embedding=None):
+    def encode(self, x) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.encoder(x)
+    
+    def decode(self, z, speaker_embedding=None) -> torch.Tensor:
+        return self.decoder(z, speaker_embedding=speaker_embedding)
+
+    def forward(self, x=None, mask=None, speaker_embedding=None, image=None):
         """
         Forward pass through VAE.
 
         Args:
             x: Input tensor [B, C, H, W] or [B, C, H, T] for audio
+            image: Alternative name for x (for compatibility with data collators)
             mask: Optional mask tensor [B, T] where 1 = valid, 0 = padding.
                   If provided, reconstruction loss is only computed on valid regions.
                   The mask is in the time dimension (last dim of x).
@@ -146,6 +153,12 @@ class VAE(nn.Module):
             logvar: Latent log variance
             losses: Dictionary of loss components
         """
+        # Support both 'x' and 'image' as input parameter names
+        if x is None and image is not None:
+            x = image
+        elif x is None and image is None:
+            raise ValueError("Either 'x' or 'image' must be provided")
+
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
 

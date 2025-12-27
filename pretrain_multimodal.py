@@ -19,16 +19,17 @@ import torchvision
 from typing import Any, Optional
 
 from PIL import Image
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling, PreTrainedTokenizer, Trainer, TrainingArguments, TrainerCallback
 
 from dataset_loading import audio_loading, multimodal_dataset
 from model import causal, multimodal, recurrent
-from model.audio.shared_window_buffer import SharedWindowBuffer
 from utils import megatransformer_utils, training_utils
-from utils.training_utils import get_writer, trainer_lookup
+from utils.audio_utils import SharedWindowBuffer
+from utils.model_loading_utils import load_model
+from utils.training_utils import create_multimodal_optimizer, get_writer, trainer_lookup, setup_int8_training
 
 
 class GenerationCallback(TrainerCallback):
@@ -124,7 +125,7 @@ class MultimodalGenerationCallback(TrainerCallback):
             
             text_only_inputs = self.tokenizer(self.text_only_prompts, padding=True, return_tensors="pt").to(model.device)
             with torch.no_grad():
-                with autocast('cuda' if model.device.type == 'cuda' else 'cpu', dtype=torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32):
+                with autocast(device_type=model.device.type, dtype=torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32):
                     outputs = model.generate(
                         input_ids=text_only_inputs["input_ids"],
                         attention_mask=text_only_inputs["attention_mask"],
@@ -551,7 +552,7 @@ else:
 shared_window_buffer = SharedWindowBuffer()
 
 model = model_maker.model_config_lookup(args.config)(tokenizer, args.max_position_embeddings)
-model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+model, model_loaded = load_model(False, model, run_dir)
 
 if args.local_rank == 0 or not args.use_deepspeed:
     print(f"model structure: {model}")
@@ -632,7 +633,7 @@ if args.local_rank == 0 or not args.use_deepspeed:
     print(f"DeepSpeed enabled: {args.use_deepspeed}")
     print(f"XLA enabled: {args.use_xla}")
 
-model = megatransformer_utils.setup_int8_training(args, model)
+model = setup_int8_training(args, model)
 
 if not os.path.exists(run_dir):
     os.makedirs(run_dir)
@@ -730,7 +731,7 @@ else:
 
 optimizer = None
 if "multimodal" in args.config.lower() and not "frankenstein" in args.config.lower():
-    optimizer = megatransformer_utils.create_multimodal_optimizer(model, args.weight_decay)
+    optimizer = create_multimodal_optimizer(model, args.weight_decay)
 
 trainer = trainer_lookup(args, args.trainer)(
     model=model,

@@ -18,7 +18,7 @@ os.makedirs("logs", exist_ok=True)
 x = torch.linspace(-5, 5, 1000)
 x_np = x.numpy()
 
-# Non-parameterized activation functions from megatransformer_utils.get_activation_type
+# Non-parameterized activation functions from model_utils.get_activation_type
 activations = {
     "ReLU": nn.ReLU(),
     "GELU": nn.GELU(),

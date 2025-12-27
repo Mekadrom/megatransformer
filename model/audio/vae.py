@@ -1,7 +1,8 @@
 import torch.nn as nn
 
-from model import activations, get_activation_type
+from model import activations
 from model.vae import VAE
+from utils.model_utils import get_activation_type
 
 
 class AudioVAEEncoder(nn.Module):

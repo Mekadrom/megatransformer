@@ -1,13 +1,15 @@
-from torch.utils.data import IterableDataset
-from transformers import DataCollatorForLanguageModeling, PreTrainedTokenizer
-from typing import Iterator, Any, List, Dict, Union, Optional
-from dataset_loading import load_dataset
-
 import random
 import time
+
 import torch
 
-from model.audio.shared_window_buffer import SharedWindowBuffer
+from typing import Iterator, Any, List, Dict, Union, Optional
+
+from torch.utils.data import IterableDataset
+from transformers import DataCollatorForLanguageModeling, PreTrainedTokenizer
+
+from dataset_loading import load_dataset
+from utils.audio_utils import SharedWindowBuffer
 
 
 class LimitedStreamDataset(IterableDataset):

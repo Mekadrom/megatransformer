@@ -30,8 +30,8 @@ from tqdm import tqdm
 
 from dataset_loading import audio_loading
 from dataset_loading.vocoder_dataset import CachedVocoderDataset, VocoderDataCollator
-from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders import vocoders
+from utils.audio_utils import SharedWindowBuffer
 from utils.model_loading_utils import load_model
 
 

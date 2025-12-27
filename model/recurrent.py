@@ -7,9 +7,10 @@ from typing import Optional, Union
 from torch import nn
 from transformers import PreTrainedModel, GenerationMixin
 
-from model import causal, create_norm, create_sinusoidal_1d_pos_encoding, kv_cache, Mult, recurrent_criteria, Sum
+from model import causal, kv_cache, Mult, recurrent_criteria, Sum
 from utils import configuration
 from utils.megatransformer_utils import transformer_weight_init
+from utils.model_utils import create_norm, create_sinusoidal_1d_pos_encoding
 
 
 class RecurrentBlockOutput:

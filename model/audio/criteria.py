@@ -5,9 +5,8 @@ import torchaudio
 
 from typing import Optional
 
-from model.audio import configurable_mel_spectrogram
-from model.audio.shared_window_buffer import SharedWindowBuffer
 from utils import configuration
+from utils.audio_utils import configurable_mel_spectrogram, SharedWindowBuffer
 
 
 # Multi-Resolution STFT Loss for better vocoder training

@@ -24,12 +24,14 @@ from transformers import TrainingArguments, Trainer, TrainerCallback, T5EncoderM
 from transformers.integrations import TensorBoardCallback
 
 from dataset_loading.audio_diffusion_dataset import CachedAudioDiffusionDataset, AudioDiffusionDataCollator
-from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.diffusion import AudioConditionalGaussianDiffusion, model_config_lookup
 from model.audio.vocoders.vocoders import model_config_lookup as vocoder_config_lookup
 from model.audio.vae import model_config_lookup as audio_vae_config_lookup
 from model.ema import EMAModel
 from utils import megatransformer_utils
+from utils.audio_utils import SharedWindowBuffer
+from utils.model_loading_utils import load_model
+from utils.training_utils import EarlyStoppingCallback
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -217,7 +219,7 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
                 shared_window_buffer=self.shared_window_buffer,
             )
 
-            megatransformer_utils.load_model(False, vocoder, self.vocoder_checkpoint_path)
+            load_model(False, vocoder, self.vocoder_checkpoint_path)
 
             vocoder.eval()
             self.vocoder = vocoder
@@ -750,7 +752,7 @@ def main():
     # Try to load existing checkpoint (only if not using resume_from_checkpoint,
     # which handles loading itself with proper RNG state restoration)
     if args.resume_from_checkpoint is None:
-        model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+        model, model_loaded = load_model(False, model, run_dir)
     else:
         model_loaded = False  # Let trainer.train(resume_from_checkpoint=...) handle it
 
@@ -891,7 +893,7 @@ def main():
     trainer.add_callback(visualization_callback)
 
     if args.stop_step > 0:
-        early_stopping_callback = megatransformer_utils.EarlyStoppingCallback(stop_step=args.stop_step)
+        early_stopping_callback = EarlyStoppingCallback(stop_step=args.stop_step)
         trainer.add_callback(early_stopping_callback)
 
     visualization_callback.trainer = trainer

@@ -1,8 +1,9 @@
-from dataset_loading import audio_loading, generic_text, image_loading, wikitext
-from transformers import PreTrainedTokenizer
 from typing import Literal
 
-from model.audio.shared_window_buffer import SharedWindowBuffer
+from transformers import PreTrainedTokenizer
+
+from dataset_loading import audio_loading, generic_text, image_loading, wikitext
+from utils.audio_utils import SharedWindowBuffer
 
 
 text_train_dataset_name = "gair-prox/FineWeb-pro"

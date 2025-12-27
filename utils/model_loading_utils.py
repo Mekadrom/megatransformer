@@ -6,9 +6,9 @@ import torch.nn as nn
 
 
 from . import configuration
-from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders.freq_domain_vocoder import LightHeadedFrequencyDomainVocoder, SplitBandLowFreqMeanFreqDomainVocoder, SplitBandFrequencyDomainVocoder
 from model.audio.vocoders.vocoders import VocoderWithLoss
+from utils.audio_utils import SharedWindowBuffer
 
 
 def load_model(finetune, model, run_dir):

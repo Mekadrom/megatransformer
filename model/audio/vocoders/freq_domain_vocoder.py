@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model import activations, get_activation_type
-from model.audio.shared_window_buffer import SharedWindowBuffer
+from model import activations
+from utils.audio_utils import SharedWindowBuffer
+from utils.model_utils import get_activation_type
 
 
 class ConvNeXtBlock(nn.Module):

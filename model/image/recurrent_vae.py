@@ -19,8 +19,10 @@ import torch.nn.functional as F
 
 from typing import Literal, Optional, Tuple, Dict, Any, List
 
-from model import get_activation_type, recurrent_criteria
+from model import recurrent_criteria
 from model.vae import VGGPerceptualLoss, LPIPSLoss
+from utils.model_utils import get_activation_type
+
 
 # Debug logger for numerical stability diagnostics
 _logger = logging.getLogger(__name__)

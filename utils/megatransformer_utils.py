@@ -117,7 +117,7 @@ def parse_args():
     argparser.add_argument('--max_steps', type=int, default=-1, help='Max steps for training')
     argparser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     argparser.add_argument('--gradient_accumulation_steps', type=int, default=32, help='Gradient accumulation steps')
-    argparser.add_argument('--warmup_ratio', type=float, default=0.03, help='Warmup ratio')
+    argparser.add_argument('--warmup_ratio', type=float, default=0.0, help='Warmup ratio')
     argparser.add_argument('--warmup_steps', type=int, default=0, help='Warmup steps')
     argparser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm')
     argparser.add_argument('--fp16', action='store_true', help='Whether to use fp16')

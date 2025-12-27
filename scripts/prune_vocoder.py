@@ -36,7 +36,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders.freq_domain_vocoder import (
     ConvNeXtBlock,
     LightHeadedFrequencyDomainVocoder,
@@ -44,6 +43,7 @@ from model.audio.vocoders.freq_domain_vocoder import (
     SplitBandLowFreqMeanFreqDomainVocoder,
 )
 from model.audio.vocoders.vocoders import VocoderWithLoss, model_config_lookup
+from utils.audio_utils import SharedWindowBuffer
 from utils.model_loading_utils import load_model
 
 

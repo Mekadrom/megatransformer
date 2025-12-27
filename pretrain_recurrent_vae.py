@@ -52,6 +52,8 @@ from model.image.recurrent_vae import RecurrentVAE, model_config_lookup
 from model.image import discriminators
 from model.image.discriminators import compute_discriminator_loss, compute_generator_gan_loss
 from utils import megatransformer_utils
+from utils.model_loading_utils import load_model
+from utils.training_utils import EarlyStoppingCallback, setup_int8_training
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -513,7 +515,7 @@ def main():
     )
 
     # Try to load existing checkpoint
-    model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+    model, model_loaded = load_model(False, model, run_dir)
 
     # Determine device for discriminator
     if torch.distributed.is_initialized():
@@ -583,7 +585,7 @@ def main():
             print(f"  GAN start condition key: {gan_start_condition_key}")
             print(f"  GAN start condition value: {gan_start_condition_value}")
 
-    model = megatransformer_utils.setup_int8_training(args, model)
+    model = setup_int8_training(args, model)
 
     if not os.path.exists(run_dir):
         os.makedirs(run_dir, exist_ok=True)
@@ -663,7 +665,7 @@ def main():
     trainer.add_callback(visualization_callback)
 
     if args.stop_step > 0:
-        early_stopping_callback = megatransformer_utils.EarlyStoppingCallback(stop_step=args.stop_step)
+        early_stopping_callback = EarlyStoppingCallback(stop_step=args.stop_step)
         trainer.add_callback(early_stopping_callback)
 
     # Add debug start callback if delayed debug is enabled

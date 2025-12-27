@@ -6,11 +6,11 @@ from typing import Dict, Optional, Literal
 
 from model.activations import Snake
 from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss
-from model.audio.shared_window_buffer import SharedWindowBuffer
 from model.audio.vocoders.convtranspose1d_vocoder import ConvTranspose1DVocoderUpsampleBlock
 from model.audio.vocoders.freq_domain_vocoder import SplitBandLowFreqMeanFreqDomainVocoder, HeavyHeadedFrequencyDomainVocoder, LightHeadedFrequencyDomainVocoder, SplitBandFrequencyDomainVocoder
 from model.audio.vocoders.upsample_vocoder import AntiAliasedUpsampleVocoderUpsampleBlock
 from utils import configuration
+from utils.audio_utils import SharedWindowBuffer
 
 
 class VocoderResidualBlock(nn.Module):

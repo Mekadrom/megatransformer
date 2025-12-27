@@ -24,6 +24,8 @@ from model.ema import EMAModel
 from model.image.diffusion import ImageConditionalGaussianDiffusion, model_config_lookup
 from model.image.vae import model_config_lookup as image_vae_config_lookup
 from utils import megatransformer_utils
+from utils.model_loading_utils import load_model
+from utils.training_utils import CLIPScoreEvaluationCallback, EarlyStoppingCallback, ReduceLROnPlateauCallback, setup_int8_training
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -186,6 +188,11 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
                 return
 
             print(f"Generating images at step {global_step}...")
+
+            if global_step == 1:
+                print("Logging text prompts")
+                for i, text in enumerate(self.text):
+                    writer.add_text(f"image_diffusion/prompt_{i}", text, global_step)
 
             # Determine device
             if torch.distributed.is_initialized():
@@ -565,6 +572,8 @@ class ImageDiffusionTrainer(Trainer):
         self.ema = ema
         self.vae = vae
 
+        self.last_logged_loss = None
+
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """Prepares one `data` before feeding it to the model."""
         if isinstance(data, Mapping):
@@ -608,7 +617,7 @@ class ImageDiffusionTrainer(Trainer):
                 return_diagnostics=True,
             )
         else:
-            predicted_noise, loss = model(
+            predicted_noise, loss, _ = model(
                 x_0=x_0,
                 condition=text_embeddings,
             )
@@ -618,6 +627,7 @@ class ImageDiffusionTrainer(Trainer):
         if global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
             self._log_scalar(f"{prefix}diffusion_loss", loss, global_step)
+            self.last_logged_loss = loss.item()
 
         # Log detailed diagnostics periodically
         if should_log_diagnostics and diagnostics is not None:
@@ -716,6 +726,12 @@ def main():
     latent_channels = int(unk_dict.get("latent_channels", 4))
     image_size = int(unk_dict.get("image_size", 32))  # Latent image size
 
+    use_step_lr = unk_dict.get("use_step_lr", "false").lower() == "true"
+    step_lr_factor = float(unk_dict.get("step_lr_factor", 0.5))
+    step_lr_patience = int(unk_dict.get("step_lr_patience", 2))
+    step_lr_check_every_n_steps = int(unk_dict.get("step_lr_check_every_n_steps", 100))
+    step_lr_min = float(unk_dict.get("min_step_lr", 1e-6))
+
     # Load VAE for latent diffusion (required)
     if vae_checkpoint is None:
         raise ValueError("vae_checkpoint is required - this model only supports latent diffusion")
@@ -740,7 +756,7 @@ def main():
 
     # Try to load existing checkpoint
     if args.resume_from_checkpoint is None:
-        model, model_loaded = megatransformer_utils.load_model(False, model, run_dir)
+        model, model_loaded = load_model(False, model, run_dir)
     else:
         model_loaded = False
 
@@ -772,7 +788,7 @@ def main():
         print(f"  Latent channels: {latent_channels}")
         print(f"  Latent image size: {image_size}")
 
-    model = megatransformer_utils.setup_int8_training(args, model)
+    model = setup_int8_training(args, model)
 
     if not os.path.exists(run_dir):
         os.makedirs(run_dir, exist_ok=True)
@@ -862,6 +878,9 @@ def main():
         ema_callback = EMAUpdateCallback(ema=ema)
         trainer.add_callback(ema_callback)
 
+    t5_model = T5EncoderModel.from_pretrained("t5-small")
+    t5_tokenizer = T5Tokenizer.from_pretrained("t5-small")
+
     # Add visualization callback
     visualization_callback = ImageDiffusionVisualizationCallback(
         step_offset=args.start_step,
@@ -875,11 +894,37 @@ def main():
     )
     trainer.add_callback(visualization_callback)
 
+    eval_callback = CLIPScoreEvaluationCallback(
+        eval_steps=args.eval_steps,
+        vae=vae,
+        text_encoder=t5_model,
+        text_tokenizer=t5_tokenizer,
+        train_prompts=[
+            "high waist sleeveless mini soft jeans dress frilled women ruffles casual summer sundress short denim beach dress cotton",
+            "CultureShock! South Africa. A Survival Guide to Customs and Etiquette, Dee Rissik"
+        ],  # pulled from laion/relaion400m training set
+        guidance_scale=7.5,
+    )
+    trainer.add_callback(eval_callback)
+
+    if use_step_lr:
+        lr_callback = ReduceLROnPlateauCallback(
+            monitor="train/diffusion_loss",
+            mode="min",
+            factor=step_lr_factor,
+            patience=step_lr_patience,
+            check_every_n_steps=step_lr_check_every_n_steps,  # Check at step intervals, not just eval
+            min_lr=step_lr_min
+        )
+        trainer.add_callback(lr_callback)
+        lr_callback.trainer = trainer
+
     if args.stop_step > 0:
-        early_stopping_callback = megatransformer_utils.EarlyStoppingCallback(stop_step=args.stop_step)
+        early_stopping_callback = EarlyStoppingCallback(stop_step=args.stop_step)
         trainer.add_callback(early_stopping_callback)
 
     visualization_callback.trainer = trainer
+    eval_callback.trainer = trainer
 
     # Log scheduler info
     if hasattr(trainer, 'deepspeed') and trainer.deepspeed is not None:

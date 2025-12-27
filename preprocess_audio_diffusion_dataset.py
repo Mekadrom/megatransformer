@@ -1,22 +1,21 @@
-import os
-import torch
-import argparse
-from tqdm import tqdm
-from datasets import load_dataset, Audio
-import json
-
-from dataset_loading.audio_loading import extract_waveforms, extract_mels, remove_mains_hum
-from model.audio.shared_window_buffer import SharedWindowBuffer
-from transformers import T5Tokenizer, T5EncoderModel
-
-from speechbrain.inference.speaker import EncoderClassifier
-
-
 """
 Uses T5-small to produce and cache text embeddings alongside mel spectrograms.
 Optionally uses ECAPA-TDNN (via SpeechBrain) for speaker embeddings.
 Optionally encodes mel spectrograms to VAE latents for latent diffusion.
 """
+import argparse
+import os
+import json
+
+import torch
+
+from datasets import load_dataset, Audio
+from speechbrain.inference.speaker import EncoderClassifier
+from tqdm import tqdm
+from transformers import T5Tokenizer, T5EncoderModel
+
+from dataset_loading.audio_loading import extract_waveforms, extract_mels, remove_mains_hum
+from utils.audio_utils import SharedWindowBuffer
 
 
 def load_audio_vae(checkpoint_path: str, vae_config: str, latent_channels: int, device: str = "cuda"):

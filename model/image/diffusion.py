@@ -304,16 +304,16 @@ class ImageConditionalGaussianDiffusion(GaussianDiffusion):
         return [result]
 
 
-def create_unet(config: configuration.MegaTransformerConfig, context_dim: Optional[int] = None):
+def create_unet(config: configuration.MegaTransformerConfig, latent_channels, context_dim: Optional[int] = None):
     return diffusion.ConvDenoisingUNet(
         activation=config.image_decoder_activation if hasattr(config, 'image_decoder_activation') else "silu",
         stride=(2, 2),
         self_attn_class=ImageDiffusionSelfAttentionBlock,
         cross_attn_class=ImageDiffusionCrossAttentionBlock,
         norm_class=ImageRMSNorm,
-        in_channels=1,
+        in_channels=latent_channels,
         model_channels=config.image_decoder_model_channels,
-        out_channels=1,
+        out_channels=latent_channels,
         channel_multipliers=config.image_decoder_channel_multipliers,
         time_embedding_dim=config.image_decoder_time_embedding_dim,
         attention_levels=config.image_decoder_attention_levels,
@@ -335,9 +335,79 @@ def create_unet(config: configuration.MegaTransformerConfig, context_dim: Option
         cross_attn_use_flash_attention=config.image_decoder_cross_attn_use_flash_attention,
     )
 
+def create_dit_unet(config: configuration.MegaTransformerConfig, latent_channels, context_dim: int):
+    return diffusion.DiTBackbone(
+        config.hidden_size,
+        config.image_decoder_num_res_blocks,
+        config.image_decoder_down_block_self_attn_n_heads,
+        config.image_decoder_cross_attn_n_heads,
+        config.image_decoder_unet_dropout_p,
+        config.image_decoder_channel_multipliers[0],
+        2,
+        latent_channels,
+        context_dim,
+        config.image_size,
+    )
+
+
+# ~80K params - tiny model for quick tests/proving architecture out
+tiny_dit_config = configuration.MegaTransformerConfig(
+    hidden_size=32,
+    image_size=32,
+    image_decoder_model_channels=16,
+    image_decoder_time_embedding_dim=32,
+    image_decoder_num_res_blocks=2,
+    image_decoder_down_block_self_attn_n_heads=2,
+    image_decoder_down_block_self_attn_d_queries=16,
+    image_decoder_down_block_self_attn_d_values=16,
+    image_decoder_down_block_self_attn_use_flash_attention=True,
+    image_decoder_cross_attn_n_heads=2,
+    image_decoder_cross_attn_d_queries=16,
+    image_decoder_cross_attn_d_values=16,
+    image_decoder_cross_attn_use_flash_attention=True,
+    image_decoder_channel_multipliers=[4],  # MLP ratio for dit
+)
+
+# ~14M params - small DiT model for memorization tests
+small_dit_config = configuration.MegaTransformerConfig(
+    hidden_size=248,
+    image_size=32,
+    image_decoder_model_channels=80,
+    image_decoder_time_embedding_dim=192,
+    image_decoder_attention_levels=[False, True, True],
+    image_decoder_num_res_blocks=8,
+    image_decoder_down_block_self_attn_n_heads=4,
+    image_decoder_down_block_self_attn_d_queries=48,
+    image_decoder_down_block_self_attn_d_values=48,
+    image_decoder_down_block_self_attn_use_flash_attention=True,
+    image_decoder_cross_attn_n_heads=4,
+    image_decoder_cross_attn_d_queries=48,
+    image_decoder_cross_attn_d_values=48,
+    image_decoder_cross_attn_use_flash_attention=True,
+    image_decoder_channel_multipliers=[4],
+)
+
+# ~46M params, medium DiT model for higher-capacity testing and generalization probing
+medium_dit_config = configuration.MegaTransformerConfig(
+    hidden_size=384,
+    image_size=32,
+    image_decoder_model_channels=128,
+    image_decoder_time_embedding_dim=256,
+    image_decoder_attention_levels=[False, True, True],
+    image_decoder_num_res_blocks=12,
+    image_decoder_down_block_self_attn_n_heads=6,
+    image_decoder_down_block_self_attn_d_queries=64,
+    image_decoder_down_block_self_attn_d_values=64,
+    image_decoder_down_block_self_attn_use_flash_attention=True,
+    image_decoder_cross_attn_n_heads=6,
+    image_decoder_cross_attn_d_queries=64,
+    image_decoder_cross_attn_d_values=64,
+    image_decoder_cross_attn_use_flash_attention=True,
+    image_decoder_channel_multipliers=[4],
+)
+
 
 # ~13M params - Good for experimentation and overfitting tests. Forces cross attention at all but the largest levels.
-# Down/Up ratio: 1.08x, Time embedding: 0.5%
 small_config = configuration.MegaTransformerConfig(
     hidden_size=192,
     image_size=32,
@@ -359,6 +429,7 @@ small_config = configuration.MegaTransformerConfig(
     image_decoder_cross_attn_use_flash_attention=True,
     image_decoder_channel_multipliers=[1, 2, 3],  # Gradual growth
 )
+
 
 # ~20M params - Optimized for conditioning-based memorization with larger attention capacity
 # Prioritizes cross-attention dim (320) to preserve more conditioning info (512→320 = 62.5%)
@@ -389,11 +460,11 @@ medium_config = configuration.MegaTransformerConfig(
 
 def create_diffusion_model(
     config: configuration.MegaTransformerConfig,
+    unet: nn.Module,
     latent_channels: int = 4,
     num_timesteps: int = 1000,
     sampling_timesteps: int = 50,
     betas_schedule: str = "cosine",
-    context_dim: int = 512,
     normalize: bool = True,
     min_snr_loss_weight: bool = True,
     min_snr_gamma: float = 5.0,
@@ -406,9 +477,9 @@ def create_diffusion_model(
     logit_normal_std: float = 1.0,  # Std for logit-normal (lower = more peaked)
 ) -> ImageConditionalGaussianDiffusion:
     return ImageConditionalGaussianDiffusion(
-        config,
-        create_unet(config, context_dim=context_dim),
-        latent_channels,
+        config=config,
+        unet=unet,
+        in_channels=latent_channels,
         num_timesteps=num_timesteps,
         betas_schedule=betas_schedule,
         min_snr_loss_weight=min_snr_loss_weight,
@@ -427,13 +498,46 @@ def create_diffusion_model(
 
 model_config_lookup = {
     # ~13M params - good for experimentation and overfitting tests
-    "small": lambda **kwargs: create_diffusion_model(
+    "small": lambda context_dim, **kwargs: create_diffusion_model(
         config=small_config,
+        unet=create_unet(config=small_config, latent_channels=4, context_dim=context_dim),
         **kwargs
     ),
     # ~20M params - optimized for conditioning-based memorization
-    "medium": lambda **kwargs: create_diffusion_model(
+    "medium": lambda context_dim, **kwargs: create_diffusion_model(
         config=medium_config,
+        unet=create_unet(config=medium_config, latent_channels=4, context_dim=context_dim),
         **kwargs
+    ),
+    "tiny_dit": lambda context_dim, **kwargs: create_diffusion_model(
+        config=tiny_dit_config,
+        unet=create_dit_unet(config=tiny_dit_config, latent_channels=4, context_dim=context_dim),
+        **kwargs
+    ),
+    "small_dit": lambda context_dim, **kwargs: create_diffusion_model(
+        config=small_dit_config,
+        unet=create_dit_unet(config=small_dit_config, latent_channels=4, context_dim=context_dim),
+        **kwargs
+    ),
+    "tiny_dit_flow": lambda context_dim, cfg_dropout_prob, timestep_sampling, **_: diffusion.create_flow_matching_model(
+        config=tiny_dit_config,
+        unet=create_dit_unet(config=tiny_dit_config, latent_channels=4, context_dim=context_dim),
+        latent_channels=4,
+        cfg_dropout_prob=cfg_dropout_prob,
+        timestep_sampling=timestep_sampling,
+    ),
+    "small_dit_flow": lambda context_dim, cfg_dropout_prob, timestep_sampling, **_: diffusion.create_flow_matching_model(
+        config=small_dit_config,
+        unet=create_dit_unet(config=small_dit_config, latent_channels=4, context_dim=context_dim),
+        latent_channels=4,
+        cfg_dropout_prob=cfg_dropout_prob,
+        timestep_sampling=timestep_sampling,
+    ),
+    "medium_dit_flow": lambda context_dim, cfg_dropout_prob, timestep_sampling, **_: diffusion.create_flow_matching_model(
+        config=medium_dit_config,
+        unet=create_dit_unet(config=medium_dit_config, latent_channels=4, context_dim=context_dim),
+        latent_channels=4,
+        cfg_dropout_prob=cfg_dropout_prob,
+        timestep_sampling=timestep_sampling,
     ),
 }
