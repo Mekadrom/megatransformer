@@ -1,10 +1,92 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from typing import Optional
 
 from model import activations
 from utils.audio_utils import SharedWindowBuffer
 from utils.model_utils import get_activation_type
+
+
+class FrequencyAttentionBlock(nn.Module):
+    """
+    Self-attention block for frequency-domain vocoders.
+
+    Applies multi-head attention across the time dimension to help learn
+    global phase coherence. Harmonics are related across time, and attention
+    allows the model to learn these long-range dependencies.
+
+    Uses pre-norm architecture with residual connection.
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+        qkv_bias: bool = True,
+    ):
+        super().__init__()
+
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert dim % num_heads == 0, f"dim ({dim}) must be divisible by num_heads ({num_heads})"
+
+        self.norm = nn.LayerNorm(dim)
+
+        # Single projection for Q, K, V
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_dropout = nn.Dropout(dropout)
+
+        # Output projection
+        self.proj = nn.Linear(dim, dim)
+        self.proj_dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.qkv.weight)
+        if self.qkv.bias is not None:
+            nn.init.zeros_(self.qkv.bias)
+        nn.init.xavier_uniform_(self.proj.weight)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, T] input tensor
+
+        Returns:
+            [B, C, T] output tensor with attention applied
+        """
+        B, C, T = x.shape
+        residual = x
+
+        # Transpose for LayerNorm: [B, C, T] -> [B, T, C]
+        x = x.transpose(1, 2)
+        x = self.norm(x)
+
+        # Compute Q, K, V
+        qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, num_heads, T, head_dim]
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_dropout(attn)
+
+        # Apply attention to values
+        x = (attn @ v).transpose(1, 2).reshape(B, T, C)
+        x = self.proj(x)
+        x = self.proj_dropout(x)
+
+        # Transpose back: [B, T, C] -> [B, C, T]
+        x = x.transpose(1, 2)
+
+        return residual + x
 
 
 class ConvNeXtBlock(nn.Module):
@@ -382,7 +464,7 @@ class SplitBandLowFreqMeanFreqDomainVocoder(FrequencyDomainVocoderBase):
         hidden_dim: int = 512,
         num_layers: int = 8,
         convnext_mult: int = 4,
-        cutoff_bin: int = 128,  # ~2kHz at 16kHz sample rate with n_fft=1024
+        cutoff_bin: int = 128,
         low_freq_kernel: int = 7,
         high_freq_kernel: int = 3,
     ):
@@ -466,7 +548,7 @@ class SplitBandLowFreqMeanFreqDomainVocoder(FrequencyDomainVocoderBase):
         low_snake = self.phase_act_low(x)
         phase_low_large = self.phase_head_low_large(low_snake)  # [B, n_low_bins, T]
         phase_low_small = self.phase_head_low_small(low_snake)  # [B, n_low_bins, T]
-        
+
         phase_low = (phase_low_large + phase_low_small) / 2.0  # [B, n_low_bins, T]
         phase_high = self.phase_head_high(x)  # [B, n_high_bins, T]
 
@@ -501,6 +583,168 @@ class SplitBandLowFreqMeanFreqDomainVocoder(FrequencyDomainVocoderBase):
         mag = F.elu(mag_pre, alpha=1.0) + 1.0
 
         phase_real, phase_imag = self.predict_phase(x)
+
+        # Construct complex STFT
+        stft_real = mag * phase_real
+        stft_imag = mag * phase_imag
+        stft = torch.complex(stft_real.to(torch.float32), stft_imag.to(torch.float32))
+
+        # iSTFT to waveform
+        waveform = torch.istft(
+            stft,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=self.window.to(stft.device),
+            length=mel.size(-1) * self.hop_length,
+            return_complex=False,
+        )
+
+        return waveform, stft
+
+
+class FrequencyDomainVocoderWithAttention(FrequencyDomainVocoderBase):
+    """
+    Frequency domain vocoder with attention for improved phase coherence.
+
+    Interleaves ConvNeXt blocks with attention blocks to capture:
+    - Local patterns via convolution
+    - Global phase relationships via attention
+
+    Attention helps harmonics (which are related across time) maintain coherence.
+    """
+    def __init__(
+        self,
+        shared_window_buffer: SharedWindowBuffer,
+        n_mels: int = 80,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        hidden_dim: int = 512,
+        num_conv_layers: int = 6,
+        num_attn_layers: int = 2,
+        attn_heads: int = 4,
+        convnext_mult: int = 4,
+        attn_dropout: float = 0.0,
+        cutoff_bin: int = 128,
+        low_freq_kernel: int = 7,
+        high_freq_kernel: int = 3,
+        use_gradient_checkpointing: bool = False,
+    ):
+        super().__init__(shared_window_buffer, n_mels, n_fft, hop_length, hidden_dim)
+
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.cutoff_bin = cutoff_bin
+        self.n_low_bins = cutoff_bin
+        self.n_high_bins = self.freq_bins - cutoff_bin
+
+        # Build backbone: ConvNeXt blocks with attention interspersed
+        # Pattern: [Conv, Conv, ..., Attn, Conv, Conv, ..., Attn, ...]
+        backbone_layers = []
+        conv_per_attn = num_conv_layers // (num_attn_layers + 1)
+
+        for i in range(num_attn_layers + 1):
+            # Add ConvNeXt blocks
+            for _ in range(conv_per_attn):
+                backbone_layers.append(ConvNeXtBlock(hidden_dim, expansion=convnext_mult))
+
+            # Add attention after each group (except the last)
+            if i < num_attn_layers:
+                backbone_layers.append(
+                    FrequencyAttentionBlock(
+                        dim=hidden_dim,
+                        num_heads=attn_heads,
+                        dropout=attn_dropout,
+                    )
+                )
+
+        # Final ConvNeXt to reduce channels
+        backbone_layers.append(
+            ConvNeXtBlock(hidden_dim, ovr_out_dim=hidden_dim // 2, expansion=convnext_mult)
+        )
+
+        self.backbone = nn.ModuleList(backbone_layers)
+
+        head_input_dim = hidden_dim // 2
+
+        # Split-band magnitude heads
+        self.mag_head_low = nn.Conv1d(
+            head_input_dim, self.n_low_bins,
+            kernel_size=low_freq_kernel, padding=low_freq_kernel // 2
+        )
+        self.mag_head_high = nn.Conv1d(
+            head_input_dim, self.n_high_bins,
+            kernel_size=high_freq_kernel, padding=high_freq_kernel // 2
+        )
+
+        # Phase heads with attention-informed features
+        self.phase_head_low = nn.Sequential(
+            nn.Conv1d(head_input_dim, head_input_dim, kernel_size=low_freq_kernel, padding=low_freq_kernel // 2),
+            activations.Snake(head_input_dim),
+            nn.Conv1d(head_input_dim, self.n_low_bins, kernel_size=low_freq_kernel, padding=low_freq_kernel // 2),
+        )
+
+        self.phase_head_high = nn.Sequential(
+            activations.Snake(head_input_dim),
+            nn.Conv1d(head_input_dim, self.n_high_bins, kernel_size=high_freq_kernel, padding=high_freq_kernel // 2)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        if self.input_proj.bias is not None:
+            nn.init.zeros_(self.input_proj.bias)
+
+        for head in [self.mag_head_low, self.mag_head_high]:
+            nn.init.xavier_uniform_(head.weight, gain=0.1)
+            if head.bias is not None:
+                nn.init.zeros_(head.bias)
+
+        for m in self.phase_head_low:
+            if isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        for m in self.phase_head_high:
+            if isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, mel):
+        """
+        Args:
+            mel: [B, n_mels, T] log mel spectrogram
+            OR [B, 1, n_mels, T] with singleton channel dim (gets dropped)
+
+        Returns:
+            waveform: [B, T * hop_length]
+            stft: [B, freq_bins, T] complex - for loss computation
+        """
+        if mel.dim() == 4 and mel.size(1) == 1:
+            mel = mel.squeeze(1)  # Remove singleton channel dim if present
+
+        x = self.input_proj(mel)
+
+        for block in self.backbone:
+            if self.use_gradient_checkpointing and self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+
+        # Magnitude prediction
+        mag_pre_low = self.mag_head_low(x)
+        mag_pre_high = self.mag_head_high(x)
+        mag_pre = torch.cat([mag_pre_low, mag_pre_high], dim=1)
+        mag = F.elu(mag_pre, alpha=1.0) + 1.0
+
+        # Phase prediction
+        phase_low = self.phase_head_low(x)
+        phase_high = self.phase_head_high(x)
+        phase_angle = torch.cat([phase_low, phase_high], dim=1)
+
+        phase_real = torch.cos(phase_angle)
+        phase_imag = torch.sin(phase_angle)
 
         # Construct complex STFT
         stft_real = mag * phase_real

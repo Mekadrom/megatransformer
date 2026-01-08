@@ -9,18 +9,18 @@ from utils.audio_utils import SharedWindowBuffer
 
 class PeriodDiscriminator(nn.Module):
     """Single period discriminator that reshapes audio into 2D based on period."""
-    def __init__(self, period: int, kernel_size: int = 5, stride: int = 3):
+    def __init__(self, period: int, base_channels: int = 32, kernel_size: int = 5, stride: int = 3):
         super().__init__()
         self.period = period
 
         self.convs = nn.ModuleList([
-            nn.utils.spectral_norm(nn.Conv2d(1, 32, (kernel_size, 1), (stride, 1), padding=(kernel_size // 2, 0))),
-            nn.utils.spectral_norm(nn.Conv2d(32, 64, (kernel_size, 1), (stride, 1), padding=(kernel_size // 2, 0))),
-            nn.utils.spectral_norm(nn.Conv2d(64, 128, (kernel_size, 1), (stride, 1), padding=(kernel_size // 2, 0))),
-            nn.utils.spectral_norm(nn.Conv2d(128, 256, (kernel_size, 1), 1, padding=(kernel_size // 2, 0))),
+            nn.utils.spectral_norm(nn.Conv2d(1, base_channels, (kernel_size, 1), (stride, 1), padding=(kernel_size // 2, 0))),
+            nn.utils.spectral_norm(nn.Conv2d(base_channels, base_channels * 2, (kernel_size, 1), (stride, 1), padding=(kernel_size // 2, 0))),
+            nn.utils.spectral_norm(nn.Conv2d(base_channels * 2, base_channels * 4, (kernel_size, 1), (stride, 1), padding=(kernel_size // 2, 0))),
+            nn.utils.spectral_norm(nn.Conv2d(base_channels * 4, base_channels * 8, (kernel_size, 1), 1, padding=(kernel_size // 2, 0))),
         ])
-        self.conv_post = nn.utils.spectral_norm(nn.Conv2d(256, 1, (3, 1), 1, padding=(1, 0)))
-
+        self.conv_post = nn.utils.spectral_norm(nn.Conv2d(base_channels * 8, 1, (3, 1), 1, padding=(1, 0)))
+    
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         features = []
 
@@ -43,10 +43,16 @@ class PeriodDiscriminator(nn.Module):
 
 class MultiPeriodDiscriminator(nn.Module):
     """Multi-period discriminator using prime periods to capture different periodic structures."""
-    def __init__(self, periods: list[int] = [2, 3, 5, 7, 11]):
+    def __init__(self, periods: list[int] = [2, 3, 5, 7, 11], base_channels: Optional[list[int]] = None):
         super().__init__()
+
+        if base_channels is None:
+            base_channels = [32] * len(periods)
+
+        assert len(base_channels) == len(periods), "base_channels length must match periods length"
+
         self.discriminators = nn.ModuleList([
-            PeriodDiscriminator(p) for p in periods
+            PeriodDiscriminator(p, base_channels=bc) for p, bc in zip(periods, base_channels)
         ])
 
     def forward(self, x: torch.Tensor) -> tuple[list[torch.Tensor], list[list[torch.Tensor]]]:
@@ -61,19 +67,19 @@ class MultiPeriodDiscriminator(nn.Module):
 
 class ScaleDiscriminator(nn.Module):
     """Single scale discriminator operating on raw or downsampled audio."""
-    def __init__(self, use_spectral_norm: bool = False):
+    def __init__(self, base_channels: int = 64, use_spectral_norm: bool = False):
         super().__init__()
         norm_f = nn.utils.spectral_norm if use_spectral_norm else nn.utils.parametrizations.weight_norm
 
         self.convs = nn.ModuleList([
-            norm_f(nn.Conv1d(1, 64, 15, 1, padding=7)),
-            norm_f(nn.Conv1d(64, 64, 41, 2, groups=4, padding=20)),
-            norm_f(nn.Conv1d(64, 128, 41, 2, groups=8, padding=20)),
-            norm_f(nn.Conv1d(128, 128, 41, 4, groups=16, padding=20)),
-            norm_f(nn.Conv1d(128, 128, 41, 1, groups=16, padding=20)),
-            norm_f(nn.Conv1d(128, 256, 5, 1, padding=2)),
+            norm_f(nn.Conv1d(1, base_channels, 15, 1, padding=7)),
+            norm_f(nn.Conv1d(base_channels, base_channels, 41, 2, groups=4, padding=20)),
+            norm_f(nn.Conv1d(base_channels, base_channels * 2, 41, 2, groups=8, padding=20)),
+            norm_f(nn.Conv1d(base_channels * 2, base_channels * 2, 41, 4, groups=16, padding=20)),
+            norm_f(nn.Conv1d(base_channels * 2, base_channels * 2, 41, 1, groups=16, padding=20)),
+            norm_f(nn.Conv1d(base_channels * 2, base_channels * 4, 5, 1, padding=2)),
         ])
-        self.conv_post = norm_f(nn.Conv1d(256, 1, 3, 1, padding=1))
+        self.conv_post = norm_f(nn.Conv1d(base_channels * 4, 1, 3, 1, padding=1))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         features = []
@@ -102,7 +108,6 @@ class PhaseAwareSpectrogramDiscriminator(nn.Module):
         shared_window_buffer: SharedWindowBuffer,
         n_fft: int = 1024,
         hop_length: int = 256,
-        win_length: int = 1024,
         channels: list[int] = [16, 32, 64, 128, 256],
         kernel_size: tuple[int, int] = (3, 9),  # (freq, time)
         stride: tuple[int, int] = (1, 2),
@@ -110,10 +115,9 @@ class PhaseAwareSpectrogramDiscriminator(nn.Module):
         super().__init__()
         self.n_fft = n_fft
         self.hop_length = hop_length
-        self.win_length = win_length
         
         # Register window buffer
-        self.register_buffer('window', shared_window_buffer.get_window(win_length, torch.device('cpu')))
+        self.register_buffer('window', shared_window_buffer.get_window(n_fft, torch.device('cpu')))
         
         # Input channels = 2 (real and imaginary parts)
         in_ch = 2
@@ -154,7 +158,7 @@ class PhaseAwareSpectrogramDiscriminator(nn.Module):
             x,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
-            win_length=self.win_length,
+            win_length=self.n_fft,
             window=self.window,
             return_complex=True
         )
@@ -173,15 +177,15 @@ class PhaseAwareSpectrogramDiscriminator(nn.Module):
 
 class MultiScaleDiscriminator(nn.Module):
     """Multi-scale discriminator operating at different audio resolutions."""
-    def __init__(self, n_scales: int = 3):
+    def __init__(self, base_channels: Optional[list[int]] = None):
         super().__init__()
 
         self.discriminators = nn.ModuleList()
         self.pooling = nn.ModuleList()
-        for i in range(n_scales):
+        for i, base_ch in enumerate(base_channels):
             use_spectral_norm = (i == 0)  # Only use spectral norm for the first scale
-            self.discriminators.append(ScaleDiscriminator(use_spectral_norm=use_spectral_norm))
-            if i < n_scales - 1:
+            self.discriminators.append(ScaleDiscriminator(base_channels=base_ch, use_spectral_norm=use_spectral_norm))
+            if i < len(base_channels) - 1:
                 self.pooling.append(nn.AvgPool1d(4, 2, padding=2))
 
     def forward(self, x: torch.Tensor) -> tuple[list[torch.Tensor], list[list[torch.Tensor]]]:
@@ -207,10 +211,10 @@ class MultiResolutionSpectrogramDiscriminator(nn.Module):
     def __init__(
         self,
         shared_window_buffer: SharedWindowBuffer,
-        resolutions: list[tuple[int, int, int]] = [
-            (1024, 256, 1024),   # (n_fft, hop_length, win_length) - balanced
-            (2048, 512, 2048),   # Low frequency detail, coarse time
-            (512, 128, 512),     # High frequency detail, fine time
+        resolutions: list[tuple[int, int]] = [
+            (1024, 256),   # (n_fft, hop_length) - balanced
+            (2048, 512),   # Low frequency detail, coarse time
+            (512, 128),     # High frequency detail, fine time
         ],
         channels: list[int] = [16, 32, 64, 128, 256],
     ):
@@ -220,10 +224,9 @@ class MultiResolutionSpectrogramDiscriminator(nn.Module):
                 shared_window_buffer=shared_window_buffer,
                 n_fft=n_fft,
                 hop_length=hop,
-                win_length=win,
                 channels=channels,
             )
-            for n_fft, hop, win in resolutions
+            for n_fft, hop in resolutions
         ])
 
     def forward(
@@ -253,18 +256,19 @@ class CombinedDiscriminator(nn.Module):
         self,
         shared_window_buffer: SharedWindowBuffer,
         mpd_periods: list[int] = [2, 3, 5, 7, 11, 13, 17],
-        n_msd_scales: int = 4,
+        mpd_base_channels: Optional[list[int]] = None,
+        msd_base_channels: Optional[list[int]] = None,
         mrsd_resolutions: list[tuple[int, int, int]] = [
-            (1024, 256, 1024),
-            (2048, 512, 2048),
-            (512, 128, 512),
+            (1024, 256),
+            (2048, 512),
+            (512, 128),
         ],
         mrsd_channels: list[int] = [16, 32, 64, 128, 256],
     ):
         super().__init__()
 
-        self.mpd = MultiPeriodDiscriminator(periods=mpd_periods)
-        self.msd = MultiScaleDiscriminator(n_msd_scales)
+        self.mpd = MultiPeriodDiscriminator(periods=mpd_periods, base_channels=mpd_base_channels)
+        self.msd = MultiScaleDiscriminator(base_channels=msd_base_channels)
         self.mrsd = MultiResolutionSpectrogramDiscriminator(shared_window_buffer=shared_window_buffer, resolutions=mrsd_resolutions, channels=mrsd_channels)
     def forward(self, x: torch.Tensor) -> dict[str, tuple[list[torch.Tensor], list[list[torch.Tensor]]]]:
         """
@@ -281,23 +285,57 @@ class CombinedDiscriminator(nn.Module):
         return results
 
 
+def micro_combined_disc(shared_window_buffer: SharedWindowBuffer) -> CombinedDiscriminator:
+    """Creates a CombinedDiscriminator with updated configuration."""
+    return CombinedDiscriminator(
+        shared_window_buffer=shared_window_buffer,
+        mpd_periods=[2, 3, 5, 7, 11],
+        msd_base_channels=[64] * 3,
+        mrsd_resolutions=[
+            (1024, 256),
+            (512, 128),
+            (256, 64),
+        ],
+        mrsd_channels=[8, 16, 32, 48, 64, 96],
+    )
+
 def small_combined_disc(shared_window_buffer: SharedWindowBuffer) -> CombinedDiscriminator:
     """Creates a CombinedDiscriminator with updated configuration."""
     return CombinedDiscriminator(
         shared_window_buffer=shared_window_buffer,
         mpd_periods=[2, 3, 5, 7, 11, 13, 17],
-        n_msd_scales=4,
+        msd_base_channels=[64] * 4,
         mrsd_resolutions=[
-            (1024, 256, 1024),
-            (2048, 512, 2048),
-            (512, 128, 512),
-            (256, 64, 256),
+            (2048, 512),
+            (1024, 256),
+            (512, 128),
+            (256, 64),
         ],
         mrsd_channels=[8, 16, 32, 48, 64, 96],
     )
 
+def medium_combined_disc(shared_window_buffer: SharedWindowBuffer) -> CombinedDiscriminator:
+    """Creates a CombinedDiscriminator with updated configuration.
+    Each of MPD, MSD, and MRSD have ~4M parameters, for a total of ~12M parameters."""
+    mpd_periods = [2, 3, 5, 7, 11, 13, 17]
+    return CombinedDiscriminator(
+        shared_window_buffer=shared_window_buffer,
+        mpd_periods=mpd_periods,
+        mpd_base_channels=[56] * len(mpd_periods),
+        msd_base_channels=[80] * 9,  # channels needs to be a multiple of 8 for statically configured groupnorm
+        mrsd_resolutions=[
+            (2048, 512),
+            (1024, 256),
+            (512, 128),
+            (256, 64),
+        ],
+        mrsd_channels=[8, 16, 32, 64, 128, 256],
+    )
+
 model_config_lookup = {
+    "micro_combined_disc": micro_combined_disc,
     "small_combined_disc": small_combined_disc,
+    "medium_combined_disc": medium_combined_disc,
 }
 
 
@@ -482,7 +520,8 @@ class MelPeriodSubDiscriminator(nn.Module):
         norm_f = nn.utils.spectral_norm if use_spectral_norm else lambda x: x
 
         self.layers = nn.ModuleList()
-        channels = in_channels
+        # After reshape in forward, channels become in_channels * period
+        channels = in_channels * period
 
         for i in range(n_layers):
             out_channels = min(base_channels * (2 ** i), 512)
@@ -515,7 +554,8 @@ class MelPeriodSubDiscriminator(nn.Module):
         # Pad time dimension to be divisible by period
         if T % self.period != 0:
             pad_len = self.period - (T % self.period)
-            x = F.pad(x, (0, pad_len), mode='reflect')
+            # For 4D tensor, reflect mode needs (left, right, top, bottom) format
+            x = F.pad(x, (0, pad_len, 0, 0), mode='reflect')
             T = T + pad_len
 
         # Reshape: [B, C, H, T] -> [B, C, H, T//period, period] -> [B, C*period, H, T//period]
@@ -866,12 +906,127 @@ def mel_combined_discriminator() -> MelCombinedDiscriminator:
         use_multi_scale=True,
         multi_scale_base_channels=48,
         multi_scale_n_layers=4,
-        multi_scale_n_scales=3,
+        multi_scale_n_scales=4,
         use_multi_period=True,
         multi_period_base_channels=48,
         multi_period_periods=[2, 3, 5, 7, 11],
         use_spectral_norm=True,
     )
+
+
+# =============================================================================
+# Regularization utilities for Mel Spectrogram Discriminators
+# =============================================================================
+
+def add_mel_instance_noise(
+    mels: torch.Tensor,
+    std: float = 0.1,
+) -> torch.Tensor:
+    """
+    Add instance noise to mel spectrograms for discriminator regularization.
+
+    This prevents the discriminator from finding shortcuts based on artifacts
+    (blur, artifacts) and forces it to learn actual spectrogram structure.
+
+    Args:
+        mels: [B, 1, n_mels, T] mel spectrogram tensor
+        std: Standard deviation of Gaussian noise (decay over training)
+
+    Returns:
+        Noisy mel spectrograms
+    """
+    if std <= 0:
+        return mels
+    return mels + std * torch.randn_like(mels)
+
+
+def r1_mel_gradient_penalty(
+    real_mels: torch.Tensor,
+    discriminator: nn.Module,
+) -> torch.Tensor:
+    """
+    R1 gradient penalty for mel spectrogram discriminators (Mescheder et al., 2018).
+
+    Penalizes the gradient norm on real mel spectrograms, encouraging the discriminator
+    to have flat responses around real data. This stabilizes training and
+    prevents the discriminator from focusing only on detecting fake artifacts.
+
+    Args:
+        real_mels: [B, 1, n_mels, T] real mel spectrogram tensor (will enable gradients)
+        discriminator: The mel discriminator module
+
+    Returns:
+        R1 penalty (scalar tensor)
+    """
+    real_mels = real_mels.detach().requires_grad_(True)
+
+    real_outputs, _ = discriminator(real_mels)
+
+    # Handle multi-scale discriminators
+    if isinstance(real_outputs, list):
+        real_outputs = sum(r.sum() for r in real_outputs)
+    else:
+        real_outputs = real_outputs.sum()
+
+    # Compute gradients
+    grads = torch.autograd.grad(
+        outputs=real_outputs,
+        inputs=real_mels,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    # R1 = E[||∇D(x)||²]
+    penalty = grads.pow(2).reshape(grads.size(0), -1).sum(1).mean()
+
+    return penalty
+
+
+class MelInstanceNoiseScheduler:
+    """
+    Scheduler for decaying instance noise over training.
+
+    Starts with high noise to prevent shortcut learning, then decays
+    to let the discriminator learn finer details.
+
+    Usage:
+        noise_scheduler = MelInstanceNoiseScheduler(initial_std=0.2, decay_steps=50000)
+        for step in range(num_steps):
+            noise_std = noise_scheduler.get_std(step)
+            real_noisy = add_mel_instance_noise(real, noise_std)
+            fake_noisy = add_mel_instance_noise(fake, noise_std)
+    """
+    def __init__(
+        self,
+        initial_std: float = 0.2,
+        final_std: float = 0.0,
+        decay_steps: int = 50000,
+        decay_type: str = "linear",  # "linear", "cosine", "exponential"
+    ):
+        self.initial_std = initial_std
+        self.final_std = final_std
+        self.decay_steps = decay_steps
+        self.decay_type = decay_type
+
+    def get_std(self, step: int) -> float:
+        if step >= self.decay_steps:
+            return self.final_std
+
+        progress = step / self.decay_steps
+
+        if self.decay_type == "linear":
+            return self.initial_std + (self.final_std - self.initial_std) * progress
+        elif self.decay_type == "cosine":
+            import math
+            return self.final_std + 0.5 * (self.initial_std - self.final_std) * (1 + math.cos(math.pi * progress))
+        elif self.decay_type == "exponential":
+            import math
+            # Exponential decay: std = initial * exp(-5 * progress)
+            # Factor of 5 means ~1% of initial at end
+            return self.final_std + (self.initial_std - self.final_std) * math.exp(-5 * progress)
+        else:
+            return self.initial_std
 
 
 mel_discriminator_config_lookup = {

@@ -97,13 +97,20 @@ class VAE(nn.Module):
         self,
         encoder,
         decoder,
-        perceptual_loss_type: str = "vgg",  # "vgg", "lpips", or "none"
+        perceptual_loss_type: str = "none",  # "vgg", "lpips", "stft", or "none"
         lpips_net: str = "alex",
         recon_loss_weight: float = 1.0,
         mse_loss_weight: float = 1.0,
         l1_loss_weight: float = 0.0,
         perceptual_loss_weight: float = 0.1,
         kl_divergence_loss_weight: float = 0.01,
+        free_bits: float = 0.0,  # Minimum KL per channel (0 = disabled)
+        # Multi-resolution STFT loss parameters (for audio)
+        stft_loss_weight: float = 0.0,  # 0 = disabled
+        stft_fft_sizes: list = None,
+        stft_hop_sizes: list = None,
+        stft_win_lengths: list = None,
+        shared_window_buffer=None,  # SharedWindowBuffer instance
     ):
         super().__init__()
 
@@ -114,6 +121,8 @@ class VAE(nn.Module):
         self.l1_loss_weight = l1_loss_weight
         self.perceptual_loss_weight = perceptual_loss_weight
         self.kl_divergence_loss_weight = kl_divergence_loss_weight
+        self.free_bits = free_bits
+        self.stft_loss_weight = stft_loss_weight
 
         self.perceptual_loss_type = perceptual_loss_type
         if perceptual_loss_type == "vgg":
@@ -123,18 +132,43 @@ class VAE(nn.Module):
         else:
             self.perceptual_loss = None
 
+        # Multi-resolution STFT loss for audio VAE
+        self.stft_loss = None
+        if stft_loss_weight > 0 and shared_window_buffer is not None:
+            from model.audio.criteria import MultiResolutionSTFTLoss
+            self.stft_loss = MultiResolutionSTFTLoss(
+                shared_window_buffer=shared_window_buffer,
+                fft_sizes=stft_fft_sizes or [256, 512, 1024, 2048],
+                hop_sizes=stft_hop_sizes or [64, 128, 256, 512],
+                win_lengths=stft_win_lengths or [256, 512, 1024, 2048],
+            )
+
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def encode(self, x) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(self, x, lengths=None) -> tuple[torch.Tensor, torch.Tensor]:
+        # Pass lengths to encoder if it supports it (e.g., AudioVAEEncoder)
+        if lengths is not None and hasattr(self.encoder, 'time_strides'):
+            return self.encoder(x, lengths=lengths)
         return self.encoder(x)
-    
-    def decode(self, z, speaker_embedding=None) -> torch.Tensor:
+
+    def decode(self, z, speaker_embedding=None, lengths=None) -> torch.Tensor:
+        # Pass lengths to decoder if it supports it (e.g., AudioVAEDecoder)
+        if lengths is not None and hasattr(self.decoder, 'time_scale_factors'):
+            return self.decoder(z, speaker_embedding=speaker_embedding, lengths=lengths)
         return self.decoder(z, speaker_embedding=speaker_embedding)
 
-    def forward(self, x=None, mask=None, speaker_embedding=None, image=None):
+    def forward(
+        self,
+        x=None,
+        mask=None,
+        speaker_embedding=None,
+        image=None,
+        lengths=None,
+        kl_weight_multiplier: float = 1.0,
+    ):
         """
         Forward pass through VAE.
 
@@ -146,6 +180,11 @@ class VAE(nn.Module):
                   The mask is in the time dimension (last dim of x).
             speaker_embedding: Optional speaker embedding tensor [B, 1, D] or [B, D]
                                for conditioning the decoder (audio VAE only)
+            lengths: Optional tensor [B] of valid time lengths for attention masking.
+                     If provided, encoder and decoder attention will mask padded positions.
+            kl_weight_multiplier: Multiplier for KL divergence weight (for KL annealing).
+                                  Default 1.0 means use full kl_divergence_loss_weight.
+                                  Set to 0.0 at start of training and anneal to 1.0.
 
         Returns:
             recon_x: Reconstructed input
@@ -159,13 +198,52 @@ class VAE(nn.Module):
         elif x is None and image is None:
             raise ValueError("Either 'x' or 'image' must be provided")
 
-        mu, logvar = self.encoder(x)
+        mu, logvar = self.encode(x, lengths=lengths)
         z = self.reparameterize(mu, logvar)
 
-        recon_x = self.decoder(z, speaker_embedding=speaker_embedding)
+        # Compute downsampled lengths for decoder attention
+        # Decoder needs latent-space lengths (same as encoder output)
+        latent_lengths = None
+        if lengths is not None and hasattr(self.encoder, 'time_strides'):
+            latent_lengths = lengths
+            for stride in self.encoder.time_strides:
+                latent_lengths = (latent_lengths + stride - 1) // stride
 
-        kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2, 3])
-        kl_divergence = torch.mean(kl_divergence)
+        recon_x = self.decode(z, speaker_embedding=speaker_embedding, lengths=latent_lengths)
+
+        # Align reconstruction to input size (encoder-decoder stride may cause size mismatch)
+        if recon_x.shape != x.shape:
+            # Truncate or pad to match input dimensions
+            slices = [slice(None)] * recon_x.dim()
+            for dim in range(2, recon_x.dim()):  # Skip batch and channel dims
+                if recon_x.shape[dim] > x.shape[dim]:
+                    slices[dim] = slice(0, x.shape[dim])
+                elif recon_x.shape[dim] < x.shape[dim]:
+                    # Pad if reconstruction is smaller (shouldn't happen normally)
+                    pad_size = x.shape[dim] - recon_x.shape[dim]
+                    pad_dims = [0, 0] * (recon_x.dim() - dim - 1) + [0, pad_size]
+                    recon_x = F.pad(recon_x, pad_dims)
+            recon_x = recon_x[tuple(slices)]
+
+        # Compute KL divergence with optional free bits
+        # Per-element KL: [B, C, H, W] for images, [B, C, T] for audio
+        kl_per_element = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+
+        if self.free_bits > 0:
+            # Free bits: apply minimum KL per channel to prevent posterior collapse
+            # Sum over spatial dims, mean over batch -> per-channel KL: [C]
+            spatial_dims = list(range(2, mu.dim()))  # [2, 3] for 4D, [2] for 3D
+            kl_per_channel = kl_per_element.sum(dim=spatial_dims).mean(dim=0)  # [C]
+
+            # Clamp each channel's KL to at least free_bits
+            kl_per_channel = torch.clamp(kl_per_channel, min=self.free_bits)
+
+            # Sum over channels for total KL
+            kl_divergence = kl_per_channel.sum()
+        else:
+            # Original behavior: sum over all latent dims, mean over batch
+            latent_dims = list(range(1, mu.dim()))  # [1, 2, 3] for 4D, [1, 2] for 3D
+            kl_divergence = kl_per_element.sum(dim=latent_dims).mean()
 
         # Reconstruction losses (with optional masking)
         if mask is not None:
@@ -204,10 +282,18 @@ class VAE(nn.Module):
         if self.perceptual_loss is not None:
             perceptual_loss = self.perceptual_loss(recon_x, x)
 
+        # Multi-resolution STFT loss (for audio, requires waveform data passed separately)
+        # This is computed externally when waveforms are available
+        stft_loss = torch.tensor(0.0, device=x.device)
+
+        # Apply KL weight multiplier for KL annealing
+        effective_kl_weight = self.kl_divergence_loss_weight * kl_weight_multiplier
+
         total_loss = (
             self.recon_loss_weight * recon_loss
             + self.perceptual_loss_weight * perceptual_loss
-            + self.kl_divergence_loss_weight * kl_divergence
+            + effective_kl_weight * kl_divergence
+            + self.stft_loss_weight * stft_loss
         )
 
         losses = {
@@ -217,6 +303,115 @@ class VAE(nn.Module):
             "mse_loss": mse_loss,
             "l1_loss": l1_loss,
             "perceptual_loss": perceptual_loss,
+            "stft_loss": stft_loss,
+            "kl_weight_multiplier": torch.tensor(kl_weight_multiplier, device=x.device),
         }
 
         return recon_x, mu, logvar, losses
+
+    def compute_stft_loss(self, pred_waveform: torch.Tensor, target_waveform: torch.Tensor) -> dict:
+        """
+        Compute multi-resolution STFT loss for audio.
+
+        This should be called externally when waveforms are available (e.g., after vocoder).
+        Returns dict with spectral convergence, magnitude, and complex STFT losses.
+        """
+        if self.stft_loss is None:
+            return {
+                "stft_sc_loss": torch.tensor(0.0, device=pred_waveform.device),
+                "stft_mag_loss": torch.tensor(0.0, device=pred_waveform.device),
+                "stft_complex_loss": torch.tensor(0.0, device=pred_waveform.device),
+            }
+
+        sc_loss, mag_loss, complex_loss = self.stft_loss(pred_waveform, target_waveform)
+        return {
+            "stft_sc_loss": sc_loss,
+            "stft_mag_loss": mag_loss,
+            "stft_complex_loss": complex_loss,
+        }
+
+    def reconstruct_with_attention(
+        self,
+        x: torch.Tensor,
+        speaker_embedding=None,
+        lengths=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict, dict]:
+        """
+        Reconstruct input and return attention weights from encoder and decoder.
+
+        This is a utility method for visualization/debugging during evaluation.
+        It bypasses the full forward() to avoid computing losses.
+
+        Args:
+            x: Input tensor [B, C, H, W] or [B, C, H, T] for audio
+            speaker_embedding: Optional speaker embedding for conditioning
+            lengths: Optional tensor [B] of valid time lengths for attention masking
+
+        Returns:
+            recon_x: Reconstructed input
+            mu: Latent mean
+            logvar: Latent log variance
+            encoder_attn_weights: Dict with 'weights' key containing [B, M, n_heads, T, T] or None
+            decoder_attn_weights: Dict with 'weights' key containing [B, M, n_heads, T, T] or None
+        """
+        # Check if encoder supports return_attention_weights
+        encoder_supports_attn = hasattr(self.encoder, 'use_attention') and self.encoder.use_attention
+
+        # Encode with attention weights
+        if encoder_supports_attn:
+            enc_result = self.encoder(
+                x,
+                speaker_embedding=speaker_embedding,
+                lengths=lengths,
+                return_attention_weights=True,
+            )
+            mu, logvar, enc_attn_weights = enc_result
+        else:
+            mu, logvar = self.encode(x, lengths=lengths)
+            enc_attn_weights = None
+
+        # Sample from latent space
+        z = self.reparameterize(mu, logvar)
+
+        # Compute downsampled lengths for decoder attention
+        latent_lengths = None
+        if lengths is not None and hasattr(self.encoder, 'time_strides'):
+            latent_lengths = lengths
+            for stride in self.encoder.time_strides:
+                latent_lengths = (latent_lengths + stride - 1) // stride
+
+        # Check if decoder supports return_attention_weights
+        decoder_supports_attn = hasattr(self.decoder, 'use_attention') and self.decoder.use_attention
+
+        # Decode with attention weights
+        if decoder_supports_attn:
+            dec_result = self.decoder(
+                z,
+                speaker_embedding=speaker_embedding,
+                lengths=latent_lengths,
+                return_attention_weights=True,
+            )
+            recon_x, dec_attn_weights = dec_result
+        else:
+            recon_x = self.decode(z, speaker_embedding=speaker_embedding, lengths=latent_lengths)
+            dec_attn_weights = None
+
+        # Align reconstruction to input size
+        if recon_x.shape != x.shape:
+            slices = [slice(None)] * recon_x.dim()
+            for dim in range(2, recon_x.dim()):
+                if recon_x.shape[dim] > x.shape[dim]:
+                    slices[dim] = slice(0, x.shape[dim])
+                elif recon_x.shape[dim] < x.shape[dim]:
+                    pad_size = x.shape[dim] - recon_x.shape[dim]
+                    pad_dims = [0, 0] * (recon_x.dim() - dim - 1) + [0, pad_size]
+                    recon_x = F.pad(recon_x, pad_dims)
+            recon_x = recon_x[tuple(slices)]
+
+        return (
+            recon_x,
+            mu,
+            logvar,
+            {"weights": enc_attn_weights},
+            {"weights": dec_attn_weights},
+        )

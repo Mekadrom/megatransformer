@@ -175,6 +175,7 @@ class RecurrentConvBlock(nn.Module):
         activation_clamp: float = 50.0,  # Clamp activations to prevent overflow (0 = disabled)
         h_injection_type: Literal['additive', 'concat'] = 'additive',
         activation_fn: str = 'gelu',  # Activation function (gelu recommended for recurrent stability)
+        use_final_spectral_norm: bool = False,  # Whether to apply spectral norm to final conv
     ):
         super().__init__()
 
@@ -199,6 +200,18 @@ class RecurrentConvBlock(nn.Module):
         self.norm2 = nn.GroupNorm(min(32, hidden), hidden)
         self.conv2 = nn.Conv2d(hidden, channels, kernel_size, padding=padding)
 
+        if use_final_spectral_norm:
+            # Initialize to small values before spectral norm for stable residual
+            # Spectral norm will normalize spectral norm to 1, but small init
+            # ensures the output starts small (identity-like behavior)
+            nn.init.normal_(self.conv2.weight, mean=0.0, std=0.01)
+            nn.init.zeros_(self.conv2.bias)
+            self.conv2 = nn.utils.spectral_norm(self.conv2)
+        else:
+            # Initialize final conv to near-zero for stable residual
+            nn.init.zeros_(self.conv2.weight)
+            nn.init.zeros_(self.conv2.bias)
+
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         # Post-residual normalization to keep values centered across iterations
@@ -213,10 +226,6 @@ class RecurrentConvBlock(nn.Module):
             # Initialize to small negative value so sigmoid gives ~0.1-0.3 initially
             # This makes early iterations more stable (small updates)
             self.residual_gate = nn.Parameter(torch.full((1, channels, 1, 1), -1.0))
-
-        # Initialize final conv to near-zero for stable residual
-        nn.init.zeros_(self.conv2.weight)
-        nn.init.zeros_(self.conv2.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x[..., :x.shape[1] // 2, :, :] if self.h_injection_type == 'concat' else x
@@ -281,6 +290,7 @@ class RecurrentEncoder(nn.Module):
         lockstep_n: bool = True,
         lockstep_k: bool = True,
         h_injection_type: Literal['additive', 'concat'] = 'additive',
+        use_injection_scale: bool = True,  # Whether to scale injection over iterations
         debug: bool = False,  # Enable debug logging for numerical stability diagnostics
         # Numerical stability settings
         post_residual_norm: bool = True,  # GroupNorm after residual in recurrent block
@@ -297,6 +307,7 @@ class RecurrentEncoder(nn.Module):
         self.lockstep_n = lockstep_n
         self.lockstep_k = lockstep_k
         self.h_injection_type = h_injection_type
+        self.use_injection_scale = use_injection_scale
         self.debug = debug
 
         # Step counter for deterministic seeding
@@ -449,7 +460,10 @@ class RecurrentEncoder(nn.Module):
                     if self.h_injection_type == "additive":
                         # Gradient injection with decay: scale by 1/(iter+1) to prevent accumulation
                         # First iter gets full scale, subsequent iters get diminishing contribution
-                        injection_scale = self.gradient_injection_scale / (total_iter + 1)
+                        if self.use_injection_scale:
+                            injection_scale = self.gradient_injection_scale / (total_iter + 1)
+                        else:
+                            injection_scale = 1.0
                         h = h + injection_scale * h_init
                     elif self.h_injection_type == "concat":
                         h = torch.cat([h, h_init], dim=1)
@@ -868,6 +882,7 @@ class RecurrentVAE(nn.Module):
         lockstep_n: bool = True,
         lockstep_k: bool = True,
         h_injection_type: Literal['additive', 'concat'] = 'additive',
+        use_injection_scale: bool = True,  # Whether to scale injection over iterations
         # Numerical stability settings (recurrent block)
         post_residual_norm: bool = True,  # GroupNorm after residual in recurrent block
         use_residual_gate: bool = True,  # Learnable gate for residual contribution
@@ -931,6 +946,7 @@ class RecurrentVAE(nn.Module):
             lockstep_n=lockstep_n,
             lockstep_k=lockstep_k,
             h_injection_type=h_injection_type,
+            use_injection_scale=use_injection_scale,
             debug=debug,
             post_residual_norm=post_residual_norm,
             use_residual_gate=use_residual_gate,
@@ -952,6 +968,7 @@ class RecurrentVAE(nn.Module):
             lockstep_n=lockstep_n,
             lockstep_k=lockstep_k,
             h_injection_type=h_injection_type,
+            use_injection_scale=use_injection_scale,
             debug=debug,
             post_residual_norm=post_residual_norm,
             use_residual_gate=use_residual_gate,

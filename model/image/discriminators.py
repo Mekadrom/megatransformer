@@ -511,7 +511,7 @@ def compute_generator_gan_loss(
 
 # Model configs
 
-def tiny_patch_discriminator() -> PatchDiscriminator:
+def micro_patch() -> PatchDiscriminator:
     """Tiny PatchGAN discriminator (~50K params) for small VAEs."""
     return PatchDiscriminator(
         in_channels=3,
@@ -521,7 +521,7 @@ def tiny_patch_discriminator() -> PatchDiscriminator:
     )
 
 
-def mini_patch_discriminator() -> PatchDiscriminator:
+def mini_patch() -> PatchDiscriminator:
     """Mini PatchGAN discriminator (~200K params)."""
     return PatchDiscriminator(
         in_channels=3,
@@ -531,7 +531,7 @@ def mini_patch_discriminator() -> PatchDiscriminator:
     )
 
 
-def mini_multi_scale_discriminator() -> MultiScalePatchDiscriminator:
+def mini_multi_scale() -> MultiScalePatchDiscriminator:
     """Mini multi-scale discriminator (~400K params)."""
     return MultiScalePatchDiscriminator(
         in_channels=3,
@@ -542,7 +542,7 @@ def mini_multi_scale_discriminator() -> MultiScalePatchDiscriminator:
     )
 
 
-def small_patch_discriminator() -> PatchDiscriminator:
+def tiny_patch() -> PatchDiscriminator:
     """Small PatchGAN discriminator (~663K params)."""
     return PatchDiscriminator(
         in_channels=3,
@@ -552,7 +552,7 @@ def small_patch_discriminator() -> PatchDiscriminator:
     )
 
 
-def small_multi_scale_discriminator() -> MultiScalePatchDiscriminator:
+def tiny_multi_scale() -> MultiScalePatchDiscriminator:
     """
     Small multi-scale discriminator (~782K params).
 
@@ -568,7 +568,7 @@ def small_multi_scale_discriminator() -> MultiScalePatchDiscriminator:
     )
 
 
-def small_multi_scale_discriminator_no_sn() -> MultiScalePatchDiscriminator:
+def tiny_multi_scale_no_sn() -> MultiScalePatchDiscriminator:
     """
     Small multi-scale discriminator WITHOUT spectral norm (~782K params).
 
@@ -589,7 +589,7 @@ def small_multi_scale_discriminator_no_sn() -> MultiScalePatchDiscriminator:
     )
 
 
-def tiny_multi_scale_discriminator() -> MultiScalePatchDiscriminator:
+def micro_multi_scale() -> MultiScalePatchDiscriminator:
     """Tiny multi-scale discriminator (~100K params) for small VAEs."""
     return MultiScalePatchDiscriminator(
         in_channels=3,
@@ -600,8 +600,8 @@ def tiny_multi_scale_discriminator() -> MultiScalePatchDiscriminator:
     )
 
 
-def multi_scale_discriminator() -> MultiScalePatchDiscriminator:
-    """Multi-scale PatchGAN discriminator (~8.4M params)."""
+def small_multi_scale() -> MultiScalePatchDiscriminator:
+    """Multi-scale PatchGAN discriminator (~2M params)."""
     return MultiScalePatchDiscriminator(
         in_channels=3,
         base_channels=64,
@@ -610,33 +610,45 @@ def multi_scale_discriminator() -> MultiScalePatchDiscriminator:
         use_spectral_norm=True,
     )
 
+def medium_multi_scale() -> MultiScalePatchDiscriminator:
+    """Multi-scale PatchGAN discriminator (~7.9M params)."""
+    return MultiScalePatchDiscriminator(
+        in_channels=3,
+        base_channels=64,
+        n_layers=4,
+        n_scales=4,
+        use_spectral_norm=True,
+    )
 
-def stylegan_discriminator(image_size: int = 256) -> StyleGANDiscriminator:
+
+def medium_stylegan_discriminator(image_size: int = 256) -> StyleGANDiscriminator:
     """StyleGAN-style discriminator."""
     return StyleGANDiscriminator(
         in_channels=3,
         base_channels=64,
-        max_channels=512,
+        max_channels=384,
         image_size=image_size,
     )
 
 
 model_config_lookup = {
     # ~50K params
-    "tiny_patch": tiny_patch_discriminator,
+    "micro_patch": micro_patch,
     # ~100K params
-    "tiny_multi_scale": tiny_multi_scale_discriminator,
+    "micro_multi_scale": micro_multi_scale,
     # ~168K params
-    "mini_patch": mini_patch_discriminator,
+    "mini_patch": mini_patch,
     # ~335K params
-    "mini_multi_scale": mini_multi_scale_discriminator,
+    "mini_multi_scale": mini_multi_scale,
     # ~663K params
-    "small_patch": small_patch_discriminator,
+    "tiny_patch": tiny_patch,
     # ~782K params - matches 'small' image VAE (~771K)
-    "small_multi_scale": small_multi_scale_discriminator,
+    "tiny_multi_scale": tiny_multi_scale,
     # ~782K params - NO spectral norm (use with R1 penalty)
-    "small_multi_scale_no_sn": small_multi_scale_discriminator_no_sn,
-    # ~2.8M params
-    "multi_scale": multi_scale_discriminator,
-    "stylegan": stylegan_discriminator,
+    "tiny_multi_scale_no_sn": tiny_multi_scale_no_sn,
+    # ~2M params
+    "small_multi_scale": small_multi_scale,
+    # ~11M params
+    "medium_multi_scale": medium_multi_scale,
+    "medium_stylegan": medium_stylegan_discriminator,
 }

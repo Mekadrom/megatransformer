@@ -7,8 +7,11 @@ os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ['NCCL_TIMEOUT'] = '1200000'
 
 import torch
+import numpy as np
+import matplotlib.pyplot as plt
 
-from typing import Any, Mapping, Optional, Union
+from contextlib import nullcontext
+from typing import Any, Dict, Mapping, Optional, Union
 
 from PIL import Image
 from torch.amp import autocast
@@ -26,6 +29,7 @@ from model.image.discriminators import (
     r1_gradient_penalty,
     InstanceNoiseScheduler,
 )
+from model.ema import EMAModel
 from model.image.vae import VAE, model_config_lookup
 from utils import megatransformer_utils
 from utils.model_loading_utils import load_model
@@ -103,14 +107,93 @@ class ImageVAEReconstructionCallback(TrainerCallback):
         else:
             return torch.device("cpu")
 
-    def _log_reconstruction(self, writer, model, image, global_step, prefix, idx, args):
+    def _log_attention_weights(
+        self,
+        writer: SummaryWriter,
+        attn_weights: Optional[torch.Tensor],
+        global_step: int,
+        tag_prefix: str,
+        H: int,
+        W: int,
+    ):
+        """
+        Log 2D attention weight visualizations to TensorBoard.
+
+        Args:
+            writer: TensorBoard writer
+            attn_weights: Attention tensor [B, n_heads, H*W, H*W] or None
+            global_step: Current training step
+            tag_prefix: Tag prefix for TensorBoard (e.g., "eval_vae/example_0/encoder_attention")
+            H: Height of the spatial grid
+            W: Width of the spatial grid
+        """
+        if attn_weights is None:
+            return
+
+        # Move to CPU and convert to numpy
+        # Shape: [n_heads, H*W, H*W]
+        weights = attn_weights[0].float().detach().cpu().numpy()
+        n_heads, seq_len, _ = weights.shape
+
+        # 1. Global average attention map (avg across heads)
+        global_avg_weights = weights.mean(axis=0)  # [H*W, H*W]
+
+        # Log full 2D attention map
+        fig, ax = plt.subplots(figsize=(8, 8))
+        im = ax.imshow(global_avg_weights, aspect='auto', origin='lower', cmap='viridis')
+        ax.set_title(f'Attention (avg {n_heads} heads, {H}×{W}={H*W} tokens)')
+        ax.set_xlabel('Key position')
+        ax.set_ylabel('Query position')
+        plt.colorbar(im, ax=ax)
+        plt.tight_layout()
+        writer.add_figure(f"{tag_prefix}/global_2d", fig, global_step)
+        plt.close(fig)
+
+        # 2. Per-head attention maps (first 4 heads)
+        n_heads_to_show = min(4, n_heads)
+        fig, axes = plt.subplots(1, n_heads_to_show, figsize=(4 * n_heads_to_show, 4))
+        if n_heads_to_show == 1:
+            axes = [axes]
+        for head_idx, ax in enumerate(axes):
+            im = ax.imshow(weights[head_idx], aspect='auto', origin='lower', cmap='viridis')
+            ax.set_title(f'Head {head_idx}')
+            ax.set_xlabel('Key')
+            ax.set_ylabel('Query')
+        plt.tight_layout()
+        writer.add_figure(f"{tag_prefix}/per_head", fig, global_step)
+        plt.close(fig)
+
+        # 3. Spatial attention pattern - where does each position attend?
+        # Reshape attention to show spatial patterns
+        # For a few query positions, show attention as a 2D heatmap
+        query_positions = [0, seq_len // 4, seq_len // 2, 3 * seq_len // 4]  # corners and center
+        fig, axes = plt.subplots(1, len(query_positions), figsize=(4 * len(query_positions), 4))
+        for i, (q_pos, ax) in enumerate(zip(query_positions, axes)):
+            # Get attention from this query position to all keys
+            attn_from_query = global_avg_weights[q_pos].reshape(H, W)
+            im = ax.imshow(attn_from_query, aspect='auto', origin='lower', cmap='hot')
+            q_h, q_w = q_pos // W, q_pos % W
+            ax.set_title(f'Query ({q_h},{q_w})')
+            ax.scatter([q_w], [q_h], c='cyan', s=100, marker='x')  # Mark query position
+        plt.suptitle('Attention from query positions (cyan X)')
+        plt.tight_layout()
+        writer.add_figure(f"{tag_prefix}/spatial_pattern", fig, global_step)
+        plt.close(fig)
+
+    def _log_reconstruction(self, writer, model, image, global_step, prefix, idx, args, log_attention: bool = True):
         """Log a single image reconstruction to TensorBoard."""
         device = self._get_device()
         dtype = torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32
 
         with torch.no_grad():
             with autocast(device.type, dtype=dtype):
-                recon, mu, logvar, losses = model(image.unsqueeze(0).to(device))
+                # Use reconstruct_with_attention to get attention weights if available
+                recon, mu, logvar, enc_attn, dec_attn = model.reconstruct_with_attention(
+                    image.unsqueeze(0).to(device)
+                )
+
+                # Also compute losses via forward pass
+                _, _, _, losses = model(image.unsqueeze(0).to(device))
 
                 # Unnormalize both original and reconstruction for visualization
                 orig_unnorm = self.unnormalize(image.float().cpu())
@@ -123,6 +206,13 @@ class ImageVAEReconstructionCallback(TrainerCallback):
                 writer.add_image(f"{prefix}/original/{idx}", orig_unnorm, global_step)
                 writer.add_image(f"{prefix}/recon/{idx}", recon_unnorm, global_step)
 
+                # Generate mu-only reconstruction (no sampling, z = mu)
+                # This is what diffusion will see during inference
+                recon_mu_only = model.decode(mu)
+                recon_mu_only_unnorm = self.unnormalize(recon_mu_only[0].float().cpu())
+                recon_mu_only_unnorm = torch.clamp(recon_mu_only_unnorm, 0, 1)
+                writer.add_image(f"{prefix}/recon_mu_only/{idx}", recon_mu_only_unnorm, global_step)
+
                 # Log per-example losses
                 for loss_name, loss_val in losses.items():
                     if isinstance(loss_val, torch.Tensor):
@@ -133,6 +223,29 @@ class ImageVAEReconstructionCallback(TrainerCallback):
                 mu_unnorm = (mu[0].float().cpu() - mu[0].float().cpu().min()) / (mu[0].float().cpu().max() - mu[0].float().cpu().min() + 1e-5)
                 for c in range(mu_unnorm.shape[0]):
                     writer.add_image(f"{prefix}/example_{idx}/mu_channel_{c}", mu_unnorm[c:c+1, :, :], global_step)
+
+                # Log attention weights if available
+                if log_attention:
+                    # Get spatial dimensions from mu (latent space)
+                    _, _, H, W = mu.shape
+
+                    # Log encoder attention
+                    enc_weights = enc_attn.get("weights") if enc_attn else None
+                    if enc_weights is not None:
+                        self._log_attention_weights(
+                            writer, enc_weights, global_step,
+                            tag_prefix=f"{prefix}/example_{idx}/encoder_attention",
+                            H=H, W=W,
+                        )
+
+                    # Log decoder attention
+                    dec_weights = dec_attn.get("weights") if dec_attn else None
+                    if dec_weights is not None:
+                        self._log_attention_weights(
+                            writer, dec_weights, global_step,
+                            tag_prefix=f"{prefix}/example_{idx}/decoder_attention",
+                            H=H, W=W,
+                        )
 
     def on_evaluate(self, args, state, control, model: VAE = None, **kwargs):
         """Generate and log reconstructions during evaluation."""
@@ -210,6 +323,12 @@ class ImageVAEGANTrainer(Trainer):
         instance_noise_decay_steps: int = 50000,  # Steps to decay noise to 0
         r1_penalty_weight: float = 0.0,  # Weight for R1 gradient penalty (0 = disabled)
         r1_penalty_interval: int = 16,  # Apply R1 penalty every N steps (expensive)
+        # GAN warmup (ramps GAN loss contribution from 0 to full weight)
+        gan_warmup_steps: int = 0,  # Steps to ramp up GAN loss (0 = no warmup)
+        # Perceptual loss delayed start
+        perceptual_loss_start_step: int = 0,  # Step to start applying perceptual loss (0 = from start)
+        # KL annealing (ramps KL weight from 0 to full over training)
+        kl_annealing_steps: int = 0,  # Steps to ramp KL weight from 0 to 1 (0 = disabled)
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -227,6 +346,12 @@ class ImageVAEGANTrainer(Trainer):
         self.gan_start_condition_key = gan_start_condition_key
         self.gan_start_condition_value = gan_start_condition_value
         self.gan_already_started = False
+        self.gan_start_step = None  # Track when GAN training started (for warmup)
+        self.gan_warmup_steps = gan_warmup_steps
+        self.perceptual_loss_start_step = perceptual_loss_start_step
+
+        # KL annealing settings
+        self.kl_annealing_steps = kl_annealing_steps
 
         # Discriminator regularization settings
         self.r1_penalty_weight = r1_penalty_weight
@@ -274,8 +399,13 @@ class ImageVAEGANTrainer(Trainer):
 
         image = inputs["image"]
 
+        # Compute KL weight multiplier for KL annealing (ramps from 0 to 1)
+        kl_weight_multiplier = 1.0
+        if self.kl_annealing_steps > 0:
+            kl_weight_multiplier = min(1.0, global_step / self.kl_annealing_steps)
+
         # Forward pass through VAE model
-        recon, mu, logvar, losses = model(image)
+        recon, mu, logvar, losses = model(image, kl_weight_multiplier=kl_weight_multiplier)
 
         # Get VAE reconstruction loss
         vae_loss = losses["total_loss"]
@@ -285,7 +415,17 @@ class ImageVAEGANTrainer(Trainer):
         d_loss = torch.tensor(0.0, device=image.device)
 
         if self.is_gan_enabled(global_step, vae_loss):
+            if not self.gan_already_started:
+                # First step of GAN training - record start step for warmup
+                self.gan_start_step = global_step
+                print(f"GAN training starting at step {global_step}")
             self.gan_already_started = True
+
+            # Compute GAN warmup factor (ramps from 0 to 1 over gan_warmup_steps)
+            gan_warmup_factor = 1.0
+            if self.gan_warmup_steps > 0 and self.gan_start_step is not None:
+                steps_since_gan_start = global_step - self.gan_start_step
+                gan_warmup_factor = min(1.0, steps_since_gan_start / self.gan_warmup_steps)
 
             # Get current instance noise std (decays over training)
             noise_std = 0.0
@@ -339,8 +479,8 @@ class ImageVAEGANTrainer(Trainer):
                         self._log_scalar("train/real_fake_mse", real_fake_mse, global_step)
                         self._log_scalar("train/real_fake_l1", real_fake_l1, global_step)
 
-                # Update discriminator
-                if self.discriminator_optimizer is not None and self.discriminator.training:
+                # Update discriminator (only during training when gradients are enabled)
+                if self.discriminator_optimizer is not None and self.discriminator.training and torch.is_grad_enabled():
                     self.discriminator_optimizer.zero_grad()
                     d_loss.backward()
 
@@ -369,6 +509,11 @@ class ImageVAEGANTrainer(Trainer):
             if global_step % self.args.logging_steps == 0 and self.writer is not None:
                 for key, val in g_loss_dict.items():
                     self._log_scalar(f"train/{key}", val, global_step)
+                # Log warmup factor
+                self._log_scalar("train/gan_warmup_factor", gan_warmup_factor, global_step)
+
+            # Apply warmup factor to GAN loss
+            g_gan_loss = gan_warmup_factor * g_gan_loss
 
         # Total generator loss
         total_loss = vae_loss + self.gan_loss_weight * g_gan_loss
@@ -382,8 +527,29 @@ class ImageVAEGANTrainer(Trainer):
             self._log_scalar(f"{prefix}vae_mu_mean", mu.mean(), global_step)
             self._log_scalar(f"{prefix}vae_mu_std", mu.std(), global_step)
             self._log_scalar(f"{prefix}vae_logvar_mean", logvar.mean(), global_step)
+            # Mean variance (what diffusion will see) - useful for setting latent_std
+            self._log_scalar(f"{prefix}vae_mean_variance", logvar.exp().mean(), global_step)
+            self._log_scalar(f"{prefix}vae_mean_std", logvar.exp().mean().sqrt(), global_step)
             self._log_scalar(f"{prefix}g_gan_loss", g_gan_loss, global_step)
             self._log_scalar(f"{prefix}total_loss", total_loss.mean(), global_step)
+
+            # Per-channel latent statistics (for detecting channel collapse)
+            # mu shape: [B, C, H, W] - compute stats per channel
+            per_channel_mu_mean = mu.mean(dim=(0, 2, 3))  # [C]
+            per_channel_mu_std = mu.std(dim=(0, 2, 3))  # [C]
+            per_channel_var = logvar.exp().mean(dim=(0, 2, 3))  # [C]
+            # Per-channel KL: 0.5 * (mu^2 + var - log(var) - 1), averaged over batch and spatial
+            per_channel_kl = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).mean(dim=(0, 2, 3))  # [C]
+
+            for c in range(mu.shape[1]):
+                self._log_scalar(f"{prefix}channel_{c}/mu_mean", per_channel_mu_mean[c], global_step)
+                self._log_scalar(f"{prefix}channel_{c}/mu_std", per_channel_mu_std[c], global_step)
+                self._log_scalar(f"{prefix}channel_{c}/variance", per_channel_var[c], global_step)
+                self._log_scalar(f"{prefix}channel_{c}/kl", per_channel_kl[c], global_step)
+
+            # Log KL weight multiplier if annealing is enabled
+            if self.kl_annealing_steps > 0:
+                self._log_scalar(f"{prefix}kl_weight_multiplier", kl_weight_multiplier, global_step)
 
         outputs = {
             "loss": total_loss,
@@ -414,13 +580,11 @@ class ImageVAEGANTrainer(Trainer):
         """Save both VAE and discriminator."""
         super().save_model(output_dir, _internal_call)
 
-        global_step = self.state.global_step + self.step_offset
-
         if output_dir is None:
             output_dir = self.args.output_dir
 
-        # Save discriminator
-        if self.is_gan_enabled(global_step, torch.tensor(float('inf'))):
+        # Save discriminator if GAN training has started
+        if self.gan_already_started and self.discriminator is not None:
             os.makedirs(output_dir, exist_ok=True)
             discriminator_path = os.path.join(output_dir, "discriminator.pt")
             torch.save({
@@ -432,13 +596,33 @@ class ImageVAEGANTrainer(Trainer):
             }, discriminator_path)
             print(f"Discriminator saved to {discriminator_path}")
 
-    def is_gan_enabled(self, global_step, vae_loss) -> bool:
-        return (
-            self.discriminator is not None and self.gan_start_condition_key is not None and self.gan_start_condition_value is not None and
-             (self.gan_already_started or
-             (self.gan_start_condition_key == "step" and global_step >= int(self.gan_start_condition_value)) or
-             (self.gan_start_condition_key == 'reconstruction_criteria_met' and vae_loss.mean().item() <= float(self.gan_start_condition_value)))
-        )
+    def is_gan_enabled(self, global_step: int, vae_loss: torch.Tensor) -> bool:
+        """
+        Check if GAN training should be enabled at the current step.
+
+        Args:
+            global_step: Current training step
+            vae_loss: Current VAE loss tensor
+
+        Returns:
+            True if GAN training should be active
+        """
+        if self.discriminator is None:
+            return False
+        if self.gan_start_condition_key is None or self.gan_start_condition_value is None:
+            return False
+
+        # Once started, always enabled
+        if self.gan_already_started:
+            return True
+
+        # Check start conditions
+        if self.gan_start_condition_key == "step":
+            return global_step >= int(self.gan_start_condition_value)
+        elif self.gan_start_condition_key == "reconstruction_criteria_met":
+            return vae_loss.mean().item() <= float(self.gan_start_condition_value)
+
+        return False
 
 def load_discriminator(
     resume_from_checkpoint: str,
@@ -456,7 +640,7 @@ def load_discriminator(
         discriminator_path = os.path.join(resume_from_checkpoint, "discriminator.pt")
         if os.path.exists(discriminator_path):
             print(f"Loading discriminator from {discriminator_path}")
-            checkpoint = torch.load(discriminator_path, map_location=device)
+            checkpoint = torch.load(discriminator_path, map_location=device, weights_only=True)
             discriminator.load_state_dict(checkpoint["discriminator_state_dict"], strict=False)
 
             if discriminator_optimizer is not None and checkpoint.get("discriminator_optimizer_state_dict"):
@@ -469,6 +653,50 @@ def load_discriminator(
 
     print("No existing discriminator checkpoint found, training from scratch")
     return discriminator, discriminator_optimizer, False
+
+
+class EMAUpdateCallback(TrainerCallback):
+    """Callback to update EMA weights after each training step and save/load EMA state."""
+
+    def __init__(self, ema: Optional[EMAModel] = None):
+        self.ema = ema
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.ema is not None:
+            self.ema.update()
+
+    def on_save(self, args, state, control, **kwargs):
+        """Save EMA weights alongside model checkpoint."""
+        if self.ema is None:
+            return
+
+        # Determine checkpoint directory
+        checkpoint_folder = f"checkpoint-{state.global_step}"
+        output_dir = os.path.join(args.output_dir, checkpoint_folder)
+
+        # Save EMA state dict
+        ema_path = os.path.join(output_dir, "ema_state.pt")
+        torch.save(self.ema.state_dict(), ema_path)
+        print(f"Saved EMA state to {ema_path}")
+
+
+def load_ema_state(ema: EMAModel, checkpoint_path: str) -> bool:
+    """Load EMA state from checkpoint if available.
+
+    Args:
+        ema: The EMA model to load state into
+        checkpoint_path: Path to checkpoint directory
+
+    Returns:
+        True if EMA state was loaded, False otherwise
+    """
+    ema_path = os.path.join(checkpoint_path, "ema_state.pt")
+    if os.path.exists(ema_path):
+        state_dict = torch.load(ema_path, map_location="cpu")
+        ema.load_state_dict(state_dict)
+        print(f"Loaded EMA state from {ema_path} (step {ema.step})")
+        return True
+    return False
 
 
 def main():
@@ -517,6 +745,21 @@ def main():
     # R1 gradient penalty: penalizes gradient norm on real images to learn real distribution
     r1_penalty_weight = float(unk_dict.get("r1_penalty_weight", 0.0))  # Weight (0 = disabled, 10.0 typical)
     r1_penalty_interval = int(unk_dict.get("r1_penalty_interval", 16))  # Apply every N steps (expensive)
+    # GAN warmup: ramps GAN loss from 0 to full over N steps (0 = no warmup)
+    gan_warmup_steps = int(unk_dict.get("gan_warmup_steps", 0))
+    # Perceptual loss delayed start (0 = from start, >0 = delay to let L1/MSE settle)
+    perceptual_loss_start_step = int(unk_dict.get("perceptual_loss_start_step", 0))
+
+    # KL annealing: ramps KL weight from 0 to full over N steps (0 = disabled, no annealing)
+    kl_annealing_steps = int(unk_dict.get("kl_annealing_steps", 0))
+
+    # Free bits: minimum KL per channel to prevent posterior collapse (0 = disabled)
+    free_bits = float(unk_dict.get("free_bits", 0.0))
+
+    # EMA settings
+    use_ema = unk_dict.get("use_ema", "false").lower() == "true"
+    ema_decay = float(unk_dict.get("ema_decay", 0.9999))
+    ema_update_after_step = int(unk_dict.get("ema_update_after_step", 0))
 
     model = model_config_lookup[args.config](
         latent_channels=latent_channels,
@@ -526,6 +769,7 @@ def main():
         mse_loss_weight=mse_loss_weight,
         l1_loss_weight=l1_loss_weight,
         kl_divergence_loss_weight=kl_divergence_loss_weight,
+        free_bits=free_bits,
         perceptual_loss_weight=perceptual_loss_weight,
     )
 
@@ -584,6 +828,14 @@ def main():
                 print(f"  Instance noise: std={instance_noise_std}, decay_steps={instance_noise_decay_steps}")
             if r1_penalty_weight > 0:
                 print(f"  R1 penalty: weight={r1_penalty_weight}, interval={r1_penalty_interval}")
+            if gan_warmup_steps > 0:
+                print(f"  GAN warmup: {gan_warmup_steps} steps (ramps loss from 0 to full)")
+        if perceptual_loss_start_step > 0:
+            print(f"Perceptual loss: delayed start at step {perceptual_loss_start_step}")
+        if kl_annealing_steps > 0:
+            print(f"KL annealing: {kl_annealing_steps} steps (ramps KL weight from 0 to 1)")
+        if free_bits > 0:
+            print(f"Free bits: {free_bits} nats per channel (prevents posterior collapse)")
 
     model = setup_int8_training(args, model)
 
@@ -595,7 +847,7 @@ def main():
         tpu_num_cores=8 if args.use_xla else None,
         output_dir=run_dir,
         overwrite_output_dir=True,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=args.lr_scheduler_type,
         learning_rate=args.learning_rate,
         warmup_ratio=args.warmup_ratio if args.warmup_steps == 0 else 0.0,
         warmup_steps=args.warmup_steps if args.warmup_steps > 0 else 0,
@@ -661,6 +913,9 @@ def main():
         instance_noise_decay_steps=instance_noise_decay_steps,
         r1_penalty_weight=r1_penalty_weight,
         r1_penalty_interval=r1_penalty_interval,
+        gan_warmup_steps=gan_warmup_steps,
+        perceptual_loss_start_step=perceptual_loss_start_step,
+        kl_annealing_steps=kl_annealing_steps,
     )
 
     # Add visualization callback
@@ -676,6 +931,24 @@ def main():
         trainer.add_callback(early_stopping_callback)
 
     visualization_callback.trainer = trainer
+
+    # Create EMA if enabled
+    ema = None
+    if use_ema:
+        ema = EMAModel(
+            model,
+            decay=ema_decay,
+            update_after_step=ema_update_after_step,
+        )
+        ema_callback = EMAUpdateCallback(ema=ema)
+        trainer.add_callback(ema_callback)
+
+        # Load EMA state if resuming from checkpoint
+        if args.resume_from_checkpoint is not None:
+            load_ema_state(ema, args.resume_from_checkpoint)
+
+        if args.local_rank == 0 or not args.use_deepspeed:
+            print(f"EMA enabled: decay={ema_decay}, update_after_step={ema_update_after_step}")
 
     # Log scheduler info
     if hasattr(trainer, 'deepspeed') and trainer.deepspeed is not None:

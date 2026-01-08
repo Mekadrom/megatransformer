@@ -24,6 +24,7 @@ from transformers import TrainingArguments, Trainer, TrainerCallback, T5EncoderM
 from transformers.integrations import TensorBoardCallback
 
 from dataset_loading.audio_diffusion_dataset import CachedAudioDiffusionDataset, AudioDiffusionDataCollator
+from shard_utils import AudioDiffusionShardedDataset
 from model.audio.diffusion import AudioConditionalGaussianDiffusion, model_config_lookup
 from model.audio.vocoders.vocoders import model_config_lookup as vocoder_config_lookup
 from model.audio.vae import model_config_lookup as audio_vae_config_lookup
@@ -110,6 +111,21 @@ class AudioDiffusionModelWithT5ConditioningAdapter(nn.Module):
         self.context_dim = context_dim
 
         self.condition_adapter = nn.Linear(context_dim, context_dim)
+        self._init_adapter()
+
+    def _init_adapter(self):
+        """Initialize adapter to preserve input distribution.
+
+        Default PyTorch Linear init (kaiming uniform) with 512->512 has weight std ~0.025,
+        which shrinks std=0.2 input to std=0.12 output (40% reduction).
+
+        We use xavier uniform with gain=1.0 to approximately preserve variance.
+        For a 512->512 linear: output_std ≈ input_std * weight_std * sqrt(fan_in)
+        With xavier gain=1.0: weight_std ≈ sqrt(2 / (fan_in + fan_out)) ≈ 0.044
+        Output_std ≈ 0.2 * 0.044 * 22.6 ≈ 0.2 (preserved)
+        """
+        nn.init.xavier_uniform_(self.condition_adapter.weight, gain=1.0)
+        nn.init.zeros_(self.condition_adapter.bias)
 
     def forward(self, x_0: torch.Tensor, condition: Optional[torch.Tensor] = None, return_diagnostics: bool = False):
         # condition is expected to be T5 text embeddings of shape [B, T_text, context_dim]
@@ -119,6 +135,9 @@ class AudioDiffusionModelWithT5ConditioningAdapter(nn.Module):
         return self.model(x_0=x_0, condition=condition, return_diagnostics=return_diagnostics)
 
     def sample(self, *args, **kwargs):
+        # Apply adapter to condition if provided (fixes train/inference mismatch)
+        if 'condition' in kwargs and kwargs['condition'] is not None:
+            kwargs['condition'] = self.condition_adapter(kwargs['condition'])
         return self.model.sample(*args, **kwargs)
 
 
@@ -145,6 +164,8 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
         ema: Optional[EMAModel] = None,
         use_latent_diffusion: bool = False,
         vae: Optional[nn.Module] = None,
+        latent_mean: float = 0.0,
+        latent_std: float = 1.0,
     ):
         self.trainer: Optional[Trainer] = None
         self.step_offset = step_offset if step_offset is not None else 0
@@ -163,6 +184,8 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
         self.ema = ema
         self.use_latent_diffusion = use_latent_diffusion
         self.vae = vae
+        self.latent_mean = latent_mean
+        self.latent_std = latent_std
 
         t5_model = T5EncoderModel.from_pretrained("t5-small")
         t5_tokenizer = T5Tokenizer.from_pretrained("t5-small")
@@ -221,6 +244,10 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
 
             load_model(False, vocoder, self.vocoder_checkpoint_path)
 
+            # Remove weight norm for inference optimization
+            if hasattr(vocoder, 'vocoder') and hasattr(vocoder.vocoder, 'remove_weight_norm'):
+                vocoder.vocoder.remove_weight_norm()
+
             vocoder.eval()
             self.vocoder = vocoder
             print(f"Loaded vocoder from {self.vocoder_checkpoint_path}")
@@ -259,17 +286,35 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
 
                 with ema_context:
                     with autocast(device.type, dtype=dtype):
+                        # Detect if model is Flow Matching or Gaussian Diffusion
+                        # Flow Matching models have 'backbone' attribute or use AudioConditionalFlowMatching
+                        is_flow_matching = hasattr(model, 'backbone') or (hasattr(model, 'model') and hasattr(model.model, 'backbone'))
+
+                        # Build sampling kwargs based on model type
+                        if is_flow_matching:
+                            sample_kwargs = {
+                                "device": device,
+                                "batch_size": 1,
+                                "condition": None,
+                                "return_intermediate": True,
+                                "override_sampling_steps": self.ddim_sampling_steps,
+                                "guidance_scale": 3.0,
+                                "solver": "euler",
+                            }
+                        else:
+                            sample_kwargs = {
+                                "device": device,
+                                "batch_size": 1,
+                                "condition": None,
+                                "return_intermediate": True,
+                                "override_sampling_steps": self.ddim_sampling_steps,
+                                "guidance_scale": 3.0,
+                                "sampler": "dpm_solver_pp",
+                                "dpm_solver_order": 2,
+                            }
+
                         # Generate unconditional samples with intermediate steps
-                        result = model.sample(
-                            device=device,
-                            batch_size=1,  # Single sample to reduce memory for intermediates
-                            condition=None,
-                            return_intermediate=True,
-                            override_sampling_steps=self.ddim_sampling_steps,
-                            guidance_scale=3.0,  # Moderate CFG for audio
-                            sampler="dpm_solver_pp",
-                            dpm_solver_order=2,
-                        )
+                        result = model.sample(**sample_kwargs)
                         generated_mels, noise_preds, x_start_preds = result
 
                         # Log generated mel spectrograms and audio (decode from latent if needed)
@@ -282,17 +327,9 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
                         # Log intermediate denoising steps
                         self._log_intermediate_steps(x_start_preds, writer, global_step, tag_prefix="audio_diffusion/uncond_intermediate")
 
-                        # generate from t5 text conditions
-                        result = model.sample(
-                            device=device,
-                            batch_size=1,
-                            condition=self.text_embeddings.to(device),
-                            return_intermediate=True,
-                            override_sampling_steps=self.ddim_sampling_steps,
-                            guidance_scale=3.0,  # Moderate CFG for audio
-                            sampler="dpm_solver_pp",
-                            dpm_solver_order=2,
-                        )
+                        # Generate from t5 text conditions
+                        sample_kwargs["condition"] = self.text_embeddings.to(device)
+                        result = model.sample(**sample_kwargs)
                         generated_mels, noise_preds, x_start_preds = result
 
                         self._log_mel_and_audio(
@@ -355,6 +392,9 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
                 latent = output
                 if latent.dim() == 3:
                     latent = latent.unsqueeze(0)  # [C, H, T] -> [1, C, H, T]
+
+                # Denormalize latent back to original VAE distribution before decoding
+                latent = latent * self.latent_std + self.latent_mean
 
                 # Decode latent to mel spec using VAE with speaker embedding
                 with torch.no_grad():
@@ -526,8 +566,9 @@ class EMAUpdateCallback(TrainerCallback):
 
 class AudioDiffusionTrainer(Trainer):
     """
-    Custom trainer for audio latent diffusion model with EMA support.
-    Operates on VAE-encoded latents (mel-space diffusion is not supported).
+    Custom trainer for audio diffusion model with EMA support.
+    Supports both latent diffusion (with VAE) and mel-space diffusion (direct on spectrograms).
+    Supports shard-aware sampling for efficient training with sharded datasets.
     """
 
     def __init__(
@@ -539,6 +580,8 @@ class AudioDiffusionTrainer(Trainer):
         ema: Optional[EMAModel] = None,
         use_latent_diffusion: bool = False,
         vae: Optional[nn.Module] = None,
+        latent_mean: float = 0.0,
+        latent_std: float = 1.0,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -550,6 +593,24 @@ class AudioDiffusionTrainer(Trainer):
         self.ema = ema
         self.use_latent_diffusion = use_latent_diffusion
         self.vae = vae
+        self.latent_mean = latent_mean
+        self.latent_std = latent_std
+
+        # Store shard-aware sampler if available
+        self._shard_sampler = None
+        if hasattr(self.train_dataset, 'get_sampler'):
+            self._shard_sampler = self.train_dataset.get_sampler(shuffle=True, seed=42)
+
+    def _get_train_sampler(self):
+        """Override to use shard-aware sampler for sharded datasets."""
+        if self._shard_sampler is not None:
+            # Update epoch for proper shuffling across epochs
+            epoch = 0
+            if self.state is not None and self.state.epoch is not None:
+                epoch = int(self.state.epoch)
+            self._shard_sampler.set_epoch(epoch)
+            return self._shard_sampler
+        return super()._get_train_sampler()
 
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """
@@ -577,16 +638,34 @@ class AudioDiffusionTrainer(Trainer):
 
         text_embeddings = inputs["text_embeddings"]
 
-        # Use latent_mu (latent-only diffusion - mel-space not supported)
-        if "latent_mu" not in inputs:
-            raise ValueError(
-                "latent_mu not found in inputs. This model only supports latent diffusion. "
-                "Ensure your dataset was preprocessed with VAE encoding (--vae_checkpoint)."
-            )
-        x_0 = inputs["latent_mu"]
-        # Add channel dimension if needed: [B, C, H, T] for latent
-        if x_0.dim() == 3:
-            x_0 = x_0.unsqueeze(1)
+        # Get input based on diffusion mode
+        if self.use_latent_diffusion:
+            # Latent diffusion: use VAE-encoded latents
+            # Speaker conditioning is handled by VAE decoder, not diffusion
+            if "latent_mu" not in inputs:
+                raise ValueError(
+                    "latent_mu not found in inputs. For latent diffusion, ensure your dataset "
+                    "was preprocessed with VAE encoding (--vae_checkpoint)."
+                )
+            x_0 = inputs["latent_mu"]
+            # Add channel dimension if needed: [B, C, H, T] for latent
+            if x_0.dim() == 3:
+                x_0 = x_0.unsqueeze(1)
+            # Normalize latents to zero-mean unit-variance for diffusion
+            x_0 = (x_0 - self.latent_mean) / self.latent_std
+            speaker_embedding = None  # Not used for latent diffusion
+        else:
+            # Mel-space diffusion: use mel spectrograms directly
+            # Speaker conditioning is done in the diffusion model
+            if "mel_spec" not in inputs:
+                raise ValueError(
+                    "mel_spec not found in inputs. For mel diffusion, ensure your dataset "
+                    "includes mel spectrograms (preprocess with --include_mel_specs)."
+                )
+            x_0 = inputs["mel_spec"]  # [B, n_mels, T]
+            x_0 = x_0.unsqueeze(1)    # [B, 1, n_mels, T]
+            # Get speaker embedding for mel-space diffusion
+            speaker_embedding = inputs.get("speaker_embedding", None)
 
         # Request diagnostics every N steps for debugging
         should_log_diagnostics = (global_step % (self.args.logging_steps * 10) == 0) and self.writer is not None
@@ -596,12 +675,14 @@ class AudioDiffusionTrainer(Trainer):
             predicted_noise, loss, diagnostics = model(
                 x_0=x_0,
                 condition=text_embeddings,
+                speaker_embedding=speaker_embedding,
                 return_diagnostics=True,
             )
         else:
             predicted_noise, loss = model(
                 x_0=x_0,
                 condition=text_embeddings,
+                speaker_embedding=speaker_embedding,
             )
             diagnostics = None
 
@@ -714,6 +795,7 @@ def main():
     audio_max_frames = int(unk_dict.get("audio_max_frames", 1875))
     max_conditions = int(unk_dict.get("max_conditions", 1024))
     n_mels = int(unk_dict.get("n_mels", 80))
+    use_sharded_dataset = unk_dict.get("use_sharded_dataset", "false").lower() == "true"
 
     # Vocoder settings (optional - for audio generation during visualization)
     vocoder_checkpoint_path = unk_dict.get("vocoder_checkpoint_path", None)
@@ -723,27 +805,41 @@ def main():
     ema_decay = float(unk_dict.get("ema_decay", 0.9999))
     ema_update_after_step = int(unk_dict.get("ema_update_after_step", 100))
 
-    # Latent diffusion settings (latent diffusion is always used - mel-space diffusion is not supported)
+    # Latent diffusion settings (optional - if no VAE provided, uses mel-space diffusion)
     vae_checkpoint = unk_dict.get("vae_checkpoint", None)
     vae_config = unk_dict.get("vae_config", "mini")
     latent_channels = int(unk_dict.get("latent_channels", 16))
     speaker_embedding_dim = int(unk_dict.get("speaker_embedding_dim", 192))
     latent_max_frames = int(unk_dict.get("latent_max_frames", 25))  # audio_max_frames / time_compression
 
+    # Latent normalization (for normalizing VAE latents to zero-mean unit-variance)
+    latent_mean = float(unk_dict.get("latent_mean", 0.0))
+    latent_std = float(unk_dict.get("latent_std", 1.0))
+
+    # Determine diffusion mode based on VAE availability
+    use_latent_diffusion = vae_checkpoint is not None
+
     shared_window_buffer = SharedWindowBuffer()
 
-    # Load VAE for latent diffusion (required)
-    if vae_checkpoint is None:
-        raise ValueError("vae_checkpoint is required - this model only supports latent diffusion")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    vae = load_audio_vae(vae_checkpoint, vae_config, latent_channels, speaker_embedding_dim, device)
-    print(f"Loaded VAE for latent diffusion: {vae_config}, latent_channels={latent_channels}")
+    # Load VAE for latent diffusion (optional)
+    vae = None
+    if use_latent_diffusion:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        vae = load_audio_vae(vae_checkpoint, vae_config, latent_channels, speaker_embedding_dim, device)
+        print(f"Loaded VAE for latent diffusion: {vae_config}, latent_channels={latent_channels}")
+    else:
+        print("No VAE checkpoint provided - using mel-space diffusion")
+
+    # Determine if we should use speaker conditioning in diffusion
+    # (only when not using latent diffusion, since latent diffusion handles speaker in VAE decoder)
+    diffusion_speaker_embedding_dim = 0 if use_latent_diffusion else speaker_embedding_dim
 
     model = model_config_lookup[args.config](
         num_timesteps=num_timesteps,
         sampling_timesteps=sampling_timesteps,
         betas_schedule=betas_schedule,
         context_dim=context_dim,
+        speaker_embedding_dim=diffusion_speaker_embedding_dim,
         normalize=normalize,
         min_snr_loss_weight=min_snr_loss_weight,
         min_snr_gamma=min_snr_gamma,
@@ -760,10 +856,22 @@ def main():
         print(f"Model structure: {model}")
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
         print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-        print(f"UNet parameters: {sum(p.numel() for p in model.unet.parameters()):,}")
-        print(f"  Downblocks: {sum(p.numel() for p in model.unet.down_blocks.parameters()):,}")
-        print(f"  Middle: {sum(p.numel() for p in model.unet.middle_attn_block.parameters()) + sum(p.numel() for p in model.unet.middle_res_block.parameters()) + sum(p.numel() for p in model.unet.middle_res_block2.parameters()):,}")
-        print(f"  Upblocks: {sum(p.numel() for p in model.unet.up_blocks.parameters()):,}")
+
+        # Check if it's a DiT-style model or UNet-style model
+        backbone = model.unet if hasattr(model, 'unet') else model.backbone if hasattr(model, 'backbone') else None
+        if backbone is not None:
+            print(f"Backbone parameters: {sum(p.numel() for p in backbone.parameters()):,}")
+            if hasattr(backbone, 'down_blocks'):
+                # UNet-style model
+                print(f"  Downblocks: {sum(p.numel() for p in backbone.down_blocks.parameters()):,}")
+                print(f"  Middle: {sum(p.numel() for p in backbone.middle_attn_block.parameters()) + sum(p.numel() for p in backbone.middle_res_block.parameters()) + sum(p.numel() for p in backbone.middle_res_block2.parameters()):,}")
+                print(f"  Upblocks: {sum(p.numel() for p in backbone.up_blocks.parameters()):,}")
+            elif hasattr(backbone, 'blocks'):
+                # DiT-style model
+                print(f"  Transformer blocks: {sum(p.numel() for p in backbone.blocks.parameters()):,}")
+                print(f"  Input projection: {sum(p.numel() for p in backbone.input_proj.parameters()):,}")
+                print(f"  Time embedding: {sum(p.numel() for p in backbone.time_embed.parameters()):,}")
+                print(f"  Final layer: {sum(p.numel() for p in backbone.final_layer.parameters()):,}")
         print(f"Diffusion settings:")
         print(f"  Num timesteps: {num_timesteps}")
         print(f"  Sampling timesteps: {sampling_timesteps}")
@@ -779,6 +887,8 @@ def main():
         print(f"  Latent channels: {latent_channels}")
         print(f"  Speaker embedding dim: {speaker_embedding_dim}")
         print(f"  Latent max frames: {latent_max_frames}")
+        if latent_mean != 0.0 or latent_std != 1.0:
+            print(f"  Latent normalization: mean={latent_mean}, std={latent_std}")
 
     model = megatransformer_utils.setup_int8_training(args, model)
 
@@ -821,22 +931,35 @@ def main():
     )
 
     # Load datasets
-    train_dataset = CachedAudioDiffusionDataset(
-        cache_dir=train_cache_dir,
-        audio_max_frames=audio_max_frames,
-    )
+    if use_sharded_dataset:
+        print(f"Using sharded dataset format")
+        train_dataset = AudioDiffusionShardedDataset(
+            shard_dir=train_cache_dir,
+            audio_max_frames=audio_max_frames,
+            latent_max_frames=latent_max_frames,
+        )
+        eval_dataset = AudioDiffusionShardedDataset(
+            shard_dir=val_cache_dir,
+            audio_max_frames=audio_max_frames,
+            latent_max_frames=latent_max_frames,
+        )
+    else:
+        print(f"Using legacy individual-file dataset format")
+        train_dataset = CachedAudioDiffusionDataset(
+            cache_dir=train_cache_dir,
+            audio_max_frames=audio_max_frames,
+        )
+        eval_dataset = CachedAudioDiffusionDataset(
+            cache_dir=val_cache_dir,
+            audio_max_frames=audio_max_frames,
+        )
 
-    eval_dataset = CachedAudioDiffusionDataset(
-        cache_dir=val_cache_dir,
-        audio_max_frames=audio_max_frames,
-    )
-
-    # Create data collator (latent diffusion is always enabled)
+    # Create data collator
     data_collator = AudioDiffusionDataCollator(
         audio_max_frames=audio_max_frames,
         max_conditions=max_conditions,
         n_mels=n_mels,
-        use_latent_diffusion=True,
+        use_latent_diffusion=use_latent_diffusion,
         latent_max_frames=latent_max_frames,
     )
 
@@ -854,7 +977,7 @@ def main():
 
     model = AudioDiffusionModelWithT5ConditioningAdapter(model, context_dim=context_dim)
 
-    # Create trainer (latent diffusion is always enabled)
+    # Create trainer
     trainer = AudioDiffusionTrainer(
         model=model,
         args=training_args,
@@ -865,8 +988,10 @@ def main():
         git_commit_hash=args.commit_hash,
         step_offset=args.start_step,
         ema=ema,
-        use_latent_diffusion=True,
+        use_latent_diffusion=use_latent_diffusion,
         vae=vae,
+        latent_mean=latent_mean,
+        latent_std=latent_std,
     )
 
     # Add EMA update callback
@@ -874,7 +999,7 @@ def main():
         ema_callback = EMAUpdateCallback(ema=ema)
         trainer.add_callback(ema_callback)
 
-    # Add visualization callback (latent diffusion is always enabled)
+    # Add visualization callback
     visualization_callback = AudioDiffusionVisualizationCallback(
         shared_window_buffer,
         step_offset=args.start_step,
@@ -887,8 +1012,10 @@ def main():
         ddim_sampling_steps=sampling_timesteps,
         vocoder_checkpoint_path=vocoder_checkpoint_path,
         ema=ema,
-        use_latent_diffusion=True,
+        use_latent_diffusion=use_latent_diffusion,
         vae=vae,
+        latent_mean=latent_mean,
+        latent_std=latent_std,
     )
     trainer.add_callback(visualization_callback)
 

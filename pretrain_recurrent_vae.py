@@ -38,6 +38,7 @@ os.environ['NCCL_TIMEOUT'] = '1200000'
 
 import torch
 
+from contextlib import nullcontext
 from typing import Any, Mapping, Optional, Union
 
 from PIL import Image
@@ -48,12 +49,54 @@ from transformers import TrainingArguments, Trainer, TrainerCallback
 from transformers.integrations import TensorBoardCallback
 
 from dataset_loading.image_vae_dataset import CachedImageVAEDataset, ImageVAEDataCollator
+from model.ema import EMAModel
 from model.image.recurrent_vae import RecurrentVAE, model_config_lookup
 from model.image import discriminators
-from model.image.discriminators import compute_discriminator_loss, compute_generator_gan_loss
+from model.image.discriminators import compute_discriminator_loss, compute_generator_gan_loss, r1_gradient_penalty
 from utils import megatransformer_utils
 from utils.model_loading_utils import load_model
 from utils.training_utils import EarlyStoppingCallback, setup_int8_training
+
+
+class InstanceNoiseScheduler:
+    """Scheduler for decaying instance noise during GAN training."""
+
+    def __init__(
+        self,
+        initial_std: float = 0.1,
+        final_std: float = 0.0,
+        decay_steps: int = 50000,
+        decay_type: str = "linear",  # "linear" or "cosine"
+    ):
+        self.initial_std = initial_std
+        self.final_std = final_std
+        self.decay_steps = decay_steps
+        self.decay_type = decay_type
+
+    def get_std(self, step: int) -> float:
+        """Get instance noise std for given step."""
+        if step >= self.decay_steps:
+            return self.final_std
+
+        progress = step / self.decay_steps
+
+        if self.decay_type == "cosine":
+            import math
+            # Cosine decay from initial to final
+            factor = 0.5 * (1 + math.cos(math.pi * progress))
+        else:
+            # Linear decay
+            factor = 1.0 - progress
+
+        return self.final_std + (self.initial_std - self.final_std) * factor
+
+
+def add_instance_noise(images: torch.Tensor, std: float) -> torch.Tensor:
+    """Add Gaussian noise to images for GAN training stability."""
+    if std <= 0:
+        return images
+    noise = torch.randn_like(images) * std
+    return images + noise
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -199,9 +242,19 @@ class RecurrentVAEGANTrainer(Trainer):
         discriminator: Optional[torch.nn.Module] = None,
         discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
         gan_loss_weight: float = 0.5,
+        feature_matching_weight: float = 0.0,
         discriminator_update_frequency: int = 1,
         gan_start_condition_key: Optional[str] = None,
         gan_start_condition_value: Optional[Any] = None,
+        # Discriminator regularization
+        instance_noise_std: float = 0.0,  # Initial std for instance noise (0 = disabled)
+        instance_noise_decay_steps: int = 50000,  # Steps to decay noise to 0
+        r1_penalty_weight: float = 0.0,  # Weight for R1 gradient penalty (0 = disabled)
+        r1_penalty_interval: int = 16,  # Apply R1 penalty every N steps (expensive)
+        # GAN warmup (ramps GAN loss contribution from 0 to full weight)
+        gan_warmup_steps: int = 0,  # Steps to ramp up GAN loss (0 = no warmup)
+        # Perceptual loss delayed start
+        perceptual_loss_start_step: int = 0,  # Step to start applying perceptual loss (0 = from start)
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -214,10 +267,33 @@ class RecurrentVAEGANTrainer(Trainer):
         self.discriminator = discriminator
         self.discriminator_optimizer = discriminator_optimizer
         self.gan_loss_weight = gan_loss_weight
+        self.feature_matching_weight = feature_matching_weight
         self.discriminator_update_frequency = discriminator_update_frequency
         self.gan_start_condition_key = gan_start_condition_key
         self.gan_start_condition_value = gan_start_condition_value
         self.gan_already_started = False
+        self.gan_start_step = None  # Track when GAN training started (for warmup)
+        self.gan_warmup_steps = gan_warmup_steps
+        self.perceptual_loss_start_step = perceptual_loss_start_step
+
+        # Discriminator regularization settings
+        self.r1_penalty_weight = r1_penalty_weight
+        self.r1_penalty_interval = r1_penalty_interval
+
+        # Instance noise scheduler (decays over training)
+        self.noise_scheduler = None
+        if instance_noise_std > 0:
+            self.noise_scheduler = InstanceNoiseScheduler(
+                initial_std=instance_noise_std,
+                final_std=0.0,
+                decay_steps=instance_noise_decay_steps,
+                decay_type="linear",
+            )
+
+        # GradScaler for discriminator when using mixed precision
+        self.discriminator_scaler = None
+        if discriminator is not None:
+            self.discriminator_scaler = torch.amp.GradScaler(enabled=False)  # Will be enabled in compute_loss
 
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """Prepares one `data` before feeding it to the model."""
@@ -262,35 +338,83 @@ class RecurrentVAEGANTrainer(Trainer):
         # Get VAE loss from info dict (without GAN)
         vae_loss = info["loss"]
 
+        # Handle perceptual loss delayed start by adjusting the loss
+        # (We modify the model's perceptual contribution post-hoc since RecurrentVAE computes it internally)
+        if self.perceptual_loss_start_step > 0 and global_step < self.perceptual_loss_start_step:
+            # Subtract the perceptual loss contribution that was added in the model
+            perceptual_contrib = model.perceptual_loss_weight * info["perceptual_loss"]
+            vae_loss = vae_loss - perceptual_contrib
+
         # GAN losses (only after condition is met)
         g_gan_loss = torch.tensor(0.0, device=image.device)
         d_loss = torch.tensor(0.0, device=image.device)
         d_loss_dict = {}
+        r1_loss = torch.tensor(0.0, device=image.device)
+        fm_loss = torch.tensor(0.0, device=image.device)
 
         if self.is_gan_enabled(global_step, vae_loss):
             if not self.gan_already_started:
+                # First step of GAN training - record start step for warmup
+                self.gan_start_step = global_step
                 print(f"GAN training starting at step {global_step}")
             self.gan_already_started = True
+
+            # Compute GAN warmup factor (ramps from 0 to 1 over gan_warmup_steps)
+            gan_warmup_factor = 1.0
+            if self.gan_warmup_steps > 0 and self.gan_start_step is not None:
+                steps_since_gan_start = global_step - self.gan_start_step
+                gan_warmup_factor = min(1.0, steps_since_gan_start / self.gan_warmup_steps)
+
+            # Get current instance noise std (decays over training)
+            noise_std = 0.0
+            if self.noise_scheduler is not None:
+                noise_std = self.noise_scheduler.get_std(global_step)
 
             # Discriminator update
             if global_step % self.discriminator_update_frequency == 0:
                 self.discriminator.train()
 
-                # Get discriminator loss
-                with torch.enable_grad():
-                    recon_detached = recon.detach()
+                # Ensure discriminator is on the same device as inputs
+                if next(self.discriminator.parameters()).device != image.device:
+                    self.discriminator.to(image.device)
+
+                # Apply instance noise to both real and fake images
+                real_for_disc = add_instance_noise(image, noise_std) if noise_std > 0 else image
+                fake_for_disc = add_instance_noise(recon.detach(), noise_std) if noise_std > 0 else recon.detach()
+
+                # Compute discriminator loss in fp32 to avoid gradient underflow
+                with autocast(image.device.type, dtype=torch.float32, enabled=False):
+                    real_fp32 = real_for_disc.float()
+                    fake_fp32 = fake_for_disc.float()
+
                     d_loss, d_loss_dict = compute_discriminator_loss(
                         self.discriminator,
-                        image,
-                        recon_detached,
+                        real_images=real_fp32,
+                        fake_images=fake_fp32,
                         loss_type="hinge"
                     )
 
-                # Update discriminator
-                if self.discriminator_optimizer is not None and self.discriminator.training:
+                # R1 gradient penalty (on clean real images, not noisy)
+                if self.r1_penalty_weight > 0 and global_step % self.r1_penalty_interval == 0:
+                    r1_loss = r1_gradient_penalty(image.float(), self.discriminator)
+                    d_loss = d_loss + self.r1_penalty_weight * r1_loss
+
+                # Update discriminator (only during training when gradients are enabled)
+                if self.discriminator_optimizer is not None and self.discriminator.training and torch.is_grad_enabled():
                     self.discriminator_optimizer.zero_grad()
                     d_loss.backward()
                     self.discriminator_optimizer.step()
+
+                # Log discriminator diagnostics
+                if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                    for key, val in d_loss_dict.items():
+                        self._log_scalar(f"train/{key}", val, global_step)
+                    if self.r1_penalty_weight > 0:
+                        self._log_scalar("train/r1_penalty", r1_loss, global_step)
+                    if noise_std > 0:
+                        self._log_scalar("train/instance_noise_std", noise_std, global_step)
+                    if gan_warmup_factor < 1.0:
+                        self._log_scalar("train/gan_warmup_factor", gan_warmup_factor, global_step)
 
             # Generator GAN Loss
             self.discriminator.eval()
@@ -301,11 +425,21 @@ class RecurrentVAEGANTrainer(Trainer):
                 recon,
                 loss_type="hinge"
             )
+
+            # Feature matching loss (if enabled)
+            if self.feature_matching_weight > 0:
+                from model.image.discriminators import compute_feature_matching_loss
+                fm_loss = compute_feature_matching_loss(self.discriminator, image, recon)
+
             with torch.no_grad():
                 self.discriminator.requires_grad_(True)
 
-        # Total loss = VAE loss + weighted GAN loss
-        total_loss = vae_loss + self.gan_loss_weight * g_gan_loss
+            # Apply warmup factor to GAN losses
+            g_gan_loss = gan_warmup_factor * g_gan_loss
+            fm_loss = gan_warmup_factor * fm_loss
+
+        # Total loss = VAE loss + weighted GAN loss + feature matching loss
+        total_loss = vae_loss + self.gan_loss_weight * g_gan_loss + self.feature_matching_weight * fm_loss
 
         # Log losses and metrics
         if global_step % self.args.logging_steps == 0 and self.writer is not None:
@@ -423,6 +557,50 @@ def load_discriminator(
     return discriminator, discriminator_optimizer, False
 
 
+class EMAUpdateCallback(TrainerCallback):
+    """Callback to update EMA weights after each training step and save/load EMA state."""
+
+    def __init__(self, ema: Optional[EMAModel] = None):
+        self.ema = ema
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.ema is not None:
+            self.ema.update()
+
+    def on_save(self, args, state, control, **kwargs):
+        """Save EMA weights alongside model checkpoint."""
+        if self.ema is None:
+            return
+
+        # Determine checkpoint directory
+        checkpoint_folder = f"checkpoint-{state.global_step}"
+        output_dir = os.path.join(args.output_dir, checkpoint_folder)
+
+        # Save EMA state dict
+        ema_path = os.path.join(output_dir, "ema_state.pt")
+        torch.save(self.ema.state_dict(), ema_path)
+        print(f"Saved EMA state to {ema_path}")
+
+
+def load_ema_state(ema: EMAModel, checkpoint_path: str) -> bool:
+    """Load EMA state from checkpoint if available.
+
+    Args:
+        ema: The EMA model to load state into
+        checkpoint_path: Path to checkpoint directory
+
+    Returns:
+        True if EMA state was loaded, False otherwise
+    """
+    ema_path = os.path.join(checkpoint_path, "ema_state.pt")
+    if os.path.exists(ema_path):
+        state_dict = torch.load(ema_path, map_location="cpu")
+        ema.load_state_dict(state_dict)
+        print(f"Loaded EMA state from {ema_path} (step {ema.step})")
+        return True
+    return False
+
+
 def main():
     args, unk = megatransformer_utils.parse_args()
     run_dir = os.path.join(args.logging_base_dir, args.run_name)
@@ -475,8 +653,22 @@ def main():
     gan_start_condition_value = unk_dict.get("gan_start_condition_value", None)
     discriminator_lr = float(unk_dict.get("discriminator_lr", 2e-4))
     gan_loss_weight = float(unk_dict.get("gan_loss_weight", 0.5))
+    feature_matching_weight = float(unk_dict.get("feature_matching_weight", 0.0))
     discriminator_update_frequency = int(unk_dict.get("discriminator_update_frequency", 1))
     discriminator_config = unk_dict.get("discriminator_config", "multi_scale")
+
+    # GAN regularization settings
+    instance_noise_std = float(unk_dict.get("instance_noise_std", 0.0))  # 0 = disabled
+    instance_noise_decay_steps = int(unk_dict.get("instance_noise_decay_steps", 50000))
+    r1_penalty_weight = float(unk_dict.get("r1_penalty_weight", 0.0))  # 0 = disabled
+    r1_penalty_interval = int(unk_dict.get("r1_penalty_interval", 16))
+    gan_warmup_steps = int(unk_dict.get("gan_warmup_steps", 0))  # 0 = no warmup
+    perceptual_loss_start_step = int(unk_dict.get("perceptual_loss_start_step", 0))  # 0 = from start
+
+    # EMA settings
+    use_ema = unk_dict.get("use_ema", "false").lower() == "true"
+    ema_decay = float(unk_dict.get("ema_decay", 0.9999))
+    ema_update_after_step = int(unk_dict.get("ema_update_after_step", 0))
 
     # Configure debug logging if enabled (either immediately or delayed)
     if debug or debug_start_step > 0:
@@ -505,7 +697,8 @@ def main():
         lockstep_n=lockstep_n,
         lockstep_k=lockstep_k,
         h_injection_type=h_injection_type,
-        activation_fn='tanh',
+        use_injection_scale=False,
+        activation_fn='silu',
         kl_weight=kl_divergence_loss_weight,
         perceptual_loss_weight=perceptual_loss_weight,
         iteration_cost_weight=iteration_cost_weight,
@@ -580,10 +773,19 @@ def main():
             print(f"  Discriminator config: {discriminator_config}")
             print(f"  Discriminator parameters: {sum(p.numel() for p in discriminator.parameters()):,}")
             print(f"  GAN loss weight: {gan_loss_weight}")
+            print(f"  Feature matching weight: {feature_matching_weight}")
             print(f"  Discriminator update frequency: {discriminator_update_frequency}")
             print(f"  Discriminator LR: {discriminator_lr}")
             print(f"  GAN start condition key: {gan_start_condition_key}")
             print(f"  GAN start condition value: {gan_start_condition_value}")
+            if instance_noise_std > 0:
+                print(f"  Instance noise: std={instance_noise_std}, decay_steps={instance_noise_decay_steps}")
+            if r1_penalty_weight > 0:
+                print(f"  R1 penalty: weight={r1_penalty_weight}, interval={r1_penalty_interval}")
+            if gan_warmup_steps > 0:
+                print(f"  GAN warmup steps: {gan_warmup_steps}")
+            if perceptual_loss_start_step > 0:
+                print(f"  Perceptual loss start step: {perceptual_loss_start_step}")
 
     model = setup_int8_training(args, model)
 
@@ -651,9 +853,17 @@ def main():
         discriminator=discriminator if use_gan else None,
         discriminator_optimizer=discriminator_optimizer if use_gan else None,
         gan_loss_weight=gan_loss_weight,
+        feature_matching_weight=feature_matching_weight,
         discriminator_update_frequency=discriminator_update_frequency,
         gan_start_condition_key=gan_start_condition_key,
         gan_start_condition_value=gan_start_condition_value,
+        # GAN regularization
+        instance_noise_std=instance_noise_std,
+        instance_noise_decay_steps=instance_noise_decay_steps,
+        r1_penalty_weight=r1_penalty_weight,
+        r1_penalty_interval=r1_penalty_interval,
+        gan_warmup_steps=gan_warmup_steps,
+        perceptual_loss_start_step=perceptual_loss_start_step,
     )
 
     # Add visualization callback
@@ -677,6 +887,24 @@ def main():
         trainer.add_callback(debug_callback)
 
     visualization_callback.trainer = trainer
+
+    # Create EMA if enabled
+    ema = None
+    if use_ema:
+        ema = EMAModel(
+            model,
+            decay=ema_decay,
+            update_after_step=ema_update_after_step,
+        )
+        ema_callback = EMAUpdateCallback(ema=ema)
+        trainer.add_callback(ema_callback)
+
+        # Load EMA state if resuming from checkpoint
+        if args.resume_from_checkpoint is not None:
+            load_ema_state(ema, args.resume_from_checkpoint)
+
+        if args.local_rank == 0 or not args.use_deepspeed:
+            print(f"EMA enabled: decay={ema_decay}, update_after_step={ema_update_after_step}")
 
     # Log scheduler info
     if hasattr(trainer, 'deepspeed') and trainer.deepspeed is not None:

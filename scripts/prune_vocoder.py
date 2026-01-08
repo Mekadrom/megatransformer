@@ -38,6 +38,8 @@ from tqdm import tqdm
 
 from model.audio.vocoders.freq_domain_vocoder import (
     ConvNeXtBlock,
+    FrequencyAttentionBlock,
+    FrequencyDomainVocoderWithAttention,
     LightHeadedFrequencyDomainVocoder,
     SplitBandFrequencyDomainVocoder,
     SplitBandLowFreqMeanFreqDomainVocoder,
@@ -65,6 +67,13 @@ def extract_vocoder_config(vocoder: nn.Module) -> dict:
     Extract the configuration needed to reconstruct a vocoder.
     Returns a dict that can be saved in the checkpoint.
     """
+    # Find the first ConvNeXtBlock to get convnext_mult
+    convnext_mult = None
+    for block in vocoder.backbone:
+        if isinstance(block, ConvNeXtBlock):
+            convnext_mult = block.pwconv1.out_features // block.pwconv1.in_features
+            break
+
     config = {
         'vocoder_class': type(vocoder).__name__,
         'n_mels': vocoder.input_proj.in_channels,
@@ -72,11 +81,23 @@ def extract_vocoder_config(vocoder: nn.Module) -> dict:
         'hop_length': vocoder.hop_length,
         'hidden_dim': vocoder.input_proj.out_channels,
         'num_layers': len(vocoder.backbone),
-        'convnext_mult': vocoder.backbone[0].pwconv1.out_features // vocoder.backbone[0].pwconv1.in_features,
+        'convnext_mult': convnext_mult,
     }
 
     # Add class-specific config
-    if isinstance(vocoder, (SplitBandFrequencyDomainVocoder, SplitBandLowFreqMeanFreqDomainVocoder)):
+    if isinstance(vocoder, FrequencyDomainVocoderWithAttention):
+        config['cutoff_bin'] = vocoder.cutoff_bin
+        config['num_conv_layers'] = sum(1 for b in vocoder.backbone if isinstance(b, ConvNeXtBlock))
+        config['num_attn_layers'] = sum(1 for b in vocoder.backbone if isinstance(b, FrequencyAttentionBlock))
+        # Get attn_heads from first attention block
+        for block in vocoder.backbone:
+            if isinstance(block, FrequencyAttentionBlock):
+                config['attn_heads'] = block.num_heads
+                break
+        config['low_freq_kernel'] = vocoder.phase_head_low[0].kernel_size[0]
+        config['high_freq_kernel'] = vocoder.phase_head_high[1].kernel_size[0]
+
+    elif isinstance(vocoder, (SplitBandFrequencyDomainVocoder, SplitBandLowFreqMeanFreqDomainVocoder)):
         config['cutoff_bin'] = vocoder.cutoff_bin
 
     if isinstance(vocoder, SplitBandLowFreqMeanFreqDomainVocoder):
@@ -108,6 +129,8 @@ def compute_magnitude_importance(model: nn.Module) -> dict[str, torch.Tensor]:
     """
     Compute channel importance based on weight magnitude.
     Simple but effective baseline.
+
+    Handles both ConvNeXtBlock and FrequencyAttentionBlock in the backbone.
     """
     importance = {}
 
@@ -115,29 +138,42 @@ def compute_magnitude_importance(model: nn.Module) -> dict[str, torch.Tensor]:
     # Shape: [hidden_dim, n_mels, kernel]
     importance['input_proj'] = model.input_proj.weight.abs().sum(dim=(1, 2))
 
-    # Backbone ConvNeXt blocks
+    # Backbone blocks (may be ConvNeXt or Attention)
     for i, block in enumerate(model.backbone):
-        # Depthwise conv: each channel is independent
-        # Shape: [dim, 1, kernel] for groups=dim
-        dw_importance = block.dwconv.weight.abs().sum(dim=(1, 2))
+        if isinstance(block, ConvNeXtBlock):
+            # Depthwise conv: each channel is independent
+            # Shape: [dim, 1, kernel] for groups=dim
+            dw_importance = block.dwconv.weight.abs().sum(dim=(1, 2))
 
-        # Pointwise convs (Linear layers)
-        # pwconv1: [dim * expansion, dim] - sum over output dim
-        pw1_importance = block.pwconv1.weight.abs().sum(dim=0)
+            # Pointwise convs (Linear layers)
+            # pwconv1: [dim * expansion, dim] - sum over output dim
+            pw1_importance = block.pwconv1.weight.abs().sum(dim=0)
 
-        # pwconv2: [dim, dim * expansion] - sum over input dim
-        pw2_importance = block.pwconv2.weight.abs().sum(dim=1)
+            # pwconv2: [dim, dim * expansion] - sum over input dim
+            pw2_importance = block.pwconv2.weight.abs().sum(dim=1)
 
-        # Combine: geometric mean of all pathways
-        if block.ovr_out_dim is None:
-            # Regular block - same input/output dim
-            combined = (dw_importance * pw1_importance * pw2_importance) ** (1/3)
-        else:
-            # Dimension-changing block - handle separately
-            combined = dw_importance * pw1_importance
-            importance[f'backbone.{i}.out'] = block.pwconv2.weight.abs().sum(dim=1)
+            # Combine: geometric mean of all pathways
+            if block.ovr_out_dim is None:
+                # Regular block - same input/output dim
+                combined = (dw_importance * pw1_importance * pw2_importance) ** (1/3)
+            else:
+                # Dimension-changing block - handle separately
+                combined = dw_importance * pw1_importance
+                importance[f'backbone.{i}.out'] = block.pwconv2.weight.abs().sum(dim=1)
 
-        importance[f'backbone.{i}'] = combined
+            importance[f'backbone.{i}'] = combined
+
+        elif isinstance(block, FrequencyAttentionBlock):
+            # Attention block: importance from qkv and proj weights
+            # qkv: [dim * 3, dim] - sum over output for each input channel
+            qkv_importance = block.qkv.weight.abs().sum(dim=0)
+
+            # proj: [dim, dim] - sum over input for each output channel
+            proj_importance = block.proj.weight.abs().sum(dim=1)
+
+            # Combine: geometric mean
+            combined = (qkv_importance * proj_importance) ** 0.5
+            importance[f'backbone.{i}'] = combined
 
     return importance
 
@@ -151,6 +187,8 @@ def compute_gradient_importance(
     """
     Compute channel importance based on gradient * weight (Taylor approximation).
     More accurate than magnitude-based but requires calibration data.
+
+    Handles both ConvNeXtBlock and FrequencyAttentionBlock in the backbone.
     """
     model = model.to(device)
     model.train()
@@ -166,12 +204,16 @@ def compute_gradient_importance(
     )
 
     for i, block in enumerate(vocoder.backbone):
-        dim = block.dwconv.weight.shape[0]
-        importance_accum[f'backbone.{i}'] = torch.zeros(dim, device=device)
-        if block.ovr_out_dim is not None:
-            importance_accum[f'backbone.{i}.out'] = torch.zeros(
-                block.ovr_out_dim, device=device
-            )
+        if isinstance(block, ConvNeXtBlock):
+            dim = block.dwconv.weight.shape[0]
+            importance_accum[f'backbone.{i}'] = torch.zeros(dim, device=device)
+            if block.ovr_out_dim is not None:
+                importance_accum[f'backbone.{i}.out'] = torch.zeros(
+                    block.ovr_out_dim, device=device
+                )
+        elif isinstance(block, FrequencyAttentionBlock):
+            dim = block.qkv.in_features
+            importance_accum[f'backbone.{i}'] = torch.zeros(dim, device=device)
 
     samples_processed = 0
 
@@ -201,25 +243,38 @@ def compute_gradient_importance(
 
             # Backbone blocks
             for i, block in enumerate(vocoder.backbone):
-                # Depthwise conv
-                dw_imp = (
-                    block.dwconv.weight * block.dwconv.weight.grad
-                ).abs().sum(dim=(1, 2))
+                if isinstance(block, ConvNeXtBlock):
+                    # Depthwise conv
+                    dw_imp = (
+                        block.dwconv.weight * block.dwconv.weight.grad
+                    ).abs().sum(dim=(1, 2))
 
-                # Pointwise convs
-                pw1_imp = (
-                    block.pwconv1.weight * block.pwconv1.weight.grad
-                ).abs().sum(dim=0)
+                    # Pointwise convs
+                    pw1_imp = (
+                        block.pwconv1.weight * block.pwconv1.weight.grad
+                    ).abs().sum(dim=0)
 
-                pw2_imp = (
-                    block.pwconv2.weight * block.pwconv2.weight.grad
-                ).abs().sum(dim=1)
+                    pw2_imp = (
+                        block.pwconv2.weight * block.pwconv2.weight.grad
+                    ).abs().sum(dim=1)
 
-                if block.ovr_out_dim is None:
-                    importance_accum[f'backbone.{i}'] += (dw_imp * pw1_imp * pw2_imp) ** (1/3)
-                else:
-                    importance_accum[f'backbone.{i}'] += dw_imp * pw1_imp
-                    importance_accum[f'backbone.{i}.out'] += pw2_imp
+                    if block.ovr_out_dim is None:
+                        importance_accum[f'backbone.{i}'] += (dw_imp * pw1_imp * pw2_imp) ** (1/3)
+                    else:
+                        importance_accum[f'backbone.{i}'] += dw_imp * pw1_imp
+                        importance_accum[f'backbone.{i}.out'] += pw2_imp
+
+                elif isinstance(block, FrequencyAttentionBlock):
+                    # Attention block: importance from qkv and proj weights
+                    qkv_imp = (
+                        block.qkv.weight * block.qkv.weight.grad
+                    ).abs().sum(dim=0)
+
+                    proj_imp = (
+                        block.proj.weight * block.proj.weight.grad
+                    ).abs().sum(dim=1)
+
+                    importance_accum[f'backbone.{i}'] += (qkv_imp * proj_imp) ** 0.5
 
         samples_processed += mel_spec.shape[0]
 
@@ -393,6 +448,199 @@ def prune_convnext_block(
     new_block.pwconv2 = new_pwconv2
 
     return new_block
+
+
+def prune_attention_block(
+    old_block: FrequencyAttentionBlock,
+    indices: torch.Tensor,
+) -> FrequencyAttentionBlock:
+    """
+    Prune a FrequencyAttentionBlock.
+
+    Args:
+        old_block: Original block
+        indices: Indices of channels to keep
+    """
+    new_dim = len(indices)
+    num_heads = old_block.num_heads
+
+    # Ensure new_dim is divisible by num_heads
+    # If not, we need to adjust or error
+    if new_dim % num_heads != 0:
+        # Try to find a compatible number of heads
+        for h in [num_heads, num_heads // 2, 2, 1]:
+            if new_dim % h == 0:
+                num_heads = h
+                break
+
+    new_block = FrequencyAttentionBlock(
+        dim=new_dim,
+        num_heads=num_heads,
+        dropout=old_block.attn_dropout.p,
+        qkv_bias=old_block.qkv.bias is not None,
+    )
+
+    # Prune qkv: [dim * 3, dim] -> select input channels and corresponding output channels
+    # Output is [Q, K, V] concatenated, so we need to prune each section
+    old_qkv = old_block.qkv.weight.data  # [dim * 3, dim]
+    old_dim = old_block.qkv.in_features
+
+    # Split into Q, K, V sections
+    q_weight = old_qkv[:old_dim]
+    k_weight = old_qkv[old_dim:2*old_dim]
+    v_weight = old_qkv[2*old_dim:]
+
+    # Prune each section: select output channels (indices) and input channels (indices)
+    new_q = q_weight[indices][:, indices]
+    new_k = k_weight[indices][:, indices]
+    new_v = v_weight[indices][:, indices]
+
+    new_qkv_weight = torch.cat([new_q, new_k, new_v], dim=0)
+    new_block.qkv.weight.data = new_qkv_weight
+
+    if old_block.qkv.bias is not None:
+        old_qkv_bias = old_block.qkv.bias.data
+        q_bias = old_qkv_bias[:old_dim][indices]
+        k_bias = old_qkv_bias[old_dim:2*old_dim][indices]
+        v_bias = old_qkv_bias[2*old_dim:][indices]
+        new_block.qkv.bias.data = torch.cat([q_bias, k_bias, v_bias], dim=0)
+
+    # Prune proj: [dim, dim] -> select both input and output channels
+    new_block.proj = prune_linear(old_block.proj, indices, indices)
+
+    # Prune LayerNorm
+    new_block.norm = prune_layernorm(old_block.norm, indices)
+
+    return new_block
+
+
+def prune_attention_vocoder(
+    old_model: FrequencyDomainVocoderWithAttention,
+    importance: dict[str, torch.Tensor],
+    target_hidden_dim: int,
+    convnext_mult: int = 4,
+) -> FrequencyDomainVocoderWithAttention:
+    """
+    Prune a FrequencyDomainVocoderWithAttention to target_hidden_dim.
+
+    This vocoder has a mixed backbone of ConvNeXt and Attention blocks.
+    """
+    from model.activations import Snake
+
+    # Get indices to keep for backbone (hidden_dim)
+    # Only average ConvNeXt blocks for importance (attention blocks have same dim)
+    convnext_importance_tensors = []
+    for i, block in enumerate(old_model.backbone):
+        if isinstance(block, ConvNeXtBlock) and block.ovr_out_dim is None:
+            # Regular ConvNeXt block (not dimension-changing)
+            convnext_importance_tensors.append(importance[f'backbone.{i}'])
+        elif isinstance(block, FrequencyAttentionBlock):
+            convnext_importance_tensors.append(importance[f'backbone.{i}'])
+
+    backbone_importance = torch.stack(convnext_importance_tensors).mean(dim=0)
+    backbone_indices = get_channels_to_keep(backbone_importance, target_hidden_dim)
+
+    # For the last block (dimension-changing ConvNeXt), we need head indices
+    target_head_dim = target_hidden_dim // 2
+
+    # Find the last ConvNeXt block with dimension change
+    last_convnext_idx = None
+    for i in range(len(old_model.backbone) - 1, -1, -1):
+        block = old_model.backbone[i]
+        if isinstance(block, ConvNeXtBlock) and block.ovr_out_dim is not None:
+            last_convnext_idx = i
+            break
+
+    last_block_key = f'backbone.{last_convnext_idx}.out' if last_convnext_idx is not None else None
+    if last_block_key and last_block_key in importance:
+        head_indices = get_channels_to_keep(importance[last_block_key], target_head_dim)
+    else:
+        head_indices = torch.arange(target_head_dim)
+
+    # Count layers by type
+    num_conv_layers = sum(1 for b in old_model.backbone if isinstance(b, ConvNeXtBlock))
+    num_attn_layers = sum(1 for b in old_model.backbone if isinstance(b, FrequencyAttentionBlock))
+    attn_heads = old_model.backbone[0].num_heads if isinstance(old_model.backbone[0], FrequencyAttentionBlock) else 4
+    for block in old_model.backbone:
+        if isinstance(block, FrequencyAttentionBlock):
+            attn_heads = block.num_heads
+            break
+
+    # Get kernel sizes from phase heads
+    low_freq_kernel = old_model.phase_head_low[0].kernel_size[0]
+    high_freq_kernel = old_model.phase_head_high[1].kernel_size[0]  # Conv is after Snake
+
+    # Create new model
+    shared_buffer = SharedWindowBuffer()
+    new_model = FrequencyDomainVocoderWithAttention(
+        shared_window_buffer=shared_buffer,
+        n_mels=old_model.input_proj.in_channels,
+        n_fft=old_model.n_fft,
+        hop_length=old_model.hop_length,
+        hidden_dim=target_hidden_dim,
+        num_conv_layers=num_conv_layers - 1,  # Exclude the final dim-changing block
+        num_attn_layers=num_attn_layers,
+        attn_heads=attn_heads,
+        convnext_mult=convnext_mult,
+        cutoff_bin=old_model.cutoff_bin,
+        low_freq_kernel=low_freq_kernel,
+        high_freq_kernel=high_freq_kernel,
+    )
+
+    # Prune input projection
+    new_model.input_proj = prune_conv1d(old_model.input_proj, None, backbone_indices)
+
+    # Prune backbone blocks
+    new_backbone = nn.ModuleList()
+    for i, old_block in enumerate(old_model.backbone):
+        if isinstance(old_block, ConvNeXtBlock):
+            if old_block.ovr_out_dim is not None:
+                # Last ConvNeXt block with dimension change
+                new_block = prune_convnext_block(
+                    old_block, backbone_indices, head_indices, expansion=convnext_mult
+                )
+            else:
+                # Regular ConvNeXt block
+                new_block = prune_convnext_block(
+                    old_block, backbone_indices, None, expansion=convnext_mult
+                )
+        elif isinstance(old_block, FrequencyAttentionBlock):
+            new_block = prune_attention_block(old_block, backbone_indices)
+
+        new_backbone.append(new_block)
+
+    new_model.backbone = new_backbone
+
+    # Prune magnitude heads
+    new_model.mag_head_low = prune_conv1d(old_model.mag_head_low, head_indices, None)
+    new_model.mag_head_high = prune_conv1d(old_model.mag_head_high, head_indices, None)
+
+    # Prune phase heads
+    # phase_head_low: Sequential with [Conv1d, Snake, Conv1d]
+    old_phase_low_conv1 = old_model.phase_head_low[0]
+    old_phase_low_snake = old_model.phase_head_low[1]
+    old_phase_low_conv2 = old_model.phase_head_low[2]
+
+    new_phase_low_conv1 = prune_conv1d(old_phase_low_conv1, head_indices, head_indices)
+    new_phase_low_snake = Snake(target_head_dim)
+    new_phase_low_snake.alpha.data = old_phase_low_snake.alpha.data[:, head_indices, :]
+    new_phase_low_conv2 = prune_conv1d(old_phase_low_conv2, head_indices, None)
+
+    new_model.phase_head_low = nn.Sequential(
+        new_phase_low_conv1, new_phase_low_snake, new_phase_low_conv2
+    )
+
+    # phase_head_high: Sequential with [Snake, Conv1d]
+    old_phase_high_snake = old_model.phase_head_high[0]
+    old_phase_high_conv = old_model.phase_head_high[1]
+
+    new_phase_high_snake = Snake(target_head_dim)
+    new_phase_high_snake.alpha.data = old_phase_high_snake.alpha.data[:, head_indices, :]
+    new_phase_high_conv = prune_conv1d(old_phase_high_conv, head_indices, None)
+
+    new_model.phase_head_high = nn.Sequential(new_phase_high_snake, new_phase_high_conv)
+
+    return new_model
 
 
 def prune_light_headed_vocoder(
@@ -753,11 +1001,23 @@ def main():
     importance = {k: v.cpu() for k, v in importance.items()}
 
     # Determine vocoder type and prune
-    # Note: Check SplitBandLowFreqMeanFreqDomainVocoder before SplitBandFrequencyDomainVocoder
-    # since it inherits from FrequencyDomainVocoderBase but has similar structure
-    convnext_mult = vocoder.backbone[0].pwconv1.out_features // vocoder.backbone[0].pwconv1.in_features
+    # Find the first ConvNeXtBlock to get convnext_mult
+    convnext_mult = None
+    for block in vocoder.backbone:
+        if isinstance(block, ConvNeXtBlock):
+            convnext_mult = block.pwconv1.out_features // block.pwconv1.in_features
+            break
 
-    if isinstance(vocoder, SplitBandLowFreqMeanFreqDomainVocoder):
+    if convnext_mult is None:
+        raise ValueError("Could not find ConvNeXtBlock in backbone to determine convnext_mult")
+
+    # Note: Check FrequencyDomainVocoderWithAttention first, then other specific types
+    if isinstance(vocoder, FrequencyDomainVocoderWithAttention):
+        print("Pruning FrequencyDomainVocoderWithAttention...")
+        new_vocoder = prune_attention_vocoder(
+            vocoder, importance, target_hidden_dim, convnext_mult
+        )
+    elif isinstance(vocoder, SplitBandLowFreqMeanFreqDomainVocoder):
         print("Pruning SplitBandLowFreqMeanFreqDomainVocoder...")
         new_vocoder = prune_split_band_low_freq_mean_vocoder(
             vocoder, importance, target_hidden_dim, convnext_mult

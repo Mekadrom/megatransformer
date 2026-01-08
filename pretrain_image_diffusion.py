@@ -25,7 +25,7 @@ from model.image.diffusion import ImageConditionalGaussianDiffusion, model_confi
 from model.image.vae import model_config_lookup as image_vae_config_lookup
 from utils import megatransformer_utils
 from utils.model_loading_utils import load_model
-from utils.training_utils import CLIPScoreEvaluationCallback, EarlyStoppingCallback, ReduceLROnPlateauCallback, setup_int8_training
+from utils.training_utils import CLIPScoreEvaluationCallback, EarlyStoppingCallback, ReduceLROnPlateauCallback, gradfilter_ema, setup_int8_training
 
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
@@ -146,6 +146,8 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
         ema: Optional[EMAModel] = None,
         vae: Optional[nn.Module] = None,
         train_dataset=None,  # Reference to training dataset for in-distribution sampling
+        latent_mean: float = 0.0,
+        latent_std: float = 1.0,
     ):
         self.trainer: Optional[Trainer] = None
         self.step_offset = step_offset if step_offset is not None else 0
@@ -157,6 +159,8 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
         self.ema = ema
         self.vae = vae
         self.train_dataset = train_dataset
+        self.latent_mean = latent_mean
+        self.latent_std = latent_std
 
         # Load T5 for text conditioning
         t5_model = T5EncoderModel.from_pretrained("t5-small")
@@ -386,7 +390,9 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
                 with torch.no_grad():
                     if x_start.dim() == 3:
                         x_start = x_start.unsqueeze(0)
-                    img = self.vae.decoder(x_start)
+                    # Denormalize latent back to original VAE distribution before decoding
+                    x_start_denorm = x_start * self.latent_std + self.latent_mean
+                    img = self.vae.decoder(x_start_denorm)
                     img = img.squeeze(0)  # [C, H, W]
             else:
                 img = x_start[0] if x_start.dim() == 4 else x_start
@@ -413,8 +419,9 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
                 with torch.no_grad():
                     if latent.dim() == 3:
                         latent = latent.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
-                    device = latent.device
-                    img = self.vae.decoder(latent)
+                    # Denormalize latent back to original VAE distribution before decoding
+                    latent_denorm = latent * self.latent_std + self.latent_mean
+                    img = self.vae.decoder(latent_denorm)
                     img = img.squeeze(0)  # [1, C, H, W] -> [C, H, W]
             else:
                 # If no VAE, just visualize the latent
@@ -561,6 +568,11 @@ class ImageDiffusionTrainer(Trainer):
         step_offset: int = 0,
         ema: Optional[EMAModel] = None,
         vae: Optional[nn.Module] = None,
+        use_grokfast_ema: bool = False,
+        grokfast_ema_alpha = 0.98,
+        grokfast_ema_lambda = 2.0,
+        latent_mean: float = 0.0,
+        latent_std: float = 1.0,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -571,7 +583,13 @@ class ImageDiffusionTrainer(Trainer):
         self.git_commit_hash = git_commit_hash
         self.ema = ema
         self.vae = vae
+        self.use_grokfast_ema = use_grokfast_ema
+        self.grokfast_ema_alpha = grokfast_ema_alpha
+        self.grokfast_ema_lambda = grokfast_ema_lambda
+        self.latent_mean = latent_mean
+        self.latent_std = latent_std
 
+        self.grads = None
         self.last_logged_loss = None
 
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
@@ -586,6 +604,13 @@ class ImageDiffusionTrainer(Trainer):
                 kwargs.update({"dtype": self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()})
             return data.to(**kwargs)
         return data
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(model, inputs)
+        # Apply gradfilter_ema after gradients are computed but before optimizer step
+        if self.use_grokfast_ema:
+            self.grads = gradfilter_ema(model, self.grads, self.grokfast_ema_alpha, self.grokfast_ema_lambda)
+        return loss
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
@@ -605,6 +630,9 @@ class ImageDiffusionTrainer(Trainer):
                 "Ensure your dataset was preprocessed with VAE encoding (--vae_checkpoint)."
             )
         x_0 = inputs["latent_mu"]
+
+        # Normalize latents to zero-mean unit-variance for diffusion
+        x_0 = (x_0 - self.latent_mean) / self.latent_std
 
         # Request diagnostics every N steps for debugging
         should_log_diagnostics = (global_step % (self.args.logging_steps * 10) == 0) and self.writer is not None
@@ -726,6 +754,10 @@ def main():
     latent_channels = int(unk_dict.get("latent_channels", 4))
     image_size = int(unk_dict.get("image_size", 32))  # Latent image size
 
+    # Latent normalization (for normalizing VAE latents to zero-mean unit-variance)
+    latent_mean = float(unk_dict.get("latent_mean", 0.0))
+    latent_std = float(unk_dict.get("latent_std", 1.0))
+
     use_step_lr = unk_dict.get("use_step_lr", "false").lower() == "true"
     step_lr_factor = float(unk_dict.get("step_lr_factor", 0.5))
     step_lr_patience = int(unk_dict.get("step_lr_patience", 2))
@@ -801,6 +833,7 @@ def main():
         lr_scheduler_type=args.lr_scheduler_type,
         learning_rate=args.learning_rate,
         warmup_ratio=args.warmup_ratio,
+        warmup_steps=args.warmup_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -871,6 +904,11 @@ def main():
         step_offset=args.start_step,
         ema=ema,
         vae=vae,
+        use_grokfast_ema=args.trainer.lower() == "grokfast_ema",
+        grokfast_ema_alpha=args.grokfast_ema_alpha,
+        grokfast_ema_lambda=args.grokfast_ema_lambda,
+        latent_mean=latent_mean,
+        latent_std=latent_std,
     )
 
     # Add EMA update callback
@@ -891,6 +929,8 @@ def main():
         ema=ema,
         vae=vae,
         train_dataset=train_dataset,  # For in-distribution visualization
+        latent_mean=latent_mean,
+        latent_std=latent_std,
     )
     trainer.add_callback(visualization_callback)
 

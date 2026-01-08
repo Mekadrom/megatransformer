@@ -46,6 +46,7 @@ def extract_mels(shared_window_buffer: SharedWindowBuffer, y, sr=16000, n_mels=8
         n_mels: Number of mel bands
         n_fft: FFT window size
         hop_length: Hop length for feature extraction
+        win_length: Window length for feature extraction
         
     Returns:
         log_mel_spec: Log mel spectrogram features
@@ -55,7 +56,7 @@ def extract_mels(shared_window_buffer: SharedWindowBuffer, y, sr=16000, n_mels=8
         audio=y.squeeze(),
         sample_rate=sr,
         hop_length=hop_length,
-        win_length=1024,
+        win_length=n_fft,
         n_mels=n_mels,
         n_fft=n_fft,
         f_min=0.0,

@@ -152,6 +152,11 @@ def parse_args():
     argparser.add_argument('--adam_beta1', type=float, default=0.9, help='Adam optimizer beta1')
     argparser.add_argument('--adam_beta2', type=float, default=0.999, help='Adam optimizer beta2')
 
+    # audio processing parameters
+    argparser.add_argument('--audio_n_fft', type=int, default=None, help='FFT window size for audio processing. Overrides config value if set.')
+    argparser.add_argument('--audio_hop_length', type=int, default=None, help='Hop length for audio processing. Overrides config value if set.')
+    argparser.add_argument('--audio_sample_rate', type=int, default=None, help='Sample rate for audio processing. Overrides config value if set.')
+
     argparser.add_argument('--stop_step', type=int, default=-1, help='Step to stop training at. For preserving the LR schedule while not training further.')
     argparser.add_argument('--commit_hash', type=str, default='', help='Git commit hash for this run. Logged in tensorboard.')
 
@@ -195,6 +200,7 @@ def parse_args():
         else:
             raise FileNotFoundError(f"DeepSpeed config file {args.deepspeed_config} not found.")
 
+    # overrides default of false in set_seed_everywhere
     if args.cudnn_benchmark:
         torch.backends.cudnn.benchmark = True
         print("cuDNN benchmark enabled.")

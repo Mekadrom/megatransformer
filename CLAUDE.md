@@ -137,3 +137,56 @@ Dataset loaders in `dataset_loading/`:
 - TensorBoard logs in `logs/`
 - Cached datasets in `cached_datasets/`
 - Generated samples in `inference/generated/`
+
+## Memory Profiling & Debugging
+
+### Vocoder GAN Training Memory Breakdown
+
+For `tiny_attention_freq_domain_vocoder` (2.3M params) + `small_combined_disc` (4.1M params) with batch_size=64, 10s audio @ 16kHz:
+
+| Component | Memory | Notes |
+|-----------|--------|-------|
+| MSD discriminator (4 scales) | ~5.9 GB | Largest consumer - processes raw 160k waveform |
+| MPD discriminator (7 periods) | ~4.4 GB | 7 sub-discriminators at different periods |
+| MRSD discriminator (4 resolutions) | ~3.2 GB | STFT at multiple resolutions |
+| Vocoder ConvNeXt blocks | ~0.75 GB | 7 blocks with 8x expansion (128→1024→128) |
+| Vocoder Attention | ~0.46 GB | 64 × 4 × 625 × 625 attention matrices |
+| cuDNN workspace | ~1.5 GB | Large convolution workspace |
+| NCCL buffers | ~0.75 GB | Distributed training overhead |
+| Fragmentation | ~10-15% | PyTorch allocator overhead |
+
+**Key insight**: The discriminator consumes ~13 GB of the ~19 GB total. This is expected for GAN training on long audio.
+
+**Memory scaling factors**:
+- Audio duration: Linear (10s → 5s halves waveform memory)
+- Batch size: Linear
+- MSD scales: Each scale adds significant memory at high resolutions
+- Attention: O(T²) where T = audio_samples / hop_length
+
+### Distributed Training Pitfalls
+
+**NCCL Timeout at Epoch Boundaries**: If ranks have different sample counts per epoch, they desync and cause NCCL ALLREDUCE timeouts. The fix in `shard_utils.py`:
+- `ShardAwareSampler` synchronizes sample counts across ranks at init using `all_gather`
+- Pads indices to max count so all ranks yield identical iteration counts
+- Enable debug logging with `SHARD_DEBUG=1` environment variable
+
+**Symptoms of rank desync**:
+- Training hangs at consistent step numbers (e.g., every ~200 steps)
+- Happens at epoch boundaries when sample counts differ
+- NCCL timeout errors after ~10 minutes of hanging
+
+### Gradient Checkpointing
+
+Implemented for `FrequencyDomainVocoderWithAttention`:
+```bash
+--use_gradient_checkpointing  # enables checkpointing in backbone
+```
+Checkpoints each ConvNeXt and FrequencyAttention block. Reduces activation memory by ~60% at ~30% compute cost.
+
+### Evaluation Mode Fix
+
+GAN trainers override `compute_loss()` which includes discriminator backward. During evaluation, gradients are disabled, so discriminator backward fails. Fixed by checking `torch.is_grad_enabled()` before any `.backward()` calls in:
+- `pretrain_vocoder.py`
+- `pretrain_audio_vae.py`
+- `pretrain_image_vae.py`
+- `pretrain_recurrent_vae.py`
