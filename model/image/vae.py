@@ -108,7 +108,7 @@ class ImageBottleneckAttention(nn.Module):
 
         # Scaled dot-product attention
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, num_heads, H*W, H*W]
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = F.softmax(attn_weights.float(), dim=-1).to(attn_weights.dtype)
         attn_weights_dropped = self.dropout(attn_weights)
 
         # Apply attention to values
@@ -152,9 +152,11 @@ class ImageVAEEncoder(nn.Module):
         activation_fn: str = "silu",
         use_attention: bool = False,
         attention_heads: int = 4,
+        logvar_clamp_max: float = 4.0,
     ):
         super().__init__()
         self.use_attention = use_attention
+        self.logvar_clamp_max = logvar_clamp_max
 
         activation_type = get_activation_type(activation_fn)
         if activation_type not in [activations.SwiGLU, activations.Snake]:
@@ -230,6 +232,7 @@ class ImageVAEEncoder(nn.Module):
 
         mu = self.fc_mu(x)
         logvar = self.fc_logvar(x)
+        logvar = torch.clamp(logvar, min=-10.0, max=self.logvar_clamp_max)
 
         if return_attention_weights:
             return mu, logvar, attn_weights
@@ -257,6 +260,7 @@ class ImageVAEDecoder(nn.Module):
         activation_fn: str = "silu",
         use_attention: bool = False,
         attention_heads: int = 4,
+        use_final_tanh: bool = False,
     ):
         super().__init__()
         self.use_attention = use_attention
@@ -295,6 +299,10 @@ class ImageVAEDecoder(nn.Module):
         ])
 
         self.final_conv = nn.Conv2d(channels[-1], out_channels, kernel_size=3, padding=1)
+        if use_final_tanh:
+            self.final_act = nn.Tanh()
+        else:
+            self.final_act = nn.Identity()
 
         self._init_weights()
 
@@ -339,6 +347,7 @@ class ImageVAEDecoder(nn.Module):
             z = upsample(z)
 
         recon_x = self.final_conv(z)
+        recon_x = self.final_act(recon_x)
 
         if return_attention_weights:
             return recon_x, attn_weights
@@ -407,7 +416,24 @@ model_config_lookup = {
             latent_channels=latent_channels,
             out_channels=3,
             intermediate_channels=[640, 480, 320],
+            activation_fn="silu",
+        ),
+        **kwargs
+    ),
+    "medium_stability_test": lambda latent_channels, **kwargs: VAE(
+        # creates 32x32 latents for 256x256 images
+        encoder=ImageVAEEncoder(
+            in_channels=3,
+            latent_channels=latent_channels,
+            intermediate_channels=[320, 480, 640],
             activation_fn="silu"
+        ),
+        decoder=ImageVAEDecoder(
+            latent_channels=latent_channels,
+            out_channels=3,
+            intermediate_channels=[640, 480, 320],
+            activation_fn="silu",
+            use_final_tanh=True,
         ),
         **kwargs
     ),

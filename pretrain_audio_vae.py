@@ -23,7 +23,7 @@ from transformers.integrations import TensorBoardCallback
 
 from dataset_loading import audio_loading
 from dataset_loading.audio_diffusion_dataset import CachedAudioDiffusionDataset
-from shard_utils import AudioVAEShardedDataset, ShardAwareSampler
+from shard_utils import AudioVAEShardedDataset, AudioVAEDataCollator, ShardAwareSampler
 from model.audio.discriminators import (
     MelMultiPeriodDiscriminator,
     MelMultiScaleDiscriminator,
@@ -43,6 +43,134 @@ from utils.model_loading_utils import load_model
 from utils.training_utils import EarlyStoppingCallback, setup_int8_training
 
 
+# =============================================================================
+# Gradient Reversal Layer for Adversarial Speaker Disentanglement
+# =============================================================================
+
+class GradientReversalFunction(torch.autograd.Function):
+    """
+    Gradient Reversal Layer (GRL) for domain adversarial training.
+
+    During forward pass: identity function
+    During backward pass: reverses gradient direction (multiplies by -alpha)
+
+    This allows training a speaker classifier that tries to predict speaker
+    from latents, while the encoder learns to fool it (remove speaker info).
+    """
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
+
+
+
+class SpeakerClassifier(torch.nn.Module):
+    """
+    Enhanced classifier to predict speaker ID from latent representations.
+
+    Uses convolutional processing to extract spatial patterns + multi-statistic
+    pooling (mean/std/max) to capture channel dynamics. Much more capable than
+    simple global average pooling.
+
+    Used with GRL: classifier tries to predict speaker, but reversed gradients
+    train the encoder to remove speaker information from latents.
+
+    Architecture:
+        Conv blocks (expand channels, extract patterns) ->
+        Multi-statistic pooling (mean/std/max per channel) ->
+        MLP classifier with residual connection
+    """
+    def __init__(self, latent_channels: int, num_speakers: int, hidden_dim: int = 512):
+        super().__init__()
+
+        # Convolutional feature extraction - process spatial patterns
+        # Input: [B, latent_channels, H, W] e.g. [B, 8, 10, 157]
+        self.conv_blocks = torch.nn.Sequential(
+            # Block 1: expand channels, extract local patterns
+            torch.nn.Conv2d(latent_channels, 64, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(64),
+            torch.nn.GELU(),
+
+            # Block 2: deeper features
+            torch.nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(128),
+            torch.nn.GELU(),
+            torch.nn.MaxPool2d(kernel_size=2, stride=2),  # Reduce spatial dims
+
+            # Block 3: high-level speaker patterns
+            torch.nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(256),
+            torch.nn.GELU(),
+        )
+
+        # Channel attention - weight channels by importance for speaker ID
+        self.channel_attention = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d(1),
+            torch.nn.Flatten(),
+            torch.nn.Linear(256, 64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, 256),
+            torch.nn.Sigmoid(),
+        )
+
+        # Multi-statistic pooling gives us 256 * 3 = 768 features
+        pooled_features = 256 * 3
+
+        # MLP classifier with residual
+        self.fc1 = torch.nn.Linear(pooled_features, hidden_dim)
+        self.fc2 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = torch.nn.Linear(hidden_dim, num_speakers)
+
+        self.dropout = torch.nn.Dropout(0.3)
+        self.layer_norm1 = torch.nn.LayerNorm(hidden_dim)
+        self.layer_norm2 = torch.nn.LayerNorm(hidden_dim)
+
+    def forward(self, latent: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+        """
+        Forward pass with gradient reversal.
+
+        Args:
+            latent: [B, C, H, W] latent representation from encoder
+            alpha: Gradient reversal strength (0 = no reversal, 1 = full reversal)
+
+        Returns:
+            [B, num_speakers] logits for speaker classification
+        """
+        # Apply gradient reversal to encoder gradients
+        reversed_latent = GradientReversalFunction.apply(latent, alpha)
+
+        # Convolutional feature extraction
+        features = self.conv_blocks(reversed_latent)  # [B, 256, H', W']
+
+        # Channel attention - reweight channels by speaker relevance
+        attn_weights = self.channel_attention(features)  # [B, 256]
+        features = features * attn_weights.unsqueeze(-1).unsqueeze(-1)  # [B, 256, H', W']
+
+        # Multi-statistic pooling - capture mean, variance, and peaks
+        feat_mean = features.mean(dim=(2, 3))  # [B, 256]
+        feat_std = features.std(dim=(2, 3))    # [B, 256]
+        feat_max = features.amax(dim=(2, 3))   # [B, 256]
+
+        pooled = torch.cat([feat_mean, feat_std, feat_max], dim=1)  # [B, 768]
+
+        # MLP with residual connection
+        x = self.fc1(pooled)
+        x = torch.nn.functional.gelu(x)
+        x = self.layer_norm1(x)
+        x = self.dropout(x)
+
+        residual = x
+        x = self.fc2(x)
+        x = torch.nn.functional.gelu(x)
+        x = self.layer_norm2(x + residual)  # Residual connection
+        x = self.dropout(x)
+
+        return self.fc_out(x)
+
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
     """Get TensorBoard writer from trainer callbacks."""
     if hasattr(trainer, 'callback_handler'):
@@ -51,98 +179,6 @@ def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
                 if callback.tb_writer is not None:
                     return callback.tb_writer
     return None
-
-
-class AudioVAEDataCollator:
-    """
-    Data collator for audio VAE training.
-
-    Pads to batch max length instead of global max for efficiency.
-    Creates masks for both loss computation and attention masking.
-    """
-    def __init__(
-        self,
-        audio_max_frames: int = 1875,
-        n_mels: int = 80,
-        speaker_embedding_dim: int = 192,
-    ):
-        self.audio_max_frames = audio_max_frames
-        self.n_mels = n_mels
-        self.speaker_embedding_dim = speaker_embedding_dim
-
-    def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
-        # Filter None examples and collect lengths first
-        valid_examples = [ex for ex in examples if ex is not None]
-        if not valid_examples:
-            raise ValueError("All examples in batch are None")
-
-        # Collect mel specs and lengths
-        raw_mel_specs = []
-        mel_lengths = []
-        speaker_embeddings = []
-
-        for ex in valid_examples:
-            mel = ex["mel_spec"]
-            mel_length = ex.get("mel_spec_length", mel.shape[-1])
-
-            # Ensure correct shape [1, n_mels, T] for single-channel input
-            if mel.dim() == 2:
-                mel = mel.unsqueeze(0)  # [n_mels, T] -> [1, n_mels, T]
-            elif mel.dim() == 3 and mel.shape[0] != 1:
-                # If shape is [n_mels, T, 1] or similar, fix it
-                if mel.shape[-1] == 1:
-                    mel = mel.squeeze(-1).unsqueeze(0)
-
-            # Clamp length to actual mel length and global max
-            mel_length = min(mel_length, mel.shape[-1], self.audio_max_frames)
-
-            raw_mel_specs.append(mel)
-            mel_lengths.append(mel_length)
-
-            # Get speaker embedding if available
-            speaker_emb = ex.get("speaker_embedding", None)
-            if speaker_emb is not None:
-                # Ensure shape is [1, speaker_embedding_dim]
-                if speaker_emb.dim() == 1:
-                    speaker_emb = speaker_emb.unsqueeze(0)
-                speaker_embeddings.append(speaker_emb)
-            else:
-                # Use zeros if no speaker embedding
-                speaker_embeddings.append(torch.zeros(1, self.speaker_embedding_dim))
-
-        # Compute batch max length (dynamic padding)
-        batch_max_length = max(mel_lengths)
-
-        # Pad/truncate to batch max length and create masks
-        mel_specs = []
-        mel_spec_masks = []
-
-        for mel, mel_length in zip(raw_mel_specs, mel_lengths):
-            # Create mel spec padding mask (1 = valid, 0 = padding)
-            mel_mask = torch.zeros(batch_max_length, dtype=torch.float32)
-            mel_mask[:mel_length] = 1.0
-
-            # Truncate to batch max length (since data is pre-padded to global max)
-            mel = mel[..., :batch_max_length]
-
-            # Pad if needed (shouldn't be needed if data is pre-padded, but just in case)
-            if mel.shape[-1] < batch_max_length:
-                mel = F.pad(mel, (0, batch_max_length - mel.shape[-1]), value=0)
-
-            mel_specs.append(mel)
-            mel_spec_masks.append(mel_mask)
-
-        # Convert lengths to tensor for attention masking
-        mel_lengths_tensor = torch.tensor(mel_lengths, dtype=torch.long)
-
-        batch = {
-            "mel_spec": torch.stack(mel_specs),
-            "mel_spec_mask": torch.stack(mel_spec_masks),  # [B, T] mask for loss (1=valid, 0=padding)
-            "mel_spec_lengths": mel_lengths_tensor,  # [B] original lengths for attention masking
-            "speaker_embedding": torch.stack(speaker_embeddings),  # [B, 1, speaker_embedding_dim]
-        }
-
-        return batch
 
 
 class AudioVAEReconstructionCallback(TrainerCallback):
@@ -184,10 +220,20 @@ class AudioVAEReconstructionCallback(TrainerCallback):
         self.vocoder = None
         self._vocoder_load_attempted = False
 
+        # Speaker encoder for extracting embeddings from example audio
+        self.speaker_encoder = None
+        self._speaker_encoder_load_attempted = False
+        self.example_speaker_embeddings = []  # Store speaker embeddings for example audio
+
         # Load example audio files and compute mel specs
         self.example_paths = [
             "inference/examples/test_alm_1.mp3",
             "inference/examples/test_alm_2.mp3",
+        ]
+        # Pre-extracted speaker embedding paths (preferred over extracting on-the-fly)
+        self.example_speaker_embedding_paths = [
+            "inference/examples/test_alm_speaker_embedding_1.pt",
+            "inference/examples/test_alm_speaker_embedding_2.pt",
         ]
         self.example_mels = []
         self.example_original_lengths = []  # Store original mel lengths before padding
@@ -269,6 +315,84 @@ class AudioVAEReconstructionCallback(TrainerCallback):
             print(f"Failed to load vocoder: {e}")
             self.vocoder = None
 
+    def _load_speaker_encoder(self, device: torch.device):
+        """Lazily load speaker embeddings from pre-extracted files, or extract from mels."""
+        if self._speaker_encoder_load_attempted:
+            return
+        self._speaker_encoder_load_attempted = True
+
+        if len(self.example_mels) == 0:
+            return
+
+        # First, try to load pre-extracted speaker embeddings
+        all_loaded = True
+        for i, emb_path in enumerate(self.example_speaker_embedding_paths):
+            if os.path.exists(emb_path):
+                try:
+                    speaker_emb = torch.load(emb_path, weights_only=True)
+                    self.example_speaker_embeddings.append(speaker_emb)
+                    print(f"Loaded pre-extracted speaker embedding from {emb_path}: shape {speaker_emb.shape}, L2 norm {speaker_emb.norm():.4f}")
+                except Exception as e:
+                    print(f"Failed to load speaker embedding from {emb_path}: {e}")
+                    all_loaded = False
+                    break
+            else:
+                print(f"Pre-extracted speaker embedding not found: {emb_path}")
+                all_loaded = False
+                break
+
+        if all_loaded and len(self.example_speaker_embeddings) == len(self.example_mels):
+            print(f"Loaded {len(self.example_speaker_embeddings)} pre-extracted speaker embeddings")
+            return
+
+        # Fall back to extracting embeddings using ECAPA-TDNN
+        self.example_speaker_embeddings = []  # Reset in case partial load
+        try:
+            from speechbrain.inference.speaker import EncoderClassifier
+
+            print("Loading ECAPA-TDNN speaker encoder for example audio...")
+            self.speaker_encoder = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb-mel-spec",
+                savedir="pretrained_models/spkrec-ecapa-voxceleb-mel-spec",
+                run_opts={"device": str(device)},
+            )
+
+            # Extract speaker embeddings from example mels
+            print("Extracting speaker embeddings from example audio...")
+            with torch.no_grad():
+                for i, mel in enumerate(self.example_mels):
+                    original_length = self.example_original_lengths[i]
+
+                    # Prepare mel for ECAPA-TDNN: [1, n_mels, T] -> [1, T, n_mels]
+                    mel_for_ecapa = mel.squeeze(0).transpose(0, 1).unsqueeze(0).to(device)  # [1, T, n_mels]
+
+                    # Compute relative length
+                    max_len = mel_for_ecapa.shape[1]
+                    rel_lens = torch.tensor([original_length / max_len], device=device)
+
+                    # Call normalizer and embedding model directly
+                    normalized = self.speaker_encoder.mods.normalizer(mel_for_ecapa, rel_lens, epoch=1)
+                    speaker_emb = self.speaker_encoder.mods.embedding_model(
+                        normalized, rel_lens
+                    ).squeeze(1).cpu()  # [1, 192] -> [192]
+
+                    self.example_speaker_embeddings.append(speaker_emb.squeeze(0))
+                    print(f"  Example {i}: speaker embedding shape {speaker_emb.shape}, L2 norm {speaker_emb.norm():.4f}")
+
+            print(f"Extracted {len(self.example_speaker_embeddings)} speaker embeddings")
+
+        except ImportError:
+            print("Warning: speechbrain not available. Speaker embeddings will be zeros.")
+            # Create zero embeddings as fallback
+            for _ in self.example_mels:
+                self.example_speaker_embeddings.append(torch.zeros(192))
+        except Exception as e:
+            print(f"Failed to load speaker encoder or extract embeddings: {e}")
+            # Create zero embeddings as fallback
+            self.example_speaker_embeddings = []
+            for _ in self.example_mels:
+                self.example_speaker_embeddings.append(torch.zeros(192))
+
     def _log_vocoder_audio(self, writer: SummaryWriter, mel_spec: torch.Tensor, global_step: int, tag: str):
         """Convert mel spectrogram to audio using vocoder and log to TensorBoard."""
         try:
@@ -348,6 +472,9 @@ class AudioVAEReconstructionCallback(TrainerCallback):
         all_mu_stds = []
         all_logvar_means = []
 
+        # Collect sample data for cross-speaker reconstruction
+        eval_samples_data = []  # List of (mel, speaker_embedding, mu, mel_length)
+
         with torch.no_grad():
             dtype = torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32
 
@@ -377,9 +504,43 @@ class AudioVAEReconstructionCallback(TrainerCallback):
                         speaker_embedding=spk_emb,
                     )
 
+                    # Store sample data for cross-speaker reconstruction later
+                    eval_samples_data.append({
+                        "mel": mel,  # [1, n_mels, T]
+                        "speaker_embedding": speaker_embedding,  # [192] or None
+                        "mu": mu.cpu(),  # [1, C, H, W]
+                        "mel_length": mel_length,
+                    })
+
                     # Generate mu-only reconstruction (no sampling, z = mu)
                     # This is what diffusion will see during inference
-                    recon_mu_only = model.decode(mu)
+                    recon_mu_only = model.decode(mu, speaker_embedding=spk_emb)
+
+                    # Debug: print stats for first sample to diagnose mu_only vs reparameterized difference
+                    if i == 0:
+                        z = model.reparameterize(mu, logvar)
+                        std = torch.exp(0.5 * logvar)
+                        print(f"[DEBUG mu_only] decoder.speaker_embedding_dim: {model.decoder.speaker_embedding_dim}")
+                        if spk_emb is not None:
+                            print(f"[DEBUG mu_only] spk_emb: shape={spk_emb.shape}, "
+                                  f"mean={spk_emb.mean().item():.4f}, std={spk_emb.std().item():.4f}")
+                        else:
+                            print("[DEBUG mu_only] spk_emb: None")
+                        print(f"[DEBUG mu_only] mu: mean={mu.mean().item():.4f}, std={mu.std().item():.4f}, "
+                              f"min={mu.min().item():.4f}, max={mu.max().item():.4f}")
+                        print(f"[DEBUG mu_only] logvar: mean={logvar.mean().item():.4f}, "
+                              f"std_from_logvar: mean={std.mean().item():.4f}, min={std.min().item():.6f}, max={std.max().item():.4f}")
+                        print(f"[DEBUG mu_only] z: mean={z.mean().item():.4f}, std={z.std().item():.4f}")
+                        print(f"[DEBUG mu_only] recon (from reconstruct_with_attention): "
+                              f"mean={recon.mean().item():.4f}, std={recon.std().item():.4f}, "
+                              f"min={recon.min().item():.4f}, max={recon.max().item():.4f}")
+                        print(f"[DEBUG mu_only] recon_mu_only: "
+                              f"mean={recon_mu_only.mean().item():.4f}, std={recon_mu_only.std().item():.4f}, "
+                              f"min={recon_mu_only.min().item():.4f}, max={recon_mu_only.max().item():.4f}")
+                        # Also check if recon from decode(z) matches reconstruct_with_attention
+                        recon_z_direct = model.decode(z, speaker_embedding=spk_emb)
+                        print(f"[DEBUG mu_only] recon from decode(z): "
+                              f"mean={recon_z_direct.mean().item():.4f}, std={recon_z_direct.std().item():.4f}")
 
                     # Compute losses manually for logging
                     losses = {}
@@ -511,6 +672,100 @@ class AudioVAEReconstructionCallback(TrainerCallback):
         writer.add_scalar("eval_vae/mean_mu_std", np.mean(all_mu_stds), global_step)
         writer.add_scalar("eval_vae/mean_logvar_mean", np.mean(all_logvar_means), global_step)
 
+        # Cross-speaker reconstruction on eval samples
+        # Select samples that have speaker embeddings
+        samples_with_speakers = [
+            (i, s) for i, s in enumerate(eval_samples_data)
+            if s["speaker_embedding"] is not None
+        ]
+
+        if len(samples_with_speakers) >= 2:
+            print("Generating cross-speaker reconstructions on eval samples...")
+
+            with torch.no_grad():
+                with autocast(device.type, dtype=dtype, enabled=args.bf16 or args.fp16):
+                    # Create 4 random pairs (or fewer if not enough samples)
+                    num_pairs = min(4, len(samples_with_speakers) // 2)
+                    pair_indices = torch.randperm(len(samples_with_speakers))[:num_pairs * 2].tolist()
+
+                    for pair_idx in range(num_pairs):
+                        idx_a = pair_indices[pair_idx * 2]
+                        idx_b = pair_indices[pair_idx * 2 + 1]
+
+                        sample_a_idx, sample_a = samples_with_speakers[idx_a]
+                        sample_b_idx, sample_b = samples_with_speakers[idx_b]
+
+                        # Reconstruct A's content with B's speaker embedding
+                        mu_a = sample_a["mu"].to(device)
+                        spk_emb_b = sample_b["speaker_embedding"].unsqueeze(0).to(device)
+                        if spk_emb_b.dim() == 2:
+                            spk_emb_b = spk_emb_b.unsqueeze(1)  # [1, 1, 192]
+
+                        cross_recon_a_with_b = model.decode(mu_a, speaker_embedding=spk_emb_b)
+
+                        # Reconstruct B's content with A's speaker embedding
+                        mu_b = sample_b["mu"].to(device)
+                        spk_emb_a = sample_a["speaker_embedding"].unsqueeze(0).to(device)
+                        if spk_emb_a.dim() == 2:
+                            spk_emb_a = spk_emb_a.unsqueeze(1)  # [1, 1, 192]
+
+                        cross_recon_b_with_a = model.decode(mu_b, speaker_embedding=spk_emb_a)
+
+                        # Log A with B's speaker
+                        mel_a_trimmed = sample_a["mel"].squeeze(0).cpu().numpy()[..., :sample_a["mel_length"]]
+                        cross_a_trimmed = cross_recon_a_with_b[0].squeeze(0).float().cpu().numpy()[..., :sample_a["mel_length"]]
+
+                        writer.add_image(
+                            f"eval_vae/cross_speaker/pair{pair_idx}_content{sample_a_idx}_spk{sample_b_idx}/original",
+                            self._visualize_mel_spec(mel_a_trimmed),
+                            global_step
+                        )
+                        writer.add_image(
+                            f"eval_vae/cross_speaker/pair{pair_idx}_content{sample_a_idx}_spk{sample_b_idx}/reconstruction",
+                            self._visualize_mel_spec(cross_a_trimmed),
+                            global_step
+                        )
+                        self._log_mel_comparison(
+                            writer, cross_a_trimmed, mel_a_trimmed, global_step,
+                            tag=f"eval_vae/cross_speaker/pair{pair_idx}_content{sample_a_idx}_spk{sample_b_idx}/comparison"
+                        )
+
+                        # Log B with A's speaker
+                        mel_b_trimmed = sample_b["mel"].squeeze(0).cpu().numpy()[..., :sample_b["mel_length"]]
+                        cross_b_trimmed = cross_recon_b_with_a[0].squeeze(0).float().cpu().numpy()[..., :sample_b["mel_length"]]
+
+                        writer.add_image(
+                            f"eval_vae/cross_speaker/pair{pair_idx}_content{sample_b_idx}_spk{sample_a_idx}/original",
+                            self._visualize_mel_spec(mel_b_trimmed),
+                            global_step
+                        )
+                        writer.add_image(
+                            f"eval_vae/cross_speaker/pair{pair_idx}_content{sample_b_idx}_spk{sample_a_idx}/reconstruction",
+                            self._visualize_mel_spec(cross_b_trimmed),
+                            global_step
+                        )
+                        self._log_mel_comparison(
+                            writer, cross_b_trimmed, mel_b_trimmed, global_step,
+                            tag=f"eval_vae/cross_speaker/pair{pair_idx}_content{sample_b_idx}_spk{sample_a_idx}/comparison"
+                        )
+
+                        # Log audio if vocoder available
+                        if self.vocoder is not None:
+                            self._log_vocoder_audio(
+                                writer,
+                                cross_recon_a_with_b[0].squeeze(0).float().cpu()[..., :sample_a["mel_length"]],
+                                global_step,
+                                tag=f"eval_vae/cross_speaker/pair{pair_idx}_content{sample_a_idx}_spk{sample_b_idx}/audio"
+                            )
+                            self._log_vocoder_audio(
+                                writer,
+                                cross_recon_b_with_a[0].squeeze(0).float().cpu()[..., :sample_b["mel_length"]],
+                                global_step,
+                                tag=f"eval_vae/cross_speaker/pair{pair_idx}_content{sample_b_idx}_spk{sample_a_idx}/audio"
+                            )
+
+            print(f"Cross-speaker reconstruction complete: {num_pairs} pairs logged")
+
         print(f"Eval visualization complete: {num_samples} samples logged")
         writer.flush()
 
@@ -540,16 +795,29 @@ class AudioVAEReconstructionCallback(TrainerCallback):
             else:
                 device = torch.device("cpu")
 
+            # Lazily load speaker encoder and extract embeddings
+            self._load_speaker_encoder(device)
+
             with torch.no_grad():
                 dtype = torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32
 
                 with autocast(device.type, dtype=dtype):
                     for i, mel in enumerate(self.example_mels):
-                        recon, mu, logvar, losses = model(mel.unsqueeze(0).to(device))
+                        # Get speaker embedding for this example (if available)
+                        spk_emb = None
+                        if i < len(self.example_speaker_embeddings):
+                            spk_emb = self.example_speaker_embeddings[i].unsqueeze(0).to(device)  # [1, 192]
+                            if spk_emb.dim() == 2:
+                                spk_emb = spk_emb.unsqueeze(1)  # [1, 1, 192]
+
+                        recon, mu, logvar, losses = model(
+                            mel.unsqueeze(0).to(device),
+                            speaker_embedding=spk_emb,
+                        )
 
                         # Generate mu-only reconstruction (no sampling, z = mu)
                         # This is what diffusion will see during inference
-                        recon_mu_only = model.decode(mu)
+                        recon_mu_only = model.decode(mu, speaker_embedding=spk_emb)
 
                         # Get original length for this example
                         original_length = self.example_original_lengths[i] if i < len(self.example_original_lengths) else mel.shape[-1]
@@ -645,6 +913,65 @@ class AudioVAEReconstructionCallback(TrainerCallback):
                                 writer, recon_mel_tensor, global_step,
                                 tag=f"audio_vae/recon_audio_padded/{i}"
                             )
+
+                    # Cross-speaker reconstruction: reconstruct each mel with the OTHER speaker's embedding
+                    # This tests speaker disentanglement - content should be preserved, voice should change
+                    if len(self.example_mels) >= 2 and len(self.example_speaker_embeddings) >= 2:
+                        print("Generating cross-speaker reconstructions...")
+                        cross_pairs = [
+                            (0, 1),  # mel 0 with speaker embedding 1
+                            (1, 0),  # mel 1 with speaker embedding 0
+                        ]
+
+                        for mel_idx, spk_idx in cross_pairs:
+                            mel = self.example_mels[mel_idx]
+                            cross_spk_emb = self.example_speaker_embeddings[spk_idx].unsqueeze(0).to(device)  # [1, 192]
+                            if cross_spk_emb.dim() == 2:
+                                cross_spk_emb = cross_spk_emb.unsqueeze(1)  # [1, 1, 192]
+
+                            # Encode the mel (get latent representation)
+                            mu, logvar = model.encode(mel.unsqueeze(0).to(device))
+
+                            # Decode with the OTHER speaker's embedding
+                            cross_recon = model.decode(mu, speaker_embedding=cross_spk_emb)
+
+                            # Get original length for this mel
+                            original_length = self.example_original_lengths[mel_idx] if mel_idx < len(self.example_original_lengths) else mel.shape[-1]
+
+                            # Get tensors for visualization
+                            mel_cpu = mel.squeeze(0).cpu().numpy()  # [n_mels, T]
+                            cross_recon_cpu = cross_recon[0].squeeze(0).float().cpu().numpy()  # [n_mels, T]
+
+                            # Trimmed versions (without padding)
+                            mel_trimmed = mel_cpu[..., :original_length]
+                            cross_recon_trimmed = cross_recon_cpu[..., :original_length]
+
+                            # Log cross-speaker reconstruction
+                            tag_suffix = f"mel{mel_idx}_spk{spk_idx}"
+                            writer.add_image(
+                                f"audio_vae/cross_speaker/{tag_suffix}/original",
+                                self._visualize_mel_spec(mel_trimmed),
+                                global_step
+                            )
+                            writer.add_image(
+                                f"audio_vae/cross_speaker/{tag_suffix}/reconstruction",
+                                self._visualize_mel_spec(cross_recon_trimmed),
+                                global_step
+                            )
+                            self._log_mel_comparison(
+                                writer, cross_recon_trimmed, mel_trimmed, global_step,
+                                tag=f"audio_vae/cross_speaker/{tag_suffix}/comparison"
+                            )
+
+                            # Convert to audio using vocoder
+                            if self.vocoder is not None:
+                                cross_recon_mel_tensor = cross_recon[0].squeeze(0).float().cpu()
+                                self._log_vocoder_audio(
+                                    writer, cross_recon_mel_tensor[..., :original_length], global_step,
+                                    tag=f"audio_vae/cross_speaker/{tag_suffix}/audio"
+                                )
+
+                        print("Cross-speaker reconstructions complete")
 
     def _visualize_mel_spec(self, mel_spec: np.ndarray) -> np.ndarray:
         """Generate mel spectrogram visualization for TensorBoard."""
@@ -926,6 +1253,26 @@ class AudioVAEGANTrainer(Trainer):
         audio_perceptual_loss_weight: float = 0.0,
         audio_perceptual_loss_start_step: int = 0,  # Step to start applying perceptual loss
         vocoder: Optional[torch.nn.Module] = None,  # For waveform-based losses
+        # GRL speaker disentanglement
+        speaker_classifier: Optional[torch.nn.Module] = None,
+        speaker_classifier_optimizer: Optional[torch.optim.Optimizer] = None,
+        grl_weight: float = 0.0,  # Weight for GRL loss (0 = disabled)
+        grl_start_step: int = 0,  # Step to start GRL (let VAE learn first)
+        grl_alpha_max: float = 1.0,  # Max gradient reversal strength
+        grl_rampup_steps: int = 5000,  # Steps to ramp alpha from 0 to max
+        # FiLM statistics tracking
+        log_film_stats: bool = False,  # Whether to log FiLM scale/shift statistics
+        # FiLM contrastive loss - encourages different speaker embeddings to produce different FiLM outputs
+        film_contrastive_loss_weight: float = 0.0,  # Weight for FiLM contrastive loss (0 = disabled)
+        film_contrastive_loss_start_step: int = 0,  # Step to start FiLM contrastive loss
+        # start with low, easy to reach margin
+        film_contrastive_margin_start_value: float = 0.01,
+        # don't ever increase margin
+        film_contrastive_margin_step_step: float = 0,
+        # how much to increase margin (multiplicative). this happens once, at film_contrastive_margin_step_step steps into training
+        film_contrastive_margin_step_multiplier: float = 10.0,
+        # Mu-only reconstruction loss (for diffusion compatibility)
+        mu_only_recon_weight: float = 0.0,  # Weight for mu-only reconstruction loss (0 = disabled)
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -981,6 +1328,32 @@ class AudioVAEGANTrainer(Trainer):
         if discriminator is not None:
             self.discriminator_scaler = torch.amp.GradScaler(enabled=False)  # Will be enabled in compute_loss
 
+        # GRL speaker disentanglement settings
+        self.speaker_classifier = speaker_classifier
+        self.speaker_classifier_optimizer = speaker_classifier_optimizer
+        self.grl_weight = grl_weight
+        self.grl_start_step = grl_start_step
+        self.grl_alpha_max = grl_alpha_max
+        self.grl_rampup_steps = grl_rampup_steps
+        self.grl_already_started = False  # Track when GRL training has actually started
+
+        # FiLM statistics tracking
+        self.log_film_stats = log_film_stats
+
+        # FiLM contrastive loss settings
+        self.film_contrastive_loss_weight = film_contrastive_loss_weight
+        self.film_contrastive_loss_start_step = film_contrastive_loss_start_step
+
+        self.film_contrastive_margin = film_contrastive_margin_start_value
+        self.film_contrastive_margin_step_step = film_contrastive_margin_step_step
+        self.film_contrastive_margin_step_multiplier = film_contrastive_margin_step_multiplier
+        self.film_contrastive_margin_stepped = False  # Track if margin has been stepped up
+
+        # Mu-only reconstruction loss (for diffusion compatibility)
+        self.mu_only_recon_weight = mu_only_recon_weight
+
+        self.has_logged_cli = False
+
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         """
         Override to use shard-aware sampler for sharded datasets.
@@ -1019,9 +1392,11 @@ class AudioVAEGANTrainer(Trainer):
 
         self._ensure_tensorboard_writer()
 
-        if global_step == 0 and self.writer is not None:
+        # gets reset any time training is resumed; it can be assumed that the cli changed, so log at the step value it was resumed from
+        if not self.has_logged_cli:
             self.writer.add_text("training/command_line", self.cmdline, global_step)
             self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            self.has_logged_cli = True
 
         mel_spec = inputs["mel_spec"]
         mel_spec_mask = inputs.get("mel_spec_mask", None)
@@ -1034,16 +1409,38 @@ class AudioVAEGANTrainer(Trainer):
             kl_weight_multiplier = min(1.0, global_step / self.kl_annealing_steps)
 
         # Forward pass through VAE model (with optional mask for reconstruction loss and lengths for attention)
+        # Request FiLM stats if logging is enabled
         recon, mu, logvar, losses = model(
             mel_spec,
             mask=mel_spec_mask,
             speaker_embedding=speaker_embedding,
             lengths=mel_spec_lengths,
             kl_weight_multiplier=kl_weight_multiplier,
+            return_film_stats=self.log_film_stats,
         )
+
+        # Extract FiLM stats if available
+        film_stats = losses.pop("film_stats", None) if self.log_film_stats else None
 
         # Get VAE reconstruction loss
         vae_loss = losses["total_loss"]
+
+        # Mu-only reconstruction loss (trains decoder to produce good outputs from mu directly)
+        # This ensures diffusion-generated latents decode well without needing reparameterization noise
+        mu_only_recon_loss = torch.tensor(0.0, device=mel_spec.device)
+        if self.mu_only_recon_weight > 0:
+            # Decode mu directly (no reparameterization noise)
+            recon_mu_only = model.decode(mu.detach(), speaker_embedding=speaker_embedding)[..., :mel_spec.shape[-1]]
+            # Use same loss as main reconstruction (L1 or MSE depending on config)
+            if hasattr(model, 'mse_loss_weight') and model.mse_loss_weight > 0:
+                mu_only_recon_loss = mu_only_recon_loss + model.mse_loss_weight * F.mse_loss(recon_mu_only, mel_spec)
+            if hasattr(model, 'l1_loss_weight') and model.l1_loss_weight > 0:
+                mu_only_recon_loss = mu_only_recon_loss + model.l1_loss_weight * F.l1_loss(recon_mu_only, mel_spec)
+            # Fallback to MSE if no weights defined
+            if mu_only_recon_loss.item() == 0.0:
+                mu_only_recon_loss = F.mse_loss(recon_mu_only, mel_spec)
+            vae_loss = vae_loss + self.mu_only_recon_weight * mu_only_recon_loss
+            losses["mu_only_recon_loss"] = mu_only_recon_loss
 
         # GAN losses (only after condition is met)
         g_gan_loss = torch.tensor(0.0, device=mel_spec.device)
@@ -1193,6 +1590,156 @@ class AudioVAEGANTrainer(Trainer):
             audio_perceptual_loss_value = audio_perceptual_losses.get("total_perceptual_loss", torch.tensor(0.0, device=mel_spec.device))
             total_loss = total_loss + self.audio_perceptual_loss_weight * audio_perceptual_loss_value
 
+        # GRL speaker disentanglement loss
+        # Uses gradient reversal to train encoder to remove speaker info from latents
+        grl_loss = torch.tensor(0.0, device=mel_spec.device)
+        speaker_classifier_acc = 0.0
+        grl_enabled = (
+            self.speaker_classifier is not None
+            and self.grl_weight > 0
+            and global_step >= self.grl_start_step
+        )
+        if grl_enabled:
+            # Get speaker IDs from batch (if available)
+            # Note: collator provides "speaker_ids" (plural) as a list
+            speaker_ids = inputs.get("speaker_ids", None)
+            if speaker_ids is not None and not isinstance(speaker_ids, torch.Tensor):
+                speaker_ids = torch.tensor(speaker_ids, device=mel_spec.device, dtype=torch.long)
+            if speaker_ids is not None:
+                # Mark GRL as started (for checkpoint saving)
+                if not self.grl_already_started:
+                    # Get num_speakers from classifier output layer
+                    num_speakers = self.speaker_classifier.fc_out.out_features
+                    print(f"GRL training starting at step {global_step}")
+                    print(f"  speaker_ids: min={speaker_ids.min().item()}, max={speaker_ids.max().item()}, "
+                          f"unique={len(torch.unique(speaker_ids))}, batch_size={len(speaker_ids)}")
+                    print(f"  classifier num_speakers: {num_speakers}")
+
+                    # Validate speaker_ids are in valid range
+                    if speaker_ids.min() < 0:
+                        raise ValueError(f"speaker_ids contains negative values (min={speaker_ids.min().item()})")
+                    if speaker_ids.max() >= num_speakers:
+                        raise ValueError(
+                            f"speaker_ids max ({speaker_ids.max().item()}) >= num_speakers ({num_speakers}). "
+                            f"Either increase --num_speakers or check if speaker_ids are 1-indexed "
+                            f"(should be 0-indexed for cross_entropy)."
+                        )
+                    self.grl_already_started = True
+
+                # Ensure speaker classifier is on same device
+                if next(self.speaker_classifier.parameters()).device != mel_spec.device:
+                    self.speaker_classifier.to(mel_spec.device)
+
+                # Compute GRL alpha (ramps from 0 to grl_alpha_max over grl_rampup_steps)
+                steps_since_grl_start = global_step - self.grl_start_step
+                grl_alpha = min(self.grl_alpha_max, self.grl_alpha_max * steps_since_grl_start / max(1, self.grl_rampup_steps))
+
+                # Update speaker classifier FIRST (separate optimizer, before GRL forward)
+                # This must happen before the GRL forward pass to avoid in-place modification errors
+                # The classifier tries to MAXIMIZE accuracy, encoder tries to MINIMIZE it
+                if self.speaker_classifier_optimizer is not None and torch.is_grad_enabled():
+                    self.speaker_classifier_optimizer.zero_grad()
+                    # Classifier loss without GRL (alpha=0 means no gradient reversal, mu detached)
+                    classifier_logits = self.speaker_classifier(mu.detach(), alpha=0.0)
+                    classifier_loss = F.cross_entropy(classifier_logits, speaker_ids)
+                    classifier_loss.backward()
+                    self.speaker_classifier_optimizer.step()
+
+                # Forward pass through speaker classifier (with GRL)
+                # mu shape: [B, C, M, T] - classifier expects this
+                # This uses the UPDATED classifier weights after the step above
+                speaker_logits = self.speaker_classifier(mu, alpha=grl_alpha)
+
+                # Compute cross-entropy loss for speaker classification
+                grl_loss = F.cross_entropy(speaker_logits, speaker_ids)
+
+                # Compute accuracy for logging
+                with torch.no_grad():
+                    speaker_preds = speaker_logits.argmax(dim=-1)
+                    speaker_classifier_acc = (speaker_preds == speaker_ids).float().mean().item()
+
+                # Add to total loss (reversed gradients flow to encoder)
+                total_loss = total_loss + self.grl_weight * grl_loss
+
+                # Log GRL metrics
+                if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                    prefix = "train/" if model.training else "eval/"
+                    self._log_scalar(f"{prefix}grl/loss", grl_loss, global_step)
+                    self._log_scalar(f"{prefix}grl/alpha", grl_alpha, global_step)
+                    self._log_scalar(f"{prefix}grl/speaker_classifier_acc", speaker_classifier_acc, global_step, skip_zero=False)
+                    self._log_scalar(f"{prefix}grl/weighted_loss", self.grl_weight * grl_loss, global_step)
+
+        # FiLM contrastive loss - encourages different speaker embeddings to produce different outputs
+        # This penalizes the decoder for ignoring speaker embeddings
+        # Key insight: weight loss by embedding similarity so we don't penalize same/similar speakers
+        film_contrastive_loss = torch.tensor(0.0, device=mel_spec.device)
+        film_contrastive_enabled = (
+            self.film_contrastive_loss_weight > 0
+            and global_step >= self.film_contrastive_loss_start_step
+            and speaker_embedding is not None
+            and speaker_embedding.shape[0] > 1  # Need at least 2 samples for shuffling
+        )
+        if film_contrastive_enabled:
+            # Step up margin if needed
+            if (
+                not self.film_contrastive_margin_stepped
+                and global_step >= self.film_contrastive_margin_step_step
+            ):
+                self.film_contrastive_margin *= self.film_contrastive_margin_step_multiplier
+                self.film_contrastive_margin_stepped = True
+
+            # Shuffle speaker embeddings to create mismatched (audio, wrong_speaker) pairs
+            batch_size = speaker_embedding.shape[0]
+            perm = torch.randperm(batch_size, device=speaker_embedding.device)
+            # Ensure no sample maps to itself (for valid pairs)
+            same_indices = (perm == torch.arange(batch_size, device=perm.device))
+            if same_indices.any():
+                # Shift indices that map to themselves
+                perm[same_indices] = (perm[same_indices] + 1) % batch_size
+            shuffled_speaker_embedding = speaker_embedding[perm]
+
+            # Compute embedding similarity to weight the loss
+            # Flatten to [B, D] for cosine similarity
+            emb_flat = speaker_embedding.squeeze(1) if speaker_embedding.dim() == 3 else speaker_embedding
+            shuffled_emb_flat = shuffled_speaker_embedding.squeeze(1) if shuffled_speaker_embedding.dim() == 3 else shuffled_speaker_embedding
+            emb_similarity = F.cosine_similarity(emb_flat, shuffled_emb_flat, dim=-1)  # [B]
+
+            # Weight loss by how different the embeddings are:
+            # - Same speaker (sim ≈ 1) → weight ≈ 0 → no penalty (correct behavior)
+            # - Similar speakers (sim ≈ 0.8) → weight ≈ 0.2 → small penalty
+            # - Very different speakers (sim ≈ 0.3) → weight ≈ 0.7 → stronger penalty
+            emb_diff_weight = (1.0 - emb_similarity).clamp(0, 1)  # [B]
+
+            # Decode with shuffled speaker embeddings (detach mu to only train decoder's FiLM)
+            recon_shuffled = model.decode(mu.detach(), speaker_embedding=shuffled_speaker_embedding)
+
+            # Compute per-sample output difference
+            # recon shape: [B, 1, n_mels, T] or [B, n_mels, T]
+            # Truncate to min time dim (decoder conv stack can produce slightly different lengths)
+            min_time = min(recon.shape[-1], recon_shuffled.shape[-1])
+            recon_truncated = recon[..., :min_time]
+            recon_shuffled_truncated = recon_shuffled[..., :min_time]
+            output_diff_per_sample = (recon_truncated - recon_shuffled_truncated).pow(2).mean(dim=list(range(1, recon.dim())))  # [B]
+
+            # Hinge loss: want output_diff > margin for different speakers
+            # Weighted by embedding difference so same/similar speakers aren't penalized
+            margin = self.film_contrastive_margin  # Reasonable margin for mel spectrograms in normalized scale
+            per_sample_loss = emb_diff_weight * F.relu(margin - output_diff_per_sample)
+            film_contrastive_loss = per_sample_loss.mean()
+
+            total_loss = total_loss + self.film_contrastive_loss_weight * film_contrastive_loss
+
+            # Log FiLM contrastive metrics
+            if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                prefix = "train/" if model.training else "eval/"
+                self._log_scalar(f"{prefix}film_contrastive/loss", film_contrastive_loss, global_step)
+                self._log_scalar(f"{prefix}film_contrastive/output_diff_mean", output_diff_per_sample.mean(), global_step)
+                self._log_scalar(f"{prefix}film_contrastive/emb_similarity_mean", emb_similarity.mean(), global_step)
+                self._log_scalar(f"{prefix}film_contrastive/emb_diff_weight_mean", emb_diff_weight.mean(), global_step)
+                self._log_scalar(f"{prefix}film_contrastive/margin", margin, global_step)
+                self._log_scalar(f"{prefix}film_contrastive/weighted_loss",
+                               self.film_contrastive_loss_weight * film_contrastive_loss, global_step)
+
         # Log losses
         if global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
@@ -1243,6 +1790,11 @@ class AudioVAEGANTrainer(Trainer):
                 self._log_scalar(f"{prefix}speaker_emb/l2_norm_min", l2_norms.min(), global_step)
                 self._log_scalar(f"{prefix}speaker_emb/l2_norm_max", l2_norms.max(), global_step)
 
+            # Log FiLM statistics (for diagnosing speaker conditioning health)
+            if film_stats is not None:
+                for stat_name, stat_value in film_stats.items():
+                    self._log_scalar(f"{prefix}film/{stat_name}", stat_value, global_step)
+
         outputs = {
             "loss": total_loss,
             "rec": recon,
@@ -1280,11 +1832,12 @@ class AudioVAEGANTrainer(Trainer):
 
         return False
 
-    def _log_scalar(self, tag, value, global_step):
+    def _log_scalar(self, tag, value, global_step, skip_zero=True):
         if self.writer is not None:
             if isinstance(value, torch.Tensor):
                 value = value.item()
-            if value != 0.0:
+            # Skip zero values by default (for unused losses), but allow explicit logging of zeros
+            if not skip_zero or value != 0.0:
                 self.writer.add_scalar(tag, value, global_step)
 
     def _ensure_tensorboard_writer(self):
@@ -1363,6 +1916,19 @@ class AudioVAEGANTrainer(Trainer):
             }, discriminator_path)
             print(f"Discriminator saved to {discriminator_path}")
 
+        # Save speaker classifier (GRL) if enabled and training has started
+        if self.speaker_classifier is not None and self.grl_already_started:
+            os.makedirs(output_dir, exist_ok=True)
+            speaker_classifier_path = os.path.join(output_dir, "speaker_classifier.pt")
+            torch.save({
+                "speaker_classifier_state_dict": self.speaker_classifier.state_dict(),
+                "speaker_classifier_optimizer_state_dict": (
+                    self.speaker_classifier_optimizer.state_dict()
+                    if self.speaker_classifier_optimizer is not None else None
+                ),
+            }, speaker_classifier_path)
+            print(f"Speaker classifier (GRL) saved to {speaker_classifier_path}")
+
 
 def load_discriminator(
     resume_from_checkpoint: str,
@@ -1404,6 +1970,46 @@ def load_discriminator(
     return discriminator, discriminator_optimizer, False
 
 
+def load_speaker_classifier(
+    resume_from_checkpoint: str,
+    speaker_classifier: torch.nn.Module,
+    speaker_classifier_optimizer: Optional[torch.optim.Optimizer] = None,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[torch.nn.Module, Optional[torch.optim.Optimizer], bool]:
+    """
+    Load speaker classifier (GRL) from checkpoint if it exists.
+
+    Handles errors gracefully - if loading fails, returns the fresh classifier
+    and continues training from scratch.
+    """
+    if resume_from_checkpoint is None:
+        print("No checkpoint path provided, training speaker classifier from scratch")
+        return speaker_classifier, speaker_classifier_optimizer, False
+
+    speaker_classifier_path = os.path.join(resume_from_checkpoint, "speaker_classifier.pt")
+    if os.path.exists(speaker_classifier_path):
+        print(f"Loading speaker classifier from {speaker_classifier_path}")
+        try:
+            checkpoint = torch.load(speaker_classifier_path, map_location=device, weights_only=True)
+            speaker_classifier.load_state_dict(checkpoint["speaker_classifier_state_dict"])
+
+            if speaker_classifier_optimizer is not None and checkpoint.get("speaker_classifier_optimizer_state_dict"):
+                try:
+                    speaker_classifier_optimizer.load_state_dict(checkpoint["speaker_classifier_optimizer_state_dict"])
+                except Exception as e:
+                    print(f"Warning: Failed to load speaker classifier optimizer state: {e}")
+                    print("Continuing with fresh optimizer state...")
+
+            return speaker_classifier, speaker_classifier_optimizer, True
+        except Exception as e:
+            print(f"Warning: Failed to load speaker classifier checkpoint: {e}")
+            print("Continuing with fresh speaker classifier...")
+            return speaker_classifier, speaker_classifier_optimizer, False
+
+    print("No existing speaker classifier checkpoint found, training from scratch")
+    return speaker_classifier, speaker_classifier_optimizer, False
+
+
 def main():
     args, unk = megatransformer_utils.parse_args()
     run_dir = os.path.join(args.logging_base_dir, args.run_name)
@@ -1419,8 +2025,8 @@ def main():
 
     # Dataset settings
     use_sharded_dataset = unk_dict.get("use_sharded_dataset", "true").lower() == "true"
-    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/audio_vae_train")
-    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/audio_vae_val")
+    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/audio_vae_speaker_train")
+    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/audio_vae_speaker_val")
 
     # Audio settings (CLI args override unk_dict defaults)
     audio_max_frames = int(unk_dict.get("audio_max_frames", 1875))
@@ -1438,6 +2044,20 @@ def main():
     # Set to 0 to disable bounding (unbounded FiLM)
     film_scale_bound = float(unk_dict.get("film_scale_bound", 0.5))
     film_shift_bound = float(unk_dict.get("film_shift_bound", 0.5))
+    # Zero-init FiLM output weights - forces model to learn FiLM from scratch instead of relying on bias
+    zero_init_film_bias = unk_dict.get("zero_init_film_bias", "false").lower() == "true"
+    # Remove bias from FiLM projections entirely - zero embedding = zero modulation (structurally enforced)
+    film_no_bias = unk_dict.get("film_no_bias", "false").lower() == "true"
+    # FiLM contrastive loss - encourages different speaker embeddings to produce different FiLM outputs
+    film_contrastive_loss_weight = float(unk_dict.get("film_contrastive_loss_weight", 0.0))
+    film_contrastive_loss_start_step = int(unk_dict.get("film_contrastive_loss_start_step", 0))
+
+    # Initial margin for FiLM contrastive loss
+    film_contrastive_margin_start_value = float(unk_dict.get("film_contrastive_margin_start_value", 0.01))
+    # what step to increase the margin target for film contrastive loss. 0 disables stepping, keeping the original starting margin
+    film_contrastive_margin_step_step = int(unk_dict.get("film_contrastive_margin_step_step", 0))
+    # after film_contrastive_margin_step_step steps, increase the margin by film_contrastive_margin_step_multiplier times
+    film_contrastive_margin_step_multiplier = float(unk_dict.get("film_contrastive_margin_step_multiplier", 10))
 
     # VAE loss weights
     recon_loss_weight = float(unk_dict.get("recon_loss_weight", 1.0))
@@ -1469,6 +2089,7 @@ def main():
     discriminator_lr = float(unk_dict.get("discriminator_lr", 2e-4))
     gan_loss_weight = float(unk_dict.get("gan_loss_weight", 0.5))
     feature_matching_weight = float(unk_dict.get("feature_matching_weight", 0.0))
+    discriminator_update_frequency = int(unk_dict.get("discriminator_update_frequency", 1))
     discriminator_config = unk_dict.get("discriminator_config", "mini_multi_scale")
 
     # Discriminator regularization settings
@@ -1484,6 +2105,27 @@ def main():
     # Free bits: minimum KL per channel to prevent posterior collapse (0 = disabled)
     free_bits = float(unk_dict.get("free_bits", 0.0))
 
+    # Speaker embedding dropout: probability of zeroing speaker embedding during training
+    # Encourages disentanglement by forcing decoder to learn to use embedding when available
+    speaker_embedding_dropout = float(unk_dict.get("speaker_embedding_dropout", 0.0))
+
+    # GRL (Gradient Reversal Layer) speaker disentanglement settings
+    # Trains a speaker classifier on latents with reversed gradients, encouraging encoder
+    # to produce latents that are speaker-agnostic
+    grl_weight = float(unk_dict.get("grl_weight", 0.0))  # Weight for GRL loss (0 = disabled)
+    grl_start_step = int(unk_dict.get("grl_start_step", 5000))  # Step to start GRL (let VAE learn first)
+    grl_alpha_max = float(unk_dict.get("grl_alpha_max", 1.0))  # Max gradient reversal strength
+    grl_rampup_steps = int(unk_dict.get("grl_rampup_steps", 10000))  # Steps to ramp alpha from 0 to max
+    grl_classifier_lr = float(unk_dict.get("grl_classifier_lr", 1e-4))  # Learning rate for speaker classifier
+    num_speakers = int(unk_dict.get("num_speakers", 0))  # Number of speaker classes (0 = auto-detect from dataset)
+
+    # FiLM statistics logging - track scale/shift statistics for diagnosing conditioning health
+    log_film_stats = unk_dict.get("log_film_stats", "false").lower() == "true"
+
+    # Mu-only reconstruction loss: trains decoder to produce good outputs from mu directly
+    # This ensures diffusion-generated latents decode well without needing reparameterization noise
+    mu_only_recon_weight = float(unk_dict.get("mu_only_recon_weight", 0.0))
+
     # Create shared window buffer for audio processing
     shared_window_buffer = SharedWindowBuffer()
 
@@ -1493,11 +2135,14 @@ def main():
         normalize_speaker_embedding=normalize_speaker_embedding,
         film_scale_bound=film_scale_bound,
         film_shift_bound=film_shift_bound,
+        zero_init_film_bias=zero_init_film_bias,
+        film_no_bias=film_no_bias,
         recon_loss_weight=recon_loss_weight,
         mse_loss_weight=mse_loss_weight,
         l1_loss_weight=l1_loss_weight,
         kl_divergence_loss_weight=kl_divergence_loss_weight,
         free_bits=free_bits,
+        speaker_embedding_dropout=speaker_embedding_dropout,
     )
 
     # Try to load existing checkpoint
@@ -1595,6 +2240,7 @@ def main():
         print(f"  FiLM shift bound: {film_shift_bound} (0=unbounded)")
         if use_gan and discriminator is not None:
             print(f"GAN training: enabled")
+            print(f"Discriminator structure: {discriminator}")
             print(f"  Discriminator config: {discriminator_config}")
             print(f"  Discriminator parameters: {sum(p.numel() for p in discriminator.parameters()):,}")
             multi_scale_discs = [d for d in discriminator.discriminators if isinstance(d, MelMultiScaleDiscriminator)]
@@ -1628,6 +2274,10 @@ def main():
             print(f"KL annealing: {kl_annealing_steps} steps (ramps KL weight from 0 to 1)")
         if free_bits > 0:
             print(f"Free bits: {free_bits} nats per channel (prevents posterior collapse)")
+        if speaker_embedding_dropout > 0:
+            print(f"Speaker embedding dropout: {speaker_embedding_dropout} (encourages disentanglement)")
+        if mu_only_recon_weight > 0:
+            print(f"Mu-only reconstruction loss: weight={mu_only_recon_weight} (trains decoder for diffusion compatibility)")
 
     model = setup_int8_training(args, model)
 
@@ -1707,6 +2357,57 @@ def main():
         speaker_embedding_dim=speaker_embedding_dim,
     )
 
+    # Create speaker classifier for GRL speaker disentanglement
+    speaker_classifier = None
+    speaker_classifier_optimizer = None
+    if grl_weight > 0:
+        # Auto-detect num_speakers from dataset if not specified
+        if num_speakers <= 0:
+            if use_sharded_dataset and hasattr(train_dataset, 'num_speakers') and train_dataset.num_speakers > 0:
+                num_speakers = train_dataset.num_speakers
+                print(f"Auto-detected {num_speakers} speakers from dataset")
+            else:
+                raise ValueError(
+                    "GRL speaker disentanglement requires num_speakers > 0. "
+                    "Either set --num_speakers explicitly, or use sharded dataset format with speaker IDs "
+                    "(enable --include_speaker_id during preprocessing and re-merge shards)."
+                )
+
+        # Check if dataset has speaker_ids available
+        if use_sharded_dataset and not train_dataset.include_speaker_ids:
+            print("WARNING: GRL enabled but dataset may not have speaker_ids. "
+                  "Re-run preprocessing with --include_speaker_id and re-merge shards.")
+
+        speaker_classifier = SpeakerClassifier(
+            latent_channels=latent_channels,
+            num_speakers=num_speakers,
+            hidden_dim=256,
+        ).to(device)
+        speaker_classifier_optimizer = torch.optim.AdamW(
+            speaker_classifier.parameters(),
+            lr=grl_classifier_lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+        )
+
+        # Try to load existing speaker classifier checkpoint
+        speaker_classifier, speaker_classifier_optimizer, sc_loaded = load_speaker_classifier(
+            args.resume_from_checkpoint, speaker_classifier, speaker_classifier_optimizer, device
+        )
+        if sc_loaded:
+            print("Loaded speaker classifier from checkpoint")
+
+        if args.local_rank == 0 or not args.use_deepspeed:
+            print(f"GRL speaker disentanglement: enabled")
+            print(f"Speaker classifier structure: {speaker_classifier}")
+            print(f"  Num speakers: {num_speakers}")
+            print(f"  GRL weight: {grl_weight}")
+            print(f"  GRL start step: {grl_start_step}")
+            print(f"  GRL alpha max: {grl_alpha_max}")
+            print(f"  GRL rampup steps: {grl_rampup_steps}")
+            print(f"  Speaker classifier LR: {grl_classifier_lr}")
+            print(f"  Speaker classifier parameters: {sum(p.numel() for p in speaker_classifier.parameters()):,}")
+
     # Create trainer
     trainer = AudioVAEGANTrainer(
         model=model,
@@ -1721,6 +2422,7 @@ def main():
         discriminator_optimizer=discriminator_optimizer if use_gan else None,
         gan_loss_weight=gan_loss_weight,
         feature_matching_weight=feature_matching_weight,
+        discriminator_update_frequency=discriminator_update_frequency,
         gan_start_condition_key=gan_start_condition_key if use_gan else None,
         gan_start_condition_value=gan_start_condition_value if use_gan else None,
         instance_noise_std=instance_noise_std,
@@ -1733,6 +2435,23 @@ def main():
         audio_perceptual_loss_start_step=audio_perceptual_loss_start_step,
         vocoder=perceptual_loss_vocoder,
         kl_annealing_steps=kl_annealing_steps,
+        # GRL speaker disentanglement
+        speaker_classifier=speaker_classifier,
+        speaker_classifier_optimizer=speaker_classifier_optimizer,
+        grl_weight=grl_weight,
+        grl_start_step=grl_start_step,
+        grl_alpha_max=grl_alpha_max,
+        grl_rampup_steps=grl_rampup_steps,
+        # FiLM statistics logging
+        log_film_stats=log_film_stats,
+        # FiLM contrastive loss
+        film_contrastive_loss_weight=film_contrastive_loss_weight,
+        film_contrastive_loss_start_step=film_contrastive_loss_start_step,
+        film_contrastive_margin_start_value=film_contrastive_margin_start_value,
+        film_contrastive_margin_step_step=film_contrastive_margin_step_step,
+        film_contrastive_margin_step_multiplier=film_contrastive_margin_step_multiplier,
+        # Mu-only reconstruction loss (for diffusion compatibility)
+        mu_only_recon_weight=mu_only_recon_weight,
     )
 
     # Add visualization callback

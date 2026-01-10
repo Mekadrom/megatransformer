@@ -514,6 +514,14 @@ class AudioVAEShardedDataset(Dataset):
 
         print(f"Loaded index: {len(self.shard_files)} shards, {self.total_samples:,} samples")
 
+        # Load speaker info for GRL training
+        self._include_speaker_ids = index_data.get("include_speaker_ids", False)
+        self._num_speakers = index_data.get("num_speakers", 0)
+        self._unique_speaker_ids = index_data.get("unique_speaker_ids", [])
+
+        if self._include_speaker_ids:
+            print(f"  Speaker info: {self._num_speakers} unique speakers")
+
     def _build_and_cache_index(self, index_path: str):
         """Build shard index by scanning all shards, then cache to JSON."""
         # Find all shards
@@ -528,6 +536,11 @@ class AudioVAEShardedDataset(Dataset):
         # Build index
         self.shard_offsets = []
         self.total_samples = 0
+
+        # Initialize speaker info (will be populated from shard_index.json if available)
+        self._include_speaker_ids = False
+        self._num_speakers = 0
+        self._unique_speaker_ids = []
 
         print(f"Indexing {len(self.shard_files)} audio VAE shards (first time only, will be cached)...")
         for shard_file in tqdm(self.shard_files):
@@ -596,7 +609,26 @@ class AudioVAEShardedDataset(Dataset):
             "speaker_embedding": shard["speaker_embeddings"][local_idx],  # [192]
         }
 
+        # Include speaker_id if available in shard
+        if "speaker_ids" in shard:
+            sample["speaker_id"] = shard["speaker_ids"][local_idx].item()
+
         return sample
+
+    @property
+    def num_speakers(self) -> int:
+        """Number of unique speakers in the dataset (for GRL training)."""
+        return getattr(self, '_num_speakers', 0)
+
+    @property
+    def include_speaker_ids(self) -> bool:
+        """Whether the dataset includes speaker IDs."""
+        return getattr(self, '_include_speaker_ids', False)
+
+    @property
+    def unique_speaker_ids(self) -> list:
+        """List of unique speaker IDs in the dataset."""
+        return getattr(self, '_unique_speaker_ids', [])
 
     def get_sampler(self, shuffle: bool = True, seed: int = 42) -> ShardAwareSampler:
         """
@@ -618,6 +650,105 @@ class AudioVAEShardedDataset(Dataset):
             shuffle=shuffle,
             seed=seed,
         )
+
+
+class AudioVAEDataCollator:
+    """
+    Data collator for audio VAE training.
+
+    Pads to batch max length instead of global max for efficiency.
+    Creates masks for both loss computation and attention masking.
+    """
+    def __init__(
+        self,
+        audio_max_frames: int = 1875,
+        n_mels: int = 80,
+        speaker_embedding_dim: int = 192,
+    ):
+        self.audio_max_frames = audio_max_frames
+        self.n_mels = n_mels
+        self.speaker_embedding_dim = speaker_embedding_dim
+
+    def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
+        import torch.nn.functional as F
+
+        # Filter None examples and collect lengths first
+        valid_examples = [ex for ex in examples if ex is not None]
+        if not valid_examples:
+            raise ValueError("All examples in batch are None")
+
+        # Collect mel specs and lengths
+        raw_mel_specs = []
+        mel_lengths = []
+        speaker_embeddings = []
+
+        for ex in valid_examples:
+            mel = ex["mel_spec"]
+            mel_length = ex.get("mel_spec_length", mel.shape[-1])
+
+            # Ensure correct shape [1, n_mels, T] for single-channel input
+            if mel.dim() == 2:
+                mel = mel.unsqueeze(0)  # [n_mels, T] -> [1, n_mels, T]
+            elif mel.dim() == 3 and mel.shape[0] != 1:
+                # If shape is [n_mels, T, 1] or similar, fix it
+                if mel.shape[-1] == 1:
+                    mel = mel.squeeze(-1).unsqueeze(0)
+
+            # Clamp length to actual mel length and global max
+            mel_length = min(mel_length, mel.shape[-1], self.audio_max_frames)
+
+            raw_mel_specs.append(mel)
+            mel_lengths.append(mel_length)
+
+            # Get speaker embedding if available
+            speaker_emb = ex.get("speaker_embedding", None)
+            if speaker_emb is not None:
+                # Ensure shape is [1, speaker_embedding_dim]
+                if speaker_emb.dim() == 1:
+                    speaker_emb = speaker_emb.unsqueeze(0)
+                speaker_embeddings.append(speaker_emb)
+            else:
+                # Use zeros if no speaker embedding
+                speaker_embeddings.append(torch.zeros(1, self.speaker_embedding_dim))
+
+        # Compute batch max length (dynamic padding)
+        batch_max_length = max(mel_lengths)
+
+        # Pad/truncate to batch max length and create masks
+        mel_specs = []
+        mel_spec_masks = []
+
+        for mel, mel_length in zip(raw_mel_specs, mel_lengths):
+            # Create mel spec padding mask (1 = valid, 0 = padding)
+            mel_mask = torch.zeros(batch_max_length, dtype=torch.float32)
+            mel_mask[:mel_length] = 1.0
+
+            # Truncate to batch max length (since data is pre-padded to global max)
+            mel = mel[..., :batch_max_length]
+
+            # Pad if needed (shouldn't be needed if data is pre-padded, but just in case)
+            if mel.shape[-1] < batch_max_length:
+                mel = F.pad(mel, (0, batch_max_length - mel.shape[-1]), value=0)
+
+            mel_specs.append(mel)
+            mel_spec_masks.append(mel_mask)
+
+        # Convert lengths to tensor for attention masking
+        mel_lengths_tensor = torch.tensor(mel_lengths, dtype=torch.long)
+
+        batch = {
+            "mel_spec": torch.stack(mel_specs),
+            "mel_spec_mask": torch.stack(mel_spec_masks),  # [B, T] mask for loss (1=valid, 0=padding)
+            "mel_spec_lengths": mel_lengths_tensor,  # [B] original lengths for attention masking
+            "speaker_embedding": torch.stack(speaker_embeddings),  # [B, 1, speaker_embedding_dim]
+        }
+
+        # Include speaker_ids if available in examples
+        if any("speaker_id" in ex for ex in valid_examples):
+            speaker_ids = [ex.get("speaker_id", -1) for ex in valid_examples]
+            batch["speaker_ids"] = speaker_ids  # List of ints (not tensor, for flexibility)
+
+        return batch
 
 
 class AudioDiffusionShardedDataset(Dataset):
@@ -1309,6 +1440,10 @@ def merge_audio_vae_shards(
 
     print(f"Found GPU directories: {gpu_dirs}")
 
+    # Collect unique speaker IDs from all GPU config.json files
+    all_unique_speaker_ids = set()
+    include_speaker_ids = False
+
     for gpu_dir in gpu_dirs:
         shard_dir = os.path.join(input_dir, gpu_dir)
         shards = sorted([
@@ -1319,7 +1454,30 @@ def merge_audio_vae_shards(
         all_shards.extend(shards)
         print(f"  {gpu_dir}: {len(shards)} shards")
 
+        # Load config.json to get unique speaker IDs from this GPU
+        config_path = os.path.join(shard_dir, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+                if config.get("include_speaker_id", False):
+                    include_speaker_ids = True
+                    gpu_speaker_ids = config.get("unique_speaker_ids", [])
+                    all_unique_speaker_ids.update(gpu_speaker_ids)
+                    print(f"    Unique speakers from this GPU: {len(gpu_speaker_ids)}")
+
     print(f"Total shards to merge: {len(all_shards)}")
+    if include_speaker_ids:
+        print(f"Total unique speakers across all GPUs: {len(all_unique_speaker_ids)}")
+
+    # Create mapping from original speaker_id -> sequential class label
+    # Reserve 0 for unknown/missing speaker, so labels are 1, 2, 3, ...
+    sorted_speaker_ids = sorted(all_unique_speaker_ids)
+    speaker_id_to_label = {sid: idx + 1 for idx, sid in enumerate(sorted_speaker_ids)}
+    # Add 0 for unknown (maps to itself)
+    speaker_id_to_label[0] = 0
+    speaker_id_to_label[-1] = 0  # Also map -1 to unknown
+    if include_speaker_ids:
+        print(f"Created speaker_id -> class_label mapping (0=unknown, 1-{len(sorted_speaker_ids)} for known speakers)")
 
     if shuffle:
         random.shuffle(all_shards)
@@ -1328,6 +1486,7 @@ def merge_audio_vae_shards(
     acc_mel_specs = []
     acc_mel_lengths = []
     acc_speaker_emb = []
+    acc_speaker_ids = []
 
     output_shard_idx = 0
     total_samples = 0
@@ -1337,7 +1496,7 @@ def merge_audio_vae_shards(
     shard_offsets = []
 
     def save_merged_shard():
-        nonlocal acc_mel_specs, acc_mel_lengths, acc_speaker_emb, output_shard_idx, total_samples
+        nonlocal acc_mel_specs, acc_mel_lengths, acc_speaker_emb, acc_speaker_ids, output_shard_idx, total_samples
 
         if not acc_mel_specs:
             return
@@ -1350,6 +1509,10 @@ def merge_audio_vae_shards(
             "speaker_embeddings": torch.cat(acc_speaker_emb, dim=0),
             "num_samples": num_samples_in_shard,
         }
+
+        # Include speaker_ids if available
+        if acc_speaker_ids and all(s is not None for s in acc_speaker_ids):
+            shard_data["speaker_ids"] = torch.cat(acc_speaker_ids, dim=0)
 
         shard_filename = f"shard_{output_shard_idx:06d}.pt"
         output_path = os.path.join(output_dir, shard_filename)
@@ -1364,6 +1527,7 @@ def merge_audio_vae_shards(
         acc_mel_specs = []
         acc_mel_lengths = []
         acc_speaker_emb = []
+        acc_speaker_ids = []
 
     for shard_path in tqdm(all_shards, desc="Merging audio VAE shards"):
         try:
@@ -1372,6 +1536,16 @@ def merge_audio_vae_shards(
             acc_mel_specs.append(shard["mel_specs"])
             acc_mel_lengths.append(shard["mel_lengths"])
             acc_speaker_emb.append(shard["speaker_embeddings"])
+
+            # Include speaker_ids if available in shard - convert to sequential class labels
+            if include_speaker_ids and "speaker_ids" in shard and shard["speaker_ids"] is not None:
+                original_ids = shard["speaker_ids"]
+                # Convert original speaker IDs to sequential class labels using the mapping
+                class_labels = torch.tensor(
+                    [speaker_id_to_label.get(sid.item(), 0) for sid in original_ids],
+                    dtype=torch.long
+                )
+                acc_speaker_ids.append(class_labels)
 
             current_size = sum(x.shape[0] for x in acc_mel_specs)
             if current_size >= target_shard_size:
@@ -1383,24 +1557,22 @@ def merge_audio_vae_shards(
 
     save_merged_shard()
 
-    # Save metadata
-    meta = {
-        "total_samples": total_samples,
-        "num_shards": output_shard_idx,
-        "shard_size": target_shard_size,
-        "source_dirs": gpu_dirs,
-        "dataset_type": "audio_vae",
-    }
-
-    with open(os.path.join(output_dir, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-
     # Save shard index for fast dataset loading
+    # num_speakers is len + 1 to account for class 0 (unknown)
+    num_speaker_classes = len(all_unique_speaker_ids) + 1 if include_speaker_ids else 0
     shard_index = {
         "shard_files": shard_files,
         "shard_offsets": shard_offsets,
         "total_samples": total_samples,
         "dataset_type": "audio_vae",
+        # Include speaker info for GRL training
+        "include_speaker_ids": include_speaker_ids,
+        # num_speakers = number of classes for cross_entropy (0=unknown, 1..N=known speakers)
+        "num_speakers": num_speaker_classes,
+        # Original unique speaker IDs (for reference only, not used in training)
+        "unique_speaker_ids": sorted(list(all_unique_speaker_ids)) if include_speaker_ids else [],
+        # Mapping from original speaker ID to class label (for debugging/reference)
+        "speaker_id_to_label": speaker_id_to_label if include_speaker_ids else {},
     }
 
     with open(os.path.join(output_dir, "shard_index.json"), "w") as f:
@@ -1411,6 +1583,9 @@ def merge_audio_vae_shards(
     print(f"  Output shards: {output_shard_idx}")
     print(f"  Output dir: {output_dir}")
     print(f"  Shard index saved (skips indexing on load)")
+    if include_speaker_ids:
+        print(f"  Total unique speakers: {len(all_unique_speaker_ids)}")
+        print(f"  Speaker classes for GRL: {num_speaker_classes} (0=unknown, 1-{len(all_unique_speaker_ids)}=known)")
 
 
 class ShuffledShardedDataset(Dataset):

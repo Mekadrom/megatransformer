@@ -202,9 +202,10 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
         )
         self.text_embeddings = self.t5_model(**self.text_inputs).last_hidden_state
 
+        # Use mel-spec model for consistency with preprocessing
         speaker_encoder = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            savedir="pretrained_models/spkrec-ecapa-voxceleb",
+            source="speechbrain/spkrec-ecapa-voxceleb-mel-spec",
+            savedir="pretrained_models/spkrec-ecapa-voxceleb-mel-spec",
             run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
         )
 
@@ -217,9 +218,28 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
         test_audio_waveforms = test_audio_waveforms[0]
 
         with torch.no_grad():
-            # ECAPA-TDNN expects [batch, time] waveform
-            self.speaker_embedding = speaker_encoder.encode_batch(
-                test_audio_waveforms.unsqueeze(0)
+            # Convert waveform to mel spectrogram using common extract_mels
+            from dataset_loading.audio_loading import extract_mels
+            log_mel_spec = extract_mels(
+                self.shared_window_buffer,
+                test_audio_waveforms,
+                sr=audio_sample_rate,
+                n_mels=80,
+                n_fft=1024,
+                hop_length=256,
+            )  # [n_mels, T]
+
+            # Transpose for ECAPA-TDNN: [n_mels, T] -> [1, T, n_mels]
+            mel_for_ecapa = log_mel_spec.transpose(0, 1).unsqueeze(0)
+            rel_lens = torch.ones(1)
+
+            # Call normalizer and embedding model directly (encode_batch doesn't work for mel-spec model)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            mel_for_ecapa = mel_for_ecapa.to(device)
+            rel_lens = rel_lens.to(device)
+            normalized = speaker_encoder.mods.normalizer(mel_for_ecapa, rel_lens, epoch=1)
+            self.speaker_embedding = speaker_encoder.mods.embedding_model(
+                normalized, rel_lens
             ).squeeze(0).cpu()
 
     def _load_vocoder(self):
@@ -601,6 +621,8 @@ class AudioDiffusionTrainer(Trainer):
         if hasattr(self.train_dataset, 'get_sampler'):
             self._shard_sampler = self.train_dataset.get_sampler(shuffle=True, seed=42)
 
+        self.has_logged_cli = False
+
     def _get_train_sampler(self):
         """Override to use shard-aware sampler for sharded datasets."""
         if self._shard_sampler is not None:
@@ -632,9 +654,10 @@ class AudioDiffusionTrainer(Trainer):
 
         self._ensure_tensorboard_writer()
 
-        if global_step == 0 and self.writer is not None:
+        if not self.has_logged_cli:
             self.writer.add_text("training/command_line", self.cmdline, global_step)
             self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            self.has_logged_cli = True
 
         text_embeddings = inputs["text_embeddings"]
 

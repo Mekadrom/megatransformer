@@ -267,7 +267,7 @@ def r1_gradient_penalty(
 
     # Handle multi-scale discriminators
     if isinstance(real_outputs, list):
-        real_outputs = sum(r.sum() for r in real_outputs)
+        real_outputs = sum(r.mean() for r in real_outputs)
     else:
         real_outputs = real_outputs.sum()
 
@@ -386,7 +386,7 @@ def discriminator_loss(
     for real, fake in zip(disc_real_outputs, disc_fake_outputs):
         loss += torch.mean(F.relu(1 - real))
         loss += torch.mean(F.relu(1 + fake))
-    return loss
+    return loss / (2 * len(disc_real_outputs))
 
 
 def generator_loss(disc_fake_outputs: list[torch.Tensor]) -> torch.Tensor:
@@ -397,7 +397,7 @@ def generator_loss(disc_fake_outputs: list[torch.Tensor]) -> torch.Tensor:
     loss = 0.0
     for fake in disc_fake_outputs:
         loss += -torch.mean(fake)
-    return loss
+    return loss / len(disc_fake_outputs)
 
 
 def feature_matching_loss(
@@ -511,48 +511,48 @@ def compute_generator_gan_loss(
 
 # Model configs
 
-def micro_patch() -> PatchDiscriminator:
+def micro_patch(use_spectral_norm=True) -> PatchDiscriminator:
     """Tiny PatchGAN discriminator (~50K params) for small VAEs."""
     return PatchDiscriminator(
         in_channels=3,
         base_channels=16,
         n_layers=2,
-        use_spectral_norm=True,
+        use_spectral_norm=use_spectral_norm,
     )
 
 
-def mini_patch() -> PatchDiscriminator:
+def mini_patch(use_spectral_norm=True) -> PatchDiscriminator:
     """Mini PatchGAN discriminator (~200K params)."""
     return PatchDiscriminator(
         in_channels=3,
         base_channels=32,
         n_layers=3,
-        use_spectral_norm=True,
+        use_spectral_norm=use_spectral_norm,
     )
 
 
-def mini_multi_scale() -> MultiScalePatchDiscriminator:
+def mini_multi_scale(use_spectral_norm=True) -> MultiScalePatchDiscriminator:
     """Mini multi-scale discriminator (~400K params)."""
     return MultiScalePatchDiscriminator(
         in_channels=3,
         base_channels=32,
         n_layers=3,
         n_scales=2,
-        use_spectral_norm=True,
+        use_spectral_norm=use_spectral_norm,
     )
 
 
-def tiny_patch() -> PatchDiscriminator:
+def tiny_patch(use_spectral_norm=True) -> PatchDiscriminator:
     """Small PatchGAN discriminator (~663K params)."""
     return PatchDiscriminator(
         in_channels=3,
         base_channels=64,
         n_layers=3,
-        use_spectral_norm=True,
+        use_spectral_norm=use_spectral_norm,
     )
 
 
-def tiny_multi_scale() -> MultiScalePatchDiscriminator:
+def tiny_multi_scale(use_spectral_norm=True) -> MultiScalePatchDiscriminator:
     """
     Small multi-scale discriminator (~782K params).
 
@@ -564,11 +564,11 @@ def tiny_multi_scale() -> MultiScalePatchDiscriminator:
         base_channels=40,
         n_layers=3,
         n_scales=3,
-        use_spectral_norm=True,
+        use_spectral_norm=use_spectral_norm,
     )
 
 
-def tiny_multi_scale_no_sn() -> MultiScalePatchDiscriminator:
+def tiny_multi_scale_no_sn(**kwargs) -> MultiScalePatchDiscriminator:
     """
     Small multi-scale discriminator WITHOUT spectral norm (~782K params).
 
@@ -589,35 +589,35 @@ def tiny_multi_scale_no_sn() -> MultiScalePatchDiscriminator:
     )
 
 
-def micro_multi_scale() -> MultiScalePatchDiscriminator:
+def micro_multi_scale(use_spectral_norm=True) -> MultiScalePatchDiscriminator:
     """Tiny multi-scale discriminator (~100K params) for small VAEs."""
     return MultiScalePatchDiscriminator(
         in_channels=3,
         base_channels=16,
         n_layers=2,
         n_scales=2,
-        use_spectral_norm=True,
+        use_spectral_norm=use_spectral_norm,
     )
 
 
-def small_multi_scale() -> MultiScalePatchDiscriminator:
+def small_multi_scale(use_spectral_norm=True) -> MultiScalePatchDiscriminator:
     """Multi-scale PatchGAN discriminator (~2M params)."""
     return MultiScalePatchDiscriminator(
         in_channels=3,
         base_channels=64,
         n_layers=3,
         n_scales=3,
-        use_spectral_norm=True,
+        use_spectral_norm=use_spectral_norm,
     )
 
-def medium_multi_scale() -> MultiScalePatchDiscriminator:
-    """Multi-scale PatchGAN discriminator (~7.9M params)."""
+def medium_multi_scale(use_spectral_norm=True) -> MultiScalePatchDiscriminator:
+    """Multi-scale PatchGAN discriminator (~4.5M params)."""
     return MultiScalePatchDiscriminator(
         in_channels=3,
-        base_channels=64,
-        n_layers=4,
-        n_scales=4,
-        use_spectral_norm=True,
+        base_channels=96,
+        n_layers=3,
+        n_scales=3,
+        use_spectral_norm=use_spectral_norm,
     )
 
 

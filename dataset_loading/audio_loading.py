@@ -39,21 +39,35 @@ def extract_waveforms(audio, sr=16000):
 def extract_mels(shared_window_buffer: SharedWindowBuffer, y, sr=16000, n_mels=80, n_fft=1024, hop_length=256):
     """
     Extract audio features from loaded audio data.
-    
+
     Args:
-        y: Audio data as waveform
+        shared_window_buffer: SharedWindowBuffer for STFT windows
+        y: Audio data as waveform. Supports:
+           - 1D tensor [T] - single sample
+           - 2D tensor [B, T] - batch of samples (same length)
+           - 2D tensor [1, T] - single sample with channel dim (will be squeezed)
         sr: Target sampling rate
         n_mels: Number of mel bands
         n_fft: FFT window size
         hop_length: Hop length for feature extraction
-        win_length: Window length for feature extraction
-        
+
     Returns:
         log_mel_spec: Log mel spectrogram features
+           - [n_mels, T] for single sample input
+           - [B, n_mels, T] for batched input
     """
+    # Handle input dimensions:
+    # - [T] -> [T] (single sample, 1D)
+    # - [1, T] -> [T] (single sample with channel dim, squeeze it)
+    # - [B, T] where B > 1 -> [B, T] (batch, keep as is)
+    if y.dim() == 2 and y.shape[0] == 1:
+        # Single sample with channel dim [1, T] -> [T]
+        y = y.squeeze(0)
+    # For [B, T] batches or [T] single samples, pass through as-is
+
     # Extract mel spectrogram
     mel_spec, _ = configurable_mel_spectrogram(
-        audio=y.squeeze(),
+        audio=y,
         sample_rate=sr,
         hop_length=hop_length,
         win_length=n_fft,

@@ -1081,6 +1081,8 @@ class VocoderGANTrainer(Trainer):
         self.direct_mag_loss_weight = direct_mag_loss_weight
         self.writer = None
 
+        self.has_logged_cli = False
+
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         """
         Override to use shard-aware sampler for sharded datasets.
@@ -1184,9 +1186,10 @@ class VocoderGANTrainer(Trainer):
 
         self._ensure_tensorboard_writer()
 
-        if global_step == 0 and self.writer is not None:
+        if not self.has_logged_cli:
             self.writer.add_text("training/command_line", self.cmdline, global_step)
             self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            self.has_logged_cli = True
 
         # Forward pass through generator (vocoder)
         waveform_labels = inputs["waveform_labels"]

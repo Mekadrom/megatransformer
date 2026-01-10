@@ -295,6 +295,8 @@ class RecurrentVAEGANTrainer(Trainer):
         if discriminator is not None:
             self.discriminator_scaler = torch.amp.GradScaler(enabled=False)  # Will be enabled in compute_loss
 
+        self.has_logged_cli = False
+
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """Prepares one `data` before feeding it to the model."""
         if isinstance(data, Mapping):
@@ -326,9 +328,10 @@ class RecurrentVAEGANTrainer(Trainer):
 
         self._ensure_tensorboard_writer()
 
-        if global_step == 0 and self.writer is not None:
+        if not self.has_logged_cli:
             self.writer.add_text("training/command_line", self.cmdline, global_step)
             self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            self.has_logged_cli = True
 
         image = inputs["image"]
 

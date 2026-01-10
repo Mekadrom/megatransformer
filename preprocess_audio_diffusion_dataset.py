@@ -213,9 +213,19 @@ class AudioDiffusionBatchProcessor:
 
         # Compute speaker embeddings from mel specs
         if self.speaker_encoder is not None:
-            # mel_specs is [B, n_mels, T], ECAPA-TDNN mel-spec model expects [B, n_mels, T]
-            speaker_embeddings = self.speaker_encoder.encode_batch(
-                mel_specs.to(self.device)
+            # mel_specs is [B, n_mels, T]
+            # ECAPA-TDNN mel-spec model expects [B, T, n_mels] and direct calls
+            # (encode_batch assumes compute_features exists, which mel-spec model lacks)
+            mel_for_ecapa = mel_specs.transpose(1, 2).to(self.device)  # [B, T, n_mels]
+
+            # Compute relative lengths (1.0 for max length, proportional for others)
+            max_len = mel_for_ecapa.shape[1]
+            rel_lens = torch.tensor([l / max_len for l in mel_lengths.tolist()], device=self.device)
+
+            # Call normalizer and embedding model directly
+            normalized = self.speaker_encoder.mods.normalizer(mel_for_ecapa, rel_lens, epoch=1)
+            speaker_embeddings = self.speaker_encoder.mods.embedding_model(
+                normalized, rel_lens
             ).squeeze(1).cpu()  # [B, 192]
         else:
             # Zeros if no speaker encoder

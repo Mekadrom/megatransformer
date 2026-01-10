@@ -414,7 +414,7 @@ def discriminator_loss(
         r_loss = torch.mean((1 - dr) ** 2)
         f_loss = torch.mean(df ** 2)
         loss += r_loss + f_loss
-    return loss
+    return loss / (2 * len(disc_real_outputs))
 
 
 def generator_loss(disc_fake_outputs: list[torch.Tensor]) -> torch.Tensor:
@@ -852,10 +852,14 @@ class AudioPerceptualLoss(nn.Module):
             )
 
         if speaker_embedding_weight > 0:
+            # Use mel-spec model for consistency with preprocessing
             self.speaker_embedding_loss = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb-mel-spec",
                 savedir="pretrained_models/spkrec-ecapa-voxceleb-mel-spec",
             )
+            # SharedWindowBuffer for extract_mels
+            self._speaker_shared_window_buffer = SharedWindowBuffer()
+            self._speaker_sample_rate = sample_rate
 
     def forward(
         self,
@@ -905,14 +909,39 @@ class AudioPerceptualLoss(nn.Module):
         else:
             losses["panns_loss"] = torch.tensor(0.0, device=device)
 
-        # Speaker embedding loss (requires waveforms)
-        if self.speaker_embedding_loss is not None:
-            # Extract embeddings
-            pred_emb = self.speaker_embedding_loss.encode_batch(pred_waveform)
+        # Speaker embedding loss (requires waveforms, converts to mel internally)
+        if self.speaker_embedding_loss is not None and pred_waveform is not None:
+            from dataset_loading.audio_loading import extract_mels
+
+            # Handle [B, 1, T] input
+            if pred_waveform.dim() == 3:
+                pred_waveform_2d = pred_waveform.squeeze(1)
+            else:
+                pred_waveform_2d = pred_waveform
+
+            # Convert waveform to log mel spectrogram using batched extract_mels
+            mel_spec_log = extract_mels(
+                self._speaker_shared_window_buffer,
+                pred_waveform_2d,  # [B, T]
+                sr=self._speaker_sample_rate,
+                n_mels=80,
+                n_fft=1024,
+                hop_length=256,
+            )  # [B, n_mels, T]
+
+            # Transpose for ECAPA-TDNN: [B, n_mels, T] -> [B, T, n_mels]
+            mel_for_ecapa = mel_spec_log.transpose(1, 2)  # [B, T, n_mels]
+            rel_lens = torch.ones(mel_for_ecapa.shape[0], device=device)
+
+            # Call normalizer and embedding model directly (encode_batch doesn't work for mel-spec model)
+            normalized = self.speaker_embedding_loss.mods.normalizer(mel_for_ecapa, rel_lens, epoch=1)
+            pred_emb = self.speaker_embedding_loss.mods.embedding_model(normalized, rel_lens).squeeze(1)
+
             spk_loss = F.l1_loss(pred_emb, target_speaker_embedding)
             losses["speaker_embedding_loss"] = spk_loss
             total = total + self.speaker_embedding_weight * spk_loss
-            
+        else:
+            losses["speaker_embedding_loss"] = torch.tensor(0.0, device=device)
 
         losses["total_perceptual_loss"] = total
         return losses

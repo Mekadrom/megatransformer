@@ -172,6 +172,7 @@ class ImageDiffusionVisualizationCallback(TrainerCallback):
             "A photo of a cat sitting on a couch",
             "A man riding a horse in a field",
             "A beautiful landscape with mountains and a lake",
+            "A photo of a man ironing a shirt while strapped to the back of a taxi in New York City"
         ]
         self.text_inputs = t5_tokenizer(
             self.text,
@@ -592,6 +593,8 @@ class ImageDiffusionTrainer(Trainer):
         self.grads = None
         self.last_logged_loss = None
 
+        self.has_logged_cli = False
+
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """Prepares one `data` before feeding it to the model."""
         if isinstance(data, Mapping):
@@ -617,9 +620,10 @@ class ImageDiffusionTrainer(Trainer):
 
         self._ensure_tensorboard_writer()
 
-        if global_step == 0 and self.writer is not None:
+        if not self.has_logged_cli:
             self.writer.add_text("training/command_line", self.cmdline, global_step)
             self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            self.has_logged_cli = True
 
         text_embeddings = inputs["text_embeddings"]
 

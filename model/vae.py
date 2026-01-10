@@ -54,7 +54,7 @@ class VGGPerceptualLoss(nn.Module):
             target_feat = layer(target_feat)
 
             if i in self.feature_layers:
-                loss = loss + F.mse_loss(x_feat, target_feat)
+                loss = loss + F.mse_loss(x_feat, target_feat) / len(self.feature_layers)
 
         return loss
 
@@ -105,6 +105,8 @@ class VAE(nn.Module):
         perceptual_loss_weight: float = 0.1,
         kl_divergence_loss_weight: float = 0.01,
         free_bits: float = 0.0,  # Minimum KL per channel (0 = disabled)
+        # Speaker embedding dropout for disentanglement (audio VAE)
+        speaker_embedding_dropout: float = 0.0,  # Probability of zeroing speaker embedding during training
         # Multi-resolution STFT loss parameters (for audio)
         stft_loss_weight: float = 0.0,  # 0 = disabled
         stft_fft_sizes: list = None,
@@ -122,6 +124,7 @@ class VAE(nn.Module):
         self.perceptual_loss_weight = perceptual_loss_weight
         self.kl_divergence_loss_weight = kl_divergence_loss_weight
         self.free_bits = free_bits
+        self.speaker_embedding_dropout = speaker_embedding_dropout
         self.stft_loss_weight = stft_loss_weight
 
         self.perceptual_loss_type = perceptual_loss_type
@@ -148,16 +151,51 @@ class VAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
+    def _apply_speaker_embedding_dropout(self, speaker_embedding):
+        """
+        Apply speaker embedding dropout during training to encourage disentanglement.
+
+        When dropout is applied, the decoder must reconstruct without speaker info,
+        forcing it to learn to use the speaker embedding when available (non-dropout steps).
+        This prevents the model from encoding all speaker info in the latent space.
+
+        Only applies during training (self.training=True).
+        """
+        if speaker_embedding is None:
+            return None
+
+        if self.training and self.speaker_embedding_dropout > 0:
+            # Create a mask that zeros out entire embeddings with probability speaker_embedding_dropout
+            # Shape: [B, 1] or [B, 1, 1] to broadcast across embedding dimension
+            batch_size = speaker_embedding.shape[0]
+            device = speaker_embedding.device
+
+            # Bernoulli mask: 1 = keep, 0 = drop
+            keep_mask = torch.rand(batch_size, device=device) >= self.speaker_embedding_dropout
+
+            # Expand mask to match speaker_embedding shape
+            if speaker_embedding.dim() == 2:
+                keep_mask = keep_mask.unsqueeze(1)  # [B, 1]
+            elif speaker_embedding.dim() == 3:
+                keep_mask = keep_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1]
+
+            speaker_embedding = speaker_embedding * keep_mask.float()
+
+        return speaker_embedding
+
     def encode(self, x, lengths=None) -> tuple[torch.Tensor, torch.Tensor]:
         # Pass lengths to encoder if it supports it (e.g., AudioVAEEncoder)
         if lengths is not None and hasattr(self.encoder, 'time_strides'):
             return self.encoder(x, lengths=lengths)
         return self.encoder(x)
 
-    def decode(self, z, speaker_embedding=None, lengths=None) -> torch.Tensor:
-        # Pass lengths to decoder if it supports it (e.g., AudioVAEDecoder)
+    def decode(self, z, speaker_embedding=None, lengths=None, return_film_stats=False) -> torch.Tensor:
+        # Pass lengths and film_stats to decoder if it supports it (e.g., AudioVAEDecoder)
         if lengths is not None and hasattr(self.decoder, 'time_scale_factors'):
-            return self.decoder(z, speaker_embedding=speaker_embedding, lengths=lengths)
+            return self.decoder(z, speaker_embedding=speaker_embedding, lengths=lengths, return_film_stats=return_film_stats)
+        # Check if decoder supports return_film_stats
+        if return_film_stats and hasattr(self.decoder, 'speaker_embedding_dim') and self.decoder.speaker_embedding_dim > 0:
+            return self.decoder(z, speaker_embedding=speaker_embedding, return_film_stats=return_film_stats)
         return self.decoder(z, speaker_embedding=speaker_embedding)
 
     def forward(
@@ -168,6 +206,7 @@ class VAE(nn.Module):
         image=None,
         lengths=None,
         kl_weight_multiplier: float = 1.0,
+        return_film_stats: bool = False,
     ):
         """
         Forward pass through VAE.
@@ -185,12 +224,13 @@ class VAE(nn.Module):
             kl_weight_multiplier: Multiplier for KL divergence weight (for KL annealing).
                                   Default 1.0 means use full kl_divergence_loss_weight.
                                   Set to 0.0 at start of training and anneal to 1.0.
+            return_film_stats: If True, include FiLM statistics in returned losses dict.
 
         Returns:
             recon_x: Reconstructed input
             mu: Latent mean
             logvar: Latent log variance
-            losses: Dictionary of loss components
+            losses: Dictionary of loss components (includes film_stats if return_film_stats=True)
         """
         # Support both 'x' and 'image' as input parameter names
         if x is None and image is not None:
@@ -209,7 +249,16 @@ class VAE(nn.Module):
             for stride in self.encoder.time_strides:
                 latent_lengths = (latent_lengths + stride - 1) // stride
 
-        recon_x = self.decode(z, speaker_embedding=speaker_embedding, lengths=latent_lengths)
+        # Apply speaker embedding dropout during training for disentanglement
+        speaker_embedding = self._apply_speaker_embedding_dropout(speaker_embedding)
+
+        # Decode with optional FiLM stats
+        film_stats = None
+        decode_result = self.decode(z, speaker_embedding=speaker_embedding, lengths=latent_lengths, return_film_stats=return_film_stats)
+        if return_film_stats and isinstance(decode_result, tuple):
+            recon_x, film_stats = decode_result
+        else:
+            recon_x = decode_result
 
         # Align reconstruction to input size (encoder-decoder stride may cause size mismatch)
         if recon_x.shape != x.shape:
@@ -261,13 +310,13 @@ class VAE(nn.Module):
             valid_elements = mask_expanded.sum(dim=list(range(1, mask_expanded.dim())), keepdim=False) * x.shape[1]
             if x.dim() == 4:
                 valid_elements = valid_elements * x.shape[2]  # Account for H dimension
-            mse_loss = (masked_squared_error.sum(dim=list(range(1, masked_squared_error.dim()))) / (valid_elements + 1e-8)).mean()
+            mse_loss = (masked_squared_error.sum(dim=list(range(1, masked_squared_error.dim()))) / (valid_elements + 1e-5)).mean()
 
             # Masked L1 loss
             if self.l1_loss_weight > 0:
                 abs_error = torch.abs(recon_x - x)
                 masked_abs_error = abs_error * mask_expanded
-                l1_loss = (masked_abs_error.sum(dim=list(range(1, masked_abs_error.dim()))) / (valid_elements + 1e-8)).mean()
+                l1_loss = (masked_abs_error.sum(dim=list(range(1, masked_abs_error.dim()))) / (valid_elements + 1e-5)).mean()
             else:
                 l1_loss = torch.tensor(0.0, device=x.device)
         else:
@@ -306,6 +355,10 @@ class VAE(nn.Module):
             "stft_loss": stft_loss,
             "kl_weight_multiplier": torch.tensor(kl_weight_multiplier, device=x.device),
         }
+
+        # Add FiLM statistics if requested
+        if return_film_stats and film_stats is not None:
+            losses["film_stats"] = film_stats
 
         return recon_x, mu, logvar, losses
 

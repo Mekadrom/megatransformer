@@ -373,6 +373,8 @@ class ImageVAEGANTrainer(Trainer):
         if discriminator is not None:
             self.discriminator_scaler = torch.amp.GradScaler(enabled=False)  # Will be enabled in compute_loss
 
+        self.has_logged_cli = False
+
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """
         Prepares one `data` before feeding it to the model.
@@ -393,9 +395,10 @@ class ImageVAEGANTrainer(Trainer):
 
         self._ensure_tensorboard_writer()
 
-        if global_step == 0 and self.writer is not None:
+        if not self.has_logged_cli:
             self.writer.add_text("training/command_line", self.cmdline, global_step)
             self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            self.has_logged_cli = True
 
         image = inputs["image"]
 
@@ -747,8 +750,13 @@ def main():
     r1_penalty_interval = int(unk_dict.get("r1_penalty_interval", 16))  # Apply every N steps (expensive)
     # GAN warmup: ramps GAN loss from 0 to full over N steps (0 = no warmup)
     gan_warmup_steps = int(unk_dict.get("gan_warmup_steps", 0))
+    # Discriminator update frequency: update D every N generator steps (1 = every step, 2 = every other step)
+    discriminator_update_frequency = int(unk_dict.get("discriminator_update_frequency", 1))
     # Perceptual loss delayed start (0 = from start, >0 = delay to let L1/MSE settle)
     perceptual_loss_start_step = int(unk_dict.get("perceptual_loss_start_step", 0))
+
+    # CONFLICTS WITH R1 PENALTY; ONLY ENABLE ONE OF THESE REGULARIZATION TYPES AT A TIME
+    discriminator_spectral_norm = unk_dict.get("discriminator_spectral_norm", "true").lower() == "true"
 
     # KL annealing: ramps KL weight from 0 to full over N steps (0 = disabled, no annealing)
     kl_annealing_steps = int(unk_dict.get("kl_annealing_steps", 0))
@@ -760,6 +768,11 @@ def main():
     use_ema = unk_dict.get("use_ema", "false").lower() == "true"
     ema_decay = float(unk_dict.get("ema_decay", 0.9999))
     ema_update_after_step = int(unk_dict.get("ema_update_after_step", 0))
+
+    if discriminator_spectral_norm and r1_penalty_weight > 0:
+        print("WARNING: Both discriminator spectral norm and R1 penalty are enabled. These regularization methods can conflict; consider disabling one of them.")
+    elif not discriminator_spectral_norm and r1_penalty_weight == 0.0:
+        print("WARNING: Neither discriminator spectral norm nor R1 penalty is enabled. Consider enabling one of these regularization methods to stabilize GAN training.")
 
     model = model_config_lookup[args.config](
         latent_channels=latent_channels,
@@ -793,7 +806,7 @@ def main():
         if discriminator_config == "stylegan":
             discriminator = discriminators.model_config_lookup[discriminator_config](image_size=image_size).to(device)
         else:
-            discriminator = discriminators.model_config_lookup[discriminator_config]().to(device)
+            discriminator = discriminators.model_config_lookup[discriminator_config](use_spectral_norm=discriminator_spectral_norm).to(device)
 
         discriminator_optimizer = torch.optim.AdamW(
             discriminator.parameters(),
@@ -830,6 +843,8 @@ def main():
                 print(f"  R1 penalty: weight={r1_penalty_weight}, interval={r1_penalty_interval}")
             if gan_warmup_steps > 0:
                 print(f"  GAN warmup: {gan_warmup_steps} steps (ramps loss from 0 to full)")
+            if discriminator_update_frequency > 1:
+                print(f"  Discriminator update frequency: every {discriminator_update_frequency} steps")
         if perceptual_loss_start_step > 0:
             print(f"Perceptual loss: delayed start at step {perceptual_loss_start_step}")
         if kl_annealing_steps > 0:
@@ -906,6 +921,7 @@ def main():
         discriminator_optimizer=discriminator_optimizer if use_gan else None,
         gan_loss_weight=gan_loss_weight,
         feature_matching_weight=feature_matching_weight,
+        discriminator_update_frequency=discriminator_update_frequency,
         gan_start_condition_key=gan_start_condition_key,
         gan_start_condition_value=gan_start_condition_value,
         # Discriminator regularization

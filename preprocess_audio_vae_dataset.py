@@ -22,7 +22,7 @@ import os
 import json
 import argparse
 import time
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -137,10 +137,19 @@ class AudioBatchProcessor:
 
         # Compute speaker embeddings from mel specs
         if self.speaker_encoder is not None:
-            # mel_specs is [B, 1, n_mels, T], ECAPA-TDNN mel-spec model expects [B, n_mels, T]
-            mel_for_ecapa = mel_specs.squeeze(1)  # [B, n_mels, T]
-            speaker_embeddings = self.speaker_encoder.encode_batch(
-                mel_for_ecapa.to(self.device)
+            # mel_specs is [B, 1, n_mels, T]
+            # ECAPA-TDNN mel-spec model expects [B, T, n_mels] and direct calls
+            # (encode_batch assumes compute_features exists, which mel-spec model lacks)
+            mel_for_ecapa = mel_specs.squeeze(1).transpose(1, 2).to(self.device)  # [B, T, n_mels]
+
+            # Compute relative lengths (1.0 for max length, proportional for others)
+            max_len = mel_for_ecapa.shape[1]
+            rel_lens = torch.tensor([l / max_len for l in mel_lengths.tolist()], device=self.device)
+
+            # Call normalizer and embedding model directly
+            normalized = self.speaker_encoder.mods.normalizer(mel_for_ecapa, rel_lens, epoch=1)
+            speaker_embeddings = self.speaker_encoder.mods.embedding_model(
+                normalized, rel_lens
             ).squeeze(1).cpu()  # [B, 192]
         else:
             # Zeros if no speaker encoder
@@ -197,6 +206,11 @@ def main():
     parser.add_argument("--compute_speaker_embeddings", action="store_true", default=True)
     parser.add_argument("--no_speaker_embeddings", action="store_false",
                         dest="compute_speaker_embeddings")
+    
+    parser.add_argument("--include_speaker_id", action="store_true", default=False,
+                        help="Include speaker ID from dataset if available")
+    parser.add_argument("--speaker_id_column", type=str, default="speaker_id",
+                        help="Column name for speaker ID in dataset")
 
     # Filtering
     parser.add_argument("--min_audio_energy", type=float, default=0.05,
@@ -270,14 +284,18 @@ def main():
         "skipped_error": 0,
     }
 
+    # Track unique speaker IDs across all shards for GRL training
+    unique_speaker_ids = set()
+
     # Shard accumulators
     shard_mel_specs = []
     shard_mel_lengths = []
     shard_speaker_embeddings = []
+    shard_speaker_ids = []
     shard_idx = 0
 
     def flush_shard():
-        nonlocal shard_mel_specs, shard_mel_lengths, shard_speaker_embeddings, shard_idx
+        nonlocal shard_mel_specs, shard_mel_lengths, shard_speaker_embeddings, shard_speaker_ids, shard_idx
 
         if not shard_mel_specs:
             return
@@ -286,6 +304,7 @@ def main():
             "mel_specs": torch.cat(shard_mel_specs, dim=0),
             "mel_lengths": torch.cat(shard_mel_lengths, dim=0),
             "speaker_embeddings": torch.cat(shard_speaker_embeddings, dim=0),
+            "speaker_ids": torch.cat(shard_speaker_ids, dim=0) if args.include_speaker_id else None,
             "num_samples": sum(x.shape[0] for x in shard_mel_specs),
         }
 
@@ -297,14 +316,16 @@ def main():
         shard_mel_specs = []
         shard_mel_lengths = []
         shard_speaker_embeddings = []
+        shard_speaker_ids = []
         shard_idx += 1
 
     # Batch accumulators
     batch_waveforms = []
+    batch_speaker_ids = []
     batch_indices = []
 
     def process_and_accumulate():
-        nonlocal batch_waveforms, batch_indices
+        nonlocal batch_waveforms, batch_speaker_ids, batch_indices
         nonlocal shard_mel_specs, shard_mel_lengths, shard_speaker_embeddings
 
         if not batch_waveforms:
@@ -317,6 +338,7 @@ def main():
             shard_mel_specs.append(result["mel_specs"])
             shard_mel_lengths.append(result["mel_lengths"])
             shard_speaker_embeddings.append(result["speaker_embeddings"])
+            shard_speaker_ids.append(torch.tensor(batch_speaker_ids, dtype=torch.long) if args.include_speaker_id else None)
 
             stats["saved"] += len(batch_waveforms)
 
@@ -330,6 +352,7 @@ def main():
             stats["skipped_error"] += len(batch_waveforms)
 
         batch_waveforms = []
+        batch_speaker_ids = []
         batch_indices = []
 
     # Main processing loop
@@ -351,6 +374,11 @@ def main():
             # Extract waveform
             audio = example["audio"]
             waveform = torch.tensor(audio["array"], dtype=torch.float32)
+            speaker_id = example[args.speaker_id_column] if args.include_speaker_id and args.speaker_id_column in example else -1
+
+            # Track unique speaker IDs for GRL training
+            if args.include_speaker_id and speaker_id != -1:
+                unique_speaker_ids.add(speaker_id)
 
             # Skip silent/near-silent audio
             if waveform.abs().max() < args.min_audio_energy or waveform.std() < args.min_audio_std:
@@ -370,6 +398,7 @@ def main():
 
             # Add to batch
             batch_waveforms.append(waveform)
+            batch_speaker_ids.append(speaker_id)
             batch_indices.append(idx)
 
             # Process batch when full
@@ -409,9 +438,13 @@ def main():
         "hop_length": args.hop_length,
         "max_audio_seconds": args.max_audio_seconds,
         "compute_speaker_embeddings": args.compute_speaker_embeddings,
+        "include_speaker_id": args.include_speaker_id,
         "remove_mains_hum": args.remove_mains_hum,
         "shard_size": args.shard_size,
         "stats": stats,
+        # Store unique speaker IDs as sorted list for merging across GPUs
+        # The merge script will union these sets to get total unique speakers
+        "unique_speaker_ids": sorted(list(unique_speaker_ids)) if args.include_speaker_id else [],
     }
 
     with open(os.path.join(output_dir, "config.json"), "w") as f:
@@ -427,6 +460,8 @@ def main():
     print(f"  Speed: {stats['saved']/elapsed:.1f} samples/sec")
     print(f"  Shards: {shard_idx}")
     print(f"  Output: {output_dir}")
+    if args.include_speaker_id:
+        print(f"  Unique speakers (this GPU): {len(unique_speaker_ids):,}")
 
 
 if __name__ == "__main__":
