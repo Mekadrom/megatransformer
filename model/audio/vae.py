@@ -137,6 +137,8 @@ class BottleneckAttention(nn.Module):
                 )
             self.num_heads = num_heads
 
+        print(f"BottleneckAttention: adjusted num_heads={self.num_heads}, head_dim={head_dim} for 2D RoPE")
+
         # pre-norm
         self.norm = nn.GroupNorm(max(1, channels // 4), channels)
 
@@ -288,6 +290,9 @@ class AudioVAEEncoder(nn.Module):
                 stage.append(ResidualBlock2d(out_c, out_c, kernel_size=kernel_size, activation_fn=activation_fn))
 
             self.stages.append(nn.ModuleList(stage))
+
+        print("Encoder BottleneckAttention: initializing 2D self-attention module with "
+                f"channels={intermediate_channels[-1]}, num_heads={attention_heads}")
 
         # Bottleneck attention (on smallest resolution)
         if use_attention:
@@ -448,6 +453,7 @@ class AudioVAEDecoder(nn.Module):
         attention_heads: int = 4,
         activation_fn: str = "snake",
         speaker_embedding_dim: int = 0,
+        speaker_embedding_proj_dim: int = 0,  # If > 0, project speaker embedding to this dim before FiLM
         normalize_speaker_embedding: bool = True,
         film_scale_bound: float = 0.5,
         film_shift_bound: float = 0.5,
@@ -459,12 +465,25 @@ class AudioVAEDecoder(nn.Module):
 
         self.use_attention = use_attention
         self.speaker_embedding_dim = speaker_embedding_dim
+        self.speaker_embedding_proj_dim = speaker_embedding_proj_dim
         self.normalize_speaker_embedding = normalize_speaker_embedding
         self.film_scale_bound = film_scale_bound
         self.film_shift_bound = film_shift_bound
         self.use_early_film = use_early_film
         self.zero_init_film_bias = zero_init_film_bias
         self.film_no_bias = film_no_bias
+
+        # Determine the effective speaker embedding dimension for FiLM layers
+        # If proj_dim > 0, we project down before FiLM; otherwise use full dim
+        self.film_speaker_dim = speaker_embedding_proj_dim if speaker_embedding_proj_dim > 0 else speaker_embedding_dim
+
+        # Speaker embedding projection (bottleneck to reduce params in FiLM layers)
+        self.speaker_embedding_projection = None
+        if speaker_embedding_dim > 0 and speaker_embedding_proj_dim > 0 and speaker_embedding_proj_dim != speaker_embedding_dim:
+            self.speaker_embedding_projection = nn.Sequential(
+                nn.Linear(speaker_embedding_dim, speaker_embedding_proj_dim),
+                nn.SiLU(),
+            )
 
         # Store time scale factors for reference (if needed for length computations)
         self.time_scale_factors = [s[1] for s in scale_factors]
@@ -482,6 +501,9 @@ class AudioVAEDecoder(nn.Module):
             else:
                 self.initial_act = activation_type()
 
+        print("Decoder BottleneckAttention: initializing 2D self-attention module with "
+                f"channels={intermediate_channels[0]}, num_heads={attention_heads}")
+
         # Bottleneck attention (before upsampling, at smallest resolution)
         if use_attention:
             self.attention = BottleneckAttention(
@@ -491,20 +513,22 @@ class AudioVAEDecoder(nn.Module):
 
         # Early FiLM projection (applied before attention/upsampling)
         # This allows speaker info to influence the bottleneck representation
+        # Uses film_speaker_dim (projected dim if projection enabled, else full dim)
         if speaker_embedding_dim > 0 and use_early_film:
             self.early_film_projection = nn.Sequential(
-                nn.Linear(speaker_embedding_dim, speaker_embedding_dim * 2, bias=not film_no_bias),
+                nn.Linear(self.film_speaker_dim, self.film_speaker_dim, bias=not film_no_bias),
                 nn.SiLU(),
-                nn.Linear(speaker_embedding_dim * 2, intermediate_channels[0] * 2, bias=not film_no_bias),
+                nn.Linear(self.film_speaker_dim, intermediate_channels[0] * 2, bias=not film_no_bias),
             )
 
         # Speaker embedding projections for FiLM conditioning (per-stage)
+        # Uses film_speaker_dim (projected dim if projection enabled, else full dim)
         if speaker_embedding_dim > 0:
             self.speaker_projections = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(speaker_embedding_dim, speaker_embedding_dim, bias=not film_no_bias),
+                    nn.Linear(self.film_speaker_dim, self.film_speaker_dim, bias=not film_no_bias),
                     nn.SiLU(),
-                    nn.Linear(speaker_embedding_dim, out_c * 2, bias=not film_no_bias),
+                    nn.Linear(self.film_speaker_dim, out_c * 2, bias=not film_no_bias),
                 )
                 for out_c in intermediate_channels
             ])
@@ -620,6 +644,9 @@ class AudioVAEDecoder(nn.Module):
                 speaker_embedding = speaker_embedding.squeeze(1)
             if self.normalize_speaker_embedding:
                 speaker_embedding = F.normalize(speaker_embedding, p=2, dim=-1)
+            # Apply projection bottleneck if configured
+            if self.speaker_embedding_projection is not None:
+                speaker_embedding = self.speaker_embedding_projection(speaker_embedding)
 
         # Initial projection
         x = self.initial_conv(z)
@@ -743,294 +770,39 @@ class AudioVAEDecoder(nn.Module):
 
 
 model_config_lookup = {
-    # Legacy configs (no residual blocks, no attention, silu activation)
-    # These maintain backward compatibility with existing checkpoints
-    "tiny_legacy": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
+    "medium": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
-            intermediate_channels=[32, 64],
-            kernel_sizes=[(3, 5), (3, 5)],
-            strides=[(2, 3), (2, 5)],
+            intermediate_channels=[256, 128, 64],
+            kernel_sizes=[(3, 7), (3, 7), (3, 5)],
+            strides=[(2, 4), (2, 3), (2, 1)],  # 4*3*1 = 12x time compression (1875 -> ~156)
             n_residual_blocks=0,
             use_attention=False,
-            activation_fn="silu"
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[64, 32],
-            scale_factors=[(2, 3), (2, 5)],
-            kernel_sizes=[(3, 5), (3, 5)],
-            n_residual_blocks=0,
-            use_attention=False,
-            activation_fn="silu",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    "small_legacy": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[64, 128, 256],
-            kernel_sizes=[(3, 5), (3, 5), (3, 3)],
-            strides=[(2, 5), (2, 5), (2, 1)],
-            n_residual_blocks=0,
-            use_attention=False,
-            activation_fn="silu"
+            activation_fn="snake",
         ),
         decoder=AudioVAEDecoder(
             latent_channels=latent_channels,
             out_channels=1,
             intermediate_channels=[256, 128, 64],
-            scale_factors=[(2, 1), (2, 5), (2, 5)],
-            kernel_sizes=[(3, 3), (3, 5), (3, 5)],
+            scale_factors=[(2, 1), (2, 3), (2, 4)],  # 1*3*4 = 12x time upsampling
+            kernel_sizes=[(3, 5), (3, 7), (3, 9)],  # increased last kernel for stride-4 upsample
             n_residual_blocks=0,
             use_attention=False,
-            activation_fn="silu",
+            activation_fn="snake",
             speaker_embedding_dim=speaker_embedding_dim,
+            speaker_embedding_proj_dim=speaker_embedding_proj_dim,
             normalize_speaker_embedding=normalize_speaker_embedding,
             film_scale_bound=film_scale_bound,
             film_shift_bound=film_shift_bound,
+            zero_init_film_bias=zero_init_film_bias,
+            film_no_bias=film_no_bias,
         ),
         **kwargs
     ),
-
-    # Improved configs with residual blocks, attention, and snake activation
-    "tiny": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[32, 64],
-            kernel_sizes=[(3, 7), (3, 7)],
-            strides=[(2, 3), (2, 5)],
-            n_residual_blocks=1,
-            use_attention=False,  # Too small for attention to help much
-            activation_fn="snake"
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[64, 32],
-            scale_factors=[(2, 3), (2, 5)],
-            kernel_sizes=[(3, 7), (3, 7)],
-            n_residual_blocks=1,
-            use_attention=False,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    "mini": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[64, 128],
-            kernel_sizes=[(3, 7), (3, 7)],
-            strides=[(2, 3), (2, 5)],
-            n_residual_blocks=2,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake"
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[128, 64],
-            scale_factors=[(2, 3), (2, 5)],
-            kernel_sizes=[(3, 7), (3, 7)],
-            n_residual_blocks=2,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    "mini_deep": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[32, 64, 128],
-            kernel_sizes=[(3, 7), (3, 7), (3, 5)],
-            strides=[(2, 3), (2, 5), (2, 5)],
-            n_residual_blocks=2,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake"
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[128, 64, 32],
-            scale_factors=[(2, 3), (2, 5), (2, 5)],
-            kernel_sizes=[(3, 5), (3, 7), (3, 7)],
-            n_residual_blocks=2,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    # Minimal config with ALL improvements (~2.6M params)
-    # The smallest usable config that includes:
-    # - Snake activation (audio-specific periodicity)
-    # - 1 residual block per stage (gradient flow)
-    # - Bottleneck attention (long-range dependencies)
-    # Uses small channel sizes (32, 64, 128) across 3 stages
-    "mini_full": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[32, 64, 128],
-            kernel_sizes=[(3, 7), (3, 7), (3, 5)],
-            strides=[(2, 3), (2, 5), (2, 5)],
-            n_residual_blocks=1,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[128, 64, 32],
-            scale_factors=[(2, 3), (2, 5), (2, 5)],
-            kernel_sizes=[(3, 5), (3, 7), (3, 7)],
-            n_residual_blocks=1,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    "mini_full_speaker_encoder": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[32, 64, 128],
-            kernel_sizes=[(3, 7), (3, 7), (3, 5)],
-            strides=[(2, 3), (2, 5), (2, 5)],
-            n_residual_blocks=1,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[128, 64, 32],
-            scale_factors=[(2, 3), (2, 5), (2, 5)],
-            kernel_sizes=[(3, 5), (3, 7), (3, 7)],
-            n_residual_blocks=1,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    # Lightweight improved config (~1.3M params)
-    # Same compression as "small" but minimal overhead:
-    # - No residual blocks (just snake activation for audio-specific improvement)
-    # - No attention
-    # - Larger kernels for better receptive field
-    # Closest to small_legacy param count with snake activation benefit
-    "small_lite_speaker_encoder": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[32, 64, 128],
-            kernel_sizes=[(3, 7), (3, 7), (3, 5)],
-            strides=[(2, 5), (2, 5), (2, 1)],  # 8x height, 25x time
-            n_residual_blocks=0,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[128, 64, 32],
-            scale_factors=[(2, 1), (2, 5), (2, 5)],
-            kernel_sizes=[(3, 5), (3, 7), (3, 7)],
-            n_residual_blocks=0,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    # medium scale (~4M params)
-    # Same structure as small_lite but with:
-    # - Increased channel sizes (64, 128, 256)
-    # - Increased attention heads (6)
-    "medium_lite_speaker_encoder": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[64, 128, 256],
-            kernel_sizes=[(3, 7), (3, 7), (3, 5)],
-            strides=[(2, 5), (2, 5), (2, 1)],  # 8x height, 25x time
-            n_residual_blocks=0,
-            use_attention=True,
-            attention_heads=6,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[256, 128, 64],
-            scale_factors=[(2, 1), (2, 5), (2, 5)],
-            kernel_sizes=[(3, 5), (3, 7), (3, 7)],
-            n_residual_blocks=0,
-            use_attention=True,
-            attention_heads=6,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    "medium_more_time": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, **kwargs: VAE(
+    # Creates a ~13M parameter VAE with ~4M encoder and ~9M decoder - includes snake activations, bottleneck attention, and FiLM speaker embedding conditioning (if speaker_embedding_dim > 0)
+    # but no residual blocks
+    "large": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
@@ -1053,176 +825,12 @@ model_config_lookup = {
             attention_heads=6,
             activation_fn="snake",
             speaker_embedding_dim=speaker_embedding_dim,
+            speaker_embedding_proj_dim=speaker_embedding_proj_dim,
             normalize_speaker_embedding=normalize_speaker_embedding,
             film_scale_bound=film_scale_bound,
             film_shift_bound=film_shift_bound,
             zero_init_film_bias=zero_init_film_bias,
             film_no_bias=film_no_bias,
-        ),
-        **kwargs
-    ),
-    # Minimal attention config (~2.5M params)
-    # Same structure as small_legacy but with:
-    # - Snake activation for audio periodicity
-    # - Bottleneck attention for long-range temporal dependencies
-    # - No residual blocks (minimal overhead)
-    # Best choice for attention benefits with small param budget
-    "small_attn": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[64, 128, 256],
-            kernel_sizes=[(3, 5), (3, 5), (3, 3)],
-            strides=[(2, 5), (2, 5), (2, 1)],  # 8x height, 25x time
-            n_residual_blocks=0,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake"
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[256, 128, 64],
-            scale_factors=[(2, 1), (2, 5), (2, 5)],
-            kernel_sizes=[(3, 3), (3, 5), (3, 5)],
-            n_residual_blocks=0,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    # Moderate improved config (~4-5M params)
-    # Adds 1 residual block per stage for better gradient flow
-    # Good middle ground between small_lite and small
-    "small_res": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[64, 128, 256],
-            kernel_sizes=[(3, 5), (3, 5), (3, 3)],  # Smaller kernels in res blocks
-            strides=[(2, 5), (2, 5), (2, 1)],  # 8x height, 25x time
-            n_residual_blocks=1,
-            use_attention=False,
-            activation_fn="snake"
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[256, 128, 64],
-            scale_factors=[(2, 1), (2, 5), (2, 5)],
-            kernel_sizes=[(3, 3), (3, 5), (3, 5)],
-            n_residual_blocks=1,
-            use_attention=False,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    # ~12.5x compression config (balanced quality/efficiency)
-    # For [1, 80, 1875] mel spec with 16 latent channels:
-    #   Height: 80 / 8 = 10, Time: 1875 / 25 = 75 (exact!)
-    #   Latent: [16, 10, 75] = 12,000 elements
-    #   Compression: 150,000 / 12,000 = 12.5x
-    # Each latent frame represents ~0.4 seconds (good balance)
-    "small": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[64, 128, 256],
-            kernel_sizes=[(3, 9), (3, 9), (3, 5)],
-            strides=[(2, 5), (2, 5), (2, 1)],  # 8x height, 25x time
-            n_residual_blocks=2,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake"
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[256, 128, 64],
-            scale_factors=[(2, 1), (2, 5), (2, 5)],  # reverse order
-            kernel_sizes=[(3, 5), (3, 9), (3, 9)],
-            n_residual_blocks=2,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    # High compression config (~37x) - use when diffusion efficiency matters more
-    # For [1, 80, 1875] mel spec with 16 latent channels:
-    #   Height: 80 / 8 = 10, Time: 1875 / 75 = 25 (exact!)
-    #   Latent: [16, 10, 25] = 4,000 elements
-    #   Compression: 150,000 / 4,000 = 37.5x
-    # Each latent frame represents ~1.2 seconds (coarse temporal resolution)
-    "small_compressed": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[64, 128, 256],
-            kernel_sizes=[(3, 9), (3, 9), (3, 5)],
-            strides=[(2, 3), (2, 5), (2, 5)],  # 8x height, 75x time
-            n_residual_blocks=2,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake"
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[256, 128, 64],
-            scale_factors=[(2, 5), (2, 5), (2, 3)],
-            kernel_sizes=[(3, 5), (3, 9), (3, 9)],
-            n_residual_blocks=2,
-            use_attention=True,
-            attention_heads=4,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
-        ),
-        **kwargs
-    ),
-    # Higher capacity version for better reconstruction at high compression
-    "small_wide": lambda latent_channels, speaker_embedding_dim=0, normalize_speaker_embedding=True, film_scale_bound=0.5, film_shift_bound=0.5, **kwargs: VAE(
-        encoder=AudioVAEEncoder(
-            in_channels=1,
-            latent_channels=latent_channels,
-            intermediate_channels=[128, 256, 512],
-            kernel_sizes=[(3, 9), (3, 9), (3, 5)],
-            strides=[(2, 3), (2, 5), (2, 5)],  # 8x height, 75x time
-            n_residual_blocks=2,
-            use_attention=True,
-            attention_heads=8,
-            activation_fn="snake"
-        ),
-        decoder=AudioVAEDecoder(
-            latent_channels=latent_channels,
-            out_channels=1,
-            intermediate_channels=[512, 256, 128],
-            scale_factors=[(2, 3), (2, 5), (2, 5)],
-            kernel_sizes=[(3, 5), (3, 9), (3, 9)],
-            n_residual_blocks=2,
-            use_attention=True,
-            attention_heads=8,
-            activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            normalize_speaker_embedding=normalize_speaker_embedding,
-            film_scale_bound=film_scale_bound,
-            film_shift_bound=film_shift_bound,
         ),
         **kwargs
     ),

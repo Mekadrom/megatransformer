@@ -201,6 +201,7 @@ class AudioVAEReconstructionCallback(TrainerCallback):
         vocoder_checkpoint_path: Optional[str] = None,
         vocoder_config: str = "experimental",
         num_eval_samples: int = 8,
+        speaker_encoder_type: str = "ecapa_tdnn",
     ):
         self.shared_window_buffer = shared_window_buffer
 
@@ -213,6 +214,7 @@ class AudioVAEReconstructionCallback(TrainerCallback):
         self.audio_hop_length = audio_hop_length
         self.audio_max_frames = audio_max_frames
         self.num_eval_samples = num_eval_samples
+        self.speaker_encoder_type = speaker_encoder_type
 
         # Vocoder settings
         self.vocoder_checkpoint_path = vocoder_checkpoint_path
@@ -220,9 +222,6 @@ class AudioVAEReconstructionCallback(TrainerCallback):
         self.vocoder = None
         self._vocoder_load_attempted = False
 
-        # Speaker encoder for extracting embeddings from example audio
-        self.speaker_encoder = None
-        self._speaker_encoder_load_attempted = False
         self.example_speaker_embeddings = []  # Store speaker embeddings for example audio
 
         # Load example audio files and compute mel specs
@@ -230,10 +229,13 @@ class AudioVAEReconstructionCallback(TrainerCallback):
             "inference/examples/test_alm_1.mp3",
             "inference/examples/test_alm_2.mp3",
         ]
-        # Pre-extracted speaker embedding paths (preferred over extracting on-the-fly)
+        # Pre-extracted speaker embedding paths - suffix based on encoder type
+        # ecapa_tdnn (default): test_alm_speaker_embedding_1.pt
+        # wavlm: test_alm_speaker_embedding_1_wavlm.pt
+        emb_suffix = "" if speaker_encoder_type == "ecapa_tdnn" else f"_{speaker_encoder_type}"
         self.example_speaker_embedding_paths = [
-            "inference/examples/test_alm_speaker_embedding_1.pt",
-            "inference/examples/test_alm_speaker_embedding_2.pt",
+            f"inference/examples/test_alm_speaker_embedding_1{emb_suffix}.pt",
+            f"inference/examples/test_alm_speaker_embedding_2{emb_suffix}.pt",
         ]
         self.example_mels = []
         self.example_original_lengths = []  # Store original mel lengths before padding
@@ -315,83 +317,28 @@ class AudioVAEReconstructionCallback(TrainerCallback):
             print(f"Failed to load vocoder: {e}")
             self.vocoder = None
 
-    def _load_speaker_encoder(self, device: torch.device):
-        """Lazily load speaker embeddings from pre-extracted files, or extract from mels."""
-        if self._speaker_encoder_load_attempted:
-            return
-        self._speaker_encoder_load_attempted = True
-
+    def _load_speaker_embeddings(self, device: torch.device):
+        """Load speaker embeddings from pre-extracted .pt files (no runtime extraction)."""
         if len(self.example_mels) == 0:
             return
 
-        # First, try to load pre-extracted speaker embeddings
-        all_loaded = True
+        # Load pre-extracted speaker embeddings - these MUST exist
         for i, emb_path in enumerate(self.example_speaker_embedding_paths):
             if os.path.exists(emb_path):
                 try:
                     speaker_emb = torch.load(emb_path, weights_only=True)
                     self.example_speaker_embeddings.append(speaker_emb)
-                    print(f"Loaded pre-extracted speaker embedding from {emb_path}: shape {speaker_emb.shape}, L2 norm {speaker_emb.norm():.4f}")
+                    print(f"Loaded speaker embedding from {emb_path}: shape {speaker_emb.shape}, L2 norm {speaker_emb.norm():.4f}")
                 except Exception as e:
-                    print(f"Failed to load speaker embedding from {emb_path}: {e}")
-                    all_loaded = False
-                    break
+                    raise RuntimeError(f"Failed to load speaker embedding from {emb_path}: {e}")
             else:
-                print(f"Pre-extracted speaker embedding not found: {emb_path}")
-                all_loaded = False
-                break
+                raise FileNotFoundError(
+                    f"Pre-extracted speaker embedding not found: {emb_path}\n"
+                    f"Please extract it using: python scripts/extract_speaker_embedding.py "
+                    f"--audio_path <audio_file> --output_path {emb_path}"
+                )
 
-        if all_loaded and len(self.example_speaker_embeddings) == len(self.example_mels):
-            print(f"Loaded {len(self.example_speaker_embeddings)} pre-extracted speaker embeddings")
-            return
-
-        # Fall back to extracting embeddings using ECAPA-TDNN
-        self.example_speaker_embeddings = []  # Reset in case partial load
-        try:
-            from speechbrain.inference.speaker import EncoderClassifier
-
-            print("Loading ECAPA-TDNN speaker encoder for example audio...")
-            self.speaker_encoder = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb-mel-spec",
-                savedir="pretrained_models/spkrec-ecapa-voxceleb-mel-spec",
-                run_opts={"device": str(device)},
-            )
-
-            # Extract speaker embeddings from example mels
-            print("Extracting speaker embeddings from example audio...")
-            with torch.no_grad():
-                for i, mel in enumerate(self.example_mels):
-                    original_length = self.example_original_lengths[i]
-
-                    # Prepare mel for ECAPA-TDNN: [1, n_mels, T] -> [1, T, n_mels]
-                    mel_for_ecapa = mel.squeeze(0).transpose(0, 1).unsqueeze(0).to(device)  # [1, T, n_mels]
-
-                    # Compute relative length
-                    max_len = mel_for_ecapa.shape[1]
-                    rel_lens = torch.tensor([original_length / max_len], device=device)
-
-                    # Call normalizer and embedding model directly
-                    normalized = self.speaker_encoder.mods.normalizer(mel_for_ecapa, rel_lens, epoch=1)
-                    speaker_emb = self.speaker_encoder.mods.embedding_model(
-                        normalized, rel_lens
-                    ).squeeze(1).cpu()  # [1, 192] -> [192]
-
-                    self.example_speaker_embeddings.append(speaker_emb.squeeze(0))
-                    print(f"  Example {i}: speaker embedding shape {speaker_emb.shape}, L2 norm {speaker_emb.norm():.4f}")
-
-            print(f"Extracted {len(self.example_speaker_embeddings)} speaker embeddings")
-
-        except ImportError:
-            print("Warning: speechbrain not available. Speaker embeddings will be zeros.")
-            # Create zero embeddings as fallback
-            for _ in self.example_mels:
-                self.example_speaker_embeddings.append(torch.zeros(192))
-        except Exception as e:
-            print(f"Failed to load speaker encoder or extract embeddings: {e}")
-            # Create zero embeddings as fallback
-            self.example_speaker_embeddings = []
-            for _ in self.example_mels:
-                self.example_speaker_embeddings.append(torch.zeros(192))
+        print(f"Loaded {len(self.example_speaker_embeddings)} pre-extracted speaker embeddings")
 
     def _log_vocoder_audio(self, writer: SummaryWriter, mel_spec: torch.Tensor, global_step: int, tag: str):
         """Convert mel spectrogram to audio using vocoder and log to TensorBoard."""
@@ -795,8 +742,8 @@ class AudioVAEReconstructionCallback(TrainerCallback):
             else:
                 device = torch.device("cpu")
 
-            # Lazily load speaker encoder and extract embeddings
-            self._load_speaker_encoder(device)
+            # Load pre-extracted speaker embeddings
+            self._load_speaker_embeddings(device)
 
             with torch.no_grad():
                 dtype = torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32
@@ -1265,12 +1212,8 @@ class AudioVAEGANTrainer(Trainer):
         # FiLM contrastive loss - encourages different speaker embeddings to produce different FiLM outputs
         film_contrastive_loss_weight: float = 0.0,  # Weight for FiLM contrastive loss (0 = disabled)
         film_contrastive_loss_start_step: int = 0,  # Step to start FiLM contrastive loss
-        # start with low, easy to reach margin
-        film_contrastive_margin_start_value: float = 0.01,
-        # don't ever increase margin
-        film_contrastive_margin_step_step: float = 0,
-        # how much to increase margin (multiplicative). this happens once, at film_contrastive_margin_step_step steps into training
-        film_contrastive_margin_step_multiplier: float = 10.0,
+        film_contrastive_margin_max: float = 0.1,  # Max margin value for hinge loss
+        film_contrastive_margin_rampup_steps: int = 5000,  # Steps to ramp margin from 0 to max
         # Mu-only reconstruction loss (for diffusion compatibility)
         mu_only_recon_weight: float = 0.0,  # Weight for mu-only reconstruction loss (0 = disabled)
         **kwargs
@@ -1343,11 +1286,8 @@ class AudioVAEGANTrainer(Trainer):
         # FiLM contrastive loss settings
         self.film_contrastive_loss_weight = film_contrastive_loss_weight
         self.film_contrastive_loss_start_step = film_contrastive_loss_start_step
-
-        self.film_contrastive_margin = film_contrastive_margin_start_value
-        self.film_contrastive_margin_step_step = film_contrastive_margin_step_step
-        self.film_contrastive_margin_step_multiplier = film_contrastive_margin_step_multiplier
-        self.film_contrastive_margin_stepped = False  # Track if margin has been stepped up
+        self.film_contrastive_margin_max = film_contrastive_margin_max
+        self.film_contrastive_margin_rampup_steps = film_contrastive_margin_rampup_steps
 
         # Mu-only reconstruction loss (for diffusion compatibility)
         self.mu_only_recon_weight = mu_only_recon_weight
@@ -1680,13 +1620,10 @@ class AudioVAEGANTrainer(Trainer):
             and speaker_embedding.shape[0] > 1  # Need at least 2 samples for shuffling
         )
         if film_contrastive_enabled:
-            # Step up margin if needed
-            if (
-                not self.film_contrastive_margin_stepped
-                and global_step >= self.film_contrastive_margin_step_step
-            ):
-                self.film_contrastive_margin *= self.film_contrastive_margin_step_multiplier
-                self.film_contrastive_margin_stepped = True
+            # Compute margin alpha (ramps from 0 to film_contrastive_margin_max over rampup_steps)
+            steps_since_start = global_step - self.film_contrastive_loss_start_step
+            film_contrastive_margin_alpha = min(1.0, steps_since_start / max(1, self.film_contrastive_margin_rampup_steps))
+            margin = self.film_contrastive_margin_max * film_contrastive_margin_alpha
 
             # Shuffle speaker embeddings to create mismatched (audio, wrong_speaker) pairs
             batch_size = speaker_embedding.shape[0]
@@ -1723,7 +1660,6 @@ class AudioVAEGANTrainer(Trainer):
 
             # Hinge loss: want output_diff > margin for different speakers
             # Weighted by embedding difference so same/similar speakers aren't penalized
-            margin = self.film_contrastive_margin  # Reasonable margin for mel spectrograms in normalized scale
             per_sample_loss = emb_diff_weight * F.relu(margin - output_diff_per_sample)
             film_contrastive_loss = per_sample_loss.mean()
 
@@ -1737,6 +1673,7 @@ class AudioVAEGANTrainer(Trainer):
                 self._log_scalar(f"{prefix}film_contrastive/emb_similarity_mean", emb_similarity.mean(), global_step)
                 self._log_scalar(f"{prefix}film_contrastive/emb_diff_weight_mean", emb_diff_weight.mean(), global_step)
                 self._log_scalar(f"{prefix}film_contrastive/margin", margin, global_step)
+                self._log_scalar(f"{prefix}film_contrastive/margin_alpha", film_contrastive_margin_alpha, global_step)
                 self._log_scalar(f"{prefix}film_contrastive/weighted_loss",
                                self.film_contrastive_loss_weight * film_contrastive_loss, global_step)
 
@@ -2025,8 +1962,8 @@ def main():
 
     # Dataset settings
     use_sharded_dataset = unk_dict.get("use_sharded_dataset", "true").lower() == "true"
-    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/audio_vae_speaker_train")
-    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/audio_vae_speaker_val")
+    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/audio_vae_wavlm_train")
+    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/audio_vae_wavlm_val")
 
     # Audio settings (CLI args override unk_dict defaults)
     audio_max_frames = int(unk_dict.get("audio_max_frames", 1875))
@@ -2037,7 +1974,13 @@ def main():
 
     # VAE settings
     latent_channels = int(unk_dict.get("latent_channels", 4))
-    speaker_embedding_dim = int(unk_dict.get("speaker_embedding_dim", 192))  # ECAPA-TDNN dim
+    # Speaker encoder type determines embedding dimension
+    speaker_encoder_type = unk_dict.get("speaker_encoder_type", "ecapa_tdnn")
+    speaker_embedding_dim_default = 768 if speaker_encoder_type == "wavlm" else 192
+    speaker_embedding_dim = int(unk_dict.get("speaker_embedding_dim", speaker_embedding_dim_default))
+    # Optional projection to reduce speaker embedding dim before FiLM (0 = no projection)
+    # Useful for reducing params when using large embeddings like WavLM (768-dim)
+    speaker_embedding_proj_dim = int(unk_dict.get("speaker_embedding_proj_dim", 0))
     normalize_speaker_embedding = unk_dict.get("normalize_speaker_embedding", "true").lower() == "true"
     # FiLM bounding - prevents extreme scale/shift values that can cause artifacts
     # Scale bound of 0.5 means (1 + scale) ranges from 0.5 to 1.5 (never zeroes out)
@@ -2048,16 +1991,13 @@ def main():
     zero_init_film_bias = unk_dict.get("zero_init_film_bias", "false").lower() == "true"
     # Remove bias from FiLM projections entirely - zero embedding = zero modulation (structurally enforced)
     film_no_bias = unk_dict.get("film_no_bias", "false").lower() == "true"
+
     # FiLM contrastive loss - encourages different speaker embeddings to produce different FiLM outputs
     film_contrastive_loss_weight = float(unk_dict.get("film_contrastive_loss_weight", 0.0))
     film_contrastive_loss_start_step = int(unk_dict.get("film_contrastive_loss_start_step", 0))
-
-    # Initial margin for FiLM contrastive loss
-    film_contrastive_margin_start_value = float(unk_dict.get("film_contrastive_margin_start_value", 0.01))
-    # what step to increase the margin target for film contrastive loss. 0 disables stepping, keeping the original starting margin
-    film_contrastive_margin_step_step = int(unk_dict.get("film_contrastive_margin_step_step", 0))
-    # after film_contrastive_margin_step_step steps, increase the margin by film_contrastive_margin_step_multiplier times
-    film_contrastive_margin_step_multiplier = float(unk_dict.get("film_contrastive_margin_step_multiplier", 10))
+    # FiLM contrastive margin scheduling (ramps from 0 to max, similar to GRL alpha)
+    film_contrastive_margin_max = float(unk_dict.get("film_contrastive_margin_max", 0.1))
+    film_contrastive_margin_rampup_steps = int(unk_dict.get("film_contrastive_margin_rampup_steps", 5000))
 
     # VAE loss weights
     recon_loss_weight = float(unk_dict.get("recon_loss_weight", 1.0))
@@ -2109,6 +2049,11 @@ def main():
     # Encourages disentanglement by forcing decoder to learn to use embedding when available
     speaker_embedding_dropout = float(unk_dict.get("speaker_embedding_dropout", 0.0))
 
+    # Instance normalization on latents for speaker disentanglement
+    # Removes per-instance statistics (mean/variance) which often encode speaker characteristics
+    # Speaker info is then re-injected via FiLM conditioning only
+    instance_norm_latents = unk_dict.get("instance_norm_latents", "false").lower() == "true"
+
     # GRL (Gradient Reversal Layer) speaker disentanglement settings
     # Trains a speaker classifier on latents with reversed gradients, encouraging encoder
     # to produce latents that are speaker-agnostic
@@ -2132,6 +2077,7 @@ def main():
     model = model_config_lookup[args.config](
         latent_channels=latent_channels,
         speaker_embedding_dim=speaker_embedding_dim,
+        speaker_embedding_proj_dim=speaker_embedding_proj_dim,
         normalize_speaker_embedding=normalize_speaker_embedding,
         film_scale_bound=film_scale_bound,
         film_shift_bound=film_shift_bound,
@@ -2143,6 +2089,7 @@ def main():
         kl_divergence_loss_weight=kl_divergence_loss_weight,
         free_bits=free_bits,
         speaker_embedding_dropout=speaker_embedding_dropout,
+        instance_norm_latents=instance_norm_latents,
     )
 
     # Try to load existing checkpoint
@@ -2234,7 +2181,9 @@ def main():
         print(f"  Hop length: {audio_hop_length}")
         print(f"  Max frames: {audio_max_frames}")
         print(f"  Latent channels: {latent_channels}")
+        print(f"  Speaker encoder type: {speaker_encoder_type}")
         print(f"  Speaker embedding dim: {speaker_embedding_dim}")
+        print(f"  Speaker embedding proj dim: {speaker_embedding_proj_dim} (0=no projection)")
         print(f"  Normalize speaker embedding: {normalize_speaker_embedding}")
         print(f"  FiLM scale bound: {film_scale_bound} (0=unbounded)")
         print(f"  FiLM shift bound: {film_shift_bound} (0=unbounded)")
@@ -2276,6 +2225,8 @@ def main():
             print(f"Free bits: {free_bits} nats per channel (prevents posterior collapse)")
         if speaker_embedding_dropout > 0:
             print(f"Speaker embedding dropout: {speaker_embedding_dropout} (encourages disentanglement)")
+        if instance_norm_latents:
+            print(f"Instance norm on latents: enabled (removes speaker statistics from z)")
         if mu_only_recon_weight > 0:
             print(f"Mu-only reconstruction loss: weight={mu_only_recon_weight} (trains decoder for diffusion compatibility)")
 
@@ -2447,9 +2398,8 @@ def main():
         # FiLM contrastive loss
         film_contrastive_loss_weight=film_contrastive_loss_weight,
         film_contrastive_loss_start_step=film_contrastive_loss_start_step,
-        film_contrastive_margin_start_value=film_contrastive_margin_start_value,
-        film_contrastive_margin_step_step=film_contrastive_margin_step_step,
-        film_contrastive_margin_step_multiplier=film_contrastive_margin_step_multiplier,
+        film_contrastive_margin_max=film_contrastive_margin_max,
+        film_contrastive_margin_rampup_steps=film_contrastive_margin_rampup_steps,
         # Mu-only reconstruction loss (for diffusion compatibility)
         mu_only_recon_weight=mu_only_recon_weight,
     )
@@ -2466,6 +2416,7 @@ def main():
         audio_max_frames=audio_max_frames,
         vocoder_checkpoint_path=vocoder_checkpoint_path,
         vocoder_config=vocoder_config,
+        speaker_encoder_type=speaker_encoder_type,
     )
     trainer.add_callback(visualization_callback)
 

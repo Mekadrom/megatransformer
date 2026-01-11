@@ -7,7 +7,7 @@ Produces sharded datasets containing:
 - text_attention_mask: Attention mask for text [T_text]
 - mel_spec: Mel spectrogram [n_mels, T] (optional, for reference)
 - mel_spec_length: Original length before padding
-- speaker_embedding: ECAPA-TDNN speaker embeddings [192]
+- speaker_embedding: Speaker embeddings [embedding_dim]
 - latent_mu: VAE-encoded latent [C, H, T'] (if VAE checkpoint provided)
 
 Designed for multi-GPU parallel preprocessing:
@@ -33,22 +33,12 @@ from transformers import T5Tokenizer, T5EncoderModel
 
 from dataset_loading.audio_loading import extract_mels, remove_mains_hum
 from utils.audio_utils import SharedWindowBuffer
-
-
-def load_speaker_encoder(device: str = "cuda"):
-    """Load ECAPA-TDNN mel-spec speaker encoder from SpeechBrain."""
-    try:
-        from speechbrain.inference.speaker import EncoderClassifier
-
-        encoder = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb-mel-spec",
-            savedir="pretrained_models/spkrec-ecapa-voxceleb-mel-spec",
-            run_opts={"device": device},
-        )
-        return encoder
-    except ImportError:
-        print("Warning: speechbrain not available. Speaker embeddings will be zeros.")
-        return None
+from utils.speaker_encoder import (
+    get_speaker_encoder,
+    get_speaker_embedding_dim,
+    get_speaker_encoder_input_type,
+    SpeakerEncoderType,
+)
 
 
 def load_audio_vae(checkpoint_path: str, vae_config: str, latent_channels: int, device: str = "cuda"):
@@ -113,6 +103,7 @@ class AudioDiffusionBatchProcessor:
         max_text_length: int = 512,
         text_model_name: str = "t5-small",
         compute_speaker_embeddings: bool = True,
+        speaker_encoder_type: SpeakerEncoderType = "ecapa_tdnn",
         vae_checkpoint: Optional[str] = None,
         vae_config: str = "mini",
         latent_channels: int = 16,
@@ -125,6 +116,7 @@ class AudioDiffusionBatchProcessor:
         self.audio_max_frames = audio_max_frames
         self.max_text_length = max_text_length
         self.device = device
+        self.speaker_encoder_type = speaker_encoder_type
 
         self.shared_window_buffer = SharedWindowBuffer()
 
@@ -135,13 +127,17 @@ class AudioDiffusionBatchProcessor:
         self.text_model.eval().to(device)
         self.context_dim = self.text_model.config.d_model
 
-        # Speaker encoder
+        # Speaker encoder (uses centralized cached singleton)
         self.speaker_encoder = None
+        self.speaker_embedding_dim = get_speaker_embedding_dim(speaker_encoder_type)
+        self.speaker_encoder_input_type = get_speaker_encoder_input_type(speaker_encoder_type)
         if compute_speaker_embeddings:
-            print("Loading ECAPA-TDNN speaker encoder...")
-            self.speaker_encoder = load_speaker_encoder(device)
-            if self.speaker_encoder is not None:
-                print("  Speaker encoder loaded successfully")
+            print(f"Loading {speaker_encoder_type} speaker encoder (cached singleton)...")
+            self.speaker_encoder = get_speaker_encoder(
+                encoder_type=speaker_encoder_type,
+                device=device,
+            )
+            print(f"  Speaker encoder loaded (embedding_dim={self.speaker_embedding_dim}, input={self.speaker_encoder_input_type})")
 
         # VAE for latent encoding
         self.vae = None
@@ -171,8 +167,12 @@ class AudioDiffusionBatchProcessor:
         # Process mel spectrograms
         mel_specs = []
         mel_lengths = []
+        waveform_lengths = []  # Track original waveform lengths for WavLM
 
         for waveform in waveforms:
+            # Store original waveform length (for WavLM speaker encoder)
+            waveform_lengths.append(len(waveform))
+
             # Extract mel spectrogram
             mel = extract_mels(
                 self.shared_window_buffer,
@@ -211,25 +211,35 @@ class AudioDiffusionBatchProcessor:
         text_embeddings = self.text_model(**text_inputs).last_hidden_state.cpu()  # [B, T_text, context_dim]
         text_attention_masks = text_inputs['attention_mask'].cpu()  # [B, T_text]
 
-        # Compute speaker embeddings from mel specs
+        # Compute speaker embeddings using centralized encoder
         if self.speaker_encoder is not None:
-            # mel_specs is [B, n_mels, T]
-            # ECAPA-TDNN mel-spec model expects [B, T, n_mels] and direct calls
-            # (encode_batch assumes compute_features exists, which mel-spec model lacks)
-            mel_for_ecapa = mel_specs.transpose(1, 2).to(self.device)  # [B, T, n_mels]
+            if self.speaker_encoder_input_type == "waveform":
+                # WavLM: needs waveforms padded to same length
+                max_waveform_len = max(waveform_lengths)
+                padded_waveforms = []
+                for waveform in waveforms:
+                    if len(waveform) < max_waveform_len:
+                        waveform = F.pad(waveform, (0, max_waveform_len - len(waveform)), value=0)
+                    padded_waveforms.append(waveform)
 
-            # Compute relative lengths (1.0 for max length, proportional for others)
-            max_len = mel_for_ecapa.shape[1]
-            rel_lens = torch.tensor([l / max_len for l in mel_lengths.tolist()], device=self.device)
+                waveform_batch = torch.stack(padded_waveforms).to(self.device)  # [B, T]
+                waveform_lengths_tensor = torch.tensor(waveform_lengths, dtype=torch.long)
 
-            # Call normalizer and embedding model directly
-            normalized = self.speaker_encoder.mods.normalizer(mel_for_ecapa, rel_lens, epoch=1)
-            speaker_embeddings = self.speaker_encoder.mods.embedding_model(
-                normalized, rel_lens
-            ).squeeze(1).cpu()  # [B, 192]
+                speaker_embeddings = self.speaker_encoder(
+                    waveform=waveform_batch,
+                    lengths=waveform_lengths_tensor,
+                    sample_rate=self.sample_rate,
+                ).cpu()  # [B, embedding_dim]
+            else:
+                # ECAPA-TDNN: needs mel specs
+                # mel_specs is [B, n_mels, T] - wrapper handles shape normalization
+                speaker_embeddings = self.speaker_encoder(
+                    mel_spec=mel_specs,
+                    lengths=mel_lengths,
+                ).cpu()  # [B, embedding_dim]
         else:
             # Zeros if no speaker encoder
-            speaker_embeddings = torch.zeros(batch_size, 192)
+            speaker_embeddings = torch.zeros(batch_size, self.speaker_embedding_dim)
 
         result = {
             "mel_specs": mel_specs,
@@ -300,6 +310,9 @@ def main():
     parser.add_argument("--compute_speaker_embeddings", action="store_true", default=True)
     parser.add_argument("--no_speaker_embeddings", action="store_false",
                         dest="compute_speaker_embeddings")
+    parser.add_argument("--speaker_encoder_type", type=str, default="ecapa_tdnn",
+                        choices=["ecapa_tdnn", "wavlm"],
+                        help="Speaker encoder type: ecapa_tdnn (192-dim, mel input) or wavlm (768-dim, waveform input)")
 
     # VAE encoding for latent diffusion
     parser.add_argument("--vae_checkpoint", type=str, default=None,
@@ -375,6 +388,7 @@ def main():
         max_text_length=args.max_text_length,
         text_model_name=args.text_model,
         compute_speaker_embeddings=args.compute_speaker_embeddings,
+        speaker_encoder_type=args.speaker_encoder_type,
         vae_checkpoint=args.vae_checkpoint,
         vae_config=args.vae_config,
         latent_channels=args.latent_channels,
@@ -561,6 +575,8 @@ def main():
         "text_model": args.text_model,
         "max_text_length": args.max_text_length,
         "compute_speaker_embeddings": args.compute_speaker_embeddings,
+        "speaker_encoder_type": args.speaker_encoder_type,
+        "speaker_embedding_dim": processor.speaker_embedding_dim,
         "remove_mains_hum": args.remove_mains_hum,
         "include_mel_specs": args.include_mel_specs,
         "shard_size": args.shard_size,

@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-Extract speaker embeddings from an audio file using ECAPA-TDNN (mel-spec version).
+Extract speaker embeddings from an audio file.
 
-Uses the same mel spectrogram extraction and speaker embedding computation
-as preprocess_audio_vae_dataset.py for consistency.
+Uses the centralized speaker encoder utility for consistency across the codebase.
+Supports ECAPA-TDNN (192-dim) and WavLM (768-dim) speaker encoders.
 
 Example usage:
+    # Using ECAPA-TDNN (default, 192-dim):
     python scripts/extract_speaker_embedding.py \
         --audio_path /path/to/audio.wav \
         --output_path /path/to/speaker_embedding.pt
 
-    # With custom audio settings:
+    # Using WavLM (768-dim, richer features):
+    python scripts/extract_speaker_embedding.py \
+        --audio_path /path/to/audio.wav \
+        --output_path /path/to/speaker_embedding.pt \
+        --speaker_encoder_type wavlm
+
+    # With custom audio settings (ECAPA-TDNN only):
     python scripts/extract_speaker_embedding.py \
         --audio_path /path/to/audio.wav \
         --output_path /path/to/speaker_embedding.pt \
@@ -35,27 +42,21 @@ import torchaudio
 
 from dataset_loading.audio_loading import extract_mels
 from utils.audio_utils import SharedWindowBuffer
-
-
-def load_speaker_encoder(device: str = "cuda"):
-    """Load ECAPA-TDNN speaker encoder (mel-spec version) from SpeechBrain."""
-    from speechbrain.inference.speaker import EncoderClassifier
-
-    encoder = EncoderClassifier.from_hparams(
-        source="speechbrain/spkrec-ecapa-voxceleb-mel-spec",
-        savedir="pretrained_models/spkrec-ecapa-voxceleb-mel-spec",
-        run_opts={"device": device},
-    )
-    return encoder
+from utils.speaker_encoder import (
+    get_speaker_encoder,
+    get_speaker_encoder_input_type,
+    SpeakerEncoderType,
+)
 
 
 @torch.no_grad()
-def extract_speaker_embedding(
+def extract_speaker_embedding_from_audio(
     audio_path: str,
     sample_rate: int = 16000,
     n_mels: int = 80,
     n_fft: int = 1024,
     hop_length: int = 256,
+    speaker_encoder_type: SpeakerEncoderType = "ecapa_tdnn",
     device: str = "cuda",
 ) -> torch.Tensor:
     """
@@ -67,10 +68,11 @@ def extract_speaker_embedding(
         n_mels: Number of mel bands
         n_fft: FFT window size
         hop_length: Hop length for spectrogram
+        speaker_encoder_type: Type of speaker encoder ("ecapa_tdnn" or "wavlm")
         device: Device to run on
 
     Returns:
-        Speaker embedding tensor of shape [192]
+        Speaker embedding tensor of shape [embedding_dim]
     """
     # Load audio
     waveform, sr = torchaudio.load(audio_path)
@@ -84,36 +86,35 @@ def extract_speaker_embedding(
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)
         waveform = resampler(waveform)
 
-    # Remove channel dimension for extract_mels: [1, T] -> [T]
+    # Remove channel dimension: [1, T] -> [T]
     waveform = waveform.squeeze(0)
 
-    # Extract mel spectrogram using the same function as preprocessing
-    shared_window_buffer = SharedWindowBuffer()
-    mel_spec = extract_mels(
-        shared_window_buffer,
-        waveform,
-        sr=sample_rate,
-        n_mels=n_mels,
-        n_fft=n_fft,
-        hop_length=hop_length,
-    )  # [n_mels, T]
+    # Get cached speaker encoder
+    encoder = get_speaker_encoder(encoder_type=speaker_encoder_type, device=device)
+    input_type = get_speaker_encoder_input_type(speaker_encoder_type)
 
-    # Load speaker encoder
-    speaker_encoder = load_speaker_encoder(device)
+    if input_type == "waveform":
+        # WavLM: use waveform directly
+        waveform_gpu = waveform.unsqueeze(0).to(device)  # [1, T]
+        speaker_embedding = encoder(
+            waveform=waveform_gpu,
+            sample_rate=sample_rate,
+        ).squeeze(0)  # [embedding_dim]
+    else:
+        # ECAPA-TDNN: extract mel spectrogram first
+        shared_window_buffer = SharedWindowBuffer()
+        mel_spec = extract_mels(
+            shared_window_buffer,
+            waveform,
+            sr=sample_rate,
+            n_mels=n_mels,
+            n_fft=n_fft,
+            hop_length=hop_length,
+        )  # [n_mels, T]
 
-    # Prepare mel for ECAPA-TDNN
-    # ECAPA-TDNN mel-spec model expects [B, T, n_mels]
-    mel_for_ecapa = mel_spec.transpose(0, 1).unsqueeze(0).to(device)  # [1, T, n_mels]
-
-    # Relative length (1.0 for full length)
-    rel_lens = torch.tensor([1.0], device=device)
-
-    # Call normalizer and embedding model directly
-    # (encode_batch assumes compute_features exists, which mel-spec model lacks)
-    normalized = speaker_encoder.mods.normalizer(mel_for_ecapa, rel_lens, epoch=1)
-    speaker_embedding = speaker_encoder.mods.embedding_model(
-        normalized, rel_lens
-    ).squeeze(1).squeeze(0)  # [192]
+        speaker_embedding = encoder(
+            mel_spec=mel_spec,
+        ).squeeze(0)  # [embedding_dim]
 
     return speaker_embedding.cpu()
 
@@ -159,6 +160,13 @@ def main():
         help="Hop length (default: 256)",
     )
     parser.add_argument(
+        "--speaker_encoder_type",
+        type=str,
+        default="ecapa_tdnn",
+        choices=["ecapa_tdnn", "wavlm"],
+        help="Speaker encoder type: ecapa_tdnn (192-dim) or wavlm (768-dim) (default: ecapa_tdnn)",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -178,18 +186,21 @@ def main():
 
     print(f"Extracting speaker embedding from: {args.audio_path}")
     print(f"  Sample rate: {args.sample_rate}")
-    print(f"  Mel bands: {args.n_mels}")
-    print(f"  FFT size: {args.n_fft}")
-    print(f"  Hop length: {args.hop_length}")
+    print(f"  Speaker encoder: {args.speaker_encoder_type}")
+    if args.speaker_encoder_type == "ecapa_tdnn":
+        print(f"  Mel bands: {args.n_mels}")
+        print(f"  FFT size: {args.n_fft}")
+        print(f"  Hop length: {args.hop_length}")
     print(f"  Device: {args.device}")
 
     # Extract embedding
-    speaker_embedding = extract_speaker_embedding(
+    speaker_embedding = extract_speaker_embedding_from_audio(
         audio_path=args.audio_path,
         sample_rate=args.sample_rate,
         n_mels=args.n_mels,
         n_fft=args.n_fft,
         hop_length=args.hop_length,
+        speaker_encoder_type=args.speaker_encoder_type,
         device=args.device,
     )
 

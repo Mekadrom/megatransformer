@@ -7,6 +7,7 @@ Produces sharded datasets containing:
 - waveform_labels: [B, T_audio] waveform targets
 - target_complex_stfts: [B, n_fft//2+1, T_stft] complex STFT targets
 - speaker_ids: [B] speaker IDs
+- texts: List[str] text transcriptions (for ASR evaluation)
 
 Designed for multi-GPU parallel preprocessing:
     GPU 0: python preprocess_vocoder_dataset.py --gpu_id 0 --total_gpus 4 ...
@@ -143,6 +144,7 @@ class VocoderBatchProcessor:
         self,
         waveforms: List[torch.Tensor],
         speaker_ids: List[int],
+        texts: List[str] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Process batch of waveforms to mel specs, waveform labels, and STFTs.
@@ -150,6 +152,7 @@ class VocoderBatchProcessor:
         Args:
             waveforms: List of [T] waveform tensors
             speaker_ids: List of speaker IDs
+            texts: Optional list of text transcriptions
 
         Returns:
             Dict with:
@@ -158,6 +161,7 @@ class VocoderBatchProcessor:
                 - target_complex_stfts: [B, n_fft//2+1, max_stft_frames] complex STFT
                 - speaker_ids: [B] speaker IDs
                 - mel_lengths: [B] original mel lengths
+                - texts: List[str] text transcriptions (if provided)
         """
         batch_size = len(waveforms)
 
@@ -223,13 +227,18 @@ class VocoderBatchProcessor:
         target_complex_stfts = torch.stack(stfts)  # [B, n_fft//2+1, T_stft]
         speaker_ids_tensor = torch.tensor(speaker_ids, dtype=torch.long)
 
-        return {
+        result = {
             "mel_specs": mel_specs,
             "waveform_labels": waveform_labels,
             "target_complex_stfts": target_complex_stfts,
             "speaker_ids": speaker_ids_tensor,
             "mel_lengths": mel_lengths,
         }
+
+        if texts is not None:
+            result["texts"] = texts
+
+        return result
 
 
 def main():
@@ -374,11 +383,12 @@ def main():
     shard_stfts = []
     shard_speaker_ids = []
     shard_mel_lengths = []
+    shard_texts = []
     shard_idx = 0
 
     def flush_shard():
         nonlocal shard_mel_specs, shard_waveform_labels, shard_stfts
-        nonlocal shard_speaker_ids, shard_mel_lengths, shard_idx
+        nonlocal shard_speaker_ids, shard_mel_lengths, shard_texts, shard_idx
 
         if not shard_mel_specs:
             return
@@ -389,6 +399,7 @@ def main():
             "target_complex_stfts": torch.cat(shard_stfts, dim=0),
             "speaker_ids": torch.cat(shard_speaker_ids, dim=0),
             "mel_lengths": torch.cat(shard_mel_lengths, dim=0),
+            "texts": shard_texts,  # List of strings - can't be tensors
             "num_samples": sum(x.shape[0] for x in shard_mel_specs),
         }
 
@@ -402,22 +413,24 @@ def main():
         shard_stfts = []
         shard_speaker_ids = []
         shard_mel_lengths = []
+        shard_texts = []
         shard_idx += 1
 
     # Batch accumulators
     batch_waveforms = []
     batch_speaker_ids = []
+    batch_texts = []
 
     def process_and_accumulate():
-        nonlocal batch_waveforms, batch_speaker_ids
+        nonlocal batch_waveforms, batch_speaker_ids, batch_texts
         nonlocal shard_mel_specs, shard_waveform_labels, shard_stfts
-        nonlocal shard_speaker_ids, shard_mel_lengths
+        nonlocal shard_speaker_ids, shard_mel_lengths, shard_texts
 
         if not batch_waveforms:
             return
 
         try:
-            result = processor.process_batch(batch_waveforms, batch_speaker_ids)
+            result = processor.process_batch(batch_waveforms, batch_speaker_ids, batch_texts)
 
             # Add to shard
             shard_mel_specs.append(result["mel_specs"])
@@ -425,6 +438,8 @@ def main():
             shard_stfts.append(result["target_complex_stfts"])
             shard_speaker_ids.append(result["speaker_ids"])
             shard_mel_lengths.append(result["mel_lengths"])
+            if "texts" in result:
+                shard_texts.extend(result["texts"])
 
             stats["saved"] += len(batch_waveforms)
 
@@ -439,6 +454,7 @@ def main():
 
         batch_waveforms = []
         batch_speaker_ids = []
+        batch_texts = []
 
     # Main processing loop
     start_time = time.time()
@@ -476,6 +492,9 @@ def main():
                 stats["no_speaker_id"] += 1
                 speaker_id = -1
 
+            # Get text transcription
+            text = example.get("text", "")
+
             # Segment long audio
             if len(waveform) > max_samples:
                 segments = []
@@ -510,6 +529,7 @@ def main():
                     # Add to batch
                     batch_waveforms.append(current_segment)
                     batch_speaker_ids.append(speaker_id)
+                    batch_texts.append(text)
 
                     # Process batch when full
                     if len(batch_waveforms) >= args.batch_size:

@@ -454,7 +454,8 @@ class AudioVAEShardedDataset(Dataset):
     Loads shards containing:
     - mel_specs: [B, 1, n_mels, T] mel spectrograms
     - mel_lengths: [B] original lengths before padding
-    - speaker_embeddings: [B, 192] speaker embeddings
+    - speaker_embeddings: [B, embedding_dim] speaker embeddings
+    - texts: List[str] text transcriptions (optional, for ASR evaluation)
 
     Features:
     - Lazy loading of shards
@@ -606,12 +607,16 @@ class AudioVAEShardedDataset(Dataset):
         sample = {
             "mel_spec": shard["mel_specs"][local_idx],  # [1, n_mels, T]
             "mel_spec_length": shard["mel_lengths"][local_idx].item(),
-            "speaker_embedding": shard["speaker_embeddings"][local_idx],  # [192]
+            "speaker_embedding": shard["speaker_embeddings"][local_idx],  # [embedding_dim]
         }
 
         # Include speaker_id if available in shard
         if "speaker_ids" in shard:
             sample["speaker_id"] = shard["speaker_ids"][local_idx].item()
+
+        # Include text if available (for ASR evaluation)
+        if "texts" in shard and shard["texts"]:
+            sample["text"] = shard["texts"][local_idx]
 
         return sample
 
@@ -759,7 +764,7 @@ class AudioDiffusionShardedDataset(Dataset):
     - text_embeddings: [B, T_text, context_dim] T5 text embeddings
     - text_attention_masks: [B, T_text] attention masks
     - mel_lengths: [B] original mel spectrogram lengths
-    - speaker_embeddings: [B, 192] speaker embeddings
+    - speaker_embeddings: [B, embedding_dim] speaker embeddings
     - latent_mus: [B, C, H, T'] VAE-encoded latents (if available)
     - mel_specs: [B, n_mels, T] mel spectrograms (optional, if include_mel_specs was enabled)
 
@@ -868,7 +873,7 @@ class AudioDiffusionShardedDataset(Dataset):
             "text_embeddings": shard["text_embeddings"][local_idx],  # [T_text, context_dim]
             "text_attention_mask": shard["text_attention_masks"][local_idx],  # [T_text]
             "mel_spec_length": shard["mel_lengths"][local_idx].item(),
-            "speaker_embedding": shard["speaker_embeddings"][local_idx],  # [192]
+            "speaker_embedding": shard["speaker_embeddings"][local_idx],  # [embedding_dim]
         }
 
         # Add latents if available
@@ -1058,6 +1063,7 @@ class VocoderShardedDataset(Dataset):
     - target_complex_stfts: [B, n_fft//2+1, T_stft] complex STFT targets
     - speaker_ids: [B] speaker IDs
     - mel_lengths: [B] original mel lengths
+    - texts: List[str] text transcriptions (optional, for ASR evaluation)
 
     Features:
     - Lazy loading of shards
@@ -1245,6 +1251,10 @@ class VocoderShardedDataset(Dataset):
             "mel_spec_length": shard["mel_lengths"][local_idx].item(),
         }
 
+        # Include text if available (for ASR evaluation)
+        if "texts" in shard and shard["texts"]:
+            sample["text"] = shard["texts"][local_idx]
+
         return sample
 
     def get_sampler(self, shuffle: bool = True, seed: int = 42) -> ShardAwareSampler:
@@ -1319,6 +1329,7 @@ def merge_vocoder_shards(
     acc_stfts = []
     acc_speaker_ids = []
     acc_mel_lengths = []
+    acc_texts = []
 
     output_shard_idx = 0
     total_samples = 0
@@ -1329,7 +1340,7 @@ def merge_vocoder_shards(
 
     def save_merged_shard():
         nonlocal acc_mel_specs, acc_waveform_labels, acc_stfts
-        nonlocal acc_speaker_ids, acc_mel_lengths, output_shard_idx, total_samples
+        nonlocal acc_speaker_ids, acc_mel_lengths, acc_texts, output_shard_idx, total_samples
 
         if not acc_mel_specs:
             return
@@ -1342,6 +1353,7 @@ def merge_vocoder_shards(
             "target_complex_stfts": torch.cat(acc_stfts, dim=0),
             "speaker_ids": torch.cat(acc_speaker_ids, dim=0),
             "mel_lengths": torch.cat(acc_mel_lengths, dim=0),
+            "texts": acc_texts,  # List of strings
             "num_samples": num_samples_in_shard,
         }
 
@@ -1360,6 +1372,7 @@ def merge_vocoder_shards(
         acc_stfts = []
         acc_speaker_ids = []
         acc_mel_lengths = []
+        acc_texts = []
 
     for shard_path in tqdm(all_shards, desc="Merging vocoder shards"):
         try:
@@ -1370,6 +1383,13 @@ def merge_vocoder_shards(
             acc_stfts.append(shard["target_complex_stfts"])
             acc_speaker_ids.append(shard["speaker_ids"])
             acc_mel_lengths.append(shard["mel_lengths"])
+
+            # Handle texts (may not be present in older shards)
+            if "texts" in shard and shard["texts"]:
+                acc_texts.extend(shard["texts"])
+            else:
+                # Fill with empty strings if no texts
+                acc_texts.extend([""] * shard["num_samples"])
 
             current_size = sum(x.shape[0] for x in acc_mel_specs)
             if current_size >= target_shard_size:
@@ -1487,6 +1507,7 @@ def merge_audio_vae_shards(
     acc_mel_lengths = []
     acc_speaker_emb = []
     acc_speaker_ids = []
+    acc_texts = []
 
     output_shard_idx = 0
     total_samples = 0
@@ -1496,7 +1517,7 @@ def merge_audio_vae_shards(
     shard_offsets = []
 
     def save_merged_shard():
-        nonlocal acc_mel_specs, acc_mel_lengths, acc_speaker_emb, acc_speaker_ids, output_shard_idx, total_samples
+        nonlocal acc_mel_specs, acc_mel_lengths, acc_speaker_emb, acc_speaker_ids, acc_texts, output_shard_idx, total_samples
 
         if not acc_mel_specs:
             return
@@ -1507,6 +1528,7 @@ def merge_audio_vae_shards(
             "mel_specs": torch.cat(acc_mel_specs, dim=0),
             "mel_lengths": torch.cat(acc_mel_lengths, dim=0),
             "speaker_embeddings": torch.cat(acc_speaker_emb, dim=0),
+            "texts": acc_texts,  # List of strings
             "num_samples": num_samples_in_shard,
         }
 
@@ -1528,6 +1550,7 @@ def merge_audio_vae_shards(
         acc_mel_lengths = []
         acc_speaker_emb = []
         acc_speaker_ids = []
+        acc_texts = []
 
     for shard_path in tqdm(all_shards, desc="Merging audio VAE shards"):
         try:
@@ -1546,6 +1569,13 @@ def merge_audio_vae_shards(
                     dtype=torch.long
                 )
                 acc_speaker_ids.append(class_labels)
+
+            # Handle texts (may not be present in older shards)
+            if "texts" in shard and shard["texts"]:
+                acc_texts.extend(shard["texts"])
+            else:
+                # Fill with empty strings if no texts
+                acc_texts.extend([""] * shard["num_samples"])
 
             current_size = sum(x.shape[0] for x in acc_mel_specs)
             if current_size >= target_shard_size:

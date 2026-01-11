@@ -17,7 +17,6 @@ import torchaudio
 from contextlib import nullcontext
 from typing import Any, Mapping, Optional, Union
 
-from speechbrain.inference.speaker import EncoderClassifier
 from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments, Trainer, TrainerCallback, T5EncoderModel, T5Tokenizer
@@ -202,45 +201,17 @@ class AudioDiffusionVisualizationCallback(TrainerCallback):
         )
         self.text_embeddings = self.t5_model(**self.text_inputs).last_hidden_state
 
-        # Use mel-spec model for consistency with preprocessing
-        speaker_encoder = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb-mel-spec",
-            savedir="pretrained_models/spkrec-ecapa-voxceleb-mel-spec",
-            run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
-        )
-
-        test_audio_path = "inference/examples/test_alm_1.mp3"
-        test_audio_waveforms, orig_sr = torchaudio.load(test_audio_path)
-        if orig_sr != audio_sample_rate:
-            test_audio_waveforms = torchaudio.transforms.Resample(
-                orig_freq=orig_sr, new_freq=audio_sample_rate
-            )(test_audio_waveforms)
-        test_audio_waveforms = test_audio_waveforms[0]
-
-        with torch.no_grad():
-            # Convert waveform to mel spectrogram using common extract_mels
-            from dataset_loading.audio_loading import extract_mels
-            log_mel_spec = extract_mels(
-                self.shared_window_buffer,
-                test_audio_waveforms,
-                sr=audio_sample_rate,
-                n_mels=80,
-                n_fft=1024,
-                hop_length=256,
-            )  # [n_mels, T]
-
-            # Transpose for ECAPA-TDNN: [n_mels, T] -> [1, T, n_mels]
-            mel_for_ecapa = log_mel_spec.transpose(0, 1).unsqueeze(0)
-            rel_lens = torch.ones(1)
-
-            # Call normalizer and embedding model directly (encode_batch doesn't work for mel-spec model)
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            mel_for_ecapa = mel_for_ecapa.to(device)
-            rel_lens = rel_lens.to(device)
-            normalized = speaker_encoder.mods.normalizer(mel_for_ecapa, rel_lens, epoch=1)
-            self.speaker_embedding = speaker_encoder.mods.embedding_model(
-                normalized, rel_lens
-            ).squeeze(0).cpu()
+        # Load pre-extracted speaker embedding (no runtime extraction)
+        speaker_embedding_path = "inference/examples/test_alm_speaker_embedding_1.pt"
+        if os.path.exists(speaker_embedding_path):
+            self.speaker_embedding = torch.load(speaker_embedding_path, weights_only=True)
+            print(f"Loaded speaker embedding from {speaker_embedding_path}: shape {self.speaker_embedding.shape}")
+        else:
+            raise FileNotFoundError(
+                f"Pre-extracted speaker embedding not found: {speaker_embedding_path}\n"
+                f"Please extract it using: python scripts/extract_speaker_embedding.py "
+                f"--audio_path inference/examples/test_alm_1.mp3 --output_path {speaker_embedding_path}"
+            )
 
     def _load_vocoder(self):
         """Lazily load vocoder on first use."""

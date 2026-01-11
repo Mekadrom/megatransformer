@@ -1228,7 +1228,7 @@ def main():
     parser.add_argument("--latent_channels", type=int, default=32,
                         help="Number of latent channels")
     parser.add_argument("--speaker_embedding_dim", type=int, default=192,
-                        help="Speaker embedding dimension (default: 192 for ECAPA-TDNN)")
+                        help="Speaker embedding dimension (default: 192, depends on speaker encoder used during preprocessing)")
     parser.add_argument("--normalize_speaker_embedding", action="store_true",
                         help="L2-normalize speaker embeddings before conditioning")
     parser.add_argument("--film_scale_bound", type=float, default=0.5,
@@ -1313,7 +1313,10 @@ def main():
     from shard_utils import AudioVAEShardedDataset, AudioVAEDataCollator
 
     dataset = AudioVAEShardedDataset(shard_dir=args.cache_dir)
-    collator = AudioVAEDataCollator()
+    collator = AudioVAEDataCollator(
+        audio_max_frames=args.max_mel_frames,
+        speaker_embedding_dim=args.speaker_embedding_dim,
+    )
 
     dataloader = DataLoader(
         dataset,

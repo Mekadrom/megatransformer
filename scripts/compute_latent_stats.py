@@ -222,6 +222,8 @@ def main():
                         help="Use recurrent VAE instead of standard VAE (image only)")
     parser.add_argument("--output_json", type=str, default=None,
                         help="Optional: save statistics to JSON file")
+    parser.add_argument("--speaker_embedding_dim", type=int, default=192,
+                        help="Speaker embedding dimension for audio VAE (default: 192)")
 
     args = parser.parse_args()
 
@@ -257,9 +259,9 @@ def main():
         dataset = CachedImageVAEDataset(cache_dir=args.cache_dir)
         collator = ImageVAEDataCollator()
     else:
-        from dataset_loading.audio_vae_dataset import CachedAudioVAEDataset, AudioVAEDataCollator
-        dataset = CachedAudioVAEDataset(cache_dir=args.cache_dir)
-        collator = AudioVAEDataCollator()
+        from shard_utils import AudioVAEShardedDataset, AudioVAEDataCollator
+        dataset = AudioVAEShardedDataset(shard_dir=args.cache_dir)
+        collator = AudioVAEDataCollator(speaker_embedding_dim=args.speaker_embedding_dim)
 
     dataloader = DataLoader(
         dataset,

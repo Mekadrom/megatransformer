@@ -5,7 +5,8 @@ Optimized Audio VAE Dataset Preprocessing with Sharding.
 Produces sharded datasets containing:
 - mel_spec: Mel spectrogram labels for VAE reconstruction [1, n_mels, T]
 - mel_spec_length: Original length before padding
-- speaker_embedding: ECAPA-TDNN speaker embeddings for decoder conditioning [192]
+- speaker_embedding: Speaker embeddings for decoder conditioning [embedding_dim]
+- texts: List[str] text transcriptions (for ASR evaluation, optional)
 
 Designed for multi-GPU parallel preprocessing:
     GPU 0: python preprocess_audio_vae_dataset.py --gpu_id 0 --total_gpus 4 ...
@@ -31,22 +32,12 @@ from datasets import load_dataset, Audio
 
 from dataset_loading.audio_loading import extract_mels, remove_mains_hum
 from utils.audio_utils import SharedWindowBuffer
-
-
-def load_speaker_encoder(device: str = "cuda"):
-    """Load ECAPA-TDNN speaker encoder from SpeechBrain."""
-    try:
-        from speechbrain.inference.speaker import EncoderClassifier
-
-        encoder = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb-mel-spec",
-            savedir="pretrained_models/spkrec-ecapa-voxceleb-mel-spec",
-            run_opts={"device": device},
-        )
-        return encoder
-    except ImportError:
-        print("Warning: speechbrain not available. Speaker embeddings will be zeros.")
-        return None
+from utils.speaker_encoder import (
+    get_speaker_encoder,
+    get_speaker_embedding_dim,
+    get_speaker_encoder_input_type,
+    SpeakerEncoderType,
+)
 
 
 class AudioBatchProcessor:
@@ -60,6 +51,7 @@ class AudioBatchProcessor:
         hop_length: int = 256,
         max_audio_seconds: int = 30,
         compute_speaker_embeddings: bool = True,
+        speaker_encoder_type: SpeakerEncoderType = "ecapa_tdnn",
         device: str = "cuda",
     ):
         self.sample_rate = sample_rate
@@ -68,18 +60,24 @@ class AudioBatchProcessor:
         self.hop_length = hop_length
         self.max_audio_seconds = max_audio_seconds
         self.device = device
+        self.speaker_encoder_type = speaker_encoder_type
 
         self.audio_max_frames = (max_audio_seconds * sample_rate) // hop_length
+        self.audio_max_samples = max_audio_seconds * sample_rate
 
         self.shared_window_buffer = SharedWindowBuffer()
 
-        # Speaker encoder
+        # Speaker encoder (uses centralized cached singleton)
         self.speaker_encoder = None
+        self.speaker_embedding_dim = get_speaker_embedding_dim(speaker_encoder_type)
+        self.speaker_encoder_input_type = get_speaker_encoder_input_type(speaker_encoder_type)
         if compute_speaker_embeddings:
-            print("Loading ECAPA-TDNN speaker encoder...")
-            self.speaker_encoder = load_speaker_encoder(device)
-            if self.speaker_encoder is not None:
-                print("  Speaker encoder loaded successfully")
+            print(f"Loading {speaker_encoder_type} speaker encoder (cached singleton)...")
+            self.speaker_encoder = get_speaker_encoder(
+                encoder_type=speaker_encoder_type,
+                device=device,
+            )
+            print(f"  Speaker encoder loaded (embedding_dim={self.speaker_embedding_dim}, input={self.speaker_encoder_input_type})")
 
     @torch.no_grad()
     def process_batch(
@@ -96,15 +94,19 @@ class AudioBatchProcessor:
             Dict with:
                 - mel_specs: [B, 1, n_mels, max_frames] padded mel spectrograms
                 - mel_lengths: [B] original lengths before padding
-                - speaker_embeddings: [B, 192] speaker embeddings
+                - speaker_embeddings: [B, embedding_dim] speaker embeddings
         """
         batch_size = len(waveforms)
 
         # Process mel spectrograms
         mel_specs = []
         mel_lengths = []
+        waveform_lengths = []  # Track original waveform lengths for WavLM
 
         for waveform in waveforms:
+            # Store original waveform length (for WavLM speaker encoder)
+            waveform_lengths.append(len(waveform))
+
             # Extract mel spectrogram
             mel = extract_mels(
                 self.shared_window_buffer,
@@ -135,25 +137,35 @@ class AudioBatchProcessor:
         mel_specs = torch.stack(mel_specs)
         mel_lengths = torch.tensor(mel_lengths, dtype=torch.long)
 
-        # Compute speaker embeddings from mel specs
+        # Compute speaker embeddings using centralized encoder
         if self.speaker_encoder is not None:
-            # mel_specs is [B, 1, n_mels, T]
-            # ECAPA-TDNN mel-spec model expects [B, T, n_mels] and direct calls
-            # (encode_batch assumes compute_features exists, which mel-spec model lacks)
-            mel_for_ecapa = mel_specs.squeeze(1).transpose(1, 2).to(self.device)  # [B, T, n_mels]
+            if self.speaker_encoder_input_type == "waveform":
+                # WavLM: needs waveforms padded to same length
+                max_waveform_len = max(waveform_lengths)
+                padded_waveforms = []
+                for waveform in waveforms:
+                    if len(waveform) < max_waveform_len:
+                        waveform = F.pad(waveform, (0, max_waveform_len - len(waveform)), value=0)
+                    padded_waveforms.append(waveform)
 
-            # Compute relative lengths (1.0 for max length, proportional for others)
-            max_len = mel_for_ecapa.shape[1]
-            rel_lens = torch.tensor([l / max_len for l in mel_lengths.tolist()], device=self.device)
+                waveform_batch = torch.stack(padded_waveforms).to(self.device)  # [B, T]
+                waveform_lengths_tensor = torch.tensor(waveform_lengths, dtype=torch.long)
 
-            # Call normalizer and embedding model directly
-            normalized = self.speaker_encoder.mods.normalizer(mel_for_ecapa, rel_lens, epoch=1)
-            speaker_embeddings = self.speaker_encoder.mods.embedding_model(
-                normalized, rel_lens
-            ).squeeze(1).cpu()  # [B, 192]
+                speaker_embeddings = self.speaker_encoder(
+                    waveform=waveform_batch,
+                    lengths=waveform_lengths_tensor,
+                    sample_rate=self.sample_rate,
+                ).cpu()  # [B, embedding_dim]
+            else:
+                # ECAPA-TDNN: needs mel specs
+                # mel_specs is [B, 1, n_mels, T] - wrapper handles shape normalization
+                speaker_embeddings = self.speaker_encoder(
+                    mel_spec=mel_specs,
+                    lengths=mel_lengths,
+                ).cpu()  # [B, embedding_dim]
         else:
             # Zeros if no speaker encoder
-            speaker_embeddings = torch.zeros(batch_size, 192)
+            speaker_embeddings = torch.zeros(batch_size, self.speaker_embedding_dim)
 
         return {
             "mel_specs": mel_specs,
@@ -199,14 +211,15 @@ def main():
                         help="Batch size for GPU processing")
     parser.add_argument("--shard_size", type=int, default=5000,
                         help="Number of samples per shard")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="Number of data loading workers")
 
     # Speaker embeddings
     parser.add_argument("--compute_speaker_embeddings", action="store_true", default=True)
     parser.add_argument("--no_speaker_embeddings", action="store_false",
                         dest="compute_speaker_embeddings")
-    
+    parser.add_argument("--speaker_encoder_type", type=str, default="ecapa_tdnn",
+                        choices=["ecapa_tdnn", "wavlm"],
+                        help="Speaker encoder type: ecapa_tdnn (192-dim, mel input) or wavlm (768-dim, waveform input)")
+
     parser.add_argument("--include_speaker_id", action="store_true", default=False,
                         help="Include speaker ID from dataset if available")
     parser.add_argument("--speaker_id_column", type=str, default="speaker_id",
@@ -272,6 +285,7 @@ def main():
         hop_length=args.hop_length,
         max_audio_seconds=args.max_audio_seconds,
         compute_speaker_embeddings=args.compute_speaker_embeddings,
+        speaker_encoder_type=args.speaker_encoder_type,
         device=device,
     )
 
@@ -292,10 +306,11 @@ def main():
     shard_mel_lengths = []
     shard_speaker_embeddings = []
     shard_speaker_ids = []
+    shard_texts = []
     shard_idx = 0
 
     def flush_shard():
-        nonlocal shard_mel_specs, shard_mel_lengths, shard_speaker_embeddings, shard_speaker_ids, shard_idx
+        nonlocal shard_mel_specs, shard_mel_lengths, shard_speaker_embeddings, shard_speaker_ids, shard_texts, shard_idx
 
         if not shard_mel_specs:
             return
@@ -305,6 +320,7 @@ def main():
             "mel_lengths": torch.cat(shard_mel_lengths, dim=0),
             "speaker_embeddings": torch.cat(shard_speaker_embeddings, dim=0),
             "speaker_ids": torch.cat(shard_speaker_ids, dim=0) if args.include_speaker_id else None,
+            "texts": shard_texts,  # List of strings
             "num_samples": sum(x.shape[0] for x in shard_mel_specs),
         }
 
@@ -317,16 +333,18 @@ def main():
         shard_mel_lengths = []
         shard_speaker_embeddings = []
         shard_speaker_ids = []
+        shard_texts = []
         shard_idx += 1
 
     # Batch accumulators
     batch_waveforms = []
     batch_speaker_ids = []
     batch_indices = []
+    batch_texts = []
 
     def process_and_accumulate():
-        nonlocal batch_waveforms, batch_speaker_ids, batch_indices
-        nonlocal shard_mel_specs, shard_mel_lengths, shard_speaker_embeddings
+        nonlocal batch_waveforms, batch_speaker_ids, batch_indices, batch_texts
+        nonlocal shard_mel_specs, shard_mel_lengths, shard_speaker_embeddings, shard_texts
 
         if not batch_waveforms:
             return
@@ -339,6 +357,7 @@ def main():
             shard_mel_lengths.append(result["mel_lengths"])
             shard_speaker_embeddings.append(result["speaker_embeddings"])
             shard_speaker_ids.append(torch.tensor(batch_speaker_ids, dtype=torch.long) if args.include_speaker_id else None)
+            shard_texts.extend(batch_texts)
 
             stats["saved"] += len(batch_waveforms)
 
@@ -354,6 +373,7 @@ def main():
         batch_waveforms = []
         batch_speaker_ids = []
         batch_indices = []
+        batch_texts = []
 
     # Main processing loop
     start_time = time.time()
@@ -375,6 +395,9 @@ def main():
             audio = example["audio"]
             waveform = torch.tensor(audio["array"], dtype=torch.float32)
             speaker_id = example[args.speaker_id_column] if args.include_speaker_id and args.speaker_id_column in example else -1
+
+            # Get text transcription if available
+            text = example.get("text", "")
 
             # Track unique speaker IDs for GRL training
             if args.include_speaker_id and speaker_id != -1:
@@ -400,6 +423,7 @@ def main():
             batch_waveforms.append(waveform)
             batch_speaker_ids.append(speaker_id)
             batch_indices.append(idx)
+            batch_texts.append(text)
 
             # Process batch when full
             if len(batch_waveforms) >= args.gpu_batch_size:
@@ -438,6 +462,8 @@ def main():
         "hop_length": args.hop_length,
         "max_audio_seconds": args.max_audio_seconds,
         "compute_speaker_embeddings": args.compute_speaker_embeddings,
+        "speaker_encoder_type": args.speaker_encoder_type,
+        "speaker_embedding_dim": processor.speaker_embedding_dim,
         "include_speaker_id": args.include_speaker_id,
         "remove_mains_hum": args.remove_mains_hum,
         "shard_size": args.shard_size,

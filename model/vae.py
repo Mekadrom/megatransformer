@@ -107,6 +107,9 @@ class VAE(nn.Module):
         free_bits: float = 0.0,  # Minimum KL per channel (0 = disabled)
         # Speaker embedding dropout for disentanglement (audio VAE)
         speaker_embedding_dropout: float = 0.0,  # Probability of zeroing speaker embedding during training
+        # Instance normalization on latents for speaker disentanglement
+        # Removes per-instance statistics (mean/variance) which often encode speaker characteristics
+        instance_norm_latents: bool = False,
         # Multi-resolution STFT loss parameters (for audio)
         stft_loss_weight: float = 0.0,  # 0 = disabled
         stft_fft_sizes: list = None,
@@ -125,6 +128,7 @@ class VAE(nn.Module):
         self.kl_divergence_loss_weight = kl_divergence_loss_weight
         self.free_bits = free_bits
         self.speaker_embedding_dropout = speaker_embedding_dropout
+        self.instance_norm_latents = instance_norm_latents
         self.stft_loss_weight = stft_loss_weight
 
         self.perceptual_loss_type = perceptual_loss_type
@@ -240,6 +244,12 @@ class VAE(nn.Module):
 
         mu, logvar = self.encode(x, lengths=lengths)
         z = self.reparameterize(mu, logvar)
+
+        # Apply instance normalization to latents for speaker disentanglement
+        # This removes per-instance statistics (mean/variance) which often encode speaker info
+        # Speaker characteristics are then re-injected via FiLM conditioning
+        if self.instance_norm_latents:
+            z = F.instance_norm(z)
 
         # Compute downsampled lengths for decoder attention
         # Decoder needs latent-space lengths (same as encoder output)

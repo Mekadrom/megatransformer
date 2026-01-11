@@ -115,4 +115,9 @@ class VocoderDataCollator:
             "target_complex_stfts": torch.stack(target_complex_stfts),
         }
 
+        # Include texts if available (for ASR evaluation)
+        texts = [ex.get("text", "") for ex in examples if ex is not None]
+        if any(texts):
+            batch["texts"] = texts
+
         return batch
