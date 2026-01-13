@@ -249,6 +249,9 @@ class AudioVAEEncoder(nn.Module):
         film_scale_bound: float = 0.5,
         film_shift_bound: float = 0.5,
         logvar_clamp_max: float = 4.0,
+        # Learned speaker embedding parameters
+        learn_speaker_embedding: bool = False,  # If True, encoder outputs learned speaker embedding
+        learned_speaker_dim: int = 256,  # Dimension of learned speaker embedding output
     ):
         super().__init__()
         self.use_attention = use_attention
@@ -257,6 +260,8 @@ class AudioVAEEncoder(nn.Module):
         self.film_scale_bound = film_scale_bound
         self.film_shift_bound = film_shift_bound
         self.logvar_clamp_max = logvar_clamp_max
+        self.learn_speaker_embedding = learn_speaker_embedding
+        self.learned_speaker_dim = learned_speaker_dim
 
         channels = [in_channels] + intermediate_channels
 
@@ -316,6 +321,16 @@ class AudioVAEEncoder(nn.Module):
         self.fc_mu = nn.Conv2d(channels[-1], latent_channels, kernel_size=(3, 5), padding=(1, 2))
         self.fc_logvar = nn.Conv2d(channels[-1], latent_channels, kernel_size=(3, 5), padding=(1, 2))
 
+        # Learned speaker embedding head
+        # Uses global average pooling to remove temporal/spatial structure, then MLP to project
+        # This forces the head to learn a single speaker vector without temporal info
+        if learn_speaker_embedding:
+            self.speaker_head = nn.Sequential(
+                nn.Linear(intermediate_channels[-1], learned_speaker_dim),
+                nn.SiLU(),
+                nn.Linear(learned_speaker_dim, learned_speaker_dim),
+            )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -348,6 +363,14 @@ class AudioVAEEncoder(nn.Module):
                             if linear.bias is not None:
                                 nn.init.zeros_(linear.bias)
 
+        # Initialize learned speaker embedding head
+        if self.learn_speaker_embedding and hasattr(self, 'speaker_head'):
+            for module in self.speaker_head:
+                if isinstance(module, nn.Linear):
+                    nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -365,6 +388,7 @@ class AudioVAEEncoder(nn.Module):
         Returns:
             mu: [B, latent_channels, H', W'] latent mean
             logvar: [B, latent_channels, H', W'] latent log variance
+            learned_speaker_emb (optional): [B, learned_speaker_dim] if learn_speaker_embedding=True
             attn_weights (optional): [B, M, n_heads, T, T] if return_attention_weights=True and use_attention
         """
         # Process speaker embedding
@@ -414,10 +438,24 @@ class AudioVAEEncoder(nn.Module):
             else:
                 x = attn_result
 
+        # Compute learned speaker embedding via global average pooling
+        # This removes temporal/spatial structure, forcing the head to learn speaker-only info
+        learned_speaker_emb = None
+        if self.learn_speaker_embedding:
+            # x shape: [B, C, M, T] -> global avg pool -> [B, C]
+            speaker_features = x.mean(dim=(2, 3))  # [B, C]
+            learned_speaker_emb = self.speaker_head(speaker_features)  # [B, learned_speaker_dim]
+
         # Get mu and logvar
         mu = self.fc_mu(x)
         logvar = self.fc_logvar(x)
         logvar = torch.clamp(logvar, min=-10.0, max=self.logvar_clamp_max)
+
+        # Build return tuple based on what's enabled
+        if self.learn_speaker_embedding:
+            if return_attention_weights:
+                return mu, logvar, learned_speaker_emb, attn_weights
+            return mu, logvar, learned_speaker_emb
 
         if return_attention_weights:
             return mu, logvar, attn_weights
@@ -770,28 +808,64 @@ class AudioVAEDecoder(nn.Module):
 
 
 model_config_lookup = {
-    "medium": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, **kwargs: VAE(
+    # Tiny config for testing - minimal channels, no attention, fast forward pass
+    "tiny_test": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, learn_speaker_embedding=False, learned_speaker_dim=256, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
-            intermediate_channels=[256, 128, 64],
+            intermediate_channels=[16, 32, 64],
+            kernel_sizes=[(3, 5), (3, 5), (3, 3)],
+            strides=[(2, 4), (2, 3), (2, 1)],
+            n_residual_blocks=0,
+            use_attention=False,
+            activation_fn="gelu",
+            learn_speaker_embedding=learn_speaker_embedding,
+            learned_speaker_dim=learned_speaker_dim,
+        ),
+        decoder=AudioVAEDecoder(
+            latent_channels=latent_channels,
+            out_channels=1,
+            intermediate_channels=[48, 24, 12],
+            scale_factors=[(2, 1), (2, 3), (2, 4)],
+            kernel_sizes=[(3, 3), (3, 5), (3, 7)],
+            n_residual_blocks=0,
+            use_attention=False,
+            activation_fn="gelu",
+            speaker_embedding_dim=learned_speaker_dim if learn_speaker_embedding else speaker_embedding_dim,
+            speaker_embedding_proj_dim=speaker_embedding_proj_dim if not learn_speaker_embedding else 0,
+            normalize_speaker_embedding=normalize_speaker_embedding,
+            film_scale_bound=film_scale_bound,
+            film_shift_bound=film_shift_bound,
+            zero_init_film_bias=zero_init_film_bias,
+            film_no_bias=film_no_bias,
+        ),
+        **kwargs
+    ),
+    "medium_no_attn": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, learn_speaker_embedding=False, learned_speaker_dim=256, **kwargs: VAE(
+        encoder=AudioVAEEncoder(
+            in_channels=1,
+            latent_channels=latent_channels,
+            intermediate_channels=[168, 336, 672],
             kernel_sizes=[(3, 7), (3, 7), (3, 5)],
             strides=[(2, 4), (2, 3), (2, 1)],  # 4*3*1 = 12x time compression (1875 -> ~156)
             n_residual_blocks=0,
             use_attention=False,
             activation_fn="snake",
+            learn_speaker_embedding=learn_speaker_embedding,
+            learned_speaker_dim=learned_speaker_dim,
         ),
         decoder=AudioVAEDecoder(
             latent_channels=latent_channels,
             out_channels=1,
-            intermediate_channels=[256, 128, 64],
+            intermediate_channels=[384, 192, 96],
             scale_factors=[(2, 1), (2, 3), (2, 4)],  # 1*3*4 = 12x time upsampling
             kernel_sizes=[(3, 5), (3, 7), (3, 9)],  # increased last kernel for stride-4 upsample
             n_residual_blocks=0,
             use_attention=False,
             activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            speaker_embedding_proj_dim=speaker_embedding_proj_dim,
+            # When learn_speaker_embedding=True, decoder uses learned_speaker_dim for FiLM
+            speaker_embedding_dim=learned_speaker_dim if learn_speaker_embedding else speaker_embedding_dim,
+            speaker_embedding_proj_dim=speaker_embedding_proj_dim if not learn_speaker_embedding else 0,
             normalize_speaker_embedding=normalize_speaker_embedding,
             film_scale_bound=film_scale_bound,
             film_shift_bound=film_shift_bound,
@@ -802,7 +876,7 @@ model_config_lookup = {
     ),
     # Creates a ~13M parameter VAE with ~4M encoder and ~9M decoder - includes snake activations, bottleneck attention, and FiLM speaker embedding conditioning (if speaker_embedding_dim > 0)
     # but no residual blocks
-    "large": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, **kwargs: VAE(
+    "large": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, learn_speaker_embedding=False, learned_speaker_dim=256, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
@@ -813,6 +887,8 @@ model_config_lookup = {
             use_attention=True,
             attention_heads=6,
             activation_fn="snake",
+            learn_speaker_embedding=learn_speaker_embedding,
+            learned_speaker_dim=learned_speaker_dim,
         ),
         decoder=AudioVAEDecoder(
             latent_channels=latent_channels,
@@ -824,8 +900,9 @@ model_config_lookup = {
             use_attention=True,
             attention_heads=6,
             activation_fn="snake",
-            speaker_embedding_dim=speaker_embedding_dim,
-            speaker_embedding_proj_dim=speaker_embedding_proj_dim,
+            # When learn_speaker_embedding=True, decoder uses learned_speaker_dim for FiLM
+            speaker_embedding_dim=learned_speaker_dim if learn_speaker_embedding else speaker_embedding_dim,
+            speaker_embedding_proj_dim=speaker_embedding_proj_dim if not learn_speaker_embedding else 0,
             normalize_speaker_embedding=normalize_speaker_embedding,
             film_scale_bound=film_scale_bound,
             film_shift_bound=film_shift_bound,

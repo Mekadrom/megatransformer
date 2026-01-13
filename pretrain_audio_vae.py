@@ -171,6 +171,157 @@ class SpeakerClassifier(torch.nn.Module):
 
         return self.fc_out(x)
 
+
+class LearnedSpeakerClassifier(torch.nn.Module):
+    """
+    Classifier to predict speaker ID from learned speaker embeddings.
+
+    Unlike the GRL SpeakerClassifier (which operates on latents with gradient reversal),
+    this classifier operates on the learned speaker embeddings with DIRECT gradients.
+    This explicitly trains the speaker head to produce speaker-discriminative features.
+
+    Used together with GRL:
+    - GRL on latents: "don't encode speaker info here" (adversarial)
+    - This classifier on speaker embeddings: "DO encode speaker info here" (direct supervision)
+
+    Architecture: Simple MLP since input is already a pooled vector [B, embedding_dim]
+    """
+    def __init__(self, embedding_dim: int, num_speakers: int, hidden_dim: int = 256):
+        super().__init__()
+
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(embedding_dim, hidden_dim),
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(0.2),
+
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(0.2),
+
+            torch.nn.Linear(hidden_dim, num_speakers),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.classifier:
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+
+    def forward(self, speaker_embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass - direct classification (no gradient reversal).
+
+        Args:
+            speaker_embedding: [B, embedding_dim] learned speaker embedding from encoder
+
+        Returns:
+            [B, num_speakers] logits for speaker classification
+        """
+        # Handle 3D input [B, 1, D] -> [B, D]
+        if speaker_embedding.dim() == 3:
+            speaker_embedding = speaker_embedding.squeeze(1)
+
+        return self.classifier(speaker_embedding)
+
+
+class ArcFaceLoss(torch.nn.Module):
+    """
+    Additive Angular Margin Loss (ArcFace) for learning speaker embeddings.
+
+    Unlike simple classification which only learns a decision boundary, ArcFace
+    explicitly shapes the embedding geometry by:
+    - Normalizing embeddings to unit hypersphere
+    - Adding angular margin to target class
+    - Scaling logits to sharpen the softmax
+
+    This forces same-speaker embeddings to cluster tightly together with angular
+    separation between different speakers - the same property that makes ECAPA-TDNN
+    embeddings effective for speaker verification.
+
+    Reference: Deng et al., "ArcFace: Additive Angular Margin Loss for Deep Face Recognition"
+
+    Args:
+        embedding_dim: Dimension of input speaker embeddings
+        num_speakers: Number of speaker classes
+        scale: Logit scale factor (higher = sharper softmax, typical: 30-64)
+        margin: Angular margin in radians (typical: 0.2-0.5)
+    """
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_speakers: int,
+        scale: float = 30.0,
+        margin: float = 0.2,
+    ):
+        super().__init__()
+        self.scale = scale
+        self.margin = margin
+        self.num_speakers = num_speakers
+        self.embedding_dim = embedding_dim
+
+        # Learnable class center weights (one per speaker)
+        self.weight = torch.nn.Parameter(torch.FloatTensor(num_speakers, embedding_dim))
+        torch.nn.init.xavier_uniform_(self.weight)
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """
+        Compute ArcFace loss.
+
+        Args:
+            embeddings: [B, D] speaker embeddings (will be L2 normalized)
+            labels: [B] speaker class labels
+
+        Returns:
+            Tuple of (loss, logits, accuracy) for logging
+        """
+        # Handle 3D input [B, 1, D] -> [B, D]
+        if embeddings.dim() == 3:
+            embeddings = embeddings.squeeze(1)
+
+        # L2 normalize embeddings and weights to project onto unit hypersphere
+        embeddings_norm = F.normalize(embeddings, p=2, dim=1)
+        weights_norm = F.normalize(self.weight, p=2, dim=1)
+
+        # Compute cosine similarity (dot product of normalized vectors)
+        cos_theta = F.linear(embeddings_norm, weights_norm)  # [B, num_speakers]
+
+        # Clamp for numerical stability before acos
+        cos_theta_clamped = cos_theta.clamp(-1 + 1e-7, 1 - 1e-7)
+
+        # Convert to angle
+        theta = torch.acos(cos_theta_clamped)
+
+        # Add angular margin only to the target class
+        # This pushes the target class embedding further from the decision boundary
+        one_hot = F.one_hot(labels, num_classes=self.num_speakers).float()
+        theta_m = theta + one_hot * self.margin
+
+        # Convert back to cosine (with margin applied to target)
+        cos_theta_m = torch.cos(theta_m)
+
+        # Scale logits (higher scale = sharper probability distribution)
+        logits = self.scale * cos_theta_m
+
+        # Standard cross-entropy on scaled logits
+        loss = F.cross_entropy(logits, labels)
+
+        # Compute accuracy for logging (use original cos_theta for predictions)
+        with torch.no_grad():
+            preds = cos_theta.argmax(dim=-1)
+            accuracy = (preds == labels).float().mean().item()
+
+        return loss, logits, accuracy
+
+
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
     """Get TensorBoard writer from trainer callbacks."""
     if hasattr(trainer, 'callback_handler'):
@@ -437,6 +588,9 @@ class AudioVAEReconstructionCallback(TrainerCallback):
 
                     mel_length = sample.get("mel_spec_length", mel.shape[-1])
 
+                    # Trim to actual length before inference (avoid wasted compute on padding)
+                    mel = mel[..., :mel_length]
+
                     # Prepare speaker embedding if available
                     spk_emb = None
                     if speaker_embedding is not None:
@@ -451,17 +605,30 @@ class AudioVAEReconstructionCallback(TrainerCallback):
                         speaker_embedding=spk_emb,
                     )
 
+                    # Determine which speaker embedding to use for decode:
+                    # If model learns speaker embedding, encode to get learned embedding
+                    # Otherwise use the pretrained speaker embedding from dataset
+                    encoder_learns_speaker = hasattr(model.encoder, 'learn_speaker_embedding') and model.encoder.learn_speaker_embedding
+                    if encoder_learns_speaker:
+                        # Get learned speaker embedding from encoder
+                        enc_result = model.encode(mel_input)
+                        # encode returns (mu, logvar, learned_speaker_emb) when learn_speaker_embedding=True
+                        learned_spk_emb = enc_result[2] if len(enc_result) > 2 else None
+                        decode_spk_emb = learned_spk_emb if learned_spk_emb is not None else spk_emb
+                    else:
+                        decode_spk_emb = spk_emb
+
                     # Store sample data for cross-speaker reconstruction later
                     eval_samples_data.append({
                         "mel": mel,  # [1, n_mels, T]
-                        "speaker_embedding": speaker_embedding,  # [192] or None
+                        "speaker_embedding": speaker_embedding,  # [192] or None (pretrained)
                         "mu": mu.cpu(),  # [1, C, H, W]
                         "mel_length": mel_length,
                     })
 
                     # Generate mu-only reconstruction (no sampling, z = mu)
                     # This is what diffusion will see during inference
-                    recon_mu_only = model.decode(mu, speaker_embedding=spk_emb)
+                    recon_mu_only = model.decode(mu, speaker_embedding=decode_spk_emb)
 
                     # Debug: print stats for first sample to diagnose mu_only vs reparameterized difference
                     if i == 0:
@@ -485,7 +652,7 @@ class AudioVAEReconstructionCallback(TrainerCallback):
                               f"mean={recon_mu_only.mean().item():.4f}, std={recon_mu_only.std().item():.4f}, "
                               f"min={recon_mu_only.min().item():.4f}, max={recon_mu_only.max().item():.4f}")
                         # Also check if recon from decode(z) matches reconstruct_with_attention
-                        recon_z_direct = model.decode(z, speaker_embedding=spk_emb)
+                        recon_z_direct = model.decode(z, speaker_embedding=decode_spk_emb)
                         print(f"[DEBUG mu_only] recon from decode(z): "
                               f"mean={recon_z_direct.mean().item():.4f}, std={recon_z_direct.std().item():.4f}")
 
@@ -502,12 +669,16 @@ class AudioVAEReconstructionCallback(TrainerCallback):
                     all_logvar_means.append(logvar.mean().item())
 
                     for loss_name, loss_val in losses.items():
+                        # Skip non-scalar values like learned_speaker_embedding
+                        if isinstance(loss_val, torch.Tensor):
+                            if loss_val.numel() != 1:
+                                continue
+                            loss_val = loss_val.item()
+                        elif not isinstance(loss_val, (int, float)):
+                            continue
                         if loss_name not in all_losses:
                             all_losses[loss_name] = []
-                        if isinstance(loss_val, torch.Tensor):
-                            all_losses[loss_name].append(loss_val.item())
-                        else:
-                            all_losses[loss_name].append(loss_val)
+                        all_losses[loss_name].append(loss_val)
 
                     # Get tensors for visualization
                     mel_cpu = mel.squeeze(0).cpu().numpy()
@@ -546,10 +717,14 @@ class AudioVAEReconstructionCallback(TrainerCallback):
                         tag=f"eval_vae/comparison_mu_only/{i}"
                     )
 
-                    # Log per-example losses
+                    # Log per-example losses (skip non-scalar values like learned_speaker_embedding)
                     for loss_name, loss_val in losses.items():
                         if isinstance(loss_val, torch.Tensor):
+                            if loss_val.numel() != 1:
+                                continue
                             loss_val = loss_val.item()
+                        elif not isinstance(loss_val, (int, float)):
+                            continue
                         writer.add_scalar(f"eval_vae/example_{i}/{loss_name}", loss_val, global_step)
 
                     # Log latent channel visualizations for first few samples
@@ -626,6 +801,9 @@ class AudioVAEReconstructionCallback(TrainerCallback):
             if s["speaker_embedding"] is not None
         ]
 
+        # Check if model uses learned speaker embeddings
+        encoder_learns_speaker = hasattr(model.encoder, 'learn_speaker_embedding') and model.encoder.learn_speaker_embedding
+
         if len(samples_with_speakers) >= 2:
             print("Generating cross-speaker reconstructions on eval samples...")
 
@@ -644,17 +822,33 @@ class AudioVAEReconstructionCallback(TrainerCallback):
 
                         # Reconstruct A's content with B's speaker embedding
                         mu_a = sample_a["mu"].to(device)
-                        spk_emb_b = sample_b["speaker_embedding"].unsqueeze(0).to(device)
-                        if spk_emb_b.dim() == 2:
-                            spk_emb_b = spk_emb_b.unsqueeze(1)  # [1, 1, 192]
+
+                        # Get speaker embedding for B (encode to get learned, or use pretrained)
+                        if encoder_learns_speaker:
+                            # Encode B's mel to get learned speaker embedding
+                            mel_b_input = sample_b["mel"].unsqueeze(0).to(device)
+                            enc_result_b = model.encode(mel_b_input)
+                            spk_emb_b = enc_result_b[2]  # learned_speaker_emb
+                        else:
+                            spk_emb_b = sample_b["speaker_embedding"].unsqueeze(0).to(device)
+                            if spk_emb_b.dim() == 2:
+                                spk_emb_b = spk_emb_b.unsqueeze(1)  # [1, 1, 192]
 
                         cross_recon_a_with_b = model.decode(mu_a, speaker_embedding=spk_emb_b)
 
                         # Reconstruct B's content with A's speaker embedding
                         mu_b = sample_b["mu"].to(device)
-                        spk_emb_a = sample_a["speaker_embedding"].unsqueeze(0).to(device)
-                        if spk_emb_a.dim() == 2:
-                            spk_emb_a = spk_emb_a.unsqueeze(1)  # [1, 1, 192]
+
+                        # Get speaker embedding for A (encode to get learned, or use pretrained)
+                        if encoder_learns_speaker:
+                            # Encode A's mel to get learned speaker embedding
+                            mel_a_input = sample_a["mel"].unsqueeze(0).to(device)
+                            enc_result_a = model.encode(mel_a_input)
+                            spk_emb_a = enc_result_a[2]  # learned_speaker_emb
+                        else:
+                            spk_emb_a = sample_a["speaker_embedding"].unsqueeze(0).to(device)
+                            if spk_emb_a.dim() == 2:
+                                spk_emb_a = spk_emb_a.unsqueeze(1)  # [1, 1, 192]
 
                         cross_recon_b_with_a = model.decode(mu_b, speaker_embedding=spk_emb_a)
 
@@ -750,6 +944,12 @@ class AudioVAEReconstructionCallback(TrainerCallback):
 
                 with autocast(device.type, dtype=dtype):
                     for i, mel in enumerate(self.example_mels):
+                        # Get original length for this example
+                        original_length = self.example_original_lengths[i] if i < len(self.example_original_lengths) else mel.shape[-1]
+
+                        # Trim to actual length before inference (avoid wasted compute on padding)
+                        mel_trimmed = mel[..., :original_length]
+
                         # Get speaker embedding for this example (if available)
                         spk_emb = None
                         if i < len(self.example_speaker_embeddings):
@@ -758,13 +958,19 @@ class AudioVAEReconstructionCallback(TrainerCallback):
                                 spk_emb = spk_emb.unsqueeze(1)  # [1, 1, 192]
 
                         recon, mu, logvar, losses = model(
-                            mel.unsqueeze(0).to(device),
+                            mel_trimmed.unsqueeze(0).to(device),
                             speaker_embedding=spk_emb,
                         )
 
+                        # Determine which speaker embedding to use for decode:
+                        # If model learns speaker embedding, use the learned one from encoder
+                        # Otherwise use the pretrained speaker embedding from dataset
+                        learned_spk_emb = losses.get("learned_speaker_embedding", None)
+                        decode_spk_emb = learned_spk_emb if learned_spk_emb is not None else spk_emb
+
                         # Generate mu-only reconstruction (no sampling, z = mu)
                         # This is what diffusion will see during inference
-                        recon_mu_only = model.decode(mu, speaker_embedding=spk_emb)
+                        recon_mu_only = model.decode(mu, speaker_embedding=decode_spk_emb)
 
                         # Get original length for this example
                         original_length = self.example_original_lengths[i] if i < len(self.example_original_lengths) else mel.shape[-1]
@@ -824,10 +1030,14 @@ class AudioVAEReconstructionCallback(TrainerCallback):
                             tag=f"audio_vae/comparison_padded/{i}"
                         )
 
-                        # Log per-example losses
+                        # Log per-example losses (skip non-scalar values like learned_speaker_embedding)
                         for loss_name, loss_val in losses.items():
                             if isinstance(loss_val, torch.Tensor):
+                                if loss_val.numel() != 1:
+                                    continue  # Skip non-scalar tensors
                                 loss_val = loss_val.item()
+                            elif not isinstance(loss_val, (int, float)):
+                                continue  # Skip non-numeric values
                             writer.add_scalar(f"audio_vae/example_{i}/{loss_name}", loss_val, global_step)
 
                         # Log latent channel visualizations
@@ -863,6 +1073,8 @@ class AudioVAEReconstructionCallback(TrainerCallback):
 
                     # Cross-speaker reconstruction: reconstruct each mel with the OTHER speaker's embedding
                     # This tests speaker disentanglement - content should be preserved, voice should change
+                    encoder_learns_speaker = hasattr(model.encoder, 'learn_speaker_embedding') and model.encoder.learn_speaker_embedding
+
                     if len(self.example_mels) >= 2 and len(self.example_speaker_embeddings) >= 2:
                         print("Generating cross-speaker reconstructions...")
                         cross_pairs = [
@@ -872,12 +1084,25 @@ class AudioVAEReconstructionCallback(TrainerCallback):
 
                         for mel_idx, spk_idx in cross_pairs:
                             mel = self.example_mels[mel_idx]
-                            cross_spk_emb = self.example_speaker_embeddings[spk_idx].unsqueeze(0).to(device)  # [1, 192]
-                            if cross_spk_emb.dim() == 2:
-                                cross_spk_emb = cross_spk_emb.unsqueeze(1)  # [1, 1, 192]
+                            mel_input = mel.unsqueeze(0).to(device)
 
                             # Encode the mel (get latent representation)
-                            mu, logvar = model.encode(mel.unsqueeze(0).to(device))
+                            enc_result = model.encode(mel_input)
+                            if encoder_learns_speaker:
+                                mu, logvar, _ = enc_result  # Ignore current mel's learned speaker emb
+                            else:
+                                mu, logvar = enc_result
+
+                            # Get cross speaker embedding (from the OTHER sample)
+                            if encoder_learns_speaker:
+                                # Encode the OTHER mel to get its learned speaker embedding
+                                other_mel_input = self.example_mels[spk_idx].unsqueeze(0).to(device)
+                                other_enc_result = model.encode(other_mel_input)
+                                cross_spk_emb = other_enc_result[2]  # learned_speaker_emb
+                            else:
+                                cross_spk_emb = self.example_speaker_embeddings[spk_idx].unsqueeze(0).to(device)  # [1, 192]
+                                if cross_spk_emb.dim() == 2:
+                                    cross_spk_emb = cross_spk_emb.unsqueeze(1)  # [1, 1, 192]
 
                             # Decode with the OTHER speaker's embedding
                             cross_recon = model.decode(mu, speaker_embedding=cross_spk_emb)
@@ -1216,6 +1441,14 @@ class AudioVAEGANTrainer(Trainer):
         film_contrastive_margin_rampup_steps: int = 5000,  # Steps to ramp margin from 0 to max
         # Mu-only reconstruction loss (for diffusion compatibility)
         mu_only_recon_weight: float = 0.0,  # Weight for mu-only reconstruction loss (0 = disabled)
+        # Learned speaker embedding classification (complementary to GRL)
+        # GRL pushes speaker OUT of latents; this pulls speaker INTO learned embeddings
+        learned_speaker_classifier: Optional[torch.nn.Module] = None,
+        learned_speaker_classifier_optimizer: Optional[torch.optim.Optimizer] = None,
+        speaker_id_loss_weight: float = 0.0,  # Weight for speaker ID loss (0 = disabled)
+        speaker_id_loss_type: str = "arcface",  # "classifier" or "arcface"
+        speaker_id_loss_start_step: int = 0,  # Step to start speaker ID loss (0 = from beginning)
+        speaker_id_loss_rampup_steps: int = 0,  # Steps to ramp weight from 0 to max (0 = no rampup)
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -1292,6 +1525,15 @@ class AudioVAEGANTrainer(Trainer):
         # Mu-only reconstruction loss (for diffusion compatibility)
         self.mu_only_recon_weight = mu_only_recon_weight
 
+        # Learned speaker embedding classification (complementary to GRL)
+        self.learned_speaker_classifier = learned_speaker_classifier
+        self.learned_speaker_classifier_optimizer = learned_speaker_classifier_optimizer
+        self.speaker_id_loss_weight = speaker_id_loss_weight
+        self.speaker_id_loss_type = speaker_id_loss_type  # "classifier" or "arcface"
+        self.speaker_id_loss_start_step = speaker_id_loss_start_step
+        self.speaker_id_loss_rampup_steps = speaker_id_loss_rampup_steps
+        self.speaker_id_training_started = False  # Track when training has started (for checkpointing)
+
         self.has_logged_cli = False
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
@@ -1362,6 +1604,12 @@ class AudioVAEGANTrainer(Trainer):
         # Extract FiLM stats if available
         film_stats = losses.pop("film_stats", None) if self.log_film_stats else None
 
+        # Determine which speaker embedding to use for decode operations:
+        # - If model learns speaker embedding, use the learned embedding from encoder output
+        # - Otherwise, use the pretrained speaker embedding from dataset
+        learned_speaker_embedding = losses.get("learned_speaker_embedding", None)
+        decode_speaker_embedding = learned_speaker_embedding if learned_speaker_embedding is not None else speaker_embedding
+
         # Get VAE reconstruction loss
         vae_loss = losses["total_loss"]
 
@@ -1370,7 +1618,7 @@ class AudioVAEGANTrainer(Trainer):
         mu_only_recon_loss = torch.tensor(0.0, device=mel_spec.device)
         if self.mu_only_recon_weight > 0:
             # Decode mu directly (no reparameterization noise)
-            recon_mu_only = model.decode(mu.detach(), speaker_embedding=speaker_embedding)[..., :mel_spec.shape[-1]]
+            recon_mu_only = model.decode(mu.detach(), speaker_embedding=decode_speaker_embedding)[..., :mel_spec.shape[-1]]
             # Use same loss as main reconstruction (L1 or MSE depending on config)
             if hasattr(model, 'mse_loss_weight') and model.mse_loss_weight > 0:
                 mu_only_recon_loss = mu_only_recon_loss + model.mse_loss_weight * F.mse_loss(recon_mu_only, mel_spec)
@@ -1410,7 +1658,7 @@ class AudioVAEGANTrainer(Trainer):
 
                 # Ensure discriminator is on the same device as inputs
                 if next(self.discriminator.parameters()).device != mel_spec.device:
-                    self.discriminator.to(mel_spec.device)
+                    self.discriminator = self.discriminator.to(mel_spec.device)
 
                 # Apply instance noise to both real and fake mel spectrograms
                 real_for_disc = add_mel_instance_noise(mel_spec, noise_std) if noise_std > 0 else mel_spec
@@ -1609,15 +1857,124 @@ class AudioVAEGANTrainer(Trainer):
                     self._log_scalar(f"{prefix}grl/speaker_classifier_acc", speaker_classifier_acc, global_step, skip_zero=False)
                     self._log_scalar(f"{prefix}grl/weighted_loss", self.grl_weight * grl_loss, global_step)
 
+        # Learned speaker embedding classification loss
+        # Complementary to GRL: GRL pushes speaker info OUT of latents, this pulls it INTO the speaker head
+        # Uses direct gradients (no reversal) to train the speaker head to be discriminative
+        speaker_id_loss = torch.tensor(0.0, device=mel_spec.device)
+        speaker_id_acc = 0.0
+        speaker_id_enabled = (
+            self.learned_speaker_classifier is not None
+            and self.speaker_id_loss_weight > 0
+            and learned_speaker_embedding is not None  # Only works with learned speaker embeddings
+        )
+        if speaker_id_enabled:
+            # Get speaker IDs from batch
+            speaker_ids = inputs.get("speaker_ids", None)
+            if speaker_ids is not None and not isinstance(speaker_ids, torch.Tensor):
+                speaker_ids = torch.tensor(speaker_ids, device=mel_spec.device, dtype=torch.long)
+
+            if speaker_ids is not None:
+                # Mark training as started (for checkpoint saving)
+                if not self.speaker_id_training_started:
+                    # Get num_speakers depending on loss type
+                    if self.speaker_id_loss_type == "arcface":
+                        num_speakers = self.learned_speaker_classifier.num_speakers
+                    else:
+                        num_speakers = self.learned_speaker_classifier.classifier[-1].out_features
+                    print(f"Learned speaker ID classification starting at step {global_step}")
+                    print(f"  loss_type: {self.speaker_id_loss_type}")
+                    print(f"  speaker_ids: min={speaker_ids.min().item()}, max={speaker_ids.max().item()}, "
+                          f"unique={len(torch.unique(speaker_ids))}, batch_size={len(speaker_ids)}")
+                    print(f"  classifier num_speakers: {num_speakers}")
+                    print(f"  learned_speaker_embedding shape: {learned_speaker_embedding.shape}")
+
+                    # Validate speaker_ids are in valid range
+                    if speaker_ids.min() < 0:
+                        raise ValueError(f"speaker_ids contains negative values (min={speaker_ids.min().item()})")
+                    if speaker_ids.max() >= num_speakers:
+                        raise ValueError(
+                            f"speaker_ids max ({speaker_ids.max().item()}) >= num_speakers ({num_speakers}). "
+                            f"Either increase --num_speakers or check if speaker_ids are 1-indexed "
+                            f"(should be 0-indexed for cross_entropy)."
+                        )
+                    self.speaker_id_training_started = True
+
+                # Ensure classifier is on same device
+                if next(self.learned_speaker_classifier.parameters()).device != mel_spec.device:
+                    self.learned_speaker_classifier.to(mel_spec.device)
+
+                if self.speaker_id_loss_type == "arcface":
+                    # ArcFace loss: returns (loss, logits, accuracy) tuple
+                    # Update ArcFace weights FIRST with detached embeddings
+                    if self.learned_speaker_classifier_optimizer is not None and torch.is_grad_enabled():
+                        self.learned_speaker_classifier_optimizer.zero_grad()
+                        classifier_loss, _, _ = self.learned_speaker_classifier(
+                            learned_speaker_embedding.detach(), speaker_ids
+                        )
+                        classifier_loss.backward()
+                        self.learned_speaker_classifier_optimizer.step()
+
+                    # Forward pass with gradients flowing to encoder
+                    speaker_id_loss, speaker_id_logits, speaker_id_acc = self.learned_speaker_classifier(
+                        learned_speaker_embedding, speaker_ids
+                    )
+                else:
+                    # Standard classifier: returns logits only
+                    # Update classifier FIRST with detached embeddings (train classifier to recognize speakers)
+                    if self.learned_speaker_classifier_optimizer is not None and torch.is_grad_enabled():
+                        self.learned_speaker_classifier_optimizer.zero_grad()
+                        classifier_logits = self.learned_speaker_classifier(learned_speaker_embedding.detach())
+                        classifier_loss = F.cross_entropy(classifier_logits, speaker_ids)
+                        classifier_loss.backward()
+                        self.learned_speaker_classifier_optimizer.step()
+
+                    # Forward pass with gradients flowing to encoder (train speaker head to produce discriminative embeddings)
+                    speaker_id_logits = self.learned_speaker_classifier(learned_speaker_embedding)
+                    speaker_id_loss = F.cross_entropy(speaker_id_logits, speaker_ids)
+
+                    # Compute accuracy for logging
+                    with torch.no_grad():
+                        speaker_id_preds = speaker_id_logits.argmax(dim=-1)
+                        speaker_id_acc = (speaker_id_preds == speaker_ids).float().mean().item()
+
+                # Compute effective weight with ramping
+                ramp_progress = 1.0  # Default: fully ramped
+                if self.speaker_id_loss_start_step > 0 and global_step < self.speaker_id_loss_start_step:
+                    # Haven't reached start step yet
+                    effective_speaker_id_weight = 0.0
+                    ramp_progress = 0.0
+                elif self.speaker_id_loss_rampup_steps > 0:
+                    # Ramp from 0 to max over rampup_steps
+                    steps_since_start = max(0, global_step - self.speaker_id_loss_start_step)
+                    ramp_progress = min(1.0, steps_since_start / self.speaker_id_loss_rampup_steps)
+                    effective_speaker_id_weight = self.speaker_id_loss_weight * ramp_progress
+                else:
+                    # No ramping
+                    effective_speaker_id_weight = self.speaker_id_loss_weight
+
+                # Add to total loss (direct gradients to encoder's speaker head)
+                total_loss = total_loss + effective_speaker_id_weight * speaker_id_loss
+
+                # Log speaker ID metrics
+                if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                    prefix = "train/" if model.training else "eval/"
+                    self._log_scalar(f"{prefix}speaker_id/loss", speaker_id_loss, global_step)
+                    self._log_scalar(f"{prefix}speaker_id/accuracy", speaker_id_acc, global_step, skip_zero=False)
+                    self._log_scalar(f"{prefix}speaker_id/weighted_loss", effective_speaker_id_weight * speaker_id_loss, global_step)
+                    self._log_scalar(f"{prefix}speaker_id/effective_weight", effective_speaker_id_weight, global_step)
+                    self._log_scalar(f"{prefix}speaker_id/ramp_progress", ramp_progress, global_step, skip_zero=False)
+
         # FiLM contrastive loss - encourages different speaker embeddings to produce different outputs
         # This penalizes the decoder for ignoring speaker embeddings
         # Key insight: weight loss by embedding similarity so we don't penalize same/similar speakers
         film_contrastive_loss = torch.tensor(0.0, device=mel_spec.device)
+
+        # Use decode_speaker_embedding (learned or pretrained, extracted earlier)
         film_contrastive_enabled = (
             self.film_contrastive_loss_weight > 0
             and global_step >= self.film_contrastive_loss_start_step
-            and speaker_embedding is not None
-            and speaker_embedding.shape[0] > 1  # Need at least 2 samples for shuffling
+            and decode_speaker_embedding is not None
+            and decode_speaker_embedding.shape[0] > 1  # Need at least 2 samples for shuffling
         )
         if film_contrastive_enabled:
             # Compute margin alpha (ramps from 0 to film_contrastive_margin_max over rampup_steps)
@@ -1626,18 +1983,18 @@ class AudioVAEGANTrainer(Trainer):
             margin = self.film_contrastive_margin_max * film_contrastive_margin_alpha
 
             # Shuffle speaker embeddings to create mismatched (audio, wrong_speaker) pairs
-            batch_size = speaker_embedding.shape[0]
-            perm = torch.randperm(batch_size, device=speaker_embedding.device)
+            batch_size = decode_speaker_embedding.shape[0]
+            perm = torch.randperm(batch_size, device=decode_speaker_embedding.device)
             # Ensure no sample maps to itself (for valid pairs)
             same_indices = (perm == torch.arange(batch_size, device=perm.device))
             if same_indices.any():
                 # Shift indices that map to themselves
                 perm[same_indices] = (perm[same_indices] + 1) % batch_size
-            shuffled_speaker_embedding = speaker_embedding[perm]
+            shuffled_speaker_embedding = decode_speaker_embedding[perm]
 
             # Compute embedding similarity to weight the loss
             # Flatten to [B, D] for cosine similarity
-            emb_flat = speaker_embedding.squeeze(1) if speaker_embedding.dim() == 3 else speaker_embedding
+            emb_flat = decode_speaker_embedding.squeeze(1) if decode_speaker_embedding.dim() == 3 else decode_speaker_embedding
             shuffled_emb_flat = shuffled_speaker_embedding.squeeze(1) if shuffled_speaker_embedding.dim() == 3 else shuffled_speaker_embedding
             emb_similarity = F.cosine_similarity(emb_flat, shuffled_emb_flat, dim=-1)  # [B]
 
@@ -1677,11 +2034,14 @@ class AudioVAEGANTrainer(Trainer):
                 self._log_scalar(f"{prefix}film_contrastive/weighted_loss",
                                self.film_contrastive_loss_weight * film_contrastive_loss, global_step)
 
-        # Log losses
+        # Log losses (skip non-loss values like learned_speaker_embedding)
         if global_step % self.args.logging_steps == 0 and self.writer is not None:
             prefix = "train/" if model.training else "eval/"
             for loss_name, loss in losses.items():
-                self._log_scalar(f"{prefix}vae_{loss_name}", loss.mean(), global_step)
+                # Skip non-scalar tensors (e.g., learned_speaker_embedding)
+                if isinstance(loss, torch.Tensor) and loss.numel() > 1 and not loss_name.endswith("_loss"):
+                    continue
+                self._log_scalar(f"{prefix}vae_{loss_name}", loss.mean() if isinstance(loss, torch.Tensor) else loss, global_step)
             # Log mu and logvar stats
             self._log_scalar(f"{prefix}vae_mu_mean", mu.mean(), global_step)
             self._log_scalar(f"{prefix}vae_mu_std", mu.std(), global_step)
@@ -1715,10 +2075,10 @@ class AudioVAEGANTrainer(Trainer):
                     self._log_scalar(f"{prefix}audio_perceptual/{loss_name}", loss_val, global_step)
                 self._log_scalar(f"{prefix}audio_perceptual_weighted", self.audio_perceptual_loss_weight * audio_perceptual_loss_value, global_step)
 
-            # Log speaker embedding statistics (before any normalization in model)
-            if speaker_embedding is not None:
+            # Log speaker embedding statistics (learned or pretrained, whichever is used for decoding)
+            if decode_speaker_embedding is not None:
                 # Flatten to [B, D] if needed
-                spk_emb = speaker_embedding.squeeze(1) if speaker_embedding.dim() == 3 else speaker_embedding
+                spk_emb = decode_speaker_embedding.squeeze(1) if decode_speaker_embedding.dim() == 3 else decode_speaker_embedding
                 self._log_scalar(f"{prefix}speaker_emb/mean", spk_emb.mean(), global_step)
                 self._log_scalar(f"{prefix}speaker_emb/std", spk_emb.std(), global_step)
                 # L2 norm per sample, then average
@@ -1726,6 +2086,102 @@ class AudioVAEGANTrainer(Trainer):
                 self._log_scalar(f"{prefix}speaker_emb/l2_norm_mean", l2_norms.mean(), global_step)
                 self._log_scalar(f"{prefix}speaker_emb/l2_norm_min", l2_norms.min(), global_step)
                 self._log_scalar(f"{prefix}speaker_emb/l2_norm_max", l2_norms.max(), global_step)
+                # Log whether using learned embedding
+                if learned_speaker_embedding is not None:
+                    self._log_scalar(f"{prefix}speaker_emb/is_learned", 1.0, global_step)
+
+                    # Log within-speaker vs between-speaker similarity (measures embedding separability)
+                    speaker_ids = inputs.get("speaker_ids", None)
+                    if speaker_ids is not None:
+                        if not isinstance(speaker_ids, torch.Tensor):
+                            speaker_ids = torch.tensor(speaker_ids, device=mel_spec.device, dtype=torch.long)
+
+                        # Normalize embeddings for cosine similarity
+                        emb_flat = spk_emb  # Already [B, D] from above
+                        emb_norm = F.normalize(emb_flat, dim=-1)
+
+                        # Compute similarity matrix [B, B]
+                        sim_matrix = emb_norm @ emb_norm.T
+
+                        # Create masks for same-speaker and different-speaker pairs
+                        batch_size = speaker_ids.shape[0]
+                        same_speaker_mask = speaker_ids.unsqueeze(0) == speaker_ids.unsqueeze(1)  # [B, B]
+                        eye_mask = torch.eye(batch_size, dtype=torch.bool, device=same_speaker_mask.device)
+
+                        # Within-speaker: same speaker, excluding self-similarity (diagonal)
+                        within_mask = same_speaker_mask & ~eye_mask
+                        # Between-speaker: different speakers
+                        between_mask = ~same_speaker_mask
+
+                        if within_mask.any():
+                            within_sim = sim_matrix[within_mask].mean()
+                            self._log_scalar(f"{prefix}speaker_emb/within_speaker_sim", within_sim, global_step)
+
+                        if between_mask.any():
+                            between_sim = sim_matrix[between_mask].mean()
+                            self._log_scalar(f"{prefix}speaker_emb/between_speaker_sim", between_sim, global_step)
+
+                        if within_mask.any() and between_mask.any():
+                            sim_margin = within_sim - between_sim
+                            self._log_scalar(f"{prefix}speaker_emb/sim_margin", sim_margin, global_step)
+
+                        # === Debug metrics for diagnosing embedding collapse ===
+
+                        # 1. All-pairs similarity statistics (excluding self-similarity)
+                        off_diag_mask = ~eye_mask
+                        all_pairs_sim = sim_matrix[off_diag_mask]
+                        self._log_scalar(f"{prefix}speaker_emb/all_pairs_sim_min", all_pairs_sim.min(), global_step)
+                        self._log_scalar(f"{prefix}speaker_emb/all_pairs_sim_max", all_pairs_sim.max(), global_step)
+                        self._log_scalar(f"{prefix}speaker_emb/all_pairs_sim_median", all_pairs_sim.median(), global_step)
+                        self._log_scalar(f"{prefix}speaker_emb/all_pairs_sim_std", all_pairs_sim.std(), global_step)
+
+                        # 2. Per-dimension statistics (detect dimension collapse)
+                        # emb_flat shape: [B, D]
+                        per_dim_mean = emb_flat.mean(dim=0)  # [D]
+                        per_dim_std = emb_flat.std(dim=0)    # [D]
+                        # Count how many dimensions have very low variance (< 0.01)
+                        collapsed_dims = (per_dim_std < 0.01).sum().item()
+                        active_dims = (per_dim_std >= 0.01).sum().item()
+                        self._log_scalar(f"{prefix}speaker_emb/collapsed_dims", collapsed_dims, global_step, skip_zero=False)
+                        self._log_scalar(f"{prefix}speaker_emb/active_dims", active_dims, global_step, skip_zero=False)
+                        self._log_scalar(f"{prefix}speaker_emb/per_dim_std_mean", per_dim_std.mean(), global_step)
+                        self._log_scalar(f"{prefix}speaker_emb/per_dim_std_min", per_dim_std.min(), global_step)
+                        self._log_scalar(f"{prefix}speaker_emb/per_dim_std_max", per_dim_std.max(), global_step)
+
+                        # 3. Similarity to batch centroid (are all embeddings collapsing to same point?)
+                        centroid = emb_flat.mean(dim=0, keepdim=True)  # [1, D]
+                        centroid_norm = F.normalize(centroid, dim=-1)
+                        sim_to_centroid = (emb_norm * centroid_norm).sum(dim=-1)  # [B]
+                        self._log_scalar(f"{prefix}speaker_emb/sim_to_centroid_mean", sim_to_centroid.mean(), global_step)
+                        self._log_scalar(f"{prefix}speaker_emb/sim_to_centroid_min", sim_to_centroid.min(), global_step)
+                        # High mean + low variance = collapse
+
+                        # 4. L2 norm variance (should have some variation across samples)
+                        self._log_scalar(f"{prefix}speaker_emb/l2_norm_std", l2_norms.std(), global_step)
+
+                        # 5. Effective dimensionality via PCA-like measure
+                        # Compute variance explained by top-k principal components
+                        # This is expensive, so only compute occasionally
+                        if global_step % (self.args.logging_steps * 10) == 0:
+                            try:
+                                # Center the data
+                                centered = emb_flat - emb_flat.mean(dim=0, keepdim=True)
+                                # SVD to get singular values (proportional to sqrt of eigenvalues)
+                                _, s, _ = torch.svd(centered)
+                                # Variance explained by each component
+                                var_explained = s ** 2 / (s ** 2).sum()
+                                # Cumulative variance
+                                cumvar = var_explained.cumsum(dim=0)
+                                # Effective dimensionality: how many dims to explain 95% variance
+                                eff_dims_95 = (cumvar < 0.95).sum().item() + 1
+                                eff_dims_90 = (cumvar < 0.90).sum().item() + 1
+                                self._log_scalar(f"{prefix}speaker_emb/eff_dims_95pct", eff_dims_95, global_step, skip_zero=False)
+                                self._log_scalar(f"{prefix}speaker_emb/eff_dims_90pct", eff_dims_90, global_step, skip_zero=False)
+                                # Top singular value ratio (if top is dominant, embeddings are 1D)
+                                top1_ratio = var_explained[0].item() if len(var_explained) > 0 else 0.0
+                                self._log_scalar(f"{prefix}speaker_emb/top1_var_ratio", top1_ratio, global_step)
+                            except Exception:
+                                pass  # SVD can fail on degenerate matrices
 
             # Log FiLM statistics (for diagnosing speaker conditioning health)
             if film_stats is not None:
@@ -1866,6 +2322,19 @@ class AudioVAEGANTrainer(Trainer):
             }, speaker_classifier_path)
             print(f"Speaker classifier (GRL) saved to {speaker_classifier_path}")
 
+        # Save learned speaker classifier (speaker ID on embeddings) if enabled and training has started
+        if self.learned_speaker_classifier is not None and self.speaker_id_training_started:
+            os.makedirs(output_dir, exist_ok=True)
+            learned_speaker_classifier_path = os.path.join(output_dir, "learned_speaker_classifier.pt")
+            torch.save({
+                "learned_speaker_classifier_state_dict": self.learned_speaker_classifier.state_dict(),
+                "learned_speaker_classifier_optimizer_state_dict": (
+                    self.learned_speaker_classifier_optimizer.state_dict()
+                    if self.learned_speaker_classifier_optimizer is not None else None
+                ),
+            }, learned_speaker_classifier_path)
+            print(f"Learned speaker classifier saved to {learned_speaker_classifier_path}")
+
 
 def load_discriminator(
     resume_from_checkpoint: str,
@@ -1947,6 +2416,46 @@ def load_speaker_classifier(
     return speaker_classifier, speaker_classifier_optimizer, False
 
 
+def load_learned_speaker_classifier(
+    resume_from_checkpoint: str,
+    learned_speaker_classifier: torch.nn.Module,
+    learned_speaker_classifier_optimizer: Optional[torch.optim.Optimizer] = None,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[torch.nn.Module, Optional[torch.optim.Optimizer], bool]:
+    """
+    Load learned speaker classifier (speaker ID on embeddings) from checkpoint if it exists.
+
+    Handles errors gracefully - if loading fails, returns the fresh classifier
+    and continues training from scratch.
+    """
+    if resume_from_checkpoint is None:
+        print("No checkpoint path provided, training learned speaker classifier from scratch")
+        return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
+
+    learned_speaker_classifier_path = os.path.join(resume_from_checkpoint, "learned_speaker_classifier.pt")
+    if os.path.exists(learned_speaker_classifier_path):
+        print(f"Loading learned speaker classifier from {learned_speaker_classifier_path}")
+        try:
+            checkpoint = torch.load(learned_speaker_classifier_path, map_location=device, weights_only=True)
+            learned_speaker_classifier.load_state_dict(checkpoint["learned_speaker_classifier_state_dict"])
+
+            if learned_speaker_classifier_optimizer is not None and checkpoint.get("learned_speaker_classifier_optimizer_state_dict"):
+                try:
+                    learned_speaker_classifier_optimizer.load_state_dict(checkpoint["learned_speaker_classifier_optimizer_state_dict"])
+                except Exception as e:
+                    print(f"Warning: Failed to load learned speaker classifier optimizer state: {e}")
+                    print("Continuing with fresh optimizer state...")
+
+            return learned_speaker_classifier, learned_speaker_classifier_optimizer, True
+        except Exception as e:
+            print(f"Warning: Failed to load learned speaker classifier checkpoint: {e}")
+            print("Continuing with fresh learned speaker classifier...")
+            return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
+
+    print("No existing learned speaker classifier checkpoint found, training from scratch")
+    return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
+
+
 def main():
     args, unk = megatransformer_utils.parse_args()
     run_dir = os.path.join(args.logging_base_dir, args.run_name)
@@ -1991,6 +2500,12 @@ def main():
     zero_init_film_bias = unk_dict.get("zero_init_film_bias", "false").lower() == "true"
     # Remove bias from FiLM projections entirely - zero embedding = zero modulation (structurally enforced)
     film_no_bias = unk_dict.get("film_no_bias", "false").lower() == "true"
+
+    # Learned speaker embedding: if True, encoder outputs a learned speaker embedding instead of using pretrained
+    # The speaker head uses global pooling to remove temporal structure, outputting a single speaker vector
+    # With GRL pushing speaker info out of latents, the speaker head learns to capture speaker characteristics
+    learn_speaker_embedding = unk_dict.get("learn_speaker_embedding", "false").lower() == "true"
+    learned_speaker_dim = int(unk_dict.get("learned_speaker_dim", 256))
 
     # FiLM contrastive loss - encourages different speaker embeddings to produce different FiLM outputs
     film_contrastive_loss_weight = float(unk_dict.get("film_contrastive_loss_weight", 0.0))
@@ -2064,6 +2579,20 @@ def main():
     grl_classifier_lr = float(unk_dict.get("grl_classifier_lr", 1e-4))  # Learning rate for speaker classifier
     num_speakers = int(unk_dict.get("num_speakers", 0))  # Number of speaker classes (0 = auto-detect from dataset)
 
+    # Speaker ID classification on learned speaker embeddings (complementary to GRL)
+    # GRL pushes speaker info OUT of latents, this pulls it INTO the speaker head
+    # Only works when learn_speaker_embedding=True
+    speaker_id_loss_weight = float(unk_dict.get("speaker_id_loss_weight", 0.0))  # Weight (0 = disabled)
+    speaker_id_classifier_lr = float(unk_dict.get("speaker_id_classifier_lr", 1e-4))  # Learning rate
+    # Loss type: "classifier" (MLP + cross-entropy) or "arcface" (angular margin for tighter clustering)
+    speaker_id_loss_type = unk_dict.get("speaker_id_loss_type", "arcface")  # "classifier" or "arcface"
+    # ArcFace hyperparameters (only used when speaker_id_loss_type="arcface")
+    arcface_scale = float(unk_dict.get("arcface_scale", 30.0))  # Logit scale (higher = sharper softmax)
+    arcface_margin = float(unk_dict.get("arcface_margin", 0.2))  # Angular margin in radians
+    # Speaker ID loss scheduling (ramps weight from 0 to max over rampup_steps starting at start_step)
+    speaker_id_loss_start_step = int(unk_dict.get("speaker_id_loss_start_step", 0))  # 0 = from beginning
+    speaker_id_loss_rampup_steps = int(unk_dict.get("speaker_id_loss_rampup_steps", 0))  # 0 = no rampup
+
     # FiLM statistics logging - track scale/shift statistics for diagnosing conditioning health
     log_film_stats = unk_dict.get("log_film_stats", "false").lower() == "true"
 
@@ -2083,6 +2612,8 @@ def main():
         film_shift_bound=film_shift_bound,
         zero_init_film_bias=zero_init_film_bias,
         film_no_bias=film_no_bias,
+        learn_speaker_embedding=learn_speaker_embedding,
+        learned_speaker_dim=learned_speaker_dim,
         recon_loss_weight=recon_loss_weight,
         mse_loss_weight=mse_loss_weight,
         l1_loss_weight=l1_loss_weight,
@@ -2108,7 +2639,8 @@ def main():
         if discriminator_config not in mel_discriminator_config_lookup:
             raise ValueError(f"Unknown discriminator config: {discriminator_config}. Available: {list(mel_discriminator_config_lookup.keys())}")
 
-        discriminator = mel_discriminator_config_lookup[discriminator_config]().to(device)
+        # keep on cpu, transfer to device when activated by provided criteria
+        discriminator = mel_discriminator_config_lookup[discriminator_config]()
 
         discriminator_optimizer = torch.optim.AdamW(
             discriminator.parameters(),
@@ -2121,6 +2653,9 @@ def main():
         discriminator, discriminator_optimizer, disc_loaded = load_discriminator(
             args.resume_from_checkpoint, discriminator, discriminator_optimizer, device
         )
+
+        discriminator = discriminator.cpu()
+
         if disc_loaded:
             print("Loaded discriminator from checkpoint")
 
@@ -2187,6 +2722,10 @@ def main():
         print(f"  Normalize speaker embedding: {normalize_speaker_embedding}")
         print(f"  FiLM scale bound: {film_scale_bound} (0=unbounded)")
         print(f"  FiLM shift bound: {film_shift_bound} (0=unbounded)")
+        if learn_speaker_embedding:
+            print(f"  Learned speaker embedding: ENABLED (dim={learned_speaker_dim})")
+        else:
+            print(f"  Learned speaker embedding: DISABLED (using pretrained from dataset)")
         if use_gan and discriminator is not None:
             print(f"GAN training: enabled")
             print(f"Discriminator structure: {discriminator}")
@@ -2359,6 +2898,74 @@ def main():
             print(f"  Speaker classifier LR: {grl_classifier_lr}")
             print(f"  Speaker classifier parameters: {sum(p.numel() for p in speaker_classifier.parameters()):,}")
 
+    # Create learned speaker classifier for speaker ID loss on learned embeddings
+    # Complementary to GRL: GRL pushes speaker OUT of latents, this pulls it INTO the speaker head
+    learned_speaker_classifier = None
+    learned_speaker_classifier_optimizer = None
+    if speaker_id_loss_weight > 0 and learn_speaker_embedding:
+        # Auto-detect num_speakers from dataset if not already set by GRL
+        if num_speakers <= 0:
+            if use_sharded_dataset and hasattr(train_dataset, 'num_speakers') and train_dataset.num_speakers > 0:
+                num_speakers = train_dataset.num_speakers
+                print(f"Auto-detected {num_speakers} speakers from dataset")
+            else:
+                raise ValueError(
+                    "Speaker ID classification requires num_speakers > 0. "
+                    "Either set --num_speakers explicitly, or use sharded dataset format with speaker IDs "
+                    "(enable --include_speaker_id during preprocessing and re-merge shards)."
+                )
+
+        # Check if dataset has speaker_ids available
+        if use_sharded_dataset and not train_dataset.include_speaker_ids:
+            print("WARNING: Speaker ID loss enabled but dataset may not have speaker_ids. "
+                  "Re-run preprocessing with --include_speaker_id and re-merge shards.")
+
+        # Create classifier based on loss type
+        if speaker_id_loss_type == "arcface":
+            # ArcFace: angular margin loss for tighter embedding clustering (like ECAPA-TDNN)
+            learned_speaker_classifier = ArcFaceLoss(
+                embedding_dim=learned_speaker_dim,
+                num_speakers=num_speakers,
+                scale=arcface_scale,
+                margin=arcface_margin,
+            ).to(device)
+        else:
+            # Simple MLP classifier with cross-entropy
+            learned_speaker_classifier = LearnedSpeakerClassifier(
+                embedding_dim=learned_speaker_dim,
+                num_speakers=num_speakers,
+                hidden_dim=256,
+            ).to(device)
+
+        learned_speaker_classifier_optimizer = torch.optim.AdamW(
+            learned_speaker_classifier.parameters(),
+            lr=speaker_id_classifier_lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+        )
+
+        # Try to load existing learned speaker classifier checkpoint
+        learned_speaker_classifier, learned_speaker_classifier_optimizer, lsc_loaded = load_learned_speaker_classifier(
+            args.resume_from_checkpoint, learned_speaker_classifier, learned_speaker_classifier_optimizer, device
+        )
+        if lsc_loaded:
+            print("Loaded learned speaker classifier from checkpoint")
+
+        if args.local_rank == 0 or not args.use_deepspeed:
+            print(f"Learned speaker ID classification: enabled")
+            print(f"  Loss type: {speaker_id_loss_type}")
+            print(f"  Embedding dim (input): {learned_speaker_dim}")
+            print(f"  Num speakers: {num_speakers}")
+            print(f"  Speaker ID loss weight: {speaker_id_loss_weight}")
+            print(f"  Speaker ID classifier LR: {speaker_id_classifier_lr}")
+            if speaker_id_loss_type == "arcface":
+                print(f"  ArcFace scale: {arcface_scale}")
+                print(f"  ArcFace margin: {arcface_margin} radians")
+            print(f"  Learned speaker classifier parameters: {sum(p.numel() for p in learned_speaker_classifier.parameters()):,}")
+    elif speaker_id_loss_weight > 0 and not learn_speaker_embedding:
+        print("WARNING: speaker_id_loss_weight > 0 but learn_speaker_embedding is False. "
+              "Speaker ID loss requires learned speaker embeddings. Disabling speaker ID loss.")
+
     # Create trainer
     trainer = AudioVAEGANTrainer(
         model=model,
@@ -2402,6 +3009,13 @@ def main():
         film_contrastive_margin_rampup_steps=film_contrastive_margin_rampup_steps,
         # Mu-only reconstruction loss (for diffusion compatibility)
         mu_only_recon_weight=mu_only_recon_weight,
+        # Learned speaker embedding classification (complementary to GRL)
+        learned_speaker_classifier=learned_speaker_classifier,
+        learned_speaker_classifier_optimizer=learned_speaker_classifier_optimizer,
+        speaker_id_loss_weight=speaker_id_loss_weight,
+        speaker_id_loss_type=speaker_id_loss_type,
+        speaker_id_loss_start_step=speaker_id_loss_start_step,
+        speaker_id_loss_rampup_steps=speaker_id_loss_rampup_steps,
     )
 
     # Add visualization callback

@@ -62,8 +62,17 @@ def load_audio_vae(
     film_scale_bound: float = 0.5,
     film_shift_bound: float = 0.5,
     zero_init_film_bias: bool = False,
+    learn_speaker_embedding: bool = False,
+    learned_speaker_dim: int = 256,
 ) -> nn.Module:
-    """Load audio VAE from checkpoint."""
+    """Load audio VAE from checkpoint.
+
+    Args:
+        learn_speaker_embedding: If True, the encoder will learn speaker embeddings
+            instead of using pretrained ones from the dataset.
+        learned_speaker_dim: Dimension of learned speaker embeddings (ignored if
+            learn_speaker_embedding is False).
+    """
     from model.audio.vae import model_config_lookup
     from utils.model_loading_utils import load_model
 
@@ -77,6 +86,8 @@ def load_audio_vae(
         film_scale_bound=film_scale_bound,
         film_shift_bound=film_shift_bound,
         zero_init_film_bias=zero_init_film_bias,
+        learn_speaker_embedding=learn_speaker_embedding,
+        learned_speaker_dim=learned_speaker_dim,
     )
 
     # Check checkpoint for FiLM weights before loading
@@ -278,11 +289,17 @@ def extract_latents(
     model.eval()
 
     latents = []
-    speaker_embeddings = []
+    speaker_embeddings = []  # Dataset speaker embeddings
+    learned_speaker_embeddings = []  # Encoder-learned speaker embeddings
     speaker_ids = []
     sample_indices = []
     mel_lengths = []  # Track original lengths before padding
     has_speaker_ids = None  # Will be set on first batch
+
+    # Check if encoder learns speaker embeddings
+    encoder_learns_speaker = hasattr(model.encoder, 'learn_speaker_embedding') and model.encoder.learn_speaker_embedding
+    if encoder_learns_speaker:
+        print("Encoder learns speaker embeddings - will extract learned embeddings")
 
     total = 0
     with torch.no_grad():
@@ -307,12 +324,18 @@ def extract_latents(
             elif spec.shape[-1] > max_mel_frames:
                 spec = spec[..., :max_mel_frames]
 
-            mu, logvar = model.encode(spec)
+            # Encode - handle learned speaker embedding if enabled
+            encode_result = model.encode(spec)
+            if encoder_learns_speaker:
+                mu, logvar, learned_spk_emb = encode_result
+                learned_speaker_embeddings.append(learned_spk_emb.cpu())
+            else:
+                mu, logvar = encode_result
 
             # Store latents (use mu, not sampled z, for consistency)
             latents.append(mu.cpu())
 
-            # Store speaker embeddings if available
+            # Store dataset speaker embeddings if available
             if "speaker_embedding" in batch and batch["speaker_embedding"] is not None:
                 speaker_embeddings.append(batch["speaker_embedding"].cpu())
 
@@ -334,12 +357,15 @@ def extract_latents(
 
     all_latents = torch.cat(latents)[:num_samples]
     all_embeddings = torch.cat(speaker_embeddings)[:num_samples] if speaker_embeddings else None
+    all_learned_embeddings = torch.cat(learned_speaker_embeddings)[:num_samples] if learned_speaker_embeddings else None
     all_lengths = mel_lengths[:num_samples]
 
     # If no speaker IDs were in the dataset, cluster embeddings to create pseudo-IDs
-    if not has_speaker_ids and all_embeddings is not None:
+    # Prefer learned embeddings if available for clustering
+    embeddings_for_clustering = all_learned_embeddings if all_learned_embeddings is not None else all_embeddings
+    if not has_speaker_ids and embeddings_for_clustering is not None:
         print("\nNo speaker_id in dataset, clustering speaker embeddings for pseudo-IDs...")
-        speaker_ids = cluster_speaker_embeddings(all_embeddings, n_clusters=min(20, num_samples // 10))
+        speaker_ids = cluster_speaker_embeddings(embeddings_for_clustering, n_clusters=min(20, num_samples // 10))
     elif not speaker_ids:
         # No speaker IDs and no embeddings - use sample index as pseudo-ID
         speaker_ids = [f"sample_{i}" for i in range(len(all_latents))]
@@ -347,9 +373,11 @@ def extract_latents(
     return {
         "latents": all_latents,
         "speaker_embeddings": all_embeddings,
+        "learned_speaker_embeddings": all_learned_embeddings,
         "speaker_ids": speaker_ids[:num_samples],
         "sample_indices": sample_indices[:num_samples],
         "mel_lengths": all_lengths,
+        "encoder_learns_speaker": encoder_learns_speaker,
     }
 
 
@@ -687,18 +715,33 @@ def test_voice_conversion(
     results = []
     audio_files = []
 
+    # Check if encoder learns speaker embeddings
+    encoder_learns_speaker = hasattr(model.encoder, 'learn_speaker_embedding') and model.encoder.learn_speaker_embedding
+    if encoder_learns_speaker:
+        print("Encoder learns speaker embeddings - will extract learned embeddings for conversion")
+
     for i in range(min(num_conversions, len(samples_by_speaker[speaker_a]))):
         sample_a = samples_by_speaker[speaker_a][i]
         sample_b = samples_by_speaker[speaker_b][min(i, len(samples_by_speaker[speaker_b]) - 1)]
 
         spec_a = sample_a["mel_spec"].to(device)
-        emb_a = sample_a["speaker_embedding"].to(device)
-        emb_b = sample_b["speaker_embedding"].to(device)
+        spec_b = sample_b["mel_spec"].to(device)
         length_a = sample_a["length"]
         length_b = sample_b["length"]
 
-        # Encode speaker A's audio
-        mu, logvar = model.encode(spec_a)
+        # Encode speaker A's audio - get mu, logvar, and optionally learned speaker embedding
+        encode_result_a = model.encode(spec_a)
+        if encoder_learns_speaker:
+            mu, logvar, learned_emb_a = encode_result_a
+            # Also encode B to get its learned speaker embedding
+            _, _, learned_emb_b = model.encode(spec_b)
+            emb_a = learned_emb_a
+            emb_b = learned_emb_b
+        else:
+            mu, logvar = encode_result_a
+            emb_a = sample_a["speaker_embedding"].to(device)
+            emb_b = sample_b["speaker_embedding"].to(device)
+
         z = model.reparameterize(mu, logvar)
 
         # Decode with different embeddings
@@ -776,13 +819,195 @@ def test_speaker_embedding_ablation(
     sample_rate: int = 16000,
 ) -> dict:
     """
-    Test reconstruction with zero and mean speaker embeddings.
-    Content should be preserved with neutral/average voice.
+    Test reconstruction with various speaker embeddings.
+
+    For pretrained embeddings: uses zero, mean, random, and extreme synthetic embeddings.
+    For learned embeddings: uses embeddings from different samples to compare.
+    Content should be preserved, only voice characteristics should change.
     """
     print("\n" + "=" * 60)
     print("TEST: Speaker Embedding Ablation")
     print("=" * 60)
 
+    model.eval()
+
+    # Check if encoder learns speaker embeddings
+    encoder_learns_speaker = hasattr(model.encoder, 'learn_speaker_embedding') and model.encoder.learn_speaker_embedding
+
+    if encoder_learns_speaker:
+        print("Encoder learns speaker embeddings - using learned embeddings from different samples")
+        return _test_speaker_embedding_ablation_learned(
+            model, dataloader, device, output_dir, vocoder, sample_rate
+        )
+    else:
+        print("Using pretrained speaker embeddings from dataset")
+        return _test_speaker_embedding_ablation_pretrained(
+            model, dataloader, device, output_dir, vocoder, sample_rate
+        )
+
+
+def _test_speaker_embedding_ablation_learned(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    output_dir: str,
+    vocoder: nn.Module = None,
+    sample_rate: int = 16000,
+) -> dict:
+    """
+    Ablation test for learned speaker embeddings.
+    Encodes multiple samples and uses their learned embeddings to test decoder conditioning.
+    """
+    model.eval()
+
+    # Collect samples from the dataset
+    samples = []
+    num_samples_needed = 6  # Original + 5 different speaker embeddings
+    for batch in dataloader:
+        spec = batch["mel_spec"]
+        lengths = batch.get("mel_spec_lengths", None)
+
+        for i in range(spec.shape[0]):
+            length = lengths[i].item() if lengths is not None else spec.shape[-1]
+            samples.append({
+                "mel_spec": spec[i:i+1],
+                "length": length,
+            })
+            if len(samples) >= num_samples_needed:
+                break
+        if len(samples) >= num_samples_needed:
+            break
+
+    if len(samples) < 2:
+        print("WARNING: Not enough samples for ablation test")
+        return {"status": "skipped", "reason": "insufficient samples"}
+
+    # Get the target sample (first one)
+    target_spec = samples[0]["mel_spec"].to(device)
+    target_length = samples[0]["length"]
+
+    # Encode all samples to get learned speaker embeddings
+    with torch.no_grad():
+        # Encode target sample
+        mu, logvar, orig_emb = model.encode(target_spec)
+        z = model.reparameterize(mu, logvar)
+
+        # Get embeddings from other samples
+        other_embeddings = []
+        for sample in samples[1:]:
+            spec = sample["mel_spec"].to(device)
+            _, _, learned_emb = model.encode(spec)
+            other_embeddings.append(learned_emb)
+
+        # Compute mean learned embedding
+        all_learned_embs = [orig_emb] + other_embeddings
+        mean_emb = torch.stack([e.squeeze(0) for e in all_learned_embs]).mean(dim=0, keepdim=True)
+
+        emb_dim = orig_emb.shape[-1]
+        print(f"Learned speaker embedding dimension: {emb_dim}")
+        print(f"Mel spec length: {target_length} frames")
+
+        # Get reconstructions with different embeddings
+        recon_orig = model.decode(z, speaker_embedding=orig_emb)
+        recon_mean = model.decode(z, speaker_embedding=mean_emb)
+        recons_other = [model.decode(z, speaker_embedding=emb) for emb in other_embeddings[:4]]
+
+    # Trim to actual length for visualization
+    spec_trimmed = trim_to_length(target_spec, target_length)
+    recon_orig_trimmed = trim_to_length(recon_orig, target_length)
+    recon_mean_trimmed = trim_to_length(recon_mean, target_length)
+    recons_other_trimmed = [trim_to_length(r, target_length) for r in recons_other]
+
+    # Compute pairwise differences
+    def mel_diff(a, b):
+        return (a - b).abs().mean().item()
+
+    diff_orig_mean = mel_diff(recon_orig_trimmed, recon_mean_trimmed)
+    diffs_orig_other = [mel_diff(recon_orig_trimmed, r) for r in recons_other_trimmed]
+
+    print(f"\nPairwise reconstruction differences (mean absolute error):")
+    print(f"  Original vs Mean:    {diff_orig_mean:.6f}")
+    for i, diff in enumerate(diffs_orig_other):
+        print(f"  Original vs Sample {i+2}: {diff:.6f}")
+
+    avg_diff = np.mean(diffs_orig_other) if diffs_orig_other else 0
+    if avg_diff < 0.01:
+        print("\n  CAUTION: Very small differences between embeddings.")
+        print("           Learned speaker embeddings may have limited effect on output.")
+    else:
+        print(f"\n  RESULT: Average difference = {avg_diff:.6f}")
+        print("           Decoder is responding to different learned speaker embeddings.")
+
+    # Plot
+    num_cols = min(6, 2 + len(recons_other_trimmed))
+    fig, axes = plt.subplots(1, num_cols, figsize=(4 * num_cols, 4))
+
+    axes[0].imshow(spec_trimmed[0, 0].cpu().numpy(), aspect='auto', origin='lower')
+    axes[0].set_title("Original Input")
+
+    axes[1].imshow(recon_orig_trimmed[0, 0].cpu().detach().numpy(), aspect='auto', origin='lower')
+    axes[1].set_title("Recon (Own Emb)")
+
+    for i, recon_t in enumerate(recons_other_trimmed[:num_cols-2]):
+        axes[i + 2].imshow(recon_t[0, 0].cpu().detach().numpy(), aspect='auto', origin='lower')
+        axes[i + 2].set_title(f"Recon (Sample {i+2} Emb)")
+
+    for ax in axes:
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Mel bin")
+
+    plt.suptitle("Learned Speaker Embedding Ablation")
+    plt.tight_layout()
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "embedding_ablation.png")
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+
+    print(f"Saved ablation plot to {save_path}")
+    print("Check: Content should be similar across all, only voice characteristics should change")
+
+    # Generate audio if vocoder available
+    audio_files = {}
+    if vocoder is not None:
+        audio_dir = os.path.join(output_dir, "audio")
+        os.makedirs(audio_dir, exist_ok=True)
+
+        audio_files["original"] = os.path.join(audio_dir, "ablation_original.wav")
+        save_audio(vocoder, spec_trimmed, audio_files["original"], sample_rate, device)
+
+        audio_files["recon_own_emb"] = os.path.join(audio_dir, "ablation_recon_own_emb.wav")
+        save_audio(vocoder, recon_orig_trimmed, audio_files["recon_own_emb"], sample_rate, device)
+
+        for i, recon_t in enumerate(recons_other_trimmed):
+            audio_files[f"recon_sample{i+2}_emb"] = os.path.join(audio_dir, f"ablation_recon_sample{i+2}_emb.wav")
+            save_audio(vocoder, recon_t, audio_files[f"recon_sample{i+2}_emb"], sample_rate, device)
+
+        print(f"  Generated ablation audio files in {audio_dir}/")
+
+    return {
+        "status": "completed",
+        "plot_path": save_path,
+        "audio_files": audio_files,
+        "pairwise_differences": {
+            "orig_vs_mean": diff_orig_mean,
+            **{f"orig_vs_sample{i+2}": diff for i, diff in enumerate(diffs_orig_other)},
+        },
+        "embedding_type": "learned",
+    }
+
+
+def _test_speaker_embedding_ablation_pretrained(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    output_dir: str,
+    vocoder: nn.Module = None,
+    sample_rate: int = 16000,
+) -> dict:
+    """
+    Ablation test for pretrained speaker embeddings from dataset.
+    Tests reconstruction with zero, mean, random, and extreme synthetic embeddings.
+    """
     model.eval()
 
     # Get a sample and speaker embedding dimension
@@ -853,7 +1078,7 @@ def test_speaker_embedding_ablation(
                     # Check if FiLM outputs are identical (the bug we're looking for)
                     scale_diff = abs(film_stats_orig[scale_key] - film_stats_zero[scale_key])
                     if scale_diff < 0.0001:
-                        print(f"    ⚠️  WARNING: scale outputs are IDENTICAL for orig vs zero!")
+                        print(f"    WARNING: scale outputs are IDENTICAL for orig vs zero!")
         else:
             print("  No FiLM stats returned - decoder may not support return_film_stats")
 
@@ -956,7 +1181,8 @@ def test_speaker_embedding_ablation(
             "orig_vs_rand": diff_orig_rand,
             "orig_vs_extreme": diff_orig_extreme,
             "zero_vs_extreme": diff_zero_extreme,
-        }
+        },
+        "embedding_type": "pretrained",
     }
 
 
@@ -986,6 +1212,11 @@ def test_speaker_interpolation(
 
     model.eval()
 
+    # Check if encoder learns speaker embeddings
+    encoder_learns_speaker = hasattr(model.encoder, 'learn_speaker_embedding') and model.encoder.learn_speaker_embedding
+    if encoder_learns_speaker:
+        print("Encoder learns speaker embeddings - will extract learned embeddings for interpolation")
+
     # Collect samples from multiple speakers
     samples_by_speaker = defaultdict(list)
     min_speakers_needed = max(10, num_interpolations * 2) if use_diverse_pairs else 2
@@ -994,12 +1225,14 @@ def test_speaker_interpolation(
     print(f"Collecting samples from at least {min_speakers_needed} speakers...")
 
     for batch in dataloader:
-        if "speaker_embedding" not in batch or batch["speaker_embedding"] is None:
-            print("WARNING: No speaker embeddings in dataset, skipping interpolation test")
-            return {"status": "skipped", "reason": "no speaker embeddings"}
+        # For learned embeddings, we don't need dataset speaker embeddings
+        if not encoder_learns_speaker:
+            if "speaker_embedding" not in batch or batch["speaker_embedding"] is None:
+                print("WARNING: No speaker embeddings in dataset, skipping interpolation test")
+                return {"status": "skipped", "reason": "no speaker embeddings"}
 
         spec = batch["mel_spec"]
-        speaker_emb = batch["speaker_embedding"]
+        speaker_emb = batch.get("speaker_embedding", None)
         lengths = batch.get("mel_spec_lengths", None)
 
         if "speaker_id" in batch:
@@ -1016,11 +1249,14 @@ def test_speaker_interpolation(
             if len(samples_by_speaker[sid]) >= max_samples_per_speaker:
                 continue
             length = lengths[i].item() if lengths is not None else spec.shape[-1]
-            samples_by_speaker[sid].append({
+            sample_data = {
                 "mel_spec": spec[i:i+1],
-                "speaker_embedding": speaker_emb[i:i+1],
                 "length": length,
-            })
+            }
+            # Only store dataset speaker embedding if not using learned embeddings
+            if speaker_emb is not None:
+                sample_data["speaker_embedding"] = speaker_emb[i:i+1]
+            samples_by_speaker[sid].append(sample_data)
 
         if len(samples_by_speaker) >= min_speakers_needed:
             break
@@ -1032,6 +1268,17 @@ def test_speaker_interpolation(
     print(f"Collected samples from {len(samples_by_speaker)} speakers")
 
     # Select speaker pairs
+    # For learned embeddings, we need to extract embeddings first before selecting diverse pairs
+    if encoder_learns_speaker:
+        # Extract learned speaker embeddings for all collected samples
+        print("Extracting learned speaker embeddings for diversity selection...")
+        with torch.no_grad():
+            for sid, samples in samples_by_speaker.items():
+                for sample in samples:
+                    spec_sample = sample["mel_spec"].to(device)
+                    _, _, learned_emb = model.encode(spec_sample)
+                    sample["speaker_embedding"] = learned_emb.cpu()
+
     if use_diverse_pairs and len(samples_by_speaker) >= 4:
         diverse_pairs = select_diverse_speaker_pairs(
             samples_by_speaker,
@@ -1045,13 +1292,24 @@ def test_speaker_interpolation(
     sample_a = samples_by_speaker[speakers[0]][0]
     sample_b = samples_by_speaker[speakers[1]][0]
 
-    spec = sample_a["mel_spec"].to(device)
-    emb_a = sample_a["speaker_embedding"].to(device)
-    emb_b = sample_b["speaker_embedding"].to(device)
+    spec_a = sample_a["mel_spec"].to(device)
+    spec_b = sample_b["mel_spec"].to(device)
     length = sample_a["length"]
 
     with torch.no_grad():
-        mu, logvar = model.encode(spec)
+        # Encode sample A to get latent and optionally learned speaker embedding
+        encode_result_a = model.encode(spec_a)
+        if encoder_learns_speaker:
+            mu, logvar, learned_emb_a = encode_result_a
+            # Encode sample B to get its learned speaker embedding
+            _, _, learned_emb_b = model.encode(spec_b)
+            emb_a = learned_emb_a
+            emb_b = learned_emb_b
+        else:
+            mu, logvar = encode_result_a
+            emb_a = sample_a["speaker_embedding"].to(device)
+            emb_b = sample_b["speaker_embedding"].to(device)
+
         z = model.reparameterize(mu, logvar)
 
         # Interpolate
@@ -1067,7 +1325,7 @@ def test_speaker_interpolation(
             recons_tensor.append(recon_trimmed)
 
     # Trim original spec for visualization
-    spec_trimmed = trim_to_length(spec, length)
+    spec_trimmed = trim_to_length(spec_a, length)
 
     # Plot
     fig, axes = plt.subplots(1, num_steps + 1, figsize=(4 * (num_steps + 1), 4))
@@ -1268,6 +1526,12 @@ def main():
     parser.add_argument("--no_diverse_pairs", action="store_false", dest="use_diverse_pairs",
                         help="Disable diverse speaker pair selection")
 
+    # Learned speaker embedding arguments
+    parser.add_argument("--learn_speaker_embedding", action="store_true",
+                        help="Use learned speaker embeddings from encoder instead of pretrained embeddings from dataset")
+    parser.add_argument("--learned_speaker_dim", type=int, default=256,
+                        help="Dimension of learned speaker embeddings (default: 256)")
+
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -1286,6 +1550,10 @@ def main():
     # Load model
     print("Loading VAE model...")
     print(f"  Speaker embedding dim: {args.speaker_embedding_dim}")
+    if args.learn_speaker_embedding:
+        print(f"  Learned speaker embedding: ENABLED (dim={args.learned_speaker_dim})")
+    else:
+        print(f"  Learned speaker embedding: DISABLED (using pretrained from dataset)")
     model = load_audio_vae(
         args.vae_checkpoint,
         args.vae_config,
@@ -1295,6 +1563,8 @@ def main():
         args.film_scale_bound,
         args.film_shift_bound,
         args.zero_init_film_bias,
+        args.learn_speaker_embedding,
+        args.learned_speaker_dim,
     )
     model = model.to(device)
     model.eval()

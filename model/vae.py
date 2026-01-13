@@ -92,6 +92,97 @@ class LPIPSLoss(nn.Module):
         return loss.mean()
 
 
+class DINOv2PerceptualLoss(nn.Module):
+    """
+    Perceptual loss using DINOv2 features.
+
+    DINOv2 provides more semantic, less texture-focused features compared to VGG.
+    This can help preserve content correctness while being less sensitive to
+    exact texture patterns that can cause GAN artifacts.
+
+    Reference: Oquab et al., "DINOv2: Learning Robust Visual Features without Supervision"
+    """
+    def __init__(
+        self,
+        model_name: str = "dinov2_vits14",  # Options: dinov2_vits14, dinov2_vitb14, dinov2_vitl14
+        use_patch_tokens: bool = True,  # Use patch tokens (spatial) vs CLS token (global)
+        layers: list = None,  # Which intermediate layers to use (None = final only)
+    ):
+        super().__init__()
+
+        # Load DINOv2 model from torch hub
+        self.model = torch.hub.load('facebookresearch/dinov2', model_name, pretrained=True)
+        self.model.requires_grad_(False)
+        self.model.eval()
+
+        self.use_patch_tokens = use_patch_tokens
+        self.layers = layers
+
+        # DINOv2 expects ImageNet normalization
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+        # Patch size for DINOv2 ViT models
+        self.patch_size = 14
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.model.eval()  # Always eval
+        return self
+
+    def _normalize(self, x):
+        """Convert from [-1, 1] to ImageNet normalized."""
+        # First convert [-1, 1] to [0, 1]
+        x = (x + 1) / 2
+        # Then apply ImageNet normalization
+        return (x - self.mean) / self.std
+
+    def _resize_if_needed(self, x):
+        """Resize to be divisible by patch size."""
+        h, w = x.shape[-2:]
+        new_h = (h // self.patch_size) * self.patch_size
+        new_w = (w // self.patch_size) * self.patch_size
+        if new_h != h or new_w != w:
+            x = F.interpolate(x, size=(new_h, new_w), mode='bilinear', align_corners=False)
+        return x
+
+    def forward(self, x, target):
+        """
+        Compute DINO perceptual loss.
+
+        Args:
+            x: Reconstructed images [-1, 1]
+            target: Target images [-1, 1]
+
+        Returns:
+            Perceptual loss (scalar)
+        """
+        # Normalize and resize
+        x = self._normalize(x)
+        target = self._normalize(target)
+        x = self._resize_if_needed(x)
+        target = self._resize_if_needed(target)
+
+        if self.use_patch_tokens:
+            # Get patch token features (spatial)
+            x_features = self.model.forward_features(x)
+            target_features = self.model.forward_features(target)
+
+            # Extract patch tokens (exclude CLS token)
+            x_patches = x_features["x_norm_patchtokens"]
+            target_patches = target_features["x_norm_patchtokens"]
+
+            # Compute MSE loss on patch features
+            loss = F.mse_loss(x_patches, target_patches)
+        else:
+            # Get CLS token (global feature)
+            x_cls = self.model(x)
+            target_cls = self.model(target)
+            loss = F.mse_loss(x_cls, target_cls)
+
+        return loss
+
+
 class VAE(nn.Module):
     def __init__(
         self,
@@ -105,6 +196,9 @@ class VAE(nn.Module):
         perceptual_loss_weight: float = 0.1,
         kl_divergence_loss_weight: float = 0.01,
         free_bits: float = 0.0,  # Minimum KL per channel (0 = disabled)
+        # DINO perceptual loss (semantic features, complementary to VGG/LPIPS)
+        dino_loss_weight: float = 0.0,  # 0 = disabled
+        dino_model: str = "dinov2_vits14",  # dinov2_vits14, dinov2_vitb14, dinov2_vitl14
         # Speaker embedding dropout for disentanglement (audio VAE)
         speaker_embedding_dropout: float = 0.0,  # Probability of zeroing speaker embedding during training
         # Instance normalization on latents for speaker disentanglement
@@ -138,6 +232,12 @@ class VAE(nn.Module):
             self.perceptual_loss = LPIPSLoss(net=lpips_net)
         else:
             self.perceptual_loss = None
+
+        # DINO perceptual loss (semantic features)
+        self.dino_loss_weight = dino_loss_weight
+        self.dino_loss = None
+        if dino_loss_weight > 0:
+            self.dino_loss = DINOv2PerceptualLoss(model_name=dino_model)
 
         # Multi-resolution STFT loss for audio VAE
         self.stft_loss = None
@@ -187,7 +287,15 @@ class VAE(nn.Module):
 
         return speaker_embedding
 
-    def encode(self, x, lengths=None) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(self, x, lengths=None) -> tuple:
+        """
+        Encode input to latent space.
+
+        Returns:
+            mu: Latent mean
+            logvar: Latent log variance
+            learned_speaker_emb (optional): [B, learned_speaker_dim] if encoder.learn_speaker_embedding=True
+        """
         # Pass lengths to encoder if it supports it (e.g., AudioVAEEncoder)
         if lengths is not None and hasattr(self.encoder, 'time_strides'):
             return self.encoder(x, lengths=lengths)
@@ -211,6 +319,7 @@ class VAE(nn.Module):
         lengths=None,
         kl_weight_multiplier: float = 1.0,
         return_film_stats: bool = False,
+        use_learned_speaker_embedding: bool = True,  # If True and encoder learns speaker emb, use it for decoder
     ):
         """
         Forward pass through VAE.
@@ -222,19 +331,23 @@ class VAE(nn.Module):
                   If provided, reconstruction loss is only computed on valid regions.
                   The mask is in the time dimension (last dim of x).
             speaker_embedding: Optional speaker embedding tensor [B, 1, D] or [B, D]
-                               for conditioning the decoder (audio VAE only)
+                               for conditioning the decoder (audio VAE only).
+                               Ignored if use_learned_speaker_embedding=True and encoder learns speaker embedding.
             lengths: Optional tensor [B] of valid time lengths for attention masking.
                      If provided, encoder and decoder attention will mask padded positions.
             kl_weight_multiplier: Multiplier for KL divergence weight (for KL annealing).
                                   Default 1.0 means use full kl_divergence_loss_weight.
                                   Set to 0.0 at start of training and anneal to 1.0.
             return_film_stats: If True, include FiLM statistics in returned losses dict.
+            use_learned_speaker_embedding: If True and encoder.learn_speaker_embedding=True,
+                                           use encoder's learned speaker embedding for decoder.
+                                           If False, use the provided speaker_embedding parameter.
 
         Returns:
             recon_x: Reconstructed input
             mu: Latent mean
             logvar: Latent log variance
-            losses: Dictionary of loss components (includes film_stats if return_film_stats=True)
+            losses: Dictionary of loss components (includes film_stats, learned_speaker_embedding if applicable)
         """
         # Support both 'x' and 'image' as input parameter names
         if x is None and image is not None:
@@ -242,7 +355,16 @@ class VAE(nn.Module):
         elif x is None and image is None:
             raise ValueError("Either 'x' or 'image' must be provided")
 
-        mu, logvar = self.encode(x, lengths=lengths)
+        # Encode - may return learned speaker embedding if encoder supports it
+        encoder_learns_speaker = hasattr(self.encoder, 'learn_speaker_embedding') and self.encoder.learn_speaker_embedding
+        encode_result = self.encode(x, lengths=lengths)
+
+        if encoder_learns_speaker:
+            mu, logvar, learned_speaker_emb = encode_result
+        else:
+            mu, logvar = encode_result
+            learned_speaker_emb = None
+
         z = self.reparameterize(mu, logvar)
 
         # Apply instance normalization to latents for speaker disentanglement
@@ -259,12 +381,18 @@ class VAE(nn.Module):
             for stride in self.encoder.time_strides:
                 latent_lengths = (latent_lengths + stride - 1) // stride
 
-        # Apply speaker embedding dropout during training for disentanglement
-        speaker_embedding = self._apply_speaker_embedding_dropout(speaker_embedding)
+        # Determine which speaker embedding to use for decoding
+        # If encoder learns speaker embedding and use_learned_speaker_embedding=True, use learned embedding
+        # Otherwise, use the provided speaker_embedding (from dataset)
+        if encoder_learns_speaker and use_learned_speaker_embedding and learned_speaker_emb is not None:
+            decoder_speaker_embedding = learned_speaker_emb
+        else:
+            # Apply speaker embedding dropout during training for disentanglement
+            decoder_speaker_embedding = self._apply_speaker_embedding_dropout(speaker_embedding)
 
         # Decode with optional FiLM stats
         film_stats = None
-        decode_result = self.decode(z, speaker_embedding=speaker_embedding, lengths=latent_lengths, return_film_stats=return_film_stats)
+        decode_result = self.decode(z, speaker_embedding=decoder_speaker_embedding, lengths=latent_lengths, return_film_stats=return_film_stats)
         if return_film_stats and isinstance(decode_result, tuple):
             recon_x, film_stats = decode_result
         else:
@@ -341,6 +469,11 @@ class VAE(nn.Module):
         if self.perceptual_loss is not None:
             perceptual_loss = self.perceptual_loss(recon_x, x)
 
+        # DINO perceptual loss (semantic features, complementary to VGG/LPIPS)
+        dino_loss = torch.tensor(0.0, device=x.device)
+        if self.dino_loss is not None:
+            dino_loss = self.dino_loss(recon_x, x)
+
         # Multi-resolution STFT loss (for audio, requires waveform data passed separately)
         # This is computed externally when waveforms are available
         stft_loss = torch.tensor(0.0, device=x.device)
@@ -351,6 +484,7 @@ class VAE(nn.Module):
         total_loss = (
             self.recon_loss_weight * recon_loss
             + self.perceptual_loss_weight * perceptual_loss
+            + self.dino_loss_weight * dino_loss
             + effective_kl_weight * kl_divergence
             + self.stft_loss_weight * stft_loss
         )
@@ -362,6 +496,7 @@ class VAE(nn.Module):
             "mse_loss": mse_loss,
             "l1_loss": l1_loss,
             "perceptual_loss": perceptual_loss,
+            "dino_loss": dino_loss,
             "stft_loss": stft_loss,
             "kl_weight_multiplier": torch.tensor(kl_weight_multiplier, device=x.device),
         }
@@ -369,6 +504,10 @@ class VAE(nn.Module):
         # Add FiLM statistics if requested
         if return_film_stats and film_stats is not None:
             losses["film_stats"] = film_stats
+
+        # Add learned speaker embedding to losses dict for external use (e.g., GRL speaker ID loss)
+        if learned_speaker_emb is not None:
+            losses["learned_speaker_embedding"] = learned_speaker_emb
 
         return recon_x, mu, logvar, losses
 
@@ -419,8 +558,11 @@ class VAE(nn.Module):
         """
         # Check if encoder supports return_attention_weights
         encoder_supports_attn = hasattr(self.encoder, 'use_attention') and self.encoder.use_attention
+        encoder_learns_speaker = hasattr(self.encoder, 'learn_speaker_embedding') and self.encoder.learn_speaker_embedding
 
         # Encode with attention weights
+        learned_speaker_emb = None
+        enc_attn_weights = None
         if encoder_supports_attn:
             enc_result = self.encoder(
                 x,
@@ -428,13 +570,26 @@ class VAE(nn.Module):
                 lengths=lengths,
                 return_attention_weights=True,
             )
-            mu, logvar, enc_attn_weights = enc_result
+            # Handle variable return signature based on learn_speaker_embedding
+            if encoder_learns_speaker:
+                mu, logvar, learned_speaker_emb, enc_attn_weights = enc_result
+            else:
+                mu, logvar, enc_attn_weights = enc_result
         else:
-            mu, logvar = self.encode(x, lengths=lengths)
-            enc_attn_weights = None
+            enc_result = self.encode(x, lengths=lengths)
+            if encoder_learns_speaker:
+                mu, logvar, learned_speaker_emb = enc_result
+            else:
+                mu, logvar = enc_result
 
         # Sample from latent space
         z = self.reparameterize(mu, logvar)
+
+        # Determine which speaker embedding to use for decoding
+        if encoder_learns_speaker and learned_speaker_emb is not None:
+            decoder_speaker_emb = learned_speaker_emb
+        else:
+            decoder_speaker_emb = speaker_embedding
 
         # Compute downsampled lengths for decoder attention
         latent_lengths = None
@@ -450,13 +605,13 @@ class VAE(nn.Module):
         if decoder_supports_attn:
             dec_result = self.decoder(
                 z,
-                speaker_embedding=speaker_embedding,
+                speaker_embedding=decoder_speaker_emb,
                 lengths=latent_lengths,
                 return_attention_weights=True,
             )
             recon_x, dec_attn_weights = dec_result
         else:
-            recon_x = self.decode(z, speaker_embedding=speaker_embedding, lengths=latent_lengths)
+            recon_x = self.decode(z, speaker_embedding=decoder_speaker_emb, lengths=latent_lengths)
             dec_attn_weights = None
 
         # Align reconstruction to input size

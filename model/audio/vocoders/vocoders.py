@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Literal
 
 from model.activations import Snake
-from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss
+from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss, Wav2Vec2PerceptualLoss
 from model.audio.vocoders.convtranspose1d_vocoder import ConvTranspose1DVocoderUpsampleBlock
 from model.audio.vocoders.freq_domain_vocoder import SplitBandLowFreqMeanFreqDomainVocoder, HeavyHeadedFrequencyDomainVocoder, LightHeadedFrequencyDomainVocoder, SplitBandFrequencyDomainVocoder, FrequencyDomainVocoderWithAttention
 from model.audio.vocoders.upsample_vocoder import AntiAliasedUpsampleVocoderUpsampleBlock
@@ -513,6 +513,8 @@ class VocoderWithLoss(nn.Module):
                  high_freq_stft_loss_weight: float = 0.0,
                  high_freq_stft_cutoff_bin: int = 256,
                  direct_mag_loss_weight: float = 0.0,
+                 wav2vec2_loss_weight: float = 0.0,
+                 wav2vec2_model: str = "facebook/wav2vec2-base",
     ):
         super().__init__()
         self.vocoder = vocoder
@@ -529,6 +531,7 @@ class VocoderWithLoss(nn.Module):
         self.phase_gd_loss_weight = phase_gd_loss_weight
         self.high_freq_stft_loss_weight = high_freq_stft_loss_weight
         self.direct_mag_loss_weight = direct_mag_loss_weight
+        self.wav2vec2_loss_weight = wav2vec2_loss_weight
 
         self.n_fft = config.audio_n_fft
         self.hop_length = config.audio_hop_length
@@ -559,6 +562,13 @@ class VocoderWithLoss(nn.Module):
             )
         else:
             self.high_freq_stft_loss = None
+        if wav2vec2_loss_weight > 0.0:
+            self.wav2vec2_loss = Wav2Vec2PerceptualLoss(
+                model_name=wav2vec2_model,
+                sample_rate=config.audio_sample_rate,
+            )
+        else:
+            self.wav2vec2_loss = None
 
     def forward(
         self,
@@ -640,6 +650,14 @@ class VocoderWithLoss(nn.Module):
             else:
                 high_freq_stft_loss_value = 0.0
 
+            if self.wav2vec2_loss is not None:
+                wav2vec2_loss_value = self.wav2vec2_loss(
+                    pred_waveform_aligned,
+                    waveform_labels_aligned,
+                )
+            else:
+                wav2vec2_loss_value = 0.0
+
             total_loss = (self.sc_loss_weight * sc_loss +
                           self.mag_loss_weight * mag_loss +
                           self.complex_stft_loss_weight * complex_stft_loss +
@@ -647,18 +665,8 @@ class VocoderWithLoss(nn.Module):
                           self.mel_recon_loss_weight * mel_recon_loss_value +
                           self.phase_loss_weight * phase_loss_value +
                           self.high_freq_stft_loss_weight * high_freq_stft_loss_value +
-                          self.direct_mag_loss_weight * direct_mag_loss)
-
-            # Debug: log all losses to catch spikes
-            # megatransformer_utils.print_debug_tensor('loss_waveform_l1', waveform_l1)
-            # megatransformer_utils.print_debug_tensor('loss_sc', sc_loss)
-            # megatransformer_utils.print_debug_tensor('loss_mag', mag_loss)
-            # megatransformer_utils.print_debug_tensor('loss_complex_stft', complex_stft_loss)
-            # megatransformer_utils.print_debug_tensor('loss_mel_recon', mel_recon_loss_value)
-            # megatransformer_utils.print_debug_tensor('loss_phase', phase_loss_value)
-            # megatransformer_utils.print_debug_tensor('loss_high_freq_stft', high_freq_stft_loss_value)
-            # megatransformer_utils.print_debug_tensor('loss_direct_mag', direct_mag_loss)
-            # megatransformer_utils.print_debug_tensor('loss_total', total_loss)
+                          self.direct_mag_loss_weight * direct_mag_loss +
+                          self.wav2vec2_loss_weight * wav2vec2_loss_value)
 
             outputs.update({
                 "loss": total_loss,
@@ -673,6 +681,7 @@ class VocoderWithLoss(nn.Module):
                 "phase_gd_loss": gd_loss,
                 "high_freq_stft_loss": high_freq_stft_loss_value,
                 "direct_mag_loss": direct_mag_loss,
+                "wav2vec2_loss": wav2vec2_loss_value,
             })
 
         return outputs

@@ -1326,6 +1326,7 @@ class VocoderGANTrainer(Trainer):
             self._log_scalar(f"{prefix}phase_gd_loss", outputs.get("phase_gd_loss", 0))
             self._log_scalar(f"{prefix}phase_loss", outputs.get("phase_loss", 0))
             self._log_scalar(f"{prefix}high_freq_stft_loss", outputs.get("high_freq_stft_loss", 0))
+            self._log_scalar(f"{prefix}wav2vec2_loss", outputs.get("wav2vec2_loss", 0))
             self._log_scalar(f"{prefix}recon_loss", recon_loss)
             self._log_scalar(f"{prefix}total_loss", total_loss)
 
@@ -1426,6 +1427,8 @@ def main():
     phase_gd_loss_weight = float(unk_dict.get("phase_gd_loss_weight", 0.0))
     high_freq_stft_loss_weight = float(unk_dict.get("high_freq_stft_loss_weight", 0.0))
     high_freq_stft_cutoff_bin = int(unk_dict.get("high_freq_stft_cutoff_bin", 256))
+    wav2vec2_loss_weight = float(unk_dict.get("wav2vec2_loss_weight", 0.0))
+    wav2vec2_model = unk_dict.get("wav2vec2_model", "facebook/wav2vec2-base")
     input_noise_std = float(unk_dict.get("input_noise_std", 0.0))
 
     # GAN training settings
@@ -1501,6 +1504,8 @@ def main():
             high_freq_stft_loss_weight=high_freq_stft_loss_weight,
             high_freq_stft_cutoff_bin=high_freq_stft_cutoff_bin,
             direct_mag_loss_weight=direct_mag_loss_weight,
+            wav2vec2_loss_weight=wav2vec2_loss_weight,
+            wav2vec2_model=wav2vec2_model,
             use_gradient_checkpointing=args.use_gradient_checkpointing,
         )
 

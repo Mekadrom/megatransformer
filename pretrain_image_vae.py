@@ -25,6 +25,7 @@ from model.image import discriminators
 from model.image.discriminators import (
     compute_discriminator_loss,
     compute_generator_gan_loss,
+    compute_adaptive_weight,
     add_instance_noise,
     r1_gradient_penalty,
     InstanceNoiseScheduler,
@@ -329,6 +330,8 @@ class ImageVAEGANTrainer(Trainer):
         perceptual_loss_start_step: int = 0,  # Step to start applying perceptual loss (0 = from start)
         # KL annealing (ramps KL weight from 0 to full over training)
         kl_annealing_steps: int = 0,  # Steps to ramp KL weight from 0 to 1 (0 = disabled)
+        # Adaptive discriminator weighting (VQGAN-style)
+        use_adaptive_weight: bool = False,  # Automatically balance GAN vs reconstruction gradients
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -352,6 +355,9 @@ class ImageVAEGANTrainer(Trainer):
 
         # KL annealing settings
         self.kl_annealing_steps = kl_annealing_steps
+
+        # Adaptive discriminator weighting (VQGAN-style)
+        self.use_adaptive_weight = use_adaptive_weight
 
         # Discriminator regularization settings
         self.r1_penalty_weight = r1_penalty_weight
@@ -518,8 +524,24 @@ class ImageVAEGANTrainer(Trainer):
             # Apply warmup factor to GAN loss
             g_gan_loss = gan_warmup_factor * g_gan_loss
 
-        # Total generator loss
-        total_loss = vae_loss + self.gan_loss_weight * g_gan_loss
+        # Total generator loss with optional adaptive weighting
+        adaptive_weight = torch.tensor(self.gan_loss_weight, device=image.device)
+        if self.use_adaptive_weight and self.gan_already_started and g_gan_loss.requires_grad:
+            # VQGAN-style adaptive weighting: balance GAN and reconstruction gradients
+            # Uses the last decoder layer as proxy for decoder output gradients
+            try:
+                last_layer = model.decoder.final_conv.weight
+                adaptive_weight = compute_adaptive_weight(
+                    vae_loss, g_gan_loss, last_layer, self.gan_loss_weight
+                )
+            except (AttributeError, RuntimeError) as e:
+                # Fallback to fixed weight if adaptive weight fails
+                # (e.g., model doesn't have expected structure, or grad computation fails)
+                if global_step % self.args.logging_steps == 0:
+                    print(f"Warning: adaptive weight computation failed ({e}), using fixed weight")
+                adaptive_weight = torch.tensor(self.gan_loss_weight, device=image.device)
+
+        total_loss = vae_loss + adaptive_weight * g_gan_loss
 
         # Log losses
         if global_step % self.args.logging_steps == 0 and self.writer is not None:
@@ -535,6 +557,9 @@ class ImageVAEGANTrainer(Trainer):
             self._log_scalar(f"{prefix}vae_mean_std", logvar.exp().mean().sqrt(), global_step)
             self._log_scalar(f"{prefix}g_gan_loss", g_gan_loss, global_step)
             self._log_scalar(f"{prefix}total_loss", total_loss.mean(), global_step)
+            # Log adaptive weight when using adaptive weighting
+            if self.use_adaptive_weight and self.gan_already_started:
+                self._log_scalar(f"{prefix}adaptive_gan_weight", adaptive_weight, global_step)
 
             # Per-channel latent statistics (for detecting channel collapse)
             # mu shape: [B, C, H, W] - compute stats per channel
@@ -732,6 +757,11 @@ def main():
     perceptual_loss_type = unk_dict.get("perceptual_loss_type", "vgg")
     lpips_net = unk_dict.get("lpips_net", "alex")  # "alex", "vgg", or "squeeze"
 
+    # DINO perceptual loss (semantic features, complementary to VGG/LPIPS)
+    # Helps preserve content correctness while being less sensitive to texture artifacts
+    dino_loss_weight = float(unk_dict.get("dino_loss_weight", 0.0))  # 0 = disabled
+    dino_model = unk_dict.get("dino_model", "dinov2_vits14")  # dinov2_vits14, dinov2_vitb14, dinov2_vitl14
+
     # GAN training settings
     use_gan = unk_dict.get("use_gan", "false").lower() == "true"
     gan_start_condition_key = unk_dict.get("gan_start_condition_key", None)  # "step" or "reconstruction_criteria_met"
@@ -752,6 +782,9 @@ def main():
     gan_warmup_steps = int(unk_dict.get("gan_warmup_steps", 0))
     # Discriminator update frequency: update D every N generator steps (1 = every step, 2 = every other step)
     discriminator_update_frequency = int(unk_dict.get("discriminator_update_frequency", 1))
+    # Adaptive discriminator weighting (VQGAN-style): automatically balances GAN vs reconstruction gradients
+    # This prevents the discriminator from dominating and causing artifacts
+    use_adaptive_weight = unk_dict.get("use_adaptive_weight", "false").lower() == "true"
     # Perceptual loss delayed start (0 = from start, >0 = delay to let L1/MSE settle)
     perceptual_loss_start_step = int(unk_dict.get("perceptual_loss_start_step", 0))
 
@@ -784,6 +817,8 @@ def main():
         kl_divergence_loss_weight=kl_divergence_loss_weight,
         free_bits=free_bits,
         perceptual_loss_weight=perceptual_loss_weight,
+        dino_loss_weight=dino_loss_weight,
+        dino_model=dino_model,
     )
 
     # Try to load existing checkpoint
@@ -932,6 +967,7 @@ def main():
         gan_warmup_steps=gan_warmup_steps,
         perceptual_loss_start_step=perceptual_loss_start_step,
         kl_annealing_steps=kl_annealing_steps,
+        use_adaptive_weight=use_adaptive_weight,
     )
 
     # Add visualization callback

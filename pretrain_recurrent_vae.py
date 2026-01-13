@@ -52,7 +52,12 @@ from dataset_loading.image_vae_dataset import CachedImageVAEDataset, ImageVAEDat
 from model.ema import EMAModel
 from model.image.recurrent_vae import RecurrentVAE, model_config_lookup
 from model.image import discriminators
-from model.image.discriminators import compute_discriminator_loss, compute_generator_gan_loss, r1_gradient_penalty
+from model.image.discriminators import (
+    compute_discriminator_loss,
+    compute_generator_gan_loss,
+    compute_adaptive_weight,
+    r1_gradient_penalty,
+)
 from utils import megatransformer_utils
 from utils.model_loading_utils import load_model
 from utils.training_utils import EarlyStoppingCallback, setup_int8_training
@@ -255,6 +260,8 @@ class RecurrentVAEGANTrainer(Trainer):
         gan_warmup_steps: int = 0,  # Steps to ramp up GAN loss (0 = no warmup)
         # Perceptual loss delayed start
         perceptual_loss_start_step: int = 0,  # Step to start applying perceptual loss (0 = from start)
+        # Adaptive discriminator weighting (VQGAN-style)
+        use_adaptive_weight: bool = False,  # Automatically balance GAN vs reconstruction gradients
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -275,6 +282,7 @@ class RecurrentVAEGANTrainer(Trainer):
         self.gan_start_step = None  # Track when GAN training started (for warmup)
         self.gan_warmup_steps = gan_warmup_steps
         self.perceptual_loss_start_step = perceptual_loss_start_step
+        self.use_adaptive_weight = use_adaptive_weight
 
         # Discriminator regularization settings
         self.r1_penalty_weight = r1_penalty_weight
@@ -394,19 +402,13 @@ class RecurrentVAEGANTrainer(Trainer):
                         self.discriminator,
                         real_images=real_fp32,
                         fake_images=fake_fp32,
-                        loss_type="hinge"
                     )
 
                 # R1 gradient penalty (on clean real images, not noisy)
+                r1_loss = torch.tensor(0.0, device=image.device)
                 if self.r1_penalty_weight > 0 and global_step % self.r1_penalty_interval == 0:
                     r1_loss = r1_gradient_penalty(image.float(), self.discriminator)
                     d_loss = d_loss + self.r1_penalty_weight * r1_loss
-
-                # Update discriminator (only during training when gradients are enabled)
-                if self.discriminator_optimizer is not None and self.discriminator.training and torch.is_grad_enabled():
-                    self.discriminator_optimizer.zero_grad()
-                    d_loss.backward()
-                    self.discriminator_optimizer.step()
 
                 # Log discriminator diagnostics
                 if global_step % self.args.logging_steps == 0 and self.writer is not None:
@@ -416,33 +418,75 @@ class RecurrentVAEGANTrainer(Trainer):
                         self._log_scalar("train/r1_penalty", r1_loss, global_step)
                     if noise_std > 0:
                         self._log_scalar("train/instance_noise_std", noise_std, global_step)
-                    if gan_warmup_factor < 1.0:
-                        self._log_scalar("train/gan_warmup_factor", gan_warmup_factor, global_step)
+
+                    # Log how different real and fake images are
+                    with torch.no_grad():
+                        real_fake_mse = torch.nn.functional.mse_loss(image, recon).item()
+                        real_fake_l1 = torch.nn.functional.l1_loss(image, recon).item()
+                        self._log_scalar("train/real_fake_mse", real_fake_mse, global_step)
+                        self._log_scalar("train/real_fake_l1", real_fake_l1, global_step)
+
+                # Update discriminator (only during training when gradients are enabled)
+                if self.discriminator_optimizer is not None and self.discriminator.training and torch.is_grad_enabled():
+                    self.discriminator_optimizer.zero_grad()
+                    d_loss.backward()
+
+                    # Log gradient statistics to diagnose training issues
+                    if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                        total_grad_norm = 0.0
+                        for p in self.discriminator.parameters():
+                            if p.grad is not None:
+                                total_grad_norm += p.grad.norm().item() ** 2
+                        total_grad_norm = total_grad_norm ** 0.5
+                        self._log_scalar("train/d_grad_norm", total_grad_norm, global_step)
+
+                    self.discriminator_optimizer.step()
 
             # Generator GAN Loss
             self.discriminator.eval()
             with torch.no_grad():
                 self.discriminator.requires_grad_(False)
-            g_gan_loss, g_loss_dict = compute_generator_gan_loss(
-                self.discriminator,
-                recon,
-                loss_type="hinge"
-            )
 
-            # Feature matching loss (if enabled)
-            if self.feature_matching_weight > 0:
-                from model.image.discriminators import compute_feature_matching_loss
-                fm_loss = compute_feature_matching_loss(self.discriminator, image, recon)
+            device_type = image.device.type
+            dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
+            with autocast(device_type, dtype=dtype, enabled=self.args.fp16 or self.args.bf16):
+                g_gan_loss, g_loss_dict = compute_generator_gan_loss(
+                    self.discriminator,
+                    real_images=image,
+                    fake_images=recon,
+                    feature_matching_weight=self.feature_matching_weight,
+                )
 
             with torch.no_grad():
                 self.discriminator.requires_grad_(True)
 
-            # Apply warmup factor to GAN losses
-            g_gan_loss = gan_warmup_factor * g_gan_loss
-            fm_loss = gan_warmup_factor * fm_loss
+            if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                for key, val in g_loss_dict.items():
+                    self._log_scalar(f"train/{key}", val, global_step)
+                # Log warmup factor
+                self._log_scalar("train/gan_warmup_factor", gan_warmup_factor, global_step)
 
-        # Total loss = VAE loss + weighted GAN loss + feature matching loss
-        total_loss = vae_loss + self.gan_loss_weight * g_gan_loss + self.feature_matching_weight * fm_loss
+            # Apply warmup factor to GAN loss
+            g_gan_loss = gan_warmup_factor * g_gan_loss
+
+        # Total generator loss with optional adaptive weighting
+        adaptive_weight = torch.tensor(self.gan_loss_weight, device=image.device)
+        if self.use_adaptive_weight and self.gan_already_started and g_gan_loss.requires_grad:
+            # VQGAN-style adaptive weighting: balance GAN and reconstruction gradients
+            # Uses the last decoder layer as proxy for decoder output gradients
+            try:
+                # RecurrentDecoder has final_conv as nn.Sequential, last layer is Conv2d
+                last_layer = model.decoder.final_conv[-1].weight
+                adaptive_weight = compute_adaptive_weight(
+                    vae_loss, g_gan_loss, last_layer, self.gan_loss_weight
+                )
+            except (AttributeError, RuntimeError, IndexError) as e:
+                # Fallback to fixed weight if adaptive weight fails
+                if global_step % self.args.logging_steps == 0:
+                    print(f"Warning: adaptive weight computation failed ({e}), using fixed weight")
+                adaptive_weight = torch.tensor(self.gan_loss_weight, device=image.device)
+
+        total_loss = vae_loss + adaptive_weight * g_gan_loss
 
         # Log losses and metrics
         if global_step % self.args.logging_steps == 0 and self.writer is not None:
@@ -467,6 +511,9 @@ class RecurrentVAEGANTrainer(Trainer):
             self._log_scalar(f"{prefix}d_loss", d_loss, global_step)
             for key, value in d_loss_dict.items():
                 self._log_scalar(f"{prefix}d_{key}", value, global_step)
+            # Log adaptive weight when using adaptive weighting
+            if self.use_adaptive_weight and self.gan_already_started:
+                self._log_scalar(f"{prefix}adaptive_gan_weight", adaptive_weight, global_step)
 
             # Recurrence metrics (recurrence/ prefix for recurrent-specific metrics)
             self._log_scalar(f"{prefix}recurrence/encoder_n_steps", info["encoder_n_steps"], global_step)
@@ -659,6 +706,9 @@ def main():
     feature_matching_weight = float(unk_dict.get("feature_matching_weight", 0.0))
     discriminator_update_frequency = int(unk_dict.get("discriminator_update_frequency", 1))
     discriminator_config = unk_dict.get("discriminator_config", "multi_scale")
+    # Adaptive discriminator weighting (VQGAN-style): automatically balances GAN vs reconstruction gradients
+    # This prevents the discriminator from dominating and causing artifacts
+    use_adaptive_weight = unk_dict.get("use_adaptive_weight", "false").lower() == "true"
 
     # GAN regularization settings
     instance_noise_std = float(unk_dict.get("instance_noise_std", 0.0))  # 0 = disabled
@@ -667,6 +717,9 @@ def main():
     r1_penalty_interval = int(unk_dict.get("r1_penalty_interval", 16))
     gan_warmup_steps = int(unk_dict.get("gan_warmup_steps", 0))  # 0 = no warmup
     perceptual_loss_start_step = int(unk_dict.get("perceptual_loss_start_step", 0))  # 0 = from start
+
+    # CONFLICTS WITH R1 PENALTY; ONLY ENABLE ONE OF THESE REGULARIZATION TYPES AT A TIME
+    discriminator_spectral_norm = unk_dict.get("discriminator_spectral_norm", "true").lower() == "true"
 
     # EMA settings
     use_ema = unk_dict.get("use_ema", "false").lower() == "true"
@@ -688,6 +741,11 @@ def main():
 
     # If debug_start_step > 0, start with debug disabled (callback will enable it later)
     initial_debug = debug and (debug_start_step == 0)
+
+    if discriminator_spectral_norm and r1_penalty_weight > 0:
+        print("WARNING: Both discriminator spectral norm and R1 penalty are enabled. These regularization methods can conflict; consider disabling one of them.")
+    elif not discriminator_spectral_norm and r1_penalty_weight == 0.0:
+        print("WARNING: Neither discriminator spectral norm nor R1 penalty is enabled. Consider enabling one of these regularization methods to stabilize GAN training.")
 
     # Create model
     model = model_config_lookup[args.config](
@@ -828,7 +886,9 @@ def main():
         adam_beta1=args.adam_beta1,
         adam_beta2=args.adam_beta2,
         ignore_data_skip=False,
-        remove_unused_columns=False
+        remove_unused_columns=False,
+        eval_strategy="steps" if args.eval_steps > 0 else "no",
+        eval_steps=args.eval_steps if args.eval_steps > 0 else None,
     )
 
     # Load datasets
@@ -867,6 +927,7 @@ def main():
         r1_penalty_interval=r1_penalty_interval,
         gan_warmup_steps=gan_warmup_steps,
         perceptual_loss_start_step=perceptual_loss_start_step,
+        use_adaptive_weight=use_adaptive_weight,
     )
 
     # Add visualization callback
