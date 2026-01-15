@@ -129,6 +129,7 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         # Add 1D positional encoding
         projected_latents = self.pos_encoding(projected_latents)
 
-        prelude_output = projected_latents + self.prelude(projected_latents)  # (batch, timesteps, d_model)
+        prelude_hidden, _ = self.prelude(projected_latents)  # (batch, timesteps, d_model)
+        prelude_output = projected_latents + prelude_hidden
 
         return prelude_output

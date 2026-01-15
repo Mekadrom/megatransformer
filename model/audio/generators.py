@@ -92,7 +92,8 @@ class AudioCodaAndVAEWithLoss(nn.Module):
             - "latent_l1_loss", "latent_mse_loss": Latent space losses (if latent_labels provided)
             - "mel_l1_loss", "mel_mse_loss": Mel space losses (if decode_to_mel and mel_spec_labels provided)
         """
-        coda_output = x + self.coda(x)  # (batch, seq_length, d_model)
+        coda_hidden, _ = self.coda(x)  # (batch, seq_length, d_model)
+        coda_output = x + coda_hidden
 
         latent_preds: torch.Tensor = self.latent_projection(coda_output)  # (batch, seq_length, latent_mel_bins * latent_channels)
 

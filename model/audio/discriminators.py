@@ -1042,3 +1042,27 @@ mel_discriminator_config_lookup = {
     "small_combined": small_mel_combined_discriminator,
     "combined": mel_combined_discriminator,
 }
+
+
+# =============================================================================
+# Gradient Reversal Layer for Adversarial Speaker Disentanglement
+# =============================================================================
+
+class GradientReversalFunction(torch.autograd.Function):
+    """
+    Gradient Reversal Layer (GRL) for domain adversarial training.
+
+    During forward pass: identity function
+    During backward pass: reverses gradient direction (multiplies by -alpha)
+
+    This allows training a speaker classifier that tries to predict speaker
+    from latents, while the encoder learns to fool it (remove speaker info).
+    """
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None

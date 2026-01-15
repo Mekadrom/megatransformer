@@ -1,8 +1,20 @@
-from typing import Optional
+from typing import Optional, List, Dict
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers import PretrainedConfig
+
+# Special token IDs (base vocab = 32000 from Mistral tokenizer)
+BOA_TOKEN_ID = 32_000  # Begin of Audio
+EOA_TOKEN_ID = 32_001  # End of Audio
+BOV_TOKEN_ID = 32_002  # Begin of Voice
+EOV_TOKEN_ID = 32_003  # End of Voice
+BOI_TOKEN_ID = 32_004  # Begin of Image
+EOI_TOKEN_ID = 32_005  # End of Image
+AUDIO_PLACEHOLDER_TOKEN_ID = 32_006
+VOICE_PLACEHOLDER_TOKEN_ID = 32_007
+IMAGE_PLACEHOLDER_TOKEN_ID = 32_008
 
 from model.audio.feature_extractors import AudioVAEPreludeFeatureExtractor, AudioVAEPreludeFeatureExtractorConfig
 from model.audio.generators import AudioCodaAndVAEConfig, AudioCodaAndVAEWithLoss
@@ -12,6 +24,7 @@ from model.image.generators import ImageCodaAndVAEConfig, ImageCodaAndVAEWithLos
 from model.image.vae import ImageVAEEncoder, ImageVAEDecoder
 from model.text.feature_extractors import TextFeatureExtractor, TextFeatureExtractorConfig
 from model.text.generators import TextCodaClassifierConfig, TextCodaClassifierWithLoss
+from model.world.kv_cache import RecurrentKVCache
 from model.world.recurrent import MegatransformerRecurrentBlock, MegatransformerRecurrentConfig
 from model.world.token_alignment import TokenInterleaver, TokenInterleaverConfig, TokenUninterleaver
 from utils import configuration
@@ -231,7 +244,7 @@ class MegatransformerWorldModel(nn.Module):
         # -----------------------------------------------------------------
         # Main Transformer (Recurrent Block)
         # -----------------------------------------------------------------
-        recurrent_output = self.recurrent_block(
+        recurrent_output, _ = self.recurrent_block(
             interleaved_tokens,
             attention_mask=attn_mask  # True for attend, False for padding
         )
@@ -286,6 +299,321 @@ class MegatransformerWorldModel(nn.Module):
             outputs.update(image_outputs)
 
         return outputs
+
+    # -------------------------------------------------------------------------
+    # Generation with KV Caching
+    # -------------------------------------------------------------------------
+
+    @torch.no_grad()
+    def generate(
+        self,
+        text_input_ids: torch.Tensor,
+        max_new_tokens: int = 512,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        kv_cache_strategy: str = "huginn",
+        kv_cache_budget: int = 16,
+        decode_outputs: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Generate tokens autoregressively with KV caching.
+
+        This method implements autoregressive generation through the recurrent block
+        with efficient KV caching using the Huginn approach (circular buffer).
+
+        The generation flow:
+        1. Process initial text input through text feature extractor
+        2. Autoregressively sample tokens through the recurrent block
+        3. When end-of-modality tokens (EOA/EOV/EOI) are detected, collect the
+           complete modality sequence and pass it to the appropriate coda
+        4. Continue generating until max_new_tokens or end-of-sequence
+
+        Args:
+            text_input_ids: Initial text prompt token IDs, shape (batch, prompt_len).
+                Can contain placeholder tokens for media that will be generated.
+            max_new_tokens: Maximum number of tokens to generate.
+            temperature: Sampling temperature. Higher = more random.
+            top_k: If set, only sample from top k most likely tokens.
+            top_p: If set, use nucleus sampling with this probability mass.
+            kv_cache_strategy: "huginn" (shared cache, efficient) or "per_iteration".
+            kv_cache_budget: Number of cache slots for Huginn strategy.
+            decode_outputs: If True, decode generated latents via VAE decoders.
+
+        Returns:
+            Dictionary containing:
+            - "generated_token_ids": Generated text token IDs
+            - "text_logits": Logits for text tokens
+            - "audio_latent_preds": Generated audio latents (if any)
+            - "voice_latent_preds": Generated voice latents (if any)
+            - "image_latent_preds": Generated image latents (if any)
+            - Decoded outputs if decode_outputs=True
+        """
+        batch_size = text_input_ids.shape[0]
+        device = text_input_ids.device
+
+        # Initialize KV cache
+        kv_cache = RecurrentKVCache(
+            strategy=kv_cache_strategy,
+            cache_budget=kv_cache_budget,
+        )
+
+        # Track generation state per batch item
+        generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
+        all_logits: List[torch.Tensor] = []
+
+        # Track modality sequences being built
+        audio_sequences: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+        voice_sequences: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+        image_sequences: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+
+        # Track which modality we're currently generating for each batch item
+        # None = text, "audio", "voice", "image"
+        current_modality: List[Optional[str]] = [None for _ in range(batch_size)]
+
+        # Completed modality outputs
+        completed_audio: List[Optional[torch.Tensor]] = [None for _ in range(batch_size)]
+        completed_voice: List[Optional[torch.Tensor]] = [None for _ in range(batch_size)]
+        completed_image: List[Optional[torch.Tensor]] = [None for _ in range(batch_size)]
+
+        # Process initial prompt
+        # Get embeddings for prompt
+        prompt_hidden = self.text_feature_extractor(text_input_ids)  # (batch, prompt_len, d_model)
+
+        # Process through recurrent block to get initial context
+        current_hidden, kv_cache = self.recurrent_block(
+            prompt_hidden,
+            attention_mask=None,
+            kv_cache=kv_cache,
+            position_offset=0,
+            use_cache=True,
+        )
+
+        position_offset = text_input_ids.shape[1]
+
+        # Get initial logits from text coda for the last position
+        last_hidden = current_hidden[:, -1:, :]  # (batch, 1, d_model)
+        text_output = self.text_generator(last_hidden)
+        logits = text_output["logits"][:, 0, :]  # (batch, vocab_size)
+        all_logits.append(logits.unsqueeze(1))
+
+        # Sample first token
+        next_token_ids = self._sample_tokens(logits, temperature, top_k, top_p)
+
+        for b in range(batch_size):
+            generated_tokens[b].append(next_token_ids[b].item())
+
+        # Autoregressive generation loop
+        for _ in range(max_new_tokens - 1):
+            # Check for modality transitions and handle accordingly
+            next_hidden_list = []
+
+            for b in range(batch_size):
+                token_id = next_token_ids[b].item()
+
+                # Check for begin-of-modality tokens
+                if token_id == BOA_TOKEN_ID:
+                    current_modality[b] = "audio"
+                    # Embed the BOA token
+                    token_embed = self.text_feature_extractor(
+                        torch.tensor([[token_id]], device=device)
+                    )  # (1, 1, d_model)
+                    next_hidden_list.append(token_embed[0])
+
+                elif token_id == BOV_TOKEN_ID:
+                    current_modality[b] = "voice"
+                    token_embed = self.text_feature_extractor(
+                        torch.tensor([[token_id]], device=device)
+                    )
+                    next_hidden_list.append(token_embed[0])
+
+                elif token_id == BOI_TOKEN_ID:
+                    current_modality[b] = "image"
+                    token_embed = self.text_feature_extractor(
+                        torch.tensor([[token_id]], device=device)
+                    )
+                    next_hidden_list.append(token_embed[0])
+
+                # Check for end-of-modality tokens
+                elif token_id == EOA_TOKEN_ID and current_modality[b] == "audio":
+                    current_modality[b] = None
+                    # Process accumulated audio sequence through audio coda
+                    if audio_sequences[b]:
+                        audio_hidden = torch.cat(audio_sequences[b], dim=0)  # (seq, d_model)
+                        audio_hidden = audio_hidden.unsqueeze(0)  # (1, seq, d_model)
+                        audio_out = self.audio_generator(
+                            audio_hidden,
+                            decode_to_mel=decode_outputs,
+                        )
+                        completed_audio[b] = audio_out.get("audio_latent_preds")
+                        audio_sequences[b] = []
+                    # Embed EOA token
+                    token_embed = self.text_feature_extractor(
+                        torch.tensor([[token_id]], device=device)
+                    )
+                    next_hidden_list.append(token_embed[0])
+
+                elif token_id == EOV_TOKEN_ID and current_modality[b] == "voice":
+                    current_modality[b] = None
+                    if voice_sequences[b]:
+                        voice_hidden = torch.cat(voice_sequences[b], dim=0)
+                        voice_hidden = voice_hidden.unsqueeze(0)
+                        voice_out = self.voice_generator(
+                            voice_hidden,
+                            decode_to_mel=decode_outputs,
+                        )
+                        completed_voice[b] = voice_out.get("voice_latent_preds")
+                        voice_sequences[b] = []
+                    token_embed = self.text_feature_extractor(
+                        torch.tensor([[token_id]], device=device)
+                    )
+                    next_hidden_list.append(token_embed[0])
+
+                elif token_id == EOI_TOKEN_ID and current_modality[b] == "image":
+                    current_modality[b] = None
+                    if image_sequences[b]:
+                        image_hidden = torch.cat(image_sequences[b], dim=0)
+                        image_hidden = image_hidden.unsqueeze(0)
+                        image_out = self.image_generator(
+                            image_hidden,
+                            decode_to_image=decode_outputs,
+                        )
+                        completed_image[b] = image_out.get("image_latent_preds")
+                        image_sequences[b] = []
+                    token_embed = self.text_feature_extractor(
+                        torch.tensor([[token_id]], device=device)
+                    )
+                    next_hidden_list.append(token_embed[0])
+
+                else:
+                    # Regular token - embed it
+                    token_embed = self.text_feature_extractor(
+                        torch.tensor([[token_id]], device=device)
+                    )
+                    next_hidden_list.append(token_embed[0])
+
+            # Stack embeddings for all batch items: (batch, 1, d_model)
+            next_hidden = torch.stack(next_hidden_list, dim=0)
+
+            # Process through recurrent block with KV cache
+            current_hidden, kv_cache = self.recurrent_block(
+                next_hidden,
+                attention_mask=None,
+                kv_cache=kv_cache,
+                position_offset=position_offset,
+                use_cache=True,
+            )
+            position_offset += 1
+
+            # Accumulate hidden states for non-text modalities
+            for b in range(batch_size):
+                if current_modality[b] == "audio":
+                    audio_sequences[b].append(current_hidden[b])  # (1, d_model)
+                elif current_modality[b] == "voice":
+                    voice_sequences[b].append(current_hidden[b])
+                elif current_modality[b] == "image":
+                    image_sequences[b].append(current_hidden[b])
+
+            # Get logits for next token
+            text_output = self.text_generator(current_hidden)
+            logits = text_output["logits"][:, 0, :]  # (batch, vocab_size)
+            all_logits.append(logits.unsqueeze(1))
+
+            # Sample next tokens
+            next_token_ids = self._sample_tokens(logits, temperature, top_k, top_p)
+
+            for b in range(batch_size):
+                generated_tokens[b].append(next_token_ids[b].item())
+
+            # Check for EOS (could add EOS_TOKEN_ID check here)
+
+        # Compile outputs
+        outputs: Dict[str, torch.Tensor] = {}
+
+        # Convert generated tokens to tensor
+        max_gen_len = max(len(tokens) for tokens in generated_tokens)
+        gen_token_tensor = torch.zeros(batch_size, max_gen_len, dtype=torch.long, device=device)
+        for b in range(batch_size):
+            gen_token_tensor[b, :len(generated_tokens[b])] = torch.tensor(
+                generated_tokens[b], device=device
+            )
+        outputs["generated_token_ids"] = gen_token_tensor
+
+        # Stack logits
+        outputs["text_logits"] = torch.cat(all_logits, dim=1)  # (batch, seq, vocab)
+
+        # Collect completed modality outputs
+        # Note: These may be None for some batch items if no modality was generated
+        if any(a is not None for a in completed_audio):
+            # Stack non-None audio outputs (with padding if needed)
+            outputs["audio_latent_preds"] = self._stack_optional_tensors(completed_audio, device)
+
+        if any(v is not None for v in completed_voice):
+            outputs["voice_latent_preds"] = self._stack_optional_tensors(completed_voice, device)
+
+        if any(i is not None for i in completed_image):
+            outputs["image_latent_preds"] = self._stack_optional_tensors(completed_image, device)
+
+        return outputs
+
+    def _sample_tokens(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+        top_k: Optional[int],
+        top_p: Optional[float],
+    ) -> torch.Tensor:
+        """Sample tokens from logits with temperature, top-k, and top-p."""
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = float('-inf')
+
+        if top_p is not None:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift the indices to the right to keep also the first token above threshold
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+
+            # Scatter sorted tensors back to original order
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+            )
+            logits[indices_to_remove] = float('-inf')
+
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+    def _stack_optional_tensors(
+        self,
+        tensors: List[Optional[torch.Tensor]],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Stack list of optional tensors, padding None entries with zeros."""
+        # Find a non-None tensor to get the shape
+        ref_tensor = None
+        for t in tensors:
+            if t is not None:
+                ref_tensor = t
+                break
+
+        if ref_tensor is None:
+            return torch.tensor([], device=device)
+
+        result = []
+        for t in tensors:
+            if t is None:
+                result.append(torch.zeros_like(ref_tensor))
+            else:
+                result.append(t)
+
+        return torch.stack(result, dim=0)
 
 
 def get_wm_config(
@@ -421,7 +749,7 @@ tiny_world_model_config = get_wm_config(
     prelude_d_values=32,
     recurrent_n_heads=4,
     recurrent_n_layers=2,
-    reurrent_d_queries=64,
+    recurrent_d_queries=64,
     recurrent_d_values=64,
     coda_n_heads=2,
     coda_n_layers=1,
@@ -442,7 +770,7 @@ small_world_model_config = get_wm_config(
     prelude_d_values=64,
     recurrent_n_heads=8,
     recurrent_n_layers=4,
-    reurrent_d_queries=128,
+    recurrent_d_queries=128,
     recurrent_d_values=128,
     coda_n_heads=4,
     coda_n_layers=2,
@@ -463,7 +791,7 @@ medium_world_model_config = get_wm_config(
     prelude_d_values=128,
     recurrent_n_heads=16,
     recurrent_n_layers=8,
-    reurrent_d_queries=256,
+    recurrent_d_queries=256,
     recurrent_d_values=256,
     coda_n_heads=8,
     coda_n_layers=4,

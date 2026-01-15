@@ -51,7 +51,8 @@ class TextCodaClassifierWithLoss(nn.Module):
         Returns:
             dict[str, torch.Tensor]: A dictionary containing the logits and classification loss if targets are provided.
         """
-        coda_output = x + self.coda(x)
+        coda_hidden, _ = self.coda(x)
+        coda_output = x + coda_hidden
 
         logits: torch.Tensor = self.lm_head(coda_output)
 

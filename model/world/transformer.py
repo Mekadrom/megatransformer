@@ -1,4 +1,6 @@
 import math
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +8,7 @@ import torch.nn.functional as F
 from rotary_embedding_torch import RotaryEmbedding
 
 from model import activations
+from model.world.kv_cache import KVCache
 from utils import configuration
 from utils.megatransformer_utils import transformer_weight_init
 from utils.model_utils import create_norm, get_activation_type
@@ -75,10 +78,28 @@ class MegaTransformerCausalSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor=None,
-        head_mask: torch.Tensor=None,
-    ) -> torch.Tensor:
-        N, _ = hidden_states.shape[:2]
+        attention_mask: torch.Tensor = None,
+        head_mask: torch.Tensor = None,
+        kv_cache: Optional[KVCache] = None,
+        position_offset: int = 0,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        """
+        Forward pass with optional KV caching for efficient generation.
+
+        Args:
+            hidden_states: Input tensor, shape (batch, seq_len, d_model)
+            attention_mask: Optional attention mask
+            head_mask: Optional head mask
+            kv_cache: Optional KVCache with cached keys/values from previous positions
+            position_offset: Position offset for RoPE (number of cached tokens)
+            use_cache: Whether to return updated KV cache
+
+        Returns:
+            output: Attention output, shape (batch, seq_len, d_model)
+            new_kv_cache: Updated KVCache if use_cache=True, else None
+        """
+        N, seq_len = hidden_states.shape[:2]
 
         queries: torch.Tensor = self.q_proj(hidden_states)
         keys: torch.Tensor = self.k_proj(hidden_states)
@@ -97,63 +118,101 @@ class MegaTransformerCausalSelfAttention(nn.Module):
         keys = keys.view(N, -1, self.n_query_groups, self.d_queries).permute(0, 2, 1, 3).contiguous()
         values = values.view(N, -1, self.n_query_groups, self.d_values).permute(0, 2, 1, 3).contiguous()
 
-        # Apply RoPE after reshaping to heads (operates on last dim which is d_queries)
+        # Apply RoPE with position offset for correct positions during generation
         if self.rotary_embedding is not None:
-            queries = self.rotary_embedding.rotate_queries_or_keys(queries)
-            keys = self.rotary_embedding.rotate_queries_or_keys(keys)
+            # rotate_queries_or_keys supports offset parameter for cached generation
+            queries = self.rotary_embedding.rotate_queries_or_keys(queries, offset=position_offset)
+            keys = self.rotary_embedding.rotate_queries_or_keys(keys, offset=position_offset)
 
-        # Expand K/V heads to match Q heads for GQA
-        # (N, n_query_groups, seq, d) -> (N, n_heads, seq, d)
-        if self.n_rep > 1:
-            keys = keys.repeat_interleave(self.n_rep, dim=1)
-            values = values.repeat_interleave(self.n_rep, dim=1)
+        # Handle KV cache
+        new_kv_cache = None
+        if kv_cache is not None and kv_cache.key_cache is not None:
+            # Concatenate cached keys/values with new ones
+            # Cached K/V are already expanded to n_heads if GQA was used
+            keys_for_cache = keys  # Before expansion
+            values_for_cache = values
+
+            # Expand new K/V heads to match Q heads for GQA before concatenation
+            if self.n_rep > 1:
+                keys = keys.repeat_interleave(self.n_rep, dim=1)
+                values = values.repeat_interleave(self.n_rep, dim=1)
+
+            # Concatenate with cache (cache stores expanded K/V)
+            keys = torch.cat([kv_cache.key_cache, keys], dim=2)
+            values = torch.cat([kv_cache.value_cache, values], dim=2)
+
+            if use_cache:
+                # Store expanded K/V in cache for next step
+                new_kv_cache = KVCache()
+                new_kv_cache.key_cache = keys.clone()
+                new_kv_cache.value_cache = values.clone()
+        else:
+            # No cache - expand K/V for GQA
+            if self.n_rep > 1:
+                keys = keys.repeat_interleave(self.n_rep, dim=1)
+                values = values.repeat_interleave(self.n_rep, dim=1)
+
+            if use_cache:
+                # Initialize cache with current K/V (already expanded)
+                new_kv_cache = KVCache()
+                new_kv_cache.key_cache = keys.clone()
+                new_kv_cache.value_cache = values.clone()
 
         attention_scores = torch.matmul(queries, keys.transpose(-1, -2))
 
-        _, _, t = queries.shape[:3]
-        _, _, T = keys.shape[:3]
+        _, _, t = queries.shape[:3]  # Query sequence length (new tokens)
+        _, _, T = keys.shape[:3]  # Total key sequence length (cached + new)
 
         if self.alibi_bias is not None:
-            attention_scores = attention_scores + self.alibi_bias[:, :t, :T].unsqueeze(0).repeat(N, 1, 1, 1)
+            # For ALiBi, we need the full position range
+            # Query positions: [position_offset, position_offset + t)
+            # Key positions: [0, T)
+            alibi_slice = self.alibi_bias[:, position_offset:position_offset + t, :T]
+            attention_scores = attention_scores + alibi_slice.unsqueeze(0).repeat(N, 1, 1, 1)
 
         attention_scores = attention_scores / math.sqrt(self.d_queries)
         if bool(self.use_grok_scaled_attn):
             attention_scores = 30.0 * torch.tanh(attention_scores / 30.0)
 
-        max_seq_len = max(t, T)
+        # Causal masking: queries at position i can attend to keys at positions <= i
+        # For cached generation: query position = position_offset + local_pos
+        # Key position = 0 to T-1
+        # Query at pos p can attend to keys at pos <= p
+        max_seq_len = position_offset + t
         if max_seq_len > min(self.causal_mask.shape[-1], self.causal_mask.shape[-2]):
-            # recalculate causal mask with new longest length
-            self.register_buffer(
-                "causal_mask",
-                torch.tril(torch.ones(max_seq_len, max_seq_len)).view(1, 1, max_seq_len, max_seq_len),
-            )
+            # Recalculate causal mask with new longest length
+            new_size = max(max_seq_len, T)
+            self.causal_mask = torch.tril(
+                torch.ones(new_size, new_size, device=hidden_states.device)
+            ).view(1, 1, new_size, new_size)
 
-        causal_mask_slice = self.causal_mask[:, :, :t, :T].to(attention_scores.device)
+        # Slice causal mask for current query/key positions
+        causal_mask_slice = self.causal_mask[:, :, position_offset:position_offset + t, :T]
+        causal_mask_slice = causal_mask_slice.to(attention_scores.device)
         attention_scores = attention_scores.masked_fill(causal_mask_slice == 0, float("-inf"))
-        
+
         if attention_mask is not None:
             # HuggingFace uses 1 for tokens to attend to and 0 for masked tokens
-            # which is the opposite of the original transformer implementation
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
             attention_scores = attention_scores.masked_fill(attention_mask == 0, float("-inf"))
-        
+
         attention_probs = F.softmax(attention_scores, dim=-1)
         attention_probs = self.attn_dropout(attention_probs)
-        
+
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
-        
+
         context_layer = torch.matmul(attention_probs, values)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
 
-        new_context_layer_shape = context_layer.size()[:-2] + (self.d_values*self.n_heads,)
+        new_context_layer_shape = context_layer.size()[:-2] + (self.d_values * self.n_heads,)
         context_layer = context_layer.view(*new_context_layer_shape)
-        
+
         # Apply output projection
         output = self.o_proj(context_layer)
         output = self.proj_dropout(output)
 
-        return output
+        return output, new_kv_cache
 
 
 class SimpleFFN(nn.Module):
@@ -210,25 +269,46 @@ class MegaTransformerBlock(nn.Module):
 
     def _init_weights(self):
         self.apply(transformer_weight_init())
-    
+
     def forward(
         self,
-        hidden_states,
-        attention_mask=None,
-        head_mask=None,
-    ) -> torch.Tensor:
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
+        position_offset: int = 0,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        """
+        Forward pass with optional KV caching.
+
+        Args:
+            hidden_states: Input tensor, shape (batch, seq_len, d_model)
+            attention_mask: Optional attention mask
+            head_mask: Optional head mask
+            kv_cache: Optional KVCache for efficient generation
+            position_offset: Position offset for RoPE
+            use_cache: Whether to return updated KV cache
+
+        Returns:
+            hidden_states: Output tensor, shape (batch, seq_len, d_model)
+            new_kv_cache: Updated KVCache if use_cache=True, else None
+        """
         if self.pre_attn_norm is not None:
             attn_input = self.pre_attn_norm(hidden_states)
         else:
             attn_input = hidden_states
 
-        attn_outputs = self.self_attn(
+        attn_output, new_kv_cache = self.self_attn(
             attn_input,
             attention_mask=attention_mask,
             head_mask=head_mask,
+            kv_cache=kv_cache,
+            position_offset=position_offset,
+            use_cache=use_cache,
         )
 
-        hidden_states = hidden_states + attn_outputs
+        hidden_states = hidden_states + attn_output
 
         if self.post_attn_norm is not None:
             hidden_states = self.post_attn_norm(hidden_states)
@@ -237,7 +317,7 @@ class MegaTransformerBlock(nn.Module):
             ffn_input = self.pre_ffn_norm(hidden_states)
         else:
             ffn_input = hidden_states
-        
+
         ffn_output = self.ffn(ffn_input)
 
         hidden_states = hidden_states + ffn_output
@@ -245,4 +325,4 @@ class MegaTransformerBlock(nn.Module):
         if self.post_ffn_norm is not None:
             hidden_states = self.post_ffn_norm(hidden_states)
 
-        return hidden_states
+        return hidden_states, new_kv_cache

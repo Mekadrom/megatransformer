@@ -130,6 +130,7 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
         # Add 2D positional encoding
         patch_embeddings = patch_embeddings + self.pos_embedding
 
-        prelude_output = patch_embeddings + self.prelude(patch_embeddings)  # (batch_size, num_patches, d_model)
+        prelude_hidden, _ = self.prelude(patch_embeddings)  # (batch_size, num_patches, d_model)
+        prelude_output = patch_embeddings + prelude_hidden
 
         return prelude_output

@@ -807,6 +807,499 @@ class AudioVAEDecoder(nn.Module):
         return recon_x
 
 
+# =============================================================================
+# GuBERT Feature VAE Components (1D)
+# =============================================================================
+
+class Snake1d(nn.Module):
+    """
+    Snake activation for 1D inputs: x + (1/alpha) * sin^2(alpha * x)
+
+    The alpha parameter is learnable per channel, allowing the network
+    to adapt the periodicity to different frequency ranges.
+    """
+    def __init__(self, channels: int, alpha_init: float = 1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.full((1, channels, 1), alpha_init))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [B, C, T]
+        return x + (1.0 / self.alpha) * torch.sin(self.alpha * x) ** 2
+
+
+class ResidualBlock1d(nn.Module):
+    """
+    Residual block for 1D sequential data (GuBERT features).
+
+    Uses two conv layers with GroupNorm and a skip connection.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int = None,
+        kernel_size: int = 5,
+        activation_fn: str = "silu",
+    ):
+        super().__init__()
+        out_channels = out_channels or in_channels
+        padding = kernel_size // 2
+
+        # Get activation
+        if activation_fn == "snake":
+            self.act1 = Snake1d(out_channels)
+            self.act2 = Snake1d(out_channels)
+        else:
+            activation_type = get_activation_type(activation_fn)
+            if activation_type in [activations.SwiGLU, activations.Snake]:
+                self.act1 = activation_type(out_channels)
+                self.act2 = activation_type(out_channels)
+            else:
+                self.act1 = activation_type()
+                self.act2 = activation_type()
+
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=padding)
+        self.norm1 = nn.GroupNorm(max(1, out_channels // 4), out_channels)
+        self.norm2 = nn.GroupNorm(max(1, out_channels // 4), out_channels)
+
+        # Skip connection projection if channels change
+        self.skip_proj = None
+        if in_channels != out_channels:
+            self.skip_proj = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in [self.conv1, self.conv2]:
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        # Initialize second conv with smaller weights for stable residual learning
+        self.conv2.weight.data *= 0.1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x if self.skip_proj is None else self.skip_proj(x)
+
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.act1(x)
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+
+        x = x + residual
+        x = self.act2(x)
+
+        return x
+
+
+class GuBERTFeatureVAEEncoder(nn.Module):
+    """
+    VAE encoder for GuBERT features.
+
+    Takes GuBERT features [B, T, D] and compresses to latent space.
+    Uses Conv1D for temporal downsampling.
+
+    Architecture:
+    - Input projection: D -> intermediate_channels[0]
+    - Downsampling stages with strided Conv1D
+    - Optional residual blocks per stage
+    - Output: mu, logvar [B, latent_dim, T']
+    """
+    def __init__(
+        self,
+        input_dim: int = 256,  # GuBERT feature dimension
+        latent_dim: int = 32,  # Latent dimension per timestep
+        intermediate_channels: list = None,
+        kernel_sizes: list = None,
+        strides: list = None,
+        n_residual_blocks: int = 1,
+        activation_fn: str = "silu",
+        dropout: float = 0.1,
+        logvar_clamp_max: float = 4.0,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.logvar_clamp_max = logvar_clamp_max
+
+        # Defaults
+        if intermediate_channels is None:
+            intermediate_channels = [256, 256, 128]
+        if kernel_sizes is None:
+            kernel_sizes = [5, 5, 3]
+        if strides is None:
+            strides = [2, 2, 2]  # 8x total downsampling
+
+        self.strides = strides
+        channels = [input_dim] + intermediate_channels
+
+        # Get activation type
+        if activation_fn == "snake":
+            self.get_activation = lambda c: Snake1d(c)
+        else:
+            activation_type = get_activation_type(activation_fn)
+            if activation_type in [activations.SwiGLU, activations.Snake]:
+                self.get_activation = lambda c: activation_type(c)
+            else:
+                self.get_activation = lambda c: activation_type()
+
+        # Build encoder stages
+        self.stages = nn.ModuleList()
+        for i, (in_c, out_c, kernel_size, stride) in enumerate(
+            zip(channels[:-1], channels[1:], kernel_sizes, strides)
+        ):
+            stage = nn.ModuleList()
+
+            # Strided conv for downsampling
+            padding = kernel_size // 2
+            stage.append(nn.Conv1d(in_c, out_c, kernel_size, stride=stride, padding=padding))
+            stage.append(nn.GroupNorm(max(1, out_c // 4), out_c))
+            stage.append(self.get_activation(out_c))
+
+            # Residual blocks
+            for _ in range(n_residual_blocks):
+                stage.append(ResidualBlock1d(out_c, out_c, kernel_size=kernel_size, activation_fn=activation_fn))
+
+            if dropout > 0:
+                stage.append(nn.Dropout(dropout))
+
+            self.stages.append(stage)
+
+        # Output projections for mu and logvar
+        final_channels = intermediate_channels[-1]
+        self.fc_mu = nn.Conv1d(final_channels, latent_dim, kernel_size=3, padding=1)
+        self.fc_logvar = nn.Conv1d(final_channels, latent_dim, kernel_size=3, padding=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv1d) and module not in [self.fc_mu, self.fc_logvar]:
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.GroupNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+        # Initialize mu/logvar with smaller variance
+        nn.init.normal_(self.fc_mu.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.fc_mu.bias)
+        nn.init.normal_(self.fc_logvar.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.fc_logvar.bias)
+
+    def get_output_length(self, input_length: int) -> int:
+        """Compute output temporal length given input length."""
+        length = input_length
+        for stride in self.strides:
+            length = (length + stride - 1) // stride  # Ceiling division
+        return length
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor = None) -> tuple:
+        """
+        Args:
+            x: [B, T, D] GuBERT features
+            lengths: [B] optional valid lengths
+
+        Returns:
+            mu: [B, latent_dim, T'] latent mean
+            logvar: [B, latent_dim, T'] latent log variance
+            output_lengths: [B] downsampled lengths (if lengths provided)
+        """
+        # Permute to [B, D, T] for Conv1d
+        x = x.permute(0, 2, 1)
+
+        # Process through encoder stages
+        for stage in self.stages:
+            for layer in stage:
+                x = layer(x)
+
+        # Get mu and logvar
+        mu = self.fc_mu(x)
+        logvar = self.fc_logvar(x)
+        logvar = torch.clamp(logvar, min=-10.0, max=self.logvar_clamp_max)
+
+        # Compute output lengths if provided
+        output_lengths = None
+        if lengths is not None:
+            output_lengths = lengths.clone()
+            for stride in self.strides:
+                output_lengths = (output_lengths + stride - 1) // stride
+
+        return mu, logvar, output_lengths
+
+
+class GuBERTFeatureVAEDecoder(nn.Module):
+    """
+    VAE decoder for GuBERT features.
+
+    Takes latent [B, latent_dim, T'] and reconstructs features [B, T, D].
+    Uses Upsample + Conv1D for temporal upsampling.
+
+    Architecture:
+    - Input projection: latent_dim -> intermediate_channels[0]
+    - Upsampling stages with Upsample + Conv1D
+    - Optional residual blocks per stage
+    - Output projection: intermediate_channels[-1] -> output_dim
+    """
+    def __init__(
+        self,
+        latent_dim: int = 32,
+        output_dim: int = 256,  # GuBERT feature dimension
+        intermediate_channels: list = None,
+        kernel_sizes: list = None,
+        scale_factors: list = None,
+        n_residual_blocks: int = 1,
+        activation_fn: str = "silu",
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.output_dim = output_dim
+
+        # Defaults (mirror encoder)
+        if intermediate_channels is None:
+            intermediate_channels = [128, 256, 256]
+        if kernel_sizes is None:
+            kernel_sizes = [3, 5, 5]
+        if scale_factors is None:
+            scale_factors = [2, 2, 2]  # 8x total upsampling
+
+        self.scale_factors = scale_factors
+
+        # Get activation type
+        if activation_fn == "snake":
+            self.get_activation = lambda c: Snake1d(c)
+        else:
+            activation_type = get_activation_type(activation_fn)
+            if activation_type in [activations.SwiGLU, activations.Snake]:
+                self.get_activation = lambda c: activation_type(c)
+            else:
+                self.get_activation = lambda c: activation_type()
+
+        # Initial projection from latent
+        self.initial_conv = nn.Conv1d(latent_dim, intermediate_channels[0], kernel_size=3, padding=1)
+        self.initial_norm = nn.GroupNorm(max(1, intermediate_channels[0] // 4), intermediate_channels[0])
+        self.initial_act = self.get_activation(intermediate_channels[0])
+
+        # Build decoder stages
+        self.stages = nn.ModuleList()
+        all_channels = [intermediate_channels[0]] + intermediate_channels
+
+        for i, (in_c, out_c, kernel_size, scale_factor) in enumerate(
+            zip(all_channels[:-1], intermediate_channels, kernel_sizes, scale_factors)
+        ):
+            stage = nn.ModuleList()
+
+            # Upsample
+            stage.append(nn.Upsample(scale_factor=scale_factor, mode='nearest'))
+
+            # Conv after upsample
+            padding = kernel_size // 2
+            stage.append(nn.Conv1d(in_c, out_c, kernel_size, padding=padding))
+            stage.append(nn.GroupNorm(max(1, out_c // 4), out_c))
+            stage.append(self.get_activation(out_c))
+
+            # Residual blocks
+            for _ in range(n_residual_blocks):
+                stage.append(ResidualBlock1d(out_c, out_c, kernel_size=kernel_size, activation_fn=activation_fn))
+
+            if dropout > 0:
+                stage.append(nn.Dropout(dropout))
+
+            self.stages.append(stage)
+
+        # Final output projection
+        self.final_conv = nn.Conv1d(intermediate_channels[-1], output_dim, kernel_size=3, padding=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.GroupNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def get_output_length(self, input_length: int) -> int:
+        """Compute output temporal length given latent length."""
+        length = input_length
+        for scale_factor in self.scale_factors:
+            length = length * scale_factor
+        return length
+
+    def forward(self, z: torch.Tensor, target_length: int = None) -> torch.Tensor:
+        """
+        Args:
+            z: [B, latent_dim, T'] latent tensor
+            target_length: Optional target output length for trimming
+
+        Returns:
+            recon: [B, T, D] reconstructed GuBERT features
+        """
+        # Initial projection
+        x = self.initial_conv(z)
+        x = self.initial_norm(x)
+        x = self.initial_act(x)
+
+        # Process through decoder stages
+        for stage in self.stages:
+            for layer in stage:
+                x = layer(x)
+
+        # Final output projection
+        x = self.final_conv(x)
+
+        # Permute back to [B, T, D]
+        x = x.permute(0, 2, 1)
+
+        # Trim to target length if specified
+        if target_length is not None and x.shape[1] > target_length:
+            x = x[:, :target_length, :]
+
+        return x
+
+
+class GuBERTFeatureVAE(nn.Module):
+    """
+    Complete VAE for GuBERT features.
+
+    Compresses speaker-invariant speech features to a lower-dimensional
+    latent space while preserving linguistic/prosodic structure.
+
+    Input: [B, T, D] GuBERT features
+    Latent: [B, latent_dim, T'] compressed representation
+    Output: [B, T, D] reconstructed features
+    """
+    def __init__(
+        self,
+        encoder: GuBERTFeatureVAEEncoder,
+        decoder: GuBERTFeatureVAEDecoder,
+        kl_weight: float = 1.0,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.kl_weight = kl_weight
+
+    def encode(self, x: torch.Tensor, lengths: torch.Tensor = None) -> tuple:
+        """Encode features to latent distribution."""
+        return self.encoder(x, lengths)
+
+    def decode(self, z: torch.Tensor, target_length: int = None) -> torch.Tensor:
+        """Decode latent to features."""
+        return self.decoder(z, target_length)
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Reparameterization trick for sampling."""
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        return mu
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor = None,
+        return_latent: bool = False,
+    ) -> dict:
+        """
+        Forward pass through VAE.
+
+        Args:
+            x: [B, T, D] GuBERT features
+            lengths: [B] optional valid lengths
+            return_latent: If True, also return latent variables
+
+        Returns:
+            dict with:
+                - recon: [B, T, D] reconstructed features
+                - mu: [B, latent_dim, T'] latent mean
+                - logvar: [B, latent_dim, T'] latent log variance
+                - z: [B, latent_dim, T'] sampled latent (if return_latent)
+                - output_lengths: [B] downsampled lengths (if lengths provided)
+        """
+        target_length = x.shape[1]
+
+        # Encode
+        mu, logvar, output_lengths = self.encode(x, lengths)
+
+        # Sample
+        z = self.reparameterize(mu, logvar)
+
+        # Decode
+        recon = self.decode(z, target_length)
+
+        result = {
+            "recon": recon,
+            "mu": mu,
+            "logvar": logvar,
+            "output_lengths": output_lengths,
+        }
+
+        if return_latent:
+            result["z"] = z
+
+        return result
+
+    def compute_loss(
+        self,
+        x: torch.Tensor,
+        recon: torch.Tensor,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        lengths: torch.Tensor = None,
+    ) -> dict:
+        """
+        Compute VAE loss.
+
+        Args:
+            x: [B, T, D] original features
+            recon: [B, T, D] reconstructed features
+            mu: [B, latent_dim, T'] latent mean
+            logvar: [B, latent_dim, T'] latent log variance
+            lengths: [B] optional valid lengths for masked loss
+
+        Returns:
+            dict with reconstruction_loss, kl_loss, total_loss
+        """
+        # Reconstruction loss (MSE)
+        if lengths is not None:
+            # Masked reconstruction loss
+            mask = torch.arange(x.shape[1], device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
+            mask = mask.unsqueeze(-1).expand_as(x)
+            recon_loss = F.mse_loss(recon * mask, x * mask, reduction='sum') / mask.sum()
+        else:
+            recon_loss = F.mse_loss(recon, x)
+
+        # KL divergence
+        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
+        # Total loss
+        total_loss = recon_loss + self.kl_weight * kl_loss
+
+        return {
+            "reconstruction_loss": recon_loss,
+            "kl_loss": kl_loss,
+            "total_loss": total_loss,
+        }
+
+    def get_num_params(self, trainable_only: bool = True) -> int:
+        """Count parameters."""
+        if trainable_only:
+            return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return sum(p.numel() for p in self.parameters())
+
+
+# =============================================================================
+# Model Config Lookups
+# =============================================================================
+
 model_config_lookup = {
     # Tiny config for testing - minimal channels, no attention, fast forward pass
     "tiny_test": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, learn_speaker_embedding=False, learned_speaker_dim=256, **kwargs: VAE(
@@ -912,3 +1405,164 @@ model_config_lookup = {
         **kwargs
     ),
 }
+
+
+# GuBERT Feature VAE configs
+# These operate on GuBERT features [B, T, D] instead of spectrograms
+gubert_feature_vae_config_lookup = {
+    # Tiny config for testing
+    "tiny": lambda input_dim=128, latent_dim=16, **kwargs: GuBERTFeatureVAE(
+        encoder=GuBERTFeatureVAEEncoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            intermediate_channels=[64, 64],
+            kernel_sizes=[3, 3],
+            strides=[2, 2],  # 4x downsampling
+            n_residual_blocks=0,
+            activation_fn="silu",
+            dropout=0.0,
+        ),
+        decoder=GuBERTFeatureVAEDecoder(
+            latent_dim=latent_dim,
+            output_dim=input_dim,
+            intermediate_channels=[64, 64],
+            kernel_sizes=[3, 3],
+            scale_factors=[2, 2],  # 4x upsampling
+            n_residual_blocks=0,
+            activation_fn="silu",
+            dropout=0.0,
+        ),
+        **kwargs
+    ),
+
+    # Small config - good balance of capacity and efficiency
+    "small": lambda input_dim=256, latent_dim=32, **kwargs: GuBERTFeatureVAE(
+        encoder=GuBERTFeatureVAEEncoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            intermediate_channels=[256, 192, 128],
+            kernel_sizes=[5, 5, 3],
+            strides=[2, 2, 2],  # 8x downsampling
+            n_residual_blocks=1,
+            activation_fn="silu",
+            dropout=0.1,
+        ),
+        decoder=GuBERTFeatureVAEDecoder(
+            latent_dim=latent_dim,
+            output_dim=input_dim,
+            intermediate_channels=[128, 192, 256],
+            kernel_sizes=[3, 5, 5],
+            scale_factors=[2, 2, 2],  # 8x upsampling
+            n_residual_blocks=1,
+            activation_fn="silu",
+            dropout=0.1,
+        ),
+        **kwargs
+    ),
+
+    # Medium config - more capacity
+    "medium": lambda input_dim=256, latent_dim=48, **kwargs: GuBERTFeatureVAE(
+        encoder=GuBERTFeatureVAEEncoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            intermediate_channels=[320, 256, 192],
+            kernel_sizes=[7, 5, 3],
+            strides=[2, 2, 2],  # 8x downsampling
+            n_residual_blocks=2,
+            activation_fn="snake",
+            dropout=0.1,
+        ),
+        decoder=GuBERTFeatureVAEDecoder(
+            latent_dim=latent_dim,
+            output_dim=input_dim,
+            intermediate_channels=[192, 256, 320],
+            kernel_sizes=[3, 5, 7],
+            scale_factors=[2, 2, 2],  # 8x upsampling
+            n_residual_blocks=2,
+            activation_fn="snake",
+            dropout=0.1,
+        ),
+        **kwargs
+    ),
+
+    # Large config - high capacity for larger GuBERT models
+    "large": lambda input_dim=512, latent_dim=64, **kwargs: GuBERTFeatureVAE(
+        encoder=GuBERTFeatureVAEEncoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            intermediate_channels=[512, 384, 256],
+            kernel_sizes=[7, 5, 3],
+            strides=[2, 2, 2],  # 8x downsampling
+            n_residual_blocks=2,
+            activation_fn="snake",
+            dropout=0.1,
+        ),
+        decoder=GuBERTFeatureVAEDecoder(
+            latent_dim=latent_dim,
+            output_dim=input_dim,
+            intermediate_channels=[256, 384, 512],
+            kernel_sizes=[3, 5, 7],
+            scale_factors=[2, 2, 2],  # 8x upsampling
+            n_residual_blocks=2,
+            activation_fn="snake",
+            dropout=0.1,
+        ),
+        **kwargs
+    ),
+
+    # XL config - for very large GuBERT models with more compression
+    "xlarge": lambda input_dim=512, latent_dim=64, **kwargs: GuBERTFeatureVAE(
+        encoder=GuBERTFeatureVAEEncoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            intermediate_channels=[512, 384, 256, 192],
+            kernel_sizes=[7, 5, 5, 3],
+            strides=[2, 2, 2, 2],  # 16x downsampling
+            n_residual_blocks=2,
+            activation_fn="snake",
+            dropout=0.1,
+        ),
+        decoder=GuBERTFeatureVAEDecoder(
+            latent_dim=latent_dim,
+            output_dim=input_dim,
+            intermediate_channels=[192, 256, 384, 512],
+            kernel_sizes=[3, 5, 5, 7],
+            scale_factors=[2, 2, 2, 2],  # 16x upsampling
+            n_residual_blocks=2,
+            activation_fn="snake",
+            dropout=0.1,
+        ),
+        **kwargs
+    ),
+}
+
+
+def create_gubert_feature_vae(
+    config: str = "small",
+    input_dim: int = None,
+    latent_dim: int = None,
+    **kwargs,
+) -> GuBERTFeatureVAE:
+    """
+    Create a GuBERT Feature VAE from a config name.
+
+    Args:
+        config: Config name (tiny, small, medium, large, xlarge)
+        input_dim: Override GuBERT feature dimension
+        latent_dim: Override latent dimension
+        **kwargs: Additional arguments (e.g., kl_weight)
+
+    Returns:
+        GuBERTFeatureVAE instance
+    """
+    if config not in gubert_feature_vae_config_lookup:
+        raise ValueError(f"Unknown config: {config}. Available: {list(gubert_feature_vae_config_lookup.keys())}")
+
+    factory_kwargs = {}
+    if input_dim is not None:
+        factory_kwargs["input_dim"] = input_dim
+    if latent_dim is not None:
+        factory_kwargs["latent_dim"] = latent_dim
+    factory_kwargs.update(kwargs)
+
+    return gubert_feature_vae_config_lookup[config](**factory_kwargs)

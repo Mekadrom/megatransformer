@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -7,6 +7,7 @@ import torch.nn as nn
 from dataclasses import dataclass
 
 from model import Mult, Sum, recurrent_criteria
+from model.world.kv_cache import KVCache, RecurrentKVCache
 from model.world.transformer import MegaTransformerBlock
 from utils.configuration import TransformerBlockConfig
 from utils.megatransformer_utils import transformer_weight_init
@@ -129,42 +130,162 @@ class MegatransformerRecurrentBlock(nn.Module):
 
         return n.to(torch.long), k.to(torch.long)
 
-    def forward(self, x_0: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x_0: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[RecurrentKVCache] = None,
+        position_offset: int = 0,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache]]:
+        """
+        Forward pass through recurrent block with optional KV caching.
+
+        For training: standard forward without caching (use_cache=False).
+        For generation: uses Huginn-style shared KV cache (use_cache=True).
+
+        The Huginn approach (Section 6.2):
+        - Uses a circular buffer with cache_budget slots
+        - At iteration i, uses slot (i % cache_budget)
+        - Previous tokens' KVs may be from different iteration depths
+        - Model zero-shot adapts to this mixed-depth attention
+
+        Args:
+            x_0: Input embeddings, shape (batch, seq_len, d_model)
+            attention_mask: Optional attention mask
+            kv_cache: Optional RecurrentKVCache for efficient generation
+            position_offset: Position offset for RoPE (for cached generation)
+            use_cache: Whether to use and update KV cache
+
+        Returns:
+            thought_states: Output thought states, shape (batch, seq_len, d_model)
+            new_kv_cache: Updated RecurrentKVCache if use_cache=True, else None
+        """
         n_steps_no_grad, k_steps_grad = self.n_k_steps(self.mean_thinking_steps, self.backprop_depth)
 
-        x = x_0  # (batch_size, seq_len, d_model)
+        last_thought_state = self.initialize_thinking_state(x_0)  # (batch_size, seq_len, d_model)
 
-        last_thought_state = self.initialize_thinking_state(x)  # (batch_size, seq_len, d_model)
+        # Initialize or use existing cache
+        new_kv_cache = kv_cache if use_cache and kv_cache is not None else None
+        if use_cache and new_kv_cache is None:
+            new_kv_cache = RecurrentKVCache(strategy="huginn", cache_budget=16)
+
+        iteration = 0
 
         if n_steps_no_grad > 0:
             with torch.no_grad():
                 for _ in range(n_steps_no_grad):
-                    thought_states = self.recurrent_block(
+                    # Get cache for this iteration (Huginn circular buffer)
+                    iter_cache = None
+                    if use_cache and new_kv_cache is not None:
+                        iter_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+
+                    block_output, updated_cache = self.recurrent_block(
                         torch.cat([x_0, last_thought_state], dim=-1),
-                        attention_mask=attention_mask
+                        attention_mask=attention_mask,
+                        kv_cache=iter_cache,
+                        position_offset=position_offset,
+                        use_cache=use_cache,
                     )
 
-                    # back down to d_model
-                    thought_states = self.projection(thought_states)  # (batch_size, seq_len, d_model)
+                    # Update cache for this iteration slot
+                    if use_cache and updated_cache is not None and new_kv_cache is not None:
+                        slot = iteration % new_kv_cache.cache_budget
+                        layer_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+                        layer_cache.key_cache = updated_cache.key_cache
+                        layer_cache.value_cache = updated_cache.value_cache
+
+                    # Project back down to d_model
+                    thought_states = self.projection(block_output)
 
                     if not self.training and self.exit_criteria is not None and self.exit_criteria.should_exit(last_thought_state, thought_states):
-                        # get out early if exit criteria is met
-                        return thought_states
+                        return thought_states, new_kv_cache
 
                     last_thought_state = thought_states
+                    iteration += 1
 
         if k_steps_grad > 0:
             for _ in range(k_steps_grad):
-                thought_states = self.recurrent_block(
+                # Get cache for this iteration
+                iter_cache = None
+                if use_cache and new_kv_cache is not None:
+                    iter_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+
+                block_output, updated_cache = self.recurrent_block(
                     torch.cat([x_0, last_thought_state], dim=-1),
-                    attention_mask=attention_mask
+                    attention_mask=attention_mask,
+                    kv_cache=iter_cache,
+                    position_offset=position_offset,
+                    use_cache=use_cache,
                 )
 
-                # back down to d_model
-                thought_states = self.projection(thought_states)
+                # Update cache for this iteration slot
+                if use_cache and updated_cache is not None and new_kv_cache is not None:
+                    layer_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+                    layer_cache.key_cache = updated_cache.key_cache
+                    layer_cache.value_cache = updated_cache.value_cache
 
-                # exit criteria doesn't need to run in the loop with grads
-
+                thought_states = self.projection(block_output)
                 last_thought_state = thought_states
+                iteration += 1
 
-        return last_thought_state
+        return last_thought_state, new_kv_cache
+
+    def generate_step(
+        self,
+        x_0: torch.Tensor,
+        kv_cache: RecurrentKVCache,
+        position_offset: int,
+        attention_mask: Optional[torch.Tensor] = None,
+        max_iterations: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, RecurrentKVCache, int]:
+        """
+        Single generation step with KV caching.
+
+        Runs recurrent iterations until convergence or max_iterations.
+        Uses Huginn-style shared KV cache.
+
+        Args:
+            x_0: Input embedding for new token(s), shape (batch, new_seq_len, d_model)
+            kv_cache: RecurrentKVCache with cached KVs from previous tokens
+            position_offset: Position of new token(s) in sequence
+            attention_mask: Optional attention mask for full sequence
+            max_iterations: Maximum iterations (defaults to mean_thinking_steps)
+
+        Returns:
+            output: Output thought state for new token(s)
+            updated_cache: Updated KVCache
+            num_iterations: Number of iterations performed
+        """
+        if max_iterations is None:
+            max_iterations = self.mean_thinking_steps
+
+        last_thought_state = self.initialize_thinking_state(x_0)
+
+        for iteration in range(max_iterations):
+            # Get cache for this iteration slot
+            iter_cache = kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+
+            block_output, updated_cache = self.recurrent_block(
+                torch.cat([x_0, last_thought_state], dim=-1),
+                attention_mask=attention_mask,
+                kv_cache=iter_cache,
+                position_offset=position_offset,
+                use_cache=True,
+            )
+
+            # Update cache
+            if updated_cache is not None:
+                layer_cache = kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+                layer_cache.key_cache = updated_cache.key_cache
+                layer_cache.value_cache = updated_cache.value_cache
+
+            thought_states = self.projection(block_output)
+
+            # Check exit criteria
+            if self.exit_criteria is not None and self.exit_criteria.should_exit(last_thought_state, thought_states):
+                return thought_states, kv_cache, iteration + 1
+
+            last_thought_state = thought_states
+
+        return last_thought_state, kv_cache, max_iterations

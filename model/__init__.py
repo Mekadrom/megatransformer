@@ -1,12 +1,8 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Optional, Union
-
-from . import causal, kv_cache
+from typing import Union
 
 
 class Sum(nn.Module):
@@ -44,74 +40,6 @@ class SinusoidalPositionEmbeddings(nn.Module):
             embeddings = F.pad(embeddings, (0, 1, 0, 0))
 
         return embeddings
-
-
-class SimpleBlock(nn.Module):
-    def __init__(self, config, name, n_layers: int, dropout: float):
-        super().__init__()
-        self.config = config
-        self.name = name
-        self.transformer = nn.ModuleList([causal.MegaTransformerBlock(config) for _ in range(n_layers)])
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        past_key_values: list[kv_cache.KVCache]=None,
-        use_cache=False,
-        head_mask=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        all_hidden_states: Optional[list] = [] if output_hidden_states else None
-        all_attentions: Optional[list] = [] if output_attentions else None
-
-        for i, block in enumerate(self.transformer):
-            past_key_value = past_key_values[i] if past_key_values is not None else None
-            if not self.training and all_hidden_states is not None:
-                all_hidden_states.append(hidden_states)
-
-            outputs = block(
-                hidden_states,
-                attention_mask=attention_mask,
-                head_mask=head_mask[i] if head_mask is not None else None,
-                past_key_values=past_key_value,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states
-            )
-
-            if not return_dict:
-                hidden_states = outputs[0]
-                attention_probs = outputs[2]
-            else:
-                hidden_states = outputs.hidden_states
-                attention_probs = outputs.attention_probs
-
-            if not self.training and all_attentions is not None:
-                all_attentions.append(attention_probs)
-
-        if not self.training and all_hidden_states is not None:
-            all_hidden_states.append(hidden_states)
-
-        hidden_states = self.dropout(hidden_states)
-
-        if not return_dict:
-            return (
-                hidden_states,
-                past_key_values,
-                all_hidden_states,
-                all_attentions,
-            )
-
-        return causal.MegaTransformerCausalOutput(
-            logits=hidden_states,
-            past_key_values=past_key_values,
-            hidden_states=all_hidden_states,
-            attentions=all_attentions,
-        )
 
 
 class AvgMaxAdaptivePool2d(nn.Module):

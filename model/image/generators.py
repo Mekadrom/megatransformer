@@ -122,7 +122,8 @@ class ImageCodaAndVAEWithLoss(nn.Module):
             - "latent_l1_loss", "latent_mse_loss": Latent space losses (if latent_labels provided)
             - "image_l1_loss", "image_mse_loss", "image_perceptual_loss": Image losses (if decode_to_image and image_labels provided)
         """
-        coda_output: torch.Tensor = x + self.coda(x)  # (batch, seq_length, d_model)
+        coda_hidden, _ = self.coda(x)  # (batch, seq_length, d_model)
+        coda_output: torch.Tensor = x + coda_hidden
 
         # seq_length should be 256 for a 256x256 image. this is because the vae latent space is 32x32 and we patchify into 2x2 patches
 

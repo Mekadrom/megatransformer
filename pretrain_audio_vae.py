@@ -25,6 +25,7 @@ from dataset_loading import audio_loading
 from dataset_loading.audio_diffusion_dataset import CachedAudioDiffusionDataset
 from shard_utils import AudioVAEShardedDataset, AudioVAEDataCollator, ShardAwareSampler
 from model.audio.discriminators import (
+    GradientReversalFunction,
     MelMultiPeriodDiscriminator,
     MelMultiScaleDiscriminator,
     mel_discriminator_config_lookup,
@@ -34,6 +35,7 @@ from model.audio.discriminators import (
     r1_mel_gradient_penalty,
     MelInstanceNoiseScheduler,
 )
+from model.image.discriminators import compute_adaptive_weight
 from model.audio.criteria import AudioPerceptualLoss
 from model.audio.vae import model_config_lookup
 from model.audio.vocoders.vocoders import model_config_lookup as vocoder_config_lookup
@@ -41,31 +43,6 @@ from utils import megatransformer_utils
 from utils.audio_utils import SharedWindowBuffer
 from utils.model_loading_utils import load_model
 from utils.training_utils import EarlyStoppingCallback, setup_int8_training
-
-
-# =============================================================================
-# Gradient Reversal Layer for Adversarial Speaker Disentanglement
-# =============================================================================
-
-class GradientReversalFunction(torch.autograd.Function):
-    """
-    Gradient Reversal Layer (GRL) for domain adversarial training.
-
-    During forward pass: identity function
-    During backward pass: reverses gradient direction (multiplies by -alpha)
-
-    This allows training a speaker classifier that tries to predict speaker
-    from latents, while the encoder learns to fool it (remove speaker info).
-    """
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return -ctx.alpha * grad_output, None
-
 
 
 class SpeakerClassifier(torch.nn.Module):
@@ -1418,6 +1395,8 @@ class AudioVAEGANTrainer(Trainer):
         r1_penalty_interval: int = 16,  # Apply R1 penalty every N steps (expensive)
         # GAN warmup (ramps GAN loss contribution from 0 to full weight)
         gan_warmup_steps: int = 0,  # Steps to ramp up GAN loss (0 = no warmup)
+        # Adaptive discriminator weighting (VQGAN-style)
+        use_adaptive_weight: bool = False,  # Automatically balance GAN vs reconstruction gradients
         # KL annealing (ramps KL weight from 0 to full over training)
         kl_annealing_steps: int = 0,  # Steps to ramp KL weight from 0 to 1 (0 = disabled)
         # Audio perceptual loss
@@ -1474,6 +1453,9 @@ class AudioVAEGANTrainer(Trainer):
         self.gan_already_started = False
         self.gan_start_step = None  # Track when GAN training started (for warmup)
         self.gan_warmup_steps = gan_warmup_steps
+
+        # Adaptive discriminator weighting (VQGAN-style)
+        self.use_adaptive_weight = use_adaptive_weight
 
         # KL annealing settings
         self.kl_annealing_steps = kl_annealing_steps
@@ -1735,8 +1717,24 @@ class AudioVAEGANTrainer(Trainer):
             # Apply warmup factor to GAN loss
             g_gan_loss = gan_warmup_factor * g_gan_loss
 
-        # Total generator loss
-        total_loss = vae_loss + self.gan_loss_weight * g_gan_loss
+        # Total generator loss with optional adaptive weighting
+        adaptive_weight = torch.tensor(self.gan_loss_weight, device=mel_spec.device)
+        if self.use_adaptive_weight and self.gan_already_started and g_gan_loss.requires_grad:
+            # VQGAN-style adaptive weighting: balance GAN and reconstruction gradients
+            # Uses the last decoder layer as proxy for decoder output gradients
+            try:
+                last_layer = model.decoder.final_conv.weight
+                adaptive_weight = compute_adaptive_weight(
+                    vae_loss, g_gan_loss, last_layer, self.gan_loss_weight
+                )
+            except (AttributeError, RuntimeError) as e:
+                # Fallback to fixed weight if adaptive weight fails
+                # (e.g., model doesn't have expected structure, or grad computation fails)
+                if global_step % self.args.logging_steps == 0:
+                    print(f"Warning: adaptive weight computation failed ({e}), using fixed weight")
+                adaptive_weight = torch.tensor(self.gan_loss_weight, device=mel_spec.device)
+
+        total_loss = vae_loss + adaptive_weight * g_gan_loss
 
         # Audio perceptual loss (requires vocoder for waveform-based losses)
         # Only apply after audio_perceptual_loss_start_step to let L1/MSE settle first
@@ -1976,6 +1974,7 @@ class AudioVAEGANTrainer(Trainer):
             and decode_speaker_embedding is not None
             and decode_speaker_embedding.shape[0] > 1  # Need at least 2 samples for shuffling
         )
+
         if film_contrastive_enabled:
             # Compute margin alpha (ramps from 0 to film_contrastive_margin_max over rampup_steps)
             steps_since_start = global_step - self.film_contrastive_loss_start_step
@@ -2025,14 +2024,15 @@ class AudioVAEGANTrainer(Trainer):
             # Log FiLM contrastive metrics
             if global_step % self.args.logging_steps == 0 and self.writer is not None:
                 prefix = "train/" if model.training else "eval/"
-                self._log_scalar(f"{prefix}film_contrastive/loss", film_contrastive_loss, global_step)
+                # Use skip_zero=False for metrics that start at 0 due to margin rampup
+                self._log_scalar(f"{prefix}film_contrastive/loss", film_contrastive_loss, global_step, skip_zero=False)
                 self._log_scalar(f"{prefix}film_contrastive/output_diff_mean", output_diff_per_sample.mean(), global_step)
                 self._log_scalar(f"{prefix}film_contrastive/emb_similarity_mean", emb_similarity.mean(), global_step)
                 self._log_scalar(f"{prefix}film_contrastive/emb_diff_weight_mean", emb_diff_weight.mean(), global_step)
-                self._log_scalar(f"{prefix}film_contrastive/margin", margin, global_step)
-                self._log_scalar(f"{prefix}film_contrastive/margin_alpha", film_contrastive_margin_alpha, global_step)
+                self._log_scalar(f"{prefix}film_contrastive/margin", margin, global_step, skip_zero=False)
+                self._log_scalar(f"{prefix}film_contrastive/margin_alpha", film_contrastive_margin_alpha, global_step, skip_zero=False)
                 self._log_scalar(f"{prefix}film_contrastive/weighted_loss",
-                               self.film_contrastive_loss_weight * film_contrastive_loss, global_step)
+                               self.film_contrastive_loss_weight * film_contrastive_loss, global_step, skip_zero=False)
 
         # Log losses (skip non-loss values like learned_speaker_embedding)
         if global_step % self.args.logging_steps == 0 and self.writer is not None:
@@ -2051,6 +2051,9 @@ class AudioVAEGANTrainer(Trainer):
             self._log_scalar(f"{prefix}vae_mean_std", logvar.exp().mean().sqrt(), global_step)
             self._log_scalar(f"{prefix}g_gan_loss", g_gan_loss, global_step)
             self._log_scalar(f"{prefix}total_loss", total_loss.mean(), global_step)
+            # Log adaptive weight when using adaptive weighting
+            if self.use_adaptive_weight and self.gan_already_started:
+                self._log_scalar(f"{prefix}adaptive_gan_weight", adaptive_weight, global_step)
             # Log KL weight multiplier when annealing is enabled
             if self.kl_annealing_steps > 0:
                 self._log_scalar(f"{prefix}kl_weight_multiplier", kl_weight_multiplier, global_step)
@@ -2471,8 +2474,8 @@ def main():
 
     # Dataset settings
     use_sharded_dataset = unk_dict.get("use_sharded_dataset", "true").lower() == "true"
-    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/audio_vae_wavlm_train")
-    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/audio_vae_wavlm_val")
+    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/audio_vae_speaker_train")
+    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/audio_vae_speaker_val")
 
     # Audio settings (CLI args override unk_dict defaults)
     audio_max_frames = int(unk_dict.get("audio_max_frames", 1875))
@@ -2553,6 +2556,9 @@ def main():
     r1_penalty_weight = float(unk_dict.get("r1_penalty_weight", 0.0))  # Weight (0 = disabled)
     r1_penalty_interval = int(unk_dict.get("r1_penalty_interval", 16))  # Apply every N steps
     gan_warmup_steps = int(unk_dict.get("gan_warmup_steps", 0))  # Steps to ramp GAN loss from 0 to full (0 = no warmup)
+    # Adaptive discriminator weighting (VQGAN-style): automatically balances GAN vs reconstruction gradients
+    # This prevents the discriminator from dominating and causing artifacts
+    use_adaptive_weight = unk_dict.get("use_adaptive_weight", "false").lower() == "true"
 
     # KL annealing: ramps KL weight from 0 to full over N steps (0 = disabled, no annealing)
     kl_annealing_steps = int(unk_dict.get("kl_annealing_steps", 0))
@@ -2747,6 +2753,8 @@ def main():
                 print(f"  R1 penalty: weight={r1_penalty_weight}, interval={r1_penalty_interval}")
             if gan_warmup_steps > 0:
                 print(f"  GAN warmup: {gan_warmup_steps} steps (ramps loss from 0 to full)")
+            if use_adaptive_weight:
+                print(f"  Adaptive GAN weight: enabled (VQGAN-style gradient balancing)")
         if audio_perceptual_loss is not None:
             print(f"Audio perceptual loss: enabled (total_weight={audio_perceptual_loss_weight})")
             if audio_perceptual_loss_start_step > 0:
@@ -2988,6 +2996,7 @@ def main():
         r1_penalty_weight=r1_penalty_weight,
         r1_penalty_interval=r1_penalty_interval,
         gan_warmup_steps=gan_warmup_steps,
+        use_adaptive_weight=use_adaptive_weight,
         audio_perceptual_loss=audio_perceptual_loss,
         audio_perceptual_loss_weight=audio_perceptual_loss_weight,
         audio_perceptual_loss_start_step=audio_perceptual_loss_start_step,
