@@ -230,6 +230,7 @@ class AudioVAEEncoder(nn.Module):
     - Snake activation for audio-specific periodicity
     - Optional bottleneck attention for long-range dependencies
     - Larger receptive fields via configurable kernel sizes
+    - Optional instance normalization for speaker-invariant features
 
     Supports padding masks via lengths parameter to prevent attention to padded positions.
     """
@@ -252,6 +253,8 @@ class AudioVAEEncoder(nn.Module):
         # Learned speaker embedding parameters
         learn_speaker_embedding: bool = False,  # If True, encoder outputs learned speaker embedding
         learned_speaker_dim: int = 256,  # Dimension of learned speaker embedding output
+        # Instance normalization for input mel spectrogram (speaker-invariant features)
+        use_instance_norm: bool = False,  # Normalize input mel to strip per-utterance speaker statistics (like CMVN)
     ):
         super().__init__()
         self.use_attention = use_attention
@@ -262,6 +265,7 @@ class AudioVAEEncoder(nn.Module):
         self.logvar_clamp_max = logvar_clamp_max
         self.learn_speaker_embedding = learn_speaker_embedding
         self.learned_speaker_dim = learned_speaker_dim
+        self.use_instance_norm = use_instance_norm
 
         channels = [in_channels] + intermediate_channels
 
@@ -391,6 +395,15 @@ class AudioVAEEncoder(nn.Module):
             learned_speaker_emb (optional): [B, learned_speaker_dim] if learn_speaker_embedding=True
             attn_weights (optional): [B, M, n_heads, T, T] if return_attention_weights=True and use_attention
         """
+        # Apply instance normalization to input mel spectrogram (if enabled)
+        # Treats mel bins as channels and normalizes each bin across time independently
+        # This strips per-utterance temporal statistics (similar to CMVN)
+        if self.use_instance_norm:
+            # x: [B, 1, M, T] -> [B, M, T] -> instance_norm -> [B, 1, M, T]
+            x_squeezed = x.squeeze(1)  # [B, M, T]
+            x_squeezed = F.instance_norm(x_squeezed)  # normalize each mel bin across time
+            x = x_squeezed.unsqueeze(1)  # [B, 1, M, T]
+
         # Process speaker embedding
         if speaker_embedding is not None and self.speaker_embedding_dim > 0:
             if speaker_embedding.dim() == 3:
@@ -1302,7 +1315,7 @@ class GuBERTFeatureVAE(nn.Module):
 
 model_config_lookup = {
     # Tiny config for testing - minimal channels, no attention, fast forward pass
-    "tiny_test": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, learn_speaker_embedding=False, learned_speaker_dim=256, **kwargs: VAE(
+    "tiny_test": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, learn_speaker_embedding=False, learned_speaker_dim=256, use_input_instance_norm=False, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
@@ -1314,6 +1327,7 @@ model_config_lookup = {
             activation_fn="gelu",
             learn_speaker_embedding=learn_speaker_embedding,
             learned_speaker_dim=learned_speaker_dim,
+            use_instance_norm=use_input_instance_norm,
         ),
         decoder=AudioVAEDecoder(
             latent_channels=latent_channels,
@@ -1334,7 +1348,7 @@ model_config_lookup = {
         ),
         **kwargs
     ),
-    "medium_no_attn": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, learn_speaker_embedding=False, learned_speaker_dim=256, **kwargs: VAE(
+    "medium_no_attn": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, learn_speaker_embedding=False, learned_speaker_dim=256, use_input_instance_norm=False, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
@@ -1346,6 +1360,7 @@ model_config_lookup = {
             activation_fn="snake",
             learn_speaker_embedding=learn_speaker_embedding,
             learned_speaker_dim=learned_speaker_dim,
+            use_instance_norm=use_input_instance_norm,
         ),
         decoder=AudioVAEDecoder(
             latent_channels=latent_channels,
@@ -1369,7 +1384,7 @@ model_config_lookup = {
     ),
     # Creates a ~13M parameter VAE with ~4M encoder and ~9M decoder - includes snake activations, bottleneck attention, and FiLM speaker embedding conditioning (if speaker_embedding_dim > 0)
     # but no residual blocks
-    "large": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, learn_speaker_embedding=False, learned_speaker_dim=256, **kwargs: VAE(
+    "large": lambda latent_channels, speaker_embedding_dim=0, speaker_embedding_proj_dim=0, normalize_speaker_embedding=False, film_scale_bound=0.0, film_shift_bound=0.0, zero_init_film_bias=True, film_no_bias=False, learn_speaker_embedding=False, learned_speaker_dim=256, use_input_instance_norm=False, **kwargs: VAE(
         encoder=AudioVAEEncoder(
             in_channels=1,
             latent_channels=latent_channels,
@@ -1382,6 +1397,7 @@ model_config_lookup = {
             activation_fn="snake",
             learn_speaker_embedding=learn_speaker_embedding,
             learned_speaker_dim=learned_speaker_dim,
+            use_instance_norm=use_input_instance_norm,
         ),
         decoder=AudioVAEDecoder(
             latent_channels=latent_channels,

@@ -2,22 +2,16 @@
 """
 GuBERT Pretraining Script
 
-Supports two training modes:
-1. CTC mode (--mode ctc): ASR-based training with transcriptions
-   - CTC loss forces encoding of linguistic content
-   - GRL speaker classification removes speaker information
-
-2. Masked mode (--mode masked): Self-supervised HuBERT-style training
-   - Masked prediction loss learns acoustic structure
-   - GRL speaker classification removes speaker information
+ASR-based training with CTC loss and GRL speaker disentanglement.
+- CTC loss forces encoding of linguistic content
+- GRL speaker classification removes speaker information
 
 Visualizations logged to TensorBoard:
-- t-SNE of features colored by speaker (both modes)
-- Feature heatmaps (both modes)
-- Sample transcriptions with WER/CER (CTC mode only)
-- Speaker classifier accuracy over time (both modes)
-- GRL alpha schedule (both modes)
-- Codebook usage (masked mode only)
+- t-SNE of features colored by speaker
+- Feature heatmaps
+- Sample transcriptions with WER/CER
+- Speaker classifier accuracy over time
+- GRL alpha schedule
 """
 
 import os
@@ -52,9 +46,11 @@ from transformers.integrations import TensorBoardCallback
 
 from model.audio.gubert import (
     GuBERTEncoder, GuBERTConfig, CTCVocab, GUBERT_CONFIGS,
-    MaskedGuBERTEncoder, MaskedGuBERTConfig, MASKED_GUBERT_CONFIGS,
 )
+from model.audio.vocoders.vocoders import model_config_lookup as vocoder_config_lookup
 from utils import megatransformer_utils
+from utils.audio_utils import SharedWindowBuffer
+from utils.model_loading_utils import load_model
 
 
 # ============================================================================
@@ -396,11 +392,22 @@ class GuBERTDataCollator:
 
 def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
     """Get TensorBoard writer from trainer callbacks."""
-    if hasattr(trainer, "callback_handler"):
-        for callback in trainer.callback_handler.callbacks:
-            if isinstance(callback, TensorBoardCallback):
-                if callback.tb_writer is not None:
+    if not hasattr(trainer, "callback_handler"):
+        return None
+
+    for callback in trainer.callback_handler.callbacks:
+        if isinstance(callback, TensorBoardCallback):
+            # If writer exists, return it
+            if callback.tb_writer is not None:
+                return callback.tb_writer
+            # Try to initialize the writer if it doesn't exist yet
+            # This can happen if eval runs before any training logs
+            if hasattr(trainer, "args") and trainer.args.logging_dir:
+                try:
+                    callback.tb_writer = SummaryWriter(log_dir=trainer.args.logging_dir)
                     return callback.tb_writer
+                except Exception:
+                    pass
     return None
 
 
@@ -482,13 +489,14 @@ class GRLAlphaScheduler:
 
 class GuBERTVisualizationCallback(TrainerCallback):
     """
-    Callback for logging GuBERT visualizations to TensorBoard.
+    Callback for logging CTC GuBERT visualizations to TensorBoard.
 
     Logs:
-    - t-SNE of features colored by speaker
-    - Feature heatmaps
-    - Sample transcriptions
-    - CER/WER metrics
+    - PCA of features colored by speaker
+    - Feature heatmaps with CTC alignment
+    - Sample transcriptions with CER/WER
+    - Feature health metrics (global_mean, std, temporal_smoothness)
+    - Audio samples via vocoder
     """
 
     def __init__(
@@ -499,6 +507,20 @@ class GuBERTVisualizationCallback(TrainerCallback):
         num_tsne_samples: int = 150,
         num_transcription_samples: int = 8,
         max_speakers_for_tsne: int = 15,
+        sync_with_eval: bool = False,
+        # Audio settings
+        audio_sample_rate: int = 16000,
+        audio_n_fft: int = 1024,
+        audio_hop_length: int = 256,
+        # Vocoder settings
+        vocoder_checkpoint_path: Optional[str] = None,
+        vocoder_config: str = "tiny_attention_freq_domain_vocoder",
+        num_audio_samples: int = 4,
+        # LM decoder settings (beam search with optional language model)
+        kenlm_model_path: Optional[str] = None,
+        lm_alpha: float = 0.5,
+        lm_beta: float = 1.0,
+        beam_width: int = 100,
     ):
         self.eval_dataset = eval_dataset
         self.vocab = vocab
@@ -506,38 +528,192 @@ class GuBERTVisualizationCallback(TrainerCallback):
         self.num_tsne_samples = num_tsne_samples
         self.num_transcription_samples = num_transcription_samples
         self.max_speakers_for_tsne = max_speakers_for_tsne
+        self.sync_with_eval = sync_with_eval
         self.trainer: Optional[Trainer] = None
 
-    def on_train_begin(self, args, state, control, **kwargs):
-        self.trainer = kwargs.get("model")
+        # Audio settings
+        self.audio_sample_rate = audio_sample_rate
+        self.audio_n_fft = audio_n_fft
+        self.audio_hop_length = audio_hop_length
+        self.num_audio_samples = num_audio_samples
 
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if state.global_step % self.visualization_steps != 0:
+        # Vocoder settings
+        self.vocoder_checkpoint_path = vocoder_checkpoint_path
+        self.vocoder_config = vocoder_config
+        self.vocoder = None
+        self._vocoder_load_attempted = False
+
+        # LM decoder settings
+        self.kenlm_model_path = kenlm_model_path
+        self.lm_alpha = lm_alpha
+        self.lm_beta = lm_beta
+        self.beam_width = beam_width
+        self.ctc_decoder = None
+        self._decoder_build_attempted = False
+
+        # Shared window buffer for vocoder
+        self.shared_window_buffer = SharedWindowBuffer()
+
+    def _load_vocoder(self):
+        """Lazily load vocoder on first use."""
+        if self._vocoder_load_attempted:
+            return
+        self._vocoder_load_attempted = True
+
+        if self.vocoder_checkpoint_path is None:
             return
 
+        if not os.path.exists(self.vocoder_checkpoint_path):
+            print(f"Vocoder checkpoint not found at {self.vocoder_checkpoint_path}")
+            return
+
+        try:
+            vocoder = vocoder_config_lookup[self.vocoder_config](
+                shared_window_buffer=self.shared_window_buffer,
+            )
+
+            load_model(False, vocoder, self.vocoder_checkpoint_path)
+
+            if hasattr(vocoder.vocoder, 'remove_weight_norm'):
+                vocoder.vocoder.remove_weight_norm()
+
+            vocoder.eval()
+            self.vocoder = vocoder
+            print(f"Loaded vocoder from {self.vocoder_checkpoint_path}")
+        except Exception as e:
+            print(f"Failed to load vocoder: {e}")
+            self.vocoder = None
+
+    def _build_ctc_decoder(self):
+        """Lazily build CTC decoder with optional LM on first use."""
+        if self._decoder_build_attempted:
+            return
+        self._decoder_build_attempted = True
+
+        # Build decoder (with or without LM)
+        try:
+            self.ctc_decoder = self.vocab.build_ctc_decoder(
+                kenlm_model_path=self.kenlm_model_path,
+                alpha=self.lm_alpha,
+                beta=self.lm_beta,
+            )
+            if self.ctc_decoder is not None:
+                if self.kenlm_model_path:
+                    print(f"Built CTC decoder with LM from {self.kenlm_model_path}")
+                    print(f"  alpha={self.lm_alpha}, beta={self.lm_beta}, beam_width={self.beam_width}")
+                else:
+                    print(f"Built CTC beam decoder (no LM), beam_width={self.beam_width}")
+        except Exception as e:
+            print(f"Failed to build CTC decoder: {e}")
+            self.ctc_decoder = None
+
+    def _log_vocoder_audio(self, writer: SummaryWriter, mel_spec: torch.Tensor, global_step: int, tag: str):
+        """Convert mel spectrogram to audio using vocoder and log to TensorBoard."""
+        if self.vocoder is None:
+            return
+
+        try:
+            if mel_spec.dim() == 2:
+                mel_spec = mel_spec.unsqueeze(0)
+
+            mel_spec = mel_spec.float().cpu()
+            self.vocoder.cpu()
+
+            with torch.no_grad():
+                outputs = self.vocoder(mel_spec)
+                if isinstance(outputs, dict):
+                    waveform = outputs["pred_waveform"]
+                else:
+                    waveform = outputs
+
+            if waveform.dim() == 3:
+                waveform = waveform.squeeze(1)
+            elif waveform.dim() == 1:
+                waveform = waveform.unsqueeze(0)
+
+            waveform = waveform / (waveform.abs().max() + 1e-8)
+
+            writer.add_audio(
+                tag,
+                waveform[0],
+                global_step=global_step,
+                sample_rate=self.audio_sample_rate
+            )
+        except Exception as e:
+            print(f"Failed to generate audio with vocoder: {e}")
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        # Skip if sync_with_eval is enabled (run viz in on_evaluate instead)
+        if self.sync_with_eval and not state.global_step == 1:
+            return
+
+        if not ((state.global_step == 1) or (state.global_step % self.visualization_steps == 0)) or not state.is_world_process_zero:
+            return
+
+        self._run_visualizations(model, state, kwargs)
+
+    def on_evaluate(self, args, state, control, model=None, **kwargs):
+        """Run visualizations in lockstep with eval (if enabled)."""
+        if not state.is_world_process_zero:
+            return
+
+        if self.sync_with_eval:
+            # Model may be passed directly or in kwargs
+            actual_model = model if model is not None else kwargs.get("model")
+            # Fall back to trainer's model if available
+            if actual_model is None and self.trainer is not None:
+                actual_model = self.trainer.model
+            self._run_visualizations(actual_model, state, kwargs)
+
+    def _run_visualizations(self, model, state, kwargs):
+        """Run all visualizations and log to TensorBoard."""
         if model is None:
+            print("  [Visualization] Skipping: model is None")
             return
 
         writer = get_writer(kwargs.get("trainer", self.trainer))
         if writer is None:
+            print("  [Visualization] Skipping: TensorBoard writer is None")
             return
+
+        # Lazily load vocoder and CTC decoder
+        self._load_vocoder()
+        self._build_ctc_decoder()
 
         model.eval()
         device = next(model.parameters()).device
 
         try:
+            print(f"  Running CTC visualizations at step {state.global_step}...")
+            t0 = time.time()
             self._log_tsne(model, writer, state.global_step, device)
-            self._log_transcriptions(model, writer, state.global_step, device)
-            self._log_feature_heatmap(model, writer, state.global_step, device)
+            print(f"    PCA/t-SNE: {time.time() - t0:.1f}s")
+
+            t0 = time.time()
+            self._log_transcriptions_with_alignment(model, writer, state.global_step, device)
+            print(f"    Transcriptions + alignment: {time.time() - t0:.1f}s")
+
+            t0 = time.time()
+            self._log_feature_health(model, writer, state.global_step, device)
+            print(f"    Feature health: {time.time() - t0:.1f}s")
+
+            t0 = time.time()
+            self._log_audio_samples(model, writer, state.global_step, device)
+            print(f"    Audio samples: {time.time() - t0:.1f}s")
+
+            t0 = time.time()
+            self._log_eval_metrics(model, writer, state.global_step, device)
+            print(f"    Eval metrics: {time.time() - t0:.1f}s")
         except Exception as e:
             print(f"Visualization error at step {state.global_step}: {e}")
+            import traceback
+            traceback.print_exc()
 
         model.train()
 
     @torch.no_grad()
     def _log_tsne(self, model, writer, step, device):
-        """Log t-SNE visualization of features colored by speaker."""
-        # Collect features
+        """Log PCA and t-SNE visualization of features colored by speaker."""
         features_list = []
         speakers_list = []
         speaker_counts = {}
@@ -552,240 +728,6 @@ class GuBERTVisualizationCallback(TrainerCallback):
             sample = self.eval_dataset[idx]
             speaker_id = sample["speaker_id"].item()
 
-            # Limit samples per speaker for balance
-            if speaker_counts.get(speaker_id, 0) >= self.num_tsne_samples // self.max_speakers_for_tsne:
-                continue
-
-            # Skip if we have enough speakers
-            if len(speaker_counts) >= self.max_speakers_for_tsne and speaker_id not in speaker_counts:
-                continue
-
-            mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
-            mel_length = sample["mel_length"].unsqueeze(0)
-
-            result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
-            feat = result["features"]  # [1, T, D]
-
-            # Mean pool over time
-            feat_pooled = feat.mean(dim=1).cpu().numpy()  # [1, D]
-
-            features_list.append(feat_pooled[0])
-            speakers_list.append(speaker_id)
-            speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
-
-        if len(features_list) < 10:
-            return
-
-        features = np.array(features_list)
-        speakers = np.array(speakers_list)
-
-        # Run PCA (much faster than t-SNE)
-        pca = PCA(n_components=2, random_state=42)
-        embeddings_2d = pca.fit_transform(features)
-
-        # Create figure - single scatter call for speed
-        fig, ax = plt.subplots(figsize=(8, 8))
-        unique_speakers = np.unique(speakers)
-        colors = plt.cm.tab20(np.linspace(0, 1, len(unique_speakers)))
-        speaker_colors = [colors[list(unique_speakers).index(s) % len(colors)] for s in speakers]
-        ax.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], c=speaker_colors, alpha=0.7, s=30)
-
-        ax.set_title(f"PCA of GuBERT Features (Step {step})")
-        ax.set_xlabel("PC1")
-        ax.set_ylabel("PC2")
-
-        plt.tight_layout()
-        writer.add_figure("visualizations/pca_by_speaker", fig, step)
-        plt.close(fig)
-
-    @torch.no_grad()
-    def _log_transcriptions(self, model, writer, step, device):
-        """Log sample transcriptions with CER/WER."""
-        transcriptions = []
-        total_cer = 0
-        total_wer = 0
-
-        indices = np.random.choice(
-            len(self.eval_dataset),
-            min(self.num_transcription_samples, len(self.eval_dataset)),
-            replace=False,
-        )
-
-        for idx in indices:
-            sample = self.eval_dataset[idx]
-
-            mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
-            mel_length = sample["mel_length"].unsqueeze(0)
-            text_tokens = sample["text_tokens"]
-            text_length = sample["text_length"].item()
-
-            # Get model prediction
-            result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
-            asr_logits = result["asr_logits"]  # [1, T, vocab]
-
-            # Greedy decode
-            pred_text = self.vocab.ctc_decode_greedy(asr_logits)[0]
-
-            # Get ground truth
-            target_text = self.vocab.decode(
-                text_tokens[:text_length].tolist(),
-                remove_blanks=True,
-                collapse_repeats=False,
-            )
-
-            # Compute metrics
-            wer, cer = compute_wer_cer(pred_text, target_text)
-            total_wer += wer
-            total_cer += cer
-
-            transcriptions.append({
-                "target": target_text,
-                "pred": pred_text,
-                "cer": cer,
-                "wer": wer,
-            })
-
-        # Log metrics
-        avg_cer = total_cer / len(transcriptions)
-        avg_wer = total_wer / len(transcriptions)
-        writer.add_scalar("eval/cer", avg_cer, step)
-        writer.add_scalar("eval/wer", avg_wer, step)
-
-        # Log sample transcriptions as text
-        text_summary = f"**Step {step} Sample Transcriptions**\n\n"
-        text_summary += f"Average CER: {avg_cer:.3f} | Average WER: {avg_wer:.3f}\n\n"
-        for i, t in enumerate(transcriptions[:4]):
-            text_summary += f"**Sample {i + 1}** (CER: {t['cer']:.3f}, WER: {t['wer']:.3f})\n"
-            text_summary += f"  Target: `{t['target'][:100]}`\n"
-            text_summary += f"  Pred:   `{t['pred'][:100]}`\n\n"
-
-        writer.add_text("transcriptions/samples", text_summary, step)
-
-    @torch.no_grad()
-    def _log_feature_heatmap(self, model, writer, step, device):
-        """Log feature heatmap for a sample."""
-        sample = self.eval_dataset[0]
-
-        mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
-        mel_length = sample["mel_length"].unsqueeze(0)
-
-        result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
-        features = result["features"][0].cpu().numpy()  # [T, D]
-
-        # Transpose for heatmap (D, T)
-        features = features.T
-
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
-
-        # Input mel spectrogram
-        mel_np = sample["mel_spec"].numpy()
-        im0 = axes[0].imshow(mel_np, aspect="auto", origin="lower", cmap="viridis")
-        axes[0].set_title("Input Mel Spectrogram")
-        axes[0].set_ylabel("Mel Bin")
-        plt.colorbar(im0, ax=axes[0])
-
-        # Output features
-        im1 = axes[1].imshow(features, aspect="auto", origin="lower", cmap="viridis")
-        axes[1].set_title(f"GuBERT Features (dim={features.shape[0]})")
-        axes[1].set_xlabel("Time")
-        axes[1].set_ylabel("Feature Dim")
-        plt.colorbar(im1, ax=axes[1])
-
-        plt.tight_layout()
-        writer.add_figure("visualizations/feature_heatmap", fig, step)
-        plt.close(fig)
-
-
-class MaskedGuBERTVisualizationCallback(TrainerCallback):
-    """
-    Callback for logging MaskedGuBERT visualizations to TensorBoard.
-
-    Logs:
-    - t-SNE of features colored by speaker
-    - Feature heatmaps with mask overlay
-    - Mask prediction visualizations
-    """
-
-    def __init__(
-        self,
-        eval_dataset: GuBERTShardedDataset,
-        visualization_steps: int = 1000,
-        num_tsne_samples: int = 150,
-        max_speakers_for_tsne: int = 15,
-        sync_with_eval: bool = False,
-    ):
-        self.eval_dataset = eval_dataset
-        self.visualization_steps = visualization_steps
-        self.num_tsne_samples = num_tsne_samples
-        self.max_speakers_for_tsne = max_speakers_for_tsne
-        self.sync_with_eval = sync_with_eval
-        self.trainer: Optional[Trainer] = None
-
-    def _run_visualizations(self, model, state, kwargs):
-        """Run all visualizations and log to TensorBoard."""
-        if model is None:
-            return
-
-        writer = get_writer(kwargs.get("trainer", self.trainer))
-        if writer is None:
-            return
-
-        model.eval()
-        device = next(model.parameters()).device
-
-        try:
-            print(f"  Running visualizations at step {state.global_step}...")
-            t0 = time.time()
-            self._log_tsne(model, writer, state.global_step, device)
-            print(f"    PCA: {time.time() - t0:.1f}s")
-
-            t0 = time.time()
-            self._log_feature_heatmap(model, writer, state.global_step, device)
-            print(f"    Feature heatmap: {time.time() - t0:.1f}s")
-
-            t0 = time.time()
-            self._log_mask_prediction(model, writer, state.global_step, device)
-            print(f"    Mask prediction: {time.time() - t0:.1f}s")
-
-            t0 = time.time()
-            self._log_feature_space_health(model, writer, state.global_step, device)
-            print(f"    Feature health: {time.time() - t0:.1f}s")
-        except Exception as e:
-            print(f"Visualization error at step {state.global_step}: {e}")
-            import traceback
-            traceback.print_exc()
-
-        model.train()
-
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        # Skip step-based visualization if syncing with eval
-        if self.sync_with_eval:
-            return
-
-        if not ((state.global_step == 1) or (state.global_step % self.visualization_steps == 0)) or not state.is_world_process_zero:
-            return
-
-        self._run_visualizations(model, state, kwargs)
-
-    @torch.no_grad()
-    def _log_tsne(self, model, writer, step, device):
-        """Log t-SNE visualization of features colored by speaker."""
-        features_list = []
-        speakers_list = []
-        speaker_counts = {}
-
-        # Use sequential indices from start to avoid random shard access
-        # This is much faster than random shuffling across the dataset
-        indices = list(range(min(len(self.eval_dataset), self.num_tsne_samples * 10)))
-
-        t_load = time.time()
-        for idx in tqdm(indices, desc="t-SNE samples", leave=False):
-            if len(features_list) >= self.num_tsne_samples:
-                break
-
-            sample = self.eval_dataset[idx]
-            speaker_id = sample["speaker_id"].item()
-
             if speaker_counts.get(speaker_id, 0) >= self.num_tsne_samples // self.max_speakers_for_tsne:
                 continue
 
@@ -795,15 +737,14 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
             mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
             mel_length = sample["mel_length"].unsqueeze(0)
 
-            # Run in inference mode (no masking)
-            result = model(mel_spec, lengths=mel_length, grl_alpha=0.0, mask=None)
-            feat = result["features"]  # [1, T, D]
+            result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
+            feat = result["features"]
 
             feat_pooled = feat.mean(dim=1).cpu().numpy()
+
             features_list.append(feat_pooled[0])
             speakers_list.append(speaker_id)
             speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
-        print(f"      Sample loading: {time.time() - t_load:.1f}s")
 
         if len(features_list) < 10:
             return
@@ -811,7 +752,7 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
         features = np.array(features_list)
         speakers = np.array(speakers_list)
 
-        # Precompute color indices
+        # Map speakers to color indices
         unique_speakers = np.unique(speakers)
         speaker_to_idx = {s: i for i, s in enumerate(unique_speakers)}
         color_indices = np.array([speaker_to_idx[s] for s in speakers])
@@ -829,8 +770,7 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
         print(f"      t-SNE compute: {time.time() - t_tsne:.1f}s")
 
         # Create side-by-side figure
-        t_plot = time.time()
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
         axes[0].scatter(pca_2d[:, 0], pca_2d[:, 1], c=color_indices, cmap='tab20', alpha=0.7, s=20)
         axes[0].set_title(f"PCA (Step {step})")
@@ -845,176 +785,250 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
         plt.tight_layout()
         writer.add_figure("visualizations/pca_tsne_by_speaker", fig, step)
         plt.close(fig)
-        print(f"      Plot: {time.time() - t_plot:.1f}s")
 
     @torch.no_grad()
-    def _log_feature_heatmap(self, model, writer, step, device):
-        """Log feature heatmap for a sample."""
-        sample = self.eval_dataset[0]
+    def _log_transcriptions_with_alignment(self, model, writer, step, device):
+        """Log sample transcriptions with CER/WER and CTC alignment visualization."""
+        transcriptions = []
+        total_cer = 0
+        total_wer = 0
 
-        mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
-        mel_length = sample["mel_length"].unsqueeze(0)
-        actual_mel_length = mel_length.item()
+        indices = np.random.choice(
+            len(self.eval_dataset),
+            min(self.num_transcription_samples, len(self.eval_dataset)),
+            replace=False,
+        )
 
-        result = model(mel_spec, lengths=mel_length, grl_alpha=0.0, mask=None)
-        features = result["features"][0].cpu().numpy()  # [T, D]
-        feature_length = result.get("feature_lengths", [features.shape[0]])[0]
-        if hasattr(feature_length, 'item'):
-            feature_length = feature_length.item()
+        for i, idx in enumerate(indices):
+            sample = self.eval_dataset[idx]
 
-        # Crop to actual content (non-padded region)
-        mel_np = sample["mel_spec"].numpy()[:, :actual_mel_length]
-        features_cropped = features[:feature_length, :].T  # [D, T_actual]
+            mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
+            mel_length = sample["mel_length"].unsqueeze(0)
+            actual_mel_len = sample["mel_length"].item()
+            text_tokens = sample["text_tokens"]
+            text_length = sample["text_length"].item()
 
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+            result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
+            asr_logits = result["asr_logits"]  # [1, T, vocab]
+            features = result["features"]  # [1, T, D]
+            feature_length = result["feature_lengths"][0].item() if result["feature_lengths"] is not None else asr_logits.size(1)
 
-        im0 = axes[0].imshow(mel_np, aspect="auto", origin="lower", cmap="viridis")
-        axes[0].set_title(f"Input Mel Spectrogram (T={actual_mel_length})")
-        axes[0].set_ylabel("Mel Bin")
-        plt.colorbar(im0, ax=axes[0])
+            # Get probabilities
+            asr_probs = F.softmax(asr_logits[0, :feature_length], dim=-1).cpu().numpy()  # [T, vocab]
 
-        # Use per-row normalization to show temporal variation within each dimension
-        feat_normalized = (features_cropped - features_cropped.mean(axis=1, keepdims=True)) / (features_cropped.std(axis=1, keepdims=True) + 1e-8)
-        im1 = axes[1].imshow(feat_normalized, aspect="auto", origin="lower", cmap="RdBu_r", vmin=-3, vmax=3)
-        axes[1].set_title(f"MaskedGuBERT Features (dim={features_cropped.shape[0]}, T={feature_length}) - normalized per dim")
-        axes[1].set_xlabel("Time")
-        axes[1].set_ylabel("Feature Dim")
-        plt.colorbar(im1, ax=axes[1])
+            # Get ground truth
+            target_text = self.vocab.decode(
+                text_tokens[:text_length].tolist(),
+                remove_blanks=True,
+                collapse_repeats=False,
+            )
 
-        plt.tight_layout()
-        writer.add_figure("visualizations/feature_heatmap", fig, step)
-        plt.close(fig)
+            # Always compute greedy decode for base metrics (maintains consistency with previous runs)
+            pred_text_greedy = self.vocab.ctc_decode_greedy(asr_logits)[0]
+            wer_greedy, cer_greedy = compute_wer_cer(pred_text_greedy, target_text)
+            length_ratio_greedy = len(pred_text_greedy) / max(len(target_text), 1)
+            total_wer += wer_greedy
+            total_cer += cer_greedy
+
+            # Optionally compute beam+LM decode for separate metrics
+            if self.ctc_decoder is not None:
+                try:
+                    pred_text_lm = self.vocab.ctc_decode_beam(
+                        asr_logits[0, :feature_length],
+                        decoder=self.ctc_decoder,
+                        beam_width=self.beam_width,
+                    )[0]
+                    wer_lm, cer_lm = compute_wer_cer(pred_text_lm, target_text)
+                    length_ratio_lm = len(pred_text_lm) / max(len(target_text), 1)
+                except Exception as e:
+                    print(f"Warning: Beam+LM decode failed: {e}")
+                    pred_text_lm = None
+                    wer_lm, cer_lm, length_ratio_lm = None, None, None
+            else:
+                pred_text_lm = None
+                wer_lm, cer_lm, length_ratio_lm = None, None, None
+
+            transcriptions.append({
+                "target": target_text,
+                "pred_greedy": pred_text_greedy,
+                "pred_lm": pred_text_lm,
+                "cer": cer_greedy,
+                "wer": wer_greedy,
+                "length_ratio": length_ratio_greedy,
+                "cer_lm": cer_lm,
+                "wer_lm": wer_lm,
+                "length_ratio_lm": length_ratio_lm,
+            })
+
+            # Create alignment visualization (mel + CTC probs + blank prob + text comparison)
+            if i < 4:  # Only visualize first 4
+                fig, axes = plt.subplots(4, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [2, 2, 1.5, 0.8]})
+
+                # 1. Mel spectrogram
+                mel_np = sample["mel_spec"][:, :actual_mel_len].numpy()
+                im0 = axes[0].imshow(mel_np, aspect="auto", origin="lower", cmap="viridis")
+                axes[0].set_title(f"Mel Spectrogram (T={actual_mel_len})")
+                axes[0].set_ylabel("Mel Bin")
+                plt.colorbar(im0, ax=axes[0])
+
+                # 2. Feature heatmap
+                feat_np = features[0, :feature_length].cpu().numpy().T  # [D, T]
+                im1 = axes[1].imshow(feat_np, aspect="auto", origin="lower", cmap="viridis")
+                axes[1].set_title(f"GuBERT Features (T'={feature_length}, D={feat_np.shape[0]})")
+                axes[1].set_ylabel("Feature Dim")
+                plt.colorbar(im1, ax=axes[1])
+
+                # 3. CTC probability heatmap (top-k characters)
+                # Get top-k most likely chars at each timestep
+                top_k = 10
+                top_indices = np.argsort(asr_probs, axis=-1)[:, -top_k:][:, ::-1]  # [T, top_k]
+                top_probs = np.take_along_axis(asr_probs, top_indices, axis=-1)  # [T, top_k]
+
+                im2 = axes[2].imshow(top_probs.T, aspect="auto", origin="lower", cmap="hot", vmin=0, vmax=1)
+                axes[2].set_title("CTC Probabilities (top-10 chars per frame)")
+                axes[2].set_ylabel("Char Rank")
+                axes[2].set_yticks(range(top_k))
+                plt.colorbar(im2, ax=axes[2])
+
+                # 4. Blank probability over time
+                blank_probs = asr_probs[:, self.vocab.blank_idx]  # [T]
+                axes[3].plot(blank_probs, color='blue', linewidth=1)
+                axes[3].fill_between(range(len(blank_probs)), blank_probs, alpha=0.3)
+                axes[3].set_xlim(0, feature_length)
+                axes[3].set_ylim(0, 1)
+                axes[3].set_ylabel("P(blank)")
+                axes[3].set_xlabel("Frame")
+                axes[3].set_title(f"Blank Probability (mean={np.mean(blank_probs):.3f})")
+                axes[3].axhline(y=0.5, color='red', linestyle='--', alpha=0.5)
+
+                # Add CER/WER, length ratio in upper right (greedy metrics, with LM if available)
+                # Length ratio > 1 means prediction is too long, < 1 means too short
+                metrics_text = f"Greedy: CER={cer_greedy:.3f} WER={wer_greedy:.3f} Len={length_ratio_greedy:.2f}x"
+                if cer_lm is not None:
+                    metrics_text += f"\nBeam+LM: CER={cer_lm:.3f} WER={wer_lm:.3f} Len={length_ratio_lm:.2f}x"
+                fig.text(0.98, 0.98, metrics_text, fontsize=9,
+                        ha='right', verticalalignment='top', fontweight='bold', family='monospace')
+
+                # Add text comparison below figure with manual line wrapping
+                def wrap_text(text, max_chars=120):
+                    """Wrap text to multiple lines."""
+                    lines = []
+                    while len(text) > max_chars:
+                        # Find last space before max_chars
+                        wrap_at = text.rfind(' ', 0, max_chars)
+                        if wrap_at == -1:
+                            wrap_at = max_chars
+                        lines.append(text[:wrap_at])
+                        text = text[wrap_at:].lstrip()
+                    lines.append(text)
+                    return '\n'.join(lines)
+
+                target_wrapped = wrap_text(f"Target:  {target_text}")
+                greedy_wrapped = wrap_text(f"Greedy:  {pred_text_greedy}")
+
+                # Count lines needed for proper spacing
+                target_lines = target_wrapped.count('\n') + 1
+                greedy_lines = greedy_wrapped.count('\n') + 1
+                total_lines = target_lines + greedy_lines + 1
+
+                # Add LM prediction if available
+                if pred_text_lm is not None:
+                    lm_wrapped = wrap_text(f"Beam+LM: {pred_text_lm}")
+                    lm_lines = lm_wrapped.count('\n') + 1
+                    total_lines += lm_lines + 1
+                else:
+                    lm_wrapped = None
+                    lm_lines = 0
+
+                # Calculate bottom margin based on number of lines
+                line_height = 0.018
+                bottom_margin = max(0.12, total_lines * line_height + 0.02)
+
+                y_pos = bottom_margin - 0.01
+                fig.text(0.02, y_pos, target_wrapped, fontsize=8, family='monospace', verticalalignment='top')
+                y_pos -= (target_lines * line_height) + 0.01
+                fig.text(0.02, y_pos, greedy_wrapped, fontsize=8, family='monospace', verticalalignment='top')
+                if lm_wrapped is not None:
+                    y_pos -= (greedy_lines * line_height) + 0.01
+                    fig.text(0.02, y_pos, lm_wrapped, fontsize=8, family='monospace', verticalalignment='top', color='blue')
+
+                # rect=[left, bottom, right, top] - leave room at top for metrics, bottom for text
+                top_margin = 0.94 if cer_lm is not None else 0.96  # More room if LM metrics shown
+                plt.tight_layout(rect=[0, bottom_margin, 1, top_margin])
+                writer.add_figure(f"ctc_alignment/sample_{i}", fig, step)
+                plt.close(fig)
+
+        # Log greedy metrics (consistent with previous runs)
+        avg_cer = total_cer / len(transcriptions) if transcriptions else 0
+        avg_wer = total_wer / len(transcriptions) if transcriptions else 0
+        avg_length_ratio = sum(t['length_ratio'] for t in transcriptions) / len(transcriptions) if transcriptions else 1.0
+        writer.add_scalar("eval/cer", avg_cer, step)
+        writer.add_scalar("eval/wer", avg_wer, step)
+        writer.add_scalar("eval/length_ratio", avg_length_ratio, step)
+
+        # Log LM metrics if available
+        if self.ctc_decoder is not None:
+            lm_cers = [t['cer_lm'] for t in transcriptions if t['cer_lm'] is not None]
+            lm_wers = [t['wer_lm'] for t in transcriptions if t['wer_lm'] is not None]
+            lm_ratios = [t['length_ratio_lm'] for t in transcriptions if t['length_ratio_lm'] is not None]
+            if lm_cers:
+                avg_cer_lm = sum(lm_cers) / len(lm_cers)
+                avg_wer_lm = sum(lm_wers) / len(lm_wers)
+                avg_length_ratio_lm = sum(lm_ratios) / len(lm_ratios)
+                writer.add_scalar("eval/cer_lm", avg_cer_lm, step)
+                writer.add_scalar("eval/wer_lm", avg_wer_lm, step)
+                writer.add_scalar("eval/length_ratio_lm", avg_length_ratio_lm, step)
+
+        # Log sample transcriptions as text
+        text_summary = f"**Step {step} Sample Transcriptions**\n\n"
+        text_summary += f"**Greedy:** CER={avg_cer:.3f} | WER={avg_wer:.3f} | Len={avg_length_ratio:.2f}x\n"
+        if self.ctc_decoder is not None and lm_cers:
+            text_summary += f"**Beam+LM:** CER={avg_cer_lm:.3f} | WER={avg_wer_lm:.3f} | Len={avg_length_ratio_lm:.2f}x\n"
+        text_summary += "\n"
+        for i, t in enumerate(transcriptions[:4]):
+            text_summary += f"**Sample {i + 1}**\n"
+            text_summary += f"  Target:  `{t['target'][:100]}`\n"
+            text_summary += f"  Greedy:  `{t['pred_greedy'][:100]}` (CER={t['cer']:.3f})\n"
+            if t['pred_lm'] is not None:
+                text_summary += f"  Beam+LM: `{t['pred_lm'][:100]}` (CER={t['cer_lm']:.3f})\n"
+            text_summary += "\n"
+
+        writer.add_text("transcriptions/samples", text_summary, step)
 
     @torch.no_grad()
-    def _log_mask_prediction(self, model, writer, step, device):
-        """Log mask prediction visualization."""
-        sample = self.eval_dataset[0]
-
-        mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
-        mel_length = sample["mel_length"].unsqueeze(0)
-        actual_mel_length = sample["mel_length"].item()
-
-        # Run with masking enabled
-        model.train()  # Enable masking
-        result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
-        model.eval()
-
-        mask = result.get("mask")  # [1, T'] where T' is feature length (subsampled)
-        if mask is None:
-            return
-
-        mask = mask[0].cpu().numpy()  # [T']
-        feature_lengths = result.get("feature_lengths")
-        actual_feature_length = feature_lengths[0].item() if feature_lengths is not None else len(mask)
-
-        # Crop mask to actual feature length (remove padding)
-        mask_cropped = mask[:actual_feature_length]
-
-        # Get the subsampling stride to rescale mask to mel spectrogram dimensions
-        total_stride = model.conv_subsample.total_stride
-
-        fig, axes = plt.subplots(3, 1, figsize=(12, 10))
-
-        # Crop mel spectrogram to actual length
-        mel_np = sample["mel_spec"].numpy()[:, :actual_mel_length]
-        im0 = axes[0].imshow(mel_np, aspect="auto", origin="lower", cmap="viridis")
-        axes[0].set_title(f"Input Mel Spectrogram (cropped to {actual_mel_length} frames)")
-        axes[0].set_ylabel("Mel Bin")
-        plt.colorbar(im0, ax=axes[0])
-
-        # Mask overlay - rescale mask from feature space to mel space
-        # Each feature position covers 'total_stride' mel frames
-        mask_mel_scale = np.repeat(mask_cropped, total_stride)[:actual_mel_length]
-        mask_expanded = np.tile(mask_mel_scale, (mel_np.shape[0], 1))
-
-        axes[1].imshow(mel_np, aspect="auto", origin="lower", cmap="viridis", alpha=0.7)
-        axes[1].imshow(mask_expanded, aspect="auto", origin="lower", cmap="Reds", alpha=0.5)
-        axes[1].set_title(f"Mask Overlay (red = masked, {mask_cropped.sum()}/{len(mask_cropped)} feature frames)")
-        axes[1].set_ylabel("Mel Bin")
-
-        # Prediction similarity (for regression mode)
-        if not model.config.use_vq and "predictions" in result and "targets" in result:
-            predictions = result["predictions"][0].cpu()[:actual_feature_length]  # [T', D]
-            targets = result["targets"][0].cpu()[:actual_feature_length]  # [T', D]
-
-            # Compute cosine similarity at each position
-            pred_norm = F.normalize(predictions, dim=-1)
-            targ_norm = F.normalize(targets, dim=-1)
-            similarity = (pred_norm * targ_norm).sum(dim=-1).numpy()  # [T']
-
-            axes[2].plot(similarity, label="Cosine Similarity", alpha=0.7)
-            axes[2].fill_between(range(len(mask_cropped)), 0, 1, where=mask_cropped.astype(bool),
-                                alpha=0.3, color='red', label="Masked")
-            axes[2].set_title("Prediction Quality (cosine sim) at Each Position")
-            axes[2].set_xlabel("Feature Frame")
-            axes[2].set_ylabel("Cosine Similarity")
-            axes[2].set_ylim(0, 1)
-            axes[2].legend()
-        else:
-            axes[2].text(0.5, 0.5, "VQ mode - see codebook accuracy in metrics",
-                        ha='center', va='center', transform=axes[2].transAxes)
-            axes[2].set_title("Prediction Visualization")
-
-        plt.tight_layout()
-        writer.add_figure("visualizations/mask_prediction", fig, step)
-        plt.close(fig)
-
-    @torch.no_grad()
-    def _log_feature_space_health(self, model, writer, step, device, num_samples: int = 50):
-        """
-        Log feature space health metrics for VAE compatibility.
-
-        Tracks:
-        - Per-dimension statistics (mean, std)
-        - Feature norms distribution
-        - Dimension utilization (dead dimension detection)
-        - Temporal smoothness (adjacent frame similarity)
-        - Activation histogram
-        - Dimension correlation
-        """
+    def _log_feature_health(self, model, writer, step, device, num_samples: int = 50):
+        """Log feature health metrics and visualization (global stats, temporal smoothness, etc.)."""
         all_features = []
-        temporal_sims = []
+        temporal_sims_norm = []
+        temporal_sims_unnorm = []
 
-        # Use sequential indices for shard locality
         indices = list(range(min(len(self.eval_dataset), num_samples)))
 
-        temporal_sims_unnorm = []
-        temporal_sims_norm = []
-
-        for idx in tqdm(indices, desc="Feature health", leave=False):
+        for idx in indices:
             sample = self.eval_dataset[idx]
             mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
             mel_length = sample["mel_length"].unsqueeze(0)
 
-            result = model(mel_spec, lengths=mel_length, grl_alpha=0.0, mask=None)
-            # Use pre-LayerNorm features for health metrics since that's what the VAE uses
-            # (with normalize=False in extract_features)
+            result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
+            features_norm = result["features"][0].cpu()  # [T, D]
             features_unnorm = result["features_unnorm"][0].cpu()  # [T, D]
-            features_norm = result["features"][0].cpu()  # [T, D] - post LayerNorm
 
-            all_features.append(features_unnorm)
+            all_features.append(features_norm)
 
-            # Temporal smoothness: cosine similarity between adjacent frames
-            if features_unnorm.shape[0] > 1:
-                # Pre-LayerNorm (what VAE will use)
+            # Temporal smoothness
+            if features_norm.shape[0] > 1:
                 feat_n = F.normalize(features_unnorm, dim=-1)
-                sim = (feat_n[:-1] * feat_n[1:]).sum(dim=-1)  # [T-1]
+                sim = (feat_n[:-1] * feat_n[1:]).sum(dim=-1)
                 temporal_sims_unnorm.append(sim.mean().item())
 
-                # Post-LayerNorm (for comparison)
                 feat_n = F.normalize(features_norm, dim=-1)
-                sim = (feat_n[:-1] * feat_n[1:]).sum(dim=-1)  # [T-1]
+                sim = (feat_n[:-1] * feat_n[1:]).sum(dim=-1)
                 temporal_sims_norm.append(sim.mean().item())
 
-        # Keep temporal_sims for backward compatibility (use unnorm)
-        temporal_sims = temporal_sims_unnorm
-
-        # Concatenate all features: [total_frames, D]
         all_features = torch.cat(all_features, dim=0).numpy()
-        total_frames, feat_dim = all_features.shape
+        feat_dim = all_features.shape[1]
 
-        # === Scalar metrics ===
-        # Overall statistics
+        # Global statistics
         global_mean = np.mean(all_features)
         global_std = np.std(all_features)
         writer.add_scalar("feature_health/global_mean", global_mean, step)
@@ -1034,8 +1048,7 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
         writer.add_scalar("feature_health/dead_dimensions", dead_dims, step)
         writer.add_scalar("feature_health/dead_dim_ratio", dead_dims / feat_dim, step)
 
-        # Effective dimensionality (via explained variance ratio)
-        # Approximate using ratio of squared stds
+        # Effective dimensionality (via explained variance ratio using entropy)
         var_per_dim = dim_stds ** 2
         var_normalized = var_per_dim / (var_per_dim.sum() + 1e-8)
         entropy = -np.sum(var_normalized * np.log(var_normalized + 1e-8))
@@ -1047,7 +1060,6 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
         if temporal_sims_unnorm:
             mean_smoothness_unnorm = np.mean(temporal_sims_unnorm)
             writer.add_scalar("feature_health/temporal_smoothness_unnorm", mean_smoothness_unnorm, step)
-            # Keep old metric name for backward compatibility
             writer.add_scalar("feature_health/temporal_smoothness", mean_smoothness_unnorm, step)
         if temporal_sims_norm:
             mean_smoothness_norm = np.mean(temporal_sims_norm)
@@ -1055,7 +1067,7 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
 
         # Debug print to console
         if temporal_sims_unnorm and temporal_sims_norm:
-            print(f"    [Smoothness] pre-norm={mean_smoothness_unnorm:.4f}, post-norm={mean_smoothness_norm:.4f}")
+            print(f"      [Smoothness] pre-norm={mean_smoothness_unnorm:.4f}, post-norm={mean_smoothness_norm:.4f}")
 
         # === Visualizations ===
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -1136,42 +1148,53 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
         plt.close(fig)
 
         # Log summary to console
-        print(f"  Feature space: dim={feat_dim}, effective_dim={effective_dim:.1f} ({100*effective_dim/feat_dim:.1f}%), "
-              f"dead={dead_dims}, temporal_sim={np.mean(temporal_sims):.3f}" if temporal_sims else
-              f"  Feature space: dim={feat_dim}, effective_dim={effective_dim:.1f}, dead={dead_dims}")
+        print(f"      Feature health: mean={global_mean:.3f}, std={global_std:.3f}, "
+              f"norm={np.mean(feature_norms):.3f}, dead={dead_dims}/{feat_dim}, "
+              f"effective_dim={effective_dim:.1f}")
 
-    def on_evaluate(self, args, state, control, model=None, **kwargs):
-        """Compute and log eval metrics after evaluation, and optionally run visualizations."""
-        if not state.is_world_process_zero:
+    @torch.no_grad()
+    def _log_audio_samples(self, model, writer, step, device):
+        """Log audio samples with vocoder output aligned with transcription."""
+        if self.vocoder is None:
             return
 
-        if model is None:
-            return
+        num_samples = min(self.num_audio_samples, len(self.eval_dataset))
 
-        writer = get_writer(kwargs.get("trainer", self.trainer))
-        if writer is None:
-            return
+        for i in range(num_samples):
+            sample = self.eval_dataset[i]
 
-        model.eval()
-        device = next(model.parameters()).device
+            mel_spec = sample["mel_spec"]  # [n_mels, T]
+            mel_length = sample["mel_length"].item()
+            text_tokens = sample["text_tokens"]
+            text_length = sample["text_length"].item()
 
-        try:
-            self._log_eval_metrics(model, writer, state.global_step, device)
-        except Exception as e:
-            print(f"Eval metrics error at step {state.global_step}: {e}")
-            import traceback
-            traceback.print_exc()
+            # Crop to actual length
+            mel_cropped = mel_spec[:, :mel_length]
 
-        # Run visualizations in lockstep with eval (if enabled)
-        if self.sync_with_eval:
-            self._run_visualizations(model, state, kwargs)
+            # Get ground truth text
+            target_text = self.vocab.decode(
+                text_tokens[:text_length].tolist(),
+                remove_blanks=True,
+                collapse_repeats=False,
+            )
+
+            # Generate audio from mel spectrogram
+            self._log_vocoder_audio(
+                writer, mel_cropped, step,
+                tag=f"audio_samples/sample_{i}"
+            )
+
+            # Log the transcription for this sample
+            writer.add_text(
+                f"audio_samples/sample_{i}_text",
+                f"**Sample {i}**: {target_text}",
+                step
+            )
 
     @torch.no_grad()
     def _log_eval_metrics(self, model, writer, step, device, num_samples: int = 100):
-        """Compute mask accuracy and speaker accuracy over eval samples."""
-        mask_accs = []
+        """Compute and log speaker accuracy (GRL effectiveness) over eval samples."""
         speaker_accs = []
-        mask_losses = []
 
         # Use sequential indices for shard locality
         indices = list(range(min(len(self.eval_dataset), num_samples)))
@@ -1183,33 +1206,7 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
             mel_length = sample["mel_length"].unsqueeze(0)
             speaker_id = sample["speaker_id"].to(device)
 
-            # Run with masking (training mode temporarily)
-            model.train()
             result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
-            model.eval()
-
-            mask = result.get("mask")
-            if mask is not None and mask.any():
-                # Compute mask accuracy
-                if model.config.use_vq:
-                    prediction_logits = result["prediction_logits"]
-                    target_indices = result["target_indices"]
-                    masked_logits = prediction_logits[mask]
-                    masked_targets = target_indices[mask]
-                    pred_indices = masked_logits.argmax(dim=-1)
-                    mask_acc = (pred_indices == masked_targets).float().mean().item()
-                else:
-                    predictions = result["predictions"]
-                    targets = result["targets"]
-                    masked_preds = F.normalize(predictions[mask], dim=-1)
-                    masked_targets = F.normalize(targets[mask], dim=-1)
-                    mask_acc = (masked_preds * masked_targets).sum(dim=-1).mean().item()
-
-                mask_accs.append(mask_acc)
-
-                # Compute mask loss
-                mask_loss = model.compute_masked_prediction_loss(result)
-                mask_losses.append(mask_loss.item())
 
             # Compute speaker accuracy
             speaker_logits = result["speaker_logits"]
@@ -1218,19 +1215,11 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
             speaker_accs.append(speaker_acc)
 
         # Log aggregated metrics
-        if mask_accs:
-            mean_mask_acc = np.mean(mask_accs)
-            writer.add_scalar("eval/mask_accuracy", mean_mask_acc, step)
-            print(f"  Eval mask accuracy: {mean_mask_acc:.4f}")
-
-        if mask_losses:
-            mean_mask_loss = np.mean(mask_losses)
-            writer.add_scalar("eval/mask_loss", mean_mask_loss, step)
-
         if speaker_accs:
             mean_speaker_acc = np.mean(speaker_accs)
             writer.add_scalar("eval/speaker_accuracy", mean_speaker_acc, step)
-            print(f"  Eval speaker accuracy: {mean_speaker_acc:.4f} (lower is better for GRL)")
+            print(f"    Eval speaker accuracy: {mean_speaker_acc:.4f} (lower is better for GRL)")
+
 
 
 # ============================================================================
@@ -1240,6 +1229,10 @@ class MaskedGuBERTVisualizationCallback(TrainerCallback):
 class GuBERTTrainer(Trainer):
     """
     Custom trainer for GuBERT with CTC + GRL losses.
+
+    Supports:
+    - Separate optimizer/LR for speaker classifier (grl_lr)
+    - GRL pre-training phase (grl_start_step) where classifier learns without adversarial pressure
     """
 
     def __init__(
@@ -1249,6 +1242,8 @@ class GuBERTTrainer(Trainer):
         grl_alpha_scheduler: GRLAlphaScheduler,
         ctc_weight: float = 1.0,
         grl_weight: float = 0.1,
+        grl_start_step: int = 0,  # Step at which GRL kicks in (before this, classifier trains freely)
+        grl_lr: float = None,  # Separate LR for speaker classifier (None = use base LR)
         cmdline: str = "",
         git_commit_hash: str = "",
         step_offset: int = 0,
@@ -1259,6 +1254,8 @@ class GuBERTTrainer(Trainer):
         self.grl_alpha_scheduler = grl_alpha_scheduler
         self.ctc_weight = ctc_weight
         self.grl_weight = grl_weight
+        self.grl_start_step = grl_start_step
+        self.grl_lr = grl_lr
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
         self.step_offset = step_offset if step_offset is not None else 0
@@ -1278,6 +1275,53 @@ class GuBERTTrainer(Trainer):
 
         # TensorBoard writer (lazily initialized)
         self.writer = None
+
+    def create_optimizer(self):
+        """
+        Override to create separate parameter groups with different learning rates.
+        Speaker classifier gets grl_lr (or base_lr if None).
+        """
+        if self.optimizer is not None:
+            return self.optimizer
+
+        model = self.model
+        base_lr = self.args.learning_rate
+        speaker_lr = self.grl_lr if self.grl_lr is not None else base_lr
+
+        # Separate speaker classifier parameters
+        speaker_classifier_params = []
+        other_params = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'speaker_classifier' in name:
+                speaker_classifier_params.append(param)
+            else:
+                other_params.append(param)
+
+        # Create parameter groups
+        optimizer_grouped_parameters = [
+            {
+                "params": other_params,
+                "lr": base_lr,
+                "weight_decay": self.args.weight_decay,
+            },
+            {
+                "params": speaker_classifier_params,
+                "lr": speaker_lr,
+                "weight_decay": self.args.weight_decay,
+            },
+        ]
+
+        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args, model)
+
+        # Remove lr from kwargs since we set it per-group
+        optimizer_kwargs.pop("lr", None)
+
+        self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+        return self.optimizer
 
     def _ensure_tensorboard_writer(self):
         """Get TensorBoard writer from callback."""
@@ -1312,32 +1356,52 @@ class GuBERTTrainer(Trainer):
         text_lengths = inputs["text_lengths"]
         speaker_ids = inputs["speaker_ids"]
 
-        # Get GRL alpha for current step
-        grl_alpha = self.grl_alpha_scheduler.get_alpha(global_step)
+        # GRL pre-training phase:
+        # Before grl_start_step, classifier trains freely (no gradient reversal)
+        # After grl_start_step, GRL kicks in with alpha ramping from that point
+        in_pretraining = global_step < self.grl_start_step
+        if in_pretraining:
+            # Pre-training phase: classifier learns without adversarial pressure
+            grl_alpha = 0.0
+        else:
+            # GRL active: alpha scheduler starts from grl_start_step
+            effective_step = global_step - self.grl_start_step
+            grl_alpha = self.grl_alpha_scheduler.get_alpha(effective_step)
 
         # Forward pass
         result = model(mel_specs, lengths=mel_lengths, grl_alpha=grl_alpha)
 
         asr_logits = result["asr_logits"]  # [B, T, vocab]
         speaker_logits = result["speaker_logits"]  # [B, num_speakers]
-        feature_lengths = result["feature_lengths"]  # [B]
+        # Use ctc_lengths for CTC loss (accounts for upsampling if enabled)
+        ctc_lengths = result.get("ctc_lengths", result["feature_lengths"])  # [B]
 
         # CTC loss
         # CTC expects [T, B, vocab] and log probabilities
         log_probs = F.log_softmax(asr_logits, dim=-1).permute(1, 0, 2)  # [T, B, vocab]
-        ctc_loss = self.ctc_criterion(log_probs, text_tokens, feature_lengths, text_lengths)
+        ctc_loss = self.ctc_criterion(log_probs, text_tokens, ctc_lengths, text_lengths)
 
         # GRL speaker classification loss
         # We want the classifier to FAIL (be at chance level)
         # But we train it normally - GRL reverses gradients to encoder
         speaker_loss = self.speaker_criterion(speaker_logits, speaker_ids)
 
-        # Speaker accuracy (for logging)
+        # Speaker accuracy and diagnostics (for logging)
         with torch.no_grad():
             speaker_preds = speaker_logits.argmax(dim=-1)
             speaker_acc = (speaker_preds == speaker_ids).float().mean().item()
 
+            # Diagnostic: check for mode collapse
+            pred_probs = F.softmax(speaker_logits, dim=-1)
+            pred_entropy = -(pred_probs * torch.log(pred_probs + 1e-8)).sum(dim=-1).mean().item()
+            unique_preds = speaker_preds.unique().numel()
+
+            # Max probability (confidence) - high values with low accuracy = overconfident
+            max_prob = pred_probs.max(dim=-1).values.mean().item()
+
         # Combined loss
+        # During pre-training phase, speaker loss still contributes but doesn't affect encoder
+        # (because grl_alpha=0 means no gradient reversal, but classifier still learns)
         total_loss = self.ctc_weight * ctc_loss + self.grl_weight * speaker_loss
 
         # Log to TensorBoard
@@ -1347,6 +1411,11 @@ class GuBERTTrainer(Trainer):
             self.writer.add_scalar("train/speaker_accuracy", speaker_acc, global_step)
             self.writer.add_scalar("train/grl_alpha", grl_alpha, global_step)
             self.writer.add_scalar("train/total_loss", total_loss.item(), global_step)
+            self.writer.add_scalar("train/grl_pretraining", float(in_pretraining), global_step)
+            # Diagnostics for speaker classifier behavior
+            self.writer.add_scalar("train/speaker_pred_entropy", pred_entropy, global_step)
+            self.writer.add_scalar("train/speaker_unique_preds", unique_preds, global_step)
+            self.writer.add_scalar("train/speaker_max_prob", max_prob, global_step)
 
         if return_outputs:
             return total_loss, result
@@ -1368,11 +1437,12 @@ class GuBERTTrainer(Trainer):
 
             asr_logits = result["asr_logits"]
             speaker_logits = result["speaker_logits"]
-            feature_lengths = result["feature_lengths"]
+            # Use ctc_lengths for CTC loss (accounts for upsampling if enabled)
+            ctc_lengths = result.get("ctc_lengths", result["feature_lengths"])
 
             # CTC loss
             log_probs = F.log_softmax(asr_logits, dim=-1).permute(1, 0, 2)
-            ctc_loss = self.ctc_criterion(log_probs, text_tokens, feature_lengths, text_lengths)
+            ctc_loss = self.ctc_criterion(log_probs, text_tokens, ctc_lengths, text_lengths)
 
             # Speaker loss
             speaker_loss = self.speaker_criterion(speaker_logits, speaker_ids)
@@ -1383,270 +1453,6 @@ class GuBERTTrainer(Trainer):
         return (total_loss, None, None)
 
 
-class MaskedGuBERTTrainer(Trainer):
-    """
-    Custom trainer for MaskedGuBERT with masked prediction + GRL losses.
-    """
-
-    def __init__(
-        self,
-        *args,
-        grl_alpha_scheduler: GRLAlphaScheduler,
-        masked_weight: float = 1.0,
-        grl_weight: float = 0.1,
-        commitment_weight: float = 0.25,
-        codebook_weight: float = 1.0,
-        variance_weight: float = 1.0,
-        cmdline: str = "",
-        git_commit_hash: str = "",
-        step_offset: int = 0,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.grl_alpha_scheduler = grl_alpha_scheduler
-        self.masked_weight = masked_weight
-        self.grl_weight = grl_weight
-        self.commitment_weight = commitment_weight
-        self.codebook_weight = codebook_weight
-        self.variance_weight = variance_weight
-        self.cmdline = cmdline
-        self.git_commit_hash = git_commit_hash
-        self.step_offset = step_offset if step_offset is not None else 0
-        self.has_logged_cli = False
-
-        self.speaker_criterion = nn.CrossEntropyLoss()
-
-        # Metrics tracking
-        self._step_metrics = {}
-
-        # Set up shard-aware sampler if dataset supports it
-        self._shard_sampler = None
-        if hasattr(self.train_dataset, 'get_sampler'):
-            self._shard_sampler = self.train_dataset.get_sampler(shuffle=True, seed=42)
-
-        # TensorBoard writer (lazily initialized)
-        self.writer = None
-
-    def _ensure_tensorboard_writer(self):
-        """Get TensorBoard writer from callback."""
-        if self.writer is not None:
-            return
-        for callback in self.callback_handler.callbacks:
-            if isinstance(callback, TensorBoardCallback):
-                self.writer = callback.tb_writer
-                return
-
-    def _get_train_sampler(self) -> Optional[Sampler]:
-        """Override to use shard-aware sampler for efficient shard loading."""
-        if self._shard_sampler is not None:
-            epoch = int(self.state.epoch) if self.state and self.state.epoch else 0
-            self._shard_sampler.set_epoch(epoch)
-            return self._shard_sampler
-        return super()._get_train_sampler()
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        global_step = self.state.global_step + self.step_offset
-        self._ensure_tensorboard_writer()
-
-        # Log CLI and git hash on first call (logs at resumed step if resuming)
-        if not self.has_logged_cli and self.writer is not None:
-            self.writer.add_text("training/command_line", self.cmdline, global_step)
-            self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
-            self.has_logged_cli = True
-
-        mel_specs = inputs["mel_specs"]
-        mel_lengths = inputs["mel_lengths"]
-        speaker_ids = inputs["speaker_ids"]
-
-        # Get GRL alpha for current step (use global_step with offset for proper resume)
-        grl_alpha = self.grl_alpha_scheduler.get_alpha(global_step)
-
-        # Forward pass (mask is generated automatically in training mode)
-        result = model(mel_specs, lengths=mel_lengths, grl_alpha=grl_alpha)
-
-        speaker_logits = result["speaker_logits"]  # [B, num_speakers]
-        mask = result["mask"]  # [B, T]
-
-        # Use the model's helper to compute masked prediction loss
-        # This handles both VQ and regression modes automatically
-        masked_loss = model.compute_masked_prediction_loss(result)
-
-        # Compute prediction accuracy at masked positions (mode-dependent)
-        mask_acc = 0.0
-        if mask is not None and mask.any():
-            with torch.no_grad():
-                if model.config.use_vq:
-                    # VQ mode: accuracy based on codebook index prediction
-                    prediction_logits = result["prediction_logits"]
-                    target_indices = result["target_indices"]
-                    masked_logits = prediction_logits[mask]
-                    masked_targets = target_indices[mask]
-                    pred_indices = masked_logits.argmax(dim=-1)
-                    mask_acc = (pred_indices == masked_targets).float().mean().item()
-                else:
-                    # Regression mode: use cosine similarity as accuracy proxy
-                    predictions = result["predictions"]
-                    targets = result["targets"]
-                    masked_preds = F.normalize(predictions[mask], dim=-1)
-                    masked_targets = F.normalize(targets[mask], dim=-1)
-                    mask_acc = (masked_preds * masked_targets).sum(dim=-1).mean().item()
-
-        # GRL speaker classification loss
-        speaker_loss = self.speaker_criterion(speaker_logits, speaker_ids)
-
-        # Speaker accuracy (for logging)
-        with torch.no_grad():
-            speaker_preds = speaker_logits.argmax(dim=-1)
-            speaker_acc = (speaker_preds == speaker_ids).float().mean().item()
-
-        # Combined loss (VQ losses only apply in VQ mode)
-        total_loss = self.masked_weight * masked_loss + self.grl_weight * speaker_loss
-
-        # VQ-specific losses (only in VQ mode)
-        commitment_loss_val = 0.0
-        codebook_loss_val = 0.0
-        if model.config.use_vq:
-            commitment_loss = result["commitment_loss"]
-            codebook_loss = result["codebook_loss"]
-            total_loss = total_loss + self.commitment_weight * commitment_loss + self.codebook_weight * codebook_loss
-            commitment_loss_val = commitment_loss.item()
-            codebook_loss_val = codebook_loss.item()
-
-        # Variance regularization loss (for VAE-friendly features)
-        variance_loss_val = 0.0
-        temporal_smoothness_val = 0.0
-        if model.config.use_variance_reg:
-            variance_loss = result["variance_loss"]
-            total_loss = total_loss + self.variance_weight * variance_loss
-            variance_loss_val = variance_loss.item()
-            # Extract temporal smoothness for logging
-            if result.get("temporal_smoothness") is not None:
-                temporal_smoothness_val = result["temporal_smoothness"].item()
-
-        # Log to TensorBoard
-        masked_loss_val = masked_loss.item() if torch.is_tensor(masked_loss) else masked_loss
-        if self.writer is not None and self.state.global_step % self.args.logging_steps == 0:
-            self.writer.add_scalar("train/masked_loss", masked_loss_val, global_step)
-            self.writer.add_scalar("train/speaker_loss", speaker_loss.item(), global_step)
-            self.writer.add_scalar("train/speaker_accuracy", speaker_acc, global_step)
-            self.writer.add_scalar("train/mask_accuracy", mask_acc, global_step)
-            self.writer.add_scalar("train/grl_alpha", grl_alpha, global_step)
-            self.writer.add_scalar("train/total_loss", total_loss.item(), global_step)
-            if model.config.use_vq:
-                self.writer.add_scalar("train/commitment_loss", commitment_loss_val, global_step)
-                self.writer.add_scalar("train/codebook_loss", codebook_loss_val, global_step)
-            if model.config.use_variance_reg:
-                self.writer.add_scalar("train/variance_loss", variance_loss_val, global_step)
-                self.writer.add_scalar("train/temporal_smoothness", temporal_smoothness_val, global_step)
-
-        if return_outputs:
-            return total_loss, result
-        return total_loss
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        """Override to handle MaskedGuBERT inputs correctly during evaluation."""
-        with torch.no_grad():
-            mel_specs = inputs["mel_specs"]
-            mel_lengths = inputs["mel_lengths"]
-            speaker_ids = inputs["speaker_ids"]
-
-            # Generate mask for eval (need to temporarily set training mode for mask generation)
-            model.train()  # Enable mask generation
-            result = model(mel_specs, lengths=mel_lengths, grl_alpha=0.0)
-            model.eval()  # Restore eval mode
-
-            # Compute masked prediction loss (now has valid mask)
-            masked_loss = model.compute_masked_prediction_loss(result)
-            mask = result["mask"]
-
-            # Compute mask prediction accuracy
-            mask_acc = 0.0
-            if mask is not None and mask.any():
-                if model.config.use_vq:
-                    prediction_logits = result["prediction_logits"]
-                    target_indices = result["target_indices"]
-                    masked_logits = prediction_logits[mask]
-                    masked_targets = target_indices[mask]
-                    pred_indices = masked_logits.argmax(dim=-1)
-                    mask_acc = (pred_indices == masked_targets).float().mean().item()
-                else:
-                    predictions = result["predictions"]
-                    targets = result["targets"]
-                    masked_preds = F.normalize(predictions[mask], dim=-1)
-                    masked_targets = F.normalize(targets[mask], dim=-1)
-                    mask_acc = (masked_preds * masked_targets).sum(dim=-1).mean().item()
-
-            # Speaker loss
-            speaker_logits = result["speaker_logits"]
-            speaker_loss = self.speaker_criterion(speaker_logits, speaker_ids)
-
-            # Speaker accuracy
-            speaker_preds = speaker_logits.argmax(dim=-1)
-            speaker_acc = (speaker_preds == speaker_ids).float().mean().item()
-
-            # Combined loss
-            total_loss = self.masked_weight * masked_loss + self.grl_weight * speaker_loss
-
-            # Add VQ losses if applicable
-            commitment_loss_val = 0.0
-            codebook_loss_val = 0.0
-            if model.config.use_vq:
-                total_loss = total_loss + self.commitment_weight * result["commitment_loss"]
-                total_loss = total_loss + self.codebook_weight * result["codebook_loss"]
-                commitment_loss_val = result["commitment_loss"].item()
-                codebook_loss_val = result["codebook_loss"].item()
-
-            # Add variance loss if applicable
-            variance_loss_val = 0.0
-            if model.config.use_variance_reg:
-                total_loss = total_loss + self.variance_weight * result["variance_loss"]
-                variance_loss_val = result["variance_loss"].item()
-
-            # Accumulate metrics for logging at end of eval
-            masked_loss_val = masked_loss.item() if torch.is_tensor(masked_loss) else masked_loss
-            self._accumulate_eval_metrics({
-                "masked_loss": masked_loss_val,
-                "speaker_loss": speaker_loss.item(),
-                "speaker_accuracy": speaker_acc,
-                "mask_accuracy": mask_acc,
-                "commitment_loss": commitment_loss_val,
-                "codebook_loss": codebook_loss_val,
-                "variance_loss": variance_loss_val,
-            })
-
-        return (total_loss, None, None)
-
-    def _accumulate_eval_metrics(self, metrics: dict):
-        """Accumulate metrics during evaluation for averaging."""
-        if not hasattr(self, "_eval_metrics_accum"):
-            self._eval_metrics_accum = {}
-            self._eval_metrics_count = 0
-
-        for key, value in metrics.items():
-            if key not in self._eval_metrics_accum:
-                self._eval_metrics_accum[key] = 0.0
-            self._eval_metrics_accum[key] += value
-        self._eval_metrics_count += 1
-
-    def evaluate(self, *args, **kwargs):
-        """Override to log accumulated eval metrics."""
-        # Reset accumulators
-        self._eval_metrics_accum = {}
-        self._eval_metrics_count = 0
-
-        # Run parent evaluate
-        output = super().evaluate(*args, **kwargs)
-
-        # Log averaged metrics to TensorBoard
-        self._ensure_tensorboard_writer()
-        if self.writer is not None and self._eval_metrics_count > 0:
-            global_step = self.state.global_step + self.step_offset
-            for key, total in self._eval_metrics_accum.items():
-                avg_value = total / self._eval_metrics_count
-                self.writer.add_scalar(f"eval/{key}", avg_value, global_step)
-
-        return output
-
 
 # ============================================================================
 # Model Configuration
@@ -1655,30 +1461,18 @@ class MaskedGuBERTTrainer(Trainer):
 def create_model(
     config_name: str,
     num_speakers: int,
-    mode: str = "ctc",
     vocab_size: int = 30,
     **overrides,
 ):
-    """Create GuBERT or MaskedGuBERT model from config name with overrides."""
-    if mode == "ctc":
-        configs = GUBERT_CONFIGS
-        if config_name not in configs:
-            config_name = "small"
-        return GuBERTEncoder.from_config(
-            config_name,
-            num_speakers=num_speakers,
-            vocab_size=vocab_size,
-            **overrides,
-        )
-    else:  # masked mode
-        configs = MASKED_GUBERT_CONFIGS
-        if config_name not in configs:
-            config_name = "small"
-        return MaskedGuBERTEncoder.from_config(
-            config_name,
-            num_speakers=num_speakers,
-            **overrides,
-        )
+    """Create GuBERT model from config name with overrides."""
+    if config_name not in GUBERT_CONFIGS:
+        config_name = "small"
+    return GuBERTEncoder.from_config(
+        config_name,
+        num_speakers=num_speakers,
+        vocab_size=vocab_size,
+        **overrides,
+    )
 
 
 # ============================================================================
@@ -1694,18 +1488,12 @@ def main():
     for i in range(0, len(unk), 2):
         unk_dict[unk[i].lstrip("-")] = unk[i + 1]
 
-    # Training mode
-    mode = unk_dict.get("mode", "ctc")
-    if mode not in ["ctc", "masked"]:
-        raise ValueError(f"Unknown mode: {mode}. Must be 'ctc' or 'masked'.")
-
     # Dataset settings
-    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/gubert_train")
-    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/gubert_val")
+    train_cache_dir = unk_dict.get("train_cache_dir", "./cached_datasets/gubert_ctc_train")
+    val_cache_dir = unk_dict.get("val_cache_dir", "./cached_datasets/gubert_ctc_val")
 
     # Model settings
-    configs = GUBERT_CONFIGS if mode == "ctc" else MASKED_GUBERT_CONFIGS
-    config_name = args.config if args.config in configs else "small"
+    config_name = args.config if args.config in GUBERT_CONFIGS else "small"
 
     # Audio settings
     n_mels = int(unk_dict.get("n_mels", 80))
@@ -1715,33 +1503,32 @@ def main():
     grl_warmup_steps = int(unk_dict.get("grl_warmup_steps", 5000))
     grl_max_alpha = float(unk_dict.get("grl_max_alpha", 1.0))
     grl_weight = float(unk_dict.get("grl_weight", 0.1))
+    grl_start_step = int(unk_dict.get("grl_start_step", 0))  # Pre-training phase before GRL kicks in
+    grl_lr_str = unk_dict.get("grl_lr", None)  # Separate LR for speaker classifier
+    grl_lr = float(grl_lr_str) if grl_lr_str is not None else None
+    speaker_pooling = unk_dict.get("speaker_pooling", "attentive_statistics")  # Pooling strategy for speaker classifier
 
     # CTC-specific settings
     ctc_weight = float(unk_dict.get("ctc_weight", 1.0))
-
-    # Masked-specific settings
-    masked_weight = float(unk_dict.get("masked_weight", 1.0))
-    use_vq = unk_dict.get("use_vq", "false").lower() in ("true", "1", "yes")
-    commitment_weight = float(unk_dict.get("commitment_weight", 0.25))
-    codebook_weight = float(unk_dict.get("codebook_weight", 1.0))
-    num_codebooks = int(unk_dict.get("num_codebooks", 2))
-    codebook_size = int(unk_dict.get("codebook_size", 320))
-
-    # Feature variance regularization (for VAE-friendly features)
-    use_variance_reg = unk_dict.get("use_variance_reg", "false").lower() in ("true", "1", "yes")
-    variance_weight = float(unk_dict.get("variance_weight", 1.0))
-    temporal_var_weight = float(unk_dict.get("temporal_var_weight", 0.01))
-    temporal_var_min = float(unk_dict.get("temporal_var_min", 0.1))
-    dim_var_weight = float(unk_dict.get("dim_var_weight", 0.01))
-    dim_var_min = float(unk_dict.get("dim_var_min", 0.1))
-    temporal_smoothness_weight = float(unk_dict.get("temporal_smoothness_weight", 0.1))
-    temporal_smoothness_max = float(unk_dict.get("temporal_smoothness_max", 0.95))
 
     # Dropout settings for regularization (helps prevent memorization)
     conv_dropout = float(unk_dict.get("conv_dropout", 0.05))  # Dropout1d in conv frontend
     feature_dropout = float(unk_dict.get("feature_dropout", 0.0))
     head_dropout = float(unk_dict.get("head_dropout", 0.0))
     attention_head_drop = float(unk_dict.get("attention_head_drop", 0.0))  # DropHead on attention
+
+    # Architectural options
+    use_rotary_embedding = unk_dict.get("use_rotary_embedding", "false").lower() in ("true", "1", "yes")
+    use_conformer_conv = unk_dict.get("use_conformer_conv", "false").lower() in ("true", "1", "yes")
+    conformer_kernel_size = int(unk_dict.get("conformer_kernel_size", 31))
+    use_macaron = unk_dict.get("use_macaron", "false").lower() in ("true", "1", "yes")
+    activation = unk_dict.get("activation", "gelu")  # "gelu" or "swiglu"
+
+    # Speaker normalization (strips speaker-specific statistics)
+    # Instance norm normalizes each sample across time, removing per-utterance mean/variance
+    # This is more direct than GRL for speaker removal
+    use_instance_norm = unk_dict.get("use_instance_norm", "false").lower() in ("true", "1", "yes")
+    instance_norm_affine = unk_dict.get("instance_norm_affine", "false").lower() in ("true", "1", "yes")
 
     # Data augmentation settings (prevents memorization)
     use_augmentation = unk_dict.get("use_augmentation", "false").lower() in ("true", "1", "yes")
@@ -1766,43 +1553,67 @@ def main():
     # Sync visualization with eval (run visualizations alongside eval instead of at fixed steps)
     sync_viz_with_eval = unk_dict.get("sync_viz_with_eval", "false").lower() in ("true", "1", "yes")
 
+    # CTC upsampling (relaxes CTC length constraint without increasing transformer cost)
+    ctc_upsample_factor = int(unk_dict.get("ctc_upsample_factor", 1))
+
+    # Vocoder settings (for audio generation in TensorBoard)
+    vocoder_checkpoint_path = unk_dict.get("vocoder_checkpoint_path", None)
+    vocoder_config = unk_dict.get("vocoder_config", "tiny_attention_freq_domain_vocoder")
+    audio_sample_rate = int(unk_dict.get("audio_sample_rate", 16000))
+    audio_n_fft = int(unk_dict.get("audio_n_fft", 1024))
+    audio_hop_length = int(unk_dict.get("audio_hop_length", 256))
+    num_audio_samples = int(unk_dict.get("num_audio_samples", 4))
+
+    # LM decoder settings (for CTC mode - beam search with optional language model)
+    kenlm_model_path = unk_dict.get("kenlm_model_path", "./pretrained_models/KenLM-4-gram/4-gram.arpa")
+    lm_alpha = float(unk_dict.get("lm_alpha", 0.5))  # LM weight
+    lm_beta = float(unk_dict.get("lm_beta", 1.0))    # Word insertion bonus
+    beam_width = int(unk_dict.get("beam_width", 100))
+
     # Max samples (for testing)
     max_train_samples = int(unk_dict.get("max_train_samples", 0)) or None
     max_val_samples = int(unk_dict.get("max_val_samples", 0)) or None
 
     print(f"GuBERT Pretraining")
     print(f"==================")
-    print(f"Mode: {mode.upper()}")
     print(f"Config: {config_name}")
     print(f"Run dir: {run_dir}")
     print(f"Train cache: {train_cache_dir}")
     print(f"Val cache: {val_cache_dir}")
-    if use_variance_reg:
-        print(f"Variance regularization: ENABLED")
-        print(f"  variance_weight: {variance_weight}")
-        print(f"  temporal_var_weight: {temporal_var_weight}, min: {temporal_var_min}")
-        print(f"  dim_var_weight: {dim_var_weight}, min: {dim_var_min}")
-        print(f"  temporal_smoothness_weight: {temporal_smoothness_weight}, max: {temporal_smoothness_max}")
+    if ctc_upsample_factor > 1:
+        print(f"CTC upsampling: ENABLED")
+        print(f"  ctc_upsample_factor: {ctc_upsample_factor} ({ctc_upsample_factor}x more CTC frames)")
     if conv_dropout > 0 or feature_dropout > 0 or head_dropout > 0 or attention_head_drop > 0:
         print(f"Dropout regularization: ENABLED")
         print(f"  conv_dropout: {conv_dropout} (Dropout1d in conv frontend)")
         print(f"  feature_dropout: {feature_dropout}")
         print(f"  head_dropout: {head_dropout} (prediction head)")
         print(f"  attention_head_drop: {attention_head_drop} (DropHead on attention)")
-    if use_vq:
-        print(f"VQ mode: ENABLED (discrete codebook targets)")
-        print(f"  num_codebooks: {num_codebooks}")
-        print(f"  codebook_size: {codebook_size}")
-        print(f"  commitment_weight: {commitment_weight}")
-        print(f"  codebook_weight: {codebook_weight}")
-    else:
-        print(f"Regression mode: ENABLED (continuous targets)")
+    if use_rotary_embedding or use_conformer_conv or activation != "gelu":
+        print(f"Architectural options:")
+        if use_rotary_embedding:
+            print(f"  RoPE: ENABLED (rotary position embeddings)")
+        if use_conformer_conv:
+            print(f"  Conformer conv: ENABLED (kernel_size={conformer_kernel_size})")
+        if activation != "gelu":
+            print(f"  Activation: {activation}")
     if use_augmentation:
         print(f"Data augmentation: ENABLED")
         print(f"  noise: prob={aug_noise_prob}, std=[{aug_noise_std_min}, {aug_noise_std_max}]")
         print(f"  gain: prob={aug_gain_prob}, range=[{aug_gain_min}, {aug_gain_max}]")
         print(f"  freq_shift: prob={aug_freq_shift_prob}, max_bins={aug_freq_shift_max}")
         print(f"  time_warp: prob={aug_time_warp_prob}, range=[{aug_time_warp_min}, {aug_time_warp_max}]")
+    if vocoder_checkpoint_path:
+        print(f"Vocoder (for audio visualization): {vocoder_config}")
+        print(f"  checkpoint: {vocoder_checkpoint_path}")
+        print(f"  sample_rate: {audio_sample_rate}, n_fft: {audio_n_fft}, hop_length: {audio_hop_length}")
+        print(f"  num_audio_samples: {num_audio_samples}")
+    print(f"CTC decoding: beam_width={beam_width}")
+    if kenlm_model_path:
+        print(f"  LM: {kenlm_model_path}")
+        print(f"  alpha={lm_alpha}, beta={lm_beta}")
+    else:
+        print(f"  No language model (greedy fallback or beam search without LM)")
     print(f"")
 
     # Create augmentation for training (if enabled)
@@ -1822,82 +1633,55 @@ def main():
     # Load datasets
     print("Loading datasets...")
     # Train dataset gets augmentation; val dataset does not
-    train_dataset = GuBERTShardedDataset(train_cache_dir, max_samples=max_train_samples, mode=mode, augmentation=augmentation)
-    val_dataset = GuBERTShardedDataset(val_cache_dir, max_samples=max_val_samples, mode=mode)
+    train_dataset = GuBERTShardedDataset(train_cache_dir, max_samples=max_train_samples, mode="ctc", augmentation=augmentation)
+    val_dataset = GuBERTShardedDataset(val_cache_dir, max_samples=max_val_samples, mode="ctc")
 
     print(f"  Train samples: {len(train_dataset):,}")
     print(f"  Val samples: {len(val_dataset):,}")
     print(f"  Num speakers: {train_dataset.num_speakers}")
-    if mode == "ctc":
-        print(f"  Vocab size: {train_dataset.vocab.vocab_size}")
+    print(f"  Vocab size: {train_dataset.vocab.vocab_size}")
     print(f"")
 
     # Create model
     print(f"Creating model ({config_name})...")
-    if mode == "ctc":
-        model = create_model(
-            config_name=config_name,
-            num_speakers=train_dataset.num_speakers,
-            mode=mode,
-            vocab_size=train_dataset.vocab.vocab_size,
-            n_mels=n_mels,
-        )
-    else:
-        model = create_model(
-            config_name=config_name,
-            num_speakers=train_dataset.num_speakers,
-            mode=mode,
-            n_mels=n_mels,
-            # VQ mode settings
-            use_vq=use_vq,
-            num_codebooks=num_codebooks,
-            codebook_size=codebook_size,
-            commitment_weight=commitment_weight,
-            # Dropout regularization (helps prevent memorization)
-            conv_dropout=conv_dropout,  # Dropout1d in conv frontend
-            feature_dropout=feature_dropout,
-            head_dropout=head_dropout,
-            attention_head_drop=attention_head_drop,  # DropHead on attention
-            # Variance regularization for VAE-friendly features
-            use_variance_reg=use_variance_reg,
-            temporal_var_weight=temporal_var_weight,
-            temporal_var_min=temporal_var_min,
-            dim_var_weight=dim_var_weight,
-            dim_var_min=dim_var_min,
-            temporal_smoothness_weight=temporal_smoothness_weight,
-            temporal_smoothness_max=temporal_smoothness_max,
-        )
+    model = create_model(
+        config_name=config_name,
+        num_speakers=train_dataset.num_speakers,
+        vocab_size=train_dataset.vocab.vocab_size,
+        n_mels=n_mels,
+        # CTC upsampling (relaxes CTC length constraint)
+        ctc_upsample_factor=ctc_upsample_factor,
+        # Dropout regularization
+        conv_dropout=conv_dropout,
+        feature_dropout=feature_dropout,
+        head_dropout=head_dropout,
+        attention_head_drop=attention_head_drop,
+        # Architectural options
+        use_rotary_embedding=use_rotary_embedding,
+        use_conformer_conv=use_conformer_conv,
+        conformer_kernel_size=conformer_kernel_size,
+        use_macaron=use_macaron,
+        activation=activation,
+        # Speaker normalization (strips speaker statistics)
+        use_instance_norm=use_instance_norm,
+        instance_norm_affine=instance_norm_affine,
+        # Speaker classifier pooling strategy
+        speaker_pooling=speaker_pooling,
+    )
 
     num_params = model.get_num_params()
     print(f"Model: {model}")
     print(f"Total Parameters: {num_params:,}")
 
-    # Debug: show actual config values to verify CLI overrides are applied
-    if mode == "masked":
-        cfg = model.config
-        print(f"\nModel config (verify CLI overrides):")
-        print(f"  use_vq: {cfg.use_vq}")
-        print(f"  num_codebooks: {cfg.num_codebooks}")
-        print(f"  codebook_size: {cfg.codebook_size}")
-        print(f"  codebook_dim: {cfg.codebook_dim}")
-        print(f"  commitment_weight: {cfg.commitment_weight}")
-        print(f"  conv_dropout: {cfg.conv_dropout}")
-        print(f"  feature_dropout: {cfg.feature_dropout}")
-        print(f"  head_dropout: {cfg.head_dropout}")
-        print(f"  attention_head_drop: {cfg.attention_head_drop}")
-        print(f"  encoder_dim: {cfg.encoder_dim}")
-        print(f"  Note: pre_quantize_proj is Identity when encoder_dim == num_codebooks * codebook_dim")
-        print(f"        ({cfg.encoder_dim} == {cfg.num_codebooks} * {cfg.codebook_dim} = {cfg.num_codebooks * cfg.codebook_dim})")
-
     conv_upsample_params = sum(p.numel() for p in model.conv_subsample.parameters())
     encoder_blocks_params = sum(p.numel() for p in model.encoder_blocks.parameters())
     final_norm_params = sum(p.numel() for p in model.final_norm.parameters())
-    prediction_head_params = sum(p.numel() for p in model.prediction_head.parameters())
-    print(f"GuBERT Parameters: {conv_upsample_params + encoder_blocks_params + final_norm_params + prediction_head_params:,}")
+    head_params = sum(p.numel() for p in model.asr_head.parameters())
+    print(f"GuBERT Parameters: {conv_upsample_params + encoder_blocks_params + final_norm_params + head_params:,}")
     print(f"GRL Parameters: {sum(p.numel() for p in model.speaker_classifier.parameters()):,}")
 
     # Create data collator
-    collator = GuBERTDataCollator(n_mels=n_mels, max_mel_frames=max_mel_frames, mode=mode)
+    collator = GuBERTDataCollator(n_mels=n_mels, max_mel_frames=max_mel_frames, mode="ctc")
 
     # Create GRL scheduler
     grl_scheduler = GRLAlphaScheduler(
@@ -1930,7 +1714,7 @@ def main():
         load_best_model_at_end=False,
         fp16=args.fp16,
         bf16=args.bf16,
-        report_to=["tensorboard"],
+        report_to="tensorboard",
         max_grad_norm=args.max_grad_norm,
         deepspeed=args.deepspeed_config if args.use_deepspeed else None,
         gradient_checkpointing=args.use_gradient_checkpointing,
@@ -1944,82 +1728,66 @@ def main():
     # Create callbacks
     callbacks = []
 
-    # Visualization callbacks
-    if mode == "ctc":
-        viz_callback = GuBERTVisualizationCallback(
-            eval_dataset=val_dataset,
-            vocab=train_dataset.vocab,
-            visualization_steps=visualization_steps,
-        )
-        callbacks.append(viz_callback)
-    else:  # masked mode
-        viz_callback = MaskedGuBERTVisualizationCallback(
-            eval_dataset=val_dataset,
-            visualization_steps=visualization_steps,
-            sync_with_eval=sync_viz_with_eval,
-        )
-        callbacks.append(viz_callback)
+    # Visualization callback
+    viz_callback = GuBERTVisualizationCallback(
+        eval_dataset=val_dataset,
+        vocab=train_dataset.vocab,
+        visualization_steps=visualization_steps,
+        sync_with_eval=sync_viz_with_eval,
+        audio_sample_rate=audio_sample_rate,
+        audio_n_fft=audio_n_fft,
+        audio_hop_length=audio_hop_length,
+        vocoder_checkpoint_path=vocoder_checkpoint_path,
+        vocoder_config=vocoder_config,
+        num_audio_samples=num_audio_samples,
+        # LM decoder settings
+        kenlm_model_path=kenlm_model_path,
+        lm_alpha=lm_alpha,
+        lm_beta=lm_beta,
+        beam_width=beam_width,
+    )
+    callbacks.append(viz_callback)
 
     # Build command line string for logging
     import sys
     cmdline = " ".join(sys.argv)
 
-    # Create trainer based on mode
+    # Create trainer
     step_offset = args.start_step or 0
-    if mode == "ctc":
-        trainer = GuBERTTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            data_collator=collator,
-            vocab=train_dataset.vocab,
-            grl_alpha_scheduler=grl_scheduler,
-            ctc_weight=ctc_weight,
-            grl_weight=grl_weight,
-            callbacks=callbacks,
-            cmdline=cmdline,
-            git_commit_hash=args.commit_hash or "",
-            step_offset=step_offset,
-        )
-    else:  # masked mode
-        trainer = MaskedGuBERTTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            data_collator=collator,
-            grl_alpha_scheduler=grl_scheduler,
-            masked_weight=masked_weight,
-            grl_weight=grl_weight,
-            commitment_weight=commitment_weight,
-            codebook_weight=codebook_weight,
-            variance_weight=variance_weight,
-            callbacks=callbacks,
-            cmdline=cmdline,
-            git_commit_hash=args.commit_hash or "",
-            step_offset=step_offset,
-        )
+    trainer = GuBERTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=collator,
+        vocab=train_dataset.vocab,
+        grl_alpha_scheduler=grl_scheduler,
+        ctc_weight=ctc_weight,
+        grl_weight=grl_weight,
+        grl_start_step=grl_start_step,
+        grl_lr=grl_lr,
+        callbacks=callbacks,
+        cmdline=cmdline,
+        git_commit_hash=args.commit_hash or "",
+        step_offset=step_offset,
+    )
 
     # Set trainer reference for visualization callback
     viz_callback.trainer = trainer
 
     # Log configuration
     print("Training configuration:")
-    print(f"  Mode: {mode}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
     print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
     print(f"  Learning rate: {args.learning_rate}")
-    if mode == "ctc":
-        print(f"  CTC weight: {ctc_weight}")
-    else:
-        print(f"  Masked weight: {masked_weight}")
-        print(f"  Commitment weight: {commitment_weight}")
-        print(f"  Codebook weight: {codebook_weight}")
+    print(f"  CTC weight: {ctc_weight}")
     print(f"  GRL weight: {grl_weight}")
     print(f"  GRL warmup steps: {grl_warmup_steps}")
     print(f"  GRL max alpha: {grl_max_alpha}")
+    print(f"  GRL start step: {grl_start_step}" + (" (pre-training phase)" if grl_start_step > 0 else ""))
+    print(f"  GRL LR: {grl_lr if grl_lr is not None else 'same as base LR'}")
+    print(f"  Speaker pooling: {speaker_pooling}")
     print(f"")
 
     # Train
@@ -2032,28 +1800,23 @@ def main():
 
     # Save config
     config_out = {
-        "mode": mode,
         "config_name": config_name,
         "model_config": model.config.__dict__,
         "num_speakers": train_dataset.num_speakers,
+        "vocab_size": train_dataset.vocab.vocab_size,
+        "ctc_weight": ctc_weight,
         "grl_weight": grl_weight,
         "grl_warmup_steps": grl_warmup_steps,
         "grl_max_alpha": grl_max_alpha,
+        "grl_start_step": grl_start_step,
+        "grl_lr": grl_lr,
+        "speaker_pooling": speaker_pooling,
     }
-
-    if mode == "ctc":
-        config_out["vocab_size"] = train_dataset.vocab.vocab_size
-        config_out["ctc_weight"] = ctc_weight
-    else:
-        config_out["masked_weight"] = masked_weight
-        config_out["commitment_weight"] = commitment_weight
-        config_out["codebook_weight"] = codebook_weight
 
     with open(os.path.join(run_dir, "training_config.json"), "w") as f:
         json.dump(config_out, f, indent=2, default=str)
 
     print(f"\nTraining complete!")
-    print(f"Mode: {mode.upper()}")
     print(f"Model saved to: {final_path}")
 
 

@@ -5,22 +5,28 @@ World Model Pretraining Script.
 Trains a multimodal autoregressive world model on preprocessed sharded datasets
 containing text, audio, voice, and image modalities.
 
+Supports multiple datasets with modality-synchronized sampling for distributed training:
+- Multiple datasets can be specified, each with different modalities (text, text_audio, text_image)
+- Batches are modality-synchronized across all ranks (all GPUs sample the same modality per batch)
+- Weighted sampling across modalities and datasets is supported
+
 Usage:
-    # Single GPU
+    # Single GPU with single dataset
     python pretrain_world_model.py \
         --run_name my_world_model \
         --config tiny \
-        --data_dir cached_datasets/world_model \
+        --train_datasets cached_datasets/world_model/text_only \
         --batch_size 8 \
         --learning_rate 1e-4
 
-    # Multi-GPU with DeepSpeed
+    # Multi-GPU with multiple datasets
     deepspeed --num_gpus=4 pretrain_world_model.py \
         --use_deepspeed \
         --bf16 \
         --run_name my_world_model \
         --config small \
-        --data_dir cached_datasets/world_model \
+        --train_datasets cached_datasets/world_model/text_only,cached_datasets/world_model/text_audio,cached_datasets/world_model/text_image \
+        --modality_weights text=1.0,text_audio=2.0,text_image=1.5 \
         --batch_size 8 \
         --learning_rate 1e-4 \
         --gradient_accumulation_steps 4 \
@@ -59,7 +65,12 @@ from model.world.world_model import (
     small_world_model_config,
     medium_world_model_config,
 )
-from shard_utils import WorldModelShardedDataset, WorldModelDataCollator
+from shard_utils import (
+    WorldModelShardedDataset,
+    WorldModelDataCollator,
+    MultiModalWorldModelDataset,
+    ModalitySyncedSampler,
+)
 from utils.training_utils import EarlyStoppingCallback
 
 logging.basicConfig(level=logging.INFO)
@@ -588,6 +599,61 @@ class WorldModelTrainer(Trainer):
         self._current_losses = {}
         self._current_metrics = {}
 
+        # Store sampler reference for get_train_dataloader
+        self._modality_synced_sampler = None
+
+    def get_train_dataloader(self):
+        """
+        Override to use ModalitySyncedSampler for modality-synchronized batches.
+
+        In distributed training, this ensures all ranks sample from the same
+        modality for each batch, which is necessary for correct gradient aggregation
+        when different modalities have different loss characteristics.
+        """
+        from torch.utils.data import DataLoader
+
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        train_dataset = self.train_dataset
+
+        # Check if this is a MultiModalWorldModelDataset
+        if isinstance(train_dataset, MultiModalWorldModelDataset):
+            # Get distributed info
+            if self.args.world_size > 1:
+                world_size = self.args.world_size
+                rank = self.args.process_index
+            else:
+                world_size = 1
+                rank = 0
+
+            # Create ModalitySyncedSampler
+            self._modality_synced_sampler = ModalitySyncedSampler(
+                dataset=train_dataset,
+                batch_size=self.args.per_device_train_batch_size,
+                shuffle=True,
+                seed=self.args.seed if self.args.seed is not None else 42,
+                drop_last=True,
+                world_size=world_size,
+                rank=rank,
+            )
+
+            logger.info(f"Using ModalitySyncedSampler for multi-dataset training")
+            logger.info(f"  World size: {world_size}, Rank: {rank}")
+            logger.info(f"  Batch size: {self.args.per_device_train_batch_size}")
+            logger.info(f"  Total batches per epoch: {len(self._modality_synced_sampler)}")
+
+            return DataLoader(
+                train_dataset,
+                batch_sampler=self._modality_synced_sampler,
+                collate_fn=self.data_collator,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
+        else:
+            # Fall back to default behavior for regular datasets
+            return super().get_train_dataloader()
+
     def _get_audio_vae_decoder(self, device: str):
         """Lazy load audio VAE decoder (no speaker conditioning)."""
         if self._audio_vae_decoder is None and self.audio_vae_checkpoint:
@@ -1081,6 +1147,30 @@ def get_config_by_name(name: str) -> MegatransformerWorldModelConfig:
     return configs[name]
 
 
+def parse_weights_string(weights_str: Optional[str]) -> Optional[Dict[str, float]]:
+    """
+    Parse a weights string into a dictionary.
+
+    Args:
+        weights_str: String like "text=1.0,text_audio=2.0" or None
+
+    Returns:
+        Dictionary mapping keys to float weights, or None if input is None
+    """
+    if weights_str is None:
+        return None
+
+    weights = {}
+    for item in weights_str.split(","):
+        item = item.strip()
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        weights[key.strip()] = float(value.strip())
+
+    return weights if weights else None
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -1092,17 +1182,28 @@ def main():
 
     # Required arguments
     parser.add_argument("--run_name", type=str, required=True, help="Name of the training run")
-    parser.add_argument("--data_dir", type=str, required=True,
-                        help="Directory containing preprocessed world model shards")
+    parser.add_argument("--train_datasets", type=str, required=True,
+                        help="Comma-separated paths to preprocessed world model dataset directories. "
+                             "Each directory should have a config.json with a 'modality' field. "
+                             "Example: cached_datasets/wm/text,cached_datasets/wm/text_audio,cached_datasets/wm/text_image")
 
     # Model configuration
     parser.add_argument("--config", type=str, default="tiny",
                         choices=["tiny", "small", "medium"],
                         help="Model configuration to use")
 
+    # Multi-dataset sampling weights
+    parser.add_argument("--modality_weights", type=str, default=None,
+                        help="Weights for sampling each modality. Format: modality=weight,modality=weight. "
+                             "Example: text=1.0,text_audio=2.0,text_image=1.5. "
+                             "Defaults to uniform weighting across modalities.")
+    parser.add_argument("--dataset_weights", type=str, default=None,
+                        help="Weights for sampling each dataset. Format: dataset_path=weight,dataset_path=weight. "
+                             "Can use partial paths for matching. Defaults to uniform weighting within modality.")
+
     # Optional data arguments
     parser.add_argument("--eval_data_dir", type=str, default=None,
-                        help="Directory for evaluation shards (optional)")
+                        help="Directory for evaluation shards (optional, uses single dataset for eval)")
 
     # Training hyperparameters
     parser.add_argument("--num_train_epoch", type=int, default=10, help="Number of training epochs")
@@ -1226,13 +1327,33 @@ def main():
     # -------------------------------------------------------------------------
     # Dataset
     # -------------------------------------------------------------------------
-    logger.info(f"Loading dataset from {args.data_dir}...")
-    train_dataset = WorldModelShardedDataset(
-        shard_dir=args.data_dir,
+    # Parse comma-separated dataset paths
+    dataset_paths = [p.strip() for p in args.train_datasets.split(",") if p.strip()]
+    logger.info(f"Loading {len(dataset_paths)} datasets: {dataset_paths}")
+
+    # Parse modality and dataset weights
+    modality_weights = parse_weights_string(args.modality_weights)
+    dataset_weights = parse_weights_string(args.dataset_weights)
+
+    if modality_weights:
+        logger.info(f"Modality weights: {modality_weights}")
+    if dataset_weights:
+        logger.info(f"Dataset weights: {dataset_weights}")
+
+    # Create multi-dataset for training
+    train_dataset = MultiModalWorldModelDataset(
+        dataset_dirs=dataset_paths,
+        modality_weights=modality_weights,
+        dataset_weights=dataset_weights,
         cache_size=3,
     )
     logger.info(f"Training samples: {len(train_dataset):,}")
+    logger.info(f"Modalities found: {list(train_dataset.modality_datasets.keys())}")
+    for modality, datasets in train_dataset.modality_datasets.items():
+        total = sum(len(d) for d in datasets)
+        logger.info(f"  {modality}: {len(datasets)} dataset(s), {total:,} samples")
 
+    # Evaluation dataset (simpler, single dataset)
     eval_dataset = None
     if args.eval_data_dir:
         eval_dataset = WorldModelShardedDataset(
@@ -1364,7 +1485,9 @@ def main():
     with open(config_path, "w") as f:
         json.dump({
             "config_name": args.config,
-            "data_dir": args.data_dir,
+            "train_datasets": dataset_paths,
+            "modality_weights": modality_weights,
+            "dataset_weights": dataset_weights,
             "text_loss_weight": args.text_loss_weight,
             "audio_loss_weight": args.audio_loss_weight,
             "voice_loss_weight": args.voice_loss_weight,

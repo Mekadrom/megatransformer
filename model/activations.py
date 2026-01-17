@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 
 class SwiGLU(nn.Module):
+    """SwiGLU with internal projection back to input dim (legacy)."""
     def __init__(self, d_in):
         super(SwiGLU, self).__init__()
 
@@ -14,6 +15,16 @@ class SwiGLU(nn.Module):
         x = F.silu(gate) * x
         x = self.cast(x)
         return x
+
+
+class SwiGLUSimple(nn.Module):
+    """SwiGLU gating only - halves the dimension. Use with external projection."""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, gate = x.chunk(2, dim=-1)
+        return F.silu(gate) * x
 
 class Snake(nn.Module):
     """

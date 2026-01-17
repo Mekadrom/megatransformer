@@ -201,6 +201,12 @@ def main():
                         help="Minimum audio std (skip near-silent samples)")
     parser.add_argument("--min_text_length", type=int, default=2,
                         help="Minimum text length (skip very short transcriptions)")
+    parser.add_argument("--conv_subsample_factor", type=int, default=4,
+                        help="Conv subsampling factor (mel_frames // factor = feature_frames). "
+                             "Used to filter samples where text is too long for CTC.")
+    parser.add_argument("--ctc_upsample_factor", type=int, default=1,
+                        help="CTC upsample factor (feature_frames * factor = ctc_frames). "
+                             "Matches GuBERTConfig.ctc_upsample_factor for filtering.")
     parser.add_argument("--remove_mains_hum", action="store_true", default=True,
                         help="Remove 50/60Hz mains hum from audio")
     parser.add_argument("--no_remove_mains_hum", action="store_false",
@@ -266,6 +272,7 @@ def main():
         "saved": 0,
         "skipped_silent": 0,
         "skipped_short_text": 0,
+        "skipped_ctc_too_long": 0,  # Text longer than feature frames (CTC constraint)
         "skipped_no_speaker": 0,
         "skipped_error": 0,
     }
@@ -414,6 +421,20 @@ def main():
                 pbar.update(1)
                 continue
 
+            # CTC length constraint: ctc_frames >= text_length
+            # ctc_frames = feature_frames * ctc_upsample_factor
+            # feature_frames = ceil(mel_frames / conv_subsample_factor)
+            # mel_frames = waveform_samples // hop_length
+            # Use ceiling division to match ConvSubsampling.get_output_length()
+            if args.mode == "ctc":
+                mel_frames = len(waveform) // args.hop_length
+                feature_frames = (mel_frames + args.conv_subsample_factor - 1) // args.conv_subsample_factor
+                ctc_frames = feature_frames * args.ctc_upsample_factor
+                if ctc_frames < len(text):
+                    stats["skipped_ctc_too_long"] += 1
+                    pbar.update(1)
+                    continue
+
             # Get speaker ID
             original_speaker_id = example.get(args.speaker_id_column, None)
             if original_speaker_id is None:
@@ -502,6 +523,7 @@ def main():
     print(f"  Skipped (silent): {stats['skipped_silent']:,}")
     if args.mode == "ctc":
         print(f"  Skipped (short text): {stats['skipped_short_text']:,}")
+        print(f"  Skipped (CTC too long): {stats['skipped_ctc_too_long']:,}")
     print(f"  Skipped (no speaker): {stats['skipped_no_speaker']:,}")
     print(f"  Skipped (error): {stats['skipped_error']:,}")
     print(f"  Time: {elapsed/60:.1f} minutes")

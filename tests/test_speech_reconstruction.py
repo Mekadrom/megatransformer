@@ -31,7 +31,14 @@ from model.audio.speech_reconstruction import (
     SPEAKER_ENCODER_CONFIGS,
     MEL_RECONSTRUCTOR_CONFIGS,
     create_speech_reconstruction_model,
+    GE2ELoss,
 )
+
+# Import GE2ESampler from pretrain script
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pretrain_speech_reconstruction import GE2ESampler
 
 
 class TestConfigs:
@@ -758,6 +765,331 @@ class TestParameterCount:
 
         # Total should be at least the sum of components
         assert total >= speaker_params + recon_params
+
+
+class TestGE2ESampler:
+    """Test GE2E batch sampler for structured N×M batching."""
+
+    def _create_mock_speaker_indices(self, num_speakers: int, utterances_per_speaker: int):
+        """Create mock speaker-to-indices mapping."""
+        speaker_to_indices = {}
+        idx = 0
+        for spk in range(num_speakers):
+            speaker_to_indices[spk] = list(range(idx, idx + utterances_per_speaker))
+            idx += utterances_per_speaker
+        return speaker_to_indices
+
+    def test_basic_sampling(self):
+        """Test basic batch structure from GE2E sampler."""
+        speaker_to_indices = self._create_mock_speaker_indices(10, 10)
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=4,
+            n_utterances=3,
+            shuffle=False,
+        )
+
+        # Get first batch worth of indices
+        indices = list(sampler)[:12]  # 4 * 3 = 12
+
+        assert len(indices) == 12
+
+    def test_batch_size_is_n_times_m(self):
+        """Test that total samples is multiple of N×M."""
+        speaker_to_indices = self._create_mock_speaker_indices(10, 10)
+
+        n_speakers = 4
+        n_utterances = 3
+        batch_size = n_speakers * n_utterances
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=n_speakers,
+            n_utterances=n_utterances,
+            shuffle=False,
+        )
+
+        total_samples = len(sampler)
+        assert total_samples % batch_size == 0
+
+    def test_utterances_grouped_by_speaker(self):
+        """Test that utterances from same speaker are grouped together."""
+        # Create speaker indices with known structure
+        speaker_to_indices = {
+            0: [0, 1, 2, 3, 4],
+            1: [5, 6, 7, 8, 9],
+            2: [10, 11, 12, 13, 14],
+            3: [15, 16, 17, 18, 19],
+        }
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=2,
+            n_utterances=3,
+            shuffle=False,  # Deterministic for testing
+        )
+
+        # Get first batch
+        indices = list(sampler)[:6]  # 2 * 3 = 6
+
+        # First 3 indices should be from same speaker
+        spk0_indices = set(speaker_to_indices[0])
+        spk1_indices = set(speaker_to_indices[1])
+        spk2_indices = set(speaker_to_indices[2])
+        spk3_indices = set(speaker_to_indices[3])
+
+        first_group = set(indices[:3])
+        second_group = set(indices[3:6])
+
+        # Each group should be from a single speaker
+        assert (first_group.issubset(spk0_indices) or
+                first_group.issubset(spk1_indices) or
+                first_group.issubset(spk2_indices) or
+                first_group.issubset(spk3_indices))
+
+        assert (second_group.issubset(spk0_indices) or
+                second_group.issubset(spk1_indices) or
+                second_group.issubset(spk2_indices) or
+                second_group.issubset(spk3_indices))
+
+    def test_filters_speakers_with_insufficient_utterances(self):
+        """Test that speakers with < M utterances are filtered out."""
+        speaker_to_indices = {
+            0: [0, 1, 2, 3, 4],  # 5 utterances (enough)
+            1: [5, 6],           # 2 utterances (not enough for M=3)
+            2: [7, 8, 9, 10],    # 4 utterances (enough)
+            3: [11],             # 1 utterance (not enough)
+        }
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=2,
+            n_utterances=3,
+            shuffle=False,
+        )
+
+        # Only speakers 0 and 2 should be valid
+        assert len(sampler.valid_speakers) == 2
+        assert 0 in sampler.valid_speakers
+        assert 2 in sampler.valid_speakers
+        assert 1 not in sampler.valid_speakers
+        assert 3 not in sampler.valid_speakers
+
+    def test_raises_error_insufficient_speakers(self):
+        """Test that error is raised when not enough valid speakers."""
+        speaker_to_indices = {
+            0: [0, 1, 2],  # 3 utterances
+            1: [3, 4, 5],  # 3 utterances
+        }
+
+        with pytest.raises(ValueError, match="Not enough speakers"):
+            GE2ESampler(
+                speaker_to_indices=speaker_to_indices,
+                n_speakers=4,  # Need 4, only have 2
+                n_utterances=3,
+            )
+
+    def test_epoch_shuffling(self):
+        """Test that different epochs produce different orderings."""
+        speaker_to_indices = self._create_mock_speaker_indices(10, 10)
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=4,
+            n_utterances=3,
+            shuffle=True,
+            seed=42,
+        )
+
+        # Get first epoch
+        epoch1_indices = list(sampler)
+
+        # Set next epoch
+        sampler.set_epoch(1)
+        epoch2_indices = list(sampler)
+
+        # Should be different orderings
+        assert epoch1_indices != epoch2_indices
+
+    def test_deterministic_with_same_seed(self):
+        """Test that same seed produces same ordering."""
+        speaker_to_indices = self._create_mock_speaker_indices(10, 10)
+
+        sampler1 = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=4,
+            n_utterances=3,
+            shuffle=True,
+            seed=42,
+        )
+
+        sampler2 = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=4,
+            n_utterances=3,
+            shuffle=True,
+            seed=42,
+        )
+
+        indices1 = list(sampler1)
+        indices2 = list(sampler2)
+
+        assert indices1 == indices2
+
+    def test_custom_num_batches(self):
+        """Test specifying custom number of batches per epoch."""
+        speaker_to_indices = self._create_mock_speaker_indices(10, 10)
+
+        n_speakers = 4
+        n_utterances = 3
+        num_batches = 5
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=n_speakers,
+            n_utterances=n_utterances,
+            num_batches_per_epoch=num_batches,
+        )
+
+        expected_samples = num_batches * n_speakers * n_utterances
+        assert len(sampler) == expected_samples
+
+    def test_all_indices_are_valid(self):
+        """Test that all returned indices are valid sample indices."""
+        speaker_to_indices = self._create_mock_speaker_indices(10, 10)
+
+        all_valid_indices = set()
+        for indices in speaker_to_indices.values():
+            all_valid_indices.update(indices)
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=4,
+            n_utterances=3,
+        )
+
+        sampled_indices = list(sampler)
+
+        for idx in sampled_indices:
+            assert idx in all_valid_indices
+
+    def test_no_speaker_repeated_in_batch(self):
+        """Test that same speaker doesn't appear twice in one batch."""
+        speaker_to_indices = self._create_mock_speaker_indices(10, 10)
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=4,
+            n_utterances=3,
+            shuffle=False,
+        )
+
+        n_speakers = 4
+        n_utterances = 3
+        batch_size = n_speakers * n_utterances
+
+        indices = list(sampler)
+
+        # Check each batch
+        for batch_start in range(0, len(indices), batch_size):
+            batch = indices[batch_start:batch_start + batch_size]
+            if len(batch) < batch_size:
+                continue  # Skip incomplete batch
+
+            # Find which speaker each index belongs to
+            batch_speakers = []
+            for idx in batch:
+                for spk, spk_indices in speaker_to_indices.items():
+                    if idx in spk_indices:
+                        batch_speakers.append(spk)
+                        break
+
+            # Group by position (every n_utterances belongs to same speaker)
+            speakers_in_batch = set()
+            for i in range(n_speakers):
+                speaker_start = i * n_utterances
+                speaker_group = batch_speakers[speaker_start:speaker_start + n_utterances]
+                # All in group should be same speaker
+                assert len(set(speaker_group)) == 1
+                speakers_in_batch.add(speaker_group[0])
+
+            # Should have exactly n_speakers unique speakers
+            assert len(speakers_in_batch) == n_speakers
+
+
+class TestGE2ESamplerEdgeCases:
+    """Test edge cases for GE2E sampler."""
+
+    def test_minimum_valid_configuration(self):
+        """Test with minimum valid configuration (2 speakers, 2 utterances)."""
+        speaker_to_indices = {
+            0: [0, 1],
+            1: [2, 3],
+        }
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=2,
+            n_utterances=2,
+        )
+
+        indices = list(sampler)
+        assert len(indices) >= 4  # At least one batch
+
+    def test_many_speakers_few_utterances(self):
+        """Test with many speakers but few utterances each."""
+        speaker_to_indices = {i: [i * 2, i * 2 + 1] for i in range(20)}
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=8,
+            n_utterances=2,
+        )
+
+        indices = list(sampler)
+        assert len(indices) > 0
+
+    def test_few_speakers_many_utterances(self):
+        """Test with few speakers but many utterances each."""
+        speaker_to_indices = {
+            0: list(range(0, 50)),
+            1: list(range(50, 100)),
+            2: list(range(100, 150)),
+        }
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=2,
+            n_utterances=10,
+        )
+
+        indices = list(sampler)
+        assert len(indices) > 0
+
+    def test_unequal_speaker_counts(self):
+        """Test with speakers having very different utterance counts."""
+        speaker_to_indices = {
+            0: list(range(0, 100)),   # 100 utterances
+            1: list(range(100, 105)), # 5 utterances (valid, >= 4)
+            2: list(range(105, 120)), # 15 utterances
+            3: list(range(120, 123)), # 3 utterances (not enough for n_utterances=4)
+        }
+
+        sampler = GE2ESampler(
+            speaker_to_indices=speaker_to_indices,
+            n_speakers=2,
+            n_utterances=4,
+        )
+
+        # Should work - speakers 0, 1, 2 are valid (>= 4 utterances), speaker 3 is not
+        assert len(sampler.valid_speakers) == 3
+        assert 0 in sampler.valid_speakers
+        assert 1 in sampler.valid_speakers
+        assert 2 in sampler.valid_speakers
+        assert 3 not in sampler.valid_speakers
+        indices = list(sampler)
+        assert len(indices) > 0
 
 
 if __name__ == "__main__":

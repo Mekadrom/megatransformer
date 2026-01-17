@@ -2281,6 +2281,299 @@ class WorldModelDataCollator:
         return batch
 
 
+class MultiModalWorldModelDataset(Dataset):
+    """
+    Dataset for loading multiple world model datasets with modality-aware sampling.
+
+    Supports:
+    - Multiple datasets per modality (e.g., LibriSpeech + CommonVoice for text_audio)
+    - Weighted sampling across modalities
+    - Weighted sampling within modalities (by dataset size or custom weights)
+    - Epoch tracking per dataset
+
+    Each dataset directory should have a config.json with a 'modality' field.
+    """
+
+    def __init__(
+        self,
+        dataset_dirs: List[str],
+        modality_weights: Optional[Dict[str, float]] = None,
+        dataset_weights: Optional[Dict[str, float]] = None,
+        cache_size: int = 3,
+    ):
+        """
+        Args:
+            dataset_dirs: List of paths to dataset directories (each with shard_*.pt files)
+            modality_weights: Weights per modality (e.g., {"text_only": 0.2, "text_audio": 0.5, "text_image": 0.3})
+                              If None, weights are proportional to dataset sizes
+            dataset_weights: Weights per dataset path (overrides modality-based weighting within modality)
+                             If None, datasets within a modality are weighted by size
+            cache_size: Number of shards to keep in memory per dataset
+        """
+        self.dataset_dirs = dataset_dirs
+        self.cache_size = cache_size
+
+        # Load each dataset and group by modality
+        self.datasets: Dict[str, List[WorldModelShardedDataset]] = {}  # modality -> [datasets]
+        self.dataset_info: Dict[str, Dict] = {}  # path -> {modality, config, dataset}
+
+        print(f"Loading {len(dataset_dirs)} world model datasets...")
+
+        for dataset_dir in dataset_dirs:
+            # Load config to get modality
+            config_path = os.path.join(dataset_dir, "config.json")
+            if not os.path.exists(config_path):
+                # Try shard_index.json
+                config_path = os.path.join(dataset_dir, "shard_index.json")
+
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                modality = config.get("modality", "unknown")
+            else:
+                print(f"Warning: No config found for {dataset_dir}, skipping")
+                continue
+
+            # Load the dataset
+            try:
+                dataset = WorldModelShardedDataset(dataset_dir, cache_size=cache_size)
+            except Exception as e:
+                print(f"Warning: Failed to load {dataset_dir}: {e}")
+                continue
+
+            # Group by modality
+            if modality not in self.datasets:
+                self.datasets[modality] = []
+            self.datasets[modality].append(dataset)
+
+            # Store info
+            self.dataset_info[dataset_dir] = {
+                "modality": modality,
+                "config": config,
+                "dataset": dataset,
+                "size": len(dataset),
+            }
+
+            print(f"  {dataset_dir}: modality={modality}, samples={len(dataset):,}")
+
+        if not self.datasets:
+            raise ValueError("No valid datasets loaded")
+
+        # Compute modality weights
+        self.modalities = list(self.datasets.keys())
+        total_samples_per_modality = {
+            mod: sum(len(d) for d in datasets)
+            for mod, datasets in self.datasets.items()
+        }
+        self.total_samples = sum(total_samples_per_modality.values())
+
+        if modality_weights is not None:
+            # Normalize user-provided weights
+            total_weight = sum(modality_weights.get(m, 0) for m in self.modalities)
+            self.modality_weights = {
+                m: modality_weights.get(m, 0) / total_weight if total_weight > 0 else 0
+                for m in self.modalities
+            }
+        else:
+            # Weight by total samples per modality (even distribution across modalities)
+            self.modality_weights = {
+                m: 1.0 / len(self.modalities) for m in self.modalities
+            }
+
+        # Compute per-dataset weights within each modality
+        self.dataset_weights_per_modality: Dict[str, List[float]] = {}
+        for modality, datasets in self.datasets.items():
+            if dataset_weights is not None:
+                # Find weights for datasets in this modality
+                weights = []
+                for ds_info in self.dataset_info.values():
+                    if ds_info["modality"] == modality:
+                        ds_path = next(
+                            path for path, info in self.dataset_info.items()
+                            if info["dataset"] is ds_info["dataset"]
+                        )
+                        weights.append(dataset_weights.get(ds_path, len(ds_info["dataset"])))
+            else:
+                # Weight by dataset size within modality
+                weights = [len(d) for d in datasets]
+
+            # Normalize
+            total_weight = sum(weights)
+            self.dataset_weights_per_modality[modality] = [
+                w / total_weight if total_weight > 0 else 1.0 / len(weights)
+                for w in weights
+            ]
+
+        # Build flat index: list of (modality, dataset_idx, sample_idx) for each sample
+        self._build_index()
+
+        # Epoch tracking per dataset
+        self.epochs_per_dataset: Dict[str, int] = {
+            path: 0 for path in self.dataset_info.keys()
+        }
+
+        print(f"\nMultiModalWorldModelDataset initialized:")
+        print(f"  Modalities: {self.modalities}")
+        print(f"  Modality weights: {self.modality_weights}")
+        print(f"  Total samples: {self.total_samples:,}")
+
+    def _build_index(self):
+        """Build flat index mapping global idx to (modality, dataset_idx, local_idx)."""
+        self.index = []
+        self.modality_indices: Dict[str, List[int]] = {m: [] for m in self.modalities}
+
+        global_idx = 0
+        for modality in self.modalities:
+            for dataset_idx, dataset in enumerate(self.datasets[modality]):
+                for local_idx in range(len(dataset)):
+                    self.index.append((modality, dataset_idx, local_idx))
+                    self.modality_indices[modality].append(global_idx)
+                    global_idx += 1
+
+    def __len__(self):
+        return self.total_samples
+
+    def __getitem__(self, idx: int) -> Dict:
+        modality, dataset_idx, local_idx = self.index[idx]
+        dataset = self.datasets[modality][dataset_idx]
+        sample = dataset[local_idx]
+        # Add modality info to sample for collator
+        sample["_modality"] = modality
+        return sample
+
+    def get_modality_indices(self, modality: str) -> List[int]:
+        """Get all global indices for a given modality."""
+        return self.modality_indices.get(modality, [])
+
+    def get_sample_by_modality(self, modality: str, idx: int) -> Dict:
+        """Get a sample by modality-local index."""
+        indices = self.modality_indices[modality]
+        global_idx = indices[idx % len(indices)]
+        return self[global_idx]
+
+
+class ModalitySyncedSampler(torch.utils.data.Sampler):
+    """
+    Sampler for multi-modal world model training with distributed synchronization.
+
+    Features:
+    - All ranks sample from the same modality each batch (required for DDP)
+    - Weighted sampling across modalities
+    - Shuffling within modalities
+    - Epoch tracking per modality/dataset
+
+    Usage:
+        sampler = ModalitySyncedSampler(dataset, batch_size=32)
+        dataloader = DataLoader(dataset, batch_sampler=sampler)
+    """
+
+    def __init__(
+        self,
+        dataset: MultiModalWorldModelDataset,
+        batch_size: int,
+        shuffle: bool = True,
+        seed: int = 42,
+        drop_last: bool = True,
+        world_size: int = 1,
+        rank: int = 0,
+    ):
+        """
+        Args:
+            dataset: MultiModalWorldModelDataset instance
+            batch_size: Batch size per GPU
+            shuffle: Whether to shuffle within modalities
+            seed: Random seed for reproducibility
+            drop_last: Drop last incomplete batch per modality
+            world_size: Number of distributed processes
+            rank: This process's rank
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.drop_last = drop_last
+        self.world_size = world_size
+        self.rank = rank
+        self.epoch = 0
+
+        # Compute number of batches per modality
+        self.batches_per_modality: Dict[str, int] = {}
+        for modality in dataset.modalities:
+            n_samples = len(dataset.modality_indices[modality])
+            # Account for distributed training - divide by world_size
+            n_samples_per_rank = n_samples // world_size
+            n_batches = n_samples_per_rank // batch_size
+            if not drop_last and n_samples_per_rank % batch_size != 0:
+                n_batches += 1
+            self.batches_per_modality[modality] = n_batches
+
+        # Total batches weighted by modality weights
+        self.total_batches = sum(
+            int(n_batches * dataset.modality_weights[mod])
+            for mod, n_batches in self.batches_per_modality.items()
+        )
+        # Ensure at least 1 batch per modality with non-zero weight
+        if self.total_batches == 0:
+            self.total_batches = sum(self.batches_per_modality.values())
+
+        print(f"ModalitySyncedSampler: {self.total_batches} total batches")
+        for mod, n in self.batches_per_modality.items():
+            print(f"  {mod}: {n} batches (weight={dataset.modality_weights[mod]:.3f})")
+
+    def __iter__(self):
+        # Create RNG with epoch-based seed (same across all ranks)
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        rng = random.Random(self.seed + self.epoch)
+
+        # Shuffle indices within each modality
+        modality_indices: Dict[str, List[int]] = {}
+        for modality in self.dataset.modalities:
+            indices = self.dataset.modality_indices[modality].copy()
+            if self.shuffle:
+                rng.shuffle(indices)
+            modality_indices[modality] = indices
+
+        # Create weighted batch order
+        # Each entry is (modality, batch_idx_within_modality)
+        batch_order = []
+        for modality in self.dataset.modalities:
+            weight = self.dataset.modality_weights[modality]
+            n_batches = self.batches_per_modality[modality]
+            n_weighted_batches = max(1, int(n_batches * weight * len(self.dataset.modalities)))
+            for batch_idx in range(min(n_weighted_batches, n_batches)):
+                batch_order.append((modality, batch_idx))
+
+        # Shuffle batch order (same across all ranks due to shared seed)
+        if self.shuffle:
+            rng.shuffle(batch_order)
+
+        # Yield batches
+        for modality, batch_idx in batch_order:
+            indices = modality_indices[modality]
+
+            # Compute this rank's portion
+            total_samples = len(indices)
+            samples_per_rank = total_samples // self.world_size
+            rank_start = self.rank * samples_per_rank
+
+            # Get batch indices for this rank
+            batch_start = rank_start + batch_idx * self.batch_size
+            batch_end = batch_start + self.batch_size
+
+            if batch_end <= rank_start + samples_per_rank:
+                batch_indices = indices[batch_start:batch_end]
+                if len(batch_indices) == self.batch_size or not self.drop_last:
+                    yield batch_indices
+
+    def __len__(self):
+        return self.total_batches
+
+    def set_epoch(self, epoch: int):
+        """Set epoch for deterministic shuffling across distributed workers."""
+        self.epoch = epoch
+
+
 def merge_gubert_shards(
     input_dir: str,
     output_dir: str,
@@ -2703,10 +2996,19 @@ def merge_world_model_shards(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Collect all shard files from all input directories
+    # Collect all shard files and modality info from all input directories
     all_shard_paths = []
+    source_modalities = {}  # input_dir -> modality
 
     for input_dir in input_dirs:
+        # Try to read modality from config.json
+        config_path = os.path.join(input_dir, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            source_modalities[input_dir] = config.get("modality", "unknown")
+        else:
+            source_modalities[input_dir] = "unknown"
         # Check for GPU subdirs
         gpu_dirs = sorted([
             d for d in os.listdir(input_dir)
@@ -2840,6 +3142,8 @@ def merge_world_model_shards(
         "num_shards": output_shard_idx,
         "shard_size": target_shard_size,
         "source_dirs": input_dirs,
+        "source_modalities": source_modalities,
+        "modalities": list(set(source_modalities.values())),
         "seed": seed,
         "shuffled": shuffle,
         "dataset_type": "world_model",
@@ -2847,6 +3151,15 @@ def merge_world_model_shards(
 
     with open(os.path.join(output_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
+
+    # Also save a config.json with modality info for compatibility
+    config = {
+        "modality": "mixed" if len(set(source_modalities.values())) > 1 else list(source_modalities.values())[0],
+        "source_modalities": source_modalities,
+        "dataset_type": "world_model",
+    }
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(config, f, indent=2)
 
     print(f"\nMerge complete!")
     print(f"  Total samples: {total_written:,}")

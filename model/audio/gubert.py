@@ -19,6 +19,10 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from rotary_embedding_torch import RotaryEmbedding
+
+from model import activations
+from utils.model_utils import get_activation_type
 
 
 class GradientReversalFunction(torch.autograd.Function):
@@ -181,8 +185,92 @@ class HeadDropout(nn.Module):
         return f"num_heads={self.num_heads}, head_dim={self.head_dim}, drop_prob={self.drop_prob}"
 
 
+class ConformerConvModule(nn.Module):
+    """
+    Conformer-style convolution module for speech processing.
+
+    Architecture: LayerNorm -> Pointwise Conv -> GLU -> Depthwise Conv -> BatchNorm -> Swish -> Pointwise Conv -> Dropout
+
+    The depthwise separable convolution captures local acoustic patterns that
+    self-attention alone may miss, making it particularly effective for speech.
+
+    Reference: "Conformer: Convolution-augmented Transformer for Speech Recognition"
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        kernel_size: int = 31,
+        expansion_factor: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        inner_dim = d_model * expansion_factor
+
+        self.norm = nn.LayerNorm(d_model)
+
+        # Pointwise expansion with GLU (doubles channels, GLU halves them)
+        self.pointwise_conv1 = nn.Conv1d(d_model, inner_dim * 2, kernel_size=1)
+
+        # Depthwise conv (processes each channel independently)
+        self.depthwise_conv = nn.Conv1d(
+            inner_dim,
+            inner_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=inner_dim,  # Depthwise: each channel has its own filter
+        )
+
+        self.batch_norm = nn.BatchNorm1d(inner_dim)
+        self.activation = nn.SiLU()  # Swish
+
+        # Pointwise projection back to d_model
+        self.pointwise_conv2 = nn.Conv1d(inner_dim, d_model, kernel_size=1)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, T, D]
+        Returns:
+            [B, T, D]
+        """
+        # Pre-norm
+        x = self.norm(x)
+
+        # [B, T, D] -> [B, D, T] for conv
+        x = x.transpose(1, 2)
+
+        # Pointwise expansion + GLU
+        x = self.pointwise_conv1(x)  # [B, inner_dim*2, T]
+        x = F.glu(x, dim=1)  # [B, inner_dim, T]
+
+        # Depthwise conv
+        x = self.depthwise_conv(x)  # [B, inner_dim, T]
+        x = self.batch_norm(x)
+        x = self.activation(x)
+
+        # Pointwise projection
+        x = self.pointwise_conv2(x)  # [B, D, T]
+        x = self.dropout(x)
+
+        # [B, D, T] -> [B, T, D]
+        return x.transpose(1, 2)
+
+
 class TransformerEncoderBlock(nn.Module):
-    """Single transformer encoder block with pre-norm and optional head dropout."""
+    """
+    Transformer encoder block with pre-norm, optional RoPE, Conformer conv, and configurable activation.
+
+    Supports:
+    - Pre-norm architecture (more stable training)
+    - Rotary Position Embeddings (RoPE) for better position modeling
+    - Conformer-style convolution module for local acoustic patterns
+    - Macaron-style FFN (half-step FFN before and after attention)
+    - SwiGLU or GELU activation in FFN
+    - DropHead regularization
+    """
 
     def __init__(
         self,
@@ -191,17 +279,37 @@ class TransformerEncoderBlock(nn.Module):
         d_ff: int,
         dropout: float = 0.1,
         head_drop_prob: float = 0.0,
+        # Architectural options
+        use_rotary_embedding: bool = False,
+        use_conformer_conv: bool = False,
+        conformer_kernel_size: int = 31,
+        use_macaron: bool = False,  # Macaron-style: ½FFN → Attn → Conv → ½FFN
+        activation: str = "gelu",  # "gelu" or "swiglu"
     ):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.d_model = d_model
+        self.use_rotary_embedding = use_rotary_embedding
+        self.use_macaron = use_macaron
 
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+        # Rotary position embeddings
+        if use_rotary_embedding:
+            self.rotary_embedding = RotaryEmbedding(dim=self.head_dim)
+            # Custom attention with RoPE (can't use nn.MultiheadAttention)
+            self.q_proj = nn.Linear(d_model, d_model)
+            self.k_proj = nn.Linear(d_model, d_model)
+            self.v_proj = nn.Linear(d_model, d_model)
+            self.o_proj = nn.Linear(d_model, d_model)
+            self.attn_dropout = nn.Dropout(dropout)
+        else:
+            self.rotary_embedding = None
+            self.self_attn = nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=n_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
 
         # Head dropout: drops entire attention heads for regularization
         self.head_dropout = HeadDropout(
@@ -210,16 +318,92 @@ class TransformerEncoderBlock(nn.Module):
             drop_prob=head_drop_prob,
         ) if head_drop_prob > 0 else nn.Identity()
 
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        # Conformer conv module (between attention and FFN)
+        self.conv_module = ConformerConvModule(
+            d_model=d_model,
+            kernel_size=conformer_kernel_size,
+            dropout=dropout,
+        ) if use_conformer_conv else None
+
+        # Helper to build FFN
+        def build_ffn():
+            activation_type = get_activation_type(activation)
+            if activation_type == activations.SwiGLU:
+                return nn.Sequential(
+                    nn.Linear(d_model, d_ff * 2),
+                    activations.SwiGLUSimple(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_ff, d_model),
+                    nn.Dropout(dropout),
+                )
+            else:
+                return nn.Sequential(
+                    nn.Linear(d_model, d_ff),
+                    activation_type(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_ff, d_model),
+                    nn.Dropout(dropout),
+                )
+
+        # Macaron-style: two half-step FFNs (each scaled by 0.5)
+        # Standard: single FFN
+        if use_macaron:
+            self.ff1 = build_ffn()  # First half-step FFN
+            self.ff2 = build_ffn()  # Second half-step FFN
+            self.norm_ff1 = nn.LayerNorm(d_model)
+            self.norm_ff2 = nn.LayerNorm(d_model)
+            self.ff = None  # Not used in Macaron mode
+            self.norm2 = None  # Not used in Macaron mode
+        else:
+            self.ff = build_ffn()
+            self.ff1 = None
+            self.ff2 = None
+            self.norm_ff1 = None
+            self.norm_ff2 = None
+            self.norm2 = nn.LayerNorm(d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)  # For attention
+        if use_conformer_conv:
+            self.norm_conv = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+
+    def _rope_attention(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Self-attention with rotary position embeddings."""
+        B, T, D = x.shape
+
+        # Project to Q, K, V
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D_h]
+        k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Apply rotary embeddings
+        q = self.rotary_embedding.rotate_queries_or_keys(q)
+        k = self.rotary_embedding.rotate_queries_or_keys(k)
+
+        # Scaled dot-product attention
+        scale = math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / scale  # [B, H, T, T]
+
+        # Apply key padding mask
+        if key_padding_mask is not None:
+            # key_padding_mask: [B, T] True for padded positions
+            attn_weights = attn_weights.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2),  # [B, 1, 1, T]
+                float('-inf')
+            )
+
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Apply attention to values
+        out = torch.matmul(attn_weights, v)  # [B, H, T, D_h]
+        out = out.transpose(1, 2).contiguous().view(B, T, D)  # [B, T, D]
+
+        return self.o_proj(out)
 
     def forward(
         self,
@@ -230,32 +414,66 @@ class TransformerEncoderBlock(nn.Module):
         """
         Args:
             x: [B, T, D]
-            attn_mask: [T, T] attention mask
+            attn_mask: [T, T] attention mask (not used with RoPE)
             key_padding_mask: [B, T] True for padded positions
         Returns:
             [B, T, D]
+
+        Macaron-style (if enabled): ½FFN → Attn → Conv → ½FFN
+        Standard: Attn → Conv → FFN
         """
+        if self.use_macaron:
+            # Macaron: First half-step FFN (scaled by 0.5)
+            residual = x
+            x = self.norm_ff1(x)
+            x = 0.5 * self.ff1(x)
+            x = residual + x
+
         # Pre-norm self-attention
         residual = x
         x = self.norm1(x)
-        x, _ = self.self_attn(x, x, x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+        if self.use_rotary_embedding:
+            x = self._rope_attention(x, key_padding_mask=key_padding_mask)
+        else:
+            x, _ = self.self_attn(x, x, x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
         x = self.head_dropout(x)  # DropHead: randomly drop entire attention heads
         x = self.dropout(x)
         x = residual + x
 
-        # Pre-norm feedforward
-        residual = x
-        x = self.norm2(x)
-        x = self.ff(x)
-        x = residual + x
+        # Conformer conv module (if enabled)
+        if self.conv_module is not None:
+            residual = x
+            x = self.conv_module(x)
+            x = residual + x
+
+        # Feedforward
+        if self.use_macaron:
+            # Macaron: Second half-step FFN (scaled by 0.5)
+            residual = x
+            x = self.norm_ff2(x)
+            x = 0.5 * self.ff2(x)
+            x = residual + x
+        else:
+            # Standard: Full FFN
+            residual = x
+            x = self.norm2(x)
+            x = self.ff(x)
+            x = residual + x
 
         return x
 
 
 class SpeakerClassifier(nn.Module):
     """
-    Speaker classifier head with pooling strategies.
+    Speaker classifier head with modern pooling strategies.
     Used with gradient reversal to push speaker info out of features.
+
+    Pooling options:
+    - "mean": Simple mean pooling
+    - "statistics": Mean + std concatenation (2x input dim)
+    - "attention": Learnable attention weights
+    - "attentive_statistics": ASP from ECAPA-TDNN (attention-weighted mean + std)
+    - "multi_head_attention": Multi-head self-attention pooling
     """
 
     def __init__(
@@ -263,28 +481,114 @@ class SpeakerClassifier(nn.Module):
         d_model: int,
         num_speakers: int,
         hidden_dim: Optional[int] = None,
-        pooling: str = "mean",  # "mean", "attention", "max"
+        pooling: str = "attentive_statistics",
         dropout: float = 0.1,
+        num_attention_heads: int = 4,
     ):
         super().__init__()
 
-        hidden_dim = hidden_dim or d_model
+        hidden_dim = hidden_dim or d_model * 2
         self.pooling = pooling
+        self.d_model = d_model
 
+        # Determine pooled dimension based on pooling type
+        if pooling in ("statistics", "attentive_statistics"):
+            pooled_dim = d_model * 2  # mean + std
+        else:
+            pooled_dim = d_model
+
+        # Pooling-specific layers
         if pooling == "attention":
             self.attn_pool = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.Tanh(),
                 nn.Linear(d_model, 1),
             )
 
+        elif pooling == "attentive_statistics":
+            # Attentive Statistics Pooling (ASP) from ECAPA-TDNN
+            # Uses attention to compute weighted mean and std
+            self.asp_linear = nn.Linear(d_model, d_model)
+            self.asp_attention = nn.Sequential(
+                nn.Conv1d(d_model, d_model, kernel_size=1),
+                nn.ReLU(),
+                nn.BatchNorm1d(d_model),
+                nn.Conv1d(d_model, d_model, kernel_size=1),
+                nn.Softmax(dim=2),
+            )
+
+        elif pooling == "multi_head_attention":
+            # Learnable query for pooling
+            self.pool_query = nn.Parameter(torch.randn(1, 1, d_model))
+            self.mha_pool = nn.MultiheadAttention(
+                d_model, num_attention_heads, dropout=dropout, batch_first=True
+            )
+            self.mha_norm = nn.LayerNorm(d_model)
+
+        # Classifier MLP
         self.classifier = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
+            nn.Linear(pooled_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_speakers),
         )
+
+    def _statistics_pooling(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute mean and std pooling."""
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(-1).float()  # [B, T, 1]
+            lengths = mask_expanded.sum(dim=1).clamp(min=1)  # [B, 1]
+
+            # Masked mean
+            mean = (x * mask_expanded).sum(dim=1) / lengths
+
+            # Masked std
+            diff_sq = ((x - mean.unsqueeze(1)) ** 2) * mask_expanded
+            var = diff_sq.sum(dim=1) / lengths.clamp(min=1)
+            std = (var + 1e-6).sqrt()
+        else:
+            mean = x.mean(dim=1)
+            std = x.std(dim=1) + 1e-6
+
+        return torch.cat([mean, std], dim=-1)  # [B, 2*D]
+
+    def _attentive_statistics_pooling(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Attentive Statistics Pooling (ASP) from ECAPA-TDNN.
+        Computes attention-weighted mean and std.
+        """
+        # x: [B, T, D]
+        h = self.asp_linear(x)  # [B, T, D]
+
+        # Compute attention weights using Conv1d (expects [B, D, T])
+        h_transposed = h.transpose(1, 2)  # [B, D, T]
+        attn_weights = self.asp_attention(h_transposed)  # [B, D, T] with softmax over T
+        attn_weights = attn_weights.transpose(1, 2)  # [B, T, D]
+
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(-1).float()  # [B, T, 1]
+            attn_weights = attn_weights * mask_expanded
+            # Re-normalize after masking
+            attn_weights = attn_weights / attn_weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
+
+        # Weighted mean
+        weighted_mean = (x * attn_weights).sum(dim=1)  # [B, D]
+
+        # Weighted std
+        diff_sq = (x - weighted_mean.unsqueeze(1)) ** 2
+        weighted_var = (diff_sq * attn_weights).sum(dim=1)
+        weighted_std = (weighted_var + 1e-6).sqrt()  # [B, D]
+
+        return torch.cat([weighted_mean, weighted_std], dim=-1)  # [B, 2*D]
 
     def forward(
         self,
@@ -300,8 +604,7 @@ class SpeakerClassifier(nn.Module):
         """
         if self.pooling == "mean":
             if mask is not None:
-                # Masked mean pooling
-                mask_expanded = mask.unsqueeze(-1).float()  # [B, T, 1]
+                mask_expanded = mask.unsqueeze(-1).float()
                 pooled = (x * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
             else:
                 pooled = x.mean(dim=1)
@@ -311,12 +614,31 @@ class SpeakerClassifier(nn.Module):
                 x = x.masked_fill(~mask.unsqueeze(-1), float('-inf'))
             pooled = x.max(dim=1)[0]
 
+        elif self.pooling == "statistics":
+            pooled = self._statistics_pooling(x, mask)
+
+        elif self.pooling == "attentive_statistics":
+            pooled = self._attentive_statistics_pooling(x, mask)
+
         elif self.pooling == "attention":
             attn_weights = self.attn_pool(x).squeeze(-1)  # [B, T]
             if mask is not None:
                 attn_weights = attn_weights.masked_fill(~mask, float('-inf'))
             attn_weights = F.softmax(attn_weights, dim=-1)  # [B, T]
             pooled = (x * attn_weights.unsqueeze(-1)).sum(dim=1)  # [B, D]
+
+        elif self.pooling == "multi_head_attention":
+            B = x.size(0)
+            query = self.pool_query.expand(B, -1, -1)  # [B, 1, D]
+
+            # Create key_padding_mask (True = ignore)
+            key_padding_mask = ~mask if mask is not None else None
+
+            pooled, _ = self.mha_pool(query, x, x, key_padding_mask=key_padding_mask)
+            pooled = self.mha_norm(pooled.squeeze(1))  # [B, D]
+
+        else:
+            raise ValueError(f"Unknown pooling type: {self.pooling}")
 
         return self.classifier(pooled)
 
@@ -337,9 +659,42 @@ class GuBERTConfig:
     max_seq_len: int = 5000
     speaker_pooling: str = "mean"
 
+    # Dropout regularization (helps prevent memorization)
+    conv_dropout: float = 0.0       # Dropout1d in conv frontend (0 = use standard dropout)
+    feature_dropout: float = 0.0    # Dropout on features before heads
+    head_dropout: float = 0.0       # Dropout in ASR head
+    attention_head_drop: float = 0.0  # DropHead on attention
+
+    # Architectural options
+    use_rotary_embedding: bool = False  # Use RoPE instead of sinusoidal positional encoding
+    use_conformer_conv: bool = False    # Add Conformer-style conv module to each block
+    conformer_kernel_size: int = 31     # Kernel size for Conformer conv (standard from paper)
+    use_macaron: bool = False           # Macaron-style FFN: ½FFN → Attn → Conv → ½FFN
+    activation: str = "gelu"            # FFN activation: "gelu" or "swiglu"
+
+    # Speaker normalization (strips speaker-specific statistics from features)
+    # Instance norm normalizes each sample across time, removing per-utterance mean/variance
+    # which often encodes speaker identity. More direct than adversarial GRL.
+    use_instance_norm: bool = False     # Add InstanceNorm after each transformer block
+    instance_norm_affine: bool = False  # Learn scale/shift (False = pure normalization)
+
+    # Variance regularization (for VAE-friendly features)
+    use_variance_reg: bool = False
+    temporal_var_weight: float = 0.01
+    temporal_var_min: float = 0.1
+    dim_var_weight: float = 0.01
+    dim_var_min: float = 0.1
+    temporal_smoothness_weight: float = 0.1
+    temporal_smoothness_max: float = 0.95
+
+    # CTC upsampling (relaxes CTC length constraint without increasing transformer cost)
+    # Upsamples features before CTC head using linear interpolation
+    # factor=1: no upsampling (default), factor=2: 2x more CTC frames, etc.
+    ctc_upsample_factor: int = 1
+
     def __post_init__(self):
         if self.conv_kernel_sizes is None:
-            self.conv_kernel_sizes = [5, 3, 3]
+            self.conv_kernel_sizes = [7, 3, 3]  # Larger first kernel for more acoustic context
         if self.conv_strides is None:
             self.conv_strides = [2, 2, 1]  # 4x downsampling
 
@@ -356,7 +711,7 @@ class GuBERTConfig:
 
 # Predefined configurations
 GUBERT_CONFIGS = {
-    # ~2M params - very fast, good for experimentation
+    # ~1.3M params - very fast, good for experimentation
     "tiny": GuBERTConfig(
         encoder_dim=128,
         num_layers=3,
@@ -364,12 +719,28 @@ GUBERT_CONFIGS = {
         ff_dim=512,
         dropout=0.1,
     ),
-    # ~5M params - balanced speed/quality
+    # ~7M params w/ macaron and swiglu, ~2.5M w/o
+    "tiny_deep": GuBERTConfig(
+        encoder_dim=128,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+    ),
+    # ~9.6M params - balanced speed/quality
     "small": GuBERTConfig(
         encoder_dim=256,
         num_layers=4,
         num_heads=4,
         ff_dim=1024,
+        dropout=0.1,
+    ),
+    # ~30M params
+    "small_deep": GuBERTConfig(
+        encoder_dim=256,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=1152,
         dropout=0.1,
     ),
     # ~15M params - good quality
@@ -407,43 +778,75 @@ class GuBERTEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-        # Convolutional subsampling frontend
+        # Convolutional subsampling frontend with optional Dropout1d
         self.conv_subsample = ConvSubsampling(
             in_channels=config.n_mels,
             out_channels=config.encoder_dim,
             kernel_sizes=config.conv_kernel_sizes,
             strides=config.conv_strides,
-            dropout=config.dropout,
+            dropout=config.conv_dropout if config.conv_dropout > 0 else config.dropout,
         )
 
-        # Positional encoding
-        self.pos_enc = SinusoidalPositionalEncoding(
-            d_model=config.encoder_dim,
-            max_len=config.max_seq_len,
-            dropout=config.dropout,
-        )
+        # Positional encoding (only used when not using RoPE)
+        if not config.use_rotary_embedding:
+            self.pos_enc = SinusoidalPositionalEncoding(
+                d_model=config.encoder_dim,
+                max_len=config.max_seq_len,
+                dropout=config.dropout,
+            )
+        else:
+            self.pos_enc = None  # RoPE handles position in each attention block
 
-        # Transformer encoder blocks
+        # Transformer encoder blocks with architectural options
         self.encoder_blocks = nn.ModuleList([
             TransformerEncoderBlock(
                 d_model=config.encoder_dim,
                 n_heads=config.num_heads,
                 d_ff=config.ff_dim,
                 dropout=config.dropout,
+                head_drop_prob=config.attention_head_drop,
+                use_rotary_embedding=config.use_rotary_embedding,
+                use_conformer_conv=config.use_conformer_conv,
+                conformer_kernel_size=config.conformer_kernel_size,
+                use_macaron=config.use_macaron,
+                activation=config.activation,
             )
             for _ in range(config.num_layers)
         ])
 
+        # Instance normalization for speaker removal (optional)
+        # Normalizes across time dimension, stripping per-utterance mean/variance
+        # which typically encodes speaker identity
+        if config.use_instance_norm:
+            self.instance_norms = nn.ModuleList([
+                nn.InstanceNorm1d(config.encoder_dim, affine=config.instance_norm_affine)
+                for _ in range(config.num_layers)
+            ])
+        else:
+            self.instance_norms = None
+
         # Final layer norm
         self.final_norm = nn.LayerNorm(config.encoder_dim)
 
-        # ASR head (CTC)
-        self.asr_head = nn.Linear(config.encoder_dim, config.vocab_size)
+        # Feature dropout (applied before heads)
+        self.feature_dropout = nn.Dropout(config.feature_dropout) if config.feature_dropout > 0 else nn.Identity()
+
+        # ASR head (CTC) with optional dropout
+        if config.head_dropout > 0:
+            self.asr_head = nn.Sequential(
+                nn.Linear(config.encoder_dim, config.encoder_dim),
+                nn.GELU(),
+                nn.Dropout(config.head_dropout),
+                nn.Linear(config.encoder_dim, config.vocab_size),
+            )
+        else:
+            self.asr_head = nn.Linear(config.encoder_dim, config.vocab_size)
 
         # Speaker classifier (for GRL)
         self.speaker_classifier = SpeakerClassifier(
             d_model=config.encoder_dim,
             num_speakers=config.num_speakers,
+            hidden_dim=config.encoder_dim * 2,
             pooling=config.speaker_pooling,
             dropout=config.dropout,
         )
@@ -511,14 +914,15 @@ class GuBERTEncoder(nn.Module):
 
         Returns:
             dict with keys:
-                - features: [B, T', encoder_dim] content features
+                - features: [B, T', encoder_dim] normalized content features
+                - features_unnorm: [B, T', encoder_dim] pre-LayerNorm features
                 - asr_logits: [B, T', vocab_size] for CTC loss
                 - speaker_logits: [B, num_speakers] for GRL loss
                 - feature_lengths: [B] output sequence lengths
+                - variance_loss: scalar loss for variance regularization (if enabled)
+                - temporal_smoothness: scalar metric (if variance_reg enabled and training)
                 - all_hiddens: list of [B, T', D] if return_all_hiddens=True
         """
-        batch_size = mel_spec.size(0)
-
         # Convolutional frontend
         x = self.conv_subsample(mel_spec)  # [B, encoder_dim, T']
         x = x.permute(0, 2, 1)  # [B, T', encoder_dim]
@@ -536,33 +940,108 @@ class GuBERTEncoder(nn.Module):
             max_len = x.size(1)
             padding_mask = torch.arange(max_len, device=x.device).unsqueeze(0) >= feature_lengths.unsqueeze(1)
 
-        # Positional encoding
-        x = self.pos_enc(x)
+        # Positional encoding (skip if using RoPE - handled in attention)
+        if self.pos_enc is not None:
+            x = self.pos_enc(x)
 
         # Transformer encoder
         all_hiddens = [x] if return_all_hiddens else None
-        for block in self.encoder_blocks:
+        for i, block in enumerate(self.encoder_blocks):
             x = block(x, key_padding_mask=padding_mask)
+
+            # Apply instance normalization to strip speaker statistics (if enabled)
+            # InstanceNorm1d expects [B, C, T], we have [B, T, C]
+            if self.instance_norms is not None:
+                x = x.transpose(1, 2)  # [B, C, T]
+                x = self.instance_norms[i](x)
+                x = x.transpose(1, 2)  # [B, T, C]
+
             if return_all_hiddens:
                 all_hiddens.append(x)
+
+        # Store pre-LayerNorm features
+        features_unnorm = x
 
         # Final normalization
         features = self.final_norm(x)
 
-        # ASR head
-        asr_logits = self.asr_head(features)
+        # Compute variance regularization loss (for VAE-friendly features)
+        variance_loss = torch.tensor(0.0, device=mel_spec.device)
+        temporal_smoothness = None
+        if self.config.use_variance_reg:
+            # Use normalized features for variance computation
+            feat_for_var = features
 
-        # Speaker classifier with gradient reversal
+            # Temporal variance: want features to change over time (not constant)
+            if feat_for_var.size(1) > 1:
+                temporal_diff = feat_for_var[:, 1:, :] - feat_for_var[:, :-1, :]
+                temporal_var = temporal_diff.var(dim=1).mean()
+                temporal_loss = F.relu(self.config.temporal_var_min - temporal_var)
+
+                # Temporal smoothness (for logging) - cosine similarity between adjacent frames
+                with torch.no_grad():
+                    feat_norm = F.normalize(feat_for_var, dim=-1)
+                    cos_sim = (feat_norm[:, 1:, :] * feat_norm[:, :-1, :]).sum(dim=-1)
+                    temporal_smoothness = cos_sim.mean()
+            else:
+                temporal_loss = torch.tensor(0.0, device=mel_spec.device)
+
+            # Per-dimension variance: want each dimension to be used (not dead)
+            dim_var = feat_for_var.var(dim=(0, 1))
+            dim_loss = F.relu(self.config.dim_var_min - dim_var).mean()
+
+            # Temporal smoothness penalty: penalize if features are too smooth
+            smoothness_loss = torch.tensor(0.0, device=mel_spec.device)
+            if temporal_smoothness is not None:
+                smoothness_loss = F.relu(temporal_smoothness - self.config.temporal_smoothness_max)
+
+            variance_loss = (
+                self.config.temporal_var_weight * temporal_loss +
+                self.config.dim_var_weight * dim_loss +
+                self.config.temporal_smoothness_weight * smoothness_loss
+            )
+
+        # Apply feature dropout before heads
+        features_for_heads = self.feature_dropout(features)
+
+        # CTC upsampling: upsample features before ASR head to relax CTC length constraint
+        # This keeps transformer efficient (operates on T/4) while giving CTC more frames
+        ctc_lengths = feature_lengths
+        if self.config.ctc_upsample_factor > 1:
+            # Linear interpolation upsampling: [B, T, D] -> [B, T*factor, D]
+            features_for_asr = features_for_heads.transpose(1, 2)  # [B, D, T]
+            features_for_asr = F.interpolate(
+                features_for_asr,
+                scale_factor=float(self.config.ctc_upsample_factor),
+                mode='linear',
+                align_corners=False,
+            )
+            features_for_asr = features_for_asr.transpose(1, 2)  # [B, T*factor, D]
+
+            # Update CTC lengths to reflect upsampling
+            if feature_lengths is not None:
+                ctc_lengths = feature_lengths * self.config.ctc_upsample_factor
+        else:
+            features_for_asr = features_for_heads
+
+        # ASR head (operates on potentially upsampled features)
+        asr_logits = self.asr_head(features_for_asr)
+
+        # Speaker classifier with gradient reversal (operates on original resolution)
         # Use ~padding_mask to get valid positions mask
         valid_mask = ~padding_mask if padding_mask is not None else None
-        reversed_features = GradientReversalFunction.apply(features, grl_alpha)
+        reversed_features = GradientReversalFunction.apply(features_for_heads, grl_alpha)
         speaker_logits = self.speaker_classifier(reversed_features, mask=valid_mask)
 
         result = {
-            "features": features,
+            "features": features,  # Normalized features (preferred for VAE)
+            "features_unnorm": features_unnorm,  # Pre-LayerNorm (for comparison)
             "asr_logits": asr_logits,
             "speaker_logits": speaker_logits,
-            "feature_lengths": feature_lengths,
+            "feature_lengths": feature_lengths,  # Original feature lengths (for feature extraction)
+            "ctc_lengths": ctc_lengths,  # CTC lengths (potentially upsampled, for CTC loss)
+            "variance_loss": variance_loss,
+            "temporal_smoothness": temporal_smoothness if self.config.use_variance_reg and self.training else None,
         }
 
         if return_all_hiddens:
@@ -691,6 +1170,133 @@ class CTCVocab:
 
         return decoded
 
+    def build_ctc_decoder(self, kenlm_model_path: Optional[str] = None, alpha: float = 0.5, beta: float = 1.0):
+        """
+        Build a pyctcdecode decoder with optional LM support.
+
+        Args:
+            kenlm_model_path: Path to KenLM .arpa or .bin file (optional)
+            alpha: LM weight (higher = more LM influence)
+            beta: Word insertion bonus (higher = longer words)
+
+        Returns:
+            pyctcdecode decoder or None if pyctcdecode not available
+        """
+        import os
+
+        try:
+            from pyctcdecode import build_ctcdecoder
+        except ImportError:
+            print("pyctcdecode not installed. Install with: pip install pyctcdecode")
+            return None
+
+        # Check if LM file exists
+        if kenlm_model_path and not os.path.exists(kenlm_model_path):
+            print(f"WARNING: KenLM model not found at {kenlm_model_path}")
+            print("  CTC decoder will be built WITHOUT language model")
+            print("  Download from: https://www.openslr.org/11/ (e.g., 4-gram.arpa.gz)")
+            kenlm_model_path = None
+
+        # Build labels list in vocab order (pyctcdecode expects this)
+        labels = self.idx_to_char.copy()
+
+        # pyctcdecode expects "" for blank token
+        labels[self.blank_idx] = ""
+
+        # Extract unigrams from ARPA file for word-level LM
+        unigrams = None
+        if kenlm_model_path and kenlm_model_path.endswith('.arpa'):
+            print(f"Loading LM from {kenlm_model_path}...")
+            unigrams = self._extract_unigrams_from_arpa(kenlm_model_path)
+
+        decoder = build_ctcdecoder(
+            labels=labels,
+            kenlm_model_path=kenlm_model_path,
+            unigrams=unigrams,
+            alpha=alpha,
+            beta=beta,
+        )
+
+        return decoder
+
+    def _extract_unigrams_from_arpa(self, arpa_path: str) -> list:
+        """Extract unigrams from ARPA file for pyctcdecode.
+
+        Note: We extract ALL words, not just those matching our char vocab.
+        pyctcdecode handles the character-to-word mapping internally.
+        """
+        unigrams = []
+        in_unigrams = False
+
+        try:
+            with open(arpa_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+
+                    if line == '\\1-grams:':
+                        in_unigrams = True
+                        continue
+                    elif line.startswith('\\') and in_unigrams:
+                        break  # Done with unigrams
+
+                    if in_unigrams and line:
+                        parts = line.split('\t')
+                        if len(parts) >= 2:
+                            word = parts[1]
+                            # Skip special tokens
+                            if word and word not in ('<s>', '</s>', '<unk>', '<UNK>'):
+                                unigrams.append(word.lower())
+
+            print(f"  Extracted {len(unigrams):,} unigrams from ARPA")
+        except Exception as e:
+            print(f"Warning: Failed to extract unigrams from ARPA: {e}")
+            return None
+
+        return unigrams if unigrams else None
+
+    def ctc_decode_beam(
+        self,
+        logits: torch.Tensor,
+        decoder=None,
+        beam_width: int = 100,
+    ) -> list:
+        """
+        Beam search CTC decoding with optional LM.
+
+        Args:
+            logits: [T, vocab_size] or [B, T, vocab_size]
+            decoder: pyctcdecode decoder (from build_ctc_decoder)
+            beam_width: Beam width for search
+
+        Returns:
+            List of decoded strings
+        """
+        if decoder is None:
+            # Fall back to greedy if no decoder
+            return self.ctc_decode_greedy(logits)
+
+        import numpy as np
+
+        if isinstance(logits, torch.Tensor):
+            logits = logits.detach().cpu().numpy()
+
+        if logits.ndim == 2:
+            logits = logits[np.newaxis, ...]
+
+        # Convert to log probabilities (pyctcdecode expects log probs)
+        # Softmax then log
+        logits_max = logits.max(axis=-1, keepdims=True)
+        logits_stable = logits - logits_max
+        probs = np.exp(logits_stable) / np.exp(logits_stable).sum(axis=-1, keepdims=True)
+        log_probs = np.log(probs + 1e-10)
+
+        decoded = []
+        for log_prob in log_probs:
+            text = decoder.decode(log_prob, beam_width=beam_width)
+            decoded.append(text)
+
+        return decoded
+
 
 def create_gubert(
     config: str = "small",
@@ -714,906 +1320,5 @@ def create_gubert(
         config,
         num_speakers=num_speakers,
         vocab_size=vocab_size,
-        **kwargs,
-    )
-
-
-# =============================================================================
-# Masked Prediction (HuBERT-style) + GRL
-# =============================================================================
-
-@dataclass
-class MaskedGuBERTConfig:
-    """Configuration for MaskedGuBERT model."""
-    n_mels: int = 80
-    encoder_dim: int = 256
-    num_layers: int = 4
-    num_heads: int = 4
-    ff_dim: int = 1024
-    conv_kernel_sizes: list = None
-    conv_strides: list = None
-    num_speakers: int = 992
-    dropout: float = 0.1
-    conv_dropout: float = 0.05     # Dropout1d in conv frontend (drops entire channels)
-    feature_dropout: float = 0.0   # Dropout on features before prediction head
-    head_dropout: float = 0.0      # Dropout inside prediction head
-    attention_head_drop: float = 0.0  # DropHead: probability of dropping entire attention heads
-    max_seq_len: int = 5000
-    speaker_pooling: str = "mean"
-
-    # Masked prediction mode
-    use_vq: bool = False            # If False, use regression; if True, use VQ targets
-
-    # Masking parameters
-    mask_prob: float = 0.08         # Probability of starting a mask span
-    mask_length: int = 10           # Length of each mask span
-    min_masks: int = 2              # Minimum number of mask spans per sequence
-
-    # Regression-specific (used when use_vq=False)
-    regression_loss_type: str = "smooth_l1"  # "smooth_l1", "mse", or "huber"
-    target_layer_norm: bool = True  # Normalize targets (data2vec style)
-
-    # VQ-specific (used when use_vq=True)
-    num_codebooks: int = 2          # Number of parallel codebooks (product quantization)
-    codebook_size: int = 320        # Entries per codebook
-    codebook_dim: int = None        # Dimension per codebook (encoder_dim // num_codebooks if None)
-    codebook_temp: float = 1.0      # Temperature for codebook softmax (Gumbel-softmax)
-    commitment_weight: float = 0.25 # VQ commitment loss weight
-
-    # Feature variance regularization (for VAE-friendly features)
-    use_variance_reg: bool = False      # Enable variance regularization
-    temporal_var_weight: float = 0.01   # Weight for temporal variance loss
-    temporal_var_min: float = 0.1       # Minimum temporal variance threshold
-    dim_var_weight: float = 0.01        # Weight for dimension variance loss
-    dim_var_min: float = 0.1            # Minimum dimension variance threshold
-    # Temporal smoothness penalty (penalize when adjacent frames too similar)
-    temporal_smoothness_weight: float = 0.1   # Weight for smoothness penalty
-    temporal_smoothness_max: float = 0.95     # Max allowed smoothness (penalize above this)
-
-    def __post_init__(self):
-        if self.conv_kernel_sizes is None:
-            self.conv_kernel_sizes = [5, 3, 3]
-        if self.conv_strides is None:
-            self.conv_strides = [2, 2, 1]  # 4x downsampling
-        if self.codebook_dim is None:
-            self.codebook_dim = self.encoder_dim // self.num_codebooks
-
-    def to_dict(self) -> dict:
-        """Convert config to dictionary (for HuggingFace compatibility)."""
-        import dataclasses
-        return dataclasses.asdict(self)
-
-    def to_json_string(self) -> str:
-        """Convert config to JSON string (for HuggingFace compatibility)."""
-        import json
-        return json.dumps(self.to_dict(), indent=2)
-
-
-# Predefined configurations for MaskedGuBERT
-# By default, use regression (use_vq=False) for continuous representations
-MASKED_GUBERT_CONFIGS = {
-    "tiny": MaskedGuBERTConfig(
-        encoder_dim=128,
-        num_layers=3,
-        num_heads=4,
-        ff_dim=512,
-        use_vq=False,  # Regression by default
-        dropout=0.1,
-    ),
-    # guber is ~4.8M params, GRL is ~432k params
-    "small": MaskedGuBERTConfig(
-        encoder_dim=288,
-        num_layers=4,
-        num_heads=4,
-        ff_dim=1152,
-        use_vq=False,  # Regression by default
-        dropout=0.1,
-    ),
-    # guber is ~6.8M params, GRL is ~432k params
-    "small_deep": MaskedGuBERTConfig(
-        encoder_dim=288,
-        num_layers=6,
-        num_heads=6,
-        ff_dim=1152,
-        use_vq=False,  # Regression by default
-        dropout=0.1,
-    ),
-    # gubert is ~12M params, GRL is ~650k params
-    "medium": MaskedGuBERTConfig(
-        encoder_dim=384,
-        num_layers=6,
-        num_heads=6,
-        ff_dim=1536,
-        use_vq=False,  # Regression by default
-        dropout=0.1,
-    ),
-    "large": MaskedGuBERTConfig(
-        encoder_dim=512,
-        num_layers=8,
-        num_heads=8,
-        ff_dim=2048,
-        use_vq=False,  # Regression by default
-        dropout=0.1,
-    ),
-}
-
-
-class VectorQuantizer(nn.Module):
-    """
-    Online Vector Quantizer with learnable codebook.
-
-    Uses straight-through estimator for gradients (forward uses hard assignment,
-    backward uses soft gradients through the codebook).
-
-    Supports product quantization with multiple codebooks for efficiency.
-    """
-
-    def __init__(
-        self,
-        num_codebooks: int,
-        codebook_size: int,
-        codebook_dim: int,
-        commitment_weight: float = 0.25,
-        ema_decay: float = 0.99,
-        use_ema: bool = False,
-    ):
-        super().__init__()
-        self.num_codebooks = num_codebooks
-        self.codebook_size = codebook_size
-        self.codebook_dim = codebook_dim
-        self.commitment_weight = commitment_weight
-        self.use_ema = use_ema
-        self.ema_decay = ema_decay
-
-        # Learnable codebook embeddings: [num_codebooks, codebook_size, codebook_dim]
-        self.codebook = nn.Parameter(
-            torch.randn(num_codebooks, codebook_size, codebook_dim) * 0.02
-        )
-
-        if use_ema:
-            # EMA cluster sizes and embeddings for codebook update
-            self.register_buffer('ema_cluster_size', torch.zeros(num_codebooks, codebook_size))
-            self.register_buffer('ema_embed_sum', torch.zeros(num_codebooks, codebook_size, codebook_dim))
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        return_indices: bool = True,
-    ) -> dict:
-        """
-        Quantize input features.
-
-        Args:
-            x: [B, T, D] where D = num_codebooks * codebook_dim
-            return_indices: Whether to return codebook indices
-
-        Returns:
-            dict with:
-                - quantized: [B, T, D] quantized features
-                - indices: [B, T, num_codebooks] codebook indices
-                - commitment_loss: scalar commitment loss
-                - codebook_loss: scalar codebook loss (if not using EMA)
-        """
-        B, T, D = x.shape
-
-        # Split into codebook groups: [B, T, num_codebooks, codebook_dim]
-        x_split = x.view(B, T, self.num_codebooks, self.codebook_dim)
-
-        # Compute distances to codebook entries
-        # x_split: [B, T, G, d], codebook: [G, K, d]
-        # distances: [B, T, G, K]
-        x_flat = x_split.reshape(-1, self.num_codebooks, self.codebook_dim)  # [B*T, G, d]
-
-        distances = torch.zeros(B * T, self.num_codebooks, self.codebook_size, device=x.device)
-        for g in range(self.num_codebooks):
-            # [B*T, d] vs [K, d] -> [B*T, K]
-            distances[:, g, :] = torch.cdist(
-                x_flat[:, g, :].unsqueeze(1),  # [B*T, 1, d]
-                self.codebook[g].unsqueeze(0),  # [1, K, d]
-            ).squeeze(1)
-
-        distances = distances.view(B, T, self.num_codebooks, self.codebook_size)
-
-        # Hard assignment (argmin)
-        indices = distances.argmin(dim=-1)  # [B, T, G]
-
-        # Gather quantized vectors
-        # indices: [B, T, G] -> one-hot: [B, T, G, K]
-        one_hot = F.one_hot(indices, self.codebook_size).float()  # [B, T, G, K]
-
-        # quantized: [B, T, G, d]
-        quantized_split = torch.einsum('btgk,gkd->btgd', one_hot, self.codebook)
-
-        # Straight-through estimator: use quantized in forward, but gradient flows through x
-        quantized_split = x_split + (quantized_split - x_split).detach()
-
-        # Reshape back: [B, T, D]
-        quantized = quantized_split.view(B, T, D)
-
-        # Commitment loss: encourage encoder output to stay close to codebook
-        commitment_loss = F.mse_loss(x_split, quantized_split.detach())
-
-        # Codebook loss: encourage codebook to stay close to encoder output
-        codebook_loss = F.mse_loss(quantized_split, x_split.detach())
-
-        result = {
-            "quantized": quantized,
-            "commitment_loss": commitment_loss,
-            "codebook_loss": codebook_loss,
-        }
-
-        if return_indices:
-            result["indices"] = indices
-
-        return result
-
-    def get_codebook_usage(self, indices: torch.Tensor) -> torch.Tensor:
-        """
-        Compute codebook usage statistics.
-
-        Args:
-            indices: [B, T, num_codebooks]
-
-        Returns:
-            usage: [num_codebooks, codebook_size] usage counts
-        """
-        usage = torch.zeros(self.num_codebooks, self.codebook_size, device=indices.device)
-        for g in range(self.num_codebooks):
-            usage[g] = torch.bincount(
-                indices[:, :, g].reshape(-1),
-                minlength=self.codebook_size
-            ).float()
-        return usage
-
-
-def generate_mask_spans(
-    seq_len: int,
-    batch_size: int,
-    mask_prob: float = 0.08,
-    mask_length: int = 10,
-    min_masks: int = 2,
-    device: torch.device = None,
-) -> torch.Tensor:
-    """
-    Generate span masks for masked audio prediction (HuBERT/wav2vec2 style).
-
-    Args:
-        seq_len: Sequence length
-        batch_size: Batch size
-        mask_prob: Probability of starting a mask span at each position
-        mask_length: Length of each mask span
-        min_masks: Minimum number of mask spans per sequence
-        device: Device for output tensor
-
-    Returns:
-        mask: [B, T] boolean tensor, True = masked
-    """
-    mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
-
-    for b in range(batch_size):
-        # Calculate number of mask spans
-        num_masks = max(min_masks, int(seq_len * mask_prob))
-
-        # Ensure we don't mask more than 80% of sequence
-        max_masked = int(seq_len * 0.8)
-        num_masks = min(num_masks, max_masked // mask_length)
-
-        if num_masks == 0:
-            continue
-
-        # Randomly select span start positions (avoid overlapping with end)
-        valid_starts = seq_len - mask_length
-        if valid_starts <= 0:
-            # Sequence too short, mask everything
-            mask[b, :] = True
-            continue
-
-        # Sample start positions
-        starts = torch.randint(0, valid_starts, (num_masks,), device=device)
-
-        # Create spans
-        for start in starts:
-            end = min(start + mask_length, seq_len)
-            mask[b, start:end] = True
-
-    return mask
-
-
-class MaskedGuBERTEncoder(nn.Module):
-    """
-    MaskedGuBERT: Speaker-Invariant Speech Encoder with Masked Prediction
-
-    Trained with dual objectives:
-    1. Masked prediction (HuBERT-style) - forces encoding of acoustic structure
-    2. GRL speaker classification - removes speaker information
-
-    Unlike CTC-based GuBERT which requires transcriptions, this version is
-    self-supervised and can be trained on any audio data.
-
-    The resulting features capture phonetic content + prosody while being
-    speaker-agnostic - ideal for TTS and voice conversion.
-    """
-
-    def __init__(self, config: MaskedGuBERTConfig):
-        super().__init__()
-        self.config = config
-
-        # Convolutional subsampling frontend with channel dropout (Dropout1d)
-        self.conv_subsample = ConvSubsampling(
-            in_channels=config.n_mels,
-            out_channels=config.encoder_dim,
-            kernel_sizes=config.conv_kernel_sizes,
-            strides=config.conv_strides,
-            dropout=config.conv_dropout,  # Uses Dropout1d internally
-        )
-
-        # Learned mask embedding (replaces masked positions)
-        self.mask_embedding = nn.Parameter(torch.randn(config.encoder_dim) * 0.02)
-
-        # Positional encoding
-        self.pos_enc = SinusoidalPositionalEncoding(
-            d_model=config.encoder_dim,
-            max_len=config.max_seq_len,
-            dropout=config.dropout,
-        )
-
-        # Transformer encoder blocks with optional DropHead
-        self.encoder_blocks = nn.ModuleList([
-            TransformerEncoderBlock(
-                d_model=config.encoder_dim,
-                n_heads=config.num_heads,
-                d_ff=config.ff_dim,
-                dropout=config.dropout,
-                head_drop_prob=config.attention_head_drop,
-            )
-            for _ in range(config.num_layers)
-        ])
-
-        # Final layer norm
-        self.final_norm = nn.LayerNorm(config.encoder_dim)
-
-        # Feature dropout: applied to features before prediction head
-        # Helps prevent memorization by forcing prediction head to be robust
-        self.feature_dropout = nn.Dropout(config.feature_dropout) if config.feature_dropout > 0 else nn.Identity()
-
-        # Mode-specific components
-        if config.use_vq:
-            # VQ mode: discrete codebook targets
-            self.quantizer = VectorQuantizer(
-                num_codebooks=config.num_codebooks,
-                codebook_size=config.codebook_size,
-                codebook_dim=config.codebook_dim,
-                commitment_weight=config.commitment_weight,
-            )
-
-            # Projection to quantizer space (if dimensions don't match)
-            if config.encoder_dim != config.num_codebooks * config.codebook_dim:
-                self.pre_quantize_proj = nn.Linear(
-                    config.encoder_dim,
-                    config.num_codebooks * config.codebook_dim,
-                )
-            else:
-                self.pre_quantize_proj = nn.Identity()
-
-            # Prediction head: predicts codebook indices for masked positions
-            # head_dropout applied after GELU activation
-            head_dropout_layer = nn.Dropout(config.head_dropout) if config.head_dropout > 0 else nn.Identity()
-            self.prediction_head = nn.Sequential(
-                nn.Linear(config.encoder_dim, config.encoder_dim),
-                nn.GELU(),
-                head_dropout_layer,
-                nn.LayerNorm(config.encoder_dim),
-                nn.Linear(config.encoder_dim, config.num_codebooks * config.codebook_size),
-            )
-        else:
-            # Regression mode: continuous normalized targets (data2vec style)
-            self.quantizer = None
-            self.pre_quantize_proj = None
-
-            # Prediction head: predicts continuous features for masked positions
-            # head_dropout applied after GELU activation
-            head_dropout_layer = nn.Dropout(config.head_dropout) if config.head_dropout > 0 else nn.Identity()
-            self.prediction_head = nn.Sequential(
-                nn.Linear(config.encoder_dim, config.encoder_dim),
-                nn.GELU(),
-                head_dropout_layer,
-                nn.LayerNorm(config.encoder_dim),
-                nn.Linear(config.encoder_dim, config.encoder_dim),
-            )
-
-        # Speaker classifier (for GRL)
-        self.speaker_classifier = SpeakerClassifier(
-            d_model=config.encoder_dim,
-            num_speakers=config.num_speakers,
-            pooling=config.speaker_pooling,
-            dropout=config.dropout,
-        )
-
-        # Initialize weights
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights with Xavier/Kaiming initialization."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Conv1d):
-                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-
-    @classmethod
-    def from_config(cls, config_name: str, **overrides) -> "MaskedGuBERTEncoder":
-        """
-        Create model from predefined config with optional overrides.
-
-        Args:
-            config_name: One of "tiny", "small", "medium", "large"
-            **overrides: Override any config parameter
-
-        Example:
-            model = MaskedGuBERTEncoder.from_config("small", num_speakers=500)
-        """
-        if config_name not in MASKED_GUBERT_CONFIGS:
-            raise ValueError(f"Unknown config: {config_name}. Available: {list(MASKED_GUBERT_CONFIGS.keys())}")
-
-        config = MASKED_GUBERT_CONFIGS[config_name]
-        config_dict = {k: v for k, v in config.__dict__.items()}
-        config_dict.update(overrides)
-        config = MaskedGuBERTConfig(**config_dict)
-
-        return cls(config)
-
-    def get_output_length(self, input_length: int) -> int:
-        """Calculate output sequence length given input mel spectrogram length."""
-        return self.conv_subsample.get_output_length(input_length)
-
-    def _generate_targets_vq(
-        self,
-        features: torch.Tensor,
-    ) -> Tuple[torch.Tensor, dict]:
-        """
-        Generate VQ targets from unmasked (teacher) features.
-
-        Uses the features BEFORE masking to create targets, ensuring the model
-        must predict the original content from context.
-
-        Args:
-            features: [B, T, D] features before masking
-
-        Returns:
-            target_indices: [B, T, num_codebooks] quantization targets
-            quantizer_output: dict with quantizer losses
-        """
-        # Project to quantizer space
-        features_proj = self.pre_quantize_proj(features)
-
-        # Quantize to get targets
-        quantizer_output = self.quantizer(features_proj, return_indices=True)
-
-        return quantizer_output["indices"], quantizer_output
-
-    def _generate_targets_regression(
-        self,
-        features: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Generate regression targets from unmasked (teacher) features.
-
-        Uses layer normalization on detached features (data2vec style) to create
-        stable targets that don't collapse during training.
-
-        Args:
-            features: [B, T, D] features before masking
-
-        Returns:
-            targets: [B, T, D] normalized continuous targets
-        """
-        targets = features.detach()
-
-        # Apply layer normalization for stable targets (data2vec insight)
-        if self.config.target_layer_norm:
-            targets = F.layer_norm(targets, [targets.shape[-1]])
-
-        return targets
-
-    def forward(
-        self,
-        mel_spec: torch.Tensor,
-        lengths: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-        grl_alpha: float = 1.0,
-        return_all_hiddens: bool = False,
-    ) -> dict:
-        """
-        Forward pass through MaskedGuBERT encoder.
-
-        Args:
-            mel_spec: [B, n_mels, T] mel spectrogram
-            lengths: [B] original lengths before padding (optional)
-            mask: [B, T'] mask for masked prediction (True = masked)
-                  If None, generates mask automatically during training
-            grl_alpha: Gradient reversal strength (0=no reversal, 1=full reversal)
-            return_all_hiddens: If True, return hidden states from all layers
-
-        Returns:
-            dict with keys (common):
-                - features: [B, T', encoder_dim] content features
-                - speaker_logits: [B, num_speakers] for GRL loss
-                - feature_lengths: [B] output sequence lengths
-                - mask: [B, T'] the mask used
-                - all_hiddens: list of [B, T', D] if return_all_hiddens=True
-
-            VQ mode (use_vq=True):
-                - prediction_logits: [B, T', num_codebooks, codebook_size] for masked prediction
-                - target_indices: [B, T', num_codebooks] quantization targets
-                - commitment_loss: scalar VQ commitment loss
-                - codebook_loss: scalar VQ codebook loss
-
-            Regression mode (use_vq=False):
-                - predictions: [B, T', encoder_dim] predicted features
-                - targets: [B, T', encoder_dim] normalized target features
-        """
-        batch_size = mel_spec.size(0)
-
-        # Convolutional frontend
-        x = self.conv_subsample(mel_spec)  # [B, encoder_dim, T']
-        x = x.permute(0, 2, 1)  # [B, T', encoder_dim]
-
-        seq_len = x.size(1)
-
-        # Calculate output lengths and padding mask
-        feature_lengths = None
-        padding_mask = None
-        if lengths is not None:
-            feature_lengths = torch.tensor(
-                [self.get_output_length(l.item()) for l in lengths],
-                device=mel_spec.device,
-                dtype=torch.long,
-            )
-            max_len = x.size(1)
-            padding_mask = torch.arange(max_len, device=x.device).unsqueeze(0) >= feature_lengths.unsqueeze(1)
-
-        # Generate targets BEFORE masking (teacher features)
-        if self.config.use_vq:
-            target_indices, quantizer_output = self._generate_targets_vq(x.detach())
-        else:
-            targets = self._generate_targets_regression(x)
-
-        # Generate mask if not provided
-        if mask is None and self.training:
-            mask = generate_mask_spans(
-                seq_len=seq_len,
-                batch_size=batch_size,
-                mask_prob=self.config.mask_prob,
-                mask_length=self.config.mask_length,
-                min_masks=self.config.min_masks,
-                device=x.device,
-            )
-            # Don't mask padding
-            if padding_mask is not None:
-                mask = mask & ~padding_mask
-
-        # Apply masking: replace masked positions with learned embedding
-        if mask is not None and mask.any():
-            x = x.masked_fill(mask.unsqueeze(-1), 0) + \
-                self.mask_embedding.unsqueeze(0).unsqueeze(0) * mask.unsqueeze(-1).float()
-
-        # Positional encoding
-        x = self.pos_enc(x)
-
-        # Transformer encoder
-        all_hiddens = [x] if return_all_hiddens else None
-        for block in self.encoder_blocks:
-            x = block(x, key_padding_mask=padding_mask)
-            if return_all_hiddens:
-                all_hiddens.append(x)
-
-        # Store pre-norm features for VAE-friendly extraction
-        features_unnorm = x
-
-        # Final normalization
-        features = self.final_norm(x)
-
-        # Speaker classifier with gradient reversal
-        valid_mask = ~padding_mask if padding_mask is not None else None
-        reversed_features = GradientReversalFunction.apply(features, grl_alpha)
-        speaker_logits = self.speaker_classifier(reversed_features, mask=valid_mask)
-
-        # Compute feature variance regularization (for VAE-friendly features)
-        variance_loss = torch.tensor(0.0, device=features.device)
-        if self.config.use_variance_reg and self.training:
-            # Use unnormalized features for variance computation (LayerNorm constrains variance)
-            feat_for_var = features_unnorm
-
-            # Mask out padding for variance computation
-            if valid_mask is not None:
-                # valid_mask: [B, T] where True = valid position
-                feat_masked = feat_for_var * valid_mask.unsqueeze(-1).float()
-                # Count valid positions per sample
-                valid_counts = valid_mask.sum(dim=1, keepdim=True).float().clamp(min=1)
-            else:
-                feat_masked = feat_for_var
-                valid_counts = torch.tensor(feat_for_var.shape[1], device=feat_for_var.device, dtype=torch.float32)
-
-            # Temporal variance: variance across time dimension (should be high)
-            # Compute per-sample temporal mean then variance
-            if valid_mask is not None:
-                temporal_mean = feat_masked.sum(dim=1) / valid_counts  # [B, D]
-                temporal_var = ((feat_masked - temporal_mean.unsqueeze(1)) ** 2 * valid_mask.unsqueeze(-1).float()).sum(dim=1) / valid_counts
-                temporal_var = temporal_var.mean()  # Average across batch and dimensions
-            else:
-                temporal_var = feat_for_var.var(dim=1).mean()
-
-            # Penalize if temporal variance is below threshold
-            temporal_loss = F.relu(self.config.temporal_var_min - temporal_var)
-
-            # Dimension variance: variance across dimensions (should utilize all dimensions)
-            # Flatten batch and time, then compute variance per dimension
-            if valid_mask is not None:
-                # Gather only valid positions
-                valid_features = feat_for_var[valid_mask]  # [N_valid, D]
-                dim_var = valid_features.var(dim=0).mean() if valid_features.shape[0] > 1 else torch.tensor(0.0, device=features.device)
-            else:
-                dim_var = feat_for_var.reshape(-1, feat_for_var.shape[-1]).var(dim=0).mean()
-
-            # Penalize if dimension variance is below threshold
-            dim_loss = F.relu(self.config.dim_var_min - dim_var)
-
-            # Temporal smoothness penalty: compute WITHOUT dropout to get true smoothness
-            # This prevents the model from hiding behind dropout noise during training
-            # We re-forward through transformer with model in eval mode (disables all dropout)
-            was_training = self.training
-            self.eval()  # Disable all dropout, batchnorm stats, etc.
-
-            # Re-forward through transformer to get clean features (with gradients)
-            # Note: even in eval mode, gradients still flow (no torch.no_grad)
-            x_clean = self.conv_subsample(mel_spec)  # [B, encoder_dim, T']
-            x_clean = x_clean.permute(0, 2, 1)  # [B, T', encoder_dim]
-            x_clean = self.pos_enc(x_clean)
-            for block in self.encoder_blocks:
-                x_clean = block(x_clean, key_padding_mask=padding_mask)
-
-            # Restore training mode
-            if was_training:
-                self.train()
-
-            # Compute temporal smoothness on clean (no-dropout) features
-            feat_for_smooth = x_clean  # Pre-LayerNorm, no dropout
-            feat_t = feat_for_smooth[:, 1:, :]  # [B, T-1, D]
-            feat_t_minus_1 = feat_for_smooth[:, :-1, :]  # [B, T-1, D]
-            temporal_smoothness = F.cosine_similarity(feat_t, feat_t_minus_1, dim=-1)  # [B, T-1]
-
-            # Mask out padding positions for smoothness calculation
-            if valid_mask is not None:
-                # valid_mask[:, 1:] AND valid_mask[:, :-1] = both positions valid
-                smooth_mask = valid_mask[:, 1:] & valid_mask[:, :-1]
-                temporal_smoothness = (temporal_smoothness * smooth_mask.float()).sum() / smooth_mask.sum().clamp(min=1)
-            else:
-                temporal_smoothness = temporal_smoothness.mean()
-
-            # Penalize if smoothness exceeds max threshold
-            smoothness_loss = F.relu(temporal_smoothness - self.config.temporal_smoothness_max)
-
-            variance_loss = (
-                self.config.temporal_var_weight * temporal_loss +
-                self.config.dim_var_weight * dim_loss +
-                self.config.temporal_smoothness_weight * smoothness_loss
-            )
-
-        # Build result dictionary
-        result = {
-            "features": features,
-            "features_unnorm": features_unnorm,  # Pre-LayerNorm features for VAE extraction
-            "speaker_logits": speaker_logits,
-            "feature_lengths": feature_lengths,
-            "mask": mask,
-            "variance_loss": variance_loss,
-            # Metrics for logging (only present when variance_reg is enabled)
-            "temporal_smoothness": temporal_smoothness if self.config.use_variance_reg and self.training else None,
-        }
-
-        # Apply feature dropout before prediction head (helps prevent memorization)
-        features_for_pred = self.feature_dropout(features)
-
-        if self.config.use_vq:
-            # VQ mode: return logits and indices for cross-entropy
-            prediction_logits = self.prediction_head(features_for_pred)  # [B, T', num_codebooks * codebook_size]
-            prediction_logits = prediction_logits.view(
-                batch_size, seq_len, self.config.num_codebooks, self.config.codebook_size
-            )
-            result["prediction_logits"] = prediction_logits
-            result["target_indices"] = target_indices
-            result["commitment_loss"] = quantizer_output["commitment_loss"]
-            result["codebook_loss"] = quantizer_output["codebook_loss"]
-        else:
-            # Regression mode: return continuous predictions and targets
-            predictions = self.prediction_head(features_for_pred)  # [B, T', encoder_dim]
-            result["predictions"] = predictions
-            result["targets"] = targets
-
-        if return_all_hiddens:
-            result["all_hiddens"] = all_hiddens
-
-        return result
-
-    def extract_features(
-        self,
-        mel_spec: torch.Tensor,
-        lengths: Optional[torch.Tensor] = None,
-        layer: int = -1,
-        normalize: bool = True,
-        layers: Optional[list] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Extract features without masking or computing prediction heads.
-        Useful for inference after training.
-
-        Args:
-            mel_spec: [B, n_mels, T]
-            lengths: [B] optional lengths
-            layer: Which layer to extract from (-1 = final). Ignored if `layers` is provided.
-            normalize: If True, apply final LayerNorm. If False, return raw pre-norm features
-                       (more dynamic range, better for VAE training).
-            layers: Optional list of layer indices for multi-scale features.
-                    If provided, concatenates features from specified layers.
-                    Example: [-1, -3, -5] extracts from last, third-to-last, fifth-to-last layers.
-                    Each intermediate layer is NOT normalized; only final layer uses normalize flag.
-
-        Returns:
-            features: [B, T', encoder_dim] or [B, T', encoder_dim * len(layers)] if multi-scale
-            feature_lengths: [B] or None
-        """
-        was_training = self.training
-        self.eval()  # Temporarily set to eval mode to skip mask generation
-
-        # Determine if we need all hidden states
-        need_all_hiddens = (layer != -1) or (layers is not None)
-
-        with torch.no_grad():
-            # Forward without mask (mask=None + eval mode = no masking)
-            result = self.forward(
-                mel_spec,
-                lengths=lengths,
-                mask=None,  # No mask for feature extraction
-                grl_alpha=0.0,  # No gradient reversal for inference
-                return_all_hiddens=need_all_hiddens,
-            )
-
-        if was_training:
-            self.train()  # Restore training mode
-
-        # Multi-scale feature extraction
-        if layers is not None:
-            all_hiddens = result["all_hiddens"]  # List of [B, T', D] from each layer
-            num_layers = len(all_hiddens)
-
-            multi_scale_features = []
-            for l in layers:
-                # Convert negative indices to positive
-                layer_idx = l if l >= 0 else num_layers + l
-                layer_idx = max(0, min(layer_idx, num_layers - 1))
-
-                layer_features = all_hiddens[layer_idx]
-
-                # Only apply normalization to the final layer if requested
-                if l == -1 and normalize:
-                    layer_features = self.final_norm(layer_features)
-
-                multi_scale_features.append(layer_features)
-
-            # Concatenate along feature dimension: [B, T', D * num_layers]
-            features = torch.cat(multi_scale_features, dim=-1)
-
-        elif layer == -1:
-            # Use normalized or unnormalized features based on flag
-            if normalize:
-                features = result["features"]  # Already normalized in forward()
-            else:
-                features = result["features_unnorm"]  # Pre-LayerNorm features
-        else:
-            features = result["all_hiddens"][layer]
-
-        return features, result["feature_lengths"]
-
-    def compute_masked_prediction_loss(
-        self,
-        forward_output: dict,
-    ) -> torch.Tensor:
-        """
-        Compute the masked prediction loss from forward output.
-
-        For VQ mode: cross-entropy over codebook indices
-        For regression mode: smooth L1 / MSE / Huber over continuous features
-
-        Args:
-            forward_output: Output dict from forward() call
-
-        Returns:
-            loss: Scalar loss tensor
-        """
-        mask = forward_output["mask"]
-
-        if mask is None or not mask.any():
-            # No masked positions - return zero loss
-            device = forward_output["features"].device
-            return torch.tensor(0.0, device=device, requires_grad=True)
-
-        if self.config.use_vq:
-            # VQ mode: cross-entropy loss
-            prediction_logits = forward_output["prediction_logits"]  # [B, T, G, K]
-            target_indices = forward_output["target_indices"]  # [B, T, G]
-
-            # Flatten for cross-entropy: [B*T*G, K] vs [B*T*G]
-            B, T, G, K = prediction_logits.shape
-            logits_flat = prediction_logits.view(-1, K)  # [B*T*G, K]
-            targets_flat = target_indices.view(-1)  # [B*T*G]
-
-            # Expand mask to match codebook dimension: [B, T] -> [B*T*G]
-            mask_expanded = mask.unsqueeze(-1).expand(-1, -1, G).reshape(-1)
-
-            # Only compute loss on masked positions
-            loss = F.cross_entropy(
-                logits_flat[mask_expanded],
-                targets_flat[mask_expanded],
-                reduction="mean",
-            )
-
-            # Add VQ losses
-            loss = loss + self.config.commitment_weight * forward_output["commitment_loss"]
-            loss = loss + forward_output["codebook_loss"]
-
-        else:
-            # Regression mode: continuous loss
-            predictions = forward_output["predictions"]  # [B, T, D]
-            targets = forward_output["targets"]  # [B, T, D]
-
-            # Get masked predictions and targets
-            masked_preds = predictions[mask]  # [N_masked, D]
-            masked_targets = targets[mask]  # [N_masked, D]
-
-            # Compute loss based on configured type
-            if self.config.regression_loss_type == "smooth_l1":
-                loss = F.smooth_l1_loss(masked_preds, masked_targets, reduction="mean")
-            elif self.config.regression_loss_type == "mse":
-                loss = F.mse_loss(masked_preds, masked_targets, reduction="mean")
-            elif self.config.regression_loss_type == "huber":
-                loss = F.huber_loss(masked_preds, masked_targets, reduction="mean", delta=1.0)
-            else:
-                raise ValueError(f"Unknown regression loss type: {self.config.regression_loss_type}")
-
-        return loss
-
-    def get_num_params(self, trainable_only: bool = True) -> int:
-        """Count number of parameters."""
-        if trainable_only:
-            return sum(p.numel() for p in self.parameters() if p.requires_grad)
-        return sum(p.numel() for p in self.parameters())
-
-
-def create_masked_gubert(
-    config: str = "small",
-    num_speakers: int = 992,
-    **kwargs,
-) -> MaskedGuBERTEncoder:
-    """
-    Convenience function to create a MaskedGuBERT model.
-
-    Args:
-        config: Model size ("tiny", "small", "medium", "large")
-        num_speakers: Number of speakers for GRL classifier
-        **kwargs: Additional config overrides
-
-    Returns:
-        MaskedGuBERTEncoder model
-    """
-    return MaskedGuBERTEncoder.from_config(
-        config,
-        num_speakers=num_speakers,
         **kwargs,
     )

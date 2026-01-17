@@ -28,17 +28,20 @@ Then merge multiple datasets with:
 """
 
 import os
+import io
 import json
 import argparse
 import time
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Literal
 
+import requests
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from datasets import load_dataset, Audio
 from transformers import AutoTokenizer
+from PIL import Image
 
 from dataset_loading.audio_loading import extract_mels, remove_mains_hum
 from utils.audio_utils import SharedWindowBuffer
@@ -61,6 +64,84 @@ SPECIAL_TOKENS = {
 
 
 ModalityType = Literal["text_only", "text_audio", "text_voice", "text_image"]
+
+
+# URL fetching timeout and headers
+URL_FETCH_TIMEOUT = 30
+URL_FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; WorldModelPreprocessor/1.0)"
+}
+
+
+def fetch_image_from_url(url: str, image_size: int) -> Optional[torch.Tensor]:
+    """
+    Fetch an image from a URL and return as a normalized tensor.
+
+    Args:
+        url: URL to fetch image from
+        image_size: Target size for resize/crop
+
+    Returns:
+        Tensor [3, H, W] normalized to [-1, 1], or None if fetch fails
+    """
+    from torchvision import transforms
+
+    try:
+        response = requests.get(url, timeout=URL_FETCH_TIMEOUT, headers=URL_FETCH_HEADERS)
+        response.raise_for_status()
+
+        image = Image.open(io.BytesIO(response.content))
+        image = image.convert("RGB")
+
+        transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+        return transform(image)
+
+    except Exception as e:
+        print(f"Failed to fetch image from {url}: {e}")
+        return None
+
+
+def fetch_audio_from_url(url: str, sample_rate: int) -> Optional[torch.Tensor]:
+    """
+    Fetch audio from a URL and return as a waveform tensor.
+
+    Args:
+        url: URL to fetch audio from
+        sample_rate: Target sample rate for resampling
+
+    Returns:
+        Tensor [num_samples] waveform, or None if fetch fails
+    """
+    try:
+        import soundfile as sf
+
+        response = requests.get(url, timeout=URL_FETCH_TIMEOUT, headers=URL_FETCH_HEADERS)
+        response.raise_for_status()
+
+        # Read audio from bytes
+        audio_data, file_sr = sf.read(io.BytesIO(response.content))
+
+        # Convert to mono if stereo
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data.mean(axis=1)
+
+        waveform = torch.tensor(audio_data, dtype=torch.float32)
+
+        # Resample if needed
+        if file_sr != sample_rate:
+            import torchaudio.functional as F_audio
+            waveform = F_audio.resample(waveform.unsqueeze(0), file_sr, sample_rate).squeeze(0)
+
+        return waveform
+
+    except Exception as e:
+        print(f"Failed to fetch audio from {url}: {e}")
+        return None
 
 
 @dataclass
@@ -474,6 +555,8 @@ def main():
                         help="Column name for audio (for audio/voice modalities)")
     parser.add_argument("--image_column", type=str, default="image",
                         help="Column name for image")
+    parser.add_argument("--url_column", type=str, default=None,
+                        help="Column name for URLs (if provided, fetches image/audio from URL instead of direct data)")
 
     # Modality
     parser.add_argument("--modality", type=str, required=True,
@@ -481,7 +564,7 @@ def main():
                         help="Modality type to process")
 
     # Tokenizer
-    parser.add_argument("--tokenizer", type=str, default="meta-llama/Llama-3.2-1B",
+    parser.add_argument("--tokenizer", type=str, default="mistralai/mistral-7b-v0.1",
                         help="HuggingFace tokenizer name")
 
     # Multi-GPU
@@ -558,6 +641,8 @@ def main():
     print(f"World Model Dataset Preprocessing")
     print(f"==================================")
     print(f"Modality: {args.modality}")
+    if args.url_column:
+        print(f"URL column: {args.url_column} (fetching media from URLs)")
     print(f"GPU {args.gpu_id}/{args.total_gpus}")
     print(f"Output: {output_dir}")
     print()
@@ -573,8 +658,8 @@ def main():
     else:
         dataset = load_dataset(args.dataset_name, split=args.split, **load_kwargs)
 
-    # Cast audio column if needed
-    if args.modality in ["text_audio", "text_voice"]:
+    # Cast audio column if needed (skip if using URL column)
+    if args.modality in ["text_audio", "text_voice"] and not args.url_column:
         dataset = dataset.cast_column(args.audio_column, Audio(sampling_rate=args.sample_rate))
 
     print(f"  Total samples in dataset: {len(dataset):,}")
@@ -615,6 +700,7 @@ def main():
         "saved": 0,
         "skipped_silent": 0,
         "skipped_no_text": 0,
+        "skipped_url_fetch": 0,
         "skipped_error": 0,
     }
 
@@ -707,8 +793,21 @@ def main():
                 batch_data.append((None, text))
 
             elif args.modality in ["text_audio", "text_voice"]:
-                audio = example[args.audio_column]
-                waveform = torch.tensor(audio["array"], dtype=torch.float32)
+                # Fetch audio from URL or use direct data
+                if args.url_column:
+                    url = example.get(args.url_column)
+                    if not url:
+                        stats["skipped_url_fetch"] += 1
+                        pbar.update(1)
+                        continue
+                    waveform = fetch_audio_from_url(url, args.sample_rate)
+                    if waveform is None:
+                        stats["skipped_url_fetch"] += 1
+                        pbar.update(1)
+                        continue
+                else:
+                    audio = example[args.audio_column]
+                    waveform = torch.tensor(audio["array"], dtype=torch.float32)
 
                 # Skip silent audio
                 if waveform.abs().max() < args.min_audio_energy or waveform.std() < args.min_audio_std:
@@ -728,19 +827,32 @@ def main():
                 batch_data.append((waveform, text))
 
             elif args.modality == "text_image":
-                image = example[args.image_column]
-                # Assume image is already a tensor or PIL Image
-                if not isinstance(image, torch.Tensor):
-                    from torchvision import transforms
-                    transform = transforms.Compose([
-                        transforms.Resize(args.image_size),
-                        transforms.CenterCrop(args.image_size),
-                        transforms.ToTensor(),
-                        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-                    ])
-                    if hasattr(image, 'convert'):
-                        image = image.convert('RGB')
-                    image = transform(image)
+                # Fetch image from URL or use direct data
+                if args.url_column:
+                    url = example.get(args.url_column)
+                    if not url:
+                        stats["skipped_url_fetch"] += 1
+                        pbar.update(1)
+                        continue
+                    image = fetch_image_from_url(url, args.image_size)
+                    if image is None:
+                        stats["skipped_url_fetch"] += 1
+                        pbar.update(1)
+                        continue
+                else:
+                    image = example[args.image_column]
+                    # Assume image is already a tensor or PIL Image
+                    if not isinstance(image, torch.Tensor):
+                        from torchvision import transforms
+                        transform = transforms.Compose([
+                            transforms.Resize(args.image_size),
+                            transforms.CenterCrop(args.image_size),
+                            transforms.ToTensor(),
+                            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                        ])
+                        if hasattr(image, 'convert'):
+                            image = image.convert('RGB')
+                        image = transform(image)
 
                 batch_data.append((image, text))
 
@@ -812,6 +924,8 @@ def main():
     print(f"  Saved: {stats['saved']:,} (with duplication for paired modalities)")
     print(f"  Skipped (silent): {stats['skipped_silent']:,}")
     print(f"  Skipped (no text): {stats['skipped_no_text']:,}")
+    if args.url_column:
+        print(f"  Skipped (URL fetch): {stats['skipped_url_fetch']:,}")
     print(f"  Skipped (error): {stats['skipped_error']:,}")
     print(f"  Time: {elapsed/60:.1f} minutes")
     print(f"  Speed: {stats['saved']/elapsed:.1f} samples/sec")

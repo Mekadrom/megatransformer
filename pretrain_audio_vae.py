@@ -2575,6 +2575,10 @@ def main():
     # Speaker info is then re-injected via FiLM conditioning only
     instance_norm_latents = unk_dict.get("instance_norm_latents", "false").lower() == "true"
 
+    # Instance normalization on input mel spectrogram for speaker-invariant features
+    # Normalizes each mel bin across time (like CMVN), stripping per-utterance speaker statistics
+    use_input_instance_norm = unk_dict.get("use_input_instance_norm", "false").lower() == "true"
+
     # GRL (Gradient Reversal Layer) speaker disentanglement settings
     # Trains a speaker classifier on latents with reversed gradients, encouraging encoder
     # to produce latents that are speaker-agnostic
@@ -2627,6 +2631,7 @@ def main():
         free_bits=free_bits,
         speaker_embedding_dropout=speaker_embedding_dropout,
         instance_norm_latents=instance_norm_latents,
+        use_input_instance_norm=use_input_instance_norm,
     )
 
     # Try to load existing checkpoint
