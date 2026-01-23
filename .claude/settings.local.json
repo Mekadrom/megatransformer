@@ -1,17 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch",
-      "Bash(pip show:*)",
-      "Bash(grep:*)",
-      "Bash(tree:*)",
-      "Bash(cat:*)",
-      "Bash(ls:*)",
-      "Bash(wc:*)",
-      "Bash(find:*)",
-      "WebFetch(domain:raw.githubusercontent.com)"
-    ],
-    "deny": [],
-    "ask": []
+      "Bash(find:*)"
+    ]
   }
 }
