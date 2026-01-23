@@ -1,0 +1,20 @@
+
+# Special token IDs (base vocab = 32000 from Mistral tokenizer)
+BOA_TOKEN_ID = 32_000  # Begin of Audio
+EOA_TOKEN_ID = 32_001  # End of Audio
+BOV_TOKEN_ID = 32_002  # Begin of Voice
+EOV_TOKEN_ID = 32_003  # End of Voice
+BOI_TOKEN_ID = 32_004  # Begin of Image
+EOI_TOKEN_ID = 32_005  # End of Image
+AUDIO_PLACEHOLDER_TOKEN_ID = 32_006
+VOICE_PLACEHOLDER_TOKEN_ID = 32_007
+IMAGE_PLACEHOLDER_TOKEN_ID = 32_008
+
+BEGIN_AUDIO_TOKEN = "<|AUDIO|>"
+END_AUDIO_TOKEN = "<|/AUDIO|>"
+
+BEGIN_VOICE_TOKEN = "<|VOICE|>"
+END_VOICE_TOKEN = "<|/VOICE|>"
+
+BEGIN_IMAGE_TOKEN = "<|IMAGE|>"
+END_IMAGE_TOKEN = "<|/IMAGE|>"
