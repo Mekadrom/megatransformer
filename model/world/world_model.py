@@ -1,4 +1,4 @@
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -342,11 +342,17 @@ class MegatransformerWorldModel(nn.Module):
 
         Returns:
             Dictionary containing:
-            - "generated_token_ids": Generated text token IDs
-            - "text_logits": Logits for text tokens
-            - "audio_latent_preds": Generated audio latents (if any)
-            - "voice_latent_preds": Generated voice latents (if any)
-            - "image_latent_preds": Generated image latents (if any)
+            - "generated_token_ids": Generated text token IDs, shape (batch, seq_len)
+            - "text_logits": Logits for text tokens, shape (batch, seq_len, vocab_size)
+            - "audio_latent_preds": Padded tensor of shape (batch, max_n_audio, C, H, max_T)
+            - "audio_counts": Number of audio clips per batch item, shape (batch,)
+            - "audio_lengths": Actual time length of each audio, shape (batch, max_n_audio).
+                Use these lengths to slice before VAE decoding to avoid decoding padding.
+            - "voice_latent_preds": Padded tensor of shape (batch, max_n_voice, C, H, max_T)
+            - "voice_counts": Number of voice clips per batch item, shape (batch,)
+            - "voice_lengths": Actual time length of each voice, shape (batch, max_n_voice)
+            - "image_latent_preds": Padded tensor of shape (batch, max_n_image, C, H, W)
+            - "image_counts": Number of images per batch item, shape (batch,)
             - Decoded outputs if decode_outputs=True
         """
         batch_size = text_input_ids.shape[0]
@@ -362,7 +368,7 @@ class MegatransformerWorldModel(nn.Module):
         generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
         all_logits: List[torch.Tensor] = []
 
-        # Track modality sequences being built
+        # Track modality sequences being built (current in-progress sequence)
         audio_sequences: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         voice_sequences: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         image_sequences: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
@@ -371,10 +377,10 @@ class MegatransformerWorldModel(nn.Module):
         # None = text, "audio", "voice", "image"
         current_modality: List[Optional[str]] = [None for _ in range(batch_size)]
 
-        # Completed modality outputs
-        completed_audio: List[Optional[torch.Tensor]] = [None for _ in range(batch_size)]
-        completed_voice: List[Optional[torch.Tensor]] = [None for _ in range(batch_size)]
-        completed_image: List[Optional[torch.Tensor]] = [None for _ in range(batch_size)]
+        # Completed modality outputs (list of tensors per batch item to support multiple media)
+        completed_audio: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+        completed_voice: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+        completed_image: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
 
         # Process initial prompt
         # Get embeddings for prompt
@@ -445,7 +451,9 @@ class MegatransformerWorldModel(nn.Module):
                             audio_hidden,
                             decode_to_mel=decode_outputs,
                         )
-                        completed_audio[b] = audio_out.get("audio_latent_preds")
+                        audio_pred = audio_out.get("audio_latent_preds")
+                        if audio_pred is not None:
+                            completed_audio[b].append(audio_pred)
                         audio_sequences[b] = []
                     # Embed EOA token
                     token_embed = self.text_feature_extractor(
@@ -462,7 +470,9 @@ class MegatransformerWorldModel(nn.Module):
                             voice_hidden,
                             decode_to_mel=decode_outputs,
                         )
-                        completed_voice[b] = voice_out.get("voice_latent_preds")
+                        voice_pred = voice_out.get("voice_latent_preds")
+                        if voice_pred is not None:
+                            completed_voice[b].append(voice_pred)
                         voice_sequences[b] = []
                     token_embed = self.text_feature_extractor(
                         torch.tensor([[token_id]], device=device)
@@ -478,7 +488,9 @@ class MegatransformerWorldModel(nn.Module):
                             image_hidden,
                             decode_to_image=decode_outputs,
                         )
-                        completed_image[b] = image_out.get("image_latent_preds")
+                        image_pred = image_out.get("image_latent_preds")
+                        if image_pred is not None:
+                            completed_image[b].append(image_pred)
                         image_sequences[b] = []
                     token_embed = self.text_feature_extractor(
                         torch.tensor([[token_id]], device=device)
@@ -543,16 +555,32 @@ class MegatransformerWorldModel(nn.Module):
         outputs["text_logits"] = torch.cat(all_logits, dim=1)  # (batch, seq, vocab)
 
         # Collect completed modality outputs
-        # Note: These may be None for some batch items if no modality was generated
-        if any(a is not None for a in completed_audio):
-            # Stack non-None audio outputs (with padding if needed)
-            outputs["audio_latent_preds"] = self._stack_optional_tensors(completed_audio, device)
+        # Stack into padded tensors with counts and lengths for proper unpadding before VAE decoding
+        # Audio/voice: variable time dimension needs lengths
+        # Image: fixed spatial size, just needs counts
+        if any(len(audios) > 0 for audios in completed_audio):
+            stacked, counts, lengths = self._stack_variable_length_media(
+                completed_audio, device, time_dim=-1
+            )
+            outputs["audio_latent_preds"] = stacked  # (batch, max_n, C, H, max_T)
+            outputs["audio_counts"] = counts  # (batch,)
+            outputs["audio_lengths"] = lengths  # (batch, max_n)
 
-        if any(v is not None for v in completed_voice):
-            outputs["voice_latent_preds"] = self._stack_optional_tensors(completed_voice, device)
+        if any(len(voices) > 0 for voices in completed_voice):
+            stacked, counts, lengths = self._stack_variable_length_media(
+                completed_voice, device, time_dim=-1
+            )
+            outputs["voice_latent_preds"] = stacked  # (batch, max_n, C, H, max_T)
+            outputs["voice_counts"] = counts  # (batch,)
+            outputs["voice_lengths"] = lengths  # (batch, max_n)
 
-        if any(i is not None for i in completed_image):
-            outputs["image_latent_preds"] = self._stack_optional_tensors(completed_image, device)
+        if any(len(images) > 0 for images in completed_image):
+            stacked, counts, lengths = self._stack_variable_length_media(
+                completed_image, device, time_dim=None  # Images have fixed spatial size
+            )
+            outputs["image_latent_preds"] = stacked  # (batch, max_n, C, H, W)
+            outputs["image_counts"] = counts  # (batch,)
+            # No lengths needed for images since spatial dims are fixed
 
         return outputs
 
@@ -614,6 +642,94 @@ class MegatransformerWorldModel(nn.Module):
                 result.append(t)
 
         return torch.stack(result, dim=0)
+
+    def _stack_variable_length_media(
+        self,
+        media_lists: List[List[torch.Tensor]],
+        device: torch.device,
+        time_dim: Optional[int] = -1,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Stack variable-length media tensors into a padded batch tensor.
+
+        Args:
+            media_lists: List of lists, where media_lists[b] contains tensors for batch item b.
+                Each tensor has shape (C, H, T) for audio/voice or (C, H, W) for images.
+            device: Device for output tensors.
+            time_dim: Dimension that varies in length (-1 for audio/voice time dim).
+                If None, assumes fixed size (images) and no length tracking needed.
+
+        Returns:
+            Tuple of:
+            - stacked: Padded tensor of shape (batch, max_n, C, H, max_T) or (batch, max_n, C, H, W)
+            - counts: Tensor of shape (batch,) with number of media per batch item
+            - lengths: Tensor of shape (batch, max_n) with actual length of each media along time_dim.
+                For fixed-size media (time_dim=None), returns zeros.
+        """
+        batch_size = len(media_lists)
+        counts = torch.tensor([len(m) for m in media_lists], dtype=torch.long, device=device)
+        max_n = max(len(m) for m in media_lists) if any(media_lists) else 0
+
+        if max_n == 0:
+            # No media generated
+            return (
+                torch.tensor([], device=device),
+                counts,
+                torch.zeros(batch_size, 0, dtype=torch.long, device=device),
+            )
+
+        # Find reference tensor for shape and compute max length along time_dim
+        ref_tensor = None
+        max_time = 0
+        all_lengths = []
+
+        for b in range(batch_size):
+            batch_lengths = []
+            for tensor in media_lists[b]:
+                if ref_tensor is None:
+                    ref_tensor = tensor
+                if time_dim is not None:
+                    length = tensor.shape[time_dim]
+                    max_time = max(max_time, length)
+                    batch_lengths.append(length)
+                else:
+                    batch_lengths.append(0)  # Fixed size, no length tracking
+            # Pad batch_lengths to max_n
+            while len(batch_lengths) < max_n:
+                batch_lengths.append(0)
+            all_lengths.append(batch_lengths)
+
+        lengths = torch.tensor(all_lengths, dtype=torch.long, device=device)  # (batch, max_n)
+
+        # Determine output shape
+        if time_dim is not None:
+            # Variable length (audio/voice): pad time dimension
+            # ref_tensor shape: (C, H, T) -> output: (batch, max_n, C, H, max_T)
+            base_shape = list(ref_tensor.shape)
+            base_shape[time_dim] = max_time
+            output_shape = [batch_size, max_n] + base_shape
+        else:
+            # Fixed size (images): no padding needed
+            # ref_tensor shape: (C, H, W) -> output: (batch, max_n, C, H, W)
+            output_shape = [batch_size, max_n] + list(ref_tensor.shape)
+
+        stacked = torch.zeros(output_shape, dtype=ref_tensor.dtype, device=device)
+
+        # Fill in the tensors
+        for b in range(batch_size):
+            for n, tensor in enumerate(media_lists[b]):
+                if time_dim is not None:
+                    # Pad along time dimension
+                    length = tensor.shape[time_dim]
+                    # Create slice for the time dimension
+                    slices = [slice(None)] * tensor.dim()
+                    slices[time_dim] = slice(0, length)
+                    # stacked[b, n, :, :, :length] = tensor
+                    stacked[b, n][tuple(slices)] = tensor
+                else:
+                    stacked[b, n] = tensor
+
+        return stacked, counts, lengths
 
 
 def get_wm_config(

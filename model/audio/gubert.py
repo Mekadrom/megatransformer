@@ -692,11 +692,16 @@ class GuBERTConfig:
     # factor=1: no upsampling (default), factor=2: 2x more CTC frames, etc.
     ctc_upsample_factor: int = 1
 
+    speaker_classifier_hidden_dim: Optional[int] = None
+
     def __post_init__(self):
         if self.conv_kernel_sizes is None:
             self.conv_kernel_sizes = [7, 3, 3]  # Larger first kernel for more acoustic context
         if self.conv_strides is None:
             self.conv_strides = [2, 2, 1]  # 4x downsampling
+
+        if self.speaker_classifier_hidden_dim is None:
+            self.speaker_classifier_hidden_dim = self.encoder_dim * 2
 
     def to_dict(self) -> dict:
         """Convert config to dictionary (for HuggingFace compatibility)."""
@@ -727,7 +732,7 @@ GUBERT_CONFIGS = {
         ff_dim=512,
         dropout=0.1,
     ),
-    # ~9.6M params - balanced speed/quality
+    # ~9.6M params w/ macaron and swiglu, ~3.7M w/o
     "small": GuBERTConfig(
         encoder_dim=256,
         num_layers=4,
@@ -735,7 +740,7 @@ GUBERT_CONFIGS = {
         ff_dim=1024,
         dropout=0.1,
     ),
-    # ~30M params
+    # ~30M params w/ macaron and swiglu, ~11M w/o
     "small_deep": GuBERTConfig(
         encoder_dim=256,
         num_layers=12,
@@ -743,7 +748,7 @@ GUBERT_CONFIGS = {
         ff_dim=1152,
         dropout=0.1,
     ),
-    # ~15M params - good quality
+    # ~32M params w/ macaron and swiglu, ~11M w/o
     "medium": GuBERTConfig(
         encoder_dim=384,
         num_layers=6,
@@ -751,10 +756,26 @@ GUBERT_CONFIGS = {
         ff_dim=1536,
         dropout=0.1,
     ),
-    # ~30M params - high quality
+    # ~61M params w/ macaron and swiglu, ~23M w/o
+    "medium_deep": GuBERTConfig(
+        encoder_dim=384,
+        num_layers=12,
+        num_heads=6,
+        ff_dim=1536,
+        dropout=0.1,
+    ),
+    # ~74M params w/ macaron and swiglu, ~27M w/o
     "large": GuBERTConfig(
         encoder_dim=512,
         num_layers=8,
+        num_heads=8,
+        ff_dim=2048,
+        dropout=0.1,
+    ),
+    # 110M params w/ macaron and swiglu, ~40M w/o
+    "large_deep": GuBERTConfig(
+        encoder_dim=512,
+        num_layers=12,
         num_heads=8,
         ff_dim=2048,
         dropout=0.1,
@@ -846,7 +867,7 @@ class GuBERTEncoder(nn.Module):
         self.speaker_classifier = SpeakerClassifier(
             d_model=config.encoder_dim,
             num_speakers=config.num_speakers,
-            hidden_dim=config.encoder_dim * 2,
+            hidden_dim=config.speaker_classifier_hidden_dim,
             pooling=config.speaker_pooling,
             dropout=config.dropout,
         )

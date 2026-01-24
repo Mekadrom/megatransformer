@@ -731,9 +731,11 @@ class WorldModelTrainer(Trainer):
 
         The world model returns losses for each modality present in the batch:
         - text_classification_loss: Cross-entropy loss for text tokens
-        - audio_latent_loss: L1/MSE loss for audio latent reconstruction
-        - voice_latent_loss: L1/MSE loss for voice latent reconstruction
-        - image_latent_loss: L1/MSE loss for image latent reconstruction
+        - audio_latent_l1_loss / audio_latent_mse_loss: Latent reconstruction losses for audio
+        - voice_latent_l1_loss / voice_latent_mse_loss: Latent reconstruction losses for voice
+        - image_latent_l1_loss / image_latent_mse_loss: Latent reconstruction losses for image
+
+        We use L1 loss as the primary loss for latent reconstruction.
         """
         # Prepare inputs for the model
         model_inputs = {
@@ -786,26 +788,32 @@ class WorldModelTrainer(Trainer):
             n_losses += 1
             self._current_losses["text_loss"] = text_loss.detach().item()
 
-        # Audio loss
-        if "audio_latent_loss" in outputs and outputs["audio_latent_loss"] is not None:
-            audio_loss = outputs["audio_latent_loss"] * self.audio_loss_weight
+        # Audio loss (codas return audio_latent_l1_loss and audio_latent_mse_loss)
+        if "audio_latent_l1_loss" in outputs and outputs["audio_latent_l1_loss"] is not None:
+            audio_loss = outputs["audio_latent_l1_loss"] * self.audio_loss_weight
             total_loss = total_loss + audio_loss
             n_losses += 1
             self._current_losses["audio_loss"] = audio_loss.detach().item()
+            if "audio_latent_mse_loss" in outputs:
+                self._current_losses["audio_mse_loss"] = outputs["audio_latent_mse_loss"].detach().item()
 
-        # Voice loss
-        if "voice_latent_loss" in outputs and outputs["voice_latent_loss"] is not None:
-            voice_loss = outputs["voice_latent_loss"] * self.voice_loss_weight
+        # Voice loss (codas return voice_latent_l1_loss and voice_latent_mse_loss)
+        if "voice_latent_l1_loss" in outputs and outputs["voice_latent_l1_loss"] is not None:
+            voice_loss = outputs["voice_latent_l1_loss"] * self.voice_loss_weight
             total_loss = total_loss + voice_loss
             n_losses += 1
             self._current_losses["voice_loss"] = voice_loss.detach().item()
+            if "voice_latent_mse_loss" in outputs:
+                self._current_losses["voice_mse_loss"] = outputs["voice_latent_mse_loss"].detach().item()
 
-        # Image loss
-        if "image_latent_loss" in outputs and outputs["image_latent_loss"] is not None:
-            image_loss = outputs["image_latent_loss"] * self.image_loss_weight
+        # Image loss (codas return image_latent_l1_loss and image_latent_mse_loss)
+        if "image_latent_l1_loss" in outputs and outputs["image_latent_l1_loss"] is not None:
+            image_loss = outputs["image_latent_l1_loss"] * self.image_loss_weight
             total_loss = total_loss + image_loss
             n_losses += 1
             self._current_losses["image_loss"] = image_loss.detach().item()
+            if "image_latent_mse_loss" in outputs:
+                self._current_losses["image_mse_loss"] = outputs["image_latent_mse_loss"].detach().item()
 
         # Average across modalities if multiple present
         if n_losses > 0:

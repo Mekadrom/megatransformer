@@ -511,27 +511,6 @@ class VAE(nn.Module):
 
         return recon_x, mu, logvar, losses
 
-    def compute_stft_loss(self, pred_waveform: torch.Tensor, target_waveform: torch.Tensor) -> dict:
-        """
-        Compute multi-resolution STFT loss for audio.
-
-        This should be called externally when waveforms are available (e.g., after vocoder).
-        Returns dict with spectral convergence, magnitude, and complex STFT losses.
-        """
-        if self.stft_loss is None:
-            return {
-                "stft_sc_loss": torch.tensor(0.0, device=pred_waveform.device),
-                "stft_mag_loss": torch.tensor(0.0, device=pred_waveform.device),
-                "stft_complex_loss": torch.tensor(0.0, device=pred_waveform.device),
-            }
-
-        sc_loss, mag_loss, complex_loss = self.stft_loss(pred_waveform, target_waveform)
-        return {
-            "stft_sc_loss": sc_loss,
-            "stft_mag_loss": mag_loss,
-            "stft_complex_loss": complex_loss,
-        }
-
     def reconstruct_with_attention(
         self,
         x: torch.Tensor,

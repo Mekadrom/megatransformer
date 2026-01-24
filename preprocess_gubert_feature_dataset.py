@@ -10,6 +10,10 @@ Produces sharded datasets containing:
     - Multi-layer: [num_layers, encoder_dim, T'] (layers stored separately for VAE to normalize)
 - feature_lengths: Original lengths before padding
 - speaker_embeddings: Optional speaker embeddings for decoder conditioning
+- mel_specs: [n_mels, T] mel spectrograms
+- mel_lengths: Original mel lengths before padding
+- f0: [T] log F0 contour (log fundamental frequency, 0 for unvoiced)
+- voiced: [T] voicing mask (1 for voiced, 0 for unvoiced)
 
 Feature extraction options:
 - --normalize: Apply LayerNorm to features (default: False for VAE-friendly features)
@@ -52,6 +56,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from datasets import load_dataset, Audio
+import numpy as np
 
 from dataset_loading.audio_loading import extract_mels, remove_mains_hum
 from utils.audio_utils import SharedWindowBuffer
@@ -68,23 +73,24 @@ def load_gubert_model(
     config_name: str,
     num_speakers: int = 992,
     device: str = "cuda",
+    overrides: Dict = {},
 ):
     """
-    Load a MaskedGuBERT model from a checkpoint.
+    Load a GuBERT model from a checkpoint.
 
     Args:
         checkpoint_path: Path to checkpoint directory (containing model.safetensors or pytorch_model.bin)
-        config_name: Config name from MASKED_GUBERT_CONFIGS (e.g., "small", "medium")
+        config_name: Config name from GUBERT_CONFIGS (e.g., "small", "medium")
         num_speakers: Number of speakers the model was trained with
         device: Device to load the model on
 
     Returns:
-        MaskedGuBERTEncoder model in eval mode
+        GuBERTEncoder model in eval mode
     """
-    from model.audio.gubert import MaskedGuBERTEncoder
+    from model.audio.gubert import GuBERTEncoder
 
     # Create model with same config
-    model = MaskedGuBERTEncoder.from_config(config_name, num_speakers=num_speakers)
+    model = GuBERTEncoder.from_config(config_name, num_speakers=num_speakers, **overrides)
 
     # Try to load from safetensors first, then pytorch_model.bin
     safetensors_path = os.path.join(checkpoint_path, "model.safetensors")
@@ -111,6 +117,69 @@ def load_gubert_model(
     return model
 
 
+def extract_f0_batch_gpu(
+    waveforms: torch.Tensor,
+    sample_rate: int = 16000,
+    hop_length: int = 256,
+    fmin: float = 50.0,
+    fmax: float = 550.0,
+    device: str = "cuda",
+    f0_batch_size: int = 512,
+) -> tuple:
+    """
+    Extract F0 (fundamental frequency) using torchcrepe on GPU (batched).
+
+    Args:
+        waveforms: [B, T] batch of audio waveforms as torch tensor
+        sample_rate: Audio sample rate
+        hop_length: Hop length for analysis (should match mel spectrogram)
+        fmin: Minimum F0 frequency (Hz)
+        fmax: Maximum F0 frequency (Hz)
+        device: Device for computation
+
+    Returns:
+        log_f0: [B, T'] Log F0 contour (always computed, even for unvoiced)
+        voiced: [B, T'] Soft voicing probability (0-1, from periodicity)
+    """
+    import torchcrepe
+
+    # torchcrepe expects [batch, samples]
+    if waveforms.dim() == 1:
+        waveforms = waveforms.unsqueeze(0)
+
+    waveforms = waveforms.to(device)
+
+    # Extract pitch and periodicity (voicing confidence)
+    # Using viterbi decoder for smoother pitch contours
+    # batch_size controls frames per CNN forward pass, not audio files
+    # Higher = better GPU utilization but more memory
+    pitch, periodicity = torchcrepe.predict(
+        waveforms,
+        sample_rate,
+        hop_length=hop_length,
+        fmin=fmin,
+        fmax=fmax,
+        model='full',
+        decoder=torchcrepe.decode.viterbi,
+        return_periodicity=True,
+        batch_size=f0_batch_size,
+        device=device,
+        pad=True,
+    )
+
+    # pitch: [B, T'] in Hz
+    # periodicity: [B, T'] confidence 0-1 (soft voicing label)
+
+    # Convert pitch to log scale (always compute, even for low-confidence frames)
+    # The model will learn to weight predictions by voicing confidence
+    log_f0 = torch.log(pitch.clamp(min=1.0))
+
+    # Return soft voicing (periodicity) instead of hard threshold
+    voiced = periodicity
+
+    return log_f0.cpu(), voiced.cpu()
+
+
 class GuBERTFeatureBatchProcessor:
     """Batched GPU processing for extracting GuBERT features."""
 
@@ -126,6 +195,10 @@ class GuBERTFeatureBatchProcessor:
         speaker_encoder_type: SpeakerEncoderType = "ecapa_tdnn",
         normalize: bool = False,
         layers: Optional[List[int]] = None,
+        extract_f0: bool = True,
+        f0_fmin: float = 50.0,
+        f0_fmax: float = 550.0,
+        f0_batch_size: int = 512,
         device: str = "cuda",
     ):
         self.gubert_model = gubert_model
@@ -138,6 +211,10 @@ class GuBERTFeatureBatchProcessor:
         self.speaker_encoder_type = speaker_encoder_type
         self.normalize = normalize
         self.layers = layers
+        self.extract_f0_enabled = extract_f0
+        self.f0_fmin = f0_fmin
+        self.f0_fmax = f0_fmax
+        self.f0_batch_size = f0_batch_size
 
         self.audio_max_frames = (max_audio_seconds * sample_rate) // hop_length
         self.shared_window_buffer = SharedWindowBuffer()
@@ -176,8 +253,11 @@ class GuBERTFeatureBatchProcessor:
                     - Single layer: [B, encoder_dim, T']
                     - Multi-layer: [B, num_layers, encoder_dim, T']
                 - feature_lengths: [B] original lengths before padding
+                - mel_specs: [B, n_mels, T] mel spectrograms
                 - mel_lengths: [B] mel spectrogram lengths (before GuBERT subsampling)
                 - speaker_embeddings: [B, embedding_dim] speaker embeddings
+                - f0: [B, T] log F0 contour (if extract_f0 enabled)
+                - voiced: [B, T] voicing mask (if extract_f0 enabled)
         """
         batch_size = len(waveforms)
 
@@ -214,6 +294,42 @@ class GuBERTFeatureBatchProcessor:
         mel_specs = torch.stack(mel_specs)
         mel_lengths_tensor = torch.tensor(mel_lengths, dtype=torch.long)
 
+        # Extract F0 on GPU (batched) if enabled
+        f0_batch = None
+        voiced_batch = None
+        if self.extract_f0_enabled:
+            # Pad waveforms to same length for batched processing
+            max_waveform_len = max(waveform_lengths)
+            padded_waveforms = []
+            for waveform in waveforms:
+                if len(waveform) < max_waveform_len:
+                    waveform = F.pad(waveform, (0, max_waveform_len - len(waveform)), value=0)
+                padded_waveforms.append(waveform)
+            waveform_batch = torch.stack(padded_waveforms)  # [B, T_audio]
+
+            # GPU batched F0 extraction using torchcrepe
+            log_f0_batch, voiced_batch = extract_f0_batch_gpu(
+                waveform_batch,
+                sample_rate=self.sample_rate,
+                hop_length=self.hop_length,
+                fmin=self.f0_fmin,
+                fmax=self.f0_fmax,
+                device=self.device,
+                f0_batch_size=self.f0_batch_size,
+            )
+            # log_f0_batch: [B, T'], voiced_batch: [B, T']
+
+            # Pad or truncate to max_audio_frames (same as mel)
+            if log_f0_batch.shape[-1] < self.audio_max_frames:
+                log_f0_batch = F.pad(log_f0_batch, (0, self.audio_max_frames - log_f0_batch.shape[-1]), value=0)
+                voiced_batch = F.pad(voiced_batch, (0, self.audio_max_frames - voiced_batch.shape[-1]), value=0)
+            elif log_f0_batch.shape[-1] > self.audio_max_frames:
+                log_f0_batch = log_f0_batch[..., :self.audio_max_frames]
+                voiced_batch = voiced_batch[..., :self.audio_max_frames]
+
+            f0_batch = log_f0_batch
+            voiced_batch = voiced_batch
+
         # Extract GuBERT features
         mel_specs_gpu = mel_specs.to(self.device)
 
@@ -224,8 +340,7 @@ class GuBERTFeatureBatchProcessor:
                 layer_features, feature_lengths = self.gubert_model.extract_features(
                     mel_specs_gpu,
                     lengths=mel_lengths_tensor.to(self.device),
-                    normalize=self.normalize,
-                    layers=[layer_idx],  # Single layer at a time
+                    layer=layer_idx,  # Single layer at a time
                 )
                 # layer_features: [B, T', encoder_dim]
                 layer_features_list.append(layer_features)
@@ -239,8 +354,7 @@ class GuBERTFeatureBatchProcessor:
             features, feature_lengths = self.gubert_model.extract_features(
                 mel_specs_gpu,
                 lengths=mel_lengths_tensor.to(self.device),
-                normalize=self.normalize,
-                layers=self.layers,
+                layer=self.layers if isinstance(self.layers, int) else self.layers[0],
             )
             # features: [B, T', encoder_dim]
             # Transpose to [B, encoder_dim, T'] for consistency with mel spec format
@@ -277,9 +391,15 @@ class GuBERTFeatureBatchProcessor:
         result = {
             "features": features,  # [B, encoder_dim, T']
             "feature_lengths": feature_lengths.cpu(),  # [B]
+            "mel_specs": mel_specs,  # [B, n_mels, T]
             "mel_lengths": mel_lengths_tensor,  # [B]
             "speaker_embeddings": speaker_embeddings,  # [B, embedding_dim]
         }
+
+        # Add F0 data if extracted
+        if self.extract_f0_enabled and f0_batch is not None:
+            result["f0"] = f0_batch  # [B, T]
+            result["voiced"] = voiced_batch  # [B, T]
 
         return result
 
@@ -292,7 +412,7 @@ def main():
                         help="Path to GuBERT checkpoint directory")
     parser.add_argument("--gubert_config", type=str, default="small",
                         help="GuBERT config name (tiny, small, medium, large)")
-    parser.add_argument("--num_speakers", type=int, default=992,
+    parser.add_argument("--num_speakers", type=int, default=921,
                         help="Number of speakers the GuBERT model was trained with")
 
     # Dataset
@@ -340,6 +460,19 @@ def main():
                         help="Layer indices for multi-scale features (e.g., --layers -1 -3). "
                              "If not specified, uses final layer only.")
 
+    # F0 extraction options
+    parser.add_argument("--extract_f0", action="store_true", default=True,
+                        help="Extract F0 contour for conditioning (default: True)")
+    parser.add_argument("--no_extract_f0", action="store_false", dest="extract_f0",
+                        help="Disable F0 extraction")
+    parser.add_argument("--f0_fmin", type=float, default=50.0,
+                        help="Minimum F0 frequency in Hz (default: 50)")
+    parser.add_argument("--f0_fmax", type=float, default=550.0,
+                        help="Maximum F0 frequency in Hz (default: 550, torchcrepe max)")
+    parser.add_argument("--f0_batch_size", type=int, default=512,
+                        help="Batch size for torchcrepe F0 extraction (frames per CNN forward pass). "
+                             "Higher = faster but more VRAM. Default 512, try 256 if OOM.")
+
     # Filtering
     parser.add_argument("--min_audio_energy", type=float, default=0.05,
                         help="Minimum audio energy (skip silent samples)")
@@ -355,6 +488,12 @@ def main():
                         help="Maximum samples to process (for testing)")
     parser.add_argument("--start_idx", type=int, default=0,
                         help="Starting index in dataset")
+    
+    parser.add_argument("--speaker_classifier_hidden_dim", type=int, default=None,
+                        help="Hidden dimension for GuBERT speaker classifier (overrides encoder_dim)")
+    parser.add_argument("--speaker_pooling", type=str, default="attentive_statistics",
+                        choices=["statistics", "attentive_statistics", "mean", "max"],
+                        help="Pooling type for GuBERT speaker classifier")
 
     args = parser.parse_args()
 
@@ -374,6 +513,12 @@ def main():
     print(f"Output: {output_dir}")
     print(f"")
 
+    gubert_config_overrides = {}
+    if args.speaker_classifier_hidden_dim:
+        gubert_config_overrides['speaker_classifier_hidden_dim'] = args.speaker_classifier_hidden_dim
+    if args.speaker_pooling:
+        gubert_config_overrides['speaker_pooling'] = args.speaker_pooling
+
     # Load GuBERT model
     print(f"Loading GuBERT model from {args.gubert_checkpoint}...")
     gubert_model = load_gubert_model(
@@ -381,6 +526,7 @@ def main():
         args.gubert_config,
         num_speakers=args.num_speakers,
         device=device,
+        overrides=gubert_config_overrides,
     )
     print(f"  GuBERT config: {args.gubert_config}")
     print(f"  Encoder dimension: {gubert_model.config.encoder_dim}")
@@ -421,9 +567,16 @@ def main():
         speaker_encoder_type=args.speaker_encoder_type,
         normalize=args.normalize,
         layers=args.layers,
+        extract_f0=args.extract_f0,
+        f0_fmin=args.f0_fmin,
+        f0_fmax=args.f0_fmax,
+        f0_batch_size=args.f0_batch_size,
         device=device,
     )
     print(f"  Output feature dimension: {processor.encoder_dim}")
+    print(f"  Extract F0: {args.extract_f0}")
+    if args.extract_f0:
+        print(f"  F0 range: {args.f0_fmin}-{args.f0_fmax} Hz")
 
     # Stats
     stats = {
@@ -436,13 +589,16 @@ def main():
     # Shard accumulators
     shard_features = []
     shard_feature_lengths = []
+    shard_mel_specs = []
     shard_mel_lengths = []
     shard_speaker_embeddings = []
+    shard_f0 = []
+    shard_voiced = []
     shard_idx = 0
 
     def flush_shard():
-        nonlocal shard_features, shard_feature_lengths, shard_mel_lengths
-        nonlocal shard_speaker_embeddings, shard_idx
+        nonlocal shard_features, shard_feature_lengths, shard_mel_specs, shard_mel_lengths
+        nonlocal shard_speaker_embeddings, shard_f0, shard_voiced, shard_idx
 
         if not shard_features:
             return
@@ -463,10 +619,16 @@ def main():
         shard_data = {
             "features": torch.cat(padded_features, dim=0),
             "feature_lengths": torch.cat(shard_feature_lengths, dim=0),
+            "mel_specs": torch.cat(shard_mel_specs, dim=0),
             "mel_lengths": torch.cat(shard_mel_lengths, dim=0),
             "speaker_embeddings": torch.cat(shard_speaker_embeddings, dim=0),
             "num_samples": sum(f.shape[0] for f in shard_features),
         }
+
+        # Add F0 data if available
+        if shard_f0:
+            shard_data["f0"] = torch.cat(shard_f0, dim=0)
+            shard_data["voiced"] = torch.cat(shard_voiced, dim=0)
 
         shard_path = os.path.join(output_dir, f"shard_{shard_idx:06d}.pt")
         torch.save(shard_data, shard_path)
@@ -475,8 +637,11 @@ def main():
 
         shard_features = []
         shard_feature_lengths = []
+        shard_mel_specs = []
         shard_mel_lengths = []
         shard_speaker_embeddings = []
+        shard_f0 = []
+        shard_voiced = []
         shard_idx += 1
 
     # Batch accumulators
@@ -484,7 +649,8 @@ def main():
 
     def process_and_accumulate():
         nonlocal batch_waveforms
-        nonlocal shard_features, shard_feature_lengths, shard_mel_lengths, shard_speaker_embeddings
+        nonlocal shard_features, shard_feature_lengths, shard_mel_specs, shard_mel_lengths
+        nonlocal shard_speaker_embeddings, shard_f0, shard_voiced
 
         if not batch_waveforms:
             return
@@ -495,8 +661,14 @@ def main():
             # Add to shard
             shard_features.append(result["features"])
             shard_feature_lengths.append(result["feature_lengths"])
+            shard_mel_specs.append(result["mel_specs"])
             shard_mel_lengths.append(result["mel_lengths"])
             shard_speaker_embeddings.append(result["speaker_embeddings"])
+
+            # Add F0 data if available
+            if "f0" in result:
+                shard_f0.append(result["f0"])
+                shard_voiced.append(result["voiced"])
 
             stats["saved"] += len(batch_waveforms)
 
@@ -600,6 +772,10 @@ def main():
         "normalize": args.normalize,
         "layers": args.layers,  # None for single layer (default), list for multi-layer
         "num_layers": processor.num_layers,  # 1 for single layer, >1 for multi-layer
+        # F0 extraction settings
+        "extract_f0": args.extract_f0,
+        "f0_fmin": args.f0_fmin,
+        "f0_fmax": args.f0_fmax,
         "stats": stats,
     }
 

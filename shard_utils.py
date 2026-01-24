@@ -9,7 +9,7 @@ import os
 import json
 import argparse
 import random
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -604,10 +604,12 @@ class AudioVAEShardedDataset(Dataset):
         shard_idx, local_idx = self._find_shard(idx)
         shard = self._load_shard(shard_idx)
 
+        mel_spec_length = shard["mel_lengths"][local_idx].item()
+
         # Return sample dict compatible with AudioVAEDataCollator
         sample = {
             "mel_spec": shard["mel_specs"][local_idx],  # [1, n_mels, T]
-            "mel_spec_length": shard["mel_lengths"][local_idx].item(),
+            "mel_spec_length": mel_spec_length,
             "speaker_embedding": shard["speaker_embeddings"][local_idx],  # [embedding_dim]
         }
 
@@ -812,6 +814,7 @@ class GuBERTFeatureShardedDataset(Dataset):
         self.speaker_embedding_dim = self.config.get("speaker_embedding_dim", 192)
         self.num_layers = self.config.get("num_layers", 1)  # 1 for single layer, >1 for multi-layer
         self.layers = self.config.get("layers", None)  # List of layer indices if multi-layer
+        self.has_f0 = self.config.get("has_f0", False)  # Whether F0 data is available
 
         # LRU cache
         self._cache = {}
@@ -897,17 +900,24 @@ class GuBERTFeatureShardedDataset(Dataset):
         # - Multi-layer:  [num_layers, encoder_dim, T']
         features = shard["features"][local_idx]
         feature_length = shard["feature_lengths"][local_idx].item()
-        mel_length = shard["mel_lengths"][local_idx].item()
+        mel_specs = shard["mel_specs"][local_idx]
+        mel_spec_length = shard["mel_lengths"][local_idx].item()
 
         sample = {
             "features": features,
             "feature_length": feature_length,
-            "mel_length": mel_length,
+            "mel_specs": mel_specs,
+            "mel_lengths": mel_spec_length,
             "num_layers": self.num_layers,  # For collator to know the format
         }
 
         if "speaker_embeddings" in shard:
             sample["speaker_embedding"] = shard["speaker_embeddings"][local_idx]
+
+        # Add F0 data if available
+        if "f0" in shard:
+            sample["f0"] = shard["f0"][local_idx]
+            sample["voiced"] = shard["voiced"][local_idx]
 
         return sample
 
@@ -934,10 +944,12 @@ class GuBERTFeatureDataCollator:
 
     def __init__(
         self,
-        max_feature_frames: int = 500,
+        max_feature_frames: int = 469,
+        max_audio_frames: int = 1875,
         speaker_embedding_dim: int = 192,
     ):
         self.max_feature_frames = max_feature_frames
+        self.max_audio_frames = max_audio_frames
         self.speaker_embedding_dim = speaker_embedding_dim
 
     def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -949,11 +961,16 @@ class GuBERTFeatureDataCollator:
         raw_features = []
         feature_lengths = []
         speaker_embeddings = []
+        mel_specs = []
+        mel_lengths = []
+        f0_list = []
+        voiced_list = []
 
-        # Detect multi-layer mode from first example
+        # Detect multi-layer mode and F0 availability from first example
         first_features = valid_examples[0]["features"]
         num_layers = valid_examples[0].get("num_layers", 1)
         is_multi_layer = num_layers > 1 or first_features.dim() == 3
+        has_f0 = "f0" in valid_examples[0]
 
         for ex in valid_examples:
             # Shape depends on mode:
@@ -976,12 +993,19 @@ class GuBERTFeatureDataCollator:
             else:
                 speaker_embeddings.append(torch.zeros(1, self.speaker_embedding_dim))
 
+            mel_specs.append(ex.get("mel_specs"))
+            mel_lengths.append(ex.get("mel_lengths"))
+
+            # Collect F0 data if available
+            if has_f0:
+                f0_list.append(ex["f0"])
+                voiced_list.append(ex["voiced"])
+
         # Compute batch max length (dynamic padding)
         batch_max_length = max(feature_lengths)
 
         # Pad/truncate to batch max length
         padded_features = []
-        feature_masks = []
 
         for feat, feat_length in zip(raw_features, feature_lengths):
             # Create mask (1 = valid, 0 = padding)
@@ -996,18 +1020,51 @@ class GuBERTFeatureDataCollator:
                 feat = F.pad(feat, (0, batch_max_length - feat.shape[-1]), value=0)
 
             padded_features.append(feat)
-            feature_masks.append(feat_mask)
+
+        mel_spec_masks = []
+        padded_mel_specs = []
+        for m, mel in enumerate(mel_specs):
+            # Truncate/pad mel specs to max length if needed
+            mel = mel[..., :self.max_audio_frames]
+            # print(f"Collation: Padding mel spec from {mel.shape[-1]} to {self.max_audio_frames}. Mask will have shape [{self.max_audio_frames}] with ones up to {mel_lengths[m]}.")
+            if mel.shape[-1] < self.max_audio_frames:
+                mel = F.pad(mel, (0, self.max_audio_frames - mel.shape[-1]), value=0)
+            mel_spec_mask = torch.zeros(self.max_audio_frames, dtype=torch.float32)
+            mel_spec_mask[:mel_lengths[m]] = 1.0
+            padded_mel_specs.append(mel)
+            mel_spec_masks.append(mel_spec_mask)
 
         # Stack features:
         # - Single layer: [B, encoder_dim, T']
         # - Multi-layer:  [B, num_layers, encoder_dim, T']
         batch = {
             "features": torch.stack(padded_features),
-            "feature_mask": torch.stack(feature_masks),  # [B, T'] mask (1=valid, 0=padding)
+            'mel_specs': torch.stack(padded_mel_specs),
+            "mel_lengths": torch.tensor(mel_lengths, dtype=torch.long),  # [B]
+            "mel_spec_masks": torch.stack(mel_spec_masks),  # [B, T] mask for mel specs
             "feature_lengths": torch.tensor(feature_lengths, dtype=torch.long),  # [B]
             "speaker_embedding": torch.stack(speaker_embeddings),  # [B, 1, speaker_embedding_dim]
             "num_layers": num_layers,  # For VAE to know the format
         }
+
+        # Add F0 data if available
+        if has_f0 and f0_list:
+            # Pad/truncate F0 and voiced to same length as mel specs
+            padded_f0 = []
+            padded_voiced = []
+            for f0, voiced in zip(f0_list, voiced_list):
+                # Truncate to max length
+                f0 = f0[:self.max_audio_frames]
+                voiced = voiced[:self.max_audio_frames]
+                # Pad if needed
+                if len(f0) < self.max_audio_frames:
+                    f0 = F.pad(f0, (0, self.max_audio_frames - len(f0)), value=0)
+                    voiced = F.pad(voiced, (0, self.max_audio_frames - len(voiced)), value=0)
+                padded_f0.append(f0)
+                padded_voiced.append(voiced)
+
+            batch["target_f0"] = torch.stack(padded_f0)  # [B, T]
+            batch["target_voiced"] = torch.stack(padded_voiced)  # [B, T]
 
         return batch
 
@@ -2843,8 +2900,11 @@ def merge_gubert_feature_shards(
     # Accumulators
     acc_features = []
     acc_feature_lengths = []
+    acc_mel_specs = []
     acc_mel_lengths = []
     acc_speaker_emb = []
+    acc_f0 = []
+    acc_voiced = []
 
     output_shard_idx = 0
     total_samples = 0
@@ -2853,6 +2913,7 @@ def merge_gubert_feature_shards(
 
     # Get encoder_dim and num_layers from first shard
     first_shard = torch.load(all_shards[0], weights_only=False)
+    has_f0 = "f0" in first_shard
     feat_shape = first_shard["features"].shape
     # Detect multi-layer format:
     # - Single layer: [N, encoder_dim, T']
@@ -2869,7 +2930,8 @@ def merge_gubert_feature_shards(
         print(f"Single-layer format: encoder_dim={encoder_dim}")
 
     def save_merged_shard():
-        nonlocal acc_features, acc_feature_lengths, acc_mel_lengths, acc_speaker_emb
+        nonlocal acc_features, acc_feature_lengths, acc_mel_specs, acc_mel_lengths, acc_speaker_emb
+        nonlocal acc_f0, acc_voiced
         nonlocal output_shard_idx, total_samples, shard_files, shard_offsets
 
         if not acc_features:
@@ -2893,10 +2955,16 @@ def merge_gubert_feature_shards(
         shard_data = {
             "features": torch.cat(padded_features, dim=0),
             "feature_lengths": torch.cat(acc_feature_lengths, dim=0),
+            "mel_specs": torch.cat(acc_mel_specs, dim=0),
             "mel_lengths": torch.cat(acc_mel_lengths, dim=0),
             "speaker_embeddings": torch.cat(acc_speaker_emb, dim=0),
             "num_samples": num_samples_in_shard,
         }
+
+        # Add F0 data if available
+        if acc_f0:
+            shard_data["f0"] = torch.cat(acc_f0, dim=0)
+            shard_data["voiced"] = torch.cat(acc_voiced, dim=0)
 
         shard_filename = f"shard_{output_shard_idx:06d}.pt"
         output_path = os.path.join(output_dir, shard_filename)
@@ -2910,8 +2978,11 @@ def merge_gubert_feature_shards(
         output_shard_idx += 1
         acc_features = []
         acc_feature_lengths = []
+        acc_mel_specs = []
         acc_mel_lengths = []
         acc_speaker_emb = []
+        acc_f0 = []
+        acc_voiced = []
 
     for shard_path in tqdm(all_shards, desc="Merging GuBERT feature shards"):
         try:
@@ -2919,8 +2990,14 @@ def merge_gubert_feature_shards(
 
             acc_features.append(shard["features"])
             acc_feature_lengths.append(shard["feature_lengths"])
+            acc_mel_specs.append(shard["mel_specs"])
             acc_mel_lengths.append(shard["mel_lengths"])
             acc_speaker_emb.append(shard["speaker_embeddings"])
+
+            # Accumulate F0 data if available
+            if "f0" in shard:
+                acc_f0.append(shard["f0"])
+                acc_voiced.append(shard["voiced"])
 
             # Save when accumulated enough
             current_count = sum(f.shape[0] for f in acc_features)
@@ -2940,6 +3017,7 @@ def merge_gubert_feature_shards(
         "num_layers": num_layers,
         "total_samples": total_samples,
         "num_shards": output_shard_idx,
+        "has_f0": has_f0,
     }
 
     # Try to get settings from first GPU config
@@ -2949,7 +3027,8 @@ def merge_gubert_feature_shards(
             first_config = json.load(f)
             for key in ["gubert_checkpoint", "gubert_config", "sample_rate", "n_mels",
                         "n_fft", "hop_length", "max_audio_seconds", "speaker_encoder_type",
-                        "speaker_embedding_dim", "total_stride", "normalize", "layers"]:
+                        "speaker_embedding_dim", "total_stride", "normalize", "layers",
+                        "extract_f0", "f0_fmin", "f0_fmax"]:
                 if key in first_config:
                     merged_config[key] = first_config[key]
 
@@ -2970,6 +3049,7 @@ def merge_gubert_feature_shards(
     print(f"  Output shards: {output_shard_idx}")
     print(f"  Encoder dimension: {encoder_dim}")
     print(f"  Num layers: {num_layers}")
+    print(f"  Has F0: {has_f0}")
     print(f"  Output dir: {output_dir}")
 
 
