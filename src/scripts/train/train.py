@@ -31,7 +31,6 @@ def create_or_load_model(args, module, overrides={}) -> nn.Module:
 
 def get_training_args(args, run_dir) -> TrainingArguments:
     return TrainingArguments(
-        tpu_num_cores=8 if args.use_xla else None,
         output_dir=run_dir,
         overwrite_output_dir=True,
         lr_scheduler_type=args.lr_scheduler_type,
@@ -53,8 +52,8 @@ def get_training_args(args, run_dir) -> TrainingArguments:
         bf16=args.bf16,
         fp16=args.fp16,
         max_grad_norm=args.max_grad_norm,
-        torch_compile=args.compile_model and not args.use_deepspeed and not args.use_xla,
-        deepspeed=args.deepspeed_config if args.use_deepspeed and not args.use_xla else None,
+        torch_compile=args.compile_model and not args.use_deepspeed,
+        deepspeed=args.deepspeed_config if args.use_deepspeed else None,
         use_cpu=args.cpu,
         log_level=args.log_level,
         logging_first_step=True,
