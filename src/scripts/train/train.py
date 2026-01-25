@@ -86,7 +86,7 @@ def get_dataset(command: str, args, split: str):
     return dataset
 
 
-def get_visualization_callback(command: str, shared_window_buffer, args, eval_dataset, trainer: Trainer, vocoder=None):
+def get_visualization_callback(command: str, shared_window_buffer, args, vocoder=None):
     if command in ["audio-cvae", 'audio-cvae-decoder']:
         vocoder = load_vocoder(args.vocoder_checkpoint_path, args.vocoder_config, shared_window_buffer)
         callback = AudioCVAEVisualizationCallback(
@@ -112,7 +112,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, shared_window_buf
     data_collator = get_data_collator(command, args)
     train_dataset = get_dataset(command, args, split="train")
     eval_dataset = get_dataset(command, args, split="val")
-    visualization_callback = get_visualization_callback(command, shared_window_buffer, args, eval_dataset, trainer)
+    visualization_callback = get_visualization_callback(command, shared_window_buffer, args)
     
     if command in ["audio-cvae", "audio-cvae-decoder"]:
         trainer: Trainer = audio_trainer.create_trainer(
