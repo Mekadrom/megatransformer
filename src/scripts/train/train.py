@@ -1,6 +1,7 @@
 import argparse
 import os
 
+import torch
 import torch.nn as nn
 
 from model.audio.vae.vae import AudioVAE
@@ -140,9 +141,6 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, shared_window_buf
 
 
 def add_common_args(parser: argparse.ArgumentParser):
-    is_tpu_available = check_tpu_availability()
-    print(f"TPU available: {is_tpu_available}")
-
     argparser.add_argument('--seed', type=int, default=42, help='Random seed')
     argparser.add_argument('--logging_base_dir', type=str, default=os.path.join('runs', 'causal'), help='Base directory for logging')
     argparser.add_argument('--run_name', type=str, help='Name of the run', required=True)
@@ -160,7 +158,6 @@ def add_common_args(parser: argparse.ArgumentParser):
     argparser.add_argument('--compile_model', action='store_true', help='Whether to compile the model')
     argparser.add_argument('--cudnn_benchmark', action='store_true', help='Whether to enable cuDNN benchmark')
     argparser.add_argument('--use_gradient_checkpointing', action='store_true', help='Whether to use gradient checkpointing')
-    argparser.add_argument('--use_xla', action='store_true', default=is_tpu_available, help='Whether to use XLA')
 
     # generic hyperparams
     argparser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate')
@@ -249,6 +246,8 @@ if __name__ == "__main__":
         shared_window_buffer = None
 
     model = create_or_load_model(args, module, overrides={})
+
+    device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
 
     model.to(args.device)
 
