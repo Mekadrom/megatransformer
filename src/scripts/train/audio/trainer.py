@@ -1114,7 +1114,7 @@ def create_trainer(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         cmdline=args.cmdline,
-        git_commit_hash=args.git_commit_hash,
+        git_commit_hash=args.commit_hash,
         step_offset=args.step_offset,
         discriminator=args.discriminator,
         discriminator_optimizer=args.discriminator_optimizer,
