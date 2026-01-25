@@ -249,6 +249,9 @@ if __name__ == "__main__":
         shared_window_buffer = None
 
     model = create_or_load_model(args, module, overrides={})
+
+    model.to(args.device)
+
     trainer: CommonTrainer = get_trainer(args.command, args, run_dir, model, shared_window_buffer=shared_window_buffer)
 
     if args.local_rank == 0 or not args.use_deepspeed:
