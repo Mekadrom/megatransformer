@@ -123,7 +123,8 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, shared_window_buf
             train_dataset,
             eval_dataset,
             shared_window_buffer,
-            vocoder=visualization_callback.vocoder
+            vocoder=visualization_callback.vocoder,
+            device=model.device,
         )
     else:
         raise ValueError(f"Unknown command: {command}. Available: audio-cvae, audio-cvae-decoder")
