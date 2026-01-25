@@ -267,7 +267,7 @@ def add_common_args(argparser: argparse.ArgumentParser):
     argparser.add_argument('--commit_hash', type=str, default='', help='Git commit hash for this run. Logged in tensorboard.')
 
 
-training_modules = [
+training_modules: list = [
     audio_cvae_training,
     image_vae_training
 ]
