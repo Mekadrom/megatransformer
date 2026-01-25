@@ -88,6 +88,7 @@ def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer, 
 
     print(f"Loaded vocoder from {vocoder_checkpoint_path}")
     print(f"Vocoder parameters: {sum(p.numel() for p in vocoder.parameters()):,}")
+    print(f"Vocoder structure: {vocoder}")
     return vocoder
 
 
