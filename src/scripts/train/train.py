@@ -249,7 +249,7 @@ if __name__ == "__main__":
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
 
-    model.to(args.device)
+    model.to(device)
 
     trainer: CommonTrainer = get_trainer(args.command, args, run_dir, model, shared_window_buffer=shared_window_buffer)
 
