@@ -23,3 +23,8 @@ class Preprocessor(abc.ABC):
     @abc.abstractmethod
     def parse_config(self) -> dict:
         pass
+
+    @classmethod
+    @abc.abstractmethod
+    def add_cli_args(self, parser):
+        pass

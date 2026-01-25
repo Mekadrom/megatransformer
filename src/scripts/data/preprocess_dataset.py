@@ -10,22 +10,30 @@ import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
+from scripts.data.audio.preprocess import AudioDatasetPreprocessor
 from scripts.data.audio.vae.preprocess import SIVEFeatureDatasetPreprocessor
 from scripts.data.image.preprocess import ImageDatasetPreprocessor
+from scripts.data.image.vae.preprocess import ImageVAEDatasetPreprocessor
 from scripts.data.preprocessor import Preprocessor
 
 
-preprocessor_clss = [
+preprocessor_clss: list[type[Preprocessor]] = [
+    AudioDatasetPreprocessor,
     SIVEFeatureDatasetPreprocessor,
     ImageDatasetPreprocessor,
+    ImageVAEDatasetPreprocessor,
 ]
 
 
 def get_preprocessor(command: str, args, dataset, output_dir, shard_fields, batch_accumulators, stats, device: str) -> Preprocessor:
-    if command == "audio-cvae":
+    if command == "audio":
+        return AudioDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
+    elif command == "audio-cvae":
         return SIVEFeatureDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
-    elif command == "image-vae" or command == "image":
+    elif command == "image":
         return ImageDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
+    elif command == "image-vae":
+        return ImageVAEDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     else:
         raise ValueError(f"Unknown command: {command}. Available: audio-vae, image-vae")
 
@@ -35,8 +43,8 @@ def main():
     
     subparsers = parser.add_subparsers(dest="command")
     for preprocessor_cls in preprocessor_clss:
-        sub_parser = preprocessor_cls.add_cli_args(subparsers)
         # Dataset
+        sub_parser = preprocessor_cls.add_cli_args(subparsers)
         sub_parser.add_argument("--output_dir", type=str, required=True,
                             help="Output directory for shards")
         sub_parser.add_argument("--dataset_name", type=str, required=True,
