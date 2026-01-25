@@ -1,5 +1,6 @@
 import argparse
 import os
+import psutil
 
 import torch
 import torch.nn as nn
@@ -219,6 +220,18 @@ def add_args(parser: argparse.ArgumentParser):
         add_common_args(sub_parser)
 
 
+def get_process_cmdline(pid):
+    """
+    Retrieves the command line arguments for a process given its PID.
+    Returns a list of strings representing the command line, or None if the process is not found.
+    """
+    try:
+        process = psutil.Process(pid)
+        return process.cmdline()
+    except psutil.NoSuchProcess:
+        return None
+
+
 command_to_module = {
     "audio-cvae": audio_trainer,
 }
@@ -230,6 +243,8 @@ if __name__ == "__main__":
     add_args(argparser)
 
     args = argparser.parse_args()
+    current_process_pid = psutil.Process().pid
+    setattr(args, 'cmdline', " ".join(get_process_cmdline(current_process_pid)))
 
     run_dir = os.path.join(args.logging_base_dir, args.run_name)
     if not os.path.exists(run_dir):
