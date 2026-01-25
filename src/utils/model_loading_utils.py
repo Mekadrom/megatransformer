@@ -63,8 +63,12 @@ def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer):
         print(f"Vocoder checkpoint not found at {vocoder_checkpoint_path}")
         return
 
+    class VocoderWrapper(torch.nn.Module):
+        def __init__(self):
+            self.vocoder: torch.nn.Module = None
+
     try:
-        vocoder = load_model(Vocoder, vocoder_config, checkpoint_path=vocoder_checkpoint_path, overrides={"shared_window_buffer": shared_window_buffer}, strict=True)
+        vocoder = load_model(VocoderWrapper, vocoder_config, checkpoint_path=vocoder_checkpoint_path, overrides={"shared_window_buffer": shared_window_buffer}, strict=True).vocoder
         vocoder.eval()
         print(f"Loaded vocoder from {vocoder_checkpoint_path}")
         print(f"Vocoder parameters: {sum(p.numel() for p in vocoder.parameters()):,}")
