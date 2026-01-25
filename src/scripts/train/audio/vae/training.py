@@ -1,4 +1,3 @@
-import argparse
 import os
 
 import torch
@@ -25,9 +24,6 @@ from model.audio.vae.vae import AudioCVAEDecoderOnly, AudioVAE
 from model.discriminator import compute_adaptive_weight
 from scripts.train.trainer import CommonTrainer
 from utils import model_loading_utils
-
-
-_model_cls = AudioVAE
 
 
 class LearnedSpeakerClassifier(torch.nn.Module):
@@ -1123,86 +1119,6 @@ def load_model(args):
         })
 
 
-def load_discriminator(
-    resume_from_checkpoint: str,
-    discriminator: torch.nn.Module,
-    discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
-    device: torch.device = torch.device("cpu"),
-) -> tuple[torch.nn.Module, Optional[torch.optim.Optimizer], bool]:
-    """
-    Load discriminator from checkpoint if it exists.
-
-    Handles errors gracefully - if loading fails, returns the fresh discriminator
-    and continues training from scratch.
-    """
-    if resume_from_checkpoint is None:
-        print("No checkpoint path provided, training discriminator from scratch")
-        return discriminator, discriminator_optimizer, False
-
-    discriminator_path = os.path.join(resume_from_checkpoint, "discriminator.pt")
-    if os.path.exists(discriminator_path):
-        print(f"Loading discriminator from {discriminator_path}")
-        try:
-            checkpoint = torch.load(discriminator_path, map_location=device, weights_only=True)
-            discriminator.load_state_dict(checkpoint["discriminator_state_dict"])
-
-            if discriminator_optimizer is not None and checkpoint.get("discriminator_optimizer_state_dict"):
-                try:
-                    discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer_state_dict"])
-                except Exception as e:
-                    print(f"Warning: Failed to load discriminator optimizer state: {e}")
-                    print("Continuing with fresh optimizer state...")
-
-            return discriminator, discriminator_optimizer, True
-        except Exception as e:
-            print(f"Warning: Failed to load discriminator checkpoint: {e}")
-            print("Continuing with fresh discriminator...")
-            return discriminator, discriminator_optimizer, False
-
-    print("No existing discriminator checkpoint found, training from scratch")
-    return discriminator, discriminator_optimizer, False
-
-
-def load_learned_speaker_classifier(
-    resume_from_checkpoint: str,
-    learned_speaker_classifier: torch.nn.Module,
-    learned_speaker_classifier_optimizer: Optional[torch.optim.Optimizer] = None,
-    device: torch.device = torch.device("cpu"),
-) -> tuple[torch.nn.Module, Optional[torch.optim.Optimizer], bool]:
-    """
-    Load learned speaker classifier (speaker ID on embeddings) from checkpoint if it exists.
-
-    Handles errors gracefully - if loading fails, returns the fresh classifier
-    and continues training from scratch.
-    """
-    if resume_from_checkpoint is None:
-        print("No checkpoint path provided, training learned speaker classifier from scratch")
-        return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
-
-    learned_speaker_classifier_path = os.path.join(resume_from_checkpoint, "learned_speaker_classifier.pt")
-    if os.path.exists(learned_speaker_classifier_path):
-        print(f"Loading learned speaker classifier from {learned_speaker_classifier_path}")
-        try:
-            checkpoint = torch.load(learned_speaker_classifier_path, map_location=device, weights_only=True)
-            learned_speaker_classifier.load_state_dict(checkpoint["learned_speaker_classifier_state_dict"])
-
-            if learned_speaker_classifier_optimizer is not None and checkpoint.get("learned_speaker_classifier_optimizer_state_dict"):
-                try:
-                    learned_speaker_classifier_optimizer.load_state_dict(checkpoint["learned_speaker_classifier_optimizer_state_dict"])
-                except Exception as e:
-                    print(f"Warning: Failed to load learned speaker classifier optimizer state: {e}")
-                    print("Continuing with fresh optimizer state...")
-
-            return learned_speaker_classifier, learned_speaker_classifier_optimizer, True
-        except Exception as e:
-            print(f"Warning: Failed to load learned speaker classifier checkpoint: {e}")
-            print("Continuing with fresh learned speaker classifier...")
-            return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
-
-    print("No existing learned speaker classifier checkpoint found, training from scratch")
-    return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
-
-
 def create_trainer(
     args,
     model,
@@ -1267,7 +1183,7 @@ def create_trainer(
         )
 
         # Try to load existing discriminator checkpoint
-        discriminator, discriminator_optimizer, disc_loaded = load_discriminator(
+        discriminator, discriminator_optimizer, disc_loaded = model_loading_utils.load_discriminator(
             args.resume_from_checkpoint, discriminator, discriminator_optimizer, device
         )
 
@@ -1315,7 +1231,7 @@ def create_trainer(
         )
 
         # Try to load existing learned speaker classifier checkpoint
-        learned_speaker_classifier, learned_speaker_classifier_optimizer, lsc_loaded = load_learned_speaker_classifier(
+        learned_speaker_classifier, learned_speaker_classifier_optimizer, lsc_loaded = model_loading_utils.load_learned_speaker_classifier(
             args.resume_from_checkpoint, learned_speaker_classifier, learned_speaker_classifier_optimizer, device
         )
         if lsc_loaded:

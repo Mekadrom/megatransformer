@@ -14,7 +14,7 @@ from typing import Dict, Optional
 from datasets import load_dataset, Audio
 
 from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
-from scripts.data.preprocessor import BatchProcessor
+from scripts.data.preprocessor import BatchProcessor, Preprocessor
 from utils import audio_utils
 from utils.audio_utils import SharedWindowBuffer, extract_mels
 from utils.model_loading_utils import load_model
@@ -308,7 +308,7 @@ class SIVEFeatureBatchProcessor(BatchProcessor):
 
         return result
 
-class SIVEFeatureDatasetPreprocessor:
+class SIVEFeatureDatasetPreprocessor(Preprocessor):
     """Preprocess dataset to extract and save SIVE features."""
 
     def __init__(self, args, dataset, output_dir, shard_fields, batch_accumulators, stats_accumulator, device):

@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 
 from model.audio.vocoder.vocoder import Vocoder
+from model.ema import EMAModel
 
 
 def load_model(
@@ -75,3 +76,103 @@ def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer):
         print(f"Failed to load vocoder: {e}")
         vocoder = None
     return vocoder
+
+
+def load_discriminator(
+    resume_from_checkpoint: str,
+    discriminator: torch.nn.Module,
+    discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[torch.nn.Module, Optional[torch.optim.Optimizer], bool]:
+    """
+    Load discriminator from checkpoint if it exists.
+
+    Handles errors gracefully - if loading fails, returns the fresh discriminator
+    and continues training from scratch.
+    """
+    if resume_from_checkpoint is None:
+        print("No checkpoint path provided, training discriminator from scratch")
+        return discriminator, discriminator_optimizer, False
+
+    discriminator_path = os.path.join(resume_from_checkpoint, "discriminator.pt")
+    if os.path.exists(discriminator_path):
+        print(f"Loading discriminator from {discriminator_path}")
+        try:
+            checkpoint = torch.load(discriminator_path, map_location=device, weights_only=True)
+            discriminator.load_state_dict(checkpoint["discriminator_state_dict"])
+
+            if discriminator_optimizer is not None and checkpoint.get("discriminator_optimizer_state_dict"):
+                try:
+                    discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer_state_dict"])
+                except Exception as e:
+                    print(f"Warning: Failed to load discriminator optimizer state: {e}")
+                    print("Continuing with fresh optimizer state...")
+
+            return discriminator, discriminator_optimizer, True
+        except Exception as e:
+            print(f"Warning: Failed to load discriminator checkpoint: {e}")
+            print("Continuing with fresh discriminator...")
+            return discriminator, discriminator_optimizer, False
+
+    print("No existing discriminator checkpoint found, training from scratch")
+    return discriminator, discriminator_optimizer, False
+
+
+def load_learned_speaker_classifier(
+    resume_from_checkpoint: str,
+    learned_speaker_classifier: torch.nn.Module,
+    learned_speaker_classifier_optimizer: Optional[torch.optim.Optimizer] = None,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[torch.nn.Module, Optional[torch.optim.Optimizer], bool]:
+    """
+    Load learned speaker classifier (speaker ID on embeddings) from checkpoint if it exists.
+
+    Handles errors gracefully - if loading fails, returns the fresh classifier
+    and continues training from scratch.
+    """
+    if resume_from_checkpoint is None:
+        print("No checkpoint path provided, training learned speaker classifier from scratch")
+        return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
+
+    learned_speaker_classifier_path = os.path.join(resume_from_checkpoint, "learned_speaker_classifier.pt")
+    if os.path.exists(learned_speaker_classifier_path):
+        print(f"Loading learned speaker classifier from {learned_speaker_classifier_path}")
+        try:
+            checkpoint = torch.load(learned_speaker_classifier_path, map_location=device, weights_only=True)
+            learned_speaker_classifier.load_state_dict(checkpoint["learned_speaker_classifier_state_dict"])
+
+            if learned_speaker_classifier_optimizer is not None and checkpoint.get("learned_speaker_classifier_optimizer_state_dict"):
+                try:
+                    learned_speaker_classifier_optimizer.load_state_dict(checkpoint["learned_speaker_classifier_optimizer_state_dict"])
+                except Exception as e:
+                    print(f"Warning: Failed to load learned speaker classifier optimizer state: {e}")
+                    print("Continuing with fresh optimizer state...")
+
+            return learned_speaker_classifier, learned_speaker_classifier_optimizer, True
+        except Exception as e:
+            print(f"Warning: Failed to load learned speaker classifier checkpoint: {e}")
+            print("Continuing with fresh learned speaker classifier...")
+            return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
+
+    print("No existing learned speaker classifier checkpoint found, training from scratch")
+    return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
+
+
+
+def load_ema_state(ema: EMAModel, checkpoint_path: str) -> bool:
+    """Load EMA state from checkpoint if available.
+
+    Args:
+        ema: The EMA model to load state into
+        checkpoint_path: Path to checkpoint directory
+
+    Returns:
+        True if EMA state was loaded, False otherwise
+    """
+    ema_path = os.path.join(checkpoint_path, "ema_state.pt")
+    if os.path.exists(ema_path):
+        state_dict = torch.load(ema_path, map_location="cpu")
+        ema.load_state_dict(state_dict)
+        print(f"Loaded EMA state from {ema_path} (step {ema.step})")
+        return True
+    return False

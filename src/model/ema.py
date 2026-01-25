@@ -8,8 +8,6 @@ This provides smoother, more stable weights for inference, which is
 particularly important for diffusion models.
 """
 
-import copy
-
 import torch
 import torch.nn as nn
 
