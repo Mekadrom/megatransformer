@@ -18,7 +18,7 @@ from scripts.data.preprocessor import Preprocessor
 
 
 preprocessor_clss: list[type[Preprocessor]] = [
-    AudioDatasetPreprocessor,
+    # AudioDatasetPreprocessor,
     SIVEFeatureDatasetPreprocessor,
     ImageDatasetPreprocessor,
     ImageVAEDatasetPreprocessor,
