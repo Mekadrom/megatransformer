@@ -406,93 +406,93 @@ def create_trainer(
 
 
 def add_cli_args(subparsers):
-    argparser = subparsers.add_parser("image-vae", help="Train image VAE with optional GAN")
+    sub_parser = subparsers.add_parser("image-vae", help="Train image VAE with optional GAN")
 
-    argparser.add_argument("--image_size", type=int, default=256,
+    sub_parser.add_argument("--image_size", type=int, default=256,
                            help="Input image size (assumed square)")
-    argparser.add_argument("--latent_channels", type=int, default=4,
+    sub_parser.add_argument("--latent_channels", type=int, default=4,
                             help="Number of latent channels in VAE")
 
     # VAE loss weights
-    argparser.add_argument("--recon_loss_weight", type=float, default=1.0,
+    sub_parser.add_argument("--recon_loss_weight", type=float, default=1.0,
                            help="Weight for reconstruction loss")
-    argparser.add_argument("--mse_loss_weight", type=float, default=1.0,
+    sub_parser.add_argument("--mse_loss_weight", type=float, default=1.0,
                            help="Weight for MSE loss")
-    argparser.add_argument("--l1_loss_weight", type=float, default=1.0,
+    sub_parser.add_argument("--l1_loss_weight", type=float, default=1.0,
                            help="Weight for L1 loss")
-    argparser.add_argument("--kl_divergence_loss_weight", type=float, default=1e-6,
+    sub_parser.add_argument("--kl_divergence_loss_weight", type=float, default=1e-6,
                            help="Weight for KL divergence loss")
-    argparser.add_argument("--perceptual_loss_weight", type=float, default=0.1,
+    sub_parser.add_argument("--perceptual_loss_weight", type=float, default=0.1,
                            help="Weight for perceptual loss (VGG or LPIPS)")
 
     # Perceptual loss type: "vgg", "lpips", or "none"
-    argparser.add_argument("--perceptual_loss_type", type=str, default="lpips",
+    sub_parser.add_argument("--perceptual_loss_type", type=str, default="lpips",
                            help="Type of perceptual loss to use (vgg, lpips, none)")
-    argparser.add_argument("--lpips_net", type=str, default="vgg",
+    sub_parser.add_argument("--lpips_net", type=str, default="vgg",
                            help="LPIPS network to use (alex, vgg, squeeze)")
 
     # DINO perceptual loss (semantic features, complementary to VGG/LPIPS)
     # Helps preserve content correctness while being less sensitive to texture artifacts
-    argparser.add_argument("--dino_loss_weight", type=float, default=0.0,
+    sub_parser.add_argument("--dino_loss_weight", type=float, default=0.0,
                             help="Weight for DINO perceptual loss")
-    argparser.add_argument("--dino_model", type=str, default="dinov2_vits14",
+    sub_parser.add_argument("--dino_model", type=str, default="dinov2_vits14",
                             help="DINO model to use (dinov2_vits14, dinov2_vitb14, dinov2_vitl14)")
 
     # GAN training settings
-    argparser.add_argument("--use_gan", action="store_true",
+    sub_parser.add_argument("--use_gan", action="store_true",
                            help="Enable GAN training with discriminator")
-    argparser.add_argument("--gan_start_condition_key", type=str, default=None,
+    sub_parser.add_argument("--gan_start_condition_key", type=str, default=None,
                            help="Condition key to start GAN training (step or reconstruction_criteria_met)")
-    argparser.add_argument("--gan_start_condition_value", type=str, default=None,
+    sub_parser.add_argument("--gan_start_condition_value", type=str, default=None,
                            help="Condition value to start GAN training")
-    argparser.add_argument("--discriminator_lr", type=float, default=2e-4,
+    sub_parser.add_argument("--discriminator_lr", type=float, default=2e-4,
                            help="Learning rate for discriminator optimizer")
-    argparser.add_argument("--gan_loss_weight", type=float, default=0.5,
+    sub_parser.add_argument("--gan_loss_weight", type=float, default=0.5,
                            help="Weight for GAN loss contribution to generator")
-    argparser.add_argument("--feature_matching_weight", type=float, default=0.0,
+    sub_parser.add_argument("--feature_matching_weight", type=float, default=0.0,
                             help="Weight for feature matching loss from discriminator")
-    argparser.add_argument("--discriminator_config", type=str, default="multi_scale",
+    sub_parser.add_argument("--discriminator_config", type=str, default="multi_scale",
                            help="Discriminator configuration (multi_scale, etc.)")
 
     # Discriminator regularization settings
     # Instance noise: adds Gaussian noise to prevent shortcut learning (e.g., detecting blur)
-    argparser.add_argument("--instance_noise_std", type=float, default=0.0,
+    sub_parser.add_argument("--instance_noise_std", type=float, default=0.0,
                            help="Initial stddev for instance noise added to real and fake images (0 = disabled)")
-    argparser.add_argument("--instance_noise_decay_steps", type=int, default=50000,
+    sub_parser.add_argument("--instance_noise_decay_steps", type=int, default=50000,
                            help="Number of steps to decay instance noise to 0")
     # R1 gradient penalty: penalizes gradient norm on real images to learn real distribution
-    argparser.add_argument("--r1_penalty_weight", type=float, default=0.0,
+    sub_parser.add_argument("--r1_penalty_weight", type=float, default=0.0,
                            help="Weight for R1 gradient penalty (0 = disabled)")
-    argparser.add_argument("--r1_penalty_interval", type=int, default=16,
+    sub_parser.add_argument("--r1_penalty_interval", type=int, default=16,
                            help="Interval (in steps) to apply R1 penalty (expensive)")
     # GAN warmup: ramps GAN loss from 0 to full over N steps (0 = no warmup)
-    argparser.add_argument("--gan_warmup_steps", type=int, default=0,
+    sub_parser.add_argument("--gan_warmup_steps", type=int, default=0,
                            help="Number of steps to ramp up GAN loss (0 = no warmup)")
     # Discriminator update frequency: update D every N generator steps (1 = every step, 2 = every other step)
-    argparser.add_argument("--discriminator_update_frequency", type=int, default=1,
+    sub_parser.add_argument("--discriminator_update_frequency", type=int, default=1,
                            help="Discriminator update frequency: update D every N generator steps (1 = every step")
     # Adaptive discriminator weighting (VQGAN-style): automatically balances GAN vs reconstruction gradients
     # This prevents the discriminator from dominating and causing artifacts
-    argparser.add_argument("--use_adaptive_weight", action="store_true",
+    sub_parser.add_argument("--use_adaptive_weight", action="store_true",
                            help="Use adaptive weighting for GAN loss contribution")
     # Perceptual loss delayed start (0 = from start, >0 = delay to let L1/MSE settle)
-    argparser.add_argument("--perceptual_loss_start_step", type=int, default=0,
+    sub_parser.add_argument("--perceptual_loss_start_step", type=int, default=0,
                            help="Step to start applying perceptual loss (0 = from start)")
 
     # CONFLICTS WITH R1 PENALTY; ONLY ENABLE ONE OF THESE REGULARIZATION TYPES AT A TIME
-    argparser.add_argument("--discriminator_spectral_norm", type=str, default="true",
+    sub_parser.add_argument("--discriminator_spectral_norm", type=str, default="true",
                            help="Whether to use spectral normalization in the discriminator (true/false)")
 
     # KL annealing: ramps KL weight from 0 to full over N steps (0 = disabled, no annealing)
-    argparser.add_argument("--kl_annealing_steps", type=int, default=0,
+    sub_parser.add_argument("--kl_annealing_steps", type=int, default=0,
                            help="Number of steps to ramp up KL weight (0 = disabled)")
 
     # Free bits: minimum KL per channel to prevent posterior collapse (0 = disabled)
-    argparser.add_argument("--free_bits", type=float, default=0.0,
+    sub_parser.add_argument("--free_bits", type=float, default=0.0,
                            help="Free bits for KL divergence loss per channel (0 = disabled)")
 
     # Dataset caching directory
-    argparser.add_argument("--cache_dir", type=str, default=None,
+    sub_parser.add_argument("--cache_dir", type=str, default=None,
                            help="Directory to cache datasets")
     
-    return subparsers
+    return sub_parser
