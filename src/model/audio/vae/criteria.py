@@ -113,10 +113,7 @@ class AudioPerceptualLoss(nn.Module):
 
     Combines multiple audio perceptual losses with individual weights:
     - Multi-scale mel loss (mel-to-mel comparison)
-    - Wav2Vec2 features (speech-specific)
-    - PANNs features (general audio)
 
-    Note: Wav2Vec2 and PANNs losses require waveforms, so a vocoder
     must be used to convert mel spectrograms to waveforms first.
     """
     def __init__(

@@ -41,8 +41,6 @@ class AudioCVAEGANTrainer(CommonTrainer):
 
     Supports audio perceptual losses:
     - Multi-scale mel loss (works on mel spectrograms directly)
-    - Wav2Vec2 perceptual loss (requires vocoder to convert to waveform)
-    - PANNs perceptual loss (requires vocoder to convert to waveform)
     """
 
     def __init__(
@@ -468,7 +466,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
             and global_step >= self.audio_perceptual_loss_start_step
         )
         if perceptual_loss_enabled:
-            # Get waveforms if vocoder is available (needed for Wav2Vec2 and PANNs)
+            # Get waveforms if vocoder is available
             pred_waveform = None
             target_waveform = None
             if self.vocoder is not None:
@@ -1037,8 +1035,6 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 print(f"  Start step: {args.audio_perceptual_loss_start_step} (delayed to let L1/MSE settle)")
             print(f"  Multi-scale mel weight: {args.multi_scale_mel_weight}")
             print(f"  use_log_mel: {args.use_log_mel} (should be false for log-mel spectrograms)")
-            print(f"  Wav2Vec2 weight: {args.wav2vec2_weight if vocoder is not None else 0.0} (model: {args.wav2vec2_model})")
-            print(f"  PANNs weight: {args.panns_weight if vocoder is not None else 0.0}")
             if vocoder is not None:
                 print(f"  Using vocoder for waveform conversion: {args.vocoder_config}")
             else:
@@ -1100,13 +1096,7 @@ def create_trainer(
     if args.audio_perceptual_loss_weight > 0:
         # Create audio perceptual loss
         audio_perceptual_loss = AudioPerceptualLoss(
-            sample_rate=args.audio_sample_rate,
             multi_scale_mel_weight=args.multi_scale_mel_weight,
-            wav2vec2_weight=args.wav2vec2_weight if vocoder is not None else 0.0,
-            panns_weight=args.panns_weight if vocoder is not None else 0.0,
-            wav2vec2_model=args.wav2vec2_model,
-            speaker_embedding_weight=args.speaker_embedding_weight,
-            use_log_mel=args.use_log_mel,  # Set to false for log-mel inputs (default)
         )
         audio_perceptual_loss.to(device)
         # Freeze all perceptual loss weights
@@ -1114,9 +1104,8 @@ def create_trainer(
             param.requires_grad = False
 
         # Warn if waveform-based perceptual losses requested but no vocoder
-        if vocoder is None and (args.wav2vec2_weight > 0 or args.panns_weight > 0):
-            print("Warning: Wav2Vec2/PANNs losses require a vocoder but no vocoder available.")
-            print("  Only multi-scale mel loss will be used.")
+        if vocoder is None and (args.waveform_stft_loss_weight > 0 or args.waveform_mel_loss_weight > 0):
+            print("WARNING: Audio perceptual loss with waveform-based components requested but no vocoder loaded. Waveform losses will be disabled.")
 
     return AudioCVAEGANTrainer(
         model=model,
@@ -1247,16 +1236,7 @@ def add_cli_args(subparsers):
     # Individual component weights (relative to total audio perceptual loss weight)
     argparser.add_argument("--multi_scale_mel_weight", type=float, default=1.0,
                            help="Weight for multi-scale mel spectrogram loss component")
-    argparser.add_argument("--wav2vec2_weight", type=float, default=0.0,
-                           help="Weight for Wav2Vec2 loss (requires vocoder for waveform)")
-    argparser.add_argument("--panns_weight", type=float, default=0.0,
-                           help="Weight for PANNs loss (requires panns-inference, vocoder)")
-    argparser.add_argument("--speaker_embedding_weight", type=float, default=0.0,
-                           help="Weight for speaker embedding loss (requires speaker embedding model, vocoder)")
     
-    # Wav2Vec2 model selection: 'facebook/wav2vec2-base' (~95M) or 'facebook/wav2vec2-large' (~317M)
-    argparser.add_argument("--wav2vec2_model", type=str, default="facebook/wav2vec2-base",
-                           help="Pretrained Wav2Vec2 model to use for perceptual loss")
     # CRITICAL: Set to false if mel spectrograms are already log-scaled (which they are by default!)
     # When true, MultiScaleMelSpectrogramLoss applies log() to inputs, which clamps negative log-mel
     # values to 1e-5 and destroys gradients. Default changed to false for log-mel inputs.
