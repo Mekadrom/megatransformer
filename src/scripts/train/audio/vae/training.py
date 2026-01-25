@@ -9,7 +9,7 @@ from torch.amp import autocast
 from torch.nn import functional as F
 
 from model.audio.criteria import MultiResolutionSTFTLoss, MultiScaleMelLoss
-from model.audio.vae.criteria import ArcFaceLoss, AudioPerceptualLoss
+from model.audio.vae.criteria import ArcFaceLoss, AudioPerceptualLoss, MultiScaleMelSpectrogramLoss
 from model.audio.vae.discriminator import (
     MelDomainCombinedDiscriminator,
     MelDomainMultiPeriodDiscriminator,
@@ -117,17 +117,11 @@ class AudioCVAEGANTrainer(CommonTrainer):
         use_adaptive_weight: bool = False,  # Automatically balance GAN vs reconstruction gradients
         # KL annealing (ramps KL weight from 0 to full over training)
         kl_annealing_steps: int = 0,  # Steps to ramp KL weight from 0 to 1 (0 = disabled)
-        # Audio perceptual loss
-        audio_perceptual_loss: Optional[torch.nn.Module] = None,
+        # Audio perceptual loss (mel domain and waveform domain if applicable)
+        audio_perceptual_loss: Optional[AudioPerceptualLoss] = None,
         audio_perceptual_loss_weight: float = 0.0,
         audio_perceptual_loss_start_step: int = 0,  # Step to start applying perceptual loss
         vocoder: Optional[torch.nn.Module] = None,  # For waveform-based losses
-        # Waveform-domain losses (require vocoder, gradients flow through vocoder)
-        waveform_stft_loss: Optional[torch.nn.Module] = None,  # MultiResolutionSTFTLoss
-        waveform_stft_loss_weight: float = 0.0,
-        waveform_mel_loss: Optional[torch.nn.Module] = None,  # MultiScaleMelLoss
-        waveform_mel_loss_weight: float = 0.0,
-        waveform_loss_start_step: int = 0,  # Step to start applying waveform losses
         # FiLM statistics tracking
         log_film_stats: bool = False,  # Whether to log FiLM scale/shift statistics
         # FiLM contrastive loss - encourages different speaker embeddings to produce different FiLM outputs
@@ -187,13 +181,6 @@ class AudioCVAEGANTrainer(CommonTrainer):
         self.audio_perceptual_loss_weight = audio_perceptual_loss_weight
         self.audio_perceptual_loss_start_step = audio_perceptual_loss_start_step
         self.vocoder = vocoder
-
-        # Waveform-domain loss settings (gradients flow through frozen vocoder)
-        self.waveform_stft_loss = waveform_stft_loss
-        self.waveform_stft_loss_weight = waveform_stft_loss_weight
-        self.waveform_mel_loss = waveform_mel_loss
-        self.waveform_mel_loss_weight = waveform_mel_loss_weight
-        self.waveform_loss_start_step = waveform_loss_start_step
 
         # Instance noise scheduler (decays over training)
         self.noise_scheduler = None
@@ -545,48 +532,6 @@ class AudioCVAEGANTrainer(CommonTrainer):
             )
             audio_perceptual_loss_value = audio_perceptual_losses.get("total_perceptual_loss", torch.tensor(0.0, device=mel_spec.device))
             total_loss = total_loss + self.audio_perceptual_loss_weight * audio_perceptual_loss_value
-
-        # Waveform-domain losses (STFT and multi-scale mel on waveforms)
-        # These require vocoder and gradients flow through the frozen vocoder
-        waveform_stft_loss_value = torch.tensor(0.0, device=mel_spec.device)
-        waveform_mel_loss_value = torch.tensor(0.0, device=mel_spec.device)
-        waveform_loss_enabled = (
-            self.vocoder is not None
-            and global_step >= self.waveform_loss_start_step
-            and (self.waveform_stft_loss_weight > 0 or self.waveform_mel_loss_weight > 0)
-        )
-        if waveform_loss_enabled:
-            # Run vocoder on predicted mel WITHOUT no_grad so gradients flow back
-            # Vocoder weights are frozen, but gradients w.r.t. input (mel) are computed
-            vocoder_outputs = self.vocoder(recon.float())
-            if isinstance(vocoder_outputs, dict):
-                pred_waveform_grad = vocoder_outputs["pred_waveform"]
-            else:
-                pred_waveform_grad = vocoder_outputs
-
-            # Run vocoder on target mel WITH no_grad (don't need gradients)
-            with torch.no_grad():
-                target_vocoder_outputs = self.vocoder(mel_spec.float())
-                if isinstance(target_vocoder_outputs, dict):
-                    target_waveform_grad = target_vocoder_outputs["pred_waveform"]
-                else:
-                    target_waveform_grad = target_vocoder_outputs
-
-            # Multi-resolution STFT loss
-            if self.waveform_stft_loss is not None and self.waveform_stft_loss_weight > 0:
-                sc_loss, mag_loss, complex_stft_loss = self.waveform_stft_loss(
-                    pred_waveform_grad, target_waveform_grad
-                )
-                waveform_stft_loss_value = sc_loss + mag_loss + complex_stft_loss
-                total_loss = total_loss + self.waveform_stft_loss_weight * waveform_stft_loss_value
-
-            # Multi-scale mel loss (on waveforms)
-            if self.waveform_mel_loss is not None and self.waveform_mel_loss_weight > 0:
-                waveform_mel_loss_value = self.waveform_mel_loss(
-                    pred_waveform_grad.squeeze(1) if pred_waveform_grad.dim() == 3 else pred_waveform_grad,
-                    target_waveform_grad.squeeze(1) if target_waveform_grad.dim() == 3 else target_waveform_grad
-                )
-                total_loss = total_loss + self.waveform_mel_loss_weight * waveform_mel_loss_value
 
         # Learned speaker embedding classification loss
         # Uses direct gradients (no reversal) to train the speaker head to be discriminative
@@ -1084,7 +1029,6 @@ class AudioCVAEGANTrainer(CommonTrainer):
             if args.audio_perceptual_loss_start_step > 0:
                 print(f"  Start step: {args.audio_perceptual_loss_start_step} (delayed to let L1/MSE settle)")
             print(f"  Multi-scale mel weight: {args.multi_scale_mel_weight}")
-            print(f"  use_log_mel: {args.use_log_mel} (should be false for log-mel spectrograms)")
             if vocoder is not None:
                 print(f"  Using vocoder for waveform conversion: {args.vocoder_config}")
             else:
@@ -1133,6 +1077,7 @@ def create_trainer(
     # Create waveform-domain loss criteria if enabled
     waveform_stft_loss = None
     waveform_mel_loss = None
+    multi_scale_mel_loss = None
     if vocoder is not None:
         if args.waveform_stft_loss_weight > 0:
             waveform_stft_loss = MultiResolutionSTFTLoss(
@@ -1152,12 +1097,23 @@ def create_trainer(
             waveform_mel_loss.to(device)
             print(f"Created MultiScaleMelLoss (weight={args.waveform_mel_loss_weight})")
 
+    # doesn't need vocoder to be enabled
+    if args.multi_scale_mel_loss_weight > 0:
+        multi_scale_mel_loss = MultiScaleMelSpectrogramLoss()
+        multi_scale_mel_loss.to(device)
+        print(f"Created MultiScaleMelSpectrogramLoss (weight={args.multi_scale_mel_loss_weight})")
+
     # Create audio perceptual loss if enabled
     audio_perceptual_loss = None
     if args.audio_perceptual_loss_weight > 0:
         # Create audio perceptual loss
         audio_perceptual_loss = AudioPerceptualLoss(
-            multi_scale_mel_weight=args.multi_scale_mel_weight,
+            waveform_stft_loss,
+            waveform_mel_loss,
+            multi_scale_mel_loss,
+            waveform_stft_weight=args.waveform_stft_loss_weight,
+            waveform_mel_weight=args.waveform_mel_loss_weight,
+            multi_scale_mel_weight=args.multi_scale_mel_loss_weight,
         )
         audio_perceptual_loss.to(device)
         # Freeze all perceptual loss weights
@@ -1279,11 +1235,6 @@ def create_trainer(
         audio_perceptual_loss_weight=args.audio_perceptual_loss_weight,
         audio_perceptual_loss_start_step=args.audio_perceptual_loss_start_step,
         vocoder=vocoder,
-        waveform_stft_loss=waveform_stft_loss,
-        waveform_stft_loss_weight=args.waveform_stft_loss_weight,
-        waveform_mel_loss=waveform_mel_loss,
-        waveform_mel_loss_weight=args.waveform_mel_loss_weight,
-        waveform_loss_start_step=args.waveform_loss_start_step,
         log_film_stats=args.log_film_stats,
         film_contrastive_loss_weight=args.film_contrastive_loss_weight,
         film_contrastive_loss_start_step=args.film_contrastive_loss_start_step,
@@ -1375,27 +1326,18 @@ def add_cli_args(subparsers):
     # Total weight for all audio perceptual losses (0 = disabled)
     sub_parser.add_argument("--audio_perceptual_loss_weight", type=float, default=0.0,
                            help="Total weight for audio perceptual loss (0 = disabled)")
-    # Step to start applying perceptual loss (0 = from start, >0 = delay to let L1/MSE settle)
-    sub_parser.add_argument("--audio_perceptual_loss_start_step", type=int, default=0,
-                           help="Step to start applying audio perceptual loss (0 = from start)")
-    # Individual component weights (relative to total audio perceptual loss weight)
-    sub_parser.add_argument("--multi_scale_mel_weight", type=float, default=1.0,
-                           help="Weight for multi-scale mel spectrogram loss component")
-    
-    # CRITICAL: Set to false if mel spectrograms are already log-scaled (which they are by default!)
-    # When true, MultiScaleMelSpectrogramLoss applies log() to inputs, which clamps negative log-mel
-    # values to 1e-5 and destroys gradients. Default changed to false for log-mel inputs.
-    sub_parser.add_argument("--use_log_mel", type=str, default="false",
-                           help="Whether input mel spectrograms are log-scaled (true/false)")
-
     # Waveform-domain losses (require vocoder, gradients flow through frozen vocoder)
     # These losses operate on waveforms generated by the vocoder, providing direct audio supervision
     sub_parser.add_argument("--waveform_stft_loss_weight", type=float, default=0.0,
                            help="Weight for MultiResolutionSTFTLoss on waveforms")
     sub_parser.add_argument("--waveform_mel_loss_weight", type=float, default=0.0,
                            help="Weight for MultiScaleMelLoss on waveforms")
-    sub_parser.add_argument("--waveform_loss_start_step", type=int, default=0,
-                           help="Step to start applying waveform losses")
+    # Individual component weights (relative to total audio perceptual loss weight)
+    sub_parser.add_argument("--multi_scale_mel_loss_weight", type=float, default=1.0,
+                           help="Weight for multi-scale mel spectrogram loss component")
+    # Step to start applying perceptual loss (0 = from start, >0 = delay to let L1/MSE settle)
+    sub_parser.add_argument("--audio_perceptual_loss_start_step", type=int, default=0,
+                           help="Step to start applying audio perceptual loss (0 = from start)")
     
     # Vocoder settings (optional - for audio generation during visualization AND waveform losses)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,

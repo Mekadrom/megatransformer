@@ -7,7 +7,6 @@ from config.audio.vae.vae import AUDIO_VAE_CONFIGS, AUDIO_DECODER_CONFIGS, AUDIO
 from config.audio.vae.vae import AudioVAEDecoderConfig, AudioVAEEncoderConfig
 from model import activations
 from model.activations import get_activation_type
-from model.audio.vae.criteria import AudioPerceptualLoss
 from model.audio.vae.residual_block import ResidualBlock1d, ResidualBlock2d
 
 
@@ -695,9 +694,6 @@ class AudioVAE(nn.Module):
         self.f0_predictor = f0_predictor
         self.f0_embedding = f0_embedding
 
-        if config.multi_scale_mel_weight > 0:
-            self.perceptual_loss = AudioPerceptualLoss(multi_scale_mel_weight=config.multi_scale_mel_weight)
-
     @classmethod
     def from_config(cls, config_name: str, **overrides) -> "AudioVAE":
         """
@@ -911,11 +907,6 @@ class AudioVAE(nn.Module):
         else:
             l1_loss = torch.tensor(0.0, device=target.device)
 
-        perceptual_loss_value = torch.tensor(0.0, device=target.device)
-        # Perceptual loss (if enabled)
-        if hasattr(self, 'perceptual_loss'):
-            perceptual_loss_value = self.perceptual_loss(recon_x, target, mask=mask)["total_perceptual_loss"]
-
         recon_loss = self.config.mse_loss_weight * mse_loss + self.config.l1_loss_weight * l1_loss
 
         # Apply KL weight multiplier for KL annealing
@@ -924,7 +915,6 @@ class AudioVAE(nn.Module):
         total_loss = (
             self.config.recon_loss_weight * recon_loss
             + effective_kl_weight * kl_divergence
-            + self.config.perceptual_loss_weight * perceptual_loss_value
         )
 
         # F0 prediction losses (if F0 conditioning is enabled and ground truth provided)
@@ -1184,16 +1174,10 @@ class AudioCVAEDecoderOnly(nn.Module):
         else:
             l1_loss = torch.tensor(0.0, device=target.device)
 
-        perceptual_loss_value = torch.tensor(0.0, device=target.device)
-        # Perceptual loss (if enabled)
-        if hasattr(self, 'perceptual_loss'):
-            perceptual_loss_value = self.perceptual_loss(recon_x, target, mask=mask)["total_perceptual_loss"]
-
         recon_loss = self.config.mse_loss_weight * mse_loss + self.config.l1_loss_weight * l1_loss
 
         total_loss = (
             self.config.recon_loss_weight * recon_loss
-            + self.config.perceptual_loss_weight * perceptual_loss_value
         )
 
         # F0 prediction losses (if F0 conditioning is enabled and ground truth provided)
