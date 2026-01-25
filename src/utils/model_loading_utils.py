@@ -55,7 +55,7 @@ def load_model(
     return model
 
 
-def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer):
+def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer, is_wrapped: bool = False):
     """Lazily load vocoder on first use."""
     if vocoder_checkpoint_path is None:
         return
@@ -64,25 +64,30 @@ def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer):
         print(f"Vocoder checkpoint not found at {vocoder_checkpoint_path}")
         return
 
-    class VocoderWrapper(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.vocoder: Optional[Vocoder] = None
-
-        @classmethod
-        def from_config(cls, config_name: str, shared_window_buffer: Optional[SharedWindowBuffer], **overrides) -> "VocoderWrapper":
-            wrapper = cls()
-            wrapper.vocoder = Vocoder.from_config(config_name, shared_window_buffer=shared_window_buffer, **overrides)
-            return wrapper
-
     try:
-        vocoder = load_model(VocoderWrapper, vocoder_config, checkpoint_path=vocoder_checkpoint_path, overrides={"shared_window_buffer": shared_window_buffer}, strict=True).vocoder
-        vocoder.eval()
-        print(f"Loaded vocoder from {vocoder_checkpoint_path}")
-        print(f"Vocoder parameters: {sum(p.numel() for p in vocoder.parameters()):,}")
+        if is_wrapped:
+            class VocoderWrapper(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.vocoder: Optional[Vocoder] = None
+
+                @classmethod
+                def from_config(cls, config_name: str, shared_window_buffer: Optional[SharedWindowBuffer], **overrides) -> "VocoderWrapper":
+                    wrapper = cls()
+                    wrapper.vocoder = Vocoder.from_config(config_name, shared_window_buffer=shared_window_buffer, **overrides)
+                    return wrapper
+
+            vocoder = load_model(VocoderWrapper, vocoder_config, checkpoint_path=vocoder_checkpoint_path, overrides={"shared_window_buffer": shared_window_buffer}, strict=False).vocoder
+            vocoder.eval()
+        else:
+            vocoder = load_model(Vocoder, vocoder_config, checkpoint_path=vocoder_checkpoint_path, overrides={"shared_window_buffer": shared_window_buffer}, strict=False)
+            vocoder.eval()
     except Exception as e:
         print(f"Failed to load vocoder: {e}")
         raise e
+
+    print(f"Loaded vocoder from {vocoder_checkpoint_path}")
+    print(f"Vocoder parameters: {sum(p.numel() for p in vocoder.parameters()):,}")
     return vocoder
 
 
