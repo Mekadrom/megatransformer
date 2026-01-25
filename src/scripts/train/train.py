@@ -298,7 +298,6 @@ def get_process_cmdline(pid):
 command_to_module = {
     "audio-cvae": audio_cvae_training,
     "image-vae": image_vae_training,
-    "world-model": world_model_training,
 }
 
 
