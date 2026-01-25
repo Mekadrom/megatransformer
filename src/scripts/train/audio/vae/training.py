@@ -1128,9 +1128,10 @@ def create_trainer(
 
         # Try to load existing discriminator checkpoint
         discriminator, discriminator_optimizer, disc_loaded = model_loading_utils.load_discriminator(
-            args.resume_from_checkpoint, discriminator, discriminator_optimizer, device
+            args.resume_from_checkpoint, discriminator, discriminator_optimizer, "cpu"
         )
 
+        # move to cpu until gan training starts
         discriminator = discriminator.cpu()
 
         if disc_loaded:
