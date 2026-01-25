@@ -23,21 +23,3 @@ class EarlyStoppingCallback(TrainerCallback):
         if self.stop_step > 0 and state.global_step >= self.stop_step:
             print(f"Early stopping at step {state.global_step} as per stop_step={self.stop_step}.")
             control.should_training_stop = True
-
-
-def check_tpu_availability():
-    try:
-        import torch_xla
-        import torch_xla.core.xla_model as xm
-        
-        device = xm.xla_device()
-        print(f"TPU is available! Device: {device}")
-        
-        tpu_cores = xm.xrt_world_size()
-        print(f"Number of TPU cores: {tpu_cores}")
-        print(f"TPU type: {torch_xla._XLAC._get_tpu_type()}")
-        
-        return True
-    except (ImportError, EnvironmentError, RuntimeError) as e:
-        print(f"TPU is not available: {e}")
-        return False
