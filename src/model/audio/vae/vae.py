@@ -1005,7 +1005,7 @@ class AudioCVAEDecoderOnly(nn.Module):
     """
     def __init__(
         self,
-        config: AudioVAEDecoderConfig,
+        config: AudioVAEConfig,
         decoder: AudioVAEDecoder,
         f0_predictor: F0Predictor,
         f0_embedding: F0ConditioningEmbedding,
@@ -1051,7 +1051,7 @@ class AudioCVAEDecoderOnly(nn.Module):
         config_dict.update(overrides)
         f0_embedding = F0ConditioningEmbedding.from_config(config.f0_conditioning_embedding_config, **config_dict)
 
-        return cls(config.decoder_config, decoder, f0_predictor, f0_embedding)
+        return cls(config, decoder, f0_predictor, f0_embedding)
     
     def decode(self, z, speaker_embedding=None, f0_embedding=None, features=None, return_film_stats=False) -> torch.Tensor:
         """
