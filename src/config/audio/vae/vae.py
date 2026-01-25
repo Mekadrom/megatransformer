@@ -11,7 +11,7 @@ class AudioVAEEncoderConfig:
 
     # architecture parameters
     encoder_dim: int = 128  # sive feature dim
-    latent_dim: int = 16
+    latent_channels: int = 16
 
     activation: str = "silu"
 
@@ -59,7 +59,7 @@ class AudioVAEDecoderConfig:
     """Configuration for audio VAE decoder model."""
 
     # architecture parameters
-    latent_dim: int = 16
+    latent_channels: int = 16
 
     activation: str = "silu"
 

@@ -66,8 +66,8 @@ class AudioVAEEncoder(nn.Module):
 
         # Output projections for mu and logvar
         final_channels = config.intermediate_channels[-1]
-        self.fc_mu = nn.Conv1d(final_channels, config.latent_dim, kernel_size=3, padding=1)
-        self.fc_logvar = nn.Conv1d(final_channels, config.latent_dim, kernel_size=3, padding=1)
+        self.fc_mu = nn.Conv1d(final_channels, config.latent_channels, kernel_size=3, padding=1)
+        self.fc_logvar = nn.Conv1d(final_channels, config.latent_channels, kernel_size=3, padding=1)
 
         self._init_weights()
 
@@ -158,7 +158,7 @@ class AudioVAEDecoder(nn.Module):
         self.film_speaker_dim = config.speaker_embedding_proj_dim if config.speaker_embedding_proj_dim > 0 else config.speaker_embedding_dim
 
         # Input dim is just latent (F0 is injected after 1D→2D transition)
-        decoder_input_dim = config.latent_dim
+        decoder_input_dim = config.latent_channels
 
         self.scale_factors_2d = config.scale_factors_2d
 
