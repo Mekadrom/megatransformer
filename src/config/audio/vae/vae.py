@@ -68,7 +68,7 @@ class AudioVAEDecoderConfig:
     strides: Optional[list[int]] = None
     n_residual_blocks: int = 1
     speaker_embedding_dim: int = 192
-    speaker_embedding_proj_dim: Optional[int] = None
+    speaker_embedding_proj_dim: int = 0
     normalize_speaker_embedding: bool = True
     film_scale_bound: float = 1.0
     film_shift_bound: float = 1.0

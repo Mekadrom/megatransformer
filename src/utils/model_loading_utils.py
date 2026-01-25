@@ -1,12 +1,15 @@
 import os
+from typing import Optional
 
 import torch
+
+from model.audio.vocoder.vocoder import Vocoder
 
 
 def load_model(
     model_cls,
-    checkpoint_path: str,
     config_name: str,
+    checkpoint_path: Optional[str] = None,
     device: str = "cuda",
     overrides: dict = {},
 ):
@@ -23,6 +26,10 @@ def load_model(
     """
     # Create model with same config
     model = model_cls.from_config(config_name, **overrides)
+    model = model.to(device)
+
+    if checkpoint_path is None:
+        return model
 
     # Try to load from safetensors first, then pytorch_model.bin
     safetensors_path = os.path.join(checkpoint_path, "model.safetensors")
@@ -42,7 +49,29 @@ def load_model(
             f"Expected model.safetensors or pytorch_model.bin"
         )
 
-    model = model.to(device)
-    model.eval()
-
     return model
+
+
+def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer):
+    """Lazily load vocoder on first use."""
+    if vocoder_checkpoint_path is None:
+        return
+
+    if not os.path.exists(vocoder_checkpoint_path):
+        print(f"Vocoder checkpoint not found at {vocoder_checkpoint_path}")
+        return
+
+    try:
+        vocoder = load_model(Vocoder, vocoder_config, checkpoint_path=vocoder_checkpoint_path, overrides={"shared_window_buffer": shared_window_buffer})
+
+        # Remove weight normalization for inference optimization
+        if hasattr(vocoder.vocoder, 'remove_weight_norm'):
+            vocoder.vocoder.remove_weight_norm()
+
+        vocoder.eval()
+        print(f"Loaded vocoder from {vocoder_checkpoint_path}")
+        print(f"Vocoder parameters: {sum(p.numel() for p in vocoder.parameters()):,}")
+    except Exception as e:
+        print(f"Failed to load vocoder: {e}")
+        vocoder = None
+    return vocoder

@@ -88,7 +88,7 @@ class AudioVAEEncoder(nn.Module):
         nn.init.zeros_(self.fc_logvar.bias)
 
     @classmethod
-    def from_config(cls, config_name: str, **overrides) -> "AudioVAEEncoder":
+    def from_config(cls, config: Union[str, AudioVAEEncoderConfig], **overrides) -> "AudioVAEEncoder":
         """
         Create model from predefined config with optional overrides.
 
@@ -99,10 +99,11 @@ class AudioVAEEncoder(nn.Module):
         Example:
             model = AudioVAEEncoder.from_config("small", latent_dim=32)
         """
-        if config_name not in AUDIO_ENCODER_CONFIGS:
-            raise ValueError(f"Unknown config: {config_name}. Available: {list(AUDIO_ENCODER_CONFIGS.keys())}")
+        if isinstance(config, str):
+            if config not in AUDIO_ENCODER_CONFIGS:
+                raise ValueError(f"Unknown config: {config}. Available: {list(AUDIO_ENCODER_CONFIGS.keys())}")
+            config = AUDIO_ENCODER_CONFIGS[config]
 
-        config = AUDIO_ENCODER_CONFIGS[config_name]
         # Apply overrides
         config_dict = {k: v for k, v in config.__dict__.items()}
         config_dict.update(overrides)
@@ -302,7 +303,7 @@ class AudioVAEDecoder(nn.Module):
                         nn.init.zeros_(linear.bias)
 
     @classmethod
-    def from_config(cls, config_name: str, **overrides) -> "AudioVAEDecoder":
+    def from_config(cls, config: Union[str, AudioVAEDecoderConfig], **overrides) -> "AudioVAEDecoder":
         """
         Create model from predefined config with optional overrides.
 
@@ -313,10 +314,11 @@ class AudioVAEDecoder(nn.Module):
         Example:
             model = AudioVAEDecoder.from_config("small", latent_dim=32)
         """
-        if config_name not in AUDIO_DECODER_CONFIGS:
-            raise ValueError(f"Unknown config: {config_name}. Available: {list(AUDIO_DECODER_CONFIGS.keys())}")
+        if isinstance(config, str):
+            if config not in AUDIO_DECODER_CONFIGS:
+                raise ValueError(f"Unknown config: {config}. Available: {list(AUDIO_DECODER_CONFIGS.keys())}")
+            config = AUDIO_DECODER_CONFIGS[config]
 
-        config = AUDIO_DECODER_CONFIGS[config_name]
         # Apply overrides
         config_dict = {k: v for k, v in config.__dict__.items()}
         config_dict.update(overrides)
@@ -483,7 +485,7 @@ class F0Predictor(nn.Module):
             self.output_proj.bias.data[1] = 0.0
 
     @classmethod
-    def from_config(cls, config_name: str, **overrides) -> "F0Predictor":
+    def from_config(cls, config: str, **overrides) -> "F0Predictor":
         """
         Create model from predefined config with optional overrides.
 
@@ -494,10 +496,11 @@ class F0Predictor(nn.Module):
         Example:
             model = F0Predictor.from_config("small", encoder_dim=256)
         """
-        if config_name not in F0_PREDICTOR_CONFIGS:
-            raise ValueError(f"Unknown config: {config_name}. Available: {list(F0_PREDICTOR_CONFIGS.keys())}")
+        if isinstance(config, str):
+            if config not in F0_PREDICTOR_CONFIGS:
+                raise ValueError(f"Unknown config: {config}. Available: {list(F0_PREDICTOR_CONFIGS.keys())}")
+            config = F0_PREDICTOR_CONFIGS[config]
 
-        config = F0_PREDICTOR_CONFIGS[config_name]
         # Apply overrides
         config_dict = {k: v for k, v in config.__dict__.items()}
         config_dict.update(overrides)
@@ -578,7 +581,7 @@ class F0ConditioningEmbedding(nn.Module):
         self.output_scale = nn.Parameter(torch.tensor(0.1))
 
     @classmethod
-    def from_config(cls, config_name: str, **overrides) -> "F0ConditioningEmbedding":
+    def from_config(cls, config: str, **overrides) -> "F0ConditioningEmbedding":
         """
         Create model from predefined config with optional overrides.
 
@@ -589,10 +592,11 @@ class F0ConditioningEmbedding(nn.Module):
         Example:
             model = F0ConditioningEmbedding.from_config("small", encoder_dim=256)
         """
-        if config_name not in F0_CONDITIONING_EMBEDDING_CONFIGS:
-            raise ValueError(f"Unknown config: {config_name}. Available: {list(F0_CONDITIONING_EMBEDDING_CONFIGS.keys())}")
+        if isinstance(config, str):
+            if config not in F0_CONDITIONING_EMBEDDING_CONFIGS:
+                raise ValueError(f"Unknown config: {config}. Available: {list(F0_CONDITIONING_EMBEDDING_CONFIGS.keys())}")
+            config = F0_CONDITIONING_EMBEDDING_CONFIGS[config]
 
-        config = F0_CONDITIONING_EMBEDDING_CONFIGS[config_name]
         # Apply overrides
         config_dict = {k: v for k, v in config.__dict__.items()}
         config_dict.update(overrides)
