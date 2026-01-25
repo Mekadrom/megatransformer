@@ -1039,7 +1039,8 @@ class AudioCVAEGANTrainer(CommonTrainer):
         vocoder = self.vocoder if hasattr(self, 'vocoder') else None
         print(f"Model structure: {model}")
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-        print(f"  VAE Encoder parameters: {sum(p.numel() for p in model.encoder.parameters()):,}")
+        if hasattr(model, 'encoder') and model.encoder is not None:
+            print(f"  VAE Encoder parameters: {sum(p.numel() for p in model.encoder.parameters()):,}")
         print(f"  VAE Decoder parameters: {sum(p.numel() for p in model.decoder.parameters()):,}")
         print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
         print(f"Audio settings:")
