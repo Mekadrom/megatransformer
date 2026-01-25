@@ -5,6 +5,7 @@ import torch
 
 from model.audio.vocoder.vocoder import Vocoder
 from model.ema import EMAModel
+from utils.audio_utils import SharedWindowBuffer
 
 
 def load_model(
@@ -65,7 +66,14 @@ def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer):
 
     class VocoderWrapper(torch.nn.Module):
         def __init__(self):
-            self.vocoder: torch.nn.Module = None
+            super().__init__()
+            self.vocoder: Optional[Vocoder] = None
+
+        @classmethod
+        def from_config(cls, config_name: str, shared_window_buffer: Optional[SharedWindowBuffer], **overrides) -> "VocoderWrapper":
+            wrapper = cls()
+            wrapper.vocoder = Vocoder.from_config(config_name, shared_window_buffer=shared_window_buffer, **overrides)
+            return wrapper
 
     try:
         vocoder = load_model(VocoderWrapper, vocoder_config, checkpoint_path=vocoder_checkpoint_path, overrides={"shared_window_buffer": shared_window_buffer}, strict=True).vocoder
