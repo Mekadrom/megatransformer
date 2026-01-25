@@ -1079,7 +1079,7 @@ def create_trainer(
             waveform_mel_loss = MultiScaleMelLoss(
                 shared_window_buffer=shared_window_buffer,
                 sample_rate=args.audio_sample_rate,
-                n_mels=args.n_mels,
+                n_mels=args.audio_n_mels,
             )
             waveform_mel_loss.to(device)
             print(f"Created MultiScaleMelLoss (weight={args.waveform_mel_loss_weight})")
