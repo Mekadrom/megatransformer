@@ -18,16 +18,15 @@ from scripts.data.data_collator import DataCollator
 from scripts.train.audio.visualization_callback import AudioCVAEVisualizationCallback
 from scripts.train.trainer import CommonTrainer
 from utils.audio_utils import SharedWindowBuffer
-from utils.model_loading_utils import load_model, load_vocoder
+from utils.model_loading_utils import load_vocoder
 from utils.train_utils import EarlyStoppingCallback
 
 
-def create_or_load_model(args, module, overrides={}) -> nn.Module:
-    if args.resume_from_checkpoint is not None:
-        checkpoint_path = args.resume_from_checkpoint
+def create_or_load_model(args) -> nn.Module:
+    if args.command in ["audio-cvae", "audio-cvae-decoder"]:
+        return audio_trainer.load_model(args)
     else:
-        checkpoint_path = None
-    return load_model(module._model_cls, args.config,  checkpoint_path=checkpoint_path, overrides=overrides)
+        raise ValueError(f"Unknown command: {args.command}. Available: audio-cvae, audio-cvae-decoder")
 
 
 def get_training_args(args, run_dir) -> TrainingArguments:
@@ -265,7 +264,7 @@ if __name__ == "__main__":
     else:
         shared_window_buffer = None
 
-    model = create_or_load_model(args, module, overrides=unk_dict)
+    model = create_or_load_model(args)
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
 

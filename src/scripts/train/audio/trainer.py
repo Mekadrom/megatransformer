@@ -21,9 +21,10 @@ from model.audio.vae.discriminator import (
     compute_mel_generator_gan_loss,
     r1_mel_gradient_penalty
 )
-from model.audio.vae.vae import AudioVAE
+from model.audio.vae.vae import AudioCVAEDecoderOnly, AudioVAE
 from model.discriminator import compute_adaptive_weight
 from scripts.train.trainer import CommonTrainer
+from utils import model_loading_utils
 
 
 _model_cls = AudioVAE
@@ -1109,6 +1110,17 @@ class AudioCVAEGANTrainer(CommonTrainer):
             print(f"Instance norm on latents: enabled (removes speaker statistics from z)")
         if args.mu_only_recon_weight > 0:
             print(f"Mu-only reconstruction loss: weight={args.mu_only_recon_weight} (trains decoder for diffusion compatibility)")
+
+
+def load_model(args):
+    if args.config.endswith("_decoder_only"):
+        return model_loading_utils.load_model(AudioCVAEDecoderOnly, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
+            "latent_channels": args.latent_channels,
+        })
+    else:
+        return model_loading_utils.load_model(AudioVAE, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
+            "latent_channels": args.latent_channels,
+        })
 
 
 def load_discriminator(
