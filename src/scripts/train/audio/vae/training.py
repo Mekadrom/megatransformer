@@ -1108,6 +1108,7 @@ def create_trainer(
     if args.audio_perceptual_loss_weight > 0:
         # Create audio perceptual loss
         audio_perceptual_loss = AudioPerceptualLoss(
+            vocoder,
             waveform_stft_loss,
             waveform_mel_loss,
             multi_scale_mel_loss,
