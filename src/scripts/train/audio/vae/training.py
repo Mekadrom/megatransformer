@@ -522,12 +522,9 @@ class AudioCVAEGANTrainer(CommonTrainer):
 
             # Compute audio perceptual losses
             # Mel spec is [B, 1, n_mels, T], squeeze channel dim for multi-scale mel loss
-            audio_perceptual_losses = self.audio_perceptual_loss(
+            audio_perceptual_losses: dict[str, torch.Tensor] = self.audio_perceptual_loss(
                 pred_mel=recon.squeeze(1),  # [B, n_mels, T]
                 target_mel=mel_spec.squeeze(1),  # [B, n_mels, T]
-                target_speaker_embedding=speaker_embedding,
-                pred_waveform=pred_waveform,
-                target_waveform=target_waveform,
                 mask=mel_spec_masks,  # [B, T] mask to exclude padded regions
             )
             audio_perceptual_loss_value = audio_perceptual_losses.get("total_perceptual_loss", torch.tensor(0.0, device=mel_spec.device))
@@ -765,13 +762,6 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 for loss_name, loss_val in audio_perceptual_losses.items():
                     self._log_scalar(f"{prefix}audio_perceptual/{loss_name}", loss_val, global_step)
                 self._log_scalar(f"{prefix}audio_perceptual_weighted", self.audio_perceptual_loss_weight * audio_perceptual_loss_value, global_step)
-
-            # Log waveform-domain losses
-            if waveform_loss_enabled:
-                self._log_scalar(f"{prefix}waveform/stft_loss", waveform_stft_loss_value, global_step)
-                self._log_scalar(f"{prefix}waveform/stft_loss_weighted", self.waveform_stft_loss_weight * waveform_stft_loss_value, global_step)
-                self._log_scalar(f"{prefix}waveform/mel_loss", waveform_mel_loss_value, global_step)
-                self._log_scalar(f"{prefix}waveform/mel_loss_weighted", self.waveform_mel_loss_weight * waveform_mel_loss_value, global_step)
 
             # Log speaker embedding statistics (learned or pretrained, whichever is used for decoding)
             if decode_speaker_embedding is not None:
