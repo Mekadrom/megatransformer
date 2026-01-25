@@ -33,5 +33,5 @@ class VocoderConfig:
 
 VOCODER_CONFIGS = {
     "default": VocoderConfig(),
-    "tiny": VocoderConfig(hidden_dim=128),
+    "tiny": VocoderConfig(hidden_dim=128, convnext_mult=8),
 }
