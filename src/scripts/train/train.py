@@ -268,7 +268,7 @@ if __name__ == "__main__":
     trainer: CommonTrainer = get_trainer(args.command, args, run_dir, model, device, shared_window_buffer=shared_window_buffer)
 
     if args.local_rank == 0 or not args.use_deepspeed:
-        trainer.start_train_print()
+        trainer.start_train_print(args)
 
     # Log scheduler info
     if hasattr(trainer, 'deepspeed') and trainer.deepspeed is not None:

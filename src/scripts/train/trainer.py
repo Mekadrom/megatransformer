@@ -93,5 +93,5 @@ class CommonTrainer(abc.ABC, Trainer):
         self.writer = None
 
     @abc.abstractmethod
-    def start_train_print(self):
+    def start_train_print(self, args):
         pass
