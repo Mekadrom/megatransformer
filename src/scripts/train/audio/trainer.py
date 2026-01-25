@@ -1172,7 +1172,7 @@ def add_cli_args(subparsers):
 
     argparser.add_argument("--audio_max_frames", type=int, default=1875,
                            help="Maximum number of frames for audio input (overrides config file)")
-    argparser.add_argument("--n_mels", type=int, default=80,
+    argparser.add_argument("--audio_n_mels", type=int, default=80,
                             help="Number of mel frequency bins (overrides config file)")
     argparser.add_argument("--audio_sample_rate", type=int, default=16000,
                             help="Audio sample rate (overrides config file)")
