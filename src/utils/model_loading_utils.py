@@ -69,7 +69,7 @@ def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer):
         print(f"Vocoder parameters: {sum(p.numel() for p in vocoder.parameters()):,}")
     except Exception as e:
         print(f"Failed to load vocoder: {e}")
-        vocoder = None
+        raise e
     return vocoder
 
 
