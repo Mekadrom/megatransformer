@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from model.audio.criteria import MultiResolutionSTFTLoss, MultiScaleMelLoss
 from model.audio.vae.criteria import AudioPerceptualLoss
 from model.audio.vae.discriminator import (
+    MelDomainCombinedDiscriminator,
     MelDomainMultiPeriodDiscriminator,
     MelDomainMultiScaleDiscriminator,
     MelInstanceNoiseScheduler,
@@ -1058,6 +1059,46 @@ class AudioCVAEGANTrainer(CommonTrainer):
             print(f"Mu-only reconstruction loss: weight={args.mu_only_recon_weight} (trains decoder for diffusion compatibility)")
 
 
+def load_discriminator(
+    resume_from_checkpoint: str,
+    discriminator: torch.nn.Module,
+    discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[torch.nn.Module, Optional[torch.optim.Optimizer], bool]:
+    """
+    Load discriminator from checkpoint if it exists.
+
+    Handles errors gracefully - if loading fails, returns the fresh discriminator
+    and continues training from scratch.
+    """
+    if resume_from_checkpoint is None:
+        print("No checkpoint path provided, training discriminator from scratch")
+        return discriminator, discriminator_optimizer, False
+
+    discriminator_path = os.path.join(resume_from_checkpoint, "discriminator.pt")
+    if os.path.exists(discriminator_path):
+        print(f"Loading discriminator from {discriminator_path}")
+        try:
+            checkpoint = torch.load(discriminator_path, map_location=device, weights_only=True)
+            discriminator.load_state_dict(checkpoint["discriminator_state_dict"])
+
+            if discriminator_optimizer is not None and checkpoint.get("discriminator_optimizer_state_dict"):
+                try:
+                    discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer_state_dict"])
+                except Exception as e:
+                    print(f"Warning: Failed to load discriminator optimizer state: {e}")
+                    print("Continuing with fresh optimizer state...")
+
+            return discriminator, discriminator_optimizer, True
+        except Exception as e:
+            print(f"Warning: Failed to load discriminator checkpoint: {e}")
+            print("Continuing with fresh discriminator...")
+            return discriminator, discriminator_optimizer, False
+
+    print("No existing discriminator checkpoint found, training from scratch")
+    return discriminator, discriminator_optimizer, False
+
+
 def create_trainer(
     args,
     model,
@@ -1107,6 +1148,30 @@ def create_trainer(
         if vocoder is None and (args.waveform_stft_loss_weight > 0 or args.waveform_mel_loss_weight > 0):
             print("WARNING: Audio perceptual loss with waveform-based components requested but no vocoder loaded. Waveform losses will be disabled.")
 
+    # Create discriminator if GAN training is enabled
+    discriminator = None
+    discriminator_optimizer = None
+    if args.use_gan:
+        # keep on cpu, transfer to device when activated by provided criteria
+        discriminator = MelDomainCombinedDiscriminator.from_config(args.discriminator_config)
+
+        discriminator_optimizer = torch.optim.AdamW(
+            discriminator.parameters(),
+            lr=args.discriminator_lr,
+            betas=(0.0, 0.99),
+            weight_decay=0.0,
+        )
+
+        # Try to load existing discriminator checkpoint
+        discriminator, discriminator_optimizer, disc_loaded = load_discriminator(
+            args.resume_from_checkpoint, discriminator, discriminator_optimizer, device
+        )
+
+        discriminator = discriminator.cpu()
+
+        if disc_loaded:
+            print("Loaded discriminator from checkpoint")
+
     return AudioCVAEGANTrainer(
         model=model,
         args=training_args,
@@ -1116,8 +1181,8 @@ def create_trainer(
         cmdline=args.cmdline,
         git_commit_hash=args.commit_hash,
         step_offset=args.start_step,
-        discriminator=args.discriminator,
-        discriminator_optimizer=args.discriminator_optimizer,
+        discriminator=discriminator,
+        discriminator_optimizer=discriminator_optimizer,
         gan_loss_weight=args.gan_loss_weight,
         feature_matching_weight=args.feature_matching_weight,
         discriminator_update_frequency=args.discriminator_update_frequency,
