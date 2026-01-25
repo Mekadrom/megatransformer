@@ -64,11 +64,6 @@ def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer):
 
     try:
         vocoder = load_model(Vocoder, vocoder_config, checkpoint_path=vocoder_checkpoint_path, overrides={"shared_window_buffer": shared_window_buffer})
-
-        # Remove weight normalization for inference optimization
-        if hasattr(vocoder.vocoder, 'remove_weight_norm'):
-            vocoder.vocoder.remove_weight_norm()
-
         vocoder.eval()
         print(f"Loaded vocoder from {vocoder_checkpoint_path}")
         print(f"Vocoder parameters: {sum(p.numel() for p in vocoder.parameters()):,}")
