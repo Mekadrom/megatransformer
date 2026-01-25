@@ -1072,24 +1072,67 @@ class AudioCVAEDecoderOnly(nn.Module):
     
     def forward(
         self,
-        z: torch.Tensor,
-        speaker_embedding: torch.Tensor,
         features: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        speaker_embedding: torch.Tensor,
+        # F0 supervision (optional, for training F0 predictor)
+        target_f0: Optional[torch.Tensor] = None,  # [B, T] ground truth log F0
+        target_voiced: Optional[torch.Tensor] = None,  # [B, T] ground truth voicing (0 or 1)
+        # F0 warmup: use GT F0 instead of predicted F0 for decoder conditioning
+        use_gt_f0: bool = False,  # If True, use target_f0/target_voiced for decoder conditioning
         return_film_stats: bool = False,
-    ) -> torch.Tensor:
+    ):
         """
-        Forward pass through CVAE decoder-only model.
+        Forward pass through VAE.
 
         Args:
-            z: [B, latent_dim, T'] latent representation
+            features: [B, D, T'] SIVE features (channel-first)
+            target: [B, n_mels, T] Mel-spectrogram features
+            mask: [B, T] optional mask for valid frames
             speaker_embedding: [B, speaker_dim] speaker embedding for FiLM conditioning
-            features: [B, D, T'] SIVE features for F0 prediction
+            kl_weight_multiplier: Multiplier for KL loss (for annealing)
+            target_f0: [B, T] ground truth log F0 for F0 prediction loss (optional)
+            target_voiced: [B, T] ground truth voicing mask for VUV loss (optional)
+            use_gt_f0: If True, use GT F0 for decoder conditioning instead of predicted F0.
+                       F0 predictor is still run for loss computation, but decoder gets GT signal.
+                       Useful for warmup to let F0 embedding learn with clean signal.
             return_film_stats: If True, return FiLM layer statistics
 
         Returns:
             recon_x: Reconstructed mel spectrogram
+            mu: Latent mean
+            logvar: Latent log variance
+            losses: Dict with loss components
         """
-        decode_result = self.decode(z, speaker_embedding=speaker_embedding, features=features, return_film_stats=return_film_stats)
+        z = features
+
+        # F0 prediction and embedding (if enabled)
+        # Always predict F0 (for loss computation even during GT warmup)
+        log_f0_pred, voiced_pred = self.f0_predictor(speaker_embedding, features)
+
+        # Determine which F0 to use for decoder conditioning
+        # Determine which F0 to use for decoder conditioning
+        if use_gt_f0 and target_f0 is not None and target_voiced is not None:
+            # GT warmup: use ground truth F0 for decoder conditioning
+            # This lets the F0 embedding learn with clean signal
+            # Downsample GT F0 to match feature resolution if needed
+            gt_f0_for_emb = target_f0
+            gt_voiced_for_emb = target_voiced
+            if gt_f0_for_emb.size(-1) != log_f0_pred.size(-1):
+                gt_f0_for_emb = F.interpolate(
+                    gt_f0_for_emb.unsqueeze(1), size=log_f0_pred.size(-1), mode='linear', align_corners=False
+                ).squeeze(1)
+                gt_voiced_for_emb = F.interpolate(
+                    gt_voiced_for_emb.unsqueeze(1), size=log_f0_pred.size(-1), mode='linear', align_corners=False
+                ).squeeze(1)
+            f0_emb = self.f0_embedding(gt_f0_for_emb, gt_voiced_for_emb)
+        else:
+            # Normal mode: use predicted F0 for decoder conditioning
+            f0_emb = self.f0_embedding(log_f0_pred, voiced_pred)
+
+        film_stats = None
+        decode_result = self.decode(z, speaker_embedding=speaker_embedding, f0_embedding=f0_emb, return_film_stats=return_film_stats)
         if return_film_stats and isinstance(decode_result, tuple):
             recon_x, film_stats = decode_result
         else:
@@ -1100,7 +1143,111 @@ class AudioCVAEDecoderOnly(nn.Module):
         if recon_x.dim() == 4 and recon_x.shape[1] == 1:
             recon_x = recon_x.squeeze(1)
 
-        if return_film_stats and isinstance(decode_result, tuple):
-            return recon_x, film_stats
+        # recon_x is mel specs, not a reconstruction
 
-        return recon_x
+        # Align reconstruction to input size (encoder-decoder stride may cause size mismatch)
+        if recon_x.shape != target.shape:
+            # Truncate or pad to match input dimensions
+            slices = [slice(None)] * recon_x.dim()
+            for dim in range(2, recon_x.dim()):  # Skip batch and channel dims
+                if recon_x.shape[dim] > target.shape[dim]:
+                    slices[dim] = slice(0, target.shape[dim])
+                elif recon_x.shape[dim] < target.shape[dim]:
+                    # Pad if reconstruction is smaller (shouldn't happen normally)
+                    pad_size = target.shape[dim] - recon_x.shape[dim]
+                    pad_dims = [0, 0] * (recon_x.dim() - dim - 1) + [0, pad_size]
+                    recon_x = F.pad(recon_x, pad_dims)
+            recon_x = recon_x[tuple(slices)]
+
+        # Reconstruction losses (with optional masking)
+        # Expand mask to match input shape: [B, T] -> [B, 1, 1, T] for 4D input
+        # or [B, 1, T] for 3D input
+        if target.dim() == 4:
+            mask_expanded = mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, T]
+        else:
+            mask_expanded = mask.unsqueeze(1)  # [B, 1, T]
+
+        # Masked MSE loss: only compute on valid positions
+        squared_error = (recon_x - target) ** 2
+        masked_squared_error = squared_error * mask_expanded
+        # Sum over all dims except batch, then divide by number of valid elements per sample
+        valid_elements = mask_expanded.sum(dim=list(range(1, mask_expanded.dim())), keepdim=False) * target.shape[1]
+        if target.dim() == 4:
+            valid_elements = valid_elements * target.shape[2]  # Account for H dimension
+        mse_loss = (masked_squared_error.sum(dim=list(range(1, masked_squared_error.dim()))) / (valid_elements + 1e-5)).mean()
+
+        # Masked L1 loss
+        if self.config.l1_loss_weight > 0:
+            abs_error = torch.abs(recon_x - target)
+            masked_abs_error = abs_error * mask_expanded
+            l1_loss = (masked_abs_error.sum(dim=list(range(1, masked_abs_error.dim()))) / (valid_elements + 1e-5)).mean()
+        else:
+            l1_loss = torch.tensor(0.0, device=target.device)
+
+        perceptual_loss_value = torch.tensor(0.0, device=target.device)
+        # Perceptual loss (if enabled)
+        if hasattr(self, 'perceptual_loss'):
+            perceptual_loss_value = self.perceptual_loss(recon_x, target, mask=mask)["total_perceptual_loss"]
+
+        recon_loss = self.config.mse_loss_weight * mse_loss + self.config.l1_loss_weight * l1_loss
+
+        total_loss = (
+            self.config.recon_loss_weight * recon_loss
+            + self.config.perceptual_loss_weight * perceptual_loss_value
+        )
+
+        # F0 prediction losses (if F0 conditioning is enabled and ground truth provided)
+        f0_loss = torch.tensor(0.0, device=target.device)
+        vuv_loss = torch.tensor(0.0, device=target.device)
+        if log_f0_pred is not None and target_f0 is not None and target_voiced is not None:
+            # Upsample predictions to match target resolution if needed
+            if log_f0_pred.size(-1) != target_f0.size(-1):
+                log_f0_pred_up: torch.Tensor = F.interpolate(
+                    log_f0_pred.unsqueeze(1), size=target_f0.size(-1), mode='linear', align_corners=False
+                ).squeeze(1)
+                voiced_pred_up: torch.Tensor = F.interpolate(
+                    voiced_pred.unsqueeze(1), size=target_f0.size(-1), mode='linear', align_corners=False
+                ).squeeze(1)
+            else:
+                log_f0_pred_up: torch.Tensor = log_f0_pred
+                voiced_pred_up: torch.Tensor = voiced_pred
+
+            # F0 loss weighted by soft voicing probability (target_voiced is 0-1 periodicity)
+            # This gives more weight to clearly voiced frames and less to ambiguous ones
+            f0_error = torch.abs(log_f0_pred_up - target_f0)
+            weighted_f0_error = f0_error * target_voiced  # Weight by voicing confidence
+            # Normalize by sum of weights to avoid scale issues
+            voicing_sum = target_voiced.sum() + 1e-8
+            f0_loss = weighted_f0_error.sum() / voicing_sum
+
+            # Voicing prediction loss (BCE with soft targets)
+            # target_voiced is now a soft probability (0-1) from periodicity
+            # Disable autocast for BCE (not autocast-safe with post-sigmoid values)
+            with torch.amp.autocast(device_type='cuda', enabled=False):
+                vuv_loss = F.binary_cross_entropy(
+                    voiced_pred_up.clamp(1e-7, 1 - 1e-7).float(),
+                    target_voiced.clamp(0, 1).float(),  # Ensure valid probability range
+                    reduction='mean'
+                )
+
+            # Add F0 losses to total
+            total_loss = total_loss + self.config.f0_loss_weight * f0_loss + self.config.vuv_loss_weight * vuv_loss
+
+        losses = {
+            "total_loss": total_loss,
+            "recon_loss": recon_loss,
+            "mse_loss": mse_loss,
+            "l1_loss": l1_loss,
+            "f0_loss": f0_loss,
+            "vuv_loss": vuv_loss,
+        }
+
+        # Add F0 predictions for external logging/monitoring
+        losses["log_f0_pred"] = log_f0_pred
+        losses["voiced_pred"] = voiced_pred
+
+        # Add FiLM statistics if requested
+        if return_film_stats and film_stats is not None:
+            losses["film_stats"] = film_stats
+
+        return recon_x, losses
