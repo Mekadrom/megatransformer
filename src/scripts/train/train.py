@@ -68,7 +68,7 @@ def get_training_args(args, run_dir) -> TrainingArguments:
 
 
 def get_data_collator(command: str, args) -> Optional[DataCollator]:
-    if command == 'audio-cvae':
+    if command in ["audio-cvae", 'audio-cvae-decoder']:
         collator =  SIVEFeatureDataCollator(
             max_feature_frames=args.audio_max_frames // 4,
             speaker_embedding_dim=args.speaker_embedding_dim,
@@ -77,7 +77,7 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
 
 
 def get_dataset(command: str, args, split: str):
-    if command == "audio-cvae":
+    if command in ["audio-cvae", 'audio-cvae-decoder']:
         dataset = SIVEFeatureShardedDataset(
             shard_dir=args.cache_dir + "_" + split,
             cache_size=32,
@@ -87,7 +87,7 @@ def get_dataset(command: str, args, split: str):
 
 
 def get_visualization_callback(command: str, shared_window_buffer, args, eval_dataset, trainer: Trainer, vocoder=None):
-    if command == "audio-cvae":
+    if command in ["audio-cvae", 'audio-cvae-decoder']:
         vocoder = load_vocoder(args.vocoder_checkpoint_path, args.vocoder_config, shared_window_buffer)
         callback = AudioCVAEVisualizationCallback(
             shared_window_buffer=shared_window_buffer,
@@ -114,7 +114,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, shared_window_buf
     eval_dataset = get_dataset(command, args, split="val")
     visualization_callback = get_visualization_callback(command, shared_window_buffer, args, eval_dataset, trainer)
     
-    if command == "audio-cvae":
+    if command in ["audio-cvae", "audio-cvae-decoder"]:
         trainer: Trainer = audio_trainer.create_trainer(
             args,
             model,
@@ -126,7 +126,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, shared_window_buf
             vocoder=visualization_callback.vocoder
         )
     else:
-        raise ValueError(f"Unknown command: {command}. Available: audio-vae, image-vae")
+        raise ValueError(f"Unknown command: {command}. Available: audio-cvae, audio-cvae-decoder")
     
     trainer.add_callback(visualization_callback)
     visualization_callback.trainer = trainer
@@ -147,7 +147,6 @@ def add_common_args(parser: argparse.ArgumentParser):
     argparser.add_argument('--run_name', type=str, help='Name of the run', required=True)
     argparser.add_argument('--include_modes', type=str, default='text,audio,image', help='Comma-separated list of modes to include (e.g., text,audio,image or audio,image), order agnostic')
     argparser.add_argument('--dataset_cache_dir', type=str, default='cached_datasets', help='Path to the dataset cache directory')
-    argparser.add_argument('--trainer', type=str, default="default", help='Trainer type: grokfast_ema, grokfast_ma, debug, or default')
     argparser.add_argument('--config', type=str, default="small", help='Model configuration.')
     argparser.add_argument('--cpu', action='store_true', help='Use CPU for training')
     argparser.add_argument('--log_level', type=str, default='warning', help='Logging level: debug, info, warning, error, critical')

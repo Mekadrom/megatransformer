@@ -712,7 +712,10 @@ class AudioVAE(nn.Module):
         """
         if config_name not in AUDIO_VAE_CONFIGS:
             raise ValueError(f"Unknown config: {config_name}. Available: {list(AUDIO_VAE_CONFIGS.keys())}")
-
+        
+        if config_name.endswith("decoder_only"):
+            return AudioCVAEDecoderOnly.from_config(config_name, **overrides)
+        
         config = AUDIO_VAE_CONFIGS[config_name]
         # Apply overrides
         config_dict = {k: v for k, v in config.__dict__.items()}
@@ -990,3 +993,114 @@ class AudioVAE(nn.Module):
         if trainable_only:
             return sum(p.numel() for p in self.parameters() if p.requires_grad)
         return sum(p.numel() for p in self.parameters())
+
+
+class AudioCVAEDecoderOnly(nn.Module):
+    """
+    CVAE Decoder-only model for mel spectrogram generation from latent + speaker + F0.
+
+    This model uses only the decoder part of the AudioVAE, allowing it to be
+    used in scenarios where the latent representation is provided externally,
+    such as in a conditional generation setup.
+
+    Input: [B, latent_dim, T'] latent representation
+    Output: [B, 1, n_mels, T] reconstructed mel spectrogram
+    """
+    def __init__(
+        self,
+        config: AudioVAEDecoderConfig,
+        decoder: AudioVAEDecoder,
+        f0_predictor: F0Predictor,
+        f0_embedding: F0ConditioningEmbedding,
+    ):
+        super().__init__()
+
+        self.config = config
+
+        self.decoder = decoder
+
+        # F0 conditioning modules
+        self.f0_predictor = f0_predictor
+        self.f0_embedding = f0_embedding
+
+    @classmethod
+    def from_config(cls, config_name: str, **overrides) -> "AudioCVAEDecoderOnly":
+        """
+        Create model from predefined config with optional overrides.
+
+        Args:
+            config_name: One of predefined configs
+            **overrides: Override any config parameter
+
+        Example:
+            model = AudioCVAEDecoderOnly.from_config("small", latent_dim=32)
+        """
+        if config_name not in AUDIO_VAE_CONFIGS:
+            raise ValueError(f"Unknown config: {config_name}. Available: {list(AUDIO_VAE_CONFIGS.keys())}")
+
+        config = AUDIO_VAE_CONFIGS[config_name]
+        # Apply overrides
+        config_dict = {k: v for k, v in config.decoder_config.__dict__.items()}
+        config_dict.update(overrides)
+        decoder = AudioVAEDecoder.from_config(config.decoder_config, **config_dict)
+
+        config_dict = {k: v for k, v in config.f0_predictor_config.__dict__.items()}
+        config_dict.update(overrides)
+        f0_predictor = F0Predictor.from_config(config.f0_predictor_config, **config_dict)
+        config_dict = {k: v for k, v in config.f0_conditioning_embedding_config.__dict__.items()}
+        config_dict.update(overrides)
+        f0_embedding = F0ConditioningEmbedding.from_config(config.f0_conditioning_embedding_config, **config_dict)
+
+        return cls(config.decoder_config, decoder, f0_predictor, f0_embedding)
+    
+    def decode(self, z, speaker_embedding=None, f0_embedding=None, features=None, return_film_stats=False) -> torch.Tensor:
+        """
+        Decode latent to mel spectrogram.
+
+        Args:
+            z: Latent tensor
+            speaker_embedding: Speaker embedding for FiLM conditioning
+            f0_embedding: Pre-computed F0 embedding (optional)
+            features: SIVE features for F0 prediction (optional, used if f0_embedding not provided)
+            return_film_stats: Whether to return FiLM statistics
+        # Predict F0 if conditioning is enabled but embedding not provided
+        """
+        if f0_embedding is None and features is not None:
+            log_f0_pred, voiced_pred = self.f0_predictor(speaker_embedding, features)
+            f0_embedding = self.f0_embedding(log_f0_pred, voiced_pred)
+        return self.decoder(z, speaker_embedding=speaker_embedding, f0_embedding=f0_embedding, return_film_stats=return_film_stats)
+    
+    def forward(
+        self,
+        z: torch.Tensor,
+        speaker_embedding: torch.Tensor,
+        features: torch.Tensor,
+        return_film_stats: bool = False,
+    ) -> torch.Tensor:
+        """
+        Forward pass through CVAE decoder-only model.
+
+        Args:
+            z: [B, latent_dim, T'] latent representation
+            speaker_embedding: [B, speaker_dim] speaker embedding for FiLM conditioning
+            features: [B, D, T'] SIVE features for F0 prediction
+            return_film_stats: If True, return FiLM layer statistics
+
+        Returns:
+            recon_x: Reconstructed mel spectrogram
+        """
+        decode_result = self.decode(z, speaker_embedding=speaker_embedding, features=features, return_film_stats=return_film_stats)
+        if return_film_stats and isinstance(decode_result, tuple):
+            recon_x, film_stats = decode_result
+        else:
+            recon_x = decode_result
+
+        # Handle 2D decoder output: [B, 1, 80, T] -> [B, 80, T]
+        # The 2D decoder returns 4D with channel dim=1, squeeze it for consistency
+        if recon_x.dim() == 4 and recon_x.shape[1] == 1:
+            recon_x = recon_x.squeeze(1)
+
+        if return_film_stats and isinstance(decode_result, tuple):
+            return recon_x, film_stats
+
+        return recon_x

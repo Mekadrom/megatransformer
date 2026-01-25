@@ -235,20 +235,37 @@ class AudioCVAEGANTrainer(CommonTrainer):
                      global_step < self.f0_warmup_use_gt_steps and
                      target_f0 is not None and target_voiced is not None)
 
-        # Forward pass through VAE model (with optional mask for reconstruction loss and lengths for attention)
-        # Request FiLM stats if logging is enabled
-        recon, mu, logvar, losses = model(
-            features=features,
-            target=mel_spec,
-            mask=mel_spec_masks,
-            speaker_embedding=speaker_embedding,
-            length=mel_spec_lengths,
-            kl_weight_multiplier=kl_weight_multiplier,
-            return_film_stats=self.log_film_stats,
-            target_f0=target_f0,
-            target_voiced=target_voiced,
-            use_gt_f0=use_gt_f0,
-        )
+        is_vae = hasattr(model, "encoder") and model.encoder is not None
+
+        if is_vae:
+            # Forward pass through VAE model (with optional mask for reconstruction loss and lengths for attention)
+            # Request FiLM stats if logging is enabled
+            recon, mu, logvar, losses = model(
+                features=features,
+                target=mel_spec,
+                mask=mel_spec_masks,
+                speaker_embedding=speaker_embedding,
+                length=mel_spec_lengths,
+                kl_weight_multiplier=kl_weight_multiplier,
+                return_film_stats=self.log_film_stats,
+                target_f0=target_f0,
+                target_voiced=target_voiced,
+                use_gt_f0=use_gt_f0,
+            )
+        else:
+            recon, losses = model(
+                features=features,
+                target=mel_spec,
+                mask=mel_spec_masks,
+                speaker_embedding=speaker_embedding,
+                length=mel_spec_lengths,
+                return_film_stats=self.log_film_stats,
+                target_f0=target_f0,
+                target_voiced=target_voiced,
+                use_gt_f0=use_gt_f0,
+            )
+            mu = None
+            logvar = None
 
         # Extract FiLM stats if available
         film_stats = losses.pop("film_stats", None) if self.log_film_stats else None
@@ -265,7 +282,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
         # Mu-only reconstruction loss (trains decoder to produce good outputs from mu directly)
         # This ensures diffusion-generated latents decode well without needing reparameterization noise
         mu_only_recon_loss = torch.tensor(0.0, device=mel_spec.device)
-        if self.mu_only_recon_weight > 0:
+        if mu is not None and self.mu_only_recon_weight > 0:
             # Decode mu directly (no reparameterization noise)
             recon_mu_only = model.decode(mu.detach(), speaker_embedding=decode_speaker_embedding, features=features)[..., :mel_spec.shape[-1]]
 
@@ -673,7 +690,10 @@ class AudioCVAEGANTrainer(CommonTrainer):
 
             # Decode with shuffled speaker embeddings (detach mu to only train decoder's FiLM)
             # Pass features for F0 prediction if enabled
-            recon_shuffled = model.decode(mu.detach(), speaker_embedding=shuffled_speaker_embedding, features=features)
+            if is_vae:
+                recon_shuffled = model.decode(mu.detach(), speaker_embedding=shuffled_speaker_embedding, features=features)
+            else:
+                recon_shuffled = model.decode(features, speaker_embedding=shuffled_speaker_embedding, features=features)
 
             # Handle 2D decoder output: [B, 1, 80, T] -> [B, 80, T]
             if recon_shuffled.dim() == 4 and recon_shuffled.shape[1] == 1:
@@ -716,34 +736,37 @@ class AudioCVAEGANTrainer(CommonTrainer):
                     continue
                 self._log_scalar(f"{prefix}vae_{loss_name}", loss.mean() if isinstance(loss, torch.Tensor) else loss, global_step)
             # Log mu and logvar stats
-            self._log_scalar(f"{prefix}vae_mu_mean", mu.mean(), global_step)
-            self._log_scalar(f"{prefix}vae_mu_std", mu.std(), global_step)
-            self._log_scalar(f"{prefix}vae_logvar_mean", logvar.mean(), global_step)
-            # Mean variance (what diffusion will see) - useful for setting latent_std
-            self._log_scalar(f"{prefix}vae_mean_variance", logvar.exp().mean(), global_step)
-            self._log_scalar(f"{prefix}vae_mean_std", logvar.exp().mean().sqrt(), global_step)
+            if mu is not None and logvar is not None:
+                self._log_scalar(f"{prefix}vae_mu_mean", mu.mean(), global_step)
+                self._log_scalar(f"{prefix}vae_mu_std", mu.std(), global_step)
+                self._log_scalar(f"{prefix}vae_logvar_mean", logvar.mean(), global_step)
+                # Mean variance (what diffusion will see) - useful for setting latent_std
+                self._log_scalar(f"{prefix}vae_mean_variance", logvar.exp().mean(), global_step)
+                self._log_scalar(f"{prefix}vae_mean_std", logvar.exp().mean().sqrt(), global_step)
+
             self._log_scalar(f"{prefix}g_gan_loss", g_gan_loss, global_step)
             self._log_scalar(f"{prefix}total_loss", total_loss.mean(), global_step)
             # Log adaptive weight when using adaptive weighting
             if self.use_adaptive_weight and self.gan_already_started:
                 self._log_scalar(f"{prefix}adaptive_gan_weight", adaptive_weight, global_step)
             # Log KL weight multiplier when annealing is enabled
-            if self.kl_annealing_steps > 0:
+            if self.kl_annealing_steps > 0 and mu is not None and logvar is not None:
                 self._log_scalar(f"{prefix}kl_weight_multiplier", kl_weight_multiplier, global_step)
 
             # Per-channel latent statistics (for detecting channel collapse)
             # mu shape: [B, C, T] - compute stats per channel (average over batch, mel, time)
-            per_channel_mu_mean = mu.mean(dim=(0, 2))  # [C]
-            per_channel_mu_std = mu.std(dim=(0, 2))  # [C]
-            per_channel_var = logvar.exp().mean(dim=(0, 2))  # [C]
-            # Per-channel KL: 0.5 * (mu^2 + var - log(var) - 1), averaged over batch and spatial
-            per_channel_kl = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).mean(dim=(0, 2))  # [C]
+            if mu is not None and logvar is not None:
+                per_channel_mu_mean = mu.mean(dim=(0, 2))  # [C]
+                per_channel_mu_std = mu.std(dim=(0, 2))  # [C]
+                per_channel_var = logvar.exp().mean(dim=(0, 2))  # [C]
+                # Per-channel KL: 0.5 * (mu^2 + var - log(var) - 1), averaged over batch and spatial
+                per_channel_kl = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).mean(dim=(0, 2))  # [C]
 
-            for c in range(mu.shape[1]):
-                self._log_scalar(f"{prefix}channel_{c}/mu_mean", per_channel_mu_mean[c], global_step)
-                self._log_scalar(f"{prefix}channel_{c}/mu_std", per_channel_mu_std[c], global_step)
-                self._log_scalar(f"{prefix}channel_{c}/variance", per_channel_var[c], global_step)
-                self._log_scalar(f"{prefix}channel_{c}/kl", per_channel_kl[c], global_step)
+                for c in range(mu.shape[1]):
+                    self._log_scalar(f"{prefix}channel_{c}/mu_mean", per_channel_mu_mean[c], global_step)
+                    self._log_scalar(f"{prefix}channel_{c}/mu_std", per_channel_mu_std[c], global_step)
+                    self._log_scalar(f"{prefix}channel_{c}/variance", per_channel_var[c], global_step)
+                    self._log_scalar(f"{prefix}channel_{c}/kl", per_channel_kl[c], global_step)
 
             # Log audio perceptual losses
             if audio_perceptual_losses:
@@ -1159,7 +1182,7 @@ def add_cli_args(subparsers):
                             help="Hop length for audio mel spectrograms (overrides config file)")
     
     # VAE settings
-    argparser.add_argument("--latent_channels", type=int, default=4,
+    argparser.add_argument("--latent_channels", type=int, default=32,
                            help="Number of latent channels in VAE bottleneck")
     # Speaker encoder type determines embedding dimension
     argparser.add_argument("--speaker_encoder_type", type=str, default="ecapa_tdnn",
@@ -1361,7 +1384,7 @@ def add_cli_args(subparsers):
     argparser.add_argument("--vuv_loss_weight", type=float, default=0.1,
                            help="Weight for V/UV prediction loss")
 
-    argparser.add_argument("--cache_dir", type=str, default="cached_datasets/sive_cvae_f0",
+    argparser.add_argument("--cache_dir", type=str, default="../cached_datasets/sive_cvae_f0",
                            help="Directory for cached datasets")
 
     return argparser
