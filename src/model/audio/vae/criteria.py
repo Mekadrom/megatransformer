@@ -167,3 +167,96 @@ class AudioPerceptualLoss(nn.Module):
 
         losses["total_perceptual_loss"] = total
         return losses
+
+
+class ArcFaceLoss(torch.nn.Module):
+    """
+    Additive Angular Margin Loss (ArcFace) for learning speaker embeddings.
+
+    Unlike simple classification which only learns a decision boundary, ArcFace
+    explicitly shapes the embedding geometry by:
+    - Normalizing embeddings to unit hypersphere
+    - Adding angular margin to target class
+    - Scaling logits to sharpen the softmax
+
+    This forces same-speaker embeddings to cluster tightly together with angular
+    separation between different speakers - the same property that makes ECAPA-TDNN
+    embeddings effective for speaker verification.
+
+    Reference: Deng et al., "ArcFace: Additive Angular Margin Loss for Deep Face Recognition"
+
+    Args:
+        embedding_dim: Dimension of input speaker embeddings
+        num_speakers: Number of speaker classes
+        scale: Logit scale factor (higher = sharper softmax, typical: 30-64)
+        margin: Angular margin in radians (typical: 0.2-0.5)
+    """
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_speakers: int,
+        scale: float = 30.0,
+        margin: float = 0.2,
+    ):
+        super().__init__()
+        self.scale = scale
+        self.margin = margin
+        self.num_speakers = num_speakers
+        self.embedding_dim = embedding_dim
+
+        # Learnable class center weights (one per speaker)
+        self.weight = torch.nn.Parameter(torch.FloatTensor(num_speakers, embedding_dim))
+        torch.nn.init.xavier_uniform_(self.weight)
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """
+        Compute ArcFace loss.
+
+        Args:
+            embeddings: [B, D] speaker embeddings (will be L2 normalized)
+            labels: [B] speaker class labels
+
+        Returns:
+            Tuple of (loss, logits, accuracy) for logging
+        """
+        # Handle 3D input [B, 1, D] -> [B, D]
+        if embeddings.dim() == 3:
+            embeddings = embeddings.squeeze(1)
+
+        # L2 normalize embeddings and weights to project onto unit hypersphere
+        embeddings_norm = F.normalize(embeddings, p=2, dim=1)
+        weights_norm = F.normalize(self.weight, p=2, dim=1)
+
+        # Compute cosine similarity (dot product of normalized vectors)
+        cos_theta = F.linear(embeddings_norm, weights_norm)  # [B, num_speakers]
+
+        # Clamp for numerical stability before acos
+        cos_theta_clamped = cos_theta.clamp(-1 + 1e-7, 1 - 1e-7)
+
+        # Convert to angle
+        theta = torch.acos(cos_theta_clamped)
+
+        # Add angular margin only to the target class
+        # This pushes the target class embedding further from the decision boundary
+        one_hot = F.one_hot(labels, num_classes=self.num_speakers).float()
+        theta_m = theta + one_hot * self.margin
+
+        # Convert back to cosine (with margin applied to target)
+        cos_theta_m = torch.cos(theta_m)
+
+        # Scale logits (higher scale = sharper probability distribution)
+        logits = self.scale * cos_theta_m
+
+        # Standard cross-entropy on scaled logits
+        loss = F.cross_entropy(logits, labels)
+
+        # Compute accuracy for logging (use original cos_theta for predictions)
+        with torch.no_grad():
+            preds = cos_theta.argmax(dim=-1)
+            accuracy = (preds == labels).float().mean().item()
+
+        return loss, logits, accuracy

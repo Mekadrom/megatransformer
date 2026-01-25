@@ -382,7 +382,7 @@ class SIVEFeatureDatasetPreprocessor:
 
     @classmethod
     def add_cli_args(cls, subparsers):
-        sub_parser = subparsers.add_parser("audio-vae", help="Preprocess audio dataset through SIVE for VAE training")
+        sub_parser = subparsers.add_parser("audio-cvae", help="Preprocess audio dataset through SIVE for VAE training")
     
         # SIVE model
         sub_parser.add_argument("--sive_checkpoint_path", type=str, required=True,

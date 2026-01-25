@@ -10,8 +10,8 @@ import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
-from scripts.data.audio.vae.preprocess_audio_vae_dataset import SIVEFeatureDatasetPreprocessor
-from scripts.data.image.preprocess_image_dataset import ImageDatasetPreprocessor
+from scripts.data.audio.vae.preprocess import SIVEFeatureDatasetPreprocessor
+from scripts.data.image.preprocess import ImageDatasetPreprocessor
 from scripts.data.preprocessor import Preprocessor
 
 
@@ -22,7 +22,7 @@ preprocessor_clss = [
 
 
 def get_preprocessor(command: str, args, dataset, output_dir, shard_fields, batch_accumulators, stats, device: str) -> Preprocessor:
-    if command == "audio-vae":
+    if command == "audio-cvae":
         return SIVEFeatureDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     elif command == "image-vae" or command == "image":
         return ImageDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
