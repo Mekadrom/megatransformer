@@ -13,6 +13,7 @@ def load_model(
     checkpoint_path: Optional[str] = None,
     device: str = "cuda",
     overrides: dict = {},
+    strict: bool = False
 ):
     """
     Load a model from a checkpoint.
@@ -38,11 +39,11 @@ def load_model(
     if os.path.exists(safetensors_path):
         from safetensors.torch import load_file
         state_dict = load_file(safetensors_path)
-        model.load_state_dict(state_dict, strict=False)
+        model.load_state_dict(state_dict, strict=strict)
         print(f"Loaded model from {safetensors_path}")
     elif os.path.exists(pytorch_path):
         state_dict = torch.load(pytorch_path, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict, strict=False)
+        model.load_state_dict(state_dict, strict=strict)
         print(f"Loaded model from {pytorch_path}")
     else:
         raise FileNotFoundError(
@@ -63,7 +64,7 @@ def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer):
         return
 
     try:
-        vocoder = load_model(Vocoder, vocoder_config, checkpoint_path=vocoder_checkpoint_path, overrides={"shared_window_buffer": shared_window_buffer})
+        vocoder = load_model(Vocoder, vocoder_config, checkpoint_path=vocoder_checkpoint_path, overrides={"shared_window_buffer": shared_window_buffer}, strict=True)
         vocoder.eval()
         print(f"Loaded vocoder from {vocoder_checkpoint_path}")
         print(f"Vocoder parameters: {sum(p.numel() for p in vocoder.parameters()):,}")
@@ -94,7 +95,7 @@ def load_discriminator(
         print(f"Loading discriminator from {discriminator_path}")
         try:
             checkpoint = torch.load(discriminator_path, map_location=device, weights_only=True)
-            discriminator.load_state_dict(checkpoint["discriminator_state_dict"])
+            discriminator.load_state_dict(checkpoint["discriminator_state_dict"], strict=False)
 
             if discriminator_optimizer is not None and checkpoint.get("discriminator_optimizer_state_dict"):
                 try:
