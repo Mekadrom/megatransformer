@@ -18,7 +18,7 @@ from scripts.train.audio.visualization_callback import AudioCVAEVisualizationCal
 from scripts.train.trainer import CommonTrainer
 from utils.audio_utils import SharedWindowBuffer
 from utils.model_loading_utils import load_model, load_vocoder
-from utils.train_utils import EarlyStoppingCallback, check_tpu_availability
+from utils.train_utils import EarlyStoppingCallback
 
 
 def create_or_load_model(args, module, overrides={}) -> nn.Module:
