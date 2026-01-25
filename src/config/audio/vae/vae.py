@@ -226,4 +226,10 @@ AUDIO_VAE_CONFIGS = {
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
+    "small_decoder_only": AudioVAEConfig(
+        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
+        decoder_config=AUDIO_DECODER_CONFIGS["small"],
+        f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+    ),
 }
