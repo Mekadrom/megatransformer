@@ -58,7 +58,7 @@ class ImageVAEGANTrainer(CommonTrainer):
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
 
-        self.discriminator = discriminator
+        self.discriminator = discr
         self.discriminator_optimizer = discriminator_optimizer
         self.gan_loss_weight = gan_loss_weight
         self.feature_matching_weight = feature_matching_weight
