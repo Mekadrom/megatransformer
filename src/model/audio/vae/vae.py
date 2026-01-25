@@ -1021,7 +1021,7 @@ class AudioCVAEDecoderOnly(nn.Module):
         self.f0_embedding = f0_embedding
 
     @classmethod
-    def from_config(cls, config_name: str, **overrides) -> "AudioCVAEDecoderOnly":
+    def from_config(cls, config: Union[str, AudioVAEDecoderConfig], **overrides) -> "AudioCVAEDecoderOnly":
         """
         Create model from predefined config with optional overrides.
 
@@ -1032,10 +1032,11 @@ class AudioCVAEDecoderOnly(nn.Module):
         Example:
             model = AudioCVAEDecoderOnly.from_config("small", latent_dim=32)
         """
-        if config_name not in AUDIO_VAE_CONFIGS:
-            raise ValueError(f"Unknown config: {config_name}. Available: {list(AUDIO_VAE_CONFIGS.keys())}")
+        if isinstance(config, str):
+            if config not in AUDIO_VAE_CONFIGS:
+                raise ValueError(f"Unknown config: {config}. Available: {list(AUDIO_VAE_CONFIGS.keys())}")
+            config = AUDIO_VAE_CONFIGS[config]
 
-        config = AUDIO_VAE_CONFIGS[config_name]
         # Apply overrides
         config_dict = {k: v for k, v in config.decoder_config.__dict__.items()}
         config_dict.update(overrides)
