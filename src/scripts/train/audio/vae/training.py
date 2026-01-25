@@ -1026,20 +1026,18 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 print(f"  Adaptive GAN weight: enabled (VQGAN-style gradient balancing)")
         if hasattr(self, 'audio_perceptual_loss') and self.audio_perceptual_loss is not None:
             print(f"Audio perceptual loss: enabled (total_weight={args.audio_perceptual_loss_weight})")
+            if args.waveform_stft_loss_weight > 0 or args.waveform_mel_loss_weight > 0:
+                print(f"Waveform-domain losses: enabled (gradients flow through frozen vocoder)")
+                print(f"  STFT loss weight: {args.waveform_stft_loss_weight if vocoder is not None else 0.0}")
+                print(f"  Mel loss weight: {args.waveform_mel_loss_weight if vocoder is not None else 0.0}")
+                print(f"  Start step: {args.waveform_loss_start_step}")
             if args.audio_perceptual_loss_start_step > 0:
                 print(f"  Start step: {args.audio_perceptual_loss_start_step} (delayed to let L1/MSE settle)")
-            print(f"  Multi-scale mel weight: {args.multi_scale_mel_weight}")
+            print(f"  Multi-scale mel weight: {args.multi_scale_mel_loss_weight}")
             if vocoder is not None:
                 print(f"  Using vocoder for waveform conversion: {args.vocoder_config}")
             else:
                 print(f"  No vocoder loaded - only multi-scale mel loss active")
-        if args.waveform_stft_loss_weight > 0 or args.waveform_mel_loss_weight > 0:
-            print(f"Waveform-domain losses: enabled (gradients flow through frozen vocoder)")
-            print(f"  STFT loss weight: {args.waveform_stft_loss_weight if vocoder is not None else 0.0}")
-            print(f"  Mel loss weight: {args.waveform_mel_loss_weight if vocoder is not None else 0.0}")
-            print(f"  Start step: {args.waveform_loss_start_step}")
-            if vocoder is None:
-                print(f"  WARNING: No vocoder loaded - waveform losses will be disabled!")
         if args.kl_annealing_steps > 0:
             print(f"KL annealing: {args.kl_annealing_steps} steps (ramps KL weight from 0 to 1)")
         if args.free_bits > 0:
