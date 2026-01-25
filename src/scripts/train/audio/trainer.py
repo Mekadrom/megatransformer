@@ -10,7 +10,7 @@ from torch.amp import autocast
 from torch.nn import functional as F
 
 from model.audio.criteria import MultiResolutionSTFTLoss, MultiScaleMelLoss
-from model.audio.vae.criteria import AudioPerceptualLoss
+from model.audio.vae.criteria import ArcFaceLoss, AudioPerceptualLoss
 from model.audio.vae.discriminator import (
     MelDomainCombinedDiscriminator,
     MelDomainMultiPeriodDiscriminator,
@@ -27,6 +27,58 @@ from scripts.train.trainer import CommonTrainer
 
 
 _model_cls = AudioVAE
+
+
+class LearnedSpeakerClassifier(torch.nn.Module):
+    """
+    Classifier to predict speaker ID from learned speaker embeddings.
+
+    This classifier operates on the learned speaker embeddings.
+    This explicitly trains the speaker head to produce speaker-discriminative features.
+
+    Architecture: Simple MLP since input is already a pooled vector [B, embedding_dim]
+    """
+    def __init__(self, embedding_dim: int, num_speakers: int, hidden_dim: int = 256):
+        super().__init__()
+
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(embedding_dim, hidden_dim),
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(0.2),
+
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(0.2),
+
+            torch.nn.Linear(hidden_dim, num_speakers),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.classifier:
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+
+    def forward(self, speaker_embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass - direct classification (no gradient reversal).
+
+        Args:
+            speaker_embedding: [B, embedding_dim] learned speaker embedding from encoder
+
+        Returns:
+            [B, num_speakers] logits for speaker classification
+        """
+        # Handle 3D input [B, 1, D] -> [B, D]
+        if speaker_embedding.dim() == 3:
+            speaker_embedding = speaker_embedding.squeeze(1)
+
+        return self.classifier(speaker_embedding)
 
 
 class AudioCVAEGANTrainer(CommonTrainer):
@@ -1099,6 +1151,46 @@ def load_discriminator(
     return discriminator, discriminator_optimizer, False
 
 
+def load_learned_speaker_classifier(
+    resume_from_checkpoint: str,
+    learned_speaker_classifier: torch.nn.Module,
+    learned_speaker_classifier_optimizer: Optional[torch.optim.Optimizer] = None,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[torch.nn.Module, Optional[torch.optim.Optimizer], bool]:
+    """
+    Load learned speaker classifier (speaker ID on embeddings) from checkpoint if it exists.
+
+    Handles errors gracefully - if loading fails, returns the fresh classifier
+    and continues training from scratch.
+    """
+    if resume_from_checkpoint is None:
+        print("No checkpoint path provided, training learned speaker classifier from scratch")
+        return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
+
+    learned_speaker_classifier_path = os.path.join(resume_from_checkpoint, "learned_speaker_classifier.pt")
+    if os.path.exists(learned_speaker_classifier_path):
+        print(f"Loading learned speaker classifier from {learned_speaker_classifier_path}")
+        try:
+            checkpoint = torch.load(learned_speaker_classifier_path, map_location=device, weights_only=True)
+            learned_speaker_classifier.load_state_dict(checkpoint["learned_speaker_classifier_state_dict"])
+
+            if learned_speaker_classifier_optimizer is not None and checkpoint.get("learned_speaker_classifier_optimizer_state_dict"):
+                try:
+                    learned_speaker_classifier_optimizer.load_state_dict(checkpoint["learned_speaker_classifier_optimizer_state_dict"])
+                except Exception as e:
+                    print(f"Warning: Failed to load learned speaker classifier optimizer state: {e}")
+                    print("Continuing with fresh optimizer state...")
+
+            return learned_speaker_classifier, learned_speaker_classifier_optimizer, True
+        except Exception as e:
+            print(f"Warning: Failed to load learned speaker classifier checkpoint: {e}")
+            print("Continuing with fresh learned speaker classifier...")
+            return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
+
+    print("No existing learned speaker classifier checkpoint found, training from scratch")
+    return learned_speaker_classifier, learned_speaker_classifier_optimizer, False
+
+
 def create_trainer(
     args,
     model,
@@ -1172,6 +1264,66 @@ def create_trainer(
         if disc_loaded:
             print("Loaded discriminator from checkpoint")
 
+    # Create learned speaker classifier for speaker ID loss on learned embeddings
+    learned_speaker_classifier = None
+    learned_speaker_classifier_optimizer = None
+    if args.speaker_id_loss_weight > 0 and args.learn_speaker_embedding:
+        # Auto-detect num_speakers from dataset if not already set
+        if num_speakers <= 0:
+            num_speakers = train_dataset.num_speakers
+            print(f"Auto-detected {num_speakers} speakers from dataset")
+
+        # Check if dataset has speaker_ids available
+        if not train_dataset.include_speaker_ids:
+            print("WARNING: Speaker ID loss enabled but dataset may not have speaker_ids. "
+                  "Re-run preprocessing with --include_speaker_id and re-merge shards.")
+
+        # Create classifier based on loss type
+        if args.speaker_id_loss_type == "arcface":
+            # ArcFace: angular margin loss for tighter embedding clustering (like ECAPA-TDNN)
+            learned_speaker_classifier = ArcFaceLoss(
+                embedding_dim=args.learned_speaker_dim,
+                num_speakers=num_speakers,
+                scale=args.arcface_scale,
+                margin=args.arcface_margin,
+            ).to(device)
+        else:
+            # Simple MLP classifier with cross-entropy
+            learned_speaker_classifier = LearnedSpeakerClassifier(
+                embedding_dim=args.learned_speaker_dim,
+                num_speakers=num_speakers,
+                hidden_dim=256,
+            ).to(device)
+
+        learned_speaker_classifier_optimizer = torch.optim.AdamW(
+            learned_speaker_classifier.parameters(),
+            lr=args.speaker_id_classifier_lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+        )
+
+        # Try to load existing learned speaker classifier checkpoint
+        learned_speaker_classifier, learned_speaker_classifier_optimizer, lsc_loaded = load_learned_speaker_classifier(
+            args.resume_from_checkpoint, learned_speaker_classifier, learned_speaker_classifier_optimizer, device
+        )
+        if lsc_loaded:
+            print("Loaded learned speaker classifier from checkpoint")
+
+        if args.local_rank == 0 or not args.use_deepspeed:
+            print(f"Learned speaker ID classification: enabled")
+            print(f"  Loss type: {args.speaker_id_loss_type}")
+            print(f"  Embedding dim (input): {args.learned_speaker_dim}")
+            print(f"  Num speakers: {num_speakers}")
+            print(f"  Speaker ID loss weight: {args.speaker_id_loss_weight}")
+            print(f"  Speaker ID classifier LR: {args.speaker_id_classifier_lr}")
+            if args.speaker_id_loss_type == "arcface":
+                print(f"  ArcFace scale: {args.arcface_scale}")
+                print(f"  ArcFace margin: {args.arcface_margin} radians")
+            print(f"  Learned speaker classifier parameters: {sum(p.numel() for p in learned_speaker_classifier.parameters()):,}")
+    elif args.speaker_id_loss_weight > 0 and not args.learn_speaker_embedding:
+        print("WARNING: speaker_id_loss_weight > 0 but learn_speaker_embedding is False. "
+              "Speaker ID loss requires learned speaker embeddings. Disabling speaker ID loss.")
+
     return AudioCVAEGANTrainer(
         model=model,
         args=training_args,
@@ -1198,7 +1350,7 @@ def create_trainer(
         audio_perceptual_loss=audio_perceptual_loss,
         audio_perceptual_loss_weight=args.audio_perceptual_loss_weight,
         audio_perceptual_loss_start_step=args.audio_perceptual_loss_start_step,
-        vocoder=args.vocoder,
+        vocoder=vocoder,
         waveform_stft_loss=waveform_stft_loss,
         waveform_stft_loss_weight=args.waveform_stft_loss_weight,
         waveform_mel_loss=waveform_mel_loss,
@@ -1210,8 +1362,8 @@ def create_trainer(
         film_contrastive_margin_max=args.film_contrastive_margin_max,
         film_contrastive_margin_rampup_steps=args.film_contrastive_margin_rampup_steps,
         mu_only_recon_weight=args.mu_only_recon_weight,
-        learned_speaker_classifier=args.learned_speaker_classifier,
-        learned_speaker_classifier_optimizer=args.learned_speaker_classifier_optimizer,
+        learned_speaker_classifier=learned_speaker_classifier,
+        learned_speaker_classifier_optimizer=learned_speaker_classifier_optimizer,
         speaker_id_loss_weight=args.speaker_id_loss_weight,
         speaker_id_loss_type=args.speaker_id_loss_type,
         speaker_id_loss_start_step=args.speaker_id_loss_start_step,
