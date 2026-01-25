@@ -1042,6 +1042,8 @@ class AudioCVAEDecoderOnly(nn.Module):
         config_dict.update(overrides)
         decoder = AudioVAEDecoder.from_config(config.decoder_config, **config_dict)
 
+        overrides.pop('latent_channels', None)  # F0 and F0 conditioning can't take this
+
         config_dict = {k: v for k, v in config.f0_predictor_config.__dict__.items()}
         config_dict.update(overrides)
         f0_predictor = F0Predictor.from_config(config.f0_predictor_config, **config_dict)
