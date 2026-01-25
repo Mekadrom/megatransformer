@@ -118,20 +118,22 @@ class AudioPerceptualLoss(nn.Module):
     """
     def __init__(
         self,
-        # Component weights (0 = disabled)
-        multi_scale_mel_weight: float = 1.0,
-        # Multi-scale mel settings
-        mel_scales: Optional[list[int]] = None,
+        vocoder,
+        waveform_stft_loss,
+        waveform_mel_loss,
+        multi_scale_mel_loss,
+        waveform_stft_weight: float = 0.0,
+        waveform_mel_weight: float = 0.0,
+        multi_scale_mel_weight: float = 0.0,
     ):
         super().__init__()
+        self.vocoder = vocoder
+        self.waveform_stft_loss = waveform_stft_loss
+        self.waveform_mel_loss = waveform_mel_loss
+        self.multi_scale_mel_loss = multi_scale_mel_loss
+        self.waveform_stft_weight = waveform_stft_weight
+        self.waveform_mel_weight = waveform_mel_weight
         self.multi_scale_mel_weight = multi_scale_mel_weight
-
-        self.multi_scale_mel_loss = None
-
-        if multi_scale_mel_weight > 0:
-            self.multi_scale_mel_loss = MultiScaleMelSpectrogramLoss(
-                scales=mel_scales,
-            )
 
     def forward(
         self,
@@ -152,17 +154,60 @@ class AudioPerceptualLoss(nn.Module):
         """
         device = pred_mel.device
         losses = {}
-        total = torch.tensor(0.0, device=device)
+        total_loss = torch.tensor(0.0, device=device)
+
+         # Waveform-domain losses (STFT and multi-scale mel on waveforms)
+        # These require vocoder and gradients flow through the frozen vocoder
+        waveform_stft_loss_value = torch.tensor(0.0, device=target_mel.device)
+        waveform_mel_loss_value = torch.tensor(0.0, device=target_mel.device)
+        waveform_loss_enabled = (
+            self.vocoder is not None
+            and (self.waveform_stft_weight > 0 or self.waveform_mel_weight > 0)
+        )
+        if waveform_loss_enabled:
+            # Run vocoder on predicted mel WITHOUT no_grad so gradients flow back
+            # Vocoder weights are frozen, but gradients w.r.t. input (mel) are computed
+            vocoder_outputs = self.vocoder(pred_mel.float())
+            if isinstance(vocoder_outputs, dict):
+                pred_waveform_grad = vocoder_outputs["pred_waveform"]
+            else:
+                pred_waveform_grad = vocoder_outputs
+
+            # Run vocoder on target mel WITH no_grad (don't need gradients)
+            with torch.no_grad():
+                target_vocoder_outputs = self.vocoder(target_mel.float())
+                if isinstance(target_vocoder_outputs, dict):
+                    target_waveform_grad = target_vocoder_outputs["pred_waveform"]
+                else:
+                    target_waveform_grad = target_vocoder_outputs
+
+            # Multi-resolution STFT loss
+            if self.waveform_stft_loss is not None and self.waveform_stft_weight > 0:
+                sc_loss, mag_loss, complex_stft_loss = self.waveform_stft_loss(
+                    pred_waveform_grad, target_waveform_grad
+                )
+                waveform_stft_loss_value = sc_loss + mag_loss + complex_stft_loss
+                losses["waveform_stft_loss"] = waveform_stft_loss_value
+                total_loss = total_loss + self.waveform_stft_weight * waveform_stft_loss_value
+
+            # Multi-scale mel loss (on waveforms)
+            if self.waveform_mel_loss is not None and self.waveform_mel_weight > 0:
+                waveform_mel_loss_value = self.waveform_mel_loss(
+                    pred_waveform_grad.squeeze(1) if pred_waveform_grad.dim() == 3 else pred_waveform_grad,
+                    target_waveform_grad.squeeze(1) if target_waveform_grad.dim() == 3 else target_waveform_grad
+                )
+                losses["waveform_mel_loss"] = waveform_mel_loss_value
+                total_loss = total_loss + self.waveform_mel_weight * waveform_mel_loss_value
 
         # Multi-scale mel loss (works on mel spectrograms)
         if self.multi_scale_mel_loss is not None:
             ms_mel_loss = self.multi_scale_mel_loss(pred_mel, target_mel, mask=mask)
             losses["multi_scale_mel_loss"] = ms_mel_loss
-            total = total + self.multi_scale_mel_weight * ms_mel_loss
+            total_loss = total_loss + self.multi_scale_mel_weight * ms_mel_loss
         else:
             losses["multi_scale_mel_loss"] = torch.tensor(0.0, device=device)
 
-        losses["total_perceptual_loss"] = total
+        losses["total_perceptual_loss"] = total_loss
         return losses
 
 
