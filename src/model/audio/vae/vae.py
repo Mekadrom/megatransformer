@@ -1042,7 +1042,7 @@ class AudioCVAEDecoderOnly(nn.Module):
         # Apply overrides
         config_dict = {k: v for k, v in config.decoder_config.__dict__.items()}
         config_dict.update(overrides)
-        decoder = AudioVAEDecoder.from_config(config.decoder_config, **config_dict)
+        decoder = AudioCVAEDecoderOnly.from_config(config.decoder_config, **config_dict)
 
         config_dict = {k: v for k, v in config.f0_predictor_config.__dict__.items()}
         config_dict.update(overrides)
