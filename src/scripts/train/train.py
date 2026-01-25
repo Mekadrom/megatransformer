@@ -242,7 +242,13 @@ if __name__ == "__main__":
 
     add_args(argparser)
 
-    args = argparser.parse_args()
+    args, unk = argparser.parse_known_args()
+
+    # Parse extra arguments
+    unk_dict = {}
+    for i in range(0, len(unk), 2):
+        unk_dict[unk[i].lstrip('-')] = unk[i+1]
+
     current_process_pid = psutil.Process().pid
     setattr(args, 'cmdline', " ".join(get_process_cmdline(current_process_pid)))
 
@@ -259,7 +265,7 @@ if __name__ == "__main__":
     else:
         shared_window_buffer = None
 
-    model = create_or_load_model(args, module, overrides={})
+    model = create_or_load_model(args, module, overrides=unk_dict)
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
 
