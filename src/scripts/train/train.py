@@ -107,7 +107,7 @@ def get_visualization_callback(command: str, shared_window_buffer, args, vocoder
     return callback
 
 
-def get_trainer(command: str, args, run_dir, model: nn.Module, shared_window_buffer=None) -> Trainer:
+def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_window_buffer=None) -> Trainer:
     training_args = get_training_args(args, run_dir=run_dir)
     data_collator = get_data_collator(command, args)
     train_dataset = get_dataset(command, args, split="train")
@@ -124,7 +124,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, shared_window_buf
             eval_dataset,
             shared_window_buffer,
             vocoder=visualization_callback.vocoder,
-            device=model.device,
+            device=device,
         )
     else:
         raise ValueError(f"Unknown command: {command}. Available: audio-cvae, audio-cvae-decoder")
@@ -250,7 +250,7 @@ if __name__ == "__main__":
 
     model.to(device)
 
-    trainer: CommonTrainer = get_trainer(args.command, args, run_dir, model, shared_window_buffer=shared_window_buffer)
+    trainer: CommonTrainer = get_trainer(args.command, args, run_dir, model, device, shared_window_buffer=shared_window_buffer)
 
     if args.local_rank == 0 or not args.use_deepspeed:
         trainer.start_train_print()
