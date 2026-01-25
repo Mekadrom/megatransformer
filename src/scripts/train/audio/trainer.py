@@ -309,7 +309,6 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 target=mel_spec,
                 mask=mel_spec_masks,
                 speaker_embedding=speaker_embedding,
-                length=mel_spec_lengths,
                 return_film_stats=self.log_film_stats,
                 target_f0=target_f0,
                 target_voiced=target_voiced,
