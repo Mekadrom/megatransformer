@@ -11,7 +11,7 @@ from typing import Literal
 class ImageVAEEncoderConfig:
     in_channels: int = 3
     latent_channels: int = 4
-    intermediate_channels: list = [32, 64, 128]
+    intermediate_channels: list = dataclasses.field(default_factory=lambda: [32, 64, 128])
     activation: str = "silu"
     logvar_clamp_max: float = 4.0
 
@@ -44,7 +44,7 @@ IMAGE_ENCODER_CONFIGS = {
 class ImageVAEDecoderConfig:
     latent_channels: int = 4
     out_channels: int = 3
-    intermediate_channels: list = [128, 64, 32]
+    intermediate_channels: list = dataclasses.field(default_factory=lambda: [128, 64, 32])
     activation: str = "silu"
     use_final_tanh: bool = False
 
