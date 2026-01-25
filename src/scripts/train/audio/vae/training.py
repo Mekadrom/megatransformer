@@ -1302,214 +1302,214 @@ def create_trainer(
 
 
 def add_cli_args(subparsers):
-    argparser = subparsers.add_parser("audio-cvae", help="Preprocess audio dataset through SIVE for VAE training")
+    sub_parser = subparsers.add_parser("audio-cvae", help="Preprocess audio dataset through SIVE for VAE training")
 
-    argparser.add_argument("--audio_max_frames", type=int, default=1875,
+    sub_parser.add_argument("--audio_max_frames", type=int, default=1875,
                            help="Maximum number of frames for audio input (overrides config file)")
-    argparser.add_argument("--audio_n_mels", type=int, default=80,
+    sub_parser.add_argument("--audio_n_mels", type=int, default=80,
                             help="Number of mel frequency bins (overrides config file)")
-    argparser.add_argument("--audio_sample_rate", type=int, default=16000,
+    sub_parser.add_argument("--audio_sample_rate", type=int, default=16000,
                             help="Audio sample rate (overrides config file)")
-    argparser.add_argument("--audio_n_fft", type=int, default=1024,
+    sub_parser.add_argument("--audio_n_fft", type=int, default=1024,
                             help="FFT size for audio mel spectrograms (overrides config file)")
-    argparser.add_argument("--audio_hop_length", type=int, default=256,
+    sub_parser.add_argument("--audio_hop_length", type=int, default=256,
                             help="Hop length for audio mel spectrograms (overrides config file)")
     
     # VAE settings
-    argparser.add_argument("--latent_channels", type=int, default=32,
+    sub_parser.add_argument("--latent_channels", type=int, default=32,
                            help="Number of latent channels in VAE bottleneck")
     # Speaker encoder type determines embedding dimension
-    argparser.add_argument("--speaker_encoder_type", type=str, default="ecapa_tdnn",
+    sub_parser.add_argument("--speaker_encoder_type", type=str, default="ecapa_tdnn",
                            help="Type of pretrained speaker encoder to use (ecapa_tdnn or wavlm)")
-    argparser.add_argument("--speaker_embedding_dim", type=int, default=192,
+    sub_parser.add_argument("--speaker_embedding_dim", type=int, default=192,
                            help="Dimension of speaker embeddings from the speaker encoder")
     # Optional projection to reduce speaker embedding dim before FiLM (0 = no projection)
     # Useful for reducing params when using large embeddings like WavLM (768-dim)
-    argparser.add_argument("--speaker_embedding_proj_dim", type=int, default=0,
+    sub_parser.add_argument("--speaker_embedding_proj_dim", type=int, default=0,
                            help="Dimension to project speaker embeddings to before FiLM (0 = no projection)")
-    argparser.add_argument("--normalize_speaker_embedding", type=str, default="true",
+    sub_parser.add_argument("--normalize_speaker_embedding", type=str, default="true",
                            help="Whether to L2-normalize speaker embeddings before FiLM (true/false)")
     # FiLM bounding - prevents extreme scale/shift values that can cause artifacts
     # Scale bound of 0.5 means (1 + scale) ranges from 0.5 to 1.5 (never zeroes out)
     # Set to 0 to disable bounding (unbounded FiLM)
-    argparser.add_argument("--film_scale_bound", type=float, default=0.5,
+    sub_parser.add_argument("--film_scale_bound", type=float, default=0.5,
                            help="Bound for FiLM scale modulation (0 = unbounded)")
-    argparser.add_argument("--film_shift_bound", type=float, default=0.5,
+    sub_parser.add_argument("--film_shift_bound", type=float, default=0.5,
                             help="Bound for FiLM shift modulation (0 = unbounded)")
     # Zero-init FiLM output weights - forces model to learn FiLM from scratch instead of relying on bias
-    argparser.add_argument("--zero_init_film_bias", type=str, default="false",
+    sub_parser.add_argument("--zero_init_film_bias", type=str, default="false",
                            help="Whether to zero-initialize FiLM bias terms (true/false)")
     # Remove bias from FiLM projections entirely - zero embedding = zero modulation (structurally enforced)
-    argparser.add_argument("--film_no_bias", type=str, default="false",
+    sub_parser.add_argument("--film_no_bias", type=str, default="false",
                            help="Whether to remove bias terms from FiLM projections (true/false)")
 
     # Learned speaker embedding: if True, encoder outputs a learned speaker embedding instead of using pretrained
     # The speaker head uses global pooling to remove temporal structure, outputting a single speaker vector
-    argparser.add_argument("--learn_speaker_embedding", type=str, default="false",
+    sub_parser.add_argument("--learn_speaker_embedding", type=str, default="false",
                            help="Whether to use a learned speaker embedding (true/false)")
-    argparser.add_argument("--learned_speaker_dim", type=int, default=256,
+    sub_parser.add_argument("--learned_speaker_dim", type=int, default=256,
                            help="Dimension of learned speaker embedding")
 
     # FiLM contrastive loss - encourages different speaker embeddings to produce different FiLM outputs
-    argparser.add_argument("--film_contrastive_loss_weight", type=float, default=0.0,
+    sub_parser.add_argument("--film_contrastive_loss_weight", type=float, default=0.0,
                            help="Weight for FiLM contrastive loss (0 = disabled)")
-    argparser.add_argument("--film_contrastive_loss_start_step", type=int, default=0,
+    sub_parser.add_argument("--film_contrastive_loss_start_step", type=int, default=0,
                            help="Step to start applying FiLM contrastive loss (0 = from start)")
     # FiLM contrastive margin scheduling (ramps from 0 to max, measure of contribution from none to all)
-    argparser.add_argument("--film_contrastive_margin_max", type=float, default=0.1,
+    sub_parser.add_argument("--film_contrastive_margin_max", type=float, default=0.1,
                            help="Maximum margin for FiLM contrastive loss")
-    argparser.add_argument("--film_contrastive_margin_rampup_steps", type=int, default=5000,
+    sub_parser.add_argument("--film_contrastive_margin_rampup_steps", type=int, default=5000,
                            help="Number of steps to ramp up FiLM contrastive margin")
 
     # VAE loss weights
-    argparser.add_argument("--recon_loss_weight", type=float, default=1.0,
+    sub_parser.add_argument("--recon_loss_weight", type=float, default=1.0,
                            help="Weight for reconstruction loss")
-    argparser.add_argument("--mse_loss_weight", type=float, default=1.0,
+    sub_parser.add_argument("--mse_loss_weight", type=float, default=1.0,
                            help="Weight for MSE loss")
-    argparser.add_argument("--l1_loss_weight", type=float, default=1.0,
+    sub_parser.add_argument("--l1_loss_weight", type=float, default=1.0,
                            help="Weight for L1 loss")
-    argparser.add_argument("--kl_divergence_loss_weight", type=float, default=1e-6,
+    sub_parser.add_argument("--kl_divergence_loss_weight", type=float, default=1e-6,
                            help="Weight for KL divergence loss")
     
     # Audio perceptual loss settings (speech-focused)
     # Total weight for all audio perceptual losses (0 = disabled)
-    argparser.add_argument("--audio_perceptual_loss_weight", type=float, default=0.0,
+    sub_parser.add_argument("--audio_perceptual_loss_weight", type=float, default=0.0,
                            help="Total weight for audio perceptual loss (0 = disabled)")
     # Step to start applying perceptual loss (0 = from start, >0 = delay to let L1/MSE settle)
-    argparser.add_argument("--audio_perceptual_loss_start_step", type=int, default=0,
+    sub_parser.add_argument("--audio_perceptual_loss_start_step", type=int, default=0,
                            help="Step to start applying audio perceptual loss (0 = from start)")
     # Individual component weights (relative to total audio perceptual loss weight)
-    argparser.add_argument("--multi_scale_mel_weight", type=float, default=1.0,
+    sub_parser.add_argument("--multi_scale_mel_weight", type=float, default=1.0,
                            help="Weight for multi-scale mel spectrogram loss component")
     
     # CRITICAL: Set to false if mel spectrograms are already log-scaled (which they are by default!)
     # When true, MultiScaleMelSpectrogramLoss applies log() to inputs, which clamps negative log-mel
     # values to 1e-5 and destroys gradients. Default changed to false for log-mel inputs.
-    argparser.add_argument("--use_log_mel", type=str, default="false",
+    sub_parser.add_argument("--use_log_mel", type=str, default="false",
                            help="Whether input mel spectrograms are log-scaled (true/false)")
 
     # Waveform-domain losses (require vocoder, gradients flow through frozen vocoder)
     # These losses operate on waveforms generated by the vocoder, providing direct audio supervision
-    argparser.add_argument("--waveform_stft_loss_weight", type=float, default=0.0,
+    sub_parser.add_argument("--waveform_stft_loss_weight", type=float, default=0.0,
                            help="Weight for MultiResolutionSTFTLoss on waveforms")
-    argparser.add_argument("--waveform_mel_loss_weight", type=float, default=0.0,
+    sub_parser.add_argument("--waveform_mel_loss_weight", type=float, default=0.0,
                            help="Weight for MultiScaleMelLoss on waveforms")
-    argparser.add_argument("--waveform_loss_start_step", type=int, default=0,
+    sub_parser.add_argument("--waveform_loss_start_step", type=int, default=0,
                            help="Step to start applying waveform losses")
     
     # Vocoder settings (optional - for audio generation during visualization AND waveform losses)
-    argparser.add_argument("--vocoder_checkpoint_path", type=str, default=None,
+    sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,
                            help="Path to pretrained vocoder checkpoint (for waveform generation/losses)")
-    argparser.add_argument("--vocoder_config", type=str, default="tiny_attention_freq_domain_vocoder",
+    sub_parser.add_argument("--vocoder_config", type=str, default="tiny_attention_freq_domain_vocoder",
                            help="Vocoder config name (from vocoder_configs.py)")
 
     # GAN training settings
-    argparser.add_argument("--use_gan", type=str, default="false",
+    sub_parser.add_argument("--use_gan", type=str, default="false",
                             help="Whether to use GAN training (true/false)")
-    argparser.add_argument("--gan_start_condition_key", type=str, default="step",
+    sub_parser.add_argument("--gan_start_condition_key", type=str, default="step",
                             help="Condition to start GAN training: 'step' or 'loss'")
-    argparser.add_argument("--gan_start_condition_value", type=str, default="0",
+    sub_parser.add_argument("--gan_start_condition_value", type=str, default="0",
                             help="Value for GAN start condition (int for 'step', float for 'loss')")
-    argparser.add_argument("--discriminator_lr", type=float, default=2e-4,
+    sub_parser.add_argument("--discriminator_lr", type=float, default=2e-4,
                             help="Learning rate for discriminator optimizer")
-    argparser.add_argument("--gan_loss_weight", type=float, default=0.5,
+    sub_parser.add_argument("--gan_loss_weight", type=float, default=0.5,
                             help="Weight for GAN loss component")
-    argparser.add_argument("--feature_matching_weight", type=float, default=0.0,
+    sub_parser.add_argument("--feature_matching_weight", type=float, default=0.0,
                             help="Weight for feature matching loss component")
-    argparser.add_argument("--discriminator_update_frequency", type=int, default=1,
+    sub_parser.add_argument("--discriminator_update_frequency", type=int, default=1,
                             help="Number of discriminator updates per generator update")
-    argparser.add_argument("--discriminator_config", type=str, default="mini_multi_scale",
+    sub_parser.add_argument("--discriminator_config", type=str, default="mini_multi_scale",
                             help="Discriminator configuration name")
 
     # Discriminator regularization settings
-    argparser.add_argument("--instance_noise_std", type=float, default=0.0,
+    sub_parser.add_argument("--instance_noise_std", type=float, default=0.0,
                             help="Initial standard deviation for instance noise (0 = disabled)")
-    argparser.add_argument("--instance_noise_decay_steps", type=int, default=50000,
+    sub_parser.add_argument("--instance_noise_decay_steps", type=int, default=50000,
                             help="Number of steps to decay instance noise to zero")
-    argparser.add_argument("--r1_penalty_weight", type=float, default=0.0,
+    sub_parser.add_argument("--r1_penalty_weight", type=float, default=0.0,
                             help="Weight for R1 gradient penalty (0 = disabled)")
-    argparser.add_argument("--r1_penalty_interval", type=int, default=16,
+    sub_parser.add_argument("--r1_penalty_interval", type=int, default=16,
                             help="Interval (in steps) to apply R1 gradient penalty")
-    argparser.add_argument("--gan_warmup_steps", type=int, default=0,
+    sub_parser.add_argument("--gan_warmup_steps", type=int, default=0,
                             help="Number of steps to warm up GAN loss (ramps from 0 to full)")
     # Adaptive discriminator weighting (VQGAN-style): automatically balances GAN vs reconstruction gradients
     # This prevents the discriminator from dominating and causing artifacts
-    argparser.add_argument("--use_adaptive_weight", type=str, default="false",
+    sub_parser.add_argument("--use_adaptive_weight", type=str, default="false",
                             help="Whether to use adaptive discriminator weighting (true/false)")
 
     # KL annealing: ramps KL weight from 0 to full over N steps (0 = disabled, no annealing)
-    argparser.add_argument("--kl_annealing_steps", type=int, default=0,
+    sub_parser.add_argument("--kl_annealing_steps", type=int, default=0,
                             help="Number of steps for KL annealing (0 = disabled)")
 
     # Free bits: minimum KL per channel to prevent posterior collapse (0 = disabled)
-    argparser.add_argument("--free_bits", type=float, default=0.0,
+    sub_parser.add_argument("--free_bits", type=float, default=0.0,
                             help="Free bits threshold in nats per channel (0 = disabled)")
 
     # Speaker embedding dropout: probability of zeroing speaker embedding during training
     # Encourages disentanglement by forcing decoder to learn to use embedding when available
-    argparser.add_argument("--speaker_embedding_dropout", type=float, default=0.0,
+    sub_parser.add_argument("--speaker_embedding_dropout", type=float, default=0.0,
                             help="Probability of dropping speaker embedding during training")
 
     # Instance normalization on latents for speaker disentanglement
     # Removes per-instance statistics (mean/variance) which often encode speaker characteristics
     # Speaker info is then re-injected via FiLM conditioning only
-    argparser.add_argument("--instance_norm_latents", type=str, default="false",
+    sub_parser.add_argument("--instance_norm_latents", type=str, default="false",
                             help="Whether to apply instance normalization on latents (true/false)")
 
     # Instance normalization on input mel spectrogram for speaker-invariant features
     # Normalizes each mel bin across time (like CMVN), stripping per-utterance speaker statistics
-    argparser.add_argument("--use_input_instance_norm", type=str, default="false",
+    sub_parser.add_argument("--use_input_instance_norm", type=str, default="false",
                             help="Whether to apply instance normalization on input mel spectrograms (true/false)")
 
     # F0 predictor pretraining settings
     # Load pretrained F0 predictor checkpoint for better initialization
-    argparser.add_argument("--f0_predictor_checkpoint", type=str, default=None,
+    sub_parser.add_argument("--f0_predictor_checkpoint", type=str, default=None,
                             help="Path to pretrained F0 predictor checkpoint (for initialization)")
     # Number of steps to keep F0 predictor frozen (0 = no freezing)
-    argparser.add_argument("--f0_predictor_freeze_steps", type=int, default=0,
+    sub_parser.add_argument("--f0_predictor_freeze_steps", type=int, default=0,
                             help="Number of steps to keep F0 predictor frozen (0 = no freezing)")
     # Use GT F0 for first N steps to let embedding learn with clean signal (0 = disabled)
-    argparser.add_argument("--f0_warmup_use_gt_steps", type=int, default=0,
+    sub_parser.add_argument("--f0_warmup_use_gt_steps", type=int, default=0,
                             help="Number of steps to use GT F0 for warmup (0 = disabled)")
 
-    argparser.add_argument("--num_speakers", type=int, default=0,
+    sub_parser.add_argument("--num_speakers", type=int, default=0,
                            help="Number of speaker classes for speaker ID loss (0 = auto-detect from dataset)")
 
     # Speaker ID classification on learned speaker embeddings
     # Only works when learn_speaker_embedding=True
-    argparser.add_argument("--speaker_id_loss_weight", type=float, default=0.0,
+    sub_parser.add_argument("--speaker_id_loss_weight", type=float, default=0.0,
                            help="Weight for speaker ID classification loss (0 = disabled)")
-    argparser.add_argument("--speaker_id_classifier_lr", type=float, default=1e-4,
+    sub_parser.add_argument("--speaker_id_classifier_lr", type=float, default=1e-4,
                             help="Learning rate for speaker ID classifier")
     # Loss type: "classifier" (MLP + cross-entropy) or "arcface" (angular margin for tighter clustering)
-    argparser.add_argument("--speaker_id_loss_type", type=str, default="arcface",
+    sub_parser.add_argument("--speaker_id_loss_type", type=str, default="arcface",
                            help="Speaker ID loss type: 'classifier' or 'arcface'")
     # ArcFace hyperparameters (only used when speaker_id_loss_type="arcface")
-    argparser.add_argument("--arcface_scale", type=float, default=30.0,
+    sub_parser.add_argument("--arcface_scale", type=float, default=30.0,
                             help="ArcFace scale parameter")
-    argparser.add_argument("--arcface_margin", type=float, default=0.2,
+    sub_parser.add_argument("--arcface_margin", type=float, default=0.2,
                             help="ArcFace margin parameter")
     # Speaker ID loss scheduling (ramps weight from 0 to max over rampup_steps starting at start_step)
-    argparser.add_argument("--speaker_id_loss_start_step", type=int, default=0,
+    sub_parser.add_argument("--speaker_id_loss_start_step", type=int, default=0,
                            help="Step to start ramping up speaker ID loss weight (0 = from beginning)")
-    argparser.add_argument("--speaker_id_loss_rampup_steps", type=int, default=0,
+    sub_parser.add_argument("--speaker_id_loss_rampup_steps", type=int, default=0,
                            help="Number of steps to ramp up speaker ID loss weight (0 = no rampup)")
 
     # FiLM statistics logging - track scale/shift statistics for diagnosing conditioning health
-    argparser.add_argument("--log_film_stats", type=str, default="false",
+    sub_parser.add_argument("--log_film_stats", type=str, default="false",
                            help="Whether to log FiLM statistics during training (true/false)")
 
     # Mu-only reconstruction loss: trains decoder to produce good outputs from mu directly
     # This ensures diffusion-generated latents decode well without needing reparameterization noise
-    argparser.add_argument("--mu_only_recon_weight", type=float, default=0.0,
+    sub_parser.add_argument("--mu_only_recon_weight", type=float, default=0.0,
                            help="Weight for mu-only reconstruction loss (0 = disabled)")
 
-    argparser.add_argument("--f0_loss_weight", type=float, default=0.1,
+    sub_parser.add_argument("--f0_loss_weight", type=float, default=0.1,
                            help="Weight for F0 prediction loss")
-    argparser.add_argument("--vuv_loss_weight", type=float, default=0.1,
+    sub_parser.add_argument("--vuv_loss_weight", type=float, default=0.1,
                            help="Weight for V/UV prediction loss")
 
-    argparser.add_argument("--cache_dir", type=str, default="../cached_datasets/sive_cvae_f0",
+    sub_parser.add_argument("--cache_dir", type=str, default="../cached_datasets/sive_cvae_f0",
                            help="Directory for cached datasets")
 
-    return argparser
+    return sub_parser
