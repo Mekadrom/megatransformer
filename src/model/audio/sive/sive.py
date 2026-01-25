@@ -5,8 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-from config.audio.vae.sive import CONFIGS as SIVE_CONFIGS
-from config.audio.vae.sive import SpeakerInvariantVoiceEncoderConfig
+from config.audio.sive.sive import CONFIGS as SIVE_CONFIGS
+from config.audio.sive.sive import SpeakerInvariantVoiceEncoderConfig
 from model.audio.sive.conv_subsampling import ConvSubsampling
 from model.audio.sive.sive_block import SpeakerInvariantVoiceEncoderBlock
 
