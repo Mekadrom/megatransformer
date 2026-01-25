@@ -713,9 +713,6 @@ class AudioVAE(nn.Module):
         if config_name not in AUDIO_VAE_CONFIGS:
             raise ValueError(f"Unknown config: {config_name}. Available: {list(AUDIO_VAE_CONFIGS.keys())}")
         
-        if config_name.endswith("decoder_only"):
-            return AudioCVAEDecoderOnly.from_config(config_name, **overrides)
-        
         config = AUDIO_VAE_CONFIGS[config_name]
         # Apply overrides
         config_dict = {k: v for k, v in config.__dict__.items()}
