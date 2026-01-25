@@ -1030,7 +1030,6 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 print(f"Waveform-domain losses: enabled (gradients flow through frozen vocoder)")
                 print(f"  STFT loss weight: {args.waveform_stft_loss_weight if vocoder is not None else 0.0}")
                 print(f"  Mel loss weight: {args.waveform_mel_loss_weight if vocoder is not None else 0.0}")
-                print(f"  Start step: {args.waveform_loss_start_step}")
             if args.audio_perceptual_loss_start_step > 0:
                 print(f"  Start step: {args.audio_perceptual_loss_start_step} (delayed to let L1/MSE settle)")
             print(f"  Multi-scale mel weight: {args.multi_scale_mel_loss_weight}")
