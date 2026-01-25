@@ -186,10 +186,10 @@ class Vocoder(nn.Module):
         # iSTFT to waveform
         waveform = torch.istft(
             stft,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
+            n_fft=self.config.n_fft,
+            hop_length=self.config.hop_length,
             window=self.window.to(stft.device),
-            length=mel.size(-1) * self.hop_length,
+            length=mel.size(-1) * self.config.hop_length,
             return_complex=False,
         )
 
