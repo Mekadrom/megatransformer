@@ -5,16 +5,16 @@ This module provides a singleton pattern for loading and caching text encoder mo
 ensuring only one instance is loaded at a time to save GPU memory.
 
 Supports T5 family of models:
-- T5-small: 512-dim embeddings, fastest
-- T5-base: 768-dim embeddings, balanced
-- T5-large: 1024-dim embeddings, higher quality
-- T5-3b: 1024-dim embeddings, highest quality (memory intensive)
+- t5_small: 512-dim embeddings, fastest
+- t5_base: 768-dim embeddings, balanced
+- t5_large: 1024-dim embeddings, higher quality
+- t5_3b: 1024-dim embeddings, highest quality (memory intensive)
 
 Usage:
     from utils.text_encoder import get_text_encoder, extract_text_embedding
 
     # Get cached encoder instance
-    encoder = get_text_encoder(encoder_type="t5-small", device="cuda")
+    encoder = get_text_encoder(encoder_type="t5_small", device="cuda")
 
     # Extract embedding from text
     embedding = extract_text_embedding(text="Hello world", encoder=encoder)
@@ -39,26 +39,26 @@ _cache_lock = Lock()
 
 
 # Supported text encoder types
-TextEncoderType = Literal["t5-small", "t5-base", "t5-large", "t5-3b"]
+TextEncoderType = Literal["t5_small", "t5_base", "t5_large", "t5_3b"]
 
 # Model names on HuggingFace
 TEXT_ENCODER_MODEL_NAMES = {
-    "t5-small": "google-t5/t5-small",
-    "t5-base": "google-t5/t5-base",
-    "t5-large": "google-t5/t5-large",
-    "t5-3b": "google-t5/t5-3b",
+    "t5_small": "google-t5/t5-small",
+    "t5_base": "google-t5/t5-base",
+    "t5_large": "google-t5/t5-large",
+    "t5_3b": "google-t5/t5-3b",
 }
 
 # Embedding dimensions for each encoder type
 TEXT_EMBEDDING_DIMS = {
-    "t5-small": 512,
-    "t5-base": 768,
-    "t5-large": 1024,
-    "t5-3b": 1024,
+    "t5_small": 512,
+    "t5_base": 768,
+    "t5_large": 1024,
+    "t5_3b": 1024,
 }
 
 # Default encoder type
-DEFAULT_ENCODER_TYPE = "t5-small"
+DEFAULT_ENCODER_TYPE = "t5_small"
 
 
 class TextEncoderWrapper(nn.Module):
@@ -75,7 +75,7 @@ class TextEncoderWrapper(nn.Module):
         encoder_type: TextEncoderType = DEFAULT_ENCODER_TYPE,
         device: Union[str, torch.device] = "cpu",
         max_length: int = 512,
-        pooling: Literal["mean", "last", "first", "none"] = "mean",
+        pooling: Literal["mean", "last", "first", "none"] = "none",
     ):
         """
         Initialize the text encoder wrapper.

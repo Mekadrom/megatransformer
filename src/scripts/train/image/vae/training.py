@@ -6,8 +6,7 @@ from model.discriminator import compute_adaptive_weight
 from model.image.vae.discriminator import InstanceNoiseScheduler, MultiScalePatchDiscriminator, add_instance_noise, compute_discriminator_loss, compute_generator_gan_loss, r1_gradient_penalty
 from model.image.vae.vae import ImageVAE
 from scripts.train.trainer import CommonTrainer
-from torch.amp import autocast
-from transformers.integrations import TensorBoardCallback
+from transformers.integrations.integration_utils import TensorBoardCallback
 from typing import Any, Mapping, Optional, Union
 
 from utils import model_loading_utils
@@ -58,7 +57,7 @@ class ImageVAEGANTrainer(CommonTrainer):
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
 
-        self.discriminator = discr
+        self.discriminator = discriminator
         self.discriminator_optimizer = discriminator_optimizer
         self.gan_loss_weight = gan_loss_weight
         self.feature_matching_weight = feature_matching_weight
@@ -97,21 +96,6 @@ class ImageVAEGANTrainer(CommonTrainer):
             self.discriminator_scaler = torch.amp.GradScaler(enabled=False)  # Will be enabled in compute_loss
 
         self.has_logged_cli = False
-
-    def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
-        """
-        Prepares one `data` before feeding it to the model.
-        """
-        if isinstance(data, Mapping):
-            return type(data)({k: self._prepare_input(v) for k, v in data.items()})
-        elif isinstance(data, (tuple, list)):
-            return type(data)(self._prepare_input(v) for v in data)
-        elif isinstance(data, torch.Tensor):
-            kwargs = {"device": self.args.device}
-            if self.is_deepspeed_enabled and (torch.is_floating_point(data)):
-                kwargs.update({"dtype": self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()})
-            return data.to(**kwargs)
-        return data
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
@@ -172,7 +156,7 @@ class ImageVAEGANTrainer(CommonTrainer):
 
                 # Compute discriminator loss in fp32 to avoid gradient underflow
                 # Mixed precision can cause discriminator gradients to vanish
-                with autocast(image.device.type, dtype=torch.float32, enabled=False):
+                with torch.autocast(image.device.type, dtype=torch.float32, enabled=False):
                     # Cast inputs to fp32 for discriminator
                     real_fp32 = real_for_disc.float()
                     fake_fp32 = fake_for_disc.float()
@@ -224,7 +208,7 @@ class ImageVAEGANTrainer(CommonTrainer):
             # Generator GAN Loss
             device_type = image.device.type
             dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
-            with autocast(device_type, dtype=dtype, enabled=self.args.fp16 or self.args.bf16):
+            with torch.autocast(device_type, dtype=dtype, enabled=self.args.fp16 or self.args.bf16):
                 g_gan_loss, g_loss_dict = compute_generator_gan_loss(
                     self.discriminator,
                     real_images=image,

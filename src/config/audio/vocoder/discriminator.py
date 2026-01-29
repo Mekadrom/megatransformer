@@ -8,7 +8,9 @@ from typing import Optional
 
 @dataclass
 class WaveformDomainMultiPeriodDiscriminatorConfig:
-    periods: list[int] = [2, 3, 5, 7, 11, 13, 17]
+    periods: list[int] = dataclasses.field(
+        default_factory=lambda: [2, 3, 5, 7, 11, 13, 17]
+    )
     base_channels: Optional[list[int]] = None
 
 
@@ -19,12 +21,16 @@ class WaveformDomainMultiScaleDiscriminatorConfig:
 
 @dataclass
 class WaveformDomainMultiResolutionDiscriminatorConfig:
-    resolutions: list[tuple[int, int, int]] = [
-        (1024, 256),
-        (2048, 512),
-        (512, 128),
-    ]
-    base_channels: list[int] = [16, 32, 64, 128, 256]
+    resolutions: list[tuple[int, int]] = dataclasses.field(
+        default_factory=lambda: [
+            (1024, 256),
+            (2048, 512),
+            (512, 128),
+        ]
+    )
+    base_channels: list[int] = dataclasses.field(
+        default_factory=lambda: [16, 32, 64, 128, 256]
+    )
 
 
 @dataclass

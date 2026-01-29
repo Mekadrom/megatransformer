@@ -1,15 +1,18 @@
-import os
-import librosa
-from matplotlib import pyplot as plt
-import numpy as np
-import torch
-from transformers import TrainerCallback
-
 import abc
 
-from model.audio.vocoder.vocoder import Vocoder
-from utils.model_loading_utils import load_model
+import librosa
+import numpy as np
+import torch
+
+
+from typing import Optional
+
+from matplotlib import pyplot as plt
+from transformers import TrainerCallback
+
 from torch.utils.tensorboard import SummaryWriter
+
+from utils import audio_utils
 
 
 class VisualizationCallback(abc.ABC, TrainerCallback):
@@ -20,17 +23,15 @@ class VisualizationCallback(abc.ABC, TrainerCallback):
             if mel_spec.dim() == 2:
                 mel_spec = mel_spec.unsqueeze(0)  # [1, n_mels, T]
 
+            print(f"Generating audio with vocoder at step {global_step} for tag {tag} with mel specs {mel_spec.shape}...")
+
             # Match vocoder dtype (may be bfloat16 if training with bf16)
             vocoder_dtype = next(self.vocoder.parameters()).dtype
             vocoder_device = next(self.vocoder.parameters()).device
             mel_spec = mel_spec.to(device=vocoder_device, dtype=vocoder_dtype)
 
             with torch.no_grad():
-                outputs = self.vocoder(mel_spec)
-                if isinstance(outputs, dict):
-                    waveform = outputs["pred_waveform"]
-                else:
-                    waveform = outputs
+                waveform, _ = self.vocoder(mel_spec)
 
             # Ensure 1D waveform and convert to float32 CPU for numpy
             if waveform.dim() > 1:
@@ -47,8 +48,10 @@ class VisualizationCallback(abc.ABC, TrainerCallback):
                 global_step,
                 sample_rate=self.audio_sample_rate
             )
+            return waveform
         except Exception as e:
             print(f"Failed to generate audio with vocoder: {e}")
+            raise e
 
     def _get_device(self):
         """Determine the device to use for inference."""
@@ -138,4 +141,77 @@ class VisualizationCallback(abc.ABC, TrainerCallback):
 
         plt.tight_layout()
         writer.add_figure(tag, fig, global_step)
+        plt.close(fig)
+
+    def _log_attention_weights(
+        self,
+        writer: SummaryWriter,
+        attn_weights: Optional[torch.Tensor],
+        global_step: int,
+        tag_prefix: str,
+        H: int,
+        W: int,
+    ):
+        """
+        Log 2D attention weight visualizations to TensorBoard.
+
+        Args:
+            writer: TensorBoard writer
+            attn_weights: Attention tensor [B, n_heads, H*W, H*W] or None
+            global_step: Current training step
+            tag_prefix: Tag prefix for TensorBoard (e.g., "eval_vae/example_0/encoder_attention")
+            H: Height of the spatial grid
+            W: Width of the spatial grid
+        """
+        if attn_weights is None:
+            return
+
+        # Move to CPU and convert to numpy
+        # Shape: [n_heads, H*W, H*W]
+        weights = attn_weights[0].float().detach().cpu().numpy()
+        n_heads, seq_len, _ = weights.shape
+
+        # 1. Global average attention map (avg across heads)
+        global_avg_weights = weights.mean(axis=0)  # [H*W, H*W]
+
+        # Log full 2D attention map
+        fig, ax = plt.subplots(figsize=(8, 8))
+        im = ax.imshow(global_avg_weights, aspect='auto', origin='lower', cmap='viridis')
+        ax.set_title(f'Attention (avg {n_heads} heads, {H}×{W}={H*W} tokens)')
+        ax.set_xlabel('Key position')
+        ax.set_ylabel('Query position')
+        plt.colorbar(im, ax=ax)
+        plt.tight_layout()
+        writer.add_figure(f"{tag_prefix}/global_2d", fig, global_step)
+        plt.close(fig)
+
+        # 2. Per-head attention maps (first 4 heads)
+        n_heads_to_show = min(4, n_heads)
+        fig, axes = plt.subplots(1, n_heads_to_show, figsize=(4 * n_heads_to_show, 4))
+        if n_heads_to_show == 1:
+            axes = [axes]
+        for head_idx, ax in enumerate(axes):
+            im = ax.imshow(weights[head_idx], aspect='auto', origin='lower', cmap='viridis')
+            ax.set_title(f'Head {head_idx}')
+            ax.set_xlabel('Key')
+            ax.set_ylabel('Query')
+        plt.tight_layout()
+        writer.add_figure(f"{tag_prefix}/per_head", fig, global_step)
+        plt.close(fig)
+
+        # 3. Spatial attention pattern - where does each position attend?
+        # Reshape attention to show spatial patterns
+        # For a few query positions, show attention as a 2D heatmap
+        query_positions = [0, seq_len // 4, seq_len // 2, 3 * seq_len // 4]  # corners and center
+        fig, axes = plt.subplots(1, len(query_positions), figsize=(4 * len(query_positions), 4))
+        for i, (q_pos, ax) in enumerate(zip(query_positions, axes)):
+            # Get attention from this query position to all keys
+            attn_from_query = global_avg_weights[q_pos].reshape(H, W)
+            im = ax.imshow(attn_from_query, aspect='auto', origin='lower', cmap='hot')
+            q_h, q_w = q_pos // W, q_pos % W
+            ax.set_title(f'Query ({q_h},{q_w})')
+            ax.scatter([q_w], [q_h], c='cyan', s=100, marker='x')  # Mark query position
+        plt.suptitle('Attention from query positions (cyan X)')
+        plt.tight_layout()
+        writer.add_figure(f"{tag_prefix}/spatial_pattern", fig, global_step)
         plt.close(fig)

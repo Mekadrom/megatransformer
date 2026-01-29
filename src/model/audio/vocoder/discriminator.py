@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 from config.audio.vocoder.discriminator import DISCRIMINATOR_CONFIGS, WaveformDomainDiscriminatorConfig, WaveformDomainMultiPeriodDiscriminatorConfig, WaveformDomainMultiResolutionDiscriminatorConfig, WaveformDomainMultiResolutionDiscriminatorConfig, WaveformDomainMultiScaleDiscriminatorConfig
+from model.discriminator import discriminator_loss
 from utils.audio_utils import SharedWindowBuffer
 
 
@@ -262,7 +263,7 @@ class WaveformDomainDiscriminator(nn.Module):
         self.mrsd = MultiResolutionSpectrogramDiscriminator(shared_window_buffer, config.mrsd_config)
 
     @classmethod
-    def from_config(cls, config_name: str, **overrides) -> "WaveformDomainDiscriminator":
+    def from_config(cls, shared_window_buffer: SharedWindowBuffer, config_name: str, **overrides) -> "WaveformDomainDiscriminator":
         """
         Create model from predefined config with optional overrides.
 
@@ -282,7 +283,7 @@ class WaveformDomainDiscriminator(nn.Module):
         config_dict.update(overrides)
         config = WaveformDomainDiscriminatorConfig(**config_dict)
 
-        return cls(config)
+        return cls(shared_window_buffer, config)
 
     def forward(self, x: torch.Tensor) -> dict[str, tuple[list[torch.Tensor], list[list[torch.Tensor]]]]:
         """
@@ -297,3 +298,71 @@ class WaveformDomainDiscriminator(nn.Module):
             "mrsd": self.mrsd(x),
         }
         return results
+
+
+def compute_discriminator_losses(
+    disc_outputs_real: dict[str, tuple[list[torch.Tensor], list[list[torch.Tensor]]]],
+    disc_outputs_fake: dict[str, tuple[list[torch.Tensor], list[list[torch.Tensor]]]],
+) -> dict[str, torch.Tensor]:
+    """Compute discriminator losses for all discriminator types."""
+    losses = {}
+    
+    for key in disc_outputs_real:
+        real_outs, _ = disc_outputs_real[key]
+        fake_outs, _ = disc_outputs_fake[key]
+        loss = discriminator_loss(real_outs, fake_outs)
+        losses[f"d_loss_{key}"] = loss
+    
+    return losses
+
+
+def generator_loss(disc_fake_outputs: list[torch.Tensor]) -> torch.Tensor:
+    """
+    Generator loss: fake samples should be classified as 1 (fool discriminator).
+    Uses least-squares GAN loss.
+    """
+    loss = 0.0
+    for df in disc_fake_outputs:
+        loss += torch.mean((1 - df) ** 2)
+    return loss
+
+
+def feature_matching_loss(
+    disc_real_features: list[list[torch.Tensor]],
+    disc_fake_features: list[list[torch.Tensor]],
+) -> torch.Tensor:
+    """
+    Feature matching loss with proper normalization.
+    """
+    loss = 0.0
+    num_layers = 0
+    
+    for real_feats, fake_feats in zip(disc_real_features, disc_fake_features):
+        for real_feat, fake_feat in zip(real_feats, fake_feats):
+            # Normalize by feature magnitude to make loss scale-invariant
+            loss += F.l1_loss(fake_feat, real_feat.detach()) / (real_feat.detach().abs().mean() + 1e-5)
+            num_layers += 1
+    
+    # Average over layers
+    return loss / num_layers if num_layers > 0 else loss
+
+
+def compute_generator_losses(
+    disc_outputs_fake: dict[str, tuple[list[torch.Tensor], list[list[torch.Tensor]]]],
+    disc_outputs_real: dict[str, tuple[list[torch.Tensor], list[list[torch.Tensor]]]],
+    fm_weight: float = 2.0,
+) -> dict[str, torch.Tensor]:
+    """Compute generator adversarial and feature matching losses."""
+    losses = {}
+
+    for key in disc_outputs_fake:
+        fake_outs, fake_feats = disc_outputs_fake[key]
+        real_outs, real_feats = disc_outputs_real[key]
+
+        adv_loss = generator_loss(fake_outs)
+        fm_loss = feature_matching_loss(real_feats, fake_feats)
+
+        losses[f"g_adv_{key}"] = adv_loss
+        losses[f"g_fm_{key}"] = fm_loss
+
+    return losses

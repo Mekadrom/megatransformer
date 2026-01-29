@@ -15,8 +15,8 @@ class SpeakerInvariantVoiceEncoderConfig:
     ff_dim: int = 1024
     conv_kernel_sizes: Optional[list[int]] = None
     conv_strides: Optional[list[int]] = None
-    vocab_size: int = 32  # Characters + blank for CTC
-    num_speakers: int = 992
+    vocab_size: int = 30  # " 'abcdefghijklmnopqrstuvwxyz" + blank + UNKOWN
+    num_speakers: int = 921
     dropout: float = 0.1
     max_seq_len: int = 5000
     speaker_pooling: str = "mean"
