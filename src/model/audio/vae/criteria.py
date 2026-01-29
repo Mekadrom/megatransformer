@@ -171,7 +171,7 @@ class AudioPerceptualLoss(nn.Module):
             if isinstance(vocoder_outputs, dict):
                 pred_waveform_grad = vocoder_outputs["pred_waveform"]
             else:
-                pred_waveform_grad = vocoder_outputs
+                pred_waveform_grad, _ = vocoder_outputs
 
             # Run vocoder on target mel WITH no_grad (don't need gradients)
             with torch.no_grad():
@@ -179,7 +179,7 @@ class AudioPerceptualLoss(nn.Module):
                 if isinstance(target_vocoder_outputs, dict):
                     target_waveform_grad = target_vocoder_outputs["pred_waveform"]
                 else:
-                    target_waveform_grad = target_vocoder_outputs
+                    target_waveform_grad, _ = target_vocoder_outputs
 
             # Multi-resolution STFT loss
             if self.waveform_stft_loss is not None and self.waveform_stft_weight > 0:

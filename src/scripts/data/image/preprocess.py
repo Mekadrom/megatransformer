@@ -15,10 +15,7 @@ from datasets import load_dataset
 from PIL.Image import Image
 from torchvision import transforms
 
-from scripts.data.audio.vae.preprocess import SIVEFeatureBatchProcessor
-from scripts.data.preprocessor import BatchProcessor
-from utils import audio_utils
-from utils.model_loading_utils import load_model
+from scripts.data.preprocessor import BatchProcessor, Preprocessor
 from utils.text_encoder import extract_text_embedding, get_text_encoder
 
 
@@ -111,7 +108,7 @@ class ConditionsBatchProcessor(BatchProcessor):
         self.max_text_length = max_text_length
         self.device = device
 
-        self.encoder = get_text_encoder(encoder_type="t5-small", device=device)
+        self.encoder = get_text_encoder(encoder_type="t5_small", device=device)
 
 
     @torch.no_grad()
@@ -223,7 +220,7 @@ class ImageBatchProcessor(BatchProcessor):
         }
 
 
-class ImageDatasetPreprocessor:
+class ImageDatasetPreprocessor(Preprocessor):
     """Preprocess dataset to save images for training."""
 
     def __init__(

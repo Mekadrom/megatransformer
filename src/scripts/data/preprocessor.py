@@ -17,7 +17,7 @@ class Preprocessor(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def preprocess_example(self, example):
+    def preprocess_example(self, example) -> bool:
         pass
 
     @abc.abstractmethod
@@ -26,5 +26,5 @@ class Preprocessor(abc.ABC):
 
     @classmethod
     @abc.abstractmethod
-    def add_cli_args(self, parser):
+    def add_cli_args(cls, parser):
         pass

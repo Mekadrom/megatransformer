@@ -28,20 +28,12 @@ class ImageVAEVisualizationCallback(VisualizationCallback):
         self,
         image_size: int = 256,
         step_offset: int = 0,
-        generation_steps: int = 1000,
         num_eval_samples: int = 8,
     ):
         self.trainer: Optional[Trainer] = None
         self.step_offset = step_offset if step_offset is not None else 0
-        self.generation_steps = generation_steps
         self.image_size = image_size
         self.num_eval_samples = num_eval_samples
-
-        self.example_paths = [
-            "inference/examples/test_vlm1_x256.png",
-            "inference/examples/test_vlm2_x256.png",
-            "inference/examples/test_vlm3_x256.png",
-        ]
 
         # VAE uses [-1, 1] normalization (for tanh output)
         transform = transforms.Compose([
@@ -49,20 +41,6 @@ class ImageVAEVisualizationCallback(VisualizationCallback):
             transforms.ToTensor(),  # [0, 1]
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # [-1, 1]
         ])
-
-        self.example_images = []
-        self.example_images_unnorm = []  # For visualization (in [0, 1] range)
-        for path in self.example_paths:
-            if os.path.exists(path):
-                image = Image.open(path).convert('RGB')
-                image_tensor = transform(image)
-                self.example_images.append(image_tensor)
-                # Store unnormalized version for visualization
-                unnorm_transform = transforms.Compose([
-                    # transforms.Resize((image_size, image_size)),
-                    transforms.ToTensor(),  # [0, 1] for direct visualization
-                ])
-                self.example_images_unnorm.append(unnorm_transform(image))
 
     def unnormalize(self, x: torch.Tensor) -> torch.Tensor:
         """Unnormalize image tensor from [-1, 1] (tanh output) back to [0, 1] for visualization."""
@@ -76,79 +54,6 @@ class ImageVAEVisualizationCallback(VisualizationCallback):
             return torch.device("cuda")
         else:
             return torch.device("cpu")
-
-    def _log_attention_weights(
-        self,
-        writer: SummaryWriter,
-        attn_weights: Optional[torch.Tensor],
-        global_step: int,
-        tag_prefix: str,
-        H: int,
-        W: int,
-    ):
-        """
-        Log 2D attention weight visualizations to TensorBoard.
-
-        Args:
-            writer: TensorBoard writer
-            attn_weights: Attention tensor [B, n_heads, H*W, H*W] or None
-            global_step: Current training step
-            tag_prefix: Tag prefix for TensorBoard (e.g., "eval_vae/example_0/encoder_attention")
-            H: Height of the spatial grid
-            W: Width of the spatial grid
-        """
-        if attn_weights is None:
-            return
-
-        # Move to CPU and convert to numpy
-        # Shape: [n_heads, H*W, H*W]
-        weights = attn_weights[0].float().detach().cpu().numpy()
-        n_heads, seq_len, _ = weights.shape
-
-        # 1. Global average attention map (avg across heads)
-        global_avg_weights = weights.mean(axis=0)  # [H*W, H*W]
-
-        # Log full 2D attention map
-        fig, ax = plt.subplots(figsize=(8, 8))
-        im = ax.imshow(global_avg_weights, aspect='auto', origin='lower', cmap='viridis')
-        ax.set_title(f'Attention (avg {n_heads} heads, {H}×{W}={H*W} tokens)')
-        ax.set_xlabel('Key position')
-        ax.set_ylabel('Query position')
-        plt.colorbar(im, ax=ax)
-        plt.tight_layout()
-        writer.add_figure(f"{tag_prefix}/global_2d", fig, global_step)
-        plt.close(fig)
-
-        # 2. Per-head attention maps (first 4 heads)
-        n_heads_to_show = min(4, n_heads)
-        fig, axes = plt.subplots(1, n_heads_to_show, figsize=(4 * n_heads_to_show, 4))
-        if n_heads_to_show == 1:
-            axes = [axes]
-        for head_idx, ax in enumerate(axes):
-            im = ax.imshow(weights[head_idx], aspect='auto', origin='lower', cmap='viridis')
-            ax.set_title(f'Head {head_idx}')
-            ax.set_xlabel('Key')
-            ax.set_ylabel('Query')
-        plt.tight_layout()
-        writer.add_figure(f"{tag_prefix}/per_head", fig, global_step)
-        plt.close(fig)
-
-        # 3. Spatial attention pattern - where does each position attend?
-        # Reshape attention to show spatial patterns
-        # For a few query positions, show attention as a 2D heatmap
-        query_positions = [0, seq_len // 4, seq_len // 2, 3 * seq_len // 4]  # corners and center
-        fig, axes = plt.subplots(1, len(query_positions), figsize=(4 * len(query_positions), 4))
-        for i, (q_pos, ax) in enumerate(zip(query_positions, axes)):
-            # Get attention from this query position to all keys
-            attn_from_query = global_avg_weights[q_pos].reshape(H, W)
-            im = ax.imshow(attn_from_query, aspect='auto', origin='lower', cmap='hot')
-            q_h, q_w = q_pos // W, q_pos % W
-            ax.set_title(f'Query ({q_h},{q_w})')
-            ax.scatter([q_w], [q_h], c='cyan', s=100, marker='x')  # Mark query position
-        plt.suptitle('Attention from query positions (cyan X)')
-        plt.tight_layout()
-        writer.add_figure(f"{tag_prefix}/spatial_pattern", fig, global_step)
-        plt.close(fig)
 
     def _log_reconstruction(self, writer, model, image, global_step, prefix, idx, args, log_attention: bool = True):
         """Log a single image reconstruction to TensorBoard."""
@@ -249,17 +154,3 @@ class ImageVAEVisualizationCallback(VisualizationCallback):
             self._log_reconstruction(writer, model, image, global_step, "eval_vae", i, args)
 
         writer.flush()
-
-    def on_step_end(self, args, state, control, model: ImageVAE = None, **kwargs):
-        global_step = state.global_step + self.step_offset
-
-        if ((global_step == 1) or (global_step % self.generation_steps == 0)) and state.is_world_process_zero:
-            writer = get_writer(self.trainer)
-            if writer is None:
-                print("No TensorBoard writer found, skipping visualization...")
-                return
-
-            print(f"Generating image reconstructions at step {global_step}...")
-
-            for i, image in enumerate(self.example_images):
-                self._log_reconstruction(writer, model, image, global_step, "image_vae", i, args)

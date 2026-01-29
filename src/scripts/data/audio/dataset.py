@@ -9,22 +9,23 @@ from tqdm import tqdm
 from scripts.data.dataset import ShardAwareSampler
 
 
-class SIVEFeatureShardedDataset(Dataset):
+class AudioShardedDataset(Dataset):
     """
-    Efficient dataset for loading preprocessed SIVE feature shards.
+    Efficient dataset for loading preprocessed audio shards.
 
     Loads shards containing:
-    - features: SIVE encoder features
+    - features: optional - SIVE encoder features
         - Single layer: [B, encoder_dim, T']
         - Multi-layer: [B, num_layers, encoder_dim, T']
-    - feature_lengths: [B] feature lengths before padding
-    - mel_lengths: [B] original mel spectrogram lengths (before SIVE subsampling)
-    - speaker_embeddings: [B, embedding_dim] speaker embeddings for conditioning
+    - feature_lengths: optional - [B] feature lengths before padding
+    - mel_specs: [B, n_mel_channels, T] original mel spectrograms
+    - mel_lengths: optional - [B] original mel spectrogram lengths (before SIVE subsampling)
+    - speaker_embeddings: optional - [B, embedding_dim] speaker embeddings for conditioning
+    - f0: optional - [B, T'] fundamental frequency aligned with features
+    - voiced: optional - [B, T'] voiced/unvoiced confidence aligned with features
+    - waveforms: optional - [B, T] original waveforms
 
-    For multi-layer features, the VAE can apply learned per-layer normalization
-    (LayerNorm, RMSNorm, etc.) before processing.
-
-    Use this dataset to train a VAE on SIVE feature space.
+    One of waveforms, mel_specs, or features WILL be present in each shard.
     """
 
     SHARD_INDEX_FILE = "shard_index.json"
@@ -33,17 +34,14 @@ class SIVEFeatureShardedDataset(Dataset):
         self,
         shard_dir: str,
         cache_size: int = 3,
-        max_feature_frames: int = 500,
     ):
         """
         Args:
             shard_dir: Directory containing shard_*.pt files
             cache_size: Number of shards to keep in memory
-            max_feature_frames: Maximum feature sequence length for padding
         """
         self.shard_dir = shard_dir
         self.cache_size = cache_size
-        self.max_feature_frames = max_feature_frames
 
         # Try to load cached index first
         index_path = os.path.join(shard_dir, self.SHARD_INDEX_FILE)
@@ -60,11 +58,8 @@ class SIVEFeatureShardedDataset(Dataset):
         else:
             self.config = {}
 
-        self.encoder_dim = self.config.get("encoder_dim", 288)
+        self.encoder_dim = self.config.get("encoder_dim", 128)
         self.speaker_embedding_dim = self.config.get("speaker_embedding_dim", 192)
-        self.num_layers = self.config.get("num_layers", 1)  # 1 for single layer, >1 for multi-layer
-        self.layers = self.config.get("layers", None)  # List of layer indices if multi-layer
-        self.has_f0 = self.config.get("has_f0", False)  # Whether F0 data is available
 
         # LRU cache
         self._cache = {}
@@ -145,29 +140,31 @@ class SIVEFeatureShardedDataset(Dataset):
         shard_idx, local_idx = self._find_shard_for_idx(idx)
         shard = self._load_shard(shard_idx)
 
-        # features shape depends on multi-layer mode:
-        # - Single layer: [encoder_dim, T']
-        # - Multi-layer:  [num_layers, encoder_dim, T']
-        features = shard["features"][local_idx]
-        feature_length = shard["feature_lengths"][local_idx].item()
-        mel_specs = shard["mel_specs"][local_idx]
-        mel_spec_length = shard["mel_lengths"][local_idx].item()
+        sample = {}
 
-        sample = {
-            "features": features,
-            "feature_length": feature_length,
-            "mel_specs": mel_specs,
-            "mel_lengths": mel_spec_length,
-            "num_layers": self.num_layers,  # For collator to know the format
-        }
+        if 'features' in shard:
+            # features shape depends on multi-layer mode:
+            # - Single layer: [encoder_dim, T']
+            # - Multi-layer:  [num_layers, encoder_dim, T']
+            sample['features'] = shard["features"][local_idx]
+            sample["feature_length"] = shard["feature_lengths"][local_idx]
+
+        if 'waveforms' in shard:
+            sample['waveform'] = shard["waveforms"][local_idx]
+            sample["waveform_length"] = shard["waveform_lengths"][local_idx]
+
+        if 'mel_specs' in shard:
+            sample['mel_spec'] = shard["mel_specs"][local_idx]
+            sample["mel_length"] = shard["mel_lengths"][local_idx]
 
         if "speaker_embeddings" in shard:
             sample["speaker_embedding"] = shard["speaker_embeddings"][local_idx]
+            sample["speaker_id"] = shard["speaker_ids"][local_idx]
 
         # Add F0 data if available
         if "f0" in shard:
             sample["f0"] = shard["f0"][local_idx]
-            sample["voiced"] = shard["voiced"][local_idx]
+            sample["vuv"] = shard["vuv"][local_idx]
 
         return sample
 

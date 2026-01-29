@@ -1,3 +1,4 @@
+from typing import Optional
 import numpy as np
 import os
 import random
@@ -9,6 +10,7 @@ except ImportError:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torch.nn import DataParallel
 from torch.nn.parallel import DistributedDataParallel
@@ -99,3 +101,35 @@ def sanitize_model(model):
         if isinstance(model, deepspeed.runtime.engine.DeepSpeedEngine):
             return model.module
     return model
+
+
+def trim(tensor: Optional[torch.Tensor], max_length: int, dim: int = -1) -> Optional[torch.Tensor]:
+    """Trim the tensor along the specified dimension to the max_length."""
+    if tensor is None:
+        return None
+    if tensor.shape[dim] > max_length:
+        slices = [slice(None)] * tensor.dim()
+        slices[dim] = slice(0, max_length)
+        return tensor[tuple(slices)]
+    return tensor
+
+
+def pad_and_mask(tensors: list[torch.Tensor], lengths: list[int]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    pad_to_length = max(lengths)
+    padded_tensors = []
+    masks = []
+    for tensor, length in zip(tensors, lengths):
+        # Create mask (1 = valid, 0 = padding)
+        mask = torch.zeros(pad_to_length, dtype=torch.float32, device=tensor.device)
+        mask[:length] = 1.0
+
+        # Truncate to batch max length (along last dimension for both formats)
+        tensor = tensor[..., :pad_to_length]
+
+        # Pad if needed (along last dimension)
+        if tensor.shape[-1] < pad_to_length:
+            tensor = F.pad(tensor, (0, pad_to_length - tensor.shape[-1]), value=0)
+
+        padded_tensors.append(tensor)
+        masks.append(mask)
+    return padded_tensors, masks

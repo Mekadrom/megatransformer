@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from config.image.vae.discriminator import MULTI_SCALE_PATCH_DISCRIMINATOR_CONFIGS, MultiScalePatchDiscriminatorConfig
+from model.discriminator import discriminator_hinge_loss
 
 
 class PatchDiscriminator(nn.Module):
@@ -290,21 +292,6 @@ class InstanceNoiseScheduler:
             return self.initial_std
 
 
-def discriminator_loss(
-    disc_real_outputs: list[torch.Tensor],
-    disc_fake_outputs: list[torch.Tensor],
-) -> torch.Tensor:
-    """
-    Discriminator hinge loss.
-    Real samples should produce positive values, fake should produce negative.
-    """
-    loss = 0.0
-    for real, fake in zip(disc_real_outputs, disc_fake_outputs):
-        loss += torch.mean(F.relu(1 - real))
-        loss += torch.mean(F.relu(1 + fake))
-    return loss / (2 * len(disc_real_outputs))
-
-
 def generator_loss(disc_fake_outputs: list[torch.Tensor]) -> torch.Tensor:
     """
     Generator hinge loss.
@@ -352,15 +339,15 @@ def compute_discriminator_loss(
         loss_dict: Dictionary with individual loss components
     """
     # Get discriminator outputs
-    real_outputs, _real_features = discriminator(real_images)
-    fake_outputs, _fake_features = discriminator(fake_images.detach())
+    real_outputs, _ = discriminator(real_images)
+    fake_outputs, _ = discriminator(fake_images.detach())
 
     # Handle both single and multi-scale discriminators
     if not isinstance(real_outputs, list):
         real_outputs = [real_outputs]
         fake_outputs = [fake_outputs]
 
-    d_loss = discriminator_loss(real_outputs, fake_outputs)
+    d_loss = discriminator_hinge_loss(real_outputs, fake_outputs)
 
     loss_dict = {
         "d_loss": d_loss,
@@ -423,52 +410,3 @@ def compute_generator_gan_loss(
         loss_dict["g_fm_loss"] = fm_loss
 
     return total_loss, loss_dict
-
-
-def compute_adaptive_weight(
-    nll_loss: torch.Tensor,
-    g_loss: torch.Tensor,
-    last_layer: nn.Parameter,
-    discriminator_weight: float = 1.0,
-) -> torch.Tensor:
-    """
-    Compute adaptive discriminator weight (VQGAN-style).
-
-    This balances the GAN loss contribution with the reconstruction loss by
-    computing the ratio of their gradient norms with respect to the last
-    decoder layer. This prevents the discriminator from dominating training.
-
-    Reference: Esser et al., "Taming Transformers for High-Resolution Image Synthesis"
-    https://arxiv.org/abs/2012.09841
-
-    Args:
-        nll_loss: Reconstruction loss (MSE, L1, perceptual, etc.) - must have grad enabled
-        g_loss: Generator's GAN loss - must have grad enabled
-        last_layer: The last layer's weight parameter (e.g., decoder.final_conv.weight)
-        discriminator_weight: Base discriminator weight to scale by
-
-    Returns:
-        Adaptive weight to multiply with the GAN loss
-    """
-    # Compute gradients of reconstruction loss w.r.t. last decoder layer
-    nll_grads = torch.autograd.grad(
-        nll_loss, last_layer, retain_graph=True, allow_unused=True
-    )[0]
-
-    # Compute gradients of GAN loss w.r.t. last decoder layer
-    g_grads = torch.autograd.grad(
-        g_loss, last_layer, retain_graph=True, allow_unused=True
-    )[0]
-
-    # Handle case where gradients are None (shouldn't happen in normal training)
-    if nll_grads is None or g_grads is None:
-        return torch.tensor(discriminator_weight, device=g_loss.device)
-
-    # Compute adaptive weight as ratio of gradient norms
-    # This ensures GAN gradients are scaled to match reconstruction gradient magnitude
-    d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
-
-    # Clamp to prevent extreme values
-    d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
-
-    return discriminator_weight * d_weight

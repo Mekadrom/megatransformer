@@ -146,6 +146,7 @@ class F0PredictorConfig:
 
 F0_PREDICTOR_CONFIGS = {
     "default": F0PredictorConfig(),
+    "small_deep": F0PredictorConfig(n_layers=5, hidden_dim=256),
 }
 
 

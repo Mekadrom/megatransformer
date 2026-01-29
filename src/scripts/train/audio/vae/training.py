@@ -177,7 +177,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
         self.r1_penalty_interval = r1_penalty_interval
 
         # Audio perceptual loss settings
-        self.audio_perceptual_loss = audio_perceptual_loss
+        self.audio_perceptual_loss: AudioPerceptualLoss = audio_perceptual_loss
         self.audio_perceptual_loss_weight = audio_perceptual_loss_weight
         self.audio_perceptual_loss_start_step = audio_perceptual_loss_start_step
         self.vocoder = vocoder
@@ -249,15 +249,14 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 for param in unwrapped_model.f0_predictor.parameters():
                     param.requires_grad = True
 
-        features = inputs.get("features", None)
-        mel_spec = inputs["mel_specs"]
-        mel_spec_masks = inputs.get("mel_spec_masks", None)
-        mel_spec_lengths = inputs.get("mel_lengths", None)
-        speaker_embedding = inputs.get("speaker_embedding", None)
-        target_f0 = inputs.get("target_f0", None)
-        target_voiced = inputs.get("target_voiced", None)
-
-        # print(f"Mask length: {torch.cumprod(mel_spec_masks, dim=-1).sum(dim=-1)}")
+        features = inputs["features"]
+        mel_specs = inputs["mel_specs"]
+        mel_spec_masks = inputs["mel_spec_masks"]
+        mel_lengths = inputs["mel_lengths"]
+        speaker_embedding = inputs["speaker_embedding"]
+        f0 = inputs["f0"]
+        f0_masks = inputs["f0_masks"]
+        vuv = inputs["vuv"]
 
         # Compute KL weight multiplier for KL annealing (ramps from 0 to 1)
         kl_weight_multiplier = 1.0
@@ -268,8 +267,8 @@ class AudioCVAEGANTrainer(CommonTrainer):
         # This lets the F0 embedding learn with clean signal before relying on predictor
         use_gt_f0 = (self.f0_warmup_use_gt_steps > 0 and
                      global_step < self.f0_warmup_use_gt_steps and
-                     target_f0 is not None and target_voiced is not None)
-
+                     f0 is not None and vuv is not None)
+        
         is_vae = hasattr(model, "encoder") and model.encoder is not None
 
         if is_vae:
@@ -277,25 +276,25 @@ class AudioCVAEGANTrainer(CommonTrainer):
             # Request FiLM stats if logging is enabled
             recon, mu, logvar, losses = model(
                 features=features,
-                target=mel_spec,
+                target=mel_specs,
                 mask=mel_spec_masks,
                 speaker_embedding=speaker_embedding,
-                length=mel_spec_lengths,
+                length=mel_lengths,
                 kl_weight_multiplier=kl_weight_multiplier,
                 return_film_stats=self.log_film_stats,
-                target_f0=target_f0,
-                target_voiced=target_voiced,
+                target_f0=f0,
+                target_voiced=vuv,
                 use_gt_f0=use_gt_f0,
             )
         else:
             recon, losses = model(
                 features=features,
-                target=mel_spec,
+                target=mel_specs,
                 mask=mel_spec_masks,
                 speaker_embedding=speaker_embedding,
                 return_film_stats=self.log_film_stats,
-                target_f0=target_f0,
-                target_voiced=target_voiced,
+                target_f0=f0,
+                target_voiced=vuv,
                 use_gt_f0=use_gt_f0,
             )
             mu = None
@@ -315,51 +314,51 @@ class AudioCVAEGANTrainer(CommonTrainer):
 
         # Mu-only reconstruction loss (trains decoder to produce good outputs from mu directly)
         # This ensures diffusion-generated latents decode well without needing reparameterization noise
-        mu_only_recon_loss = torch.tensor(0.0, device=mel_spec.device)
+        mu_only_recon_loss = torch.tensor(0.0, device=mel_specs.device)
         if mu is not None and self.mu_only_recon_weight > 0:
             # Decode mu directly (no reparameterization noise)
-            recon_mu_only = model.decode(mu.detach(), speaker_embedding=decode_speaker_embedding, features=features)[..., :mel_spec.shape[-1]]
+            recon_mu_only = model.decode(mu.detach(), speaker_embedding=decode_speaker_embedding, features=features)[..., :mel_specs.shape[-1]]
 
             # Compute masked loss if mask is available (prevents optimizing padded regions)
             if mel_spec_masks is not None:
                 # Expand mask to match mel_spec shape: [B, T] -> [B, 1, 1, T]
                 mask_expanded = mel_spec_masks.unsqueeze(1).unsqueeze(2)
                 # Count valid elements per sample: sum(mask) * C * n_mels
-                valid_elements = mask_expanded.sum() * mel_spec.shape[1] * mel_spec.shape[2]
+                valid_elements = mask_expanded.sum() * mel_specs.shape[1] * mel_specs.shape[2]
 
                 # Masked MSE loss
                 mel_length = recon_mu_only.size(-1)
                 if hasattr(model, 'mse_loss_weight') and model.mse_loss_weight > 0:
-                    masked_squared_error = ((recon_mu_only - mel_spec[..., :mel_length]) ** 2) * mask_expanded[..., :mel_length]
+                    masked_squared_error = ((recon_mu_only - mel_specs[..., :mel_length]) ** 2) * mask_expanded[..., :mel_length]
                     masked_mse = masked_squared_error.sum() / (valid_elements + 1e-5)
                     mu_only_recon_loss = mu_only_recon_loss + model.mse_loss_weight * masked_mse
 
                 # Masked L1 loss
                 if hasattr(model, 'l1_loss_weight') and model.l1_loss_weight > 0:
-                    masked_abs_error = torch.abs(recon_mu_only - mel_spec[..., :mel_length]) * mask_expanded[..., :mel_length]
+                    masked_abs_error = torch.abs(recon_mu_only - mel_specs[..., :mel_length]) * mask_expanded[..., :mel_length]
                     masked_l1 = masked_abs_error.sum() / (valid_elements + 1e-5)
                     mu_only_recon_loss = mu_only_recon_loss + model.l1_loss_weight * masked_l1
 
                 # Fallback to masked MSE if no weights defined
                 if mu_only_recon_loss.item() == 0.0:
-                    masked_squared_error = ((recon_mu_only - mel_spec[..., :mel_length]) ** 2) * mask_expanded[..., :mel_length]
+                    masked_squared_error = ((recon_mu_only - mel_specs[..., :mel_length]) ** 2) * mask_expanded[..., :mel_length]
                     mu_only_recon_loss = masked_squared_error.sum() / (valid_elements + 1e-5)
             else:
                 # No mask available - use standard unmasked losses
                 if hasattr(model, 'mse_loss_weight') and model.mse_loss_weight > 0:
-                    mu_only_recon_loss = mu_only_recon_loss + model.mse_loss_weight * F.mse_loss(recon_mu_only, mel_spec)
+                    mu_only_recon_loss = mu_only_recon_loss + model.mse_loss_weight * F.mse_loss(recon_mu_only, mel_specs)
                 if hasattr(model, 'l1_loss_weight') and model.l1_loss_weight > 0:
-                    mu_only_recon_loss = mu_only_recon_loss + model.l1_loss_weight * F.l1_loss(recon_mu_only, mel_spec)
+                    mu_only_recon_loss = mu_only_recon_loss + model.l1_loss_weight * F.l1_loss(recon_mu_only, mel_specs)
                 # Fallback to MSE if no weights defined
                 if mu_only_recon_loss.item() == 0.0:
-                    mu_only_recon_loss = F.mse_loss(recon_mu_only, mel_spec)
+                    mu_only_recon_loss = F.mse_loss(recon_mu_only, mel_specs)
 
             vae_loss = vae_loss + self.mu_only_recon_weight * mu_only_recon_loss
             losses["mu_only_recon_loss"] = mu_only_recon_loss
 
         # GAN losses (only after condition is met)
-        g_gan_loss = torch.tensor(0.0, device=mel_spec.device)
-        d_loss = torch.tensor(0.0, device=mel_spec.device)
+        g_gan_loss = torch.tensor(0.0, device=mel_specs.device)
+        d_loss = torch.tensor(0.0, device=mel_specs.device)
 
         if self.is_gan_enabled(global_step, vae_loss):
             if not self.gan_already_started:
@@ -384,16 +383,16 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 self.discriminator.train()
 
                 # Ensure discriminator is on the same device as inputs
-                if next(self.discriminator.parameters()).device != mel_spec.device:
-                    self.discriminator = self.discriminator.to(mel_spec.device)
+                if next(self.discriminator.parameters()).device != mel_specs.device:
+                    self.discriminator = self.discriminator.to(mel_specs.device)
 
                 # Apply instance noise to both real and fake mel spectrograms
-                real_for_disc = add_mel_instance_noise(mel_spec, noise_std) if noise_std > 0 else mel_spec
+                real_for_disc = add_mel_instance_noise(mel_specs, noise_std) if noise_std > 0 else mel_specs
                 fake_for_disc = add_mel_instance_noise(recon.detach(), noise_std) if noise_std > 0 else recon.detach()
 
                 # Compute discriminator loss in fp32 to avoid gradient underflow
                 # Mixed precision can cause discriminator gradients to vanish
-                with autocast(mel_spec.device.type, dtype=torch.float32, enabled=False):
+                with autocast(mel_specs.device.type, dtype=torch.float32, enabled=False):
                     # Cast inputs to fp32 for discriminator
                     # Add channel dimension: [B, n_mels, T] -> [B, 1, n_mels, T]
                     # Discriminator expects [B, 1, n_mels, T] format
@@ -411,10 +410,10 @@ class AudioCVAEGANTrainer(CommonTrainer):
                     )
 
                 # R1 gradient penalty (on clean real mels, not noisy)
-                r1_loss = torch.tensor(0.0, device=mel_spec.device)
+                r1_loss = torch.tensor(0.0, device=mel_specs.device)
                 if self.r1_penalty_weight > 0 and global_step % self.r1_penalty_interval == 0:
                     # Add channel dimension for discriminator: [B, n_mels, T] -> [B, 1, n_mels, T]
-                    mel_spec_4d = mel_spec.float().unsqueeze(1) if mel_spec.dim() == 3 else mel_spec.float()
+                    mel_spec_4d = mel_specs.float().unsqueeze(1) if mel_specs.dim() == 3 else mel_specs.float()
                     r1_loss = r1_mel_gradient_penalty(mel_spec_4d, self.discriminator)
                     d_loss = d_loss + self.r1_penalty_weight * r1_loss
 
@@ -429,8 +428,8 @@ class AudioCVAEGANTrainer(CommonTrainer):
 
                     # Log how different real and fake mel spectrograms are
                     with torch.no_grad():
-                        real_fake_mse = torch.nn.functional.mse_loss(mel_spec, recon).item()
-                        real_fake_l1 = torch.nn.functional.l1_loss(mel_spec, recon).item()
+                        real_fake_mse = torch.nn.functional.mse_loss(mel_specs, recon).item()
+                        real_fake_l1 = torch.nn.functional.l1_loss(mel_specs, recon).item()
                         self._log_scalar("train/real_fake_mse", real_fake_mse, global_step)
                         self._log_scalar("train/real_fake_l1", real_fake_l1, global_step)
 
@@ -451,11 +450,11 @@ class AudioCVAEGANTrainer(CommonTrainer):
                     self.discriminator_optimizer.step()
 
             # Generator GAN Loss
-            device_type = mel_spec.device.type
+            device_type = mel_specs.device.type
             dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
             with autocast(device_type, dtype=dtype, enabled=self.args.fp16 or self.args.bf16):
                 # Add channel dimension for discriminator: [B, n_mels, T] -> [B, 1, n_mels, T]
-                mel_spec_for_gen = mel_spec.unsqueeze(1) if mel_spec.dim() == 3 else mel_spec
+                mel_spec_for_gen = mel_specs.unsqueeze(1) if mel_specs.dim() == 3 else mel_specs
                 recon_for_gen = recon.unsqueeze(1) if recon.dim() == 3 else recon
                 g_gan_loss, g_loss_dict = compute_mel_generator_gan_loss(
                     self.discriminator,
@@ -474,7 +473,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
             g_gan_loss = gan_warmup_factor * g_gan_loss
 
         # Total generator loss with optional adaptive weighting
-        adaptive_weight = torch.tensor(self.gan_loss_weight, device=mel_spec.device)
+        adaptive_weight = torch.tensor(self.gan_loss_weight, device=mel_specs.device)
         if self.use_adaptive_weight and self.gan_already_started and g_gan_loss.requires_grad:
             # VQGAN-style adaptive weighting: balance GAN and reconstruction gradients
             # Uses the last decoder layer as proxy for decoder output gradients
@@ -488,13 +487,13 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 # (e.g., model doesn't have expected structure, or grad computation fails)
                 if global_step % self.args.logging_steps == 0:
                     print(f"Warning: adaptive weight computation failed ({e}), using fixed weight")
-                adaptive_weight = torch.tensor(self.gan_loss_weight, device=mel_spec.device)
+                adaptive_weight = torch.tensor(self.gan_loss_weight, device=mel_specs.device)
 
         total_loss = vae_loss + adaptive_weight * g_gan_loss
 
         # Audio perceptual loss (requires vocoder for waveform-based losses)
         # Only apply after audio_perceptual_loss_start_step to let L1/MSE settle first
-        audio_perceptual_loss_value = torch.tensor(0.0, device=mel_spec.device)
+        audio_perceptual_loss_value = torch.tensor(0.0, device=mel_specs.device)
         audio_perceptual_losses = {}
         perceptual_loss_enabled = (
             self.audio_perceptual_loss is not None
@@ -502,37 +501,19 @@ class AudioCVAEGANTrainer(CommonTrainer):
             and global_step >= self.audio_perceptual_loss_start_step
         )
         if perceptual_loss_enabled:
-            # Get waveforms if vocoder is available
-            pred_waveform = None
-            target_waveform = None
-            if self.vocoder is not None:
-                with torch.no_grad():
-                    # Vocoder expects [B, n_mels, T] - recon is already in that format
-                    vocoder_outputs = self.vocoder(recon.float())
-                    if isinstance(vocoder_outputs, dict):
-                        pred_waveform = vocoder_outputs["pred_waveform"]
-                    else:
-                        pred_waveform = vocoder_outputs
-
-                    target_vocoder_outputs = self.vocoder(mel_spec.float())
-                    if isinstance(target_vocoder_outputs, dict):
-                        target_waveform = target_vocoder_outputs["pred_waveform"]
-                    else:
-                        target_waveform = target_vocoder_outputs
-
             # Compute audio perceptual losses
             # Mel spec is [B, 1, n_mels, T], squeeze channel dim for multi-scale mel loss
             audio_perceptual_losses: dict[str, torch.Tensor] = self.audio_perceptual_loss(
                 pred_mel=recon.squeeze(1),  # [B, n_mels, T]
-                target_mel=mel_spec.squeeze(1),  # [B, n_mels, T]
+                target_mel=mel_specs.squeeze(1),  # [B, n_mels, T]
                 mask=mel_spec_masks,  # [B, T] mask to exclude padded regions
             )
-            audio_perceptual_loss_value = audio_perceptual_losses.get("total_perceptual_loss", torch.tensor(0.0, device=mel_spec.device))
+            audio_perceptual_loss_value = audio_perceptual_losses.get("total_perceptual_loss", torch.tensor(0.0, device=mel_specs.device))
             total_loss = total_loss + self.audio_perceptual_loss_weight * audio_perceptual_loss_value
 
         # Learned speaker embedding classification loss
         # Uses direct gradients (no reversal) to train the speaker head to be discriminative
-        speaker_id_loss = torch.tensor(0.0, device=mel_spec.device)
+        speaker_id_loss = torch.tensor(0.0, device=mel_specs.device)
         speaker_id_acc = 0.0
         speaker_id_enabled = (
             self.learned_speaker_classifier is not None
@@ -543,7 +524,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
             # Get speaker IDs from batch
             speaker_ids = inputs.get("speaker_ids", None)
             if speaker_ids is not None and not isinstance(speaker_ids, torch.Tensor):
-                speaker_ids = torch.tensor(speaker_ids, device=mel_spec.device, dtype=torch.long)
+                speaker_ids = torch.tensor(speaker_ids, device=mel_specs.device, dtype=torch.long)
 
             if speaker_ids is not None:
                 # Mark training as started (for checkpoint saving)
@@ -572,8 +553,8 @@ class AudioCVAEGANTrainer(CommonTrainer):
                     self.speaker_id_training_started = True
 
                 # Ensure classifier is on same device
-                if next(self.learned_speaker_classifier.parameters()).device != mel_spec.device:
-                    self.learned_speaker_classifier.to(mel_spec.device)
+                if next(self.learned_speaker_classifier.parameters()).device != mel_specs.device:
+                    self.learned_speaker_classifier.to(mel_specs.device)
 
                 if self.speaker_id_loss_type == "arcface":
                     # ArcFace loss: returns (loss, logits, accuracy) tuple
@@ -639,7 +620,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
         # FiLM contrastive loss - encourages different speaker embeddings to produce different outputs
         # This penalizes the decoder for ignoring speaker embeddings
         # Key insight: weight loss by embedding similarity so we don't penalize same/similar speakers
-        film_contrastive_loss = torch.tensor(0.0, device=mel_spec.device)
+        film_contrastive_loss = torch.tensor(0.0, device=mel_specs.device)
 
         # Use decode_speaker_embedding (learned or pretrained, extracted earlier)
         film_contrastive_enabled = (
@@ -782,7 +763,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
                     speaker_ids = inputs.get("speaker_ids", None)
                     if speaker_ids is not None:
                         if not isinstance(speaker_ids, torch.Tensor):
-                            speaker_ids = torch.tensor(speaker_ids, device=mel_spec.device, dtype=torch.long)
+                            speaker_ids = torch.tensor(speaker_ids, device=mel_specs.device, dtype=torch.long)
 
                         # Normalize embeddings for cosine similarity
                         emb_flat = spk_emb  # Already [B, D] from above
@@ -918,12 +899,11 @@ class AudioCVAEGANTrainer(CommonTrainer):
             dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
             with autocast(self.args.device.type, dtype=dtype, enabled=self.args.bf16 or self.args.fp16):
                 # Forward pass
-                _, _, _, losses = model(
+                _, losses = model(
                     features=features,
                     target=mel_spec,
                     mask=mel_spec_masks,
                     speaker_embedding=speaker_embedding,
-                    length=mel_spec_lengths,
                 )
 
                 loss = losses["total_loss"]
@@ -979,7 +959,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
         print(f"  N mels: {args.audio_n_mels}")
         print(f"  N FFT: {args.audio_n_fft}")
         print(f"  Hop length: {args.audio_hop_length}")
-        print(f"  Max frames: {args.audio_max_frames}")
+        print(f"  Max audio: {args.audio_max_seconds} seconds")
         print(f"  Latent channels: {args.latent_channels}")
         print(f"  Speaker encoder type: {args.speaker_encoder_type}")
         print(f"  Speaker embedding dim: {args.speaker_embedding_dim}")
@@ -1242,10 +1222,10 @@ def create_trainer(
 
 
 def add_cli_args(subparsers):
-    sub_parser = subparsers.add_parser("audio-cvae", help="Preprocess audio dataset through SIVE for VAE training")
+    sub_parser = subparsers.add_parser("audio-cvae", help="Train audio CVAE model with speaker conditioning via FiLM")
 
-    sub_parser.add_argument("--audio_max_frames", type=int, default=1875,
-                           help="Maximum number of frames for audio input (overrides config file)")
+    sub_parser.add_argument('--audio_max_seconds', type=float, default=10.0,
+                            help="Maximum audio length in seconds (overrides config file)")
     sub_parser.add_argument("--audio_n_mels", type=int, default=80,
                             help="Number of mel frequency bins (overrides config file)")
     sub_parser.add_argument("--audio_sample_rate", type=int, default=16000,

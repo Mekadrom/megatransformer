@@ -2,39 +2,47 @@ import argparse
 import os
 import psutil
 
+import matplotlib
+matplotlib.use('Agg')
 import torch
 import torch.nn as nn
 
-from model.ema import EMAModel
-from scripts.data.image.vae.data_collator import ImageVAEDataCollator
-from scripts.data.image.vae.dataset import ImageVAEShardedDataset
 import scripts.train.audio.vae.training as audio_cvae_training
-from scripts.train.ema_callback import EMAUpdateCallback
+import scripts.train.audio.vocoder.training as audio_vocoder_training
 import scripts.train.image.vae.training as image_vae_training
 
 
 from typing import Optional
 
-from transformers import Trainer, TrainingArguments
-from scripts.data.audio.vae.data_collator import SIVEFeatureDataCollator
-from scripts.data.audio.vae.dataset import SIVEFeatureShardedDataset
+from transformers.trainer import Trainer
+from transformers.training_args import TrainingArguments
+
+from model.ema import EMAModel
+from scripts.data.image.vae.data_collator import ImageVAEDataCollator
+from scripts.data.image.vae.dataset import ImageVAEShardedDataset
+from scripts.data.audio.data_collator import AudioDataCollator
+from scripts.data.audio.dataset import AudioShardedDataset
 from scripts.data.data_collator import DataCollator
 from scripts.train.audio.vae.visualization_callback import AudioCVAEVisualizationCallback
+from scripts.train.audio.vocoder.visualization_callback import VocoderVisualizationCallback
+from scripts.train.ema_callback import EMAUpdateCallback
 from scripts.train.image.vae.visualization_callback import ImageVAEVisualizationCallback
 from scripts.train.trainer import CommonTrainer
 from scripts.train.visualization_callback import VisualizationCallback
-from utils import model_loading_utils
+from utils import megatransformer_utils, model_loading_utils
 from utils.audio_utils import SharedWindowBuffer
 from utils.train_utils import EarlyStoppingCallback
 
 
-def create_or_load_model(args) -> nn.Module:
+def create_or_load_model(args, shared_window_buffer: Optional[SharedWindowBuffer]) -> nn.Module:
     if args.command in ["audio-cvae", "audio-cvae-decoder"]:
         return audio_cvae_training.load_model(args)
+    elif args.command in ["vocoder"]:
+        return audio_vocoder_training.load_model(args, shared_window_buffer=shared_window_buffer)
     elif args.command in ["image-vae"]:
         return image_vae_training.load_model(args)
     else:
-        raise ValueError(f"Unknown command: {args.command}. Available: audio-cvae, audio-cvae-decoder")
+        raise ValueError(f"Unknown command: {args.command}. Available: audio-cvae, audio-cvae-decoder, vocoder, image-vae")
 
 
 def get_training_args(args, run_dir) -> TrainingArguments:
@@ -76,10 +84,13 @@ def get_training_args(args, run_dir) -> TrainingArguments:
 
 
 def get_data_collator(command: str, args) -> Optional[DataCollator]:
-    if command in ["audio-cvae", 'audio-cvae-decoder']:
-        collator =  SIVEFeatureDataCollator(
-            max_feature_frames=args.audio_max_frames // 4,
-            speaker_embedding_dim=args.speaker_embedding_dim,
+    if command in ["audio-cvae", 'audio-cvae-decoder', 'vocoder']:
+        audio_max_frames = args.audio_max_seconds * args.audio_sample_rate // args.audio_hop_length
+        collator =  AudioDataCollator(
+            max_waveforms=args.audio_max_seconds * args.audio_sample_rate,
+            max_mel_spec_frames=audio_max_frames,
+            max_sive_feature_frames=audio_max_frames // 4,
+            speaker_embedding_dim=args.speaker_embedding_dim if hasattr(args, 'speaker_embedding_dim') else 192,
         )
     elif command in ["image-vae"]:
         collator = ImageVAEDataCollator()
@@ -89,10 +100,14 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
 def get_dataset(command: str, args, split: str):
     shard_dir = args.cache_dir + "_" + split
     if command in ["audio-cvae", 'audio-cvae-decoder']:
-        dataset = SIVEFeatureShardedDataset(
+        dataset = AudioShardedDataset(
             shard_dir=shard_dir,
             cache_size=32,
-            max_feature_frames=args.audio_max_frames // 4,
+        )
+    elif command in ['vocoder']:
+        dataset = AudioShardedDataset(
+            shard_dir=shard_dir,
+            cache_size=3,
         )
     elif command in ["image-vae"]:
         dataset = ImageVAEShardedDataset(
@@ -103,29 +118,34 @@ def get_dataset(command: str, args, split: str):
     return dataset
 
 
-def get_visualization_callback(args, command: str, shared_window_buffer=None) -> VisualizationCallback:
+def get_visualization_callback(args, command: str, shared_window_buffer=None, legacy_vocoder: bool = False) -> VisualizationCallback:
     if command in ["audio-cvae", 'audio-cvae-decoder']:
-        vocoder = model_loading_utils.load_vocoder(args.vocoder_checkpoint_path, args.vocoder_config, shared_window_buffer)
+        vocoder = model_loading_utils.load_vocoder(args.vocoder_checkpoint_path, args.vocoder_config, shared_window_buffer, is_wrapped=legacy_vocoder)
         callback = AudioCVAEVisualizationCallback(
             shared_window_buffer=shared_window_buffer,
             step_offset=args.start_step,
-            generation_steps=args.generation_steps,
             audio_sample_rate=args.audio_sample_rate,
             audio_n_mels=args.audio_n_mels,
             audio_n_fft=args.audio_n_fft,
             audio_hop_length=args.audio_hop_length,
-            audio_max_frames=args.audio_max_frames,
             vocoder_checkpoint_path=args.vocoder_checkpoint_path,
             vocoder=vocoder,
             vocoder_config=args.vocoder_config,
             speaker_encoder_type=args.speaker_encoder_type,
             free_bits=args.free_bits,
         )
+    elif command in ["vocoder"]:
+        callback = VocoderVisualizationCallback(
+            shared_window_buffer=shared_window_buffer,
+            audio_sample_rate=args.audio_sample_rate,
+            audio_n_mels=args.audio_n_mels,
+            audio_n_fft=args.audio_n_fft,
+            audio_hop_length=args.audio_hop_length,
+        )
     elif command in ["image-vae"]:
         callback = ImageVAEVisualizationCallback(
             image_size=args.image_size,
             step_offset=args.start_step,
-            generation_steps=args.generation_steps,
             num_eval_samples=8,
         )
     return callback
@@ -156,7 +176,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
     data_collator = get_data_collator(command, args)
     train_dataset = get_dataset(command, args, split="train")
     eval_dataset = get_dataset(command, args, split="val")
-    visualization_callback = get_visualization_callback(args, command, shared_window_buffer=shared_window_buffer)
+    visualization_callback = get_visualization_callback(args, command, shared_window_buffer=shared_window_buffer, legacy_vocoder=args.legacy_vocoder)
     ema = get_ema_callback(args)
     
     if command in ["audio-cvae", "audio-cvae-decoder"]:
@@ -170,6 +190,16 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
             shared_window_buffer,
             vocoder=visualization_callback.vocoder,  # obtain vocoder loaded in visualization callback
             device=device,
+        )
+    elif command in ["vocoder"]:
+        trainer: Trainer = audio_vocoder_training.create_trainer(
+            args,
+            model,
+            training_args,
+            data_collator,
+            train_dataset,
+            eval_dataset,
+            shared_window_buffer,
         )
     elif command in ["image-vae"]:
         trainer: Trainer = image_vae_training.create_trainer(
@@ -199,6 +229,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
 
 training_modules: list = [
     audio_cvae_training,
+    audio_vocoder_training,
     image_vae_training
 ]
 
@@ -273,10 +304,10 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--eval_strategy', type=str, default='epoch', help='Evaluation strategy: steps or epoch')
         sub_parser.add_argument('--eval_steps', type=int, default=0, help='Evaluation steps')
         sub_parser.add_argument('--save_steps', type=int, default=500, help='Save steps')
-        sub_parser.add_argument('--generation_steps', type=int, default=1000, help='Generation steps')
 
         sub_parser.add_argument('--stop_step', type=int, default=-1, help='Step to stop training at. For preserving the LR schedule while not training further.')
         sub_parser.add_argument('--commit_hash', type=str, default='', help='Git commit hash for this run. Logged in tensorboard.')
+        sub_parser.add_argument('--legacy_vocoder', action='store_true', help='Use legacy vocoder wrapper')
 
 
 def get_process_cmdline(pid):
@@ -293,6 +324,7 @@ def get_process_cmdline(pid):
 
 command_to_module = {
     "audio-cvae": audio_cvae_training,
+    "vocoder": audio_vocoder_training,
     "image-vae": image_vae_training,
 }
 
@@ -304,10 +336,14 @@ if __name__ == "__main__":
 
     args, unk = argparser.parse_known_args()
 
+    megatransformer_utils.set_seed_everywhere(args.seed)
+
     # Parse extra arguments
     unk_dict = {}
     for i in range(0, len(unk), 2):
         unk_dict[unk[i].lstrip('-')] = unk[i+1]
+
+    print(f"Unknown args: {unk_dict}")
 
     current_process_pid = psutil.Process().pid
     setattr(args, 'cmdline', " ".join(get_process_cmdline(current_process_pid)))
@@ -320,12 +356,12 @@ if __name__ == "__main__":
     if module is None:
         raise ValueError(f"Unknown command: {args.command}. Available: audio-cvae, image-vae")
 
-    if module == audio_cvae_training:
+    if module in [audio_cvae_training, audio_vocoder_training]:
         shared_window_buffer = SharedWindowBuffer()
     else:
         shared_window_buffer = None
 
-    model = create_or_load_model(args)
+    model = create_or_load_model(args, shared_window_buffer=shared_window_buffer)
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
 
