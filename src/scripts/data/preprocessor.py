@@ -1,0 +1,30 @@
+import abc
+
+
+class BatchProcessor(abc.ABC):
+    @abc.abstractmethod
+    def process_batch(self, batch):
+        pass
+
+
+class Preprocessor(abc.ABC):
+    @abc.abstractmethod
+    def flush_shard(self):
+        pass
+
+    @abc.abstractmethod
+    def process_and_accumulate(self):
+        pass
+
+    @abc.abstractmethod
+    def preprocess_example(self, example) -> bool:
+        pass
+
+    @abc.abstractmethod
+    def parse_config(self) -> dict:
+        pass
+
+    @classmethod
+    @abc.abstractmethod
+    def add_cli_args(cls, parser):
+        pass
