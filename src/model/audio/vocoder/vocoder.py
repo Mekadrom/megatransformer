@@ -83,12 +83,12 @@ class Vocoder(nn.Module):
         self.phase_head_low = nn.Sequential(
             nn.Conv1d(head_input_dim, head_input_dim, kernel_size=config.low_freq_kernel, padding=config.low_freq_kernel // 2),
             activations.Snake(head_input_dim),
-            nn.Conv1d(head_input_dim, self.n_low_bins, kernel_size=config.low_freq_kernel, padding=config.low_freq_kernel // 2),
+            nn.Conv1d(head_input_dim, self.n_low_bins * 2, kernel_size=config.low_freq_kernel, padding=config.low_freq_kernel // 2),
         )
 
         self.phase_head_high = nn.Sequential(
             activations.Snake(head_input_dim),
-            nn.Conv1d(head_input_dim, self.n_high_bins, kernel_size=config.high_freq_kernel, padding=config.high_freq_kernel // 2)
+            nn.Conv1d(head_input_dim, self.n_high_bins * 2, kernel_size=config.high_freq_kernel, padding=config.high_freq_kernel // 2)
         )
 
         self._init_weights()
@@ -222,10 +222,23 @@ class Vocoder(nn.Module):
         # Phase prediction
         phase_low = self.phase_head_low(x)
         phase_high = self.phase_head_high(x)
-        phase_angle = torch.cat([phase_low, phase_high], dim=1)
 
-        phase_real = torch.cos(phase_angle)
-        phase_imag = torch.sin(phase_angle)
+        # phase_raw = torch.cat([phase_low, phase_high], dim=1)
+        # phase_real = torch.cos(phase_raw)
+        # phase_imag = torch.sin(phase_raw)
+
+        # Split each into cos/sin
+        low_cos, low_sin = phase_low.chunk(2, dim=1)   # each [B, n_low_bins, T]
+        high_cos, high_sin = phase_high.chunk(2, dim=1)  # each [B, n_high_bins, T]
+
+        # Concat along frequency axis
+        phase_cos = torch.cat([low_cos, high_cos], dim=1)  # [B, 513, T]
+        phase_sin = torch.cat([low_sin, high_sin], dim=1)  # [B, 513, T]
+
+        # Normalize to unit circle
+        phase_norm = torch.sqrt(phase_cos**2 + phase_sin**2 + 1.0)
+        phase_real = phase_cos / phase_norm
+        phase_imag = phase_sin / phase_norm
 
         # Construct complex STFT
         stft_real = mag * phase_real
@@ -261,7 +274,7 @@ class Vocoder(nn.Module):
             # Compute losses (masked if waveform_masks provided)
             waveform_l1 = (torch.abs(pred_waveform_aligned - waveform_labels_aligned) * waveform_masks_aligned).sum() / waveform_masks_aligned.sum()
             # STFT loss expects [B, 1, T] shape
-            sc_loss, mag_loss, complex_stft_loss = self.stft_loss(
+            sc_loss, mag_loss = self.stft_loss(
                 pred_waveform_aligned.unsqueeze(1) if pred_waveform_aligned.dim() == 2 else pred_waveform_aligned,
                 waveform_labels_aligned.unsqueeze(1) if waveform_labels_aligned.dim() == 2 else waveform_labels_aligned,
             )
@@ -310,15 +323,17 @@ class Vocoder(nn.Module):
                     waveform_labels_aligned,
                 )
 
+            high_freq_penalty = mag[..., -20:, :].pow(2).mean()
+
             total_loss = (self.config.sc_loss_weight * sc_loss +
                           self.config.mag_loss_weight * mag_loss +
-                          self.config.complex_stft_loss_weight * complex_stft_loss +
                           self.config.waveform_l1_loss_weight * waveform_l1 +
                           self.config.mel_recon_loss_weight * mel_recon_loss_value +
                           self.config.phase_loss_weight * phase_loss_value +
                           self.config.high_freq_stft_loss_weight * high_freq_stft_loss_value +
                           self.config.direct_mag_loss_weight * direct_mag_loss +
-                          self.config.wav2vec2_loss_weight * wav2vec2_loss_value)
+                          self.config.wav2vec2_loss_weight * wav2vec2_loss_value +
+                          self.config.high_freq_mag_penalty_weight * high_freq_penalty)
 
             outputs.update({
                 "loss": total_loss,
@@ -326,7 +341,6 @@ class Vocoder(nn.Module):
                 "sc_loss": sc_loss,
                 "mag_loss": mag_loss,
                 "mel_recon_loss": mel_recon_loss_value,
-                "complex_stft_loss": complex_stft_loss,
                 "phase_loss": phase_loss_value,
                 "phase_ip_loss": ip_loss,
                 "phase_iaf_loss": iaf_loss,

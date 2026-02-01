@@ -338,6 +338,8 @@ if __name__ == "__main__":
 
     megatransformer_utils.set_seed_everywhere(args.seed)
 
+    print(unk)
+
     # Parse extra arguments
     unk_dict = {}
     for i in range(0, len(unk), 2):

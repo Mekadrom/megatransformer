@@ -146,8 +146,11 @@ class VocoderGANTrainer(CommonTrainer):
 
         if gan_enabled:
             # Discriminator Update
+            dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
             if global_step % self.discriminator_update_frequency == 0:
                 self.discriminator.train()
+                self.discriminator.to(pred_waveform.device)
+                self.discriminator.to(dtype)
 
                 # Detach generator outputs for discriminator update
                 with torch.no_grad():
@@ -156,7 +159,6 @@ class VocoderGANTrainer(CommonTrainer):
                 # Get discriminator outputs for real and fake
                 # autocast needs to be used here
                 device_type = pred_waveform.device.type
-                dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
                 with torch.autocast(device_type, dtype=dtype, enabled=self.args.fp16 or self.args.bf16):
                     disc_real = self.discriminator(waveform_labels_aligned)
                     disc_fake = self.discriminator(pred_waveform_detached)
@@ -230,7 +232,10 @@ class VocoderGANTrainer(CommonTrainer):
             # Uses the last decoder layer as proxy for decoder output gradients
             try:
                 m: Vocoder = model
-                last_parameters = nn.ModuleList([m.mag_head_low, m.mag_head_high, m.phase_head_low, m.phase_head_high]).parameters()
+                last_parameters = [
+                    *m.mag_head_low.parameters(), *m.mag_head_high.parameters(),
+                    *m.phase_head_low.parameters(), *m.phase_head_high.parameters()
+                ]
                 adaptive_weight = compute_adaptive_weight(
                     recon_loss, g_loss_gan, last_parameters, self.gan_adv_loss_weight
                 )
@@ -251,7 +256,6 @@ class VocoderGANTrainer(CommonTrainer):
             self._log_scalar(f"{prefix}sc_loss", outputs.get("sc_loss", 0))
             self._log_scalar(f"{prefix}mag_loss", outputs.get("mag_loss", 0))
             self._log_scalar(f"{prefix}mel_recon_loss", outputs.get("mel_recon_loss", 0))
-            self._log_scalar(f"{prefix}complex_stft_loss", outputs.get("complex_stft_loss", 0))
             self._log_scalar(f"{prefix}phase_ip_loss", outputs.get("phase_ip_loss", 0))
             self._log_scalar(f"{prefix}phase_iaf_loss", outputs.get("phase_iaf_loss", 0))
             self._log_scalar(f"{prefix}phase_gd_loss", outputs.get("phase_gd_loss", 0))
@@ -373,7 +377,21 @@ class VocoderGANTrainer(CommonTrainer):
 
 def load_model(args, shared_window_buffer: SharedWindowBuffer):
     return model_loading_utils.load_model(Vocoder, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
-        'shared_window_buffer': shared_window_buffer
+        'shared_window_buffer': shared_window_buffer,
+        'sc_loss_weight': args.sc_loss_weight,
+        'mag_loss_weight': args.mag_loss_weight,
+        'waveform_l1_loss_weight': args.waveform_l1_loss_weight,
+        'mel_recon_loss_weight': args.mel_recon_loss_weight,
+        'mel_recon_loss_weight_linspace_max': args.mel_recon_loss_weight_linspace_max,
+        'phase_loss_weight': args.phase_loss_weight,
+        'phase_ip_loss_weight': args.phase_ip_loss_weight,
+        'phase_iaf_loss_weight': args.phase_iaf_loss_weight,
+        'phase_gd_loss_weight': args.phase_gd_loss_weight,
+        'high_freq_stft_loss_weight': args.high_freq_stft_loss_weight,
+        'high_freq_stft_cutoff_bin': args.high_freq_stft_cutoff_bin,
+        'direct_mag_loss_weight': args.direct_mag_loss_weight,
+        'high_freq_mag_penalty_weight': args.high_freq_mag_penalty_weight,
+        'wav2vec2_loss_weight': args.wav2vec2_loss_weight,
     })
 
 
@@ -389,6 +407,7 @@ def create_trainer(
     # Create discriminator if GAN training is enabled
     discriminator = None
     discriminator_optimizer = None
+
     if args.use_gan:
         # keep on cpu, transfer to device when activated by provided criteria
         discriminator = WaveformDomainDiscriminator.from_config(shared_window_buffer, args.discriminator_config)
@@ -457,7 +476,7 @@ def add_cli_args(subparsers):
                             help="Hop length for audio mel spectrograms (overrides config file)")
     
     # GAN training settings
-    sub_parser.add_argument("--use_gan", type=str, default="false",
+    sub_parser.add_argument("--use_gan", action="store_true",
                             help="Whether to use GAN training (true/false)")
     sub_parser.add_argument("--gan_start_condition_key", type=str, default="step",
                             help="Condition to start GAN training: 'step' or 'loss'")
@@ -496,8 +515,6 @@ def add_cli_args(subparsers):
                             help="Mel spectrogram reconstruction loss weight")
     sub_parser.add_argument("--mel_recon_loss_weight_linspace_max", type=float, default=1.0,
                             help="Max mel recon loss weight for linear spacing over training")
-    sub_parser.add_argument("--complex_stft_loss_weight", type=float, default=1.0,
-                            help="Complex STFT loss weight")
     sub_parser.add_argument("--phase_loss_weight", type=float, default=0.0,
                             help="Phase loss weight")
     sub_parser.add_argument("--phase_ip_loss_weight", type=float, default=0.0,
@@ -510,6 +527,10 @@ def add_cli_args(subparsers):
                             help="High-frequency STFT loss weight")
     sub_parser.add_argument("--high_freq_stft_cutoff_bin", type=int, default=256,
                             help="Cutoff bin for high-frequency STFT loss")
+    sub_parser.add_argument("--direct_mag_loss_weight", type=float, default=0.0,
+                            help="Direct magnitude loss weight")
+    sub_parser.add_argument("--high_freq_mag_penalty_weight", type=float, default=0.1,
+                            help="High-frequency magnitude penalty weight")
     sub_parser.add_argument("--wav2vec2_loss_weight", type=float, default=0.0,
                             help="Wav2Vec2 perceptual loss weight")
     
@@ -518,17 +539,17 @@ def add_cli_args(subparsers):
                             help="GAN adversarial loss weight")
     sub_parser.add_argument("--gan_feature_matching_loss_weight", type=float, default=2.0,
                             help="GAN feature matching loss weight")
-    sub_parser.add_argument("--mpd_loss_weight", type=float, default=1.0,
+    sub_parser.add_argument("--mpd_loss_weight", type=float, default=0.8,
                             help="Multi-period discriminator loss weight")
-    sub_parser.add_argument("--msd_loss_weight", type=float, default=1.0,
+    sub_parser.add_argument("--msd_loss_weight", type=float, default=0.5,
                             help="Multi-scale discriminator loss weight")
-    sub_parser.add_argument("--mrsd_loss_weight", type=float, default=1.0,
+    sub_parser.add_argument("--mrsd_loss_weight", type=float, default=0.8,
                             help="Multi-resolution discriminator loss weight")
-    sub_parser.add_argument("--mpd_adv_loss_weight", type=float, default=1.0,
+    sub_parser.add_argument("--mpd_adv_loss_weight", type=float, default=1.2,
                             help="Multi-period discriminator adversarial loss weight")
     sub_parser.add_argument("--msd_adv_loss_weight", type=float, default=0.5,
                             help="Multi-scale discriminator adversarial loss weight")
-    sub_parser.add_argument("--mrsd_adv_loss_weight", type=float, default=0.5,
+    sub_parser.add_argument("--mrsd_adv_loss_weight", type=float, default=0.7,
                             help="Multi-resolution discriminator adversarial loss weight")
     sub_parser.add_argument("--mpd_fm_loss_weight", type=float, default=1.0,
                             help="Multi-period discriminator feature matching loss weight")
@@ -536,8 +557,6 @@ def add_cli_args(subparsers):
                             help="Multi-scale discriminator feature matching loss weight")
     sub_parser.add_argument("--mrsd_fm_loss_weight", type=float, default=2.0,
                             help="Multi-resolution discriminator feature matching loss weight")
-    sub_parser.add_argument("--direct_mag_loss_weight", type=float, default=0.0,
-                            help="Direct magnitude loss weight")
 
     sub_parser.add_argument("--cache_dir", type=str, default="../cached_datasets/audio",
                            help="Directory for cached datasets")

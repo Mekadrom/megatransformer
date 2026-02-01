@@ -183,10 +183,10 @@ class AudioPerceptualLoss(nn.Module):
 
             # Multi-resolution STFT loss
             if self.waveform_stft_loss is not None and self.waveform_stft_weight > 0:
-                sc_loss, mag_loss, complex_stft_loss = self.waveform_stft_loss(
+                sc_loss, mag_loss = self.waveform_stft_loss(
                     pred_waveform_grad, target_waveform_grad
                 )
-                waveform_stft_loss_value = sc_loss + mag_loss + complex_stft_loss
+                waveform_stft_loss_value = sc_loss + mag_loss
                 losses["waveform_stft_loss"] = waveform_stft_loss_value
                 total_loss = total_loss + self.waveform_stft_weight * waveform_stft_loss_value
 
