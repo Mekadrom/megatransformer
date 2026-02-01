@@ -23,7 +23,6 @@ class VocoderConfig:
     waveform_l1_loss_weight: float = 0.1
     mel_recon_loss_weight: float = 1.0
     mel_recon_loss_weight_linspace_max: float = 1.0
-    complex_stft_loss_weight: float = 2.0
     phase_loss_weight: float = 1.0
     phase_ip_loss_weight: float = 1.0
     phase_iaf_loss_weight: float = 1.0
@@ -32,6 +31,7 @@ class VocoderConfig:
     high_freq_stft_cutoff_bin: int = 256
     direct_mag_loss_weight: float = 0.0
     wav2vec2_loss_weight: float = 0.0
+    high_freq_mag_penalty_weight: float = 0.1
     wav2vec2_model: str = "facebook/wav2vec2-base"
 
 

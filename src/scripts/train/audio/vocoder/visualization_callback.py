@@ -117,7 +117,7 @@ class VocoderVisualizationCallback(VisualizationCallback):
                     outputs = model(mel_spec, mel_spec_mask, waveform, waveform_mask)
 
                     # Collect per-sample losses
-                    for loss_name in ["loss", "waveform_l1", "sc_loss", "mag_loss", "mel_recon_loss", "complex_stft_loss"]:
+                    for loss_name in ["loss", "waveform_l1", "sc_loss", "mag_loss", "mel_recon_loss"]:
                         if loss_name in outputs:
                             if loss_name not in all_losses:
                                 all_losses[loss_name] = []

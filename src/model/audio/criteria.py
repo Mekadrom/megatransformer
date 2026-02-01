@@ -56,14 +56,6 @@ class MultiResolutionSTFTLoss(nn.Module):
         )
         return torch.abs(x_stft).to(x.dtype)
     
-    def complex_stft_loss(self, pred, target_complex_stft, fft_size, hop_size, win_length) -> torch.Tensor:
-        pred_stft = torch.stft(
-            pred.float(), fft_size, hop_size, win_length,
-            self.buffer_lookup[str(win_length)].to(pred.dtype).to(pred.device),
-            return_complex=True
-            )
-        return F.l1_loss(pred_stft.real, target_complex_stft.real) + F.l1_loss(pred_stft.imag, target_complex_stft.imag)
-
     def forward(
         self, 
         pred_waveform: torch.Tensor, 
@@ -85,7 +77,6 @@ class MultiResolutionSTFTLoss(nn.Module):
         """
         sc_loss = 0.0
         mag_loss = 0.0
-        complex_stft_loss = 0.0
         
         for fft_size, hop_size in zip(
             self.fft_sizes, self.hop_sizes
@@ -112,23 +103,10 @@ class MultiResolutionSTFTLoss(nn.Module):
             log_target_mag = torch.log(target_mag.clamp(min=1e-5))
             mag_loss += F.l1_loss(log_pred_mag, log_target_mag)
 
-            # Complex STFT loss
-            complex_stft_loss += self.complex_stft_loss(
-                pred_waveform.squeeze(1),
-                torch.stft(
-                    target_waveform.squeeze(1).to(torch.float32), fft_size, hop_size,
-                    window=self.buffer_lookup[str(fft_size)].to(torch.float32).to(target_waveform.device), return_complex=True
-                ),
-                fft_size,
-                hop_size,
-                fft_size
-            ).to(pred_waveform.dtype)
-        
         # Normalize by number of STFT resolutions
         sc_loss = sc_loss / len(self.fft_sizes)
         mag_loss = mag_loss / len(self.fft_sizes)
-        complex_stft_loss = complex_stft_loss / len(self.fft_sizes)
-        return sc_loss, mag_loss, complex_stft_loss
+        return sc_loss, mag_loss
 
 
 class MultiScaleMelLoss(nn.Module):

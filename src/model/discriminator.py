@@ -86,7 +86,7 @@ def discriminator_hinge_loss(
 def compute_adaptive_weight(
     nll_loss: torch.Tensor,
     g_loss: torch.Tensor,
-    last_parameters: nn.Parameter,
+    last_parameters: list[nn.Parameter],
     discriminator_weight: float = 1.0,
 ) -> torch.Tensor:
     """
@@ -102,7 +102,7 @@ def compute_adaptive_weight(
     Args:
         nll_loss: Reconstruction loss (MSE, L1, perceptual, etc.) - must have grad enabled
         g_loss: Generator's GAN loss - must have grad enabled
-        last_layer: The last layer's weight parameter (e.g., decoder.final_conv.weight)
+        last_parameters: The last layer(s)' weight parameters (e.g., decoder.final_conv.weight)
         discriminator_weight: Base discriminator weight to scale by
 
     Returns:
@@ -111,22 +111,23 @@ def compute_adaptive_weight(
     # Compute gradients of reconstruction loss w.r.t. last decoder layer
     nll_grads = torch.autograd.grad(
         nll_loss, last_parameters, retain_graph=True, allow_unused=True
-    )[0]
+    )
 
     # Compute gradients of GAN loss w.r.t. last decoder layer
     g_grads = torch.autograd.grad(
         g_loss, last_parameters, retain_graph=True, allow_unused=True
-    )[0]
+    )
+
+    nll_grads = [g for g in nll_grads if g is not None]
+    g_grads = [g for g in g_grads if g is not None]
 
     # Handle case where gradients are None (shouldn't happen in normal training)
     if nll_grads is None or g_grads is None:
         return torch.tensor(discriminator_weight, device=g_loss.device)
 
-    # Compute adaptive weight as ratio of gradient norms
-    # This ensures GAN gradients are scaled to match reconstruction gradient magnitude
-    d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
+    nll_norm = torch.sqrt(sum(g.pow(2).sum() for g in nll_grads))
+    g_norm = torch.sqrt(sum(g.pow(2).sum() for g in g_grads))
 
-    # Clamp to prevent extreme values
-    d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+    d_weight = torch.clamp(nll_norm / (g_norm + 1e-4), 0.0, 1e4).detach()
 
     return discriminator_weight * d_weight
