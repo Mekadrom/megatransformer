@@ -109,12 +109,10 @@ class VocoderVisualizationCallback(VisualizationCallback):
 
                     # Move to device
                     mel_spec = mel_spec.to(device)
-                    mel_spec_mask = pad_and_mask([mel_spec], [mel_length])[1][0].to(device)
                     waveform = waveform.to(device)
-                    waveform_mask = pad_and_mask([waveform], [waveform_length])[1][0].to(device)
 
                     # Run vocoder
-                    outputs = model(mel_spec, mel_spec_mask, waveform, waveform_mask)
+                    outputs = model(mel_spec)
 
                     # Collect per-sample losses
                     for loss_name in ["loss", "waveform_l1", "sc_loss", "mag_loss", "mel_recon_loss"]:

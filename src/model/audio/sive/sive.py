@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from config.audio.sive.sive import CONFIGS as SIVE_CONFIGS
 from config.audio.sive.sive import SpeakerInvariantVoiceEncoderConfig
 from model.audio.sive.conv_subsampling import ConvSubsampling
+from model.audio.sive.grl import GradientReversalFunction, SpeakerClassifier
 from model.audio.sive.sive_block import SpeakerInvariantVoiceEncoderBlock
 
 
@@ -29,7 +30,7 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
 
         # Convolutional subsampling frontend with optional Dropout1d
         self.conv_subsample = ConvSubsampling(
-            in_channels=config.n_mels,
+            in_channels=config.audio_n_mels,
             out_channels=config.encoder_dim,
             kernel_sizes=config.conv_kernel_sizes,
             strides=config.conv_strides,
@@ -61,6 +62,15 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             nn.GELU(),
             nn.Dropout(config.head_dropout),
             nn.Linear(config.encoder_dim, config.vocab_size),
+        )
+
+        # Speaker classifier (for GRL)
+        self.speaker_classifier = SpeakerClassifier(
+            d_model=config.encoder_dim,
+            num_speakers=config.num_speakers,
+            hidden_dim=config.speaker_classifier_hidden_dim,
+            pooling=config.speaker_pooling,
+            dropout=config.dropout,
         )
 
         # Initialize weights
@@ -112,6 +122,7 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         self,
         mel_spec: torch.Tensor,
         lengths: Optional[torch.Tensor] = None,
+        grl_alpha: float = 1.0,
         return_all_hiddens: bool = False,
     ) -> dict:
         """
@@ -120,6 +131,7 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         Args:
             mel_spec: [B, n_mels, T] mel spectrogram
             lengths: [B] original lengths before padding (optional)
+            grl_alpha: Gradient reversal strength (0=no reversal, 1=full reversal)
             return_all_hiddens: If True, return hidden states from all layers
 
         Returns:
@@ -127,6 +139,7 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 - features: [B, T', encoder_dim] normalized content features
                 - features_unnorm: [B, T', encoder_dim] pre-LayerNorm features
                 - asr_logits: [B, T', vocab_size] for CTC loss
+                - speaker_logits: [B, num_speakers] for GRL speaker classification
                 - feature_lengths: [B] output sequence lengths
                 - variance_loss: scalar loss for variance regularization (if enabled)
                 - temporal_smoothness: scalar metric (if variance_reg enabled and training)
@@ -225,10 +238,17 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         # ASR head (operates on potentially upsampled features)
         asr_logits = self.asr_head(features_for_asr)
 
+        # Speaker classifier with gradient reversal (operates on original resolution)
+        # Use ~padding_mask to get valid positions mask
+        valid_mask = ~padding_mask if padding_mask is not None else None
+        reversed_features = GradientReversalFunction.apply(features_for_heads, grl_alpha)
+        speaker_logits = self.speaker_classifier(reversed_features, mask=valid_mask)
+
         result = {
             "features": features,  # Normalized features (preferred for VAE)
             "features_unnorm": features_unnorm,  # Pre-LayerNorm (for comparison)
             "asr_logits": asr_logits,
+            "speaker_logits": speaker_logits,
             "feature_lengths": feature_lengths,  # Original feature lengths (for feature extraction)
             "ctc_lengths": ctc_lengths,  # CTC lengths (potentially upsampled, for CTC loss)
             "variance_loss": variance_loss,

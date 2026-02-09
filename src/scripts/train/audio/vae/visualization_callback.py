@@ -4,7 +4,6 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchaudio
 from transformers import Trainer
 from scripts.train.visualization_callback import VisualizationCallback
 from utils import audio_utils

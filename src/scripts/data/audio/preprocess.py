@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import traceback
 
+from scripts.data.ctc_tokens_batch_processor import TextCTCTokensBatchProcessor
 from scripts.data.text_batch_processor import TextConditionsBatchProcessor
 import torchcrepe
 
@@ -418,6 +419,10 @@ class AudioDatasetPreprocessor(Preprocessor):
                 device=self.device,
             )
 
+        self.ctc_tokens_processor = None
+        if args.extract_ctc_tokens:
+            self.ctc_tokens_processor = TextCTCTokensBatchProcessor()
+
         if args.compute_speaker_embeddings:
             shard_fields.update({
                 'shard_speaker_embeddings': [],
@@ -447,6 +452,12 @@ class AudioDatasetPreprocessor(Preprocessor):
         if args.save_text:
             shard_fields.update({
                 'shard_text': [],
+            })
+
+        if args.extract_ctc_tokens:
+            shard_fields.update({
+                'shard_ctc_tokens': [],
+                'shard_ctc_lengths': [],
             })
 
         shard_fields.update({
@@ -504,7 +515,7 @@ class AudioDatasetPreprocessor(Preprocessor):
         sub_parser.add_argument("--n_mels", type=int, default=80)
         sub_parser.add_argument("--n_fft", type=int, default=1024)
         sub_parser.add_argument("--hop_length", type=int, default=256)
-        sub_parser.add_argument("--audio_max_seconds", type=int, default=20,
+        sub_parser.add_argument("--audio_max_seconds", type=int, default=10,
                             help="Maximum audio length in seconds")
 
         # Speaker embeddings
@@ -557,6 +568,10 @@ class AudioDatasetPreprocessor(Preprocessor):
                             help="Model to use for condition embeddings")
         sub_parser.add_argument("--save_text", action="store_true", default=False,
                                 help="Enable saving raw text strings.")
+        
+        # CTC tokens
+        sub_parser.add_argument("--extract_ctc_tokens", action="store_true",
+                            help="Whether to extract CTC tokens from the dataset")
 
         return sub_parser
 
@@ -651,6 +666,18 @@ class AudioDatasetPreprocessor(Preprocessor):
             shard_data["text"] = self.shard_fields['shard_text']
             self.shard_fields['shard_text'] = []
 
+        if self.args.extract_ctc_tokens:
+            # pad ctc tokens to same length
+            max_ctc_len = max(f.shape[1] for f in self.shard_fields['shard_ctc_tokens'])
+            padded_ctc_tokens = []
+            for tokens in self.shard_fields['shard_ctc_tokens']:
+                if tokens.shape[1] < max_ctc_len:
+                    tokens = F.pad(tokens, (0, max_ctc_len - tokens.shape[1]), value=0)
+                padded_ctc_tokens.append(tokens)
+            shard_data["ctc_tokens"] = torch.cat(padded_ctc_tokens, dim=0)
+            shard_data["ctc_lengths"] = torch.cat(self.shard_fields['shard_ctc_lengths'], dim=0)
+            self.shard_fields['shard_ctc_tokens'] = []
+
         shard_data["num_samples"] = num_samples
 
         shard_path = os.path.join(self.output_dir, f"shard_{self.shard_fields['shard_idx']:06d}.pt")
@@ -714,6 +741,9 @@ class AudioDatasetPreprocessor(Preprocessor):
                 conditions = self.batch_accumulators['batch_conditions']
                 conditions_result = self.conditions_processor.process_batch(conditions)
 
+            if self.args.extract_ctc_tokens:
+                ctc_result = self.ctc_tokens_processor.process_batch(conditions)
+
             # Add to shard
             # count_key tracks which field to use for shard size checking (doesn't matter which one, just needs to be one of them)
             count_key = ""
@@ -746,6 +776,10 @@ class AudioDatasetPreprocessor(Preprocessor):
 
             if self.args.save_text:
                 self.shard_fields['shard_text'].extend(conditions)
+            
+            if self.args.extract_ctc_tokens:
+                self.shard_fields['shard_ctc_tokens'].append(ctc_result["ctc_tokens"])
+                self.shard_fields['shard_ctc_lengths'].append(ctc_result["ctc_lengths"])
 
             self.stats_accumulator["saved"] += len(self.batch_accumulators['batch_waveforms'])
 

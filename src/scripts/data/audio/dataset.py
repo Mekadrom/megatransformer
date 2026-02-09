@@ -34,14 +34,31 @@ class AudioShardedDataset(Dataset):
         self,
         shard_dir: str,
         cache_size: int = 3,
+        columns: list[str] = []
     ):
         """
         Args:
             shard_dir: Directory containing shard_*.pt files
             cache_size: Number of shards to keep in memory
+            columns: List of columns to load from each shard (e.g. ["features", "mel_specs", "speaker_embeddings"])
         """
         self.shard_dir = shard_dir
         self.cache_size = cache_size
+        self.columns = columns
+
+        if not self.columns or len(self.columns) == 0:
+            self.columns = [
+                "conditions",  # text conditions as tensors
+                "features",  # features extracted by a pretrained SIVE model as tensors (could single-layer extractions or multi-layer with an extra layer dimension at dim=1)
+                "mel_specs",  # pre-extracted mel spectrograms as tensors
+                "speaker_embeddings",  # unnormalized speaker embeddings
+                "speaker_ids",  # speaker IDs normalized to the total number of unique speakers in the entire dataset
+                "waveforms",  # original waveforms
+                "f0",  # f0 baselines as extracted by a pretrained model
+                "vuv",  # vuv booleans as extracted by a pretrained model
+                "ctc_tokens",  # ctc tokens as tensors
+                "text",  # text as strings
+            ]
 
         # Try to load cached index first
         index_path = os.path.join(shard_dir, self.SHARD_INDEX_FILE)
@@ -95,8 +112,7 @@ class AudioShardedDataset(Dataset):
             self.shard_offsets.append(self.total_samples)
             shard_path = os.path.join(self.shard_dir, shard_file)
             shard = torch.load(shard_path, map_location="cpu", weights_only=True)
-            num_samples = shard["features"].shape[0]
-            self.total_samples += num_samples
+            self.total_samples += shard["num_samples"]
 
         # Cache the index
         index_data = {
@@ -142,29 +158,40 @@ class AudioShardedDataset(Dataset):
 
         sample = {}
 
-        if 'features' in shard:
+        if 'features' in shard and 'features' in self.columns:
             # features shape depends on multi-layer mode:
             # - Single layer: [encoder_dim, T']
             # - Multi-layer:  [num_layers, encoder_dim, T']
             sample['features'] = shard["features"][local_idx]
             sample["feature_length"] = shard["feature_lengths"][local_idx]
 
-        if 'waveforms' in shard:
+        if 'waveforms' in shard and 'waveforms' in self.columns:
             sample['waveform'] = shard["waveforms"][local_idx]
             sample["waveform_length"] = shard["waveform_lengths"][local_idx]
 
-        if 'mel_specs' in shard:
+        if 'mel_specs' in shard and 'mel_specs' in self.columns:
             sample['mel_spec'] = shard["mel_specs"][local_idx]
             sample["mel_length"] = shard["mel_lengths"][local_idx]
 
-        if "speaker_embeddings" in shard:
+        if "speaker_embeddings" in shard and "speaker_embeddings" in self.columns:
             sample["speaker_embedding"] = shard["speaker_embeddings"][local_idx]
+
+        if "speaker_ids" in shard and "speaker_ids" in self.columns:
             sample["speaker_id"] = shard["speaker_ids"][local_idx]
 
         # Add F0 data if available
-        if "f0" in shard:
+        if "f0" in shard and "f0" in self.columns:
             sample["f0"] = shard["f0"][local_idx]
+
+        if "vuv" in shard and "vuv" in self.columns:
             sample["vuv"] = shard["vuv"][local_idx]
+
+        if "ctc_tokens" in shard and "ctc_tokens" in self.columns:
+            sample["ctc_tokens"] = shard["ctc_tokens"][local_idx]
+            sample["ctc_length"] = shard["ctc_lengths"][local_idx]
+
+        if "text" in shard and "text" in self.columns:
+            sample["text"] = shard["text"][local_idx]
 
         return sample
 

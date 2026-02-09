@@ -2,12 +2,15 @@ import os
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 from typing import Any, Optional
 
 from transformers.integrations.integration_utils import TensorBoardCallback
 
+from config.audio.vocoder.vocoder import VocoderConfig
+from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss, Wav2Vec2PerceptualLoss
 from model.audio.vocoder.discriminator import WaveformDomainDiscriminator, compute_discriminator_losses, compute_generator_losses
 from model.audio.vocoder.vocoder import Vocoder
 from model.discriminator import compute_adaptive_weight
@@ -31,11 +34,32 @@ class VocoderGANTrainer(CommonTrainer):
     def __init__(
         self,
         *args,
+        shared_window_buffer: SharedWindowBuffer,
+        config: VocoderConfig,
         step_offset,
         n_fft,
         hop_length,
         cmdline,
         git_commit_hash,
+        sc_loss_weight: float = 1.0,
+        mag_loss_weight: float = 3.0,
+        waveform_l1_loss_weight: float = 0.1,
+        phase_loss_weight: float = 1.0,
+        phase_ip_loss_weight: float = 1.0,
+        phase_iaf_loss_weight: float = 1.0,
+        phase_gd_loss_weight: float = 1.0,
+        high_freq_stft_loss_weight: float = 0.0,
+        high_freq_stft_cutoff_bin: int = 256,
+        high_freq_mag_penalty_weight: float = 0.1,
+        direct_mag_loss_weight: float = 0.0,
+        mel_recon_loss_weight: float = 1.0,
+        wav2vec2_loss_weight: float = 0.0,
+        recon_annealing_start_step: int = 5000,
+        recon_annealing_steps: int = 5000,
+        perceptual_inclusion_start_step: int = 5000,
+        perceptual_inclusion_annealing_steps: int = 5000,
+        perceptual_annealing_start_step: int = 20000,
+        perceptual_annealing_steps: int = 10000,
         discriminator: Optional[WaveformDomainDiscriminator] = None,
         discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
         gan_adv_loss_weight: float = 1.0,
@@ -52,11 +76,13 @@ class VocoderGANTrainer(CommonTrainer):
         mpd_fm_loss_weight: float = 1.0,
         msd_fm_loss_weight: float = 1.0,
         mrsd_fm_loss_weight: float = 1.0,
-        direct_mag_loss_weight: float = 0.0,
         use_adaptive_weight: bool = True,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
+
+        self.shared_window_buffer = shared_window_buffer
+        self.config = config
 
         # Store shard-aware sampler if available
         self._shard_sampler = None
@@ -69,6 +95,26 @@ class VocoderGANTrainer(CommonTrainer):
         self.hop_length = hop_length
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
+
+        self.sc_loss_weight = sc_loss_weight
+        self.mag_loss_weight = mag_loss_weight
+        self.waveform_l1_loss_weight = waveform_l1_loss_weight
+        self.phase_loss_weight = phase_loss_weight
+        self.phase_ip_loss_weight = phase_ip_loss_weight
+        self.phase_iaf_loss_weight = phase_iaf_loss_weight
+        self.phase_gd_loss_weight = phase_gd_loss_weight
+        self.high_freq_stft_loss_weight = high_freq_stft_loss_weight
+        self.high_freq_stft_cutoff_bin = high_freq_stft_cutoff_bin
+        self.direct_mag_loss_weight = direct_mag_loss_weight
+        self.high_freq_mag_penalty_weight = high_freq_mag_penalty_weight
+        self.mel_recon_loss_weight = mel_recon_loss_weight
+        self.wav2vec2_loss_weight = wav2vec2_loss_weight
+        self.recon_annealing_start_step = recon_annealing_start_step
+        self.recon_annealing_steps = recon_annealing_steps
+        self.perceptual_inclusion_start_step = perceptual_inclusion_start_step
+        self.perceptual_inclusion_annealing_steps = perceptual_inclusion_annealing_steps
+        self.perceptual_annealing_start_step = perceptual_annealing_start_step
+        self.perceptual_annealing_steps = perceptual_annealing_steps
 
         self.discriminator = discriminator
         self.discriminator_optimizer = discriminator_optimizer
@@ -87,17 +133,43 @@ class VocoderGANTrainer(CommonTrainer):
         self.mpd_fm_loss_weight = mpd_fm_loss_weight
         self.msd_fm_loss_weight = msd_fm_loss_weight
         self.mrsd_fm_loss_weight = mrsd_fm_loss_weight
-        self.direct_mag_loss_weight = direct_mag_loss_weight
         self.use_adaptive_weight = use_adaptive_weight
         self.writer = None
 
         self.has_logged_cli = False
 
+        # Loss functions
+        self.stft_loss = MultiResolutionSTFTLoss(shared_window_buffer=shared_window_buffer)
+        self.mel_recon_loss = StableMelSpectrogramLoss(
+            shared_window_buffer=shared_window_buffer,
+            sample_rate=config.sample_rate,
+            n_fft=config.n_fft,
+            hop_length=config.hop_length,
+            n_mels=config.n_mels,
+        )
+
+        self.phase_loss = None
+        if phase_loss_weight > 0.0:
+            self.phase_loss = PhaseLoss(shared_window_buffer=shared_window_buffer, n_fft=config.n_fft, hop_length=config.hop_length)
+
+        self.high_freq_stft_loss = None
+        if high_freq_stft_loss_weight > 0.0:
+            self.high_freq_stft_loss = HighFreqSTFTLoss(
+                shared_window_buffer=shared_window_buffer,
+                n_fft=config.n_fft,
+                hop_length=config.hop_length,
+                cutoff_bin=high_freq_stft_cutoff_bin
+            )
+
+        self.wav2vec2_loss = None
+        if wav2vec2_loss_weight > 0.0:
+            self.wav2vec2_loss = Wav2Vec2PerceptualLoss(
+                model_name=config.wav2vec2_model,
+                sample_rate=config.sample_rate,
+            )
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
-
-        # Debug logging for distributed sync issues
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
         self._ensure_tensorboard_writer()
 
@@ -112,16 +184,205 @@ class VocoderGANTrainer(CommonTrainer):
         waveform_labels = inputs["waveforms"]
         waveform_masks = inputs["waveform_masks"]
 
-        outputs = model(
-            mel_specs=mel_specs,
-            mel_spec_masks=mel_spec_masks,
-            waveforms=waveform_labels,
-            waveform_masks = waveform_masks,
-        )
+        outputs = model(mel_specs)
 
         # Get reconstruction losses from model
-        recon_loss = outputs["loss"]
         pred_waveform = outputs["pred_waveform"]
+        pred_stft = outputs["pred_stft"]
+        pred_magnitude = outputs["pred_magnitude"]
+
+        # Ensure waveform_labels has batch dimension to match pred_waveform
+        if waveform_labels.dim() == 1:
+            waveform_labels = waveform_labels.unsqueeze(0)
+
+        # Align waveform lengths
+        min_len = min(pred_waveform.shape[-1], waveform_labels.shape[-1])
+        pred_waveform_aligned = pred_waveform[..., :min_len]
+        waveform_labels_aligned = waveform_labels[..., :min_len]
+        waveform_masks_aligned = waveform_masks[..., :min_len]
+
+        # Compute losses (masked if waveform_masks provided)
+        waveform_l1 = (torch.abs(pred_waveform_aligned - waveform_labels_aligned) * waveform_masks_aligned).sum() / waveform_masks_aligned.sum()
+
+        # STFT loss expects [B, 1, T] shape
+        sc_loss, mag_loss = self.stft_loss(
+            pred_waveform_aligned.unsqueeze(1) if pred_waveform_aligned.dim() == 2 else pred_waveform_aligned,
+            waveform_labels_aligned.unsqueeze(1) if waveform_labels_aligned.dim() == 2 else waveform_labels_aligned,
+        )
+
+        target_complex_stfts = torch.stft(
+            waveform_labels_aligned.to(torch.float32), self.config.n_fft, self.config.hop_length,
+            window=self.shared_window_buffer.get_window(self.config.n_fft, waveform_labels_aligned.device), return_complex=True
+        )[..., :mel_spec_masks.shape[-1]]
+
+        direct_mag_loss = 0.0
+        if pred_stft is not None and target_complex_stfts is not None:
+            pred_mag = pred_stft.abs()
+            target_mag = target_complex_stfts.abs()
+            # Use 1e-5 minimum for bf16 numerical stability
+            direct_mag_loss = F.l1_loss(
+                torch.log(pred_mag.clamp(min=1e-5)),
+                torch.log(target_mag.clamp(min=1e-5))
+            )
+
+        mel_recon_loss_value = self.mel_recon_loss(pred_waveform_aligned, mel_specs[..., :mel_spec_masks.shape[-1]])
+
+        ip_loss = iaf_loss = gd_loss = phase_loss_value = 0.0
+        if self.phase_loss is not None:
+            ip_loss, iaf_loss, gd_loss = self.phase_loss(
+                pred_waveform_aligned,
+                target_complex_stfts=target_complex_stfts,
+                precomputed_stft=pred_stft,
+            )
+            phase_loss_value = (self.phase_ip_loss_weight * ip_loss +
+                                self.phase_iaf_loss_weight * iaf_loss +
+                                self.phase_gd_loss_weight * gd_loss)
+
+        high_freq_stft_loss_value = 0.0
+        if self.high_freq_stft_loss is not None:
+            high_freq_stft_loss_value = self.high_freq_stft_loss(
+                pred_waveform_aligned,
+                waveform_labels_aligned,
+                target_complex_stfts=target_complex_stfts,
+                precomputed_stft=pred_stft
+            )
+
+        wav2vec2_loss_value = 0.0
+        if self.wav2vec2_loss is not None:
+            wav2vec2_loss_value = self.wav2vec2_loss(
+                pred_waveform_aligned,
+                waveform_labels_aligned,
+            )
+
+        high_freq_penalty = pred_magnitude[..., -20:, :].pow(2).mean()
+
+        sc_loss_weight = self.get_loss_weight(
+            self.sc_loss_weight,
+            global_step,
+            start_step=0,
+            rampup_steps=0,
+            anneal_start_step=self.recon_annealing_start_step,
+            anneal_steps=self.recon_annealing_steps,
+            min_ratio=0.5*self.sc_loss_weight
+        )
+
+        mag_loss_weight = self.get_loss_weight(
+            self.mag_loss_weight,
+            global_step,
+            start_step=0,
+            rampup_steps=0,
+            anneal_start_step=self.recon_annealing_start_step,
+            anneal_steps=self.recon_annealing_steps,
+            min_ratio=0.15*self.mag_loss_weight
+        )
+
+        waveform_l1_loss_weight = self.get_loss_weight(
+            self.waveform_l1_loss_weight,
+            global_step,
+            start_step=0,
+            rampup_steps=0,
+            anneal_start_step=self.recon_annealing_start_step,
+            anneal_steps=self.recon_annealing_steps,
+            min_ratio=0.15*self.waveform_l1_loss_weight
+        )
+
+        phase_loss_weight = self.get_loss_weight(
+            self.phase_loss_weight,
+            global_step,
+            start_step=0,
+            rampup_steps=0,
+            anneal_start_step=self.recon_annealing_start_step,
+            anneal_steps=self.recon_annealing_steps,
+            min_ratio=0.675*self.phase_loss_weight
+        )
+
+        high_freq_stft_loss_weight = self.get_loss_weight(
+            self.high_freq_stft_loss_weight,
+            global_step,
+            start_step=0,
+            rampup_steps=0,
+            anneal_start_step=self.recon_annealing_start_step,
+            anneal_steps=self.recon_annealing_steps,
+            min_ratio=0.325*self.high_freq_stft_loss_weight
+        )
+
+        high_freq_mag_penalty_weight = self.get_loss_weight(
+            self.high_freq_mag_penalty_weight,
+            global_step,
+            start_step=0,
+            rampup_steps=0,
+            anneal_start_step=self.recon_annealing_start_step,
+            anneal_steps=self.recon_annealing_steps,
+            min_ratio=0.15*self.high_freq_mag_penalty_weight
+        )
+
+        direct_mag_loss_weight = self.get_loss_weight(
+            self.direct_mag_loss_weight,
+            global_step,
+            start_step=0,
+            rampup_steps=0,
+            anneal_start_step=self.recon_annealing_start_step,
+            anneal_steps=self.recon_annealing_steps,
+            min_ratio=0.15*self.direct_mag_loss_weight
+        )
+
+        mel_recon_loss_weight = self.get_loss_weight(
+            self.mel_recon_loss_weight,
+            global_step,
+            start_step=self.perceptual_inclusion_start_step,
+            rampup_steps=self.perceptual_inclusion_annealing_steps,
+            anneal_start_step=self.perceptual_annealing_start_step,
+            anneal_steps=self.perceptual_annealing_steps,
+            min_ratio=0.675*self.mel_recon_loss_weight
+        )
+
+        wav2vec2_loss_weight = self.get_loss_weight(
+            self.wav2vec2_loss_weight,
+            global_step,
+            start_step=self.perceptual_inclusion_start_step,
+            rampup_steps=self.perceptual_inclusion_annealing_steps,
+            anneal_start_step=self.perceptual_annealing_start_step,
+            anneal_steps=self.perceptual_annealing_steps,
+            min_ratio=0.675*self.wav2vec2_loss_weight
+        )
+
+        recon_loss = (sc_loss_weight * sc_loss +
+                        mag_loss_weight * mag_loss +
+                        waveform_l1_loss_weight * waveform_l1 +
+                        phase_loss_weight * phase_loss_value +
+                        high_freq_stft_loss_weight * high_freq_stft_loss_value +
+                        high_freq_mag_penalty_weight * high_freq_penalty +
+                        direct_mag_loss_weight * direct_mag_loss +
+                        mel_recon_loss_weight * mel_recon_loss_value +
+                        wav2vec2_loss_weight * wav2vec2_loss_value)
+
+        # log weights
+        if global_step % self.args.logging_steps == 0 and self.writer is not None:
+            self._log_scalar("train/loss_weights/sc_loss_weight", sc_loss_weight)
+            self._log_scalar("train/loss_weights/mag_loss_weight", mag_loss_weight)
+            self._log_scalar("train/loss_weights/waveform_l1_loss_weight", waveform_l1_loss_weight)
+            self._log_scalar("train/loss_weights/phase_loss_weight", phase_loss_weight)
+            self._log_scalar("train/loss_weights/high_freq_stft_loss_weight", high_freq_stft_loss_weight)
+            self._log_scalar("train/loss_weights/high_freq_mag_penalty_weight", high_freq_mag_penalty_weight)
+            self._log_scalar("train/loss_weights/direct_mag_loss_weight", direct_mag_loss_weight)
+            self._log_scalar("train/loss_weights/mel_recon_loss_weight", mel_recon_loss_weight)
+            self._log_scalar("train/loss_weights/wav2vec2_loss_weight", wav2vec2_loss_weight)
+
+        outputs.update({
+            "loss": recon_loss,
+            "waveform_l1": waveform_l1,
+            "sc_loss": sc_loss,
+            "mag_loss": mag_loss,
+            "phase_loss": phase_loss_value,
+            "phase_ip_loss": ip_loss,
+            "phase_iaf_loss": iaf_loss,
+            "phase_gd_loss": gd_loss,
+            "high_freq_stft_loss": high_freq_stft_loss_value,
+            "direct_mag_loss": direct_mag_loss,
+            "mel_recon_loss": mel_recon_loss_value,
+            "wav2vec2_loss": wav2vec2_loss_value,
+            "high_freq_mag_penalty": high_freq_penalty,
+        })
 
         # Ensure waveform_labels has correct shape
         if waveform_labels.dim() == 1:
@@ -283,28 +544,14 @@ class VocoderGANTrainer(CommonTrainer):
         with torch.no_grad():
             # Unpack inputs the same way as compute_loss
             mel_specs = inputs["mel_specs"]
-            mel_spec_masks = inputs["mel_spec_masks"]
-            waveforms = inputs["waveforms"]
-            waveform_masks = inputs["waveform_masks"]
 
             # Move to device
             mel_specs = mel_specs.to(self.args.device)
 
-            if mel_spec_masks is not None:
-                mel_spec_masks = mel_spec_masks.to(self.args.device)
-
             # Use autocast for mixed precision (same as training)
             dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
             with torch.autocast(self.args.device.type, dtype=dtype, enabled=self.args.bf16 or self.args.fp16):
-                # Forward pass
-                outputs = model(
-                    mel_specs=mel_specs,
-                    mel_spec_masks=mel_spec_masks,
-                    waveforms=waveforms,
-                    waveform_masks = waveform_masks,
-                )
-
-                loss = outputs["loss"]
+                loss = self.compute_loss(model, inputs, return_outputs=True)[0]
 
         # Return (loss, logits, labels) - for VAE we don't have traditional logits/labels
         return (loss, None, None)
@@ -376,22 +623,30 @@ class VocoderGANTrainer(CommonTrainer):
 
 
 def load_model(args, shared_window_buffer: SharedWindowBuffer):
+    # return model_loading_utils.load_model(Vocoder, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
+    #     'shared_window_buffer': shared_window_buffer,
+    #     'sc_loss_weight': args.sc_loss_weight,
+    #     'mag_loss_weight': args.mag_loss_weight,
+    #     'waveform_l1_loss_weight': args.waveform_l1_loss_weight,
+    #     'phase_loss_weight': args.phase_loss_weight,
+    #     'phase_ip_loss_weight': args.phase_ip_loss_weight,
+    #     'phase_iaf_loss_weight': args.phase_iaf_loss_weight,
+    #     'phase_gd_loss_weight': args.phase_gd_loss_weight,
+    #     'high_freq_stft_loss_weight': args.high_freq_stft_loss_weight,
+    #     'high_freq_stft_cutoff_bin': args.high_freq_stft_cutoff_bin,
+    #     'high_freq_mag_penalty_weight': args.high_freq_mag_penalty_weight,
+    #     'direct_mag_loss_weight': args.direct_mag_loss_weight,
+    #     'mel_recon_loss_weight': args.mel_recon_loss_weight,
+    #     'wav2vec2_loss_weight': args.wav2vec2_loss_weight,
+    #     'recon_annealing_start_step': args.recon_annealing_start_step,
+    #     'recon_annealing_steps': args.recon_annealing_steps,
+    #     'perceptual_inclusion_start_step': args.perceptual_inclusion_start_step,
+    #     'perceptual_inclusion_annealing_steps': args.perceptual_inclusion_annealing_steps,
+    #     'perceptual_annealing_start_step': args.perceptual_annealing_start_step,
+    #     'perceptual_annealing_steps': args.perceptual_annealing_steps,
+    # })
     return model_loading_utils.load_model(Vocoder, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
         'shared_window_buffer': shared_window_buffer,
-        'sc_loss_weight': args.sc_loss_weight,
-        'mag_loss_weight': args.mag_loss_weight,
-        'waveform_l1_loss_weight': args.waveform_l1_loss_weight,
-        'mel_recon_loss_weight': args.mel_recon_loss_weight,
-        'mel_recon_loss_weight_linspace_max': args.mel_recon_loss_weight_linspace_max,
-        'phase_loss_weight': args.phase_loss_weight,
-        'phase_ip_loss_weight': args.phase_ip_loss_weight,
-        'phase_iaf_loss_weight': args.phase_iaf_loss_weight,
-        'phase_gd_loss_weight': args.phase_gd_loss_weight,
-        'high_freq_stft_loss_weight': args.high_freq_stft_loss_weight,
-        'high_freq_stft_cutoff_bin': args.high_freq_stft_cutoff_bin,
-        'direct_mag_loss_weight': args.direct_mag_loss_weight,
-        'high_freq_mag_penalty_weight': args.high_freq_mag_penalty_weight,
-        'wav2vec2_loss_weight': args.wav2vec2_loss_weight,
     })
 
 
@@ -432,6 +687,8 @@ def create_trainer(
 
     return VocoderGANTrainer(
         model=model,
+        shared_window_buffer=shared_window_buffer,
+        config=model.config,
         step_offset=args.start_step,
         n_fft=args.audio_n_fft,
         hop_length=args.audio_hop_length,
@@ -511,10 +768,6 @@ def add_cli_args(subparsers):
                             help="Log magnitude loss weight")
     sub_parser.add_argument("--waveform_l1_loss_weight", type=float, default=0.1,
                             help="Waveform L1 loss weight")
-    sub_parser.add_argument("--mel_recon_loss_weight", type=float, default=1.0,
-                            help="Mel spectrogram reconstruction loss weight")
-    sub_parser.add_argument("--mel_recon_loss_weight_linspace_max", type=float, default=1.0,
-                            help="Max mel recon loss weight for linear spacing over training")
     sub_parser.add_argument("--phase_loss_weight", type=float, default=0.0,
                             help="Phase loss weight")
     sub_parser.add_argument("--phase_ip_loss_weight", type=float, default=0.0,
@@ -531,8 +784,22 @@ def add_cli_args(subparsers):
                             help="Direct magnitude loss weight")
     sub_parser.add_argument("--high_freq_mag_penalty_weight", type=float, default=0.1,
                             help="High-frequency magnitude penalty weight")
+    sub_parser.add_argument("--mel_recon_loss_weight", type=float, default=1.0,
+                            help="Mel spectrogram reconstruction loss weight")
     sub_parser.add_argument("--wav2vec2_loss_weight", type=float, default=0.0,
                             help="Wav2Vec2 perceptual loss weight")
+    sub_parser.add_argument("--recon_annealing_start_step", type=int, default=5000,
+                            help="Reconstruction loss annealing start step")
+    sub_parser.add_argument("--recon_annealing_steps", type=int, default=5000,
+                            help="Number of steps over which to anneal reconstruction loss")
+    sub_parser.add_argument("--perceptual_inclusion_start_step", type=int, default=5000,
+                            help="Perceptual inclusion start step")
+    sub_parser.add_argument("--perceptual_inclusion_annealing_steps", type=int, default=5000,
+                            help="Number of steps over which to anneal perceptual inclusion")
+    sub_parser.add_argument("--perceptual_annealing_start_step", type=int, default=20000,
+                            help="Perceptual annealing start step")
+    sub_parser.add_argument("--perceptual_annealing_steps", type=int, default=10000,
+                            help="Number of steps over which to anneal perceptual loss")
     
     # Discriminator loss weights
     sub_parser.add_argument("--gan_adv_loss_weight", type=float, default=1.0,

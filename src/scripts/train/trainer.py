@@ -1,4 +1,5 @@
 import abc
+import math
 
 import torch
 
@@ -95,3 +96,56 @@ class CommonTrainer(abc.ABC, Trainer):
     @abc.abstractmethod
     def start_train_print(self, args):
         pass
+
+    def get_loss_weight(
+        self,
+        base_weight: float,
+        step: int,
+        start_step: int,
+        rampup_steps: int,
+        anneal_start_step: int,
+        anneal_steps: int,
+        min_ratio: float = 0.1
+    ) -> float:
+        """
+        Compute loss weight with ramp-up and ramp-down phases.
+        
+        Phases:
+            1. Before start_step: weight = 0
+            2. Ramp-up: start_step -> start_step + rampup_steps (0 -> base_weight)
+            3. Plateau: start_step + rampup_steps -> anneal_start_step (base_weight)
+            4. Ramp-down: anneal_start_step -> anneal_start_step + anneal_steps (base_weight -> base_weight * min_ratio)
+            5. After ramp-down: weight = base_weight * min_ratio
+        """
+        rampup_end = start_step + rampup_steps
+        anneal_end = anneal_start_step + anneal_steps
+        
+        assert rampup_end <= anneal_start_step, "Ramp-up must end before anneal starts"
+
+        # Phase 1: Before start - weight is 0
+        if step < start_step:
+            return 0.0
+        
+        # Phase 2: Ramp-up (cosine from 0 to base_weight)
+        if step < rampup_end:
+            if rampup_steps == 0:
+                return base_weight
+            progress = (step - start_step) / rampup_steps
+            # Cosine ramp-up: starts at 0, ends at 1
+            ramp = 0.5 * (1 - math.cos(math.pi * progress))
+            return base_weight * ramp
+        
+        # Phase 3: Plateau at base_weight
+        if step < anneal_start_step:
+            return base_weight
+        
+        # Phase 4: Ramp-down (cosine from base_weight to base_weight * min_ratio)
+        if step < anneal_end:
+            if anneal_steps == 0:
+                return base_weight * min_ratio
+            progress = (step - anneal_start_step) / anneal_steps
+            ratio = min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+            return base_weight * ratio
+        
+        # Phase 5: After ramp-down - hold at minimum
+        return base_weight * min_ratio

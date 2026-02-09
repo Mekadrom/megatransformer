@@ -36,9 +36,13 @@ class AudioDataCollator(DataCollator):
         all_feature_lengths = []
         all_mel_specs = []
         all_speaker_embeddings = []
+        all_speaker_ids = []
         all_mel_lengths = []
         all_f0 = []
         all_vuv = []
+        all_ctc_tokens = []
+        all_ctc_lengths = []
+        all_texts = []  # the only string column, we won't pad but will collate into a list with one entry per example
 
         for ex in valid_examples:
             all_waveforms.append(trim(ex.get("waveform", None), self.max_waveforms, dim=-1))
@@ -48,8 +52,12 @@ class AudioDataCollator(DataCollator):
             all_mel_specs.append(trim(ex.get("mel_spec", None), self.max_mel_spec_frames, dim=-1))
             all_mel_lengths.append(ex.get("mel_length", None))
             all_speaker_embeddings.append(ex.get("speaker_embedding", None))
+            all_speaker_ids.append(ex.get("speaker_id", None))
             all_f0.append(trim(ex.get("f0", None), self.max_mel_spec_frames, dim=-1))
             all_vuv.append(trim(ex.get("vuv", None), self.max_mel_spec_frames, dim=-1))
+            all_ctc_tokens.append(ex.get("ctc_tokens", None))
+            all_ctc_lengths.append(ex.get("ctc_length", None))
+            all_texts.append(ex.get("text", None))
 
         if all_waveforms[0] is not None:
             padded_waveforms, waveform_masks = pad_and_mask(all_waveforms, all_waveform_lengths)
@@ -69,7 +77,11 @@ class AudioDataCollator(DataCollator):
         else:
             padded_f0 = None
             padded_vuv = None
-
+        if all_ctc_tokens[0] is not None:
+            padded_ctc_tokens, ctc_masks = pad_and_mask(all_ctc_tokens, all_ctc_lengths)
+        else:
+            padded_ctc_tokens, ctc_masks = None, None
+        
         batch = {}
 
         if padded_waveforms is not None:
@@ -89,9 +101,17 @@ class AudioDataCollator(DataCollator):
 
         if all_speaker_embeddings[0] is not None:
             batch["speaker_embeddings"] = torch.stack(all_speaker_embeddings)  # [B, speaker_embedding_dim]
+            batch["speaker_ids"] = torch.stack(all_speaker_ids)  # [B]
 
         if padded_f0 is not None:
             batch["f0"] = torch.stack(padded_f0)  # [B, T]
             batch["vuv"] = torch.stack(padded_vuv)  # [B, T]
+
+        if padded_ctc_tokens is not None:
+            batch["ctc_tokens"] = torch.stack(padded_ctc_tokens)  # [B, T]
+            batch["ctc_lengths"] = torch.stack(all_ctc_lengths)  # [B]
+            batch["ctc_masks"] = torch.stack(ctc_masks)  # [B, T] mask for ctc tokens
+
+        batch["texts"] = all_texts  # list of strings, one per example
 
         return batch

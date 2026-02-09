@@ -7,7 +7,7 @@ from utils.text_encoder import TextEncoderType, get_text_encoder
 
 
 class TextConditionsBatchProcessor(BatchProcessor):
-    """Batched GPU processing for extracting F0 and VUV labels."""
+    """Batched GPU processing for extracting t5 text embeddings."""
 
     def __init__(
         self,
@@ -22,7 +22,7 @@ class TextConditionsBatchProcessor(BatchProcessor):
         text: list[str],
     ) -> dict[str, torch.Tensor]:
         """
-        Process batch of waveforms to extract speaker embeddings, F0 and VUV labels.
+        Process batch of texts to extract t5 text embeddings.
 
         Args:
             text: list of strings

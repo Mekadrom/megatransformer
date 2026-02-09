@@ -3,11 +3,15 @@ import os
 import psutil
 
 import matplotlib
+
+from model.audio.sive.ctc_vocab import CTCVocab
+from scripts.train.audio.sive.visualization_callback import SIVEVisualizationCallback
 matplotlib.use('Agg')
 import torch
 import torch.nn as nn
 
 import scripts.train.audio.vae.training as audio_cvae_training
+import scripts.train.audio.sive.training as audio_sive_training
 import scripts.train.audio.vocoder.training as audio_vocoder_training
 import scripts.train.image.vae.training as image_vae_training
 
@@ -37,6 +41,8 @@ from utils.train_utils import EarlyStoppingCallback
 def create_or_load_model(args, shared_window_buffer: Optional[SharedWindowBuffer]) -> nn.Module:
     if args.command in ["audio-cvae", "audio-cvae-decoder"]:
         return audio_cvae_training.load_model(args)
+    elif args.command in ["audio-sive", "sive"]:
+        return audio_sive_training.load_model(args)
     elif args.command in ["vocoder"]:
         return audio_vocoder_training.load_model(args, shared_window_buffer=shared_window_buffer)
     elif args.command in ["image-vae"]:
@@ -84,7 +90,7 @@ def get_training_args(args, run_dir) -> TrainingArguments:
 
 
 def get_data_collator(command: str, args) -> Optional[DataCollator]:
-    if command in ["audio-cvae", 'audio-cvae-decoder', 'vocoder']:
+    if command in ["audio-cvae", 'audio-cvae-decoder', 'vocoder', 'audio-sive', 'sive']:
         audio_max_frames = args.audio_max_seconds * args.audio_sample_rate // args.audio_hop_length
         collator =  AudioDataCollator(
             max_waveforms=args.audio_max_seconds * args.audio_sample_rate,
@@ -103,11 +109,40 @@ def get_dataset(command: str, args, split: str):
         dataset = AudioShardedDataset(
             shard_dir=shard_dir,
             cache_size=32,
+            columns=[
+                "features",  # includes lengths
+                "mel_specs",  # includes lengths
+                "speaker_embeddings",
+                "f0",
+                "vuv",
+                "text",
+            ]
         )
     elif command in ['vocoder']:
         dataset = AudioShardedDataset(
             shard_dir=shard_dir,
             cache_size=3,
+            columns=[
+                "waveforms",  # includes lengths
+                "mel_specs",  # includes lengths
+                "conditions",  # includes lengths
+                "text",
+            ]
+        )
+    elif command in ['audio-sive', 'sive']:
+        dataset = AudioShardedDataset(
+            shard_dir=shard_dir,
+            cache_size=32,
+            columns=[
+                "features",  # includes lengths
+                "mel_specs",  # includes lengths
+                "speaker_embeddings",
+                "f0",
+                "vuv",
+                "speaker_ids",
+                "ctc_tokens",  # includes lengths
+                "text",
+            ]
         )
     elif command in ["image-vae"]:
         dataset = ImageVAEShardedDataset(
@@ -118,7 +153,7 @@ def get_dataset(command: str, args, split: str):
     return dataset
 
 
-def get_visualization_callback(args, command: str, shared_window_buffer=None, legacy_vocoder: bool = False) -> VisualizationCallback:
+def get_visualization_callback(args, command: str, model: nn.Module, shared_window_buffer=None, legacy_vocoder: bool = False) -> VisualizationCallback:
     if command in ["audio-cvae", 'audio-cvae-decoder']:
         vocoder = model_loading_utils.load_vocoder(args.vocoder_checkpoint_path, args.vocoder_config, shared_window_buffer, is_wrapped=legacy_vocoder)
         callback = AudioCVAEVisualizationCallback(
@@ -133,6 +168,21 @@ def get_visualization_callback(args, command: str, shared_window_buffer=None, le
             vocoder_config=args.vocoder_config,
             speaker_encoder_type=args.speaker_encoder_type,
             free_bits=args.free_bits,
+        )
+    elif command in ['audio-sive', 'sive']:
+        vocoder = model_loading_utils.load_vocoder(args.vocoder_checkpoint_path, args.vocoder_config, shared_window_buffer, is_wrapped=legacy_vocoder)
+        callback = SIVEVisualizationCallback(
+            vocoder=vocoder,
+            vocab=CTCVocab(),
+            audio_sample_rate=args.audio_sample_rate,
+            audio_n_fft=args.audio_n_fft,
+            audio_hop_length=args.audio_hop_length,
+            num_audio_samples=args.num_audio_samples,
+            # LM decoder settings
+            kenlm_model_path=args.kenlm_model_path,
+            lm_alpha=args.lm_alpha,
+            lm_beta=args.lm_beta,
+            beam_width=args.beam_width,
         )
     elif command in ["vocoder"]:
         callback = VocoderVisualizationCallback(
@@ -176,7 +226,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
     data_collator = get_data_collator(command, args)
     train_dataset = get_dataset(command, args, split="train")
     eval_dataset = get_dataset(command, args, split="val")
-    visualization_callback = get_visualization_callback(args, command, shared_window_buffer=shared_window_buffer, legacy_vocoder=args.legacy_vocoder)
+    visualization_callback = get_visualization_callback(args, command, model, shared_window_buffer=shared_window_buffer, legacy_vocoder=args.legacy_vocoder)
     ema = get_ema_callback(args)
     
     if command in ["audio-cvae", "audio-cvae-decoder"]:
@@ -190,6 +240,15 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
             shared_window_buffer,
             vocoder=visualization_callback.vocoder,  # obtain vocoder loaded in visualization callback
             device=device,
+        )
+    elif command in ['audio-sive', 'sive']:
+        trainer: Trainer = audio_sive_training.create_trainer(
+            args,
+            model,
+            training_args,
+            data_collator,
+            train_dataset,
+            eval_dataset,
         )
     elif command in ["vocoder"]:
         trainer: Trainer = audio_vocoder_training.create_trainer(
@@ -229,6 +288,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
 
 training_modules: list = [
     audio_cvae_training,
+    audio_sive_training,
     audio_vocoder_training,
     image_vae_training
 ]
@@ -324,6 +384,7 @@ def get_process_cmdline(pid):
 
 command_to_module = {
     "audio-cvae": audio_cvae_training,
+    "audio-sive": audio_sive_training,
     "vocoder": audio_vocoder_training,
     "image-vae": image_vae_training,
 }
@@ -353,6 +414,7 @@ if __name__ == "__main__":
     run_dir = os.path.join(args.logging_base_dir, args.run_name)
     if not os.path.exists(run_dir):
         os.makedirs(run_dir, exist_ok=True)
+    setattr(args, 'run_dir', run_dir)
 
     module = command_to_module.get(args.command, None)
     if module is None:

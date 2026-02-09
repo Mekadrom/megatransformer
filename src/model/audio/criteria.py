@@ -233,14 +233,13 @@ class MultiScaleMelLoss(nn.Module):
 
 
 class StableMelSpectrogramLoss(nn.Module):
-    def __init__(self, shared_window_buffer: SharedWindowBuffer, sample_rate, n_fft, hop_length, n_mels, mel_recon_loss_weight_linspace_max: float = 1.0):
+    def __init__(self, shared_window_buffer: SharedWindowBuffer, sample_rate, n_fft, hop_length, n_mels):
         super().__init__()
         self.shared_window_buffer = shared_window_buffer
         self.sample_rate = sample_rate
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.n_mels = n_mels
-        self.mel_recon_loss_weight_linspace_max = mel_recon_loss_weight_linspace_max
         
         # Pre-compute mel filterbank (no grad needed)
         mel_fb = torchaudio.functional.melscale_fbanks(

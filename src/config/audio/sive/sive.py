@@ -8,7 +8,7 @@ from typing import Optional
 @dataclass
 class SpeakerInvariantVoiceEncoderConfig:
     """Configuration for SIVE model."""
-    n_mels: int = 80
+    audio_n_mels: int = 80
     encoder_dim: int = 256
     num_layers: int = 4
     num_heads: int = 4
@@ -18,7 +18,7 @@ class SpeakerInvariantVoiceEncoderConfig:
     vocab_size: int = 30  # " 'abcdefghijklmnopqrstuvwxyz" + blank + UNKOWN
     num_speakers: int = 921
     dropout: float = 0.1
-    max_seq_len: int = 5000
+    max_seq_len: int = 4096
     speaker_pooling: str = "mean"
 
     # Dropout regularization (helps prevent memorization)

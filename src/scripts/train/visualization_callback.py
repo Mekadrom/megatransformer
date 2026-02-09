@@ -31,7 +31,7 @@ class VisualizationCallback(abc.ABC, TrainerCallback):
             mel_spec = mel_spec.to(device=vocoder_device, dtype=vocoder_dtype)
 
             with torch.no_grad():
-                waveform, _ = self.vocoder(mel_spec)
+                waveform = self.vocoder(mel_spec)["pred_waveform"]
 
             # Ensure 1D waveform and convert to float32 CPU for numpy
             if waveform.dim() > 1:
