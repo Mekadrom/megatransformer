@@ -1,6 +1,4 @@
-import json
 from typing import Optional
-import os
 
 import numpy as np
 import torch
@@ -11,7 +9,8 @@ from transformers.integrations.integration_utils import TensorBoardCallback
 from transformers.trainer import Trainer
 from model.audio.sive.ctc_vocab import CTCVocab
 from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
-from utils import megatransformer_utils, model_loading_utils
+from utils import model_loading_utils
+from utils.megatransformer_utils import print_debug_tensor
 
 
 class GRLAlphaScheduler:
@@ -196,12 +195,13 @@ class SIVETrainer(Trainer):
         asr_logits = result["asr_logits"]  # [B, T, vocab]
         speaker_logits = result["speaker_logits"]  # [B, num_speakers]
         # Use ctc_lengths for CTC loss (accounts for upsampling if enabled)
-        ctc_lengths = result.get("ctc_lengths", result["feature_lengths"])  # [B]
+        output_ctc_lengths = result.get("ctc_lengths", result["feature_lengths"])  # [B]
 
         # CTC loss
         # CTC expects [T, B, vocab] and log probabilities
         log_probs = F.log_softmax(asr_logits, dim=-1).permute(1, 0, 2)  # [T, B, vocab]
-        ctc_loss = self.ctc_criterion(log_probs, ctc_tokens, ctc_lengths, ctc_lengths)
+
+        ctc_loss = self.ctc_criterion(log_probs, ctc_tokens, output_ctc_lengths, ctc_lengths)
 
         # GRL speaker classification loss
         # We want the classifier to FAIL (be at chance level)
@@ -289,6 +289,12 @@ class SIVETrainer(Trainer):
             print(f"  feature_dropout: {args.feature_dropout}")
             print(f"  head_dropout: {args.head_dropout} (prediction head)")
             print(f"  attention_head_drop: {args.attention_head_drop} (DropHead on attention)")
+        if args.use_spec_augment:
+            print(f"SpecAugment: ENABLED")
+            print(f"  time_mask_param: {args.spec_time_mask_param}, freq_mask_param: {args.spec_freq_mask_param}")
+            print(f"  num_time_masks: {args.spec_num_time_masks}, num_freq_masks: {args.spec_num_freq_masks}")
+        if args.drop_path_rate > 0:
+            print(f"Stochastic Depth: ENABLED (max drop_path_rate={args.drop_path_rate})")
         if args.activation != "gelu":
             print(f"Architectural options:")
             if args.activation != "gelu":
@@ -351,12 +357,21 @@ def load_model(args):
         'activation': args.activation,
         # Speaker classifier pooling strategy
         'speaker_pooling': args.speaker_pooling,
+        # SpecAugment
+        'use_spec_augment': args.use_spec_augment,
+        'spec_time_mask_param': args.spec_time_mask_param,
+        'spec_freq_mask_param': args.spec_freq_mask_param,
+        'spec_num_time_masks': args.spec_num_time_masks,
+        'spec_num_freq_masks': args.spec_num_freq_masks,
+        # Stochastic Depth
+        'drop_path_rate': args.drop_path_rate,
     })
 
 
 def create_trainer(
     args,
     model,
+    optimizer,
     training_args,
     data_collator,
     train_dataset,
@@ -370,6 +385,7 @@ def create_trainer(
 
     return SIVETrainer(
         model=model,
+        optimizers=(optimizer, None),
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -439,6 +455,22 @@ def add_cli_args(subparsers):
     # CTC upsampling (relaxes CTC length constraint without increasing transformer cost)
     sub_parser.add_argument("--ctc_upsample_factor", type=int, default=1,
                             help="CTC upsampling factor (e.g., 2 = double CTC frames)")
+
+    # SpecAugment (data augmentation)
+    sub_parser.add_argument("--use_spec_augment", action="store_true",
+                            help="Enable SpecAugment data augmentation")
+    sub_parser.add_argument("--spec_time_mask_param", type=int, default=50,
+                            help="Max time mask width for SpecAugment")
+    sub_parser.add_argument("--spec_freq_mask_param", type=int, default=20,
+                            help="Max frequency mask width for SpecAugment")
+    sub_parser.add_argument("--spec_num_time_masks", type=int, default=2,
+                            help="Number of time masks for SpecAugment")
+    sub_parser.add_argument("--spec_num_freq_masks", type=int, default=2,
+                            help="Number of frequency masks for SpecAugment")
+
+    # Stochastic Depth (drop entire residual paths for regularization)
+    sub_parser.add_argument("--drop_path_rate", type=float, default=0.0,
+                            help="Max drop path rate for stochastic depth (linearly scaled per layer, 0=disabled)")
 
     # Vocoder settings (for audio generation in TensorBoard)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,

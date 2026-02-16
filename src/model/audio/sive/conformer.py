@@ -7,7 +7,7 @@ class ConformerConvModule(nn.Module):
     """
     Conformer-style convolution module for speech processing.
 
-    Architecture: LayerNorm -> Pointwise Conv -> GLU -> Depthwise Conv -> BatchNorm -> Swish -> Pointwise Conv -> Dropout
+    Architecture: LayerNorm -> Pointwise Conv -> GLU -> Depthwise Conv -> InstanceNorm -> Swish -> Pointwise Conv -> Dropout
 
     The depthwise separable convolution captures local acoustic patterns that
     self-attention alone may miss, making it particularly effective for speech.
@@ -39,7 +39,7 @@ class ConformerConvModule(nn.Module):
             groups=inner_dim,  # Depthwise: each channel has its own filter
         )
 
-        self.batch_norm = nn.BatchNorm1d(inner_dim)
+        self.instance_norm = nn.InstanceNorm1d(inner_dim, affine=True)
         self.activation = nn.SiLU()  # Swish
 
         # Pointwise projection back to d_model
@@ -66,7 +66,7 @@ class ConformerConvModule(nn.Module):
 
         # Depthwise conv
         x = self.depthwise_conv(x)  # [B, inner_dim, T]
-        x = self.batch_norm(x)
+        x = self.instance_norm(x)
         x = self.activation(x)
 
         # Pointwise projection

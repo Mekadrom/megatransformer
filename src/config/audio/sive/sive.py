@@ -31,6 +31,16 @@ class SpeakerInvariantVoiceEncoderConfig:
     conformer_kernel_size: int = 31  # Kernel size for Conformer conv (standard from paper)
     activation: str = "swiglu"
 
+    # SpecAugment (data augmentation for ASR)
+    use_spec_augment: bool = False
+    spec_time_mask_param: int = 50   # Max time mask width (T)
+    spec_freq_mask_param: int = 20   # Max frequency mask width (F)
+    spec_num_time_masks: int = 2     # Number of time masks
+    spec_num_freq_masks: int = 2     # Number of frequency masks
+
+    # Stochastic Depth (drop entire residual paths)
+    drop_path_rate: float = 0.0  # Max drop rate (linearly scaled per layer, 0=disabled)
+
     # Variance regularization (for VAE-friendly features)
     use_variance_reg: bool = False
     temporal_var_weight: float = 0.01

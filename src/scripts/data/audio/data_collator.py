@@ -2,7 +2,10 @@ import torch
 import torch.nn.functional as F
 
 from scripts.data.data_collator import DataCollator
-from utils.megatransformer_utils import pad_and_mask, trim
+from utils.megatransformer_utils import pad_and_mask, trim, print_debug_tensor
+
+# Set to True to enable debug printing in data collator
+DEBUG_COLLATOR = False  # Set True to debug data loading issues
 
 
 class AudioDataCollator(DataCollator):
@@ -113,5 +116,22 @@ class AudioDataCollator(DataCollator):
             batch["ctc_masks"] = torch.stack(ctc_masks)  # [B, T] mask for ctc tokens
 
         batch["texts"] = all_texts  # list of strings, one per example
+
+        if DEBUG_COLLATOR and "ctc_tokens" in batch:
+            print("\n--- DATA COLLATOR DEBUG ---")
+            print_debug_tensor("batch mel_specs", batch.get("mel_specs"))
+            print_debug_tensor("batch mel_lengths", batch.get("mel_lengths"))
+            print_debug_tensor("batch ctc_tokens", batch.get("ctc_tokens"))
+            print_debug_tensor("batch ctc_lengths", batch.get("ctc_lengths"))
+            print(f"  mel_lengths: {batch['mel_lengths'].tolist() if 'mel_lengths' in batch else 'N/A'}")
+            print(f"  ctc_lengths: {batch['ctc_lengths'].tolist() if 'ctc_lengths' in batch else 'N/A'}")
+            # Check the ratio of mel frames to CTC tokens (need sufficient frames for CTC)
+            if "mel_lengths" in batch and "ctc_lengths" in batch:
+                mel_lens = batch["mel_lengths"]
+                ctc_lens = batch["ctc_lengths"]
+                for i in range(len(mel_lens)):
+                    ratio = mel_lens[i].item() / max(ctc_lens[i].item(), 1)
+                    print(f"  Sample {i}: mel_len={mel_lens[i].item()}, ctc_len={ctc_lens[i].item()}, ratio={ratio:.2f}")
+            print("---\n")
 
         return batch

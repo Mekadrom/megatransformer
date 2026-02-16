@@ -1033,6 +1033,7 @@ def load_model(args):
 def create_trainer(
     args,
     model,
+    optimizer,
     training_args,
     data_collator,
     train_dataset,
@@ -1179,6 +1180,7 @@ def create_trainer(
 
     return AudioCVAEGANTrainer(
         model=model,
+        optimizers=(optimizer, None),
         args=training_args,
         data_collator=data_collator,
         train_dataset=train_dataset,

@@ -6,10 +6,13 @@ import torch.nn.functional as F
 
 
 from config.audio.sive.sive import CONFIGS as SIVE_CONFIGS
+from utils.megatransformer_utils import print_debug_tensor
+
 from config.audio.sive.sive import SpeakerInvariantVoiceEncoderConfig
 from model.audio.sive.conv_subsampling import ConvSubsampling
 from model.audio.sive.grl import GradientReversalFunction, SpeakerClassifier
 from model.audio.sive.sive_block import SpeakerInvariantVoiceEncoderBlock
+from model.audio.sive.spec_augment import SpecAugment
 
 
 class SpeakerInvariantVoiceEncoder(nn.Module):
@@ -28,6 +31,17 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
 
         self.config = config
 
+        # SpecAugment for data augmentation (only active during training)
+        if config.use_spec_augment:
+            self.spec_augment = SpecAugment(
+                time_mask_param=config.spec_time_mask_param,
+                freq_mask_param=config.spec_freq_mask_param,
+                num_time_masks=config.spec_num_time_masks,
+                num_freq_masks=config.spec_num_freq_masks,
+            )
+        else:
+            self.spec_augment = None
+
         # Convolutional subsampling frontend with optional Dropout1d
         self.conv_subsample = ConvSubsampling(
             in_channels=config.audio_n_mels,
@@ -38,6 +52,11 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         )
 
         # Transformer encoder blocks with architectural options
+        # Stochastic depth: linearly scale drop_path from 0 to drop_path_rate
+        drop_path_rates = [
+            config.drop_path_rate * i / max(config.num_layers - 1, 1)
+            for i in range(config.num_layers)
+        ]
         self.encoder_blocks = nn.ModuleList([
             SpeakerInvariantVoiceEncoderBlock(
                 d_model=config.encoder_dim,
@@ -45,10 +64,11 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 d_ff=config.ff_dim,
                 dropout=config.dropout,
                 head_drop_prob=config.attention_head_drop,
+                drop_path_prob=drop_path_rates[i],
                 conformer_kernel_size=config.conformer_kernel_size,
                 activation=config.activation,
             )
-            for _ in range(config.num_layers)
+            for i in range(config.num_layers)
         ])
 
         # Final layer norm
@@ -145,8 +165,13 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 - temporal_smoothness: scalar metric (if variance_reg enabled and training)
                 - all_hiddens: list of [B, T', D] if return_all_hiddens=True
         """
+        # Apply SpecAugment (only during training)
+        if self.spec_augment is not None:
+            mel_spec = self.spec_augment(mel_spec)
+
         # Convolutional frontend
         x: torch.Tensor = self.conv_subsample(mel_spec)  # [B, encoder_dim, T']
+
         x = x.permute(0, 2, 1)  # [B, T', encoder_dim]
 
         # Calculate output lengths
@@ -164,7 +189,7 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
 
         # Transformer encoder
         all_hiddens = [x] if return_all_hiddens else None
-        for block in self.encoder_blocks:
+        for i, block in enumerate(self.encoder_blocks):
             x = block(x, key_padding_mask=padding_mask)
 
             if return_all_hiddens:

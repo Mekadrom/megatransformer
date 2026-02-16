@@ -15,6 +15,28 @@ from model.audio.sive.conformer import ConformerConvModule
 from model.head_dropout import HeadDropout
 
 
+def stochastic_depth(x: torch.Tensor, drop_prob: float, training: bool) -> torch.Tensor:
+    """
+    Stochastic Depth (Drop Path) for regularization.
+
+    During training, randomly drops the entire residual branch with probability drop_prob.
+    Scales the output by 1/(1-drop_prob) to maintain expected value.
+
+    Reference: "Deep Networks with Stochastic Depth" https://arxiv.org/abs/1603.09382
+    """
+    if not training or drop_prob == 0.0:
+        return x
+
+    keep_prob = 1.0 - drop_prob
+    # Per-sample drop decision: [B, 1, 1] for broadcasting
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+    binary_mask = (random_tensor > drop_prob).float()
+
+    # Scale by 1/keep_prob to maintain expected value
+    return x * binary_mask / keep_prob
+
+
 class SpeakerInvariantVoiceEncoderBlock(nn.Module):
     """
     Transformer encoder block with pre-norm, optional RoPE, Conformer conv, and configurable activation.
@@ -26,6 +48,7 @@ class SpeakerInvariantVoiceEncoderBlock(nn.Module):
     - Macaron-style FFN (half-step FFN before and after attention)
     - SwiGLU or GELU activation in FFN
     - DropHead regularization
+    - Stochastic Depth (drop entire block)
     """
 
     def __init__(
@@ -35,6 +58,7 @@ class SpeakerInvariantVoiceEncoderBlock(nn.Module):
         d_ff: int,
         dropout: float = 0.1,
         head_drop_prob: float = 0.0,
+        drop_path_prob: float = 0.0,
         # Architectural options
         conformer_kernel_size: int = 31,
         activation: str = "gelu",
@@ -43,6 +67,7 @@ class SpeakerInvariantVoiceEncoderBlock(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.d_model = d_model
+        self.drop_path_prob = drop_path_prob
 
         # Rotary position embeddings
         self.rotary_embedding = RotaryEmbedding(dim=self.head_dim)
@@ -154,6 +179,9 @@ class SpeakerInvariantVoiceEncoderBlock(nn.Module):
 
         Macaron-style: ½FFN → Attn → Conv → ½FFN
         """
+        # Save input for stochastic depth (drop entire block)
+        block_input = x
+
         # macaron: first half-step FFN (scaled by 0.5)
         residual = x
         x = self.norm_ff1(x)
@@ -178,5 +206,10 @@ class SpeakerInvariantVoiceEncoderBlock(nn.Module):
         x = self.norm_ff2(x)
         x = 0.5 * self.ff2(x)
         x = residual + x
+
+        # Stochastic depth: randomly drop entire block's contribution
+        # x = input + drop(block_output - input) = input + drop(delta)
+        if self.drop_path_prob > 0:
+            x = block_input + stochastic_depth(x - block_input, self.drop_path_prob, self.training)
 
         return x

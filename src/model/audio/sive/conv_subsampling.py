@@ -24,7 +24,7 @@ class ConvSubsampling(nn.Module):
         for i, (k, s) in enumerate(zip(kernel_sizes, strides)):
             layers.extend([
                 nn.Conv1d(channels[i], channels[i + 1], kernel_size=k, stride=s, padding=k // 2),
-                nn.GroupNorm(min(32, channels[i + 1]), channels[i + 1]),
+                nn.InstanceNorm1d(channels[i + 1], affine=True),
                 nn.GELU(),
                 nn.Dropout1d(dropout),
             ])

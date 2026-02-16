@@ -325,6 +325,36 @@ class ImageVAEGANTrainer(CommonTrainer):
             }, discriminator_path)
             print(f"Discriminator saved to {discriminator_path}")
 
+    def start_train_print(self, args):
+        print(f"Model structure: {self.model}")
+        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"  VAE Encoder parameters: {sum(p.numel() for p in self.model.encoder.parameters()):,}")
+        print(f"  VAE Decoder parameters: {sum(p.numel() for p in self.model.decoder.parameters()):,}")
+        print(f"Trainable parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
+        if args.use_gan and self.discriminator is not None:
+            print(f"GAN training: enabled")
+            print(f"  Discriminator config: {args.discriminator_config}")
+            print(f"  Discriminator parameters: {sum(p.numel() for p in self.discriminator.parameters()):,}")
+            print(f"  GAN loss weight: {args.gan_loss_weight}")
+            print(f"  Feature matching weight: {args.feature_matching_weight}")
+            print(f"  Discriminator LR: {args.discriminator_lr}")
+            print(f"  GAN start condition key: {args.gan_start_condition_key}")
+            print(f"  GAN start condition value: {args.gan_start_condition_value}")
+            if args.instance_noise_std > 0:
+                print(f"  Instance noise: std={args.instance_noise_std}, decay_steps={args.instance_noise_decay_steps}")
+            if args.r1_penalty_weight > 0:
+                print(f"  R1 penalty: weight={args.r1_penalty_weight}, interval={args.r1_penalty_interval}")
+            if args.gan_warmup_steps > 0:
+                print(f"  GAN warmup: {args.gan_warmup_steps} steps (ramps loss from 0 to full)")
+            if args.discriminator_update_frequency > 1:
+                print(f"  Discriminator update frequency: every {args.discriminator_update_frequency} steps")
+        if args.perceptual_loss_start_step > 0:
+            print(f"Perceptual loss: delayed start at step {args.perceptual_loss_start_step}")
+        if args.kl_annealing_steps > 0:
+            print(f"KL annealing: {args.kl_annealing_steps} steps (ramps KL weight from 0 to 1)")
+        if args.free_bits > 0:
+            print(f"Free bits: {args.free_bits} nats per channel (prevents posterior collapse)")
+
 
 def load_model(args):
     return model_loading_utils.load_model(ImageVAE, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
@@ -335,6 +365,7 @@ def load_model(args):
 def create_trainer(
     args,
     model,
+    optimizer,
     training_args,
     data_collator,
     train_dataset,
@@ -363,6 +394,7 @@ def create_trainer(
 
     return ImageVAEGANTrainer(
         model=model,
+        optimizers=(optimizer, None),
         args=training_args,
         data_collator=data_collator,
         train_dataset=train_dataset,

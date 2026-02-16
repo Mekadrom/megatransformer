@@ -653,6 +653,7 @@ def load_model(args, shared_window_buffer: SharedWindowBuffer):
 def create_trainer(
     args,
     model,
+    optimizer,
     training_args,
     data_collator,
     train_dataset,
@@ -687,6 +688,8 @@ def create_trainer(
 
     return VocoderGANTrainer(
         model=model,
+        optimizers=(optimizer, None),
+        args=training_args,
         shared_window_buffer=shared_window_buffer,
         config=model.config,
         step_offset=args.start_step,
@@ -694,7 +697,6 @@ def create_trainer(
         hop_length=args.audio_hop_length,
         cmdline=args.cmdline,
         git_commit_hash=args.commit_hash,
-        args=training_args,
         data_collator=data_collator,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,

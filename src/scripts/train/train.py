@@ -16,10 +16,12 @@ import scripts.train.audio.vocoder.training as audio_vocoder_training
 import scripts.train.image.vae.training as image_vae_training
 
 
-from typing import Optional
+from typing import Optional, List
 
 from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
+
+from scripts.train.optimizers import MuonAdamW, create_muon_adamw_optimizer
 
 from model.ema import EMAModel
 from scripts.data.image.vae.data_collator import ImageVAEDataCollator
@@ -221,7 +223,7 @@ def get_ema_callback(args) -> Optional[EMAUpdateCallback]:
     return None
 
 
-def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_window_buffer=None) -> Trainer:
+def get_trainer(command: str, args, run_dir, model: nn.Module, optimizer: Optional[MuonAdamW], device, shared_window_buffer=None) -> Trainer:
     training_args = get_training_args(args, run_dir=run_dir)
     data_collator = get_data_collator(command, args)
     train_dataset = get_dataset(command, args, split="train")
@@ -233,6 +235,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
         trainer: Trainer = audio_cvae_training.create_trainer(
             args,
             model,
+            optimizer,
             training_args,
             data_collator,
             train_dataset,
@@ -245,6 +248,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
         trainer: Trainer = audio_sive_training.create_trainer(
             args,
             model,
+            optimizer,
             training_args,
             data_collator,
             train_dataset,
@@ -254,6 +258,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
         trainer: Trainer = audio_vocoder_training.create_trainer(
             args,
             model,
+            optimizer,
             training_args,
             data_collator,
             train_dataset,
@@ -264,6 +269,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
         trainer: Trainer = image_vae_training.create_trainer(
             args,
             model,
+            optimizer,
             training_args,
             data_collator,
             train_dataset,
@@ -284,6 +290,50 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, device, shared_wi
         trainer.add_callback(early_stopping_callback)
 
     return trainer
+
+
+def get_optimizer(args, model: nn.Module) -> Optional[MuonAdamW]:
+    """
+    Create optimizer based on args.
+
+    If --use_muon is set, creates a MuonAdamW optimizer that routes:
+    - 2D+ params (Linear weights, Conv filters) -> Muon
+    - 1D params (biases, norms, embeddings) -> AdamW
+    - First/last layer params (specified via args) -> AdamW
+
+    Returns:
+        MuonAdamW optimizer if --use_muon is set, None otherwise
+    """
+    if not getattr(args, 'use_muon', False):
+        return None
+
+    # Parse comma-separated layer name patterns
+    first_layer_names = [s.strip() for s in args.muon_first_layer_names.split(',') if s.strip()]
+    last_layer_names = [s.strip() for s in args.muon_last_layer_names.split(',') if s.strip()]
+
+    optimizer = create_muon_adamw_optimizer(
+        model=model,
+        lr_muon=args.lr_muon,
+        lr_adamw=args.lr_adamw,
+        weight_decay_muon=args.weight_decay_muon,
+        weight_decay_adamw=args.weight_decay,  # Use existing weight_decay for AdamW part
+        momentum_muon=args.momentum_muon,
+        ns_steps=args.ns_steps,
+        first_layer_names=first_layer_names if first_layer_names else None,
+        last_layer_names=last_layer_names if last_layer_names else None,
+        verbose=args.muon_verbose,
+    )
+
+    if args.local_rank == 0 or not args.use_deepspeed:
+        print(f"Created MuonAdamW optimizer:")
+        print(f"  Muon params: {len(optimizer.muon_params)} tensors, lr={args.lr_muon}")
+        print(f"  AdamW params: {len(optimizer.adamw_params)} tensors, lr={args.lr_adamw}")
+        if first_layer_names:
+            print(f"  First layer patterns (AdamW): {first_layer_names}")
+        if last_layer_names:
+            print(f"  Last layer patterns (AdamW): {last_layer_names}")
+
+    return optimizer
 
 
 training_modules: list = [
@@ -333,6 +383,17 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm')
         sub_parser.add_argument('--fp16', action='store_true', help='Whether to use fp16')
         sub_parser.add_argument('--bf16', action='store_true', help='Whether to use bf16')
+
+        # muon optimizer params
+        sub_parser.add_argument('--use_muon', action='store_true', help='Use Muon+AdamW optimizer instead of AdamW')
+        sub_parser.add_argument('--lr_muon', type=float, default=0.02, help='Learning rate for Muon (2D+ params)')
+        sub_parser.add_argument('--lr_adamw', type=float, default=1e-4, help='Learning rate for AdamW (1D params) when using Muon')
+        sub_parser.add_argument('--momentum_muon', type=float, default=0.95, help='Momentum for Muon optimizer')
+        sub_parser.add_argument('--weight_decay_muon', type=float, default=0.0, help='Weight decay for Muon params')
+        sub_parser.add_argument('--ns_steps', type=int, default=5, help='Newton-Schulz iterations for Muon')
+        sub_parser.add_argument('--muon_first_layer_names', type=str, default='', help='Comma-separated substrings to match first layer params (kept on AdamW)')
+        sub_parser.add_argument('--muon_last_layer_names', type=str, default='', help='Comma-separated substrings to match last layer params (kept on AdamW)')
+        sub_parser.add_argument('--muon_verbose', action='store_true', help='Print parameter routing info for Muon optimizer')
 
         # ema params
         sub_parser.add_argument('--use_ema', action='store_true', help='Whether to use EMA for model weights')
@@ -431,7 +492,10 @@ if __name__ == "__main__":
 
     model.to(device)
 
-    trainer: CommonTrainer = get_trainer(args.command, args, run_dir, model, device, shared_window_buffer=shared_window_buffer)
+    # Create optimizer if using Muon (not passed to trainer yet)
+    optimizer = get_optimizer(args, model)
+
+    trainer: CommonTrainer = get_trainer(args.command, args, run_dir, model, optimizer, device, shared_window_buffer=shared_window_buffer)
 
     if args.local_rank == 0 or not args.use_deepspeed:
         trainer.start_train_print(args)

@@ -71,9 +71,11 @@ class SIVEVisualizationCallback(VisualizationCallback):
         max_speakers_for_tsne: int = 15,
         # Audio settings
         audio_sample_rate: int = 16000,
+        audio_max_length: int = 10,
         audio_n_fft: int = 1024,
         audio_hop_length: int = 256,
         num_audio_samples: int = 4,
+        sive_downsampling_factor: int = 4,
         # LM decoder settings (beam search with optional language model)
         kenlm_model_path: Optional[str] = None,
         lm_alpha: float = 0.5,
@@ -93,6 +95,8 @@ class SIVEVisualizationCallback(VisualizationCallback):
         self.audio_n_fft = audio_n_fft
         self.audio_hop_length = audio_hop_length
         self.num_audio_samples = num_audio_samples
+        self.max_mel_frames = (audio_sample_rate * audio_max_length) // audio_hop_length
+        self.max_feature_frames = (self.max_mel_frames + sive_downsampling_factor - 1) // sive_downsampling_factor
 
         # LM decoder settings
         self.kenlm_model_path = kenlm_model_path
@@ -330,6 +334,20 @@ class SIVEVisualizationCallback(VisualizationCallback):
 
                 # 2. Feature heatmap
                 feat_np = features[0, :feature_length].cpu().numpy().T  # [D, T]
+    
+                # Log features as grayscale image upscaled to mel resolution for alignment
+                feat_normalized = (feat_np - feat_np.min()) / (feat_np.max() - feat_np.min() + 1e-8)
+                # Pad timesteps to max_feature_frames, then nearest-neighbor upscale to max_mel_frames
+                feat_padded = np.zeros((feat_normalized.shape[0], self.max_feature_frames))
+                feat_padded[:, :feat_normalized.shape[1]] = feat_normalized
+                # Upscale to mel resolution using nearest-neighbor (preserves pixel-accurate look)
+                feat_upscaled = np.repeat(feat_padded, self.max_mel_frames // self.max_feature_frames, axis=1)
+                # Handle remainder frames if max_mel_frames isn't evenly divisible
+                if feat_upscaled.shape[1] < self.max_mel_frames:
+                    feat_upscaled = np.pad(feat_upscaled, ((0, 0), (0, self.max_mel_frames - feat_upscaled.shape[1])))
+                # Flip vertically so feature dim 0 is at bottom (origin="lower")
+                writer.add_image(f"ctc_alignment/sample_{i}/features_grid", feat_upscaled[::-1][np.newaxis], step, dataformats='CHW')
+
                 im1 = axes[1].imshow(feat_np, aspect="auto", origin="lower", cmap="viridis")
                 axes[1].set_title(f"SIVE Features (T'={feature_length}, D={feat_np.shape[0]})")
                 axes[1].set_ylabel("Feature Dim")
