@@ -94,6 +94,24 @@ CONFIGS = {
         num_heads=8,
         ff_dim=512,
         dropout=0.1,
+        ctc_upsample_factor=2,
+    ),
+    "tiny_deep_2xdownsample": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=128,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        conv_strides=[2, 1, 1],  # 2x downsampling instead of 4x (more CTC frames, higher transformer cost)
+        ctc_upsample_factor=1,
+    ),
+    "tiny_deep_4xupsample": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=128,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        ctc_upsample_factor=4,
     ),
     # ~9.6M params w/ macaron and swiglu, ~3.7M w/o
     "small": SpeakerInvariantVoiceEncoderConfig(
@@ -108,7 +126,7 @@ CONFIGS = {
         encoder_dim=256,
         num_layers=12,
         num_heads=8,
-        ff_dim=1152,
+        ff_dim=1024,
         dropout=0.1,
     ),
     # ~32M params w/ macaron and swiglu, ~11M w/o
