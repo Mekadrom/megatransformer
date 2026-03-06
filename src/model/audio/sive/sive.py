@@ -9,7 +9,7 @@ from config.audio.sive.sive import CONFIGS as SIVE_CONFIGS
 from utils.megatransformer_utils import print_debug_tensor
 
 from config.audio.sive.sive import SpeakerInvariantVoiceEncoderConfig
-from model.audio.sive.conv_subsampling import ConvSubsampling
+from model.audio.sive.conv_subsampling import Conv2dSubsampling, ConvSubsampling
 from model.audio.sive.grl import GradientReversalFunction, SpeakerClassifier
 from model.audio.sive.sive_block import SpeakerInvariantVoiceEncoderBlock
 from model.audio.sive.spec_augment import SpecAugment
@@ -43,13 +43,22 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             self.spec_augment = None
 
         # Convolutional subsampling frontend with optional Dropout1d
-        self.conv_subsample = ConvSubsampling(
-            in_channels=config.audio_n_mels,
-            out_channels=config.encoder_dim,
-            kernel_sizes=config.conv_kernel_sizes,
-            strides=config.conv_strides,
-            dropout=config.conv_dropout if config.conv_dropout > 0 else config.dropout,
-        )
+        if config.use_conv2d_frontend:
+            self.conv_subsample = Conv2dSubsampling(
+                out_channels=config.encoder_dim,
+                n_mels=config.audio_n_mels,
+                kernel_sizes=config.conv_kernel_sizes,
+                strides=config.conv_strides,
+                dropout=config.conv_dropout if config.conv_dropout > 0 else config.dropout,
+            )
+        else:
+            self.conv_subsample = ConvSubsampling(
+                in_channels=config.audio_n_mels,
+                out_channels=config.encoder_dim,
+                kernel_sizes=config.conv_kernel_sizes,
+                strides=config.conv_strides,
+                dropout=config.conv_dropout if config.conv_dropout > 0 else config.dropout,
+            )
 
         # Transformer encoder blocks with architectural options
         # Stochastic depth: linearly scale drop_path from 0 to drop_path_rate

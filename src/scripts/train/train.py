@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import psutil
 
@@ -97,7 +98,7 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
         collator =  AudioDataCollator(
             max_waveforms=args.audio_max_seconds * args.audio_sample_rate,
             max_mel_spec_frames=audio_max_frames,
-            max_sive_feature_frames=audio_max_frames // 4,
+            max_sive_feature_frames=math.ceil(audio_max_frames / 4.0),
             speaker_embedding_dim=args.speaker_embedding_dim if hasattr(args, 'speaker_embedding_dim') else 192,
         )
     elif command in ["image-vae"]:
@@ -115,6 +116,7 @@ def get_dataset(command: str, args, split: str):
                 "features",  # includes lengths
                 "mel_specs",  # includes lengths
                 "speaker_embeddings",
+                "speaker_ids",
                 "f0",
                 "vuv",
                 "text",
@@ -383,6 +385,7 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm')
         sub_parser.add_argument('--fp16', action='store_true', help='Whether to use fp16')
         sub_parser.add_argument('--bf16', action='store_true', help='Whether to use bf16')
+        sub_parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
 
         # muon optimizer params
         sub_parser.add_argument('--use_muon', action='store_true', help='Use Muon+AdamW optimizer instead of AdamW')

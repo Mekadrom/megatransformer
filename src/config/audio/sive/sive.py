@@ -2,7 +2,7 @@ import dataclasses
 import json
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 
 @dataclass
@@ -13,10 +13,11 @@ class SpeakerInvariantVoiceEncoderConfig:
     num_layers: int = 4
     num_heads: int = 4
     ff_dim: int = 1024
-    conv_kernel_sizes: Optional[list[int]] = None
-    conv_strides: Optional[list[int]] = None
+    use_conv2d_frontend: bool = False
+    conv_kernel_sizes: Optional[list[Union[int, tuple[int, int], list[int]]]] = None
+    conv_strides: Optional[list[Union[int, tuple[int, int], list[int]]]] = None
     vocab_size: int = 30  # " 'abcdefghijklmnopqrstuvwxyz" + blank + UNKOWN
-    num_speakers: int = 921
+    num_speakers: int = 2338
     dropout: float = 0.1
     max_seq_len: int = 4096
     speaker_pooling: str = "mean"
@@ -55,6 +56,8 @@ class SpeakerInvariantVoiceEncoderConfig:
     # factor=1: no upsampling (default), factor=2: 2x more CTC frames, etc.
     ctc_upsample_factor: int = 1
 
+    downsample_norm_type: Optional[str] = None  # "batchnorm", "layernorm", or None (default)
+
     speaker_classifier_hidden_dim: Optional[int] = None
 
     def __post_init__(self):
@@ -63,6 +66,8 @@ class SpeakerInvariantVoiceEncoderConfig:
             self.conv_kernel_sizes = [7, 3, 3]  # Larger first kernel for more acoustic context
         if self.conv_strides is None:
             self.conv_strides = [2, 2, 1]  # 4x downsampling
+        if self.downsample_norm_type is None:
+            self.downsample_norm_type = "instancenorm"
 
         if self.speaker_classifier_hidden_dim is None:
             self.speaker_classifier_hidden_dim = self.encoder_dim * 2
@@ -95,6 +100,52 @@ CONFIGS = {
         ff_dim=512,
         dropout=0.1,
         ctc_upsample_factor=2,
+    ),
+    "tiny_deep": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=128,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        use_conv2d_frontend=True,
+        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
+        conv_strides=[(2, 2), (1, 1), (1, 1)],  # 4x downsampling
+        ctc_upsample_factor=2,
+    ),
+    "tiny_deep_4xdownsample_conv2d": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=128,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        use_conv2d_frontend=True,
+        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
+        conv_strides=[(2, 2), (2, 2), (1, 1)],
+        ctc_upsample_factor=2,
+    ),
+    "tiny_deep_4xdownsample_conv2d_batchnorm": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=128,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        use_conv2d_frontend=True,
+        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
+        conv_strides=[(2, 2), (2, 2), (1, 1)],
+        ctc_upsample_factor=2,
+        downsample_norm_type="batchnorm",
+    ),
+    "tiny_deep_3xdownsample_conv2d_batchnorm": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=128,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        use_conv2d_frontend=True,
+        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
+        conv_strides=[(2, 3), (2, 1), (1, 1)],
+        ctc_upsample_factor=2,
+        downsample_norm_type="batchnorm",
     ),
     "tiny_deep_2xdownsample": SpeakerInvariantVoiceEncoderConfig(
         encoder_dim=128,

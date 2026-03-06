@@ -55,8 +55,94 @@ def load_model(
     return model
 
 
+class PretrainedVocoderWrapper(torch.nn.Module):
+    """Wraps a pretrained vocoder to match the expected interface.
+
+    Expected interface: vocoder(mel_spec) -> {"pred_waveform": waveform}
+    where mel_spec is [B, n_mels, T] and waveform is [B, T] or [T].
+    """
+    def __init__(self, vocoder: torch.nn.Module, name: str = "pretrained"):
+        super().__init__()
+        self.vocoder = vocoder
+        self.name = name
+
+    def forward(self, mel_spec: torch.Tensor) -> dict[str, torch.Tensor]:
+        waveform = self.vocoder(mel_spec)
+        # Handle various output formats
+        if isinstance(waveform, dict):
+            return waveform
+        if isinstance(waveform, (tuple, list)):
+            waveform = waveform[0]
+        # Squeeze channel dim if present: [B, 1, T] -> [B, T]
+        if waveform.dim() == 3 and waveform.shape[1] == 1:
+            waveform = waveform.squeeze(1)
+        return {"pred_waveform": waveform}
+
+
+def _load_pretrained_hifigan():
+    """Load SpeechBrain HiFi-GAN trained on LibriTTS at 16kHz.
+
+    Mel parameters: 80 bins, 1024 n_fft, 256 hop_length, slaney norm, f_max=8000.
+    """
+    try:
+        from speechbrain.inference.vocoders import HIFIGAN
+    except ImportError:
+        raise ImportError(
+            "speechbrain is required for pretrained HiFi-GAN vocoder. "
+            "Install it with: pip install speechbrain"
+        )
+
+    hifi_gan = HIFIGAN.from_hparams(
+        source="speechbrain/tts-hifigan-libritts-16kHz",
+        savedir="pretrained_models/tts-hifigan-libritts-16kHz",
+    )
+
+    # Extract the generator directly from SpeechBrain's ModuleDict and cast to float32.
+    # We bypass decode_batch/infer because those only cast device (not dtype),
+    # causing bf16 mismatches when training with --bf16.
+    generator = hifi_gan.mods.generator.float()
+
+    class HiFiGANInner(torch.nn.Module):
+        def __init__(self, gen):
+            super().__init__()
+            self.generator = gen
+
+        def forward(self, mel_spec: torch.Tensor) -> torch.Tensor:
+            mel_spec = mel_spec.float()
+            return self.generator.inference(mel_spec).squeeze(1)  # [B, 1, T] -> [B, T]
+
+    inner = HiFiGANInner(generator)
+    return PretrainedVocoderWrapper(inner, name="hifigan-libritts-16khz")
+
+
+PRETRAINED_VOCODERS = {
+    "hifigan": _load_pretrained_hifigan,
+}
+
+
 def load_vocoder(vocoder_checkpoint_path, vocoder_config, shared_window_buffer, is_wrapped: bool = False):
-    """Lazily load vocoder on first use."""
+    """Load vocoder for mel-to-waveform conversion.
+
+    For pretrained vocoders, set vocoder_config to a pretrained name (e.g. "hifigan")
+    and vocoder_checkpoint_path can be None.
+
+    Available pretrained vocoders:
+        - "hifigan": SpeechBrain HiFi-GAN trained on LibriTTS at 16kHz
+                     (80 mel bins, 256 hop_length, 1024 n_fft, slaney norm)
+    """
+    # Check for pretrained vocoders first
+    if vocoder_config in PRETRAINED_VOCODERS:
+        try:
+            vocoder = PRETRAINED_VOCODERS[vocoder_config]()
+            vocoder.eval()
+            print(f"Loaded pretrained vocoder: {vocoder.name}")
+            print(f"Vocoder parameters: {sum(p.numel() for p in vocoder.parameters()):,}")
+            return vocoder
+        except Exception as e:
+            print(f"Failed to load pretrained vocoder '{vocoder_config}': {e}")
+            raise e
+
+    # Fall back to custom vocoder loading
     if vocoder_checkpoint_path is None:
         return
 

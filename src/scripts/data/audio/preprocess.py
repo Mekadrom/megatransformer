@@ -729,7 +729,7 @@ class AudioDatasetPreprocessor(Preprocessor):
             mel_specs, mel_spec_lengths, waveform_lengths = self.encode_to_mels(waveforms)
 
             if self.sive_batch_processor is not None:
-                features_result = self.sive_batch_processor.process_batch(mel_specs, mel_spec_lengths)
+                features_result = self.sive_batch_processor.process_batch(mel_specs.to(self.sive_batch_processor.device), mel_spec_lengths.to(self.sive_batch_processor.device))
             
             if self.args.compute_speaker_embeddings:
                 speaker_features_result = self.speaker_feature_batch_processor.process_batch(waveforms, waveform_lengths, mel_specs, mel_spec_lengths)

@@ -335,16 +335,18 @@ class SIVEVisualizationCallback(VisualizationCallback):
                 # 2. Feature heatmap
                 feat_np = features[0, :feature_length].cpu().numpy().T  # [D, T]
     
-                # Log features as grayscale image upscaled to mel resolution for alignment
+                # Log features as grayscale image upscaled with square pixels
                 feat_normalized = (feat_np - feat_np.min()) / (feat_np.max() - feat_np.min() + 1e-8)
-                # Pad timesteps to max_feature_frames, then nearest-neighbor upscale to max_mel_frames
-                feat_padded = np.zeros((feat_normalized.shape[0], self.max_feature_frames))
-                feat_padded[:, :feat_normalized.shape[1]] = feat_normalized
-                # Upscale to mel resolution using nearest-neighbor (preserves pixel-accurate look)
-                feat_upscaled = np.repeat(feat_padded, self.max_mel_frames // self.max_feature_frames, axis=1)
-                # Handle remainder frames if max_mel_frames isn't evenly divisible
+                # Repeat both axes by the same factor for square pixels
+                actual_feature_frames = feat_normalized.shape[1]
+                upsample_ratio = max(1, self.max_mel_frames // actual_feature_frames)
+                feat_upscaled = np.repeat(feat_normalized, upsample_ratio, axis=1)
+                feat_upscaled = np.repeat(feat_upscaled, upsample_ratio, axis=0)
+                # Pad or trim time axis to match mel resolution
                 if feat_upscaled.shape[1] < self.max_mel_frames:
                     feat_upscaled = np.pad(feat_upscaled, ((0, 0), (0, self.max_mel_frames - feat_upscaled.shape[1])))
+                elif feat_upscaled.shape[1] > self.max_mel_frames:
+                    feat_upscaled = feat_upscaled[:, :self.max_mel_frames]
                 # Flip vertically so feature dim 0 is at bottom (origin="lower")
                 writer.add_image(f"ctc_alignment/sample_{i}/features_grid", feat_upscaled[::-1][np.newaxis], step, dataformats='CHW')
 

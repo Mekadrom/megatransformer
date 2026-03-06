@@ -6,8 +6,8 @@ from typing import Optional, Union
 
 from torch.utils.checkpoint import checkpoint
 
-from config.audio.vae.vae import AUDIO_VAE_CONFIGS, AUDIO_DECODER_CONFIGS, AUDIO_ENCODER_CONFIGS, F0_CONDITIONING_EMBEDDING_CONFIGS, F0_PREDICTOR_CONFIGS, AudioVAEConfig, F0ConditioningEmbeddingConfig, F0PredictorConfig
-from config.audio.vae.vae import AudioVAEDecoderConfig, AudioVAEEncoderConfig
+from config.audio.vae.vae import AUDIO_VAE_CONFIGS, AUDIO_DECODER_CONFIGS, AUDIO_DECODER_1D_CONFIGS, AUDIO_ENCODER_CONFIGS, F0_CONDITIONING_EMBEDDING_CONFIGS, F0_PREDICTOR_CONFIGS, AudioVAEConfig, F0ConditioningEmbeddingConfig, F0PredictorConfig
+from config.audio.vae.vae import AudioVAEDecoderConfig, AudioVAEDecoder1DConfig, AudioVAEEncoderConfig
 from model import activations
 from model.activations import get_activation_type
 from model.audio.vae.residual_block import ResidualBlock1d, ResidualBlock2d
@@ -155,6 +155,7 @@ class AudioVAEDecoder(nn.Module):
         super().__init__()
 
         self.config = config
+        self.gradient_checkpointing = False
 
         # Effective speaker dim for FiLM
         self.film_speaker_dim = config.speaker_embedding_proj_dim if config.speaker_embedding_proj_dim > 0 else config.speaker_embedding_dim
@@ -456,6 +457,269 @@ class AudioVAEDecoder(nn.Module):
         return x
 
 
+class AudioVAEDecoder1D(nn.Module):
+    """
+    Conv1D-only audio VAE decoder. Treats frequency as channels throughout.
+
+    Avoids ring/circle artifacts caused by Conv2D's spatial isotropy assumption
+    on mel spectrograms where frequency and time axes have different semantics.
+
+    Takes 1D latent [B, latent_dim, T'] and produces mel spectrogram [B, output_dim, T].
+
+    Architecture:
+    1. Initial projection: latent → initial_channels
+    2. F0 injection (additive)
+    3. Early FiLM (speaker conditioning)
+    4. Pre-upsample residual blocks
+    5. Upsample stages: Upsample + Conv1d + ResidualBlock1d + FiLM
+    6. Final conv: channels → output_dim (80 mel bins)
+    """
+    def __init__(self, config: AudioVAEDecoder1DConfig):
+        super().__init__()
+
+        self.config = config
+        self.gradient_checkpointing = False
+
+        # Effective speaker dim for FiLM
+        self.film_speaker_dim = config.speaker_embedding_proj_dim if config.speaker_embedding_proj_dim > 0 else config.speaker_embedding_dim
+
+        # Activation helper
+        if config.activation == "snake":
+            self.get_activation = lambda c: activations.Snake(c)
+        else:
+            activation_type = get_activation_type(config.activation)
+            if activation_type in [activations.SwiGLU, activations.Snake]:
+                self.get_activation = lambda c: activation_type(c)
+            else:
+                self.get_activation = lambda _: activation_type()
+
+        # Speaker embedding projection
+        self.speaker_embedding_projection = None
+        if config.speaker_embedding_dim > 0 and config.speaker_embedding_proj_dim > 0 and config.speaker_embedding_proj_dim != config.speaker_embedding_dim:
+            self.speaker_embedding_projection = nn.Sequential(
+                nn.Linear(config.speaker_embedding_dim, config.speaker_embedding_proj_dim),
+                nn.SiLU(),
+            )
+
+        # Initial projection from latent to working channels
+        self.initial_conv = nn.Conv1d(config.latent_channels, config.initial_channels, kernel_size=3, padding=1)
+        self.initial_norm = nn.GroupNorm(max(1, config.initial_channels // 4), config.initial_channels)
+        self.initial_act = self.get_activation(config.initial_channels)
+
+        # F0 conditioning injection (additive, projected to initial_channels)
+        self.f0_projection = nn.Sequential(
+            nn.Conv1d(config.f0_embedding_dim, config.initial_channels, kernel_size=1),
+            nn.SiLU(),
+            nn.Conv1d(config.initial_channels, config.initial_channels, kernel_size=3, padding=1),
+        )
+
+        # Early FiLM (speaker conditioning on initial channels)
+        if config.speaker_embedding_dim > 0:
+            self.early_film_projection = nn.Sequential(
+                nn.Linear(self.film_speaker_dim, self.film_speaker_dim),
+                nn.SiLU(),
+                nn.Linear(self.film_speaker_dim, config.initial_channels * 2),
+            )
+
+        # Pre-upsample residual blocks
+        self.pre_upsample_blocks = nn.ModuleList([
+            ResidualBlock1d(
+                config.initial_channels, config.initial_channels,
+                kernel_size=config.pre_upsample_kernel_size,
+                activation_fn=config.activation,
+            )
+            for _ in range(config.pre_upsample_residual_blocks)
+        ])
+
+        # Upsample stages
+        all_channels = [config.initial_channels] + config.stage_channels
+        self.upsample_stages = nn.ModuleList()
+
+        for in_c, out_c, kernel_size, upsample_factor in zip(
+            all_channels[:-1], config.stage_channels, config.stage_kernel_sizes, config.time_upsample_factors
+        ):
+            stage = nn.ModuleList()
+
+            # Upsample (skip if factor=1)
+            if upsample_factor > 1:
+                stage.append(nn.Upsample(scale_factor=upsample_factor, mode='nearest'))
+            else:
+                stage.append(nn.Identity())
+
+            # Conv after upsample
+            padding = kernel_size // 2
+            stage.append(nn.Conv1d(in_c, out_c, kernel_size, padding=padding))
+            stage.append(nn.GroupNorm(max(1, out_c // 4), out_c))
+            stage.append(self.get_activation(out_c))
+
+            # Residual blocks
+            for _ in range(config.n_residual_blocks_per_stage):
+                stage.append(ResidualBlock1d(out_c, out_c, kernel_size=kernel_size, activation_fn=config.activation))
+
+            if config.dropout > 0:
+                stage.append(nn.Dropout(config.dropout))
+
+            self.upsample_stages.append(stage)
+
+        # FiLM projections for upsample stages
+        if config.speaker_embedding_dim > 0:
+            self.stage_film_projections = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(self.film_speaker_dim, self.film_speaker_dim),
+                    nn.SiLU(),
+                    nn.Linear(self.film_speaker_dim, out_c * 2),
+                )
+                for out_c in config.stage_channels
+            ])
+
+        # Final output conv — named final_conv for adaptive weight compatibility
+        self.final_conv = nn.Conv1d(config.stage_channels[-1], config.output_dim, kernel_size=3, padding=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.GroupNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+        # Init FiLM projections
+        if self.config.speaker_embedding_dim > 0:
+            if hasattr(self, 'early_film_projection'):
+                self._init_film_projection(self.early_film_projection)
+            for proj in self.stage_film_projections:
+                self._init_film_projection(proj)
+
+    def _init_film_projection(self, proj):
+        if isinstance(proj, nn.Sequential):
+            linear_layers = [m for m in proj if isinstance(m, nn.Linear)]
+            for i, linear in enumerate(linear_layers):
+                if i < len(linear_layers) - 1:
+                    if linear.bias is not None:
+                        nn.init.zeros_(linear.bias)
+                else:
+                    nn.init.normal_(linear.weight, mean=0.0, std=0.02)
+                    if linear.bias is not None:
+                        nn.init.zeros_(linear.bias)
+
+    @classmethod
+    def from_config(cls, config: Union[str, AudioVAEDecoder1DConfig], **overrides) -> "AudioVAEDecoder1D":
+        if isinstance(config, str):
+            if config not in AUDIO_DECODER_1D_CONFIGS:
+                raise ValueError(f"Unknown config: {config}. Available: {list(AUDIO_DECODER_1D_CONFIGS.keys())}")
+            config = AUDIO_DECODER_1D_CONFIGS[config]
+
+        config_dict = {k: v for k, v in config.__dict__.items()}
+        config_dict.update(overrides)
+        config = AudioVAEDecoder1DConfig(**config_dict)
+
+        return cls(config)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        self.gradient_checkpointing = False
+
+    def get_output_length(self, input_length: int) -> int:
+        length = input_length
+        for factor in self.config.time_upsample_factors:
+            length = length * factor
+        return length
+
+    def _apply_film(self, x: torch.Tensor, film_params: torch.Tensor, return_film_stats: bool, stats_dict: Optional[dict], prefix: str) -> torch.Tensor:
+        channels = x.shape[1]
+        scale = film_params[:, :channels].unsqueeze(-1)  # [B, C, 1]
+        shift = film_params[:, channels:].unsqueeze(-1)
+
+        if return_film_stats and stats_dict is not None:
+            stats_dict[f"{prefix}_scale_raw_mean"] = scale.mean().item()
+            stats_dict[f"{prefix}_shift_raw_mean"] = shift.mean().item()
+
+        if self.config.film_scale_bound > 0:
+            scale = self.config.film_scale_bound * torch.tanh(scale)
+        if self.config.film_shift_bound > 0:
+            shift = self.config.film_shift_bound * torch.tanh(shift)
+
+        return x * (1 + scale) + shift
+
+    def _run_stage(self, stage: nn.ModuleList, x: torch.Tensor) -> torch.Tensor:
+        for layer in stage:
+            x = layer(x)
+        return x
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        speaker_embedding: torch.Tensor,
+        f0_embedding: torch.Tensor,
+        return_film_stats: bool = False,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[str, float]]]:
+        """
+        Args:
+            z: [B, latent_dim, T'] latent tensor
+            speaker_embedding: [B, speaker_dim] or [B, 1, speaker_dim]
+            f0_embedding: [B, f0_conditioning_dim, T'] F0 conditioning
+
+        Returns:
+            recon: [B, output_dim, T] reconstructed mel spectrogram (3D, no channel squeeze needed)
+        """
+        film_stats: Optional[dict[str, float]] = {} if return_film_stats else None
+
+        # Process speaker embedding
+        if speaker_embedding is not None:
+            if speaker_embedding.dim() == 3:
+                speaker_embedding = speaker_embedding.squeeze(1)
+            if self.config.normalize_speaker_embedding:
+                speaker_embedding = F.normalize(speaker_embedding, p=2, dim=-1)
+            if self.speaker_embedding_projection is not None:
+                speaker_embedding = self.speaker_embedding_projection(speaker_embedding)
+
+        # Initial projection
+        x: torch.Tensor = self.initial_conv(z)
+        x = self.initial_norm(x)
+        x = self.initial_act(x)
+
+        # F0 injection (additive)
+        if f0_embedding.shape[-1] != x.shape[-1]:
+            f0_embedding = F.interpolate(f0_embedding, size=x.shape[-1], mode='linear', align_corners=False)
+        f0_cond: torch.Tensor = self.f0_projection(f0_embedding)
+        x = x + f0_cond
+
+        # Early FiLM
+        if speaker_embedding is not None and self.config.speaker_embedding_dim > 0:
+            film_params = self.early_film_projection(speaker_embedding)
+            x = self._apply_film(x, film_params, return_film_stats, film_stats, "early")
+
+        # Pre-upsample residual blocks
+        for block in self.pre_upsample_blocks:
+            x = block(x)
+
+        # Upsample stages with FiLM
+        for i, stage in enumerate(self.upsample_stages):
+            if self.gradient_checkpointing and self.training and i >= 1:
+                x = checkpoint(self._run_stage, stage, x, use_reentrant=False)
+            else:
+                x = self._run_stage(stage, x)
+
+            # FiLM conditioning after each stage
+            if speaker_embedding is not None and self.config.speaker_embedding_dim > 0:
+                film_params = self.stage_film_projections[i](speaker_embedding)
+                x = self._apply_film(x, film_params, return_film_stats, film_stats, f"stage_{i}")
+
+        # Final output: [B, output_dim, T]
+        x = self.final_conv(x)
+
+        if return_film_stats:
+            return x, film_stats
+
+        return x
+
+
 class F0Predictor(nn.Module):
     """
     Predicts F0 (fundamental frequency) contour from speaker embedding + SIVE features.
@@ -695,7 +959,7 @@ class AudioVAE(nn.Module):
         self,
         config: AudioVAEConfig,
         encoder: AudioVAEEncoder,
-        decoder: AudioVAEDecoder,
+        decoder: Union[AudioVAEDecoder, AudioVAEDecoder1D],
         f0_predictor: F0Predictor,
         f0_embedding: F0ConditioningEmbedding,
     ):
@@ -724,20 +988,30 @@ class AudioVAE(nn.Module):
         """
         if config_name not in AUDIO_VAE_CONFIGS:
             raise ValueError(f"Unknown config: {config_name}. Available: {list(AUDIO_VAE_CONFIGS.keys())}")
-        
+
         config = AUDIO_VAE_CONFIGS[config_name]
-        # Apply overrides
+        # Filter overrides to only AudioVAEConfig fields for top-level config
+        vae_fields = set(config.__dict__.keys())
         config_dict = {k: v for k, v in config.__dict__.items()}
-        config_dict.update(overrides)
+        config_dict.update({k: v for k, v in overrides.items() if k in vae_fields})
         config = AudioVAEConfig(**config_dict)
 
         config_dict = {k: v for k, v in config.encoder_config.__dict__.items()}
         config_dict.update(overrides)
         encoder = AudioVAEEncoder.from_config(config.encoder_config, **config_dict)
 
-        config_dict = {k: v for k, v in config.decoder_config.__dict__.items()}
-        config_dict.update(overrides)
-        decoder = AudioVAEDecoder.from_config(config.decoder_config, **config_dict)
+        # Select decoder type based on config
+        if config.decoder_1d_config is not None:
+            config_dict = {k: v for k, v in config.decoder_1d_config.__dict__.items()}
+            config_dict.update(overrides)
+            decoder = AudioVAEDecoder1D.from_config(config.decoder_1d_config, **config_dict)
+        else:
+            config_dict = {k: v for k, v in config.decoder_config.__dict__.items()}
+            config_dict.update(overrides)
+            decoder = AudioVAEDecoder.from_config(config.decoder_config, **config_dict)
+
+        overrides.pop('latent_channels', None)
+        overrides.pop('activation', None)
 
         config_dict = {k: v for k, v in config.f0_predictor_config.__dict__.items()}
         config_dict.update(overrides)
@@ -960,11 +1234,12 @@ class AudioVAE(nn.Module):
 
             # Voicing prediction loss (BCE with soft targets)
             # target_voiced is now a soft probability (0-1) from periodicity
-            # Disable autocast for BCE (not autocast-safe with post-sigmoid values)
+            # Use bce_with_logits for numerical stability (avoids NaN from sigmoid + BCE)
             with torch.autocast(device_type='cuda', enabled=False):
-                vuv_loss = F.binary_cross_entropy(
-                    voiced_pred_up.clamp(1e-7, 1 - 1e-7).float(),
-                    target_voiced.clamp(0, 1).float(),  # Ensure valid probability range
+                voiced_logit = torch.logit(voiced_pred_up.float(), eps=1e-6)
+                vuv_loss = F.binary_cross_entropy_with_logits(
+                    voiced_logit,
+                    target_voiced.clamp(0, 1).float(),
                     reduction='mean'
                 )
 
@@ -1008,12 +1283,12 @@ class AudioCVAEDecoderOnly(nn.Module):
     such as in a conditional generation setup.
 
     Input: [B, latent_dim, T'] latent representation
-    Output: [B, 1, n_mels, T] reconstructed mel spectrogram
+    Output: [B, n_mels, T] reconstructed mel spectrogram
     """
     def __init__(
         self,
         config: AudioVAEConfig,
-        decoder: AudioVAEDecoder,
+        decoder: Union[AudioVAEDecoder, AudioVAEDecoder1D],
         f0_predictor: F0Predictor,
         f0_embedding: F0ConditioningEmbedding,
     ):
@@ -1046,12 +1321,18 @@ class AudioCVAEDecoderOnly(nn.Module):
                 raise ValueError(f"Unknown config: {config}. Available: {list(AUDIO_VAE_CONFIGS.keys())}")
             config = AUDIO_VAE_CONFIGS[config]
 
-        # Apply overrides
-        config_dict = {k: v for k, v in config.decoder_config.__dict__.items()}
-        config_dict.update(overrides)
-        decoder = AudioVAEDecoder.from_config(config.decoder_config, **config_dict)
+        # Select decoder type based on config
+        if config.decoder_1d_config is not None:
+            config_dict = {k: v for k, v in config.decoder_1d_config.__dict__.items()}
+            config_dict.update(overrides)
+            decoder = AudioVAEDecoder1D.from_config(config.decoder_1d_config, **config_dict)
+        else:
+            config_dict = {k: v for k, v in config.decoder_config.__dict__.items()}
+            config_dict.update(overrides)
+            decoder = AudioVAEDecoder.from_config(config.decoder_config, **config_dict)
 
         overrides.pop('latent_channels', None)  # F0 and F0 conditioning can't take this
+        overrides.pop('activation', None)
 
         config_dict = {k: v for k, v in config.f0_predictor_config.__dict__.items()}
         config_dict.update(overrides)
@@ -1235,11 +1516,12 @@ class AudioCVAEDecoderOnly(nn.Module):
 
             # Voicing prediction loss (BCE with soft targets)
             # target_voiced is now a soft probability (0-1) from periodicity
-            # Disable autocast for BCE (not autocast-safe with post-sigmoid values)
+            # Use bce_with_logits for numerical stability (avoids NaN from sigmoid + BCE)
             with torch.autocast(device_type='cuda', enabled=False):
-                vuv_loss = F.binary_cross_entropy(
-                    voiced_pred_up.clamp(1e-7, 1 - 1e-7).float(),
-                    target_voiced.clamp(0, 1).float(),  # Ensure valid probability range
+                voiced_logit = torch.logit(voiced_pred_up.float(), eps=1e-6)
+                vuv_loss = F.binary_cross_entropy_with_logits(
+                    voiced_logit,
+                    target_voiced.clamp(0, 1).float(),
                     reduction='mean'
                 )
 

@@ -104,7 +104,7 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
                     mel_specs = sample["mel_specs"]
                     mel_lengths = sample.get("mel_lengths", None)
                     mel_spec_masks = sample.get("mel_spec_masks", None)
-                    speaker_embedding = sample.get("speaker_embedding", None)
+                    speaker_embeddings = sample.get("speaker_embeddings", None)
                     sample_f0 = sample.get("f0", None)
                     sample_voiced = sample.get("voiced", None)
 
@@ -123,7 +123,7 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
                         target_f0 = sample_f0[:mel_lengths].unsqueeze(0).to(device)  # [1, T]
                         target_voiced = sample_voiced[:mel_lengths].unsqueeze(0).to(device)  # [1, T]
 
-                    spk_emb = speaker_embedding.to(device)
+                    spk_emb = speaker_embeddings.to(device)
 
                     # Use reconstruct_with_attention to get attention weights
                     if is_vae:
@@ -164,7 +164,7 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
                     eval_samples_data.append({
                         "features": features,  # [1, C, H, W]
                         "mel": mel,  # [1, n_mels, T]
-                        "speaker_embedding": speaker_embedding,  # [192] or None (pretrained)
+                        "speaker_embedding": speaker_embeddings,  # [192] or None (pretrained)
                         "mu": mu.cpu() if mu is not None else None,  # [1, C, H, W]
                         "mel_length": mel_lengths,
                     })

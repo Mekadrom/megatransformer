@@ -253,9 +253,8 @@ class AudioCVAEGANTrainer(CommonTrainer):
         mel_specs = inputs["mel_specs"]
         mel_spec_masks = inputs["mel_spec_masks"]
         mel_lengths = inputs["mel_lengths"]
-        speaker_embedding = inputs["speaker_embedding"]
+        speaker_embedding = inputs["speaker_embeddings"]
         f0 = inputs["f0"]
-        f0_masks = inputs["f0_masks"]
         vuv = inputs["vuv"]
 
         # Compute KL weight multiplier for KL annealing (ramps from 0 to 1)
@@ -385,6 +384,21 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 # Ensure discriminator is on the same device as inputs
                 if next(self.discriminator.parameters()).device != mel_specs.device:
                     self.discriminator = self.discriminator.to(mel_specs.device)
+                    # Migrate optimizer state to the new device. After .to(), the
+                    # model's parameter tensors are new objects on the target device,
+                    # so we rebuild the optimizer with fresh param refs and reload
+                    # the state dict (moving any momentum buffers to the device).
+                    if self.discriminator_optimizer is not None:
+                        old_state = self.discriminator_optimizer.state_dict()
+                        self.discriminator_optimizer = torch.optim.AdamW(
+                            self.discriminator.parameters(),
+                            lr=self.discriminator_optimizer.defaults["lr"],
+                            betas=self.discriminator_optimizer.defaults["betas"],
+                            weight_decay=self.discriminator_optimizer.defaults["weight_decay"],
+                        )
+                        # Reload state — moves exp_avg/exp_avg_sq to the correct device
+                        if old_state["state"]:
+                            self.discriminator_optimizer.load_state_dict(old_state)
 
                 # Apply instance noise to both real and fake mel spectrograms
                 real_for_disc = add_mel_instance_noise(mel_specs, noise_std) if noise_std > 0 else mel_specs
@@ -883,7 +897,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
             mel_spec = inputs["mel_specs"]
             mel_spec_lengths = inputs.get("mel_lengths", None)
             mel_spec_masks = inputs.get("mel_spec_masks", None)
-            speaker_embedding = inputs.get("speaker_embedding", None)
+            speaker_embeddings = inputs.get("speaker_embeddings", None)
 
             # Move to device
             mel_spec = mel_spec.to(self.args.device)
@@ -892,8 +906,8 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 mel_spec_lengths = mel_spec_lengths.to(self.args.device)
             if mel_spec_masks is not None:
                 mel_spec_masks = mel_spec_masks.to(self.args.device)
-            if speaker_embedding is not None:
-                speaker_embedding = speaker_embedding.to(self.args.device)
+            if speaker_embeddings is not None:
+                speaker_embeddings = speaker_embeddings.to(self.args.device)
 
             # Use autocast for mixed precision (same as training)
             dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
@@ -903,7 +917,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
                     features=features,
                     target=mel_spec,
                     mask=mel_spec_masks,
-                    speaker_embedding=speaker_embedding,
+                    speaker_embedding=speaker_embeddings,
                 )
 
                 loss = losses["total_loss"]
@@ -1020,7 +1034,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
 
 
 def load_model(args):
-    if args.config.endswith("_decoder_only"):
+    if "_decoder_only" in args.config:
         return model_loading_utils.load_model(AudioCVAEDecoderOnly, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
             "latent_channels": args.latent_channels,
         })
@@ -1317,8 +1331,7 @@ def add_cli_args(subparsers):
                            help="Vocoder config name (from vocoder_configs.py)")
 
     # GAN training settings
-    sub_parser.add_argument("--use_gan", type=str, default="false",
-                            help="Whether to use GAN training (true/false)")
+    sub_parser.add_argument("--use_gan", action="store_true", help="Whether to use GAN training with a discriminator")
     sub_parser.add_argument("--gan_start_condition_key", type=str, default="step",
                             help="Condition to start GAN training: 'step' or 'loss'")
     sub_parser.add_argument("--gan_start_condition_value", type=str, default="0",
@@ -1347,8 +1360,7 @@ def add_cli_args(subparsers):
                             help="Number of steps to warm up GAN loss (ramps from 0 to full)")
     # Adaptive discriminator weighting (VQGAN-style): automatically balances GAN vs reconstruction gradients
     # This prevents the discriminator from dominating and causing artifacts
-    sub_parser.add_argument("--use_adaptive_weight", type=str, default="false",
-                            help="Whether to use adaptive discriminator weighting (true/false)")
+    sub_parser.add_argument("--use_adaptive_weight", action="store_true", help="Whether to use adaptive weighting for GAN loss (VQGAN-style)")
 
     # KL annealing: ramps KL weight from 0 to full over N steps (0 = disabled, no annealing)
     sub_parser.add_argument("--kl_annealing_steps", type=int, default=0,

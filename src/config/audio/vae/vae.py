@@ -124,6 +124,82 @@ AUDIO_DECODER_CONFIGS = {
 
 
 @dataclass
+class AudioVAEDecoder1DConfig:
+    """Configuration for Conv1D-only audio VAE decoder.
+
+    Treats frequency as channels throughout — no 1D→2D reshape.
+    Avoids ring artifacts caused by Conv2D spatial isotropy assumption.
+    """
+
+    latent_channels: int = 16
+    activation: str = "silu"
+
+    # Speaker conditioning (FiLM)
+    speaker_embedding_dim: int = 192
+    speaker_embedding_proj_dim: int = 0
+    normalize_speaker_embedding: bool = True
+    film_scale_bound: float = 1.0
+    film_shift_bound: float = 1.0
+    zero_init_film_bias: bool = True
+
+    # F0 conditioning
+    f0_embedding_dim: int = 64
+
+    # 1D architecture — frequency is channels
+    initial_channels: int = 512
+    stage_channels: Optional[list[int]] = None
+    stage_kernel_sizes: Optional[list[int]] = None
+    time_upsample_factors: Optional[list[int]] = None
+    n_residual_blocks_per_stage: int = 2
+    pre_upsample_residual_blocks: int = 2
+    pre_upsample_kernel_size: int = 5
+
+    output_dim: int = 80  # n_mels
+    dropout: float = 0.1
+
+    def __post_init__(self):
+        if self.stage_channels is None:
+            self.stage_channels = [512, 256, 256]
+        if self.stage_kernel_sizes is None:
+            self.stage_kernel_sizes = [5, 5, 5]
+        if self.time_upsample_factors is None:
+            self.time_upsample_factors = [2, 2, 1]  # 4x total time upsampling
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    def to_json_string(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+
+AUDIO_DECODER_1D_CONFIGS = {
+    "default": AudioVAEDecoder1DConfig(),
+    "small": AudioVAEDecoder1DConfig(
+        initial_channels=512,
+        stage_channels=[512, 256, 256],
+        stage_kernel_sizes=[5, 5, 5],
+        time_upsample_factors=[2, 2, 1],  # 4x total
+    ),
+    "medium": AudioVAEDecoder1DConfig(
+        initial_channels=640,
+        stage_channels=[640, 384, 256],
+        stage_kernel_sizes=[7, 5, 5],
+        time_upsample_factors=[2, 2, 1],  # 4x total
+        n_residual_blocks_per_stage=3,
+        pre_upsample_residual_blocks=3,
+        pre_upsample_kernel_size=7,
+    ),
+    "small_snake": AudioVAEDecoder1DConfig(
+        activation="snake",
+        initial_channels=512,
+        stage_channels=[512, 256, 256],
+        stage_kernel_sizes=[5, 5, 5],
+        time_upsample_factors=[2, 2, 1],  # 4x total
+    ),
+}
+
+
+@dataclass
 class F0PredictorConfig:
     speaker_embedding_dim: int = 192
     encoder_dim: int = 128
@@ -146,7 +222,7 @@ class F0PredictorConfig:
 
 F0_PREDICTOR_CONFIGS = {
     "default": F0PredictorConfig(),
-    "small_deep": F0PredictorConfig(n_layers=5, hidden_dim=256),
+    "small_deep": F0PredictorConfig(n_layers=5),
 }
 
 
@@ -186,6 +262,7 @@ class AudioVAEConfig:
     decoder_config: AudioVAEDecoderConfig = dataclasses.field(
         default_factory=AudioVAEDecoderConfig
     )
+    decoder_1d_config: Optional[AudioVAEDecoder1DConfig] = None
     f0_predictor_config: F0PredictorConfig = dataclasses.field(
         default_factory=F0PredictorConfig
     )
@@ -230,6 +307,36 @@ AUDIO_VAE_CONFIGS = {
     "small_decoder_only": AudioVAEConfig(
         encoder_config=AUDIO_ENCODER_CONFIGS["default"],
         decoder_config=AUDIO_DECODER_CONFIGS["small"],
+        f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+    ),
+    "small_1d": AudioVAEConfig(
+        encoder_config=AUDIO_ENCODER_CONFIGS["small"],
+        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["small"],
+        f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+    ),
+    "small_decoder_only_1d": AudioVAEConfig(
+        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
+        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["small"],
+        f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+    ),
+    "default_decoder_only_1d": AudioVAEConfig(
+        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
+        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["default"],
+        f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+    ),
+    "medium_decoder_only_1d": AudioVAEConfig(
+        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
+        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["medium"],
+        f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+    ),
+    "small_decoder_only_1d_snake": AudioVAEConfig(
+        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
+        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["small_snake"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),

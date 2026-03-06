@@ -348,6 +348,7 @@ def load_model(args):
         # CTC upsampling (relaxes CTC length constraint)
         'ctc_upsample_factor': args.ctc_upsample_factor,
         # Dropout regularization
+        'dropout': args.dropout,
         'conv_dropout': args.conv_dropout,
         'feature_dropout': args.feature_dropout,
         'head_dropout': args.head_dropout,

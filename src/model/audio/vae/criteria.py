@@ -94,7 +94,9 @@ class MultiScaleMelSpectrogramLoss(nn.Module):
             # Compute masked or unmasked L1 loss
             if mask_scaled is not None:
                 abs_diff = torch.abs(diff) * mask_scaled
-                valid_count = mask_scaled.sum()
+                # valid_count must account for all dimensions (including n_mels)
+                # mask_scaled is [B, 1, 1, T] but abs_diff is [B, 1, n_mels, T]
+                valid_count = mask_scaled.sum() * pred_scaled.shape[2]  # * n_mels
                 if valid_count > 0:
                     scale_loss = abs_diff.sum() / valid_count
                 else:
