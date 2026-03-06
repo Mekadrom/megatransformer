@@ -13,12 +13,14 @@ from tqdm import tqdm
 
 from scripts.data.audio.preprocess import AudioDatasetPreprocessor
 from scripts.data.image.preprocess import ImageDatasetPreprocessor
+from scripts.data.text.preprocess import TextDatasetPreprocessor
 from scripts.data.preprocessor import Preprocessor
 
 
 preprocessor_clss: list[type[Preprocessor]] = [
     AudioDatasetPreprocessor,
     ImageDatasetPreprocessor,
+    TextDatasetPreprocessor,
 ]
 
 
@@ -78,8 +80,10 @@ def get_preprocessor(command: str, args, dataset, output_dir, shard_fields, batc
         return AudioDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     elif command == "image":
         return ImageDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
+    elif command == "text":
+        return TextDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     else:
-        raise ValueError(f"Unknown command: {command}. Available: audio-vae, image-vae")
+        raise ValueError(f"Unknown command: {command}. Available: audio, image, text")
 
 
 def main():
