@@ -3,6 +3,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from config.world.world_model import TokenInterleaverConfig
+
 
 # Modality type constants for the modality map
 MODALITY_TEXT = 0

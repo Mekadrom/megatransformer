@@ -15,6 +15,7 @@ import scripts.train.audio.vae.training as audio_cvae_training
 import scripts.train.audio.sive.training as audio_sive_training
 import scripts.train.audio.vocoder.training as audio_vocoder_training
 import scripts.train.image.vae.training as image_vae_training
+import scripts.train.world.training as world_training
 
 
 from typing import Optional, List
@@ -29,6 +30,8 @@ from scripts.data.image.vae.data_collator import ImageVAEDataCollator
 from scripts.data.image.vae.dataset import ImageVAEShardedDataset
 from scripts.data.audio.data_collator import AudioDataCollator
 from scripts.data.audio.dataset import AudioShardedDataset
+from scripts.data.world.data_collator import MultimodalDataCollator
+from scripts.data.world.dataset import MultimodalShardedDataset
 from scripts.data.data_collator import DataCollator
 from scripts.train.audio.vae.visualization_callback import AudioCVAEVisualizationCallback
 from scripts.train.audio.vocoder.visualization_callback import VocoderVisualizationCallback
@@ -50,8 +53,10 @@ def create_or_load_model(args, shared_window_buffer: Optional[SharedWindowBuffer
         return audio_vocoder_training.load_model(args, shared_window_buffer=shared_window_buffer)
     elif args.command in ["image-vae"]:
         return image_vae_training.load_model(args)
+    elif args.command in ["world"]:
+        return world_training.load_model(args)
     else:
-        raise ValueError(f"Unknown command: {args.command}. Available: audio-cvae, audio-cvae-decoder, vocoder, image-vae")
+        raise ValueError(f"Unknown command: {args.command}. Available: audio-cvae, audio-cvae-decoder, vocoder, image-vae, world")
 
 
 def get_training_args(args, run_dir) -> TrainingArguments:
@@ -98,11 +103,19 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
         collator =  AudioDataCollator(
             max_waveforms=args.audio_max_seconds * args.audio_sample_rate,
             max_mel_spec_frames=audio_max_frames,
-            max_sive_feature_frames=math.ceil(audio_max_frames / 4.0),
+            max_sive_feature_frames=math.ceil(audio_max_frames / args.sive_total_stride),
             speaker_embedding_dim=args.speaker_embedding_dim if hasattr(args, 'speaker_embedding_dim') else 192,
         )
     elif command in ["image-vae"]:
         collator = ImageVAEDataCollator()
+    elif command in ["world"]:
+        audio_max_frames = int(args.audio_max_seconds * args.audio_sample_rate // args.audio_hop_length)
+        collator = MultimodalDataCollator(
+            max_seq_len=args.max_seq_len,
+            max_waveforms=int(args.audio_max_seconds * args.audio_sample_rate),
+            max_mel_spec_frames=audio_max_frames,
+            max_sive_feature_frames=math.ceil(audio_max_frames / args.sive_total_stride),
+        )
     return collator
 
 
@@ -154,6 +167,18 @@ def get_dataset(command: str, args, split: str):
             cache_size=32,
             image_size=args.image_size,
         )
+    elif command in ["world"]:
+        audio_columns = [c.strip() for c in args.audio_columns.split(",")] if args.audio_columns else None
+        text_dir = (args.text_cache_dir + "_" + split) if args.text_cache_dir else None
+        audio_dir = (args.audio_cache_dir + "_" + split) if args.audio_cache_dir else None
+        image_dir = (args.image_cache_dir + "_" + split) if args.image_cache_dir else None
+        dataset = MultimodalShardedDataset(
+            text_shard_dir=text_dir,
+            audio_shard_dir=audio_dir,
+            image_shard_dir=image_dir,
+            audio_columns=audio_columns,
+            cache_size=32,
+        )
     return dataset
 
 
@@ -202,6 +227,8 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             step_offset=args.start_step,
             num_eval_samples=8,
         )
+    elif command in ["world"]:
+        callback = None
     return callback
 
 
@@ -278,11 +305,22 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, optimizer: Option
             eval_dataset,
             device=device,
         )
+    elif command in ["world"]:
+        trainer: Trainer = world_training.create_trainer(
+            args,
+            model,
+            optimizer,
+            training_args,
+            data_collator,
+            train_dataset,
+            eval_dataset,
+        )
     else:
-        raise ValueError(f"Unknown command: {command}. Available: audio-cvae, audio-cvae-decoder")
-    
-    trainer.add_callback(visualization_callback)
-    visualization_callback.trainer = trainer
+        raise ValueError(f"Unknown command: {command}. Available: audio-cvae, audio-cvae-decoder, vocoder, image-vae, world")
+
+    if visualization_callback is not None:
+        trainer.add_callback(visualization_callback)
+        visualization_callback.trainer = trainer
 
     if ema is not None:
         trainer.add_callback(ema)
@@ -342,7 +380,8 @@ training_modules: list = [
     audio_cvae_training,
     audio_sive_training,
     audio_vocoder_training,
-    image_vae_training
+    image_vae_training,
+    world_training,
 ]
 
 
@@ -451,6 +490,7 @@ command_to_module = {
     "audio-sive": audio_sive_training,
     "vocoder": audio_vocoder_training,
     "image-vae": image_vae_training,
+    "world": world_training,
 }
 
 
@@ -484,7 +524,7 @@ if __name__ == "__main__":
     if module is None:
         raise ValueError(f"Unknown command: {args.command}. Available: audio-cvae, image-vae")
 
-    if module in [audio_cvae_training, audio_vocoder_training]:
+    if module in [audio_cvae_training, audio_vocoder_training, world_training]:
         shared_window_buffer = SharedWindowBuffer()
     else:
         shared_window_buffer = None

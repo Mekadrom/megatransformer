@@ -5,7 +5,6 @@ import torch.nn as nn
 
 from config.text.generator import TextCodaClassifierConfig
 from model.transformer import MegaTransformerBlock
-from utils import configuration
 from utils.megatransformer_utils import transformer_weight_init
 
 

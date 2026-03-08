@@ -121,6 +121,6 @@ class MegaTransformerWorldModelConfig:
     )
 
 
-WORLD_MODEL_CONFIGS: {
+WORLD_MODEL_CONFIGS = {
     "default": MegaTransformerWorldModelConfig(),
 }

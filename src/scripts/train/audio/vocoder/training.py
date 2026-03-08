@@ -733,7 +733,9 @@ def add_cli_args(subparsers):
                             help="FFT size for audio mel spectrograms (overrides config file)")
     sub_parser.add_argument("--audio_hop_length", type=int, default=256,
                             help="Hop length for audio mel spectrograms (overrides config file)")
-    
+    sub_parser.add_argument("--sive_total_stride", type=int, default=4,
+                            help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
+
     # GAN training settings
     sub_parser.add_argument("--use_gan", action="store_true",
                             help="Whether to use GAN training (true/false)")

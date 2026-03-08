@@ -364,7 +364,7 @@ class AudioDatasetPreprocessor(Preprocessor):
                 args.sive_checkpoint_path,
                 device=device,
                 overrides=model_config_overrides,
-            )
+            ).eval()
 
             print(f"  SIVE config: {args.sive_config}")
             print(f"  Encoder dimension: {sive_model.config.encoder_dim}")
@@ -723,6 +723,9 @@ class AudioDatasetPreprocessor(Preprocessor):
         return mel_specs, mel_lengths_tensor, waveform_lengths_tensor
 
     def process_and_accumulate(self):
+        if not self.batch_accumulators.get('batch_waveforms'):
+            return
+
         try:
             waveforms = self.batch_accumulators['batch_waveforms']
 

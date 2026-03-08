@@ -189,6 +189,15 @@ AUDIO_DECODER_1D_CONFIGS = {
         pre_upsample_residual_blocks=3,
         pre_upsample_kernel_size=7,
     ),
+    "medium_3x": AudioVAEDecoder1DConfig(
+        initial_channels=640,
+        stage_channels=[640, 384, 256],
+        stage_kernel_sizes=[7, 5, 5],
+        time_upsample_factors=[3, 1, 1],  # 3x total
+        n_residual_blocks_per_stage=3,
+        pre_upsample_residual_blocks=3,
+        pre_upsample_kernel_size=7,
+    ),
     "small_snake": AudioVAEDecoder1DConfig(
         activation="snake",
         initial_channels=512,
@@ -331,6 +340,12 @@ AUDIO_VAE_CONFIGS = {
     "medium_decoder_only_1d": AudioVAEConfig(
         encoder_config=AUDIO_ENCODER_CONFIGS["default"],
         decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["medium"],
+        f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+    ),
+    "medium_decoder_only_1d_3x": AudioVAEConfig(
+        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
+        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["medium_3x"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),

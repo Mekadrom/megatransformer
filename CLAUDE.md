@@ -24,6 +24,9 @@ python -m src.scripts.train.train audio-sive --run_name my_sive --config small -
 
 # Image VAE
 python -m src.scripts.train.train image-vae --run_name my_image_vae --config small --cache_dir ../cached_datasets/image
+
+# World Model (multimodal)
+python -m src.scripts.train.train world --run_name my_world --config small --include_modes text,audio,image
 ```
 
 Common training arguments:
@@ -32,6 +35,9 @@ Common training arguments:
 - `--bf16` / `--fp16`: Mixed precision training
 - `--use_gradient_checkpointing`: Memory optimization
 - `--use_gan`: Enable GAN training (for VAE models)
+- `--use_muon`: Use Muon+AdamW optimizer (with `--lr_muon`, `--lr_adamw`)
+- `--use_ema --ema_decay 0.9999`: Exponential moving average
+- `--compile_model`: torch.compile the model
 
 ### Data Preprocessing
 
@@ -66,18 +72,21 @@ python -m src.scripts.data.preprocess_dataset audio --gpu_id 0 --total_gpus 4 ..
   - `audio/`: Audio models (VAE, SIVE conformer, vocoder)
   - `image/`: Image VAE models
   - `text/`: Text feature extractor and generator
+  - `transformer.py`: `MegaTransformerBlock` with GQA, rotary embeddings, ALiBi
 
 - `src/config/`: Dataclass configs with predefined configurations (small, medium, large)
   - Each model has `*_CONFIGS` dicts mapping config names to dataclass instances
+  - `common.py`: `MegaTransformerBlockConfig` shared across models
 
 - `src/scripts/train/`: Training scripts
   - `train.py`: Main entry point with subcommand routing
   - `trainer.py`: `CommonTrainer` base class extending HuggingFace Trainer
-  - `audio/vae/`, `audio/vocoder/`, `audio/sive/`, `image/vae/`: Model-specific trainers
+  - `optimizers.py`: `MuonAdamW` custom optimizer
+  - `audio/vae/`, `audio/vocoder/`, `audio/sive/`, `image/vae/`, `world/`: Model-specific trainers
 
 - `src/scripts/data/`: Dataset preprocessing and loading
-  - `preprocess_dataset.py`: Main preprocessing entry point
-  - `audio/preprocess.py`: Audio feature extraction (SIVE, speaker embedding, F0)
+  - `preprocess_dataset.py`: Main preprocessing entry point with modality-specific `Preprocessor` subclasses
+  - `audio/`, `image/`, `text/`, `world/`: Per-modality dataset, collator, and preprocessor implementations
 
 - `src/utils/`: Shared utilities
   - `model_loading_utils.py`: `load_model()` function for loading from config + checkpoint
@@ -91,11 +100,15 @@ python -m src.scripts.data.preprocess_dataset audio --gpu_id 0 --total_gpus 4 ..
 model = load_model(AudioVAE, "small", checkpoint_path=path, overrides={"latent_channels": 32})
 ```
 
-**Sharded datasets**: Training data is preprocessed into `.pt` shards with a `shard_index.json` manifest. `AudioShardedDataset` / `ImageVAEShardedDataset` classes handle lazy loading with LRU caching.
+**Sharded datasets**: Training data is preprocessed into `.pt` shards with a `shard_index.json` manifest. Dataset classes (e.g. `AudioShardedDataset`, `MultimodalShardedDataset`) handle lazy loading with LRU caching. `ShardAwareSampler` groups indices by shard to minimize disk I/O.
 
-**Custom trainers**: Each training script has a trainer class extending `CommonTrainer` (which extends HuggingFace `Trainer`). Trainers implement `compute_loss()` with model-specific loss computation and TensorBoard logging.
+**Custom trainers**: Each training script has a trainer class extending `CommonTrainer` (which extends HuggingFace `Trainer`). Each module exports `add_cli_args(subparsers)` and `load_model(args)` functions. Trainers implement `compute_loss()` with model-specific loss computation and TensorBoard logging.
 
 **GAN training**: VAE trainers support optional discriminator training with configurable start conditions (`--gan_start_condition_key step/loss`), adaptive weighting, R1 penalty, and instance noise.
+
+**Training module convention**: Each training submodule in `src/scripts/train/` (e.g. `audio/vae/training.py`) must export:
+- `add_cli_args(subparsers)`: Registers the subcommand and its args
+- `load_model(args)`: Creates/loads the model from config and optional checkpoint
 
 ### World Model Architecture
 
@@ -110,8 +123,14 @@ model = load_model(AudioVAE, "small", checkpoint_path=path, overrides={"latent_c
 
 1. **SIVE** (Speaker-Invariant Voice Encoder): Conformer encoder with CTC loss + GRL for speaker disentanglement
 2. **Audio CVAE**: VAE with FiLM-based speaker conditioning, outputs mel spectrograms
-3. **Vocoder**: Mel spectrogram to waveform synthesis with multi-resolution STFT losses
+3. **Vocoder**: Mel spectrogram to waveform synthesis (HiFiGAN-based)
 
 ## Configuration
 
 DeepSpeed configs are in root: `ds_config.json`, `ds_config_zero-*.json`, `ds_config_int8.json`
+
+Runs are logged to `runs/<run_name>/` (TensorBoard + checkpoints).
+
+## Import Convention
+
+All imports use relative-to-`src/` paths (e.g. `from model.audio.vae.vae import AudioVAE`, not `from src.model...`). The project is run as a module from the repo root: `python -m src.scripts.train.train ...`

@@ -417,6 +417,8 @@ def add_cli_args(subparsers):
                             help="FFT size for audio processing")
     sub_parser.add_argument("--audio_hop_length", type=int, default=256,
                             help="Hop length for audio processing")
+    sub_parser.add_argument("--sive_total_stride", type=int, default=4,
+                            help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
 
     # GRL settings
     sub_parser.add_argument("--grl_warmup_steps", type=int, default=5000,

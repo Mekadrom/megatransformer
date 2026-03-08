@@ -2,9 +2,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from model.norms import RMSNorm
+from config.text.feature_extractor import TextFeatureExtractorConfig
+from model.norms import RMSNorm, create_norm
 from utils.megatransformer_utils import embedding_weight_init
-from utils.model_utils import create_norm
 
 
 class TextFeatureExtractor(nn.Module):

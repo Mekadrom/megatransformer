@@ -1250,7 +1250,9 @@ def add_cli_args(subparsers):
                             help="FFT size for audio mel spectrograms (overrides config file)")
     sub_parser.add_argument("--audio_hop_length", type=int, default=256,
                             help="Hop length for audio mel spectrograms (overrides config file)")
-    
+    sub_parser.add_argument("--sive_total_stride", type=int, default=4,
+                            help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
+
     # VAE settings
     sub_parser.add_argument("--latent_channels", type=int, default=32,
                            help="Number of latent channels in VAE bottleneck")
