@@ -183,7 +183,7 @@ class MegaTransformerWorldModel(nn.Module):
         )
 
         # Main Transformer (Recurrent Block)
-        recurrent_output, _, _ = self.recurrent_block(
+        recurrent_output, _, _, _ = self.recurrent_block(
             interleaved_tokens,
             attention_mask=attn_mask  # True for attend, False for padding
         )
@@ -485,10 +485,11 @@ class MegaTransformerWorldModel(nn.Module):
         )
 
         # Process through recurrent block to get initial context
-        # Track recurrent iteration counts per generated token
+        # Track recurrent iteration counts and KL divergences per generated token
         recurrent_iteration_counts: List[int] = []
+        recurrent_kl_final: List[float] = []  # final KL per token (convergence measure)
 
-        current_hidden, kv_cache, prompt_iters = self.recurrent_block(
+        current_hidden, kv_cache, prompt_iters, prompt_kls = self.recurrent_block(
             prompt_hidden,
             attention_mask=prompt_attn_mask,
             kv_cache=kv_cache,
@@ -578,7 +579,7 @@ class MegaTransformerWorldModel(nn.Module):
             next_hidden = torch.stack(next_hidden_list, dim=0)
 
             # Process through recurrent block with KV cache
-            current_hidden, kv_cache, n_iters = self.recurrent_block(
+            current_hidden, kv_cache, n_iters, kl_trace = self.recurrent_block(
                 next_hidden,
                 attention_mask=None,
                 kv_cache=kv_cache,
@@ -586,6 +587,7 @@ class MegaTransformerWorldModel(nn.Module):
                 use_cache=True,
             )
             recurrent_iteration_counts.append(n_iters)
+            recurrent_kl_final.append(kl_trace[-1] if kl_trace else 0.0)
             position_offset += 1
 
             # Accumulate hidden states for non-text modalities
@@ -660,9 +662,11 @@ class MegaTransformerWorldModel(nn.Module):
         # Stack logits
         outputs["text_logits"] = torch.cat(all_logits, dim=1)  # (batch, seq, vocab)
 
-        # Recurrent iteration counts per generated token
+        # Recurrent iteration counts and KL divergences per generated token
         outputs["recurrent_iteration_counts"] = recurrent_iteration_counts
+        outputs["recurrent_kl_final"] = recurrent_kl_final
         outputs["prompt_recurrent_iterations"] = prompt_iters
+        outputs["prompt_recurrent_kl"] = prompt_kls
 
         # Collect completed modality outputs
         # Stack into padded tensors with counts and lengths for proper unpadding before VAE decoding

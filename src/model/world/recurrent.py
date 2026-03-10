@@ -1,8 +1,9 @@
 import math
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from dataclasses import dataclass
 
@@ -121,7 +122,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         kv_cache: Optional[RecurrentKVCache] = None,
         position_offset: int = 0,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache], int]:
+    ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache], int, List[float]]:
         """
         Forward pass through recurrent block with optional KV caching.
 
@@ -145,10 +146,14 @@ class MegatransformerRecurrentBlock(nn.Module):
             thought_states: Output thought states, shape (batch, seq_len, d_model)
             new_kv_cache: Updated RecurrentKVCache if use_cache=True, else None
             num_iterations: Total number of recurrent iterations performed
+            kl_per_iteration: Per-iteration KL divergence between consecutive
+                thought states (mean over batch and sequence). Empty during training.
         """
         n_steps_no_grad, k_steps_grad = self.n_k_steps(self.mean_thinking_steps, self.backprop_depth)
 
         last_thought_state = self.initialize_thinking_state(x_0)  # (batch_size, seq_len, d_model)
+        track_kl = not self.training
+        kl_per_iteration: List[float] = []
 
         # Initialize or use existing cache
         new_kv_cache = kv_cache if use_cache and kv_cache is not None else None
@@ -183,8 +188,15 @@ class MegatransformerRecurrentBlock(nn.Module):
                     # Project back down to d_model
                     thought_states = self.projection(block_output)
 
+                    if track_kl:
+                        kl = F.kl_div(
+                            last_thought_state, thought_states,
+                            reduction="none", log_target=True,
+                        ).sum(dim=-1).mean().item()
+                        kl_per_iteration.append(kl)
+
                     if not self.training and self.exit_criteria is not None and self.exit_criteria.should_exit(last_thought_state, thought_states):
-                        return thought_states, new_kv_cache, iteration + 1
+                        return thought_states, new_kv_cache, iteration + 1, kl_per_iteration
 
                     last_thought_state = thought_states
                     iteration += 1
@@ -211,10 +223,18 @@ class MegatransformerRecurrentBlock(nn.Module):
                     layer_cache.value_cache = updated_cache.value_cache
 
                 thought_states = self.projection(block_output)
+
+                if track_kl:
+                    kl = F.kl_div(
+                        last_thought_state, thought_states,
+                        reduction="none", log_target=True,
+                    ).sum(dim=-1).mean().item()
+                    kl_per_iteration.append(kl)
+
                 last_thought_state = thought_states
                 iteration += 1
 
-        return last_thought_state, new_kv_cache, iteration
+        return last_thought_state, new_kv_cache, iteration, kl_per_iteration
 
     def generate_step(
         self,

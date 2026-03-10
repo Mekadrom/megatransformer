@@ -1,7 +1,9 @@
-from typing import Optional
+from typing import List, Optional
 
+import math
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.amp import autocast
 from transformers import Trainer
 
@@ -164,19 +166,201 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         """Build a prompt tensor from a list of token IDs. Shape: (1, seq_len)."""
         return torch.tensor([tokens], dtype=torch.long, device=device)
 
-    def _log_recurrent_iterations(self, outputs: dict, writer, tag: str, sample_idx: int, global_step: int):
+    def _log_generation_metrics(
+        self, outputs: dict, sample: dict, model, device,
+        writer, tag: str, sample_idx: int, global_step: int,
+        pred_latent=None, target_latent=None, modality: str = "",
+    ):
+        """Log all generation quality metrics for a single sample."""
+        t = f"{tag}/{sample_idx}"
+        self._log_recurrent_iterations(outputs, writer, t, global_step)
+        self._log_thought_convergence(outputs, writer, t, global_step)
+        self._log_token_entropy(outputs, writer, t, global_step)
+        self._log_modality_timing(outputs, writer, t, global_step)
+        self._log_token_repetition(outputs, writer, t, global_step)
+        self._log_text_perplexity(outputs, model, device, writer, t, global_step)
+        if pred_latent is not None and target_latent is not None:
+            self._log_latent_statistics(pred_latent, target_latent, writer, t, global_step, modality)
+            self._log_latent_similarity(pred_latent, target_latent, writer, t, global_step, modality)
+        elif pred_latent is not None:
+            self._log_latent_statistics(pred_latent, None, writer, t, global_step, modality)
+
+    # --- Individual metric loggers ---
+
+    def _log_recurrent_iterations(self, outputs: dict, writer, tag: str, global_step: int):
         """Log recurrent iteration count statistics from generate() outputs."""
         iter_counts = outputs.get("recurrent_iteration_counts")
         if not iter_counts:
             return
         counts = torch.tensor(iter_counts, dtype=torch.float32)
-        writer.add_scalar(f"{tag}/{sample_idx}/recurrent_iters_mean", counts.mean().item(), global_step)
-        writer.add_scalar(f"{tag}/{sample_idx}/recurrent_iters_min", counts.min().item(), global_step)
-        writer.add_scalar(f"{tag}/{sample_idx}/recurrent_iters_max", counts.max().item(), global_step)
-        writer.add_histogram(f"{tag}/{sample_idx}/recurrent_iters", counts, global_step)
+        writer.add_scalar(f"{tag}/recurrent_iters_mean", counts.mean().item(), global_step)
+        writer.add_scalar(f"{tag}/recurrent_iters_min", counts.min().item(), global_step)
+        writer.add_scalar(f"{tag}/recurrent_iters_max", counts.max().item(), global_step)
+        writer.add_histogram(f"{tag}/recurrent_iters", counts, global_step)
         prompt_iters = outputs.get("prompt_recurrent_iterations")
         if prompt_iters is not None:
-            writer.add_scalar(f"{tag}/{sample_idx}/recurrent_iters_prompt", prompt_iters, global_step)
+            writer.add_scalar(f"{tag}/recurrent_iters_prompt", prompt_iters, global_step)
+
+    def _log_thought_convergence(self, outputs: dict, writer, tag: str, global_step: int):
+        """Log per-token KL divergence between final consecutive thought states.
+
+        Shows how converged the recurrent thinking was for each generated token.
+        Lower = more converged. Spikes indicate tokens the model "thought harder" about.
+        """
+        kl_finals = outputs.get("recurrent_kl_final")
+        if not kl_finals:
+            return
+        kl_tensor = torch.tensor(kl_finals, dtype=torch.float32)
+        # Filter out inf/nan from potential numerical issues
+        valid = kl_tensor[torch.isfinite(kl_tensor)]
+        if valid.numel() == 0:
+            return
+        writer.add_scalar(f"{tag}/thought_kl_mean", valid.mean().item(), global_step)
+        writer.add_scalar(f"{tag}/thought_kl_max", valid.max().item(), global_step)
+        writer.add_histogram(f"{tag}/thought_kl", valid, global_step)
+
+        # Also log prompt KL trace if available
+        prompt_kls = outputs.get("prompt_recurrent_kl")
+        if prompt_kls:
+            prompt_kl = torch.tensor(prompt_kls, dtype=torch.float32)
+            prompt_valid = prompt_kl[torch.isfinite(prompt_kl)]
+            if prompt_valid.numel() > 0:
+                writer.add_scalar(f"{tag}/thought_kl_prompt_final", prompt_valid[-1].item(), global_step)
+
+    def _log_token_entropy(self, outputs: dict, writer, tag: str, global_step: int):
+        """Log entropy of the softmax distribution at each generated token.
+
+        High entropy = model is uncertain. Low entropy = confident prediction.
+        Trending downward during training indicates the model is learning.
+        """
+        logits = outputs.get("text_logits")
+        if logits is None:
+            return
+        # logits: (batch, seq, vocab) — use batch 0
+        logits_b = logits[0].float().cpu()  # (seq, vocab)
+        probs = F.softmax(logits_b, dim=-1)
+        log_probs = F.log_softmax(logits_b, dim=-1)
+        entropy = -(probs * log_probs).sum(dim=-1)  # (seq,)
+        writer.add_scalar(f"{tag}/token_entropy_mean", entropy.mean().item(), global_step)
+        writer.add_scalar(f"{tag}/token_entropy_min", entropy.min().item(), global_step)
+        writer.add_scalar(f"{tag}/token_entropy_max", entropy.max().item(), global_step)
+        writer.add_histogram(f"{tag}/token_entropy", entropy, global_step)
+
+    def _log_modality_timing(self, outputs: dict, writer, tag: str, global_step: int):
+        """Log position of first BO*/EO* tokens in generated sequence.
+
+        Tracks when the model decides to begin/end media generation.
+        """
+        gen_ids = outputs.get("generated_token_ids")
+        if gen_ids is None:
+            return
+        ids = gen_ids[0].tolist()  # batch 0
+        modality_tokens = {
+            "BOV": BOV_TOKEN_ID, "EOV": EOV_TOKEN_ID,
+            "BOI": BOI_TOKEN_ID, "EOI": EOI_TOKEN_ID,
+            "BOA": BOA_TOKEN_ID, "EOA": EOA_TOKEN_ID,
+        }
+        for name, tid in modality_tokens.items():
+            if tid in ids:
+                writer.add_scalar(f"{tag}/first_{name}_position", ids.index(tid), global_step)
+
+    def _log_token_repetition(self, outputs: dict, writer, tag: str, global_step: int):
+        """Log fraction of generated tokens that repeat the previous token.
+
+        High repetition rate indicates degenerate looping behavior.
+        """
+        gen_ids = outputs.get("generated_token_ids")
+        if gen_ids is None:
+            return
+        ids = gen_ids[0].tolist()  # batch 0
+        if len(ids) < 2:
+            return
+        repeats = sum(1 for j in range(1, len(ids)) if ids[j] == ids[j - 1])
+        rate = repeats / (len(ids) - 1)
+        writer.add_scalar(f"{tag}/token_repetition_rate", rate, global_step)
+
+        # Also log longest consecutive repeat streak
+        max_streak = 0
+        current_streak = 0
+        for j in range(1, len(ids)):
+            if ids[j] == ids[j - 1]:
+                current_streak += 1
+                max_streak = max(max_streak, current_streak)
+            else:
+                current_streak = 0
+        writer.add_scalar(f"{tag}/token_max_repeat_streak", max_streak, global_step)
+
+    def _log_text_perplexity(
+        self, outputs: dict, model, device, writer, tag: str, global_step: int,
+    ):
+        """Log perplexity of generated text by feeding it back through the model.
+
+        Lower perplexity = model finds its own output more probable = higher quality.
+        """
+        gen_ids = outputs.get("generated_token_ids")
+        if gen_ids is None or gen_ids.shape[1] < 2:
+            return
+        try:
+            # Use generated tokens as input, compute cross-entropy on shifted targets
+            input_ids = gen_ids[:, :-1].to(device)  # (1, seq-1)
+            targets = gen_ids[:, 1:].to(device)  # (1, seq-1)
+
+            # Run through text feature extractor + recurrent block + text coda
+            text_hidden = model.text_feature_extractor(input_ids)
+            recurrent_out, _, _, _ = model.recurrent_block(text_hidden)
+            text_out = model.text_generator(recurrent_out)
+            logits = text_out["logits"]  # (1, seq-1, vocab)
+
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=0,  # ignore padding
+            )
+            perplexity = torch.exp(loss).item()
+            if math.isfinite(perplexity):
+                writer.add_scalar(f"{tag}/text_perplexity", perplexity, global_step)
+        except Exception as e:
+            print(f"Warning: perplexity computation failed: {e}")
+
+    def _log_latent_statistics(
+        self, pred_latent: torch.Tensor, target_latent: Optional[torch.Tensor],
+        writer, tag: str, global_step: int, modality: str,
+    ):
+        """Log mean/std/min/max of generated (and target) latents.
+
+        Detects mode collapse (low std) or latent explosion (extreme values).
+        """
+        prefix = f"{tag}/{modality}_latent" if modality else f"{tag}/latent"
+        pred = pred_latent.float().cpu()
+        writer.add_scalar(f"{prefix}_pred_mean", pred.mean().item(), global_step)
+        writer.add_scalar(f"{prefix}_pred_std", pred.std().item(), global_step)
+        writer.add_scalar(f"{prefix}_pred_min", pred.min().item(), global_step)
+        writer.add_scalar(f"{prefix}_pred_max", pred.max().item(), global_step)
+
+        if target_latent is not None:
+            tgt = target_latent.float().cpu()
+            writer.add_scalar(f"{prefix}_target_mean", tgt.mean().item(), global_step)
+            writer.add_scalar(f"{prefix}_target_std", tgt.std().item(), global_step)
+            writer.add_scalar(f"{prefix}_target_min", tgt.min().item(), global_step)
+            writer.add_scalar(f"{prefix}_target_max", tgt.max().item(), global_step)
+
+    def _log_latent_similarity(
+        self, pred_latent: torch.Tensor, target_latent: torch.Tensor,
+        writer, tag: str, global_step: int, modality: str,
+    ):
+        """Log cosine similarity between generated and target latents.
+
+        Simple proxy for reconstruction quality. 1.0 = perfect match, 0.0 = orthogonal.
+        """
+        prefix = f"{tag}/{modality}_latent" if modality else f"{tag}/latent"
+        pred_flat = pred_latent.float().cpu().flatten()
+        tgt_flat = target_latent.float().cpu().flatten()
+        # Truncate to same length if needed
+        min_len = min(pred_flat.shape[0], tgt_flat.shape[0])
+        pred_flat = pred_flat[:min_len]
+        tgt_flat = tgt_flat[:min_len]
+        cos_sim = F.cosine_similarity(pred_flat.unsqueeze(0), tgt_flat.unsqueeze(0)).item()
+        writer.add_scalar(f"{prefix}_cosine_sim", cos_sim, global_step)
 
     def _scenario_text_continuation(self, model, eval_dataset, collator, device, writer, global_step):
         """Scenario 1: Text-only generation (take text, generate continuation)."""
@@ -213,7 +397,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             writer.add_text(f"{tag}/{i}/input", input_text, global_step)
             writer.add_text(f"{tag}/{i}/generated", gen_text, global_step)
             writer.add_text(f"{tag}/{i}/target", full_target, global_step)
-            self._log_recurrent_iterations(outputs, writer, tag, i, global_step)
+            self._log_generation_metrics(
+                outputs, sample, model, device, writer, tag, i, global_step,
+            )
 
     def _scenario_text_to_voice(self, model, eval_dataset, collator, device, writer, global_step):
         """Scenario 2: Text -> Voice synthesis."""
@@ -260,8 +446,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     pred_latent, sample, writer, global_step, f"{tag}/{i}"
                 )
 
-            self._log_recurrent_iterations(outputs, writer, tag, i, global_step)
-
             # Log target voice for comparison
             target_features = sample.get("voice_features")
             if target_features is not None:
@@ -270,6 +454,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     self._latent_to_image(target_features),
                     global_step,
                 )
+
+            voice_preds = outputs.get("voice_latent_preds")
+            gen_latent = voice_preds[0, 0] if voice_preds is not None and voice_preds.numel() > 0 else None
+            self._log_generation_metrics(
+                outputs, sample, model, device, writer, tag, i, global_step,
+                pred_latent=gen_latent, target_latent=target_features, modality="voice",
+            )
 
     def _prepare_audio_for_generate(self, sample, device):
         """Prepare SIVE audio features from a sample for model.generate().
@@ -386,7 +577,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
             writer.add_text(f"{tag}/{i}/generated", gen_text, global_step)
             writer.add_text(f"{tag}/{i}/target", target_text, global_step)
-            self._log_recurrent_iterations(outputs, writer, tag, i, global_step)
+            self._log_generation_metrics(
+                outputs, sample, model, device, writer, tag, i, global_step,
+            )
 
     def _scenario_text_to_image(self, model, eval_dataset, collator, device, writer, global_step):
         """Scenario 4: Text -> Image synthesis."""
@@ -451,7 +644,15 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                         f"{tag}/{i}/target_image"
                     )
 
-            self._log_recurrent_iterations(outputs, writer, tag, i, global_step)
+            image_preds_all = outputs.get("image_latent_preds")
+            gen_latent = image_preds_all[0, 0] if image_preds_all is not None and image_preds_all.numel() > 0 else None
+            target_image_latent = sample.get("image_images")
+            if target_image_latent is None:
+                target_image_latent = sample.get("image_image")
+            self._log_generation_metrics(
+                outputs, sample, model, device, writer, tag, i, global_step,
+                pred_latent=gen_latent, target_latent=target_image_latent, modality="image",
+            )
 
     def _scenario_image_to_text(self, model, eval_dataset, collator, device, writer, global_step):
         """Scenario 5: Image -> Text description."""
@@ -491,7 +692,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
             writer.add_text(f"{tag}/{i}/generated", gen_text, global_step)
             writer.add_text(f"{tag}/{i}/target", target_text, global_step)
-            self._log_recurrent_iterations(outputs, writer, tag, i, global_step)
+            self._log_generation_metrics(
+                outputs, sample, model, device, writer, tag, i, global_step,
+            )
 
     def _scenario_voice_to_image(self, model, eval_dataset, collator, device, writer, global_step):
         """Scenario 6: Voice -> Image cross-modal generation."""
@@ -535,7 +738,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                         f"{tag}/{i}/generated_image"
                     )
 
-            self._log_recurrent_iterations(outputs, writer, tag, i, global_step)
+            img_preds = outputs.get("image_latent_preds")
+            gen_img = img_preds[0, 0] if img_preds is not None and img_preds.numel() > 0 else None
+            self._log_generation_metrics(
+                outputs, sample, model, device, writer, tag, i, global_step,
+                pred_latent=gen_img, modality="image",
+            )
 
     def _scenario_image_to_voice(self, model, eval_dataset, collator, device, writer, global_step):
         """Scenario 7: Image -> Voice cross-modal generation."""
@@ -577,7 +785,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     pred_latent, sample, writer, global_step, f"{tag}/{i}"
                 )
 
-            self._log_recurrent_iterations(outputs, writer, tag, i, global_step)
+            voice_preds = outputs.get("voice_latent_preds")
+            gen_voice = voice_preds[0, 0] if voice_preds is not None and voice_preds.numel() > 0 else None
+            self._log_generation_metrics(
+                outputs, sample, model, device, writer, tag, i, global_step,
+                pred_latent=gen_voice, modality="voice",
+            )
 
     # --- Helper methods ---
 
@@ -587,7 +800,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         Each channel is individually normalized to [0, 1] and arranged in a grid.
         Returns (1, grid_H, grid_W) for TensorBoard add_image (grayscale).
         """
-        import math
 
         latent = latent.float().cpu()
 
