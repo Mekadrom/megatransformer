@@ -8,7 +8,7 @@ from dataclasses import dataclass
 @dataclass
 class TextFeatureExtractorConfig:
     d_model: int = 512
-    vocab_size: int = 32007
+    vocab_size: int = 32009
     norm_type: str = "layernorm"
     layer_norm_epsilon: float = 1e-5
     hidden_dropout_prob: float = 0.1

@@ -25,7 +25,10 @@ class TextDatasetPreprocessor(Preprocessor):
         self.vocab_size = len(self.tokenizer)
         print(f"  Vocab size: {self.vocab_size}")
 
-        print(f"  Total samples in dataset: {len(self.dataset):,}")
+        try:
+            print(f"  Total samples in dataset: {len(self.dataset):,}")
+        except TypeError:
+            print(f"  Dataset is streaming (size unknown)")
         print(f"  Max sequence length: {args.max_seq_len}")
 
         shard_fields.update({

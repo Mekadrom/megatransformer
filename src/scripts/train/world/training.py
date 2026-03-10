@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 
 from model.world.world_model import MegaTransformerWorldModel
 from scripts.train.trainer import CommonTrainer
@@ -14,7 +15,8 @@ class WorldModelTrainer(CommonTrainer):
     2. Token interleaving (text as driver with media placeholders)
     3. Recurrent transformer
     4. Token uninterleaving
-    5. Modality-specific codas with per-modality losses
+    5. Modality-specific codas (predictions only)
+    6. Loss computation per modality (in this trainer, not the model)
 
     Each modality is optional per-batch — the model gracefully handles batches
     where only some modalities are present.
@@ -38,6 +40,8 @@ class WorldModelTrainer(CommonTrainer):
         include_image: bool = True,
         # Whether data provides precomputed VAE latents
         precomputed_latents: bool = True,
+        # Text loss label smoothing
+        text_label_smoothing: float = 0.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -70,6 +74,11 @@ class WorldModelTrainer(CommonTrainer):
         self.gan_start_condition_key = None
         self.gan_start_condition_value = None
 
+        # Loss functions
+        self.text_loss_fn = nn.CrossEntropyLoss(label_smoothing=text_label_smoothing)
+        self.latent_l1_loss = nn.L1Loss()
+        self.latent_mse_loss = nn.MSELoss()
+
         self.writer = None
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -84,33 +93,87 @@ class WorldModelTrainer(CommonTrainer):
 
         # ── Prepare inputs for world model forward ──────────────────────
 
-        # Text: the collator produces text_token_ids [B, T] which become both
-        # the input (with placeholder tokens) and the shifted target.
+        # Text: the collator produces text_token_ids [B, T] which include
+        # boundary tokens (BOV, EOV, etc.) and placeholder tokens (VOICE_PH, etc.).
+        # The interleaver replaces placeholder positions with media embeddings and
+        # marks everything else as text. The text coda sees all tokens EXCEPT
+        # placeholders.
+        #
+        # To build aligned targets: remove placeholders from the full sequence,
+        # then do the standard causal shift. This ensures e.g. the target for BOV
+        # is EOV (the next text token), not VOICE_PH.
+        #
+        # The model still receives the full text_input_ids (with placeholders)
+        # because the interleaver needs them to locate media insertion points.
         text_input_ids = inputs.get("text_token_ids")  # [B, T]
         text_targets = None
         if text_input_ids is not None and self.include_text:
-            # Standard causal LM target: shift right by 1
-            text_targets = text_input_ids[:, 1:].contiguous()
-            text_input_ids = text_input_ids[:, :-1].contiguous()
+            from utils.constants import (
+                AUDIO_PLACEHOLDER_TOKEN_ID,
+                VOICE_PLACEHOLDER_TOKEN_ID,
+                IMAGE_PLACEHOLDER_TOKEN_ID,
+            )
+            placeholder_ids = {AUDIO_PLACEHOLDER_TOKEN_ID, VOICE_PLACEHOLDER_TOKEN_ID, IMAGE_PLACEHOLDER_TOKEN_ID}
 
-        # Audio inputs: the collator provides audio_features or audio_mel_specs.
-        # For precomputed latent training we expect VAE latents in audio_features
-        # shaped [B, C, H, T].  The world model expects (B, n_audio, C, H, T)
-        # where n_audio is the number of audio clips per batch item.  Since the
-        # multimodal dataset provides one clip per item we unsqueeze to n_audio=1.
+            # The model sees text_input_ids[:, :-1] as input (standard causal shift).
+            # The interleaver removes placeholder positions, so the text coda
+            # produces logits only at non-placeholder positions.
+            #
+            # For targets: remove placeholders from the FULL sequence, then shift.
+            # This way BOV's target is EOV (next text token), not VOICE_PH.
+            #
+            # Example: full = [hello, world, BOV, VOICE_PH, EOV]
+            #   Model input (:-1): [hello, world, BOV, VOICE_PH] → 3 text logits
+            #   Full no-PH: [hello, world, BOV, EOV] → shift → [world, BOV, EOV] = 3 targets ✓
+
+            full_ids = text_input_ids  # [B, T_full] before :-1
+
+            # Remove placeholders from full sequence, then shift by 1
+            non_ph_mask_full = torch.ones_like(full_ids, dtype=torch.bool)
+            for pid in placeholder_ids:
+                non_ph_mask_full &= (full_ids != pid)
+
+            # Model input: keep placeholders for the interleaver
+            text_input_ids = full_ids[:, :-1].contiguous()
+
+            # Count non-PH positions in model input (= number of logits per item)
+            non_ph_input = torch.ones_like(text_input_ids, dtype=torch.bool)
+            for pid in placeholder_ids:
+                non_ph_input &= (text_input_ids != pid)
+
+            target_list = []
+            for b in range(full_ids.shape[0]):
+                clean = full_ids[b][non_ph_mask_full[b]]  # non-PH tokens in order
+                shifted = clean[1:]  # causal shift: predict next non-PH token
+                K = non_ph_input[b].sum().item()  # number of logits this item will produce
+                # Truncate or pad targets to exactly K
+                if shifted.shape[0] >= K:
+                    target_list.append(shifted[:K])
+                else:
+                    target_list.append(torch.cat([shifted, shifted.new_zeros(K - shifted.shape[0])]))
+
+            # Pad and stack targets across batch
+            max_len = max(t.shape[0] for t in target_list)
+            padded_targets = []
+            for t in target_list:
+                if t.shape[0] < max_len:
+                    padded_targets.append(torch.cat([t, t.new_zeros(max_len - t.shape[0])]))
+                else:
+                    padded_targets.append(t)
+            text_targets = torch.stack(padded_targets)  # [B, T_text]
+
+        # Audio inputs: SIVE features shaped [B, C, T].
+        # The world model expects (B, n_audio, C, T) where n_audio is the number
+        # of audio clips per batch item. Since the dataset provides one clip per
+        # item we unsqueeze to n_audio=1.
         audio_inputs = None
         audio_lengths = None
         audio_latent_labels = None
         if self.include_audio:
-            audio_data = inputs.get("audio_features")  # [B, C, T] or [B, C, H, T]
+            audio_data = inputs.get("audio_features")  # [B, C, T]
             if audio_data is not None:
-                if audio_data.dim() == 3:
-                    # [B, C, T] -> [B, 1, C, 1, T] — mono feature channel
-                    audio_data = audio_data.unsqueeze(1).unsqueeze(3)
-                elif audio_data.dim() == 4:
-                    # [B, C, H, T] -> [B, 1, C, H, T]
-                    audio_data = audio_data.unsqueeze(1)
-                audio_inputs = audio_data
+                audio_inputs = audio_data.unsqueeze(1)  # [B, 1, C, T]
+                # Labels: squeeze n_audio dim to match coda output shape [B, C, T]
                 audio_latent_labels = audio_data.clone()
 
                 # Lengths: per-clip lengths, shape (B, n_audio=1)
@@ -118,91 +181,94 @@ class WorldModelTrainer(CommonTrainer):
                 if feat_lengths is not None:
                     audio_lengths = feat_lengths.unsqueeze(1)  # [B, 1]
 
-            # Fall back to mel specs when features are unavailable
-            if audio_inputs is None:
-                mel_data = inputs.get("audio_mel_specs")  # [B, mel_bins, T]
-                if mel_data is not None:
-                    mel_data = mel_data.unsqueeze(1)  # [B, 1, mel_bins, T]
-                    audio_inputs = mel_data
-                    audio_latent_labels = mel_data.clone()
-                    mel_lengths = inputs.get("audio_mel_lengths")
-                    if mel_lengths is not None:
-                        audio_lengths = mel_lengths.unsqueeze(1)
-
-        # Voice: same shape contract as audio. Separate placeholder token.
+        # Voice: same shape contract as audio (SIVE features). Separate placeholder token.
         voice_inputs = None
         voice_lengths = None
         voice_latent_labels = None
-        # Voice data would come from a voice shard dir; same keys with voice_ prefix.
-        # Not wired yet, but the plumbing is ready.
+        if self.include_voice:
+            voice_data = inputs.get("voice_features")  # [B, C, T]
+            if voice_data is not None:
+                voice_inputs = voice_data.unsqueeze(1)  # [B, 1, C, T]
+                voice_latent_labels = voice_data.clone()
 
-        # Image inputs: collator provides image_images [B, 3, H, W].
+                voice_feat_lengths = inputs.get("voice_feature_lengths")
+                if voice_feat_lengths is not None:
+                    voice_lengths = voice_feat_lengths.unsqueeze(1)
+
+        # Image inputs: collator provides image_images [B, C, H, W] (raw or latent).
         # World model expects (B, n_images, ...).
         image_inputs = None
         image_latent_labels = None
         if self.include_image:
-            image_data = inputs.get("image_images")  # [B, 3, H, W]
+            image_data = inputs.get("image_images")  # [B, C, H, W]
             if image_data is not None:
-                image_data = image_data.unsqueeze(1)  # [B, 1, 3, H, W]
-                image_inputs = image_data
+                image_inputs = image_data.unsqueeze(1)  # [B, 1, C, H, W]
+                # Labels: keep without n_images dim to match coda output [B, C, H, W]
                 image_latent_labels = image_data.clone()
 
-        # ── Forward pass ────────────────────────────────────────────────
+        # ── Forward pass (predictions only, no loss) ────────────────────
 
         outputs = model(
             text_input_ids=text_input_ids,
             audio_inputs=audio_inputs,
             audio_lengths=audio_lengths,
-            audio_latent_labels=audio_latent_labels,
             voice_inputs=voice_inputs,
             voice_lengths=voice_lengths,
-            voice_latent_labels=voice_latent_labels,
             image_inputs=image_inputs,
-            image_latent_labels=image_latent_labels,
-            text_targets=text_targets,
             precomputed_latents=self.precomputed_latents,
             decode_outputs=False,
         )
 
-        # ── Aggregate losses ────────────────────────────────────────────
+        # ── Compute losses ──────────────────────────────────────────────
 
-        total_loss = torch.tensor(0.0, device=text_input_ids.device)
+        device = text_input_ids.device if text_input_ids is not None else next(model.parameters()).device
+        total_loss = torch.tensor(0.0, device=device)
         loss_components = {}
 
-        # Text classification loss
-        text_loss = outputs.get("text_classification_loss")
-        if text_loss is not None:
-            weighted_text = self.text_loss_weight * text_loss
-            total_loss = total_loss + weighted_text
+        # Text: cross-entropy on logits vs shifted targets (placeholders already removed)
+        logits = outputs.get("logits")
+        if logits is not None and text_targets is not None:
+            B, T, V = logits.size()
+            # Align logits and targets (may differ by at most 1 due to
+            # uninterleaver padding vs target padding across batch items)
+            T_min = min(T, text_targets.shape[1])
+            logits = logits[:, :T_min, :].contiguous()
+            text_targets = text_targets[:, :T_min].contiguous()
+            B, T, V = logits.size()
+            text_loss = self.text_loss_fn(
+                logits.reshape(B * T, V),
+                text_targets.reshape(B * T),
+            )
+            total_loss = total_loss + self.text_loss_weight * text_loss
             loss_components["text_loss"] = text_loss.detach()
 
-        # Audio latent losses (prefixed with "audio_" by AudioCodaAndVAEWithLoss)
-        audio_l1 = outputs.get("audio_latent_l1_loss")
-        audio_mse = outputs.get("audio_latent_mse_loss")
-        if audio_l1 is not None and audio_mse is not None:
+        # Audio: L1 + MSE on latent predictions vs latent labels
+        audio_latent_preds = outputs.get("audio_latent_preds")
+        if audio_latent_preds is not None and audio_latent_labels is not None:
+            audio_l1 = self.latent_l1_loss(audio_latent_preds, audio_latent_labels)
+            audio_mse = self.latent_mse_loss(audio_latent_preds, audio_latent_labels)
             audio_loss = audio_l1 + audio_mse
-            weighted_audio = self.audio_latent_loss_weight * audio_loss
-            total_loss = total_loss + weighted_audio
+            total_loss = total_loss + self.audio_latent_loss_weight * audio_loss
             loss_components["audio_latent_l1"] = audio_l1.detach()
             loss_components["audio_latent_mse"] = audio_mse.detach()
 
-        # Voice latent losses
-        voice_l1 = outputs.get("voice_latent_l1_loss")
-        voice_mse = outputs.get("voice_latent_mse_loss")
-        if voice_l1 is not None and voice_mse is not None:
+        # Voice: L1 + MSE (same as audio)
+        voice_latent_preds = outputs.get("voice_latent_preds")
+        if voice_latent_preds is not None and voice_latent_labels is not None:
+            voice_l1 = self.latent_l1_loss(voice_latent_preds, voice_latent_labels)
+            voice_mse = self.latent_mse_loss(voice_latent_preds, voice_latent_labels)
             voice_loss = voice_l1 + voice_mse
-            weighted_voice = self.voice_latent_loss_weight * voice_loss
-            total_loss = total_loss + weighted_voice
+            total_loss = total_loss + self.voice_latent_loss_weight * voice_loss
             loss_components["voice_latent_l1"] = voice_l1.detach()
             loss_components["voice_latent_mse"] = voice_mse.detach()
 
-        # Image latent losses
-        image_l1 = outputs.get("image_latent_l1_loss")
-        image_mse = outputs.get("image_latent_mse_loss")
-        if image_l1 is not None and image_mse is not None:
+        # Image: L1 + MSE on latent predictions vs latent labels
+        image_latent_preds = outputs.get("image_latent_preds")
+        if image_latent_preds is not None and image_latent_labels is not None:
+            image_l1 = self.latent_l1_loss(image_latent_preds, image_latent_labels)
+            image_mse = self.latent_mse_loss(image_latent_preds, image_latent_labels)
             image_loss = image_l1 + image_mse
-            weighted_image = self.image_latent_loss_weight * image_loss
-            total_loss = total_loss + weighted_image
+            total_loss = total_loss + self.image_latent_loss_weight * image_loss
             loss_components["image_latent_l1"] = image_l1.detach()
             loss_components["image_latent_mse"] = image_mse.detach()
 
@@ -216,6 +282,18 @@ class WorldModelTrainer(CommonTrainer):
         if return_outputs:
             return total_loss, outputs
         return total_loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """Override to route eval through compute_loss (same as training).
+
+        The default Trainer.prediction_step calls model(**inputs), passing raw
+        collator keys as kwargs. Our model expects different arg names, so we
+        reuse compute_loss which handles the mapping.
+        """
+        model.eval()
+        with torch.no_grad():
+            loss = self.compute_loss(model, inputs)
+        return (loss, None, None)
 
     def start_train_print(self, args):
         model = self.model
@@ -267,6 +345,7 @@ def create_trainer(
         include_voice="voice" in include_modes,
         include_image="image" in include_modes,
         precomputed_latents=args.precomputed_latents,
+        text_label_smoothing=args.text_label_smoothing,
     )
 
 
@@ -280,14 +359,12 @@ def add_cli_args(subparsers):
                             help="Directory for preprocessed text shards")
     sub_parser.add_argument("--audio_cache_dir", type=str, default=None,
                             help="Directory for preprocessed audio shards")
+    sub_parser.add_argument("--voice_cache_dir", type=str, default=None,
+                            help="Directory for preprocessed voice shards")
     sub_parser.add_argument("--image_cache_dir", type=str, default=None,
                             help="Directory for preprocessed image shards")
     sub_parser.add_argument("--cache_dir", type=str, default=None,
                             help="Unused for world model — use per-modality cache dirs instead")
-
-    # Audio columns to load from shards
-    sub_parser.add_argument("--audio_columns", type=str, default="features,mel_specs,text",
-                            help="Comma-separated list of audio shard columns to load")
 
     # Modality loss weights
     sub_parser.add_argument("--text_loss_weight", type=float, default=1.0,
@@ -299,6 +376,10 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--image_latent_loss_weight", type=float, default=1.0,
                             help="Weight for image latent prediction losses")
 
+    # Text loss
+    sub_parser.add_argument("--text_label_smoothing", type=float, default=0.0,
+                            help="Label smoothing for text cross-entropy loss")
+
     # Precomputed latents flag
     sub_parser.add_argument("--precomputed_latents", action="store_true", default=True,
                             help="Whether media inputs are precomputed VAE latents (default: True)")
@@ -308,6 +389,26 @@ def add_cli_args(subparsers):
     # Max sequence length for text collator
     sub_parser.add_argument("--max_seq_len", type=int, default=2048,
                             help="Maximum token sequence length for text")
+
+    # Visualization callback dependencies
+    sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,
+                            help="Path to vocoder checkpoint for visualization")
+    sub_parser.add_argument("--vocoder_config", type=str, default=None,
+                            help="Vocoder config name (e.g. 'hifigan' for pretrained SpeechBrain HiFi-GAN, no checkpoint needed)")
+    sub_parser.add_argument("--image_vae_decoder_path", type=str, default=None,
+                            help="Path to image VAE decoder checkpoint (not needed for litevae)")
+    sub_parser.add_argument("--image_vae_decoder_config", type=str, default=None,
+                            help="Image VAE decoder config. Use 'litevae' for pretrained LiteVAE (auto-downloaded)")
+    sub_parser.add_argument("--voice_cvae_checkpoint_path", type=str, default=None,
+                            help="Path to voice CVAE decoder checkpoint for decoding SIVE latents to mel specs")
+    sub_parser.add_argument("--voice_cvae_config", type=str, default="small",
+                            help="Voice CVAE decoder config name")
+    sub_parser.add_argument("--voice_cvae_latent_channels", type=int, default=None,
+                            help="Override latent_channels for voice CVAE (must match what it was trained with)")
+    sub_parser.add_argument("--static_speaker_embedding_path", type=str, default=None,
+                            help="Path to a .pt file containing a speaker embedding tensor for static-speaker voice decoding")
+    sub_parser.add_argument("--num_eval_samples", type=int, default=4,
+                            help="Number of samples per visualization scenario")
 
     # Audio collator settings
     sub_parser.add_argument("--audio_max_seconds", type=float, default=10.0,

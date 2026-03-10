@@ -423,6 +423,15 @@ class AudioDatasetPreprocessor(Preprocessor):
         if args.extract_ctc_tokens:
             self.ctc_tokens_processor = TextCTCTokensBatchProcessor()
 
+        self.tokenizer = None
+        if args.tokenize_text:
+            from transformers import AutoTokenizer
+            print(f"Loading tokenizer: {args.tokenizer_name}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+            self.max_seq_len = args.max_seq_len
+            print(f"  Vocab size: {len(self.tokenizer)}")
+            print(f"  Max seq len: {self.max_seq_len}")
+
         if args.compute_speaker_embeddings:
             shard_fields.update({
                 'shard_speaker_embeddings': [],
@@ -458,6 +467,12 @@ class AudioDatasetPreprocessor(Preprocessor):
             shard_fields.update({
                 'shard_ctc_tokens': [],
                 'shard_ctc_lengths': [],
+            })
+
+        if args.tokenize_text:
+            shard_fields.update({
+                'shard_token_ids': [],
+                'shard_text_lengths': [],
             })
 
         shard_fields.update({
@@ -573,6 +588,14 @@ class AudioDatasetPreprocessor(Preprocessor):
         sub_parser.add_argument("--extract_ctc_tokens", action="store_true",
                             help="Whether to extract CTC tokens from the dataset")
 
+        # Text tokenization (for world model training — saves token IDs alongside audio)
+        sub_parser.add_argument("--tokenize_text", action="store_true", default=False,
+                            help="Tokenize text into token IDs (for world model text input)")
+        sub_parser.add_argument("--tokenizer_name", type=str, default="mistralai/Mistral-7B-v0.1",
+                            help="HuggingFace tokenizer for --tokenize_text")
+        sub_parser.add_argument("--max_seq_len", type=int, default=128,
+                            help="Maximum token sequence length for --tokenize_text")
+
         return sub_parser
 
     def flush_shard(self):
@@ -677,6 +700,19 @@ class AudioDatasetPreprocessor(Preprocessor):
             shard_data["ctc_tokens"] = torch.cat(padded_ctc_tokens, dim=0)
             shard_data["ctc_lengths"] = torch.cat(self.shard_fields['shard_ctc_lengths'], dim=0)
             self.shard_fields['shard_ctc_tokens'] = []
+
+        if self.args.tokenize_text and self.shard_fields['shard_token_ids']:
+            max_len = max(t.shape[-1] for t in self.shard_fields['shard_token_ids'])
+            pad_id = self.tokenizer.pad_token_id or 0
+            padded = []
+            for tokens in self.shard_fields['shard_token_ids']:
+                if tokens.shape[-1] < max_len:
+                    tokens = F.pad(tokens, (0, max_len - tokens.shape[-1]), value=pad_id)
+                padded.append(tokens)
+            shard_data["token_ids"] = torch.stack(padded, dim=0)
+            shard_data["text_lengths"] = torch.stack(self.shard_fields['shard_text_lengths'], dim=0)
+            self.shard_fields['shard_token_ids'] = []
+            self.shard_fields['shard_text_lengths'] = []
 
         shard_data["num_samples"] = num_samples
 
@@ -784,6 +820,20 @@ class AudioDatasetPreprocessor(Preprocessor):
                 self.shard_fields['shard_ctc_tokens'].append(ctc_result["ctc_tokens"])
                 self.shard_fields['shard_ctc_lengths'].append(ctc_result["ctc_lengths"])
 
+            if self.args.tokenize_text:
+                texts = self.batch_accumulators.get('batch_conditions', [])
+                if texts:
+                    encoded = self.tokenizer(
+                        texts,
+                        truncation=True,
+                        max_length=self.max_seq_len,
+                        padding=False,
+                        return_attention_mask=False,
+                    )
+                    for input_ids in encoded["input_ids"]:
+                        self.shard_fields['shard_token_ids'].append(torch.tensor(input_ids, dtype=torch.long))
+                        self.shard_fields['shard_text_lengths'].append(torch.tensor(len(input_ids), dtype=torch.long))
+
             self.stats_accumulator["saved"] += len(self.batch_accumulators['batch_waveforms'])
 
             # Flush shard if full
@@ -799,7 +849,7 @@ class AudioDatasetPreprocessor(Preprocessor):
         self.batch_accumulators['batch_waveforms'] = []
         if self.args.compute_speaker_embeddings:
             self.batch_accumulators['batch_speaker_ids'] = []
-        if self.args.extract_conditions:
+        if self.args.extract_conditions or self.args.tokenize_text:
             self.batch_accumulators['batch_conditions'] = []
     
     def preprocess_example(self, example) -> bool:
@@ -827,7 +877,7 @@ class AudioDatasetPreprocessor(Preprocessor):
             self.batch_accumulators['batch_waveforms'] = []
         if 'batch_speaker_ids' not in self.batch_accumulators and self.args.compute_speaker_embeddings:
             self.batch_accumulators['batch_speaker_ids'] = []
-        if 'batch_conditions' not in self.batch_accumulators and self.args.extract_conditions:
+        if 'batch_conditions' not in self.batch_accumulators and (self.args.extract_conditions or self.args.tokenize_text):
             self.batch_accumulators['batch_conditions'] = []
 
         # Add to batch
@@ -835,7 +885,7 @@ class AudioDatasetPreprocessor(Preprocessor):
         if self.args.compute_speaker_embeddings:
             speaker_id = example.get(self.args.speaker_id_column, "unknown")
             self.batch_accumulators['batch_speaker_ids'].append(speaker_id)
-        if self.args.extract_conditions:
+        if self.args.extract_conditions or self.args.tokenize_text:
             conditions = example[self.args.text_conditions_column]
             self.batch_accumulators['batch_conditions'].append(conditions)
 
@@ -877,4 +927,8 @@ class AudioDatasetPreprocessor(Preprocessor):
             "save_waveforms": self.args.save_waveforms,
             "save_text": self.args.save_text,
             "num_unique_speakers": self.num_unique_speaker_ids,
+            "tokenize_text": self.args.tokenize_text,
+            "tokenizer_name": self.args.tokenizer_name if self.args.tokenize_text else None,
+            "max_seq_len": self.args.max_seq_len if self.args.tokenize_text else None,
+            "vocab_size": len(self.tokenizer) if self.tokenizer else None,
         }

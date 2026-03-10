@@ -120,7 +120,7 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
 
 
 def get_dataset(command: str, args, split: str):
-    shard_dir = args.cache_dir + "_" + split
+    shard_dir = (args.cache_dir + "_" + split) if args.cache_dir else None
     if command in ["audio-cvae", 'audio-cvae-decoder']:
         dataset = AudioShardedDataset(
             shard_dir=shard_dir,
@@ -168,15 +168,26 @@ def get_dataset(command: str, args, split: str):
             image_size=args.image_size,
         )
     elif command in ["world"]:
-        audio_columns = [c.strip() for c in args.audio_columns.split(",")] if args.audio_columns else None
-        text_dir = (args.text_cache_dir + "_" + split) if args.text_cache_dir else None
-        audio_dir = (args.audio_cache_dir + "_" + split) if args.audio_cache_dir else None
-        image_dir = (args.image_cache_dir + "_" + split) if args.image_cache_dir else None
+
+        def _resolve_shard_dir(cache_dir, split):
+            """Resolve shard directory, skipping if the split-specific dir doesn't exist."""
+            if cache_dir is None:
+                return None
+            candidate = cache_dir + "_" + split
+            if os.path.isdir(candidate):
+                return candidate
+            print(f"Warning: {candidate} not found, skipping this modality for {split} split")
+            return None
+
+        text_dir = _resolve_shard_dir(args.text_cache_dir, split)
+        audio_dir = _resolve_shard_dir(args.audio_cache_dir, split)
+        voice_dir = _resolve_shard_dir(getattr(args, 'voice_cache_dir', None), split)
+        image_dir = _resolve_shard_dir(args.image_cache_dir, split)
         dataset = MultimodalShardedDataset(
             text_shard_dir=text_dir,
             audio_shard_dir=audio_dir,
+            voice_shard_dir=voice_dir,
             image_shard_dir=image_dir,
-            audio_columns=audio_columns,
             cache_size=32,
         )
     return dataset
@@ -228,7 +239,84 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             num_eval_samples=8,
         )
     elif command in ["world"]:
-        callback = None
+        from scripts.train.world.visualization_callback import WorldModelVisualizationCallback
+
+        vocoder = None
+        if getattr(args, 'vocoder_checkpoint_path', None) or getattr(args, 'vocoder_config', None):
+            try:
+                vocoder = model_loading_utils.load_vocoder(
+                    getattr(args, 'vocoder_checkpoint_path', None),
+                    getattr(args, 'vocoder_config', 'hifigan'),
+                    shared_window_buffer,
+                    is_wrapped=legacy_vocoder,
+                )
+            except Exception as e:
+                print(f"Warning: Failed to load vocoder for world model visualization: {e}")
+
+        image_vae_decoder = None
+        image_vae_decoder_config = getattr(args, 'image_vae_decoder_config', 'small')
+        if image_vae_decoder_config == 'litevae':
+            try:
+                from scripts.data.image.vae.preprocess import _load_litevae
+                image_vae_decoder = _load_litevae("litevae", device="cpu")
+                image_vae_decoder.eval()
+                print(f"Loaded LiteVAE decoder for visualization")
+            except Exception as e:
+                print(f"Warning: Failed to load LiteVAE decoder: {e}")
+        elif getattr(args, 'image_vae_decoder_path', None):
+            try:
+                from model.image.vae.vae import ImageVAEDecoder
+                image_vae_decoder = model_loading_utils.load_model(
+                    ImageVAEDecoder,
+                    getattr(args, 'image_vae_decoder_config', 'small'),
+                    checkpoint_path=args.image_vae_decoder_path,
+                    strict=False,
+                )
+                image_vae_decoder.eval()
+            except Exception as e:
+                print(f"Warning: Failed to load image VAE decoder for world model visualization: {e}")
+
+        voice_cvae_decoder = None
+        if getattr(args, 'voice_cvae_checkpoint_path', None):
+            try:
+                from model.audio.vae.vae import AudioCVAEDecoderOnly
+                cvae_overrides = {}
+                if getattr(args, 'voice_cvae_latent_channels', None) is not None:
+                    cvae_overrides["latent_channels"] = args.voice_cvae_latent_channels
+                voice_cvae_decoder = model_loading_utils.load_model(
+                    AudioCVAEDecoderOnly,
+                    getattr(args, 'voice_cvae_config', 'small'),
+                    checkpoint_path=args.voice_cvae_checkpoint_path,
+                    strict=False,
+                    overrides=cvae_overrides,
+                )
+                voice_cvae_decoder.eval()
+            except Exception as e:
+                print(f"Warning: Failed to load voice CVAE decoder for world model visualization: {e}")
+
+        static_speaker_embedding = None
+        if getattr(args, 'static_speaker_embedding_path', None):
+            try:
+                static_speaker_embedding = torch.load(
+                    args.static_speaker_embedding_path, map_location="cpu", weights_only=True,
+                )
+                print(f"Loaded static speaker embedding: shape={static_speaker_embedding.shape}")
+            except Exception as e:
+                print(f"Warning: Failed to load static speaker embedding: {e}")
+
+        callback = WorldModelVisualizationCallback(
+            tokenizer=None,  # Will be set up in callback if needed
+            vocoder=vocoder,
+            image_vae_decoder=image_vae_decoder,
+            voice_cvae_decoder=voice_cvae_decoder,
+            static_speaker_embedding=static_speaker_embedding,
+            num_eval_samples=getattr(args, 'num_eval_samples', 4),
+            step_offset=args.start_step,
+            audio_sample_rate=getattr(args, 'audio_sample_rate', 16000),
+            audio_n_mels=getattr(args, 'audio_n_mels', 80),
+            audio_n_fft=getattr(args, 'audio_n_fft', 1024),
+            audio_hop_length=getattr(args, 'audio_hop_length', 256),
+        )
     return callback
 
 

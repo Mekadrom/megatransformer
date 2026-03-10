@@ -121,7 +121,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         kv_cache: Optional[RecurrentKVCache] = None,
         position_offset: int = 0,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache]]:
+    ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache], int]:
         """
         Forward pass through recurrent block with optional KV caching.
 
@@ -144,6 +144,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         Returns:
             thought_states: Output thought states, shape (batch, seq_len, d_model)
             new_kv_cache: Updated RecurrentKVCache if use_cache=True, else None
+            num_iterations: Total number of recurrent iterations performed
         """
         n_steps_no_grad, k_steps_grad = self.n_k_steps(self.mean_thinking_steps, self.backprop_depth)
 
@@ -183,7 +184,7 @@ class MegatransformerRecurrentBlock(nn.Module):
                     thought_states = self.projection(block_output)
 
                     if not self.training and self.exit_criteria is not None and self.exit_criteria.should_exit(last_thought_state, thought_states):
-                        return thought_states, new_kv_cache
+                        return thought_states, new_kv_cache, iteration + 1
 
                     last_thought_state = thought_states
                     iteration += 1
@@ -213,7 +214,7 @@ class MegatransformerRecurrentBlock(nn.Module):
                 last_thought_state = thought_states
                 iteration += 1
 
-        return last_thought_state, new_kv_cache
+        return last_thought_state, new_kv_cache, iteration
 
     def generate_step(
         self,

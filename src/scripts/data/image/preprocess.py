@@ -284,7 +284,7 @@ class ImageDatasetPreprocessor(Preprocessor):
 
     @classmethod
     def add_cli_args(cls, subparsers):
-        sub_parser = subparsers.add_parser("image-vae", help="Preprocess image dataset for unconditional or conditional image training.")
+        sub_parser = subparsers.add_parser("image", help="Preprocess raw image dataset (no VAE encoding)")
     
         # Image settings
         sub_parser.add_argument("--image_size", type=int, default=256,

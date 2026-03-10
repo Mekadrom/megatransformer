@@ -138,18 +138,105 @@ class T5TextEncoder:
         }
 
 
+LITEVAE_MODELS = {
+    "litevae": {
+        "repo_id": "RGenDiff/olitevaeB_im_f8c12",
+        "filename": "olitevaeB_im_f8c12.safetensors",
+        "config": {
+            "target": "olvae.models.liteautoencoder.LiteAutoencoderKL",
+            "params": {
+                "use_ema": False,
+                "embed_dim": 12,
+                "use_quant": False,
+                "encoder_config": {
+                    "target": "olvae.modules.litevae.encoder_model.LiteVAE_Encoder",
+                    "params": {
+                        "in_channels": 3,
+                        "dct_levels": 3,
+                        "latent_dim": 12,
+                        "image_size": 256,
+                        "extractor_channels": 32,
+                        "extractor_mult": [1, 2, 3],
+                        "extractor_resblocks": 4,
+                        "aggregate_channels": 32,
+                        "aggregate_mult": [1, 2, 3],
+                        "aggregate_resblocks": 4,
+                    },
+                },
+                "decoder_config": {
+                    "target": "olvae.modules.litevae.decoder_model.LiteVAE_Decoder",
+                    "params": {
+                        "channels": 128,
+                        "z_channels": 12,
+                        "out_channels": 3,
+                        "channel_mult": [1, 2, 4, 4],
+                        "num_res_blocks": 2,
+                    },
+                },
+                "lossconfig": {"target": "torch.nn.Identity"},
+            },
+        },
+    },
+}
+
+
+def _load_litevae(model_name: str = "litevae", device: str = "cuda"):
+    """Load a pretrained LiteVAE model, downloading the checkpoint if needed.
+
+    Requires open-litevae to be installed: pip install -e . from the open-litevae repo.
+
+    Args:
+        model_name: Key in LITEVAE_MODELS (currently only "litevae")
+        device: Device to load model on
+    """
+    try:
+        from omegaconf import OmegaConf
+        from safetensors.torch import load_file
+        from olvae.util import instantiate_from_config
+    except ImportError:
+        raise ImportError(
+            "open-litevae is required for LiteVAE support. "
+            "Install it from https://github.com/RGenDiff/open-litevae"
+        )
+
+    from huggingface_hub import hf_hub_download
+
+    model_info = LITEVAE_MODELS[model_name]
+
+    # Download checkpoint (cached automatically by huggingface_hub)
+    checkpoint_path = hf_hub_download(
+        repo_id=model_info["repo_id"],
+        filename=model_info["filename"],
+    )
+    print(f"  LiteVAE checkpoint: {checkpoint_path}")
+
+    config = OmegaConf.create({"model": model_info["config"]})
+    sd = load_file(checkpoint_path)
+    model = instantiate_from_config(config.model)
+    model.load_state_dict(sd, strict=False)
+    model = model.to(device).eval()
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    return model
+
+
+PRETRAINED_IMAGE_VAES = set(LITEVAE_MODELS.keys())
+
+
 class ImageVAEBatchProcessor(BatchProcessor):
     """Batched GPU processing for encoding images through VAE."""
 
     def __init__(
         self,
-        vae_encoder,
+        encode_fn,
         image_size: tuple[int, int] = (256, 256),
         normalize_mean: tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize_std: tuple[float, float, float] = (0.5, 0.5, 0.5),
         device: str = "cuda",
     ):
-        self.vae_encoder = vae_encoder
+        self.encode_fn = encode_fn
         self.image_size = image_size
         self.normalize_mean = torch.tensor(normalize_mean).view(3, 1, 1)
         self.normalize_std = torch.tensor(normalize_std).view(3, 1, 1)
@@ -190,7 +277,7 @@ class ImageVAEBatchProcessor(BatchProcessor):
 
         Returns:
             Dict with:
-                - latents: [B, latent_channels, H', W'] VAE latents (mu, not sampled)
+                - latents: [B, latent_channels, H', W'] VAE latents (mu / mode)
                 - mu: [B, latent_channels, H', W'] latent means
                 - logvar: [B, latent_channels, H', W'] latent log variances
         """
@@ -201,15 +288,8 @@ class ImageVAEBatchProcessor(BatchProcessor):
         # Normalize
         images = (images - self.normalize_mean) / self.normalize_std
 
-        # Encode through VAE
-        mu, logvar = self.vae_encoder(images)
-
-        # Return mu as latents (deterministic encoding for dataset)
-        return {
-            "latents": mu.cpu(),
-            "mu": mu.cpu(),
-            "logvar": logvar.cpu(),
-        }
+        # Encode through VAE (encode_fn handles API differences)
+        return self.encode_fn(images)
 
 
 class ImageVAEDatasetPreprocessor(Preprocessor):
@@ -250,6 +330,17 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         self.encode_text = args.encode_text
         self.t5_encoder = None
 
+        # Text tokenization (for world model text input)
+        self.tokenize_text = args.tokenize_text
+        self.tokenizer = None
+        if self.tokenize_text and self.text_column:
+            from transformers import AutoTokenizer
+            print(f"Loading tokenizer: {args.tokenizer_name}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+            self.max_seq_len = args.max_seq_len
+            print(f"  Vocab size: {len(self.tokenizer)}")
+            print(f"  Max seq len: {self.max_seq_len}")
+
         if self.text_column:
             print(f"Text conditioning: column={self.text_column}")
             if self.encode_text:
@@ -272,7 +363,28 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         print(f"  Download timeout: {self.download_timeout}s")
 
         # Load VAE encoder
-        if args.vae_checkpoint_path:
+        self.vae_encoder = None
+        self._encode_fn = None
+
+        if args.vae_config in PRETRAINED_IMAGE_VAES:
+            # Pretrained external VAE (e.g. LiteVAE)
+            print(f"Loading pretrained image VAE: {args.vae_config}...")
+            litevae_model = _load_litevae(args.vae_config, device=device)
+            self.vae_encoder = litevae_model
+            print(f"  Parameters: {sum(p.numel() for p in litevae_model.parameters()):,}")
+
+            def _litevae_encode(images):
+                posterior = litevae_model.encode(images)
+                mu = posterior.mode()
+                return {
+                    "latents": mu.cpu(),
+                    "mu": mu.cpu(),
+                    "logvar": torch.zeros_like(mu).cpu(),
+                }
+            self._encode_fn = _litevae_encode
+
+        elif args.vae_checkpoint_path:
+            # Internal VAE
             print(f"Loading VAE encoder from {args.vae_checkpoint_path}...")
             from utils.model_loading_utils import load_model
             self.vae_model = load_model(
@@ -281,18 +393,27 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
                 device=device,
             )
             self.vae_encoder = self.vae_model.encoder
+
+            def _internal_encode(images):
+                mu, logvar = self.vae_encoder(images)
+                return {
+                    "latents": mu.cpu(),
+                    "mu": mu.cpu(),
+                    "logvar": logvar.cpu(),
+                }
+            self._encode_fn = _internal_encode
+
         else:
             print("No VAE checkpoint specified - will save raw images as tensors")
-            self.vae_encoder = None
 
         self.image_size = (args.image_size, args.image_size)
         print(f"  Image size: {self.image_size}")
         print(f"  Total samples in dataset: {len(self.dataset):,}")
 
         # Initialize batch processor
-        if self.vae_encoder is not None:
+        if self._encode_fn is not None:
             self.batch_processor = ImageVAEBatchProcessor(
-                vae_encoder=self.vae_encoder,
+                encode_fn=self._encode_fn,
                 image_size=self.image_size,
                 normalize_mean=tuple(args.normalize_mean),
                 normalize_std=tuple(args.normalize_std),
@@ -311,6 +432,9 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
             'shard_text_embeddings': [],  # T5 encoded text [B, seq_len, hidden]
             'shard_text_attention_mask': [],  # Attention mask [B, seq_len]
             'shard_raw_text': [],  # Raw text strings
+            # Tokenized text fields
+            'shard_token_ids': [],  # Tokenized text [N, T]
+            'shard_text_lengths': [],  # Token counts [N]
         })
 
         # Initialize batch accumulators
@@ -322,11 +446,12 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
     def add_cli_args(cls, subparsers):
         sub_parser = subparsers.add_parser("image-vae", help="Preprocess image dataset for VAE training")
 
-        # VAE model
+        # VAE model — set --vae_config to "litevae" for pretrained LiteVAE
+        # (auto-downloads from HuggingFace), or an internal config name with --vae_checkpoint_path.
         sub_parser.add_argument("--vae_checkpoint_path", type=str, default=None,
-                                help="Path to VAE checkpoint (if None, saves raw image tensors)")
+                                help="Path to internal VAE checkpoint (not needed for pretrained VAEs)")
         sub_parser.add_argument("--vae_config", type=str, default="default",
-                                help="VAE config name")
+                                help="VAE config name, or 'litevae' for pretrained LiteVAE (auto-downloaded)")
 
         # Image settings
         sub_parser.add_argument("--image_size", type=int, default=256,
@@ -363,6 +488,14 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
                                 help="T5 model name for text encoding")
         sub_parser.add_argument("--t5_max_length", type=int, default=128,
                                 help="Maximum token length for T5 encoding")
+
+        # Text tokenization (for world model training — saves token IDs alongside latents)
+        sub_parser.add_argument("--tokenize_text", action="store_true", default=False,
+                                help="Tokenize text into token IDs (for world model text input)")
+        sub_parser.add_argument("--tokenizer_name", type=str, default="mistralai/Mistral-7B-v0.1",
+                                help="HuggingFace tokenizer for --tokenize_text")
+        sub_parser.add_argument("--max_seq_len", type=int, default=128,
+                                help="Maximum token sequence length for --tokenize_text")
         
         return sub_parser
 
@@ -417,7 +550,19 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
                 shard_data["text_embeddings"] = torch.cat(self.shard_fields['shard_text_embeddings'], dim=0)
                 shard_data["text_attention_mask"] = torch.cat(self.shard_fields['shard_text_attention_mask'], dim=0)
             elif self.shard_fields['shard_raw_text']:
-                shard_data["raw_text"] = self.shard_fields['shard_raw_text'].copy()
+                shard_data["text"] = self.shard_fields['shard_raw_text'].copy()
+
+            # Add tokenized text if enabled
+            if self.tokenize_text and self.shard_fields['shard_token_ids']:
+                max_len = max(t.shape[-1] for t in self.shard_fields['shard_token_ids'])
+                pad_id = self.tokenizer.pad_token_id or 0
+                padded = []
+                for tokens in self.shard_fields['shard_token_ids']:
+                    if tokens.shape[-1] < max_len:
+                        tokens = F.pad(tokens, (0, max_len - tokens.shape[-1]), value=pad_id)
+                    padded.append(tokens)
+                shard_data["token_ids"] = torch.stack(padded, dim=0)
+                shard_data["text_lengths"] = torch.stack(self.shard_fields['shard_text_lengths'], dim=0)
 
         shard_path = os.path.join(self.output_dir, f"shard_{self.shard_fields['shard_idx']:06d}.pt")
         torch.save(shard_data, shard_path)
@@ -432,6 +577,8 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         self.shard_fields['shard_text_embeddings'] = []
         self.shard_fields['shard_text_attention_mask'] = []
         self.shard_fields['shard_raw_text'] = []
+        self.shard_fields['shard_token_ids'] = []
+        self.shard_fields['shard_text_lengths'] = []
         self.shard_fields['shard_idx'] += 1
 
     def process_and_accumulate(self):
@@ -466,6 +613,19 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
                     # Store raw text
                     self.shard_fields['shard_raw_text'].extend(self.batch_accumulators['batch_texts'])
 
+                # Tokenize text if enabled
+                if self.tokenize_text and self.tokenizer is not None:
+                    encoded = self.tokenizer(
+                        self.batch_accumulators['batch_texts'],
+                        truncation=True,
+                        max_length=self.max_seq_len,
+                        padding=False,
+                        return_attention_mask=False,
+                    )
+                    for input_ids in encoded["input_ids"]:
+                        self.shard_fields['shard_token_ids'].append(torch.tensor(input_ids, dtype=torch.long))
+                        self.shard_fields['shard_text_lengths'].append(torch.tensor(len(input_ids), dtype=torch.long))
+
             self.stats_accumulator["saved"] += len(self.batch_accumulators['batch_images'])
 
             # Flush shard if full
@@ -485,26 +645,28 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         self.batch_accumulators['batch_images'] = []
         self.batch_accumulators['batch_texts'] = []
 
-    def _extract_text_from_example(self, example) -> Optional[str]:
-        """Extract text from dataset example."""
+    def _extract_texts_from_example(self, example) -> list[str]:
+        """Extract text(s) from dataset example. Returns a list of captions."""
         if not self.text_column:
-            return None
+            return []
 
         try:
             text = example.get(self.text_column)
             if text is None:
-                return None
+                return []
 
             # Handle various text formats
             if isinstance(text, str):
-                return text.strip()
+                stripped = text.strip()
+                return [stripped] if stripped else []
             elif isinstance(text, list):
-                # Some datasets have multiple captions - take the first
-                return str(text[0]).strip() if text else None
+                # Multiple captions (e.g. Flickr30k) — return all non-empty
+                return [str(t).strip() for t in text if str(t).strip()]
             else:
-                return str(text).strip()
+                stripped = str(text).strip()
+                return [stripped] if stripped else []
         except Exception:
-            return None
+            return []
 
     def preprocess_example(self, example) -> bool:
         """Process a single example. Returns True if example was processed."""
@@ -525,22 +687,25 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
             self.stats_accumulator["skipped"]["grayscale"] += 1
             return False
 
-        # Extract text if configured
-        text = None
+        # Extract text(s) if configured
         if self.text_column:
-            text = self._extract_text_from_example(example)
-            if text is None or len(text) == 0:
+            texts = self._extract_texts_from_example(example)
+            if not texts:
                 self.stats_accumulator["skipped"]["missing_text"] += 1
                 return False
 
-        # Add to batch
-        self.batch_accumulators['batch_images'].append(image)
-        if self.text_column:
-            self.batch_accumulators['batch_texts'].append(text)
+            # One example per caption-image pair
+            for caption in texts:
+                self.batch_accumulators['batch_images'].append(image)
+                self.batch_accumulators['batch_texts'].append(caption)
 
-        # Process batch when full
-        if len(self.batch_accumulators['batch_images']) >= self.args.gpu_batch_size:
-            self.process_and_accumulate()
+                if len(self.batch_accumulators['batch_images']) >= self.args.gpu_batch_size:
+                    self.process_and_accumulate()
+        else:
+            self.batch_accumulators['batch_images'].append(image)
+
+            if len(self.batch_accumulators['batch_images']) >= self.args.gpu_batch_size:
+                self.process_and_accumulate()
 
         return True
 
@@ -575,5 +740,10 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
             config["t5_max_length"] = self.args.t5_max_length
             if self.t5_encoder is not None:
                 config["t5_hidden_size"] = self.t5_encoder.encoder.config.d_model
+
+        if self.tokenize_text:
+            config["tokenizer_name"] = self.args.tokenizer_name
+            config["max_seq_len"] = self.args.max_seq_len
+            config["vocab_size"] = len(self.tokenizer) if self.tokenizer else None
 
         return config

@@ -13,7 +13,7 @@ class TextCodaClassifierConfig:
     coda_config: MegaTransformerBlockConfig = dataclasses.field(
         default_factory=MegaTransformerBlockConfig
     )
-    vocab_size: int = 32007
+    vocab_size: int = 32009
     label_smoothing: float = 0.0
 
 

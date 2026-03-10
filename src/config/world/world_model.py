@@ -15,6 +15,11 @@ from config.image.feature_extractor import ImageVAEPreludeFeatureExtractorConfig
 from config.image.generator import ImageCodaAndVAEConfig
 from config.text.feature_extractor import TextFeatureExtractorConfig
 from config.text.generator import TextCodaClassifierConfig
+from utils.constants import (
+    AUDIO_PLACEHOLDER_TOKEN_ID,
+    VOICE_PLACEHOLDER_TOKEN_ID,
+    IMAGE_PLACEHOLDER_TOKEN_ID,
+)
 
 
 @dataclass
@@ -32,9 +37,9 @@ class TokenInterleaverConfig:
     Then configure accordingly. The interleaver will scan for these tokens
     in the input sequence and replace them with the corresponding media embeddings.
     """
-    audio_placeholder_token_id: Optional[int] = None
-    voice_placeholder_token_id: Optional[int] = None
-    image_placeholder_token_id: Optional[int] = None
+    audio_placeholder_token_id: Optional[int] = AUDIO_PLACEHOLDER_TOKEN_ID
+    voice_placeholder_token_id: Optional[int] = VOICE_PLACEHOLDER_TOKEN_ID
+    image_placeholder_token_id: Optional[int] = IMAGE_PLACEHOLDER_TOKEN_ID
 
 
     def __post_init__(self):
@@ -57,7 +62,7 @@ class MegaTransformerRecurrentConfig:
     input embeddings with thought state, then projects back to d_model.
     """
     block_config: MegaTransformerBlockConfig = dataclasses.field(
-        default_factory=MegaTransformerBlockConfig
+        default_factory=lambda: MegaTransformerBlockConfig(d_model=1024, d_inner=4096)
     )
     mean_thinking_steps: int = 32
     backprop_depth: int = 8
@@ -119,6 +124,12 @@ class MegaTransformerWorldModelConfig:
     image_coda_config: ImageCodaAndVAEConfig = dataclasses.field(
         default_factory=ImageCodaAndVAEConfig
     )
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    def to_json_string(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
 
 
 WORLD_MODEL_CONFIGS = {

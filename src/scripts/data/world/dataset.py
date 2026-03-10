@@ -25,18 +25,22 @@ class MultimodalShardedDataset(Dataset):
         self,
         text_shard_dir: str = None,
         audio_shard_dir: str = None,
+        voice_shard_dir: str = None,
         image_shard_dir: str = None,
         text_columns: list[str] = None,
         audio_columns: list[str] = None,
+        voice_columns: list[str] = None,
         cache_size: int = 3,
     ):
         """
         Args:
             text_shard_dir: Path to preprocessed text shards (token_ids, text_lengths, text)
             audio_shard_dir: Path to preprocessed audio shards (features, mel_specs, etc.)
+            voice_shard_dir: Path to preprocessed voice shards (same format as audio)
             image_shard_dir: Path to preprocessed image shards (images)
             text_columns: Columns to load from text shards. If None, loads all.
             audio_columns: Columns to load from audio shards. If None, loads all.
+            voice_columns: Columns to load from voice shards. If None, mirrors audio_columns.
             cache_size: Number of shards to keep cached per modality
         """
         self.cache_size = cache_size
@@ -46,6 +50,8 @@ class MultimodalShardedDataset(Dataset):
             self.modalities["text"] = self._init_modality(text_shard_dir, "text")
         if audio_shard_dir is not None:
             self.modalities["audio"] = self._init_modality(audio_shard_dir, "audio")
+        if voice_shard_dir is not None:
+            self.modalities["voice"] = self._init_modality(voice_shard_dir, "voice")
         if image_shard_dir is not None:
             self.modalities["image"] = self._init_modality(image_shard_dir, "image")
 
@@ -54,13 +60,17 @@ class MultimodalShardedDataset(Dataset):
 
         self.text_columns = text_columns
         self.audio_columns = audio_columns
+        self.voice_columns = voice_columns
 
         # Default audio columns (mirrors AudioShardedDataset defaults)
+        _default_audio_columns = [
+            "conditions", "features", "mel_specs", "speaker_embeddings",
+            "speaker_ids", "waveforms", "f0", "vuv", "ctc_tokens", "text",
+        ]
         if self.audio_columns is None and "audio" in self.modalities:
-            self.audio_columns = [
-                "conditions", "features", "mel_specs", "speaker_embeddings",
-                "speaker_ids", "waveforms", "f0", "vuv", "ctc_tokens", "text",
-            ]
+            self.audio_columns = _default_audio_columns
+        if self.voice_columns is None and "voice" in self.modalities:
+            self.voice_columns = _default_audio_columns
 
         # Total length = max across modalities; shorter ones wrap via modulo
         self.total_samples = max(m["total_samples"] for m in self.modalities.values())
@@ -164,6 +174,8 @@ class MultimodalShardedDataset(Dataset):
         }
         if "text" in shard:
             sample["text"] = shard["text"][local_idx]
+        elif "raw_text" in shard:
+            sample["text"] = shard["raw_text"][local_idx]
 
         return sample
 
@@ -209,12 +221,57 @@ class MultimodalShardedDataset(Dataset):
 
         return sample
 
+    def _get_voice_sample(self, idx: int) -> dict:
+        mod = self.modalities["voice"]
+        wrapped_idx = idx % mod["total_samples"]
+        shard_idx, local_idx = self._find_shard_for_idx(mod, wrapped_idx)
+        shard = self._load_shard(mod, shard_idx)
+        columns = self.voice_columns
+
+        sample = {}
+
+        if "features" in shard and "features" in columns:
+            sample["features"] = shard["features"][local_idx]
+            sample["feature_length"] = shard["feature_lengths"][local_idx]
+
+        if "waveforms" in shard and "waveforms" in columns:
+            sample["waveform"] = shard["waveforms"][local_idx]
+            sample["waveform_length"] = shard["waveform_lengths"][local_idx]
+
+        if "mel_specs" in shard and "mel_specs" in columns:
+            sample["mel_spec"] = shard["mel_specs"][local_idx]
+            sample["mel_length"] = shard["mel_lengths"][local_idx]
+
+        if "speaker_embeddings" in shard and "speaker_embeddings" in columns:
+            sample["speaker_embedding"] = shard["speaker_embeddings"][local_idx]
+
+        if "speaker_ids" in shard and "speaker_ids" in columns:
+            sample["speaker_id"] = shard["speaker_ids"][local_idx]
+
+        if "f0" in shard and "f0" in columns:
+            sample["f0"] = shard["f0"][local_idx]
+
+        if "vuv" in shard and "vuv" in columns:
+            sample["vuv"] = shard["vuv"][local_idx]
+
+        if "ctc_tokens" in shard and "ctc_tokens" in columns:
+            sample["ctc_tokens"] = shard["ctc_tokens"][local_idx]
+            sample["ctc_length"] = shard["ctc_lengths"][local_idx]
+
+        if "text" in shard and "text" in columns:
+            sample["voice_text"] = shard["text"][local_idx]
+
+        return sample
+
     def _get_image_sample(self, idx: int) -> dict:
         mod = self.modalities["image"]
         wrapped_idx = idx % mod["total_samples"]
         shard_idx, local_idx = self._find_shard_for_idx(mod, wrapped_idx)
         shard = self._load_shard(mod, shard_idx)
 
+        # Support both raw image shards ("images") and precomputed latent shards ("latents")
+        if "latents" in shard:
+            return {"image": shard["latents"][local_idx]}
         return {"image": shard["images"][local_idx]}
 
     def __len__(self):
@@ -230,6 +287,10 @@ class MultimodalShardedDataset(Dataset):
         if "audio" in self.modalities:
             audio_sample = self._get_audio_sample(idx)
             sample.update({f"audio_{k}": v for k, v in audio_sample.items()})
+
+        if "voice" in self.modalities:
+            voice_sample = self._get_voice_sample(idx)
+            sample.update({f"voice_{k}": v for k, v in voice_sample.items()})
 
         if "image" in self.modalities:
             image_sample = self._get_image_sample(idx)

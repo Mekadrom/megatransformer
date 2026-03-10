@@ -11,7 +11,7 @@
       "Bash(find:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "mcp__ide__getDiagnostics",
-      "Bash(python:*)"
+      "WebFetch(domain:github.com)"
     ],
     "deny": [],
     "ask": []

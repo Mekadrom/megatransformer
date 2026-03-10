@@ -9,7 +9,6 @@ from typing import Dict, List, Optional
 from config.world.world_model import WORLD_MODEL_CONFIGS, MegaTransformerWorldModelConfig
 from model.audio.feature_extractor import AudioVAEPreludeFeatureExtractor
 from model.audio.generator import AudioCodaAndVAEWithLoss
-from model.audio.vae.vae import AudioVAEDecoder, AudioVAEEncoder
 from model.image.feature_extractor import ImageVAEPreludeFeatureExtractor
 from model.image.generator import ImageCodaAndVAEWithLoss
 from model.image.vae.vae import ImageVAEDecoder, ImageVAEEncoder
@@ -61,29 +60,10 @@ class MegaTransformerWorldModel(nn.Module):
         self.voice_generator = AudioCodaAndVAEWithLoss("voice", config.voice_coda_config)
         self.image_generator = ImageCodaAndVAEWithLoss(config.image_coda_config)
 
-    def load_audio_vae(self, encoder: AudioVAEEncoder, decoder: AudioVAEDecoder):
-        """Load audio VAE encoder/decoder for live encoding/decoding."""
-        self.audio_feature_extractor.vae_encoder = encoder
-        self.audio_generator.vae_decoder = decoder
-
-    def load_voice_vae(self, encoder: AudioVAEEncoder, decoder: AudioVAEDecoder):
-        """Load voice VAE encoder/decoder for live encoding/decoding."""
-        self.voice_feature_extractor.vae_encoder = encoder
-        self.voice_generator.vae_decoder = decoder
-
     def load_image_vae(self, encoder: ImageVAEEncoder, decoder: ImageVAEDecoder):
         """Load image VAE encoder/decoder for live encoding/decoding."""
         self.image_feature_extractor.vae_encoder = encoder
         self.image_generator.vae_decoder = decoder
-
-    def unload_vaes(self):
-        """Unload all VAE encoders/decoders to free memory."""
-        self.audio_feature_extractor.vae_encoder = None
-        self.audio_generator.vae_decoder = None
-        self.voice_feature_extractor.vae_encoder = None
-        self.voice_generator.vae_decoder = None
-        self.image_feature_extractor.vae_encoder = None
-        self.image_generator.vae_decoder = None
 
     @classmethod
     def from_config(cls, config_name: str, **overrides) -> "MegaTransformerWorldModel":
@@ -135,15 +115,13 @@ class MegaTransformerWorldModel(nn.Module):
             text_input_ids: Token IDs for text, shape (batch, text_seq_len).
                 Contains placeholder tokens for media positions.
 
-            audio_inputs: Audio input, shape depends on mode:
-                - precomputed_latents=True: (batch, n_audio, latent_channels, mel_bins, timesteps)
-                - precomputed_latents=False: (batch, n_audio, mel_bins, timesteps) raw mel specs
+            audio_inputs: SIVE features, shape (batch, n_audio, feature_channels, timesteps).
             audio_lengths: Actual lengths per audio example, shape (batch, n_audio).
             audio_latent_labels: Target latents for audio loss, same shape as latent inputs.
 
-            voice_inputs: Same format as audio_inputs.
+            voice_inputs: SIVE features, same format as audio_inputs.
             voice_lengths: Same format as audio_lengths.
-            voice_latent_labels: Target latents for voice loss.
+            voice_latent_labels: Target SIVE features for voice loss.
 
             image_inputs: Image input, shape depends on mode:
                 - precomputed_latents=True: (batch, n_images, latent_channels, latent_h, latent_w)
@@ -205,7 +183,7 @@ class MegaTransformerWorldModel(nn.Module):
         )
 
         # Main Transformer (Recurrent Block)
-        recurrent_output, _ = self.recurrent_block(
+        recurrent_output, _, _ = self.recurrent_block(
             interleaved_tokens,
             attention_mask=attn_mask  # True for attend, False for padding
         )
@@ -257,6 +235,139 @@ class MegaTransformerWorldModel(nn.Module):
 
         return outputs
 
+    @property
+    def image_num_patches(self) -> int:
+        """Number of tokens the image coda expects (must be a perfect square)."""
+        nps = self.image_feature_extractor.num_patches_per_side
+        return nps * nps
+
+    def _encode_prompt(
+        self,
+        text_input_ids: torch.Tensor,
+        audio_inputs: Optional[torch.Tensor] = None,
+        audio_lengths: Optional[torch.Tensor] = None,
+        voice_inputs: Optional[torch.Tensor] = None,
+        voice_lengths: Optional[torch.Tensor] = None,
+        image_inputs: Optional[torch.Tensor] = None,
+        precomputed_latents: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode a prompt with optional pre-encoded media into hidden states.
+
+        If media inputs are provided, placeholder tokens in text_input_ids are
+        replaced with actual media embeddings via the TokenInterleaver (same as
+        in forward()).
+
+        Returns:
+            Tuple of (prompt_hidden, attention_mask):
+            - prompt_hidden: (batch, seq_len, d_model)
+            - attention_mask: (batch, seq_len) or None
+        """
+        has_media = (
+            audio_inputs is not None
+            or voice_inputs is not None
+            or image_inputs is not None
+        )
+
+        if not has_media:
+            # Text-only prompt — no interleaving needed
+            prompt_hidden = self.text_feature_extractor(text_input_ids)
+            return prompt_hidden, None
+
+        # Encode text
+        text_hidden = self.text_feature_extractor(text_input_ids)
+
+        # Encode media through feature extractors
+        audio_hidden = None
+        if audio_inputs is not None:
+            batch_size, n_audio = audio_inputs.shape[:2]
+            audio_flat = audio_inputs.view(batch_size * n_audio, *audio_inputs.shape[2:])
+            audio_hidden_flat = self.audio_feature_extractor(
+                audio_flat, precomputed_latents=precomputed_latents
+            )
+            seq_len, d_model = audio_hidden_flat.shape[1], audio_hidden_flat.shape[2]
+            audio_hidden = audio_hidden_flat.view(batch_size, n_audio, seq_len, d_model)
+
+        voice_hidden = None
+        if voice_inputs is not None:
+            batch_size, n_voice = voice_inputs.shape[:2]
+            voice_flat = voice_inputs.view(batch_size * n_voice, *voice_inputs.shape[2:])
+            voice_hidden_flat = self.voice_feature_extractor(
+                voice_flat, precomputed_latents=precomputed_latents
+            )
+            seq_len, d_model = voice_hidden_flat.shape[1], voice_hidden_flat.shape[2]
+            voice_hidden = voice_hidden_flat.view(batch_size, n_voice, seq_len, d_model)
+
+        image_hidden = None
+        if image_inputs is not None:
+            batch_size, n_images = image_inputs.shape[:2]
+            image_flat = image_inputs.view(batch_size * n_images, *image_inputs.shape[2:])
+            image_hidden_flat = self.image_feature_extractor(
+                image_flat, precomputed_latents=precomputed_latents
+            )
+            seq_len, d_model = image_hidden_flat.shape[1], image_hidden_flat.shape[2]
+            image_hidden = image_hidden_flat.view(batch_size, n_images, seq_len, d_model)
+
+        # Interleave — replaces placeholder tokens with media embeddings
+        interleaved, attn_mask, _ = self.token_interleaver(
+            text_hidden_states=text_hidden,
+            text_token_ids=text_input_ids,
+            audio_hidden_states=audio_hidden,
+            audio_lengths=audio_lengths,
+            voice_hidden_states=voice_hidden,
+            voice_lengths=voice_lengths,
+            image_hidden_states=image_hidden,
+        )
+
+        return interleaved, attn_mask
+
+    def _finalize_audio_sequence(
+        self,
+        prefix: str,
+        sequences: List[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Finalize an audio/voice sequence through the appropriate coda."""
+        if not sequences:
+            return None
+        hidden = torch.cat(sequences, dim=0)  # (seq, d_model)
+        hidden = hidden.unsqueeze(0)  # (1, seq, d_model)
+        generator = self.audio_generator if prefix == "audio" else self.voice_generator
+        out = generator(hidden)
+        return out.get(f"{prefix}_latent_preds")
+
+    def _finalize_image_sequence(
+        self,
+        image_sequences_b: List[torch.Tensor],
+        decode_outputs: bool,
+    ) -> Optional[torch.Tensor]:
+        """Finalize an image sequence through the image coda.
+
+        Pads or truncates to exactly image_num_patches tokens so the
+        unpatchify layer can reshape to a square spatial grid.
+        """
+        if not image_sequences_b:
+            return None
+        image_hidden = torch.cat(image_sequences_b, dim=0)  # (seq, d_model)
+        expected = self.image_num_patches
+        actual = image_hidden.shape[0]
+        if actual < expected:
+            # Pad with zeros to reach expected patch count
+            pad = torch.zeros(
+                expected - actual, image_hidden.shape[1],
+                device=image_hidden.device, dtype=image_hidden.dtype,
+            )
+            image_hidden = torch.cat([image_hidden, pad], dim=0)
+        elif actual > expected:
+            image_hidden = image_hidden[:expected]
+        image_hidden = image_hidden.unsqueeze(0)  # (1, num_patches, d_model)
+        image_out = self.image_generator(
+            image_hidden,
+            decode_to_image=decode_outputs,
+        )
+        preds = image_out.get("image_latent_preds")
+        if preds is not None:
+            preds = preds.squeeze(0)  # (1, C, H, W) -> (C, H, W)
+        return preds
+
     # Generation with KV Caching
     @torch.no_grad()
     def generate(
@@ -269,6 +380,16 @@ class MegaTransformerWorldModel(nn.Module):
         kv_cache_strategy: str = "huginn",
         kv_cache_budget: int = 16,
         decode_outputs: bool = False,
+        # Token budgets for media generation (fixed-length, like image patches)
+        audio_token_budget: int = 209,
+        voice_token_budget: int = 209,
+        # Pre-encoded media for transcription / cross-modal tasks
+        audio_inputs: Optional[torch.Tensor] = None,
+        audio_lengths: Optional[torch.Tensor] = None,
+        voice_inputs: Optional[torch.Tensor] = None,
+        voice_lengths: Optional[torch.Tensor] = None,
+        image_inputs: Optional[torch.Tensor] = None,
+        precomputed_latents: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Generate tokens autoregressively with KV caching.
@@ -278,14 +399,19 @@ class MegaTransformerWorldModel(nn.Module):
 
         The generation flow:
         1. Process initial text input through text feature extractor
-        2. Autoregressively sample tokens through the recurrent block
-        3. When end-of-modality tokens (EOA/EOV/EOI) are detected, collect the
-           complete modality sequence and pass it to the appropriate coda
-        4. Continue generating until max_new_tokens or end-of-sequence
+        2. If media inputs are provided, replace placeholder tokens with actual
+           media embeddings via the TokenInterleaver (for transcription tasks)
+        3. Autoregressively sample tokens through the recurrent block
+        4. Media generation uses fixed token budgets: audio/voice generate exactly
+           audio_token_budget/voice_token_budget tokens, images generate exactly
+           num_patches tokens. After reaching the budget, the corresponding EO*
+           token is auto-emitted and the sequence is finalized through the coda.
+        5. Continue generating until max_new_tokens or end-of-sequence
 
         Args:
             text_input_ids: Initial text prompt token IDs, shape (batch, prompt_len).
-                Can contain placeholder tokens for media that will be generated.
+                Can contain placeholder tokens for media that will be generated,
+                or for pre-encoded media that replaces the placeholders.
             max_new_tokens: Maximum number of tokens to generate.
             temperature: Sampling temperature. Higher = more random.
             top_k: If set, only sample from top k most likely tokens.
@@ -293,16 +419,24 @@ class MegaTransformerWorldModel(nn.Module):
             kv_cache_strategy: "huginn" (shared cache, efficient) or "per_iteration".
             kv_cache_budget: Number of cache slots for Huginn strategy.
             decode_outputs: If True, decode generated latents via VAE decoders.
+            audio_inputs: Pre-encoded SIVE features, shape (batch, n_audio, C, T).
+                Requires corresponding AUDIO_PLACEHOLDER tokens in text_input_ids.
+            audio_lengths: Actual lengths per audio clip, shape (batch, n_audio).
+            voice_inputs: Pre-encoded SIVE voice features, same format as audio_inputs.
+            voice_lengths: Actual lengths per voice clip, shape (batch, n_voice).
+            image_inputs: Pre-encoded images, shape (batch, n_images, C, H, W).
+                Requires corresponding IMAGE_PLACEHOLDER tokens in text_input_ids.
+            precomputed_latents: If True, media inputs are VAE latents.
 
         Returns:
             Dictionary containing:
             - "generated_token_ids": Generated text token IDs, shape (batch, seq_len)
             - "text_logits": Logits for text tokens, shape (batch, seq_len, vocab_size)
-            - "audio_latent_preds": Padded tensor of shape (batch, max_n_audio, C, H, max_T)
+            - "audio_latent_preds": Padded tensor of shape (batch, max_n_audio, C, max_T)
             - "audio_counts": Number of audio clips per batch item, shape (batch,)
             - "audio_lengths": Actual time length of each audio, shape (batch, max_n_audio).
                 Use these lengths to slice before VAE decoding to avoid decoding padding.
-            - "voice_latent_preds": Padded tensor of shape (batch, max_n_voice, C, H, max_T)
+            - "voice_latent_preds": Padded tensor of shape (batch, max_n_voice, C, max_T)
             - "voice_counts": Number of voice clips per batch item, shape (batch,)
             - "voice_lengths": Actual time length of each voice, shape (batch, max_n_voice)
             - "image_latent_preds": Padded tensor of shape (batch, max_n_image, C, H, W)
@@ -311,6 +445,9 @@ class MegaTransformerWorldModel(nn.Module):
         """
         batch_size = text_input_ids.shape[0]
         device = text_input_ids.device
+
+        # Required token count for image generation
+        image_token_budget = self.image_num_patches
 
         # Initialize KV cache
         kv_cache = RecurrentKVCache(
@@ -336,20 +473,41 @@ class MegaTransformerWorldModel(nn.Module):
         completed_voice: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         completed_image: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
 
-        # Process initial prompt
-        # Get embeddings for prompt
-        prompt_hidden = self.text_feature_extractor(text_input_ids)  # (batch, prompt_len, d_model)
+        # Process initial prompt — replace placeholders with media if provided
+        prompt_hidden, prompt_attn_mask = self._encode_prompt(
+            text_input_ids,
+            audio_inputs=audio_inputs,
+            audio_lengths=audio_lengths,
+            voice_inputs=voice_inputs,
+            voice_lengths=voice_lengths,
+            image_inputs=image_inputs,
+            precomputed_latents=precomputed_latents,
+        )
 
         # Process through recurrent block to get initial context
-        current_hidden, kv_cache = self.recurrent_block(
+        # Track recurrent iteration counts per generated token
+        recurrent_iteration_counts: List[int] = []
+
+        current_hidden, kv_cache, prompt_iters = self.recurrent_block(
             prompt_hidden,
-            attention_mask=None,
+            attention_mask=prompt_attn_mask,
             kv_cache=kv_cache,
             position_offset=0,
             use_cache=True,
         )
 
-        position_offset = text_input_ids.shape[1]
+        position_offset = prompt_hidden.shape[1]
+
+        # Check if prompt ends with a BO* token — if so, initialize modality mode
+        # so the first generated hidden states are accumulated correctly.
+        for b in range(batch_size):
+            last_token = text_input_ids[b, -1].item()
+            if last_token == constants.BOA_TOKEN_ID:
+                current_modality[b] = "audio"
+            elif last_token == constants.BOV_TOKEN_ID:
+                current_modality[b] = "voice"
+            elif last_token == constants.BOI_TOKEN_ID:
+                current_modality[b] = "image"
 
         # Get initial logits from text coda for the last position
         last_hidden = current_hidden[:, -1:, :]  # (batch, 1, d_model)
@@ -371,13 +529,28 @@ class MegaTransformerWorldModel(nn.Module):
             for b in range(batch_size):
                 token_id = next_token_ids[b].item()
 
-                # Check for begin-of-modality tokens
-                if token_id == constants.BOA_TOKEN_ID:
+                # During media generation, ignore sampled tokens — the budget
+                # controls finalization, not sampled EO* tokens. The text coda
+                # runs every step but its output is only meaningful in text mode.
+                if current_modality[b] in ("audio", "voice", "image"):
+                    # Still need to feed something to the recurrent block.
+                    # Re-embed the BO* token as a continuation signal.
+                    bo_token = {
+                        "audio": constants.BOA_TOKEN_ID,
+                        "voice": constants.BOV_TOKEN_ID,
+                        "image": constants.BOI_TOKEN_ID,
+                    }[current_modality[b]]
+                    token_embed = self.text_feature_extractor(
+                        torch.tensor([[bo_token]], device=device)
+                    )
+                    next_hidden_list.append(token_embed[0])
+
+                # Text mode: check for begin-of-modality tokens
+                elif token_id == constants.BOA_TOKEN_ID:
                     current_modality[b] = "audio"
-                    # Embed the BOA token
                     token_embed = self.text_feature_extractor(
                         torch.tensor([[token_id]], device=device)
-                    )  # (1, 1, d_model)
+                    )
                     next_hidden_list.append(token_embed[0])
 
                 elif token_id == constants.BOV_TOKEN_ID:
@@ -394,63 +567,6 @@ class MegaTransformerWorldModel(nn.Module):
                     )
                     next_hidden_list.append(token_embed[0])
 
-                # Check for end-of-modality tokens
-                elif token_id == constants.EOA_TOKEN_ID and current_modality[b] == "audio":
-                    current_modality[b] = None
-                    # Process accumulated audio sequence through audio coda
-                    if audio_sequences[b]:
-                        audio_hidden = torch.cat(audio_sequences[b], dim=0)  # (seq, d_model)
-                        audio_hidden = audio_hidden.unsqueeze(0)  # (1, seq, d_model)
-                        audio_out = self.audio_generator(
-                            audio_hidden,
-                            decode_to_mel=decode_outputs,
-                        )
-                        audio_pred = audio_out.get("audio_latent_preds")
-                        if audio_pred is not None:
-                            completed_audio[b].append(audio_pred)
-                        audio_sequences[b] = []
-                    # Embed EOA token
-                    token_embed = self.text_feature_extractor(
-                        torch.tensor([[token_id]], device=device)
-                    )
-                    next_hidden_list.append(token_embed[0])
-
-                elif token_id == constants.EOV_TOKEN_ID and current_modality[b] == "voice":
-                    current_modality[b] = None
-                    if voice_sequences[b]:
-                        voice_hidden = torch.cat(voice_sequences[b], dim=0)
-                        voice_hidden = voice_hidden.unsqueeze(0)
-                        voice_out = self.voice_generator(
-                            voice_hidden,
-                            decode_to_mel=decode_outputs,
-                        )
-                        voice_pred = voice_out.get("voice_latent_preds")
-                        if voice_pred is not None:
-                            completed_voice[b].append(voice_pred)
-                        voice_sequences[b] = []
-                    token_embed = self.text_feature_extractor(
-                        torch.tensor([[token_id]], device=device)
-                    )
-                    next_hidden_list.append(token_embed[0])
-
-                elif token_id == constants.EOI_TOKEN_ID and current_modality[b] == "image":
-                    current_modality[b] = None
-                    if image_sequences[b]:
-                        image_hidden = torch.cat(image_sequences[b], dim=0)
-                        image_hidden = image_hidden.unsqueeze(0)
-                        image_out = self.image_generator(
-                            image_hidden,
-                            decode_to_image=decode_outputs,
-                        )
-                        image_pred = image_out.get("image_latent_preds")
-                        if image_pred is not None:
-                            completed_image[b].append(image_pred)
-                        image_sequences[b] = []
-                    token_embed = self.text_feature_extractor(
-                        torch.tensor([[token_id]], device=device)
-                    )
-                    next_hidden_list.append(token_embed[0])
-
                 else:
                     # Regular token - embed it
                     token_embed = self.text_feature_extractor(
@@ -462,23 +578,59 @@ class MegaTransformerWorldModel(nn.Module):
             next_hidden = torch.stack(next_hidden_list, dim=0)
 
             # Process through recurrent block with KV cache
-            current_hidden, kv_cache = self.recurrent_block(
+            current_hidden, kv_cache, n_iters = self.recurrent_block(
                 next_hidden,
                 attention_mask=None,
                 kv_cache=kv_cache,
                 position_offset=position_offset,
                 use_cache=True,
             )
+            recurrent_iteration_counts.append(n_iters)
             position_offset += 1
 
             # Accumulate hidden states for non-text modalities
             for b in range(batch_size):
                 if current_modality[b] == "audio":
                     audio_sequences[b].append(current_hidden[b])  # (1, d_model)
+
+                    # Force EOA after exactly audio_token_budget tokens
+                    if len(audio_sequences[b]) >= audio_token_budget:
+                        current_modality[b] = None
+                        audio_pred = self._finalize_audio_sequence(
+                            "audio", audio_sequences[b]
+                        )
+                        if audio_pred is not None:
+                            completed_audio[b].append(audio_pred.squeeze(0))
+                        audio_sequences[b] = []
+                        generated_tokens[b].append(constants.EOA_TOKEN_ID)
+
                 elif current_modality[b] == "voice":
                     voice_sequences[b].append(current_hidden[b])
+
+                    # Force EOV after exactly voice_token_budget tokens
+                    if len(voice_sequences[b]) >= voice_token_budget:
+                        current_modality[b] = None
+                        voice_pred = self._finalize_audio_sequence(
+                            "voice", voice_sequences[b]
+                        )
+                        if voice_pred is not None:
+                            completed_voice[b].append(voice_pred.squeeze(0))
+                        voice_sequences[b] = []
+                        generated_tokens[b].append(constants.EOV_TOKEN_ID)
+
                 elif current_modality[b] == "image":
                     image_sequences[b].append(current_hidden[b])
+
+                    # Force EOI after exactly image_token_budget tokens
+                    if len(image_sequences[b]) >= image_token_budget:
+                        current_modality[b] = None
+                        image_pred = self._finalize_image_sequence(
+                            image_sequences[b], decode_outputs
+                        )
+                        if image_pred is not None:
+                            completed_image[b].append(image_pred)
+                        image_sequences[b] = []
+                        generated_tokens[b].append(constants.EOI_TOKEN_ID)
 
             # Get logits for next token
             text_output = self.text_generator(current_hidden)
@@ -507,6 +659,10 @@ class MegaTransformerWorldModel(nn.Module):
 
         # Stack logits
         outputs["text_logits"] = torch.cat(all_logits, dim=1)  # (batch, seq, vocab)
+
+        # Recurrent iteration counts per generated token
+        outputs["recurrent_iteration_counts"] = recurrent_iteration_counts
+        outputs["prompt_recurrent_iterations"] = prompt_iters
 
         # Collect completed modality outputs
         # Stack into padded tensors with counts and lengths for proper unpadding before VAE decoding

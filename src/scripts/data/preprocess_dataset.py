@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from scripts.data.audio.preprocess import AudioDatasetPreprocessor
 from scripts.data.image.preprocess import ImageDatasetPreprocessor
+from scripts.data.image.vae.preprocess import ImageVAEDatasetPreprocessor
 from scripts.data.text.preprocess import TextDatasetPreprocessor
 from scripts.data.preprocessor import Preprocessor
 
@@ -20,6 +21,7 @@ from scripts.data.preprocessor import Preprocessor
 preprocessor_clss: list[type[Preprocessor]] = [
     AudioDatasetPreprocessor,
     ImageDatasetPreprocessor,
+    ImageVAEDatasetPreprocessor,
     TextDatasetPreprocessor,
 ]
 
@@ -80,10 +82,12 @@ def get_preprocessor(command: str, args, dataset, output_dir, shard_fields, batc
         return AudioDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     elif command == "image":
         return ImageDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
+    elif command == "image-vae":
+        return ImageVAEDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     elif command == "text":
         return TextDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     else:
-        raise ValueError(f"Unknown command: {command}. Available: audio, image, text")
+        raise ValueError(f"Unknown command: {command}. Available: audio, image, image-vae, text")
 
 
 def main():
@@ -119,6 +123,9 @@ def main():
                             help="Maximum samples to process (for testing)")
         sub_parser.add_argument("--start_idx", type=int, default=0,
                             help="Starting index in dataset")
+        # Streaming
+        sub_parser.add_argument("--streaming", action="store_true", default=False,
+                            help="Stream dataset instead of downloading entirely (avoids disk caching)")
 
     args = parser.parse_args()
 
@@ -139,12 +146,14 @@ def main():
     print(f"Output: {output_dir}")
 
     # Load dataset
-    print(f"Loading dataset {args.dataset_name}/{args.dataset_config} split {args.split}...")
+    streaming = getattr(args, 'streaming', False)
+    print(f"Loading dataset {args.dataset_name}/{args.dataset_config} split {args.split} (streaming={streaming})...")
     dataset = load_dataset(
         args.dataset_name,
         args.dataset_config,
         split=args.split,
         trust_remote_code=True,
+        streaming=streaming,
     )
 
     # Shard accumulators
@@ -170,38 +179,57 @@ def main():
     assert args.dataset_name is not None, "--dataset_name is required"
     assert args.split is not None, "--split is required"
 
-    # Calculate samples for this GPU
-    samples_for_this_gpu = len([
-        i for i in range(args.start_idx, len(dataset))
-        if i % args.total_gpus == args.gpu_id
-    ])
-    print(f"  Samples for this GPU: {samples_for_this_gpu:,}")
-
     # Main processing loop
     start_time = time.time()
-    pbar = tqdm(total=samples_for_this_gpu, desc=f"GPU {args.gpu_id}")
-    for idx in range(args.start_idx, len(dataset)):
-        # Skip if not our sample (multi-GPU distribution)
-        if idx % args.total_gpus != args.gpu_id:
-            continue
 
-        # Check max samples limit
-        if args.max_samples and stats["saved"] >= args.max_samples:
-            break
+    if streaming:
+        # Streaming mode: iterate directly, no len() or indexing
+        total = args.max_samples or None
+        pbar = tqdm(total=total, desc=f"GPU {args.gpu_id}")
+        for idx, example in enumerate(dataset):
+            if idx < args.start_idx:
+                continue
+            if idx % args.total_gpus != args.gpu_id:
+                continue
+            if args.max_samples and stats["saved"] >= args.max_samples:
+                break
+            try:
+                if preprocessor.preprocess_example(example):
+                    stats["processed"] += 1
+                pbar.update(1)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"Error processing sample {idx}: {e}")
+                stats["skipped"]["error"] += 1
+                pbar.update(1)
+                continue
+    else:
+        # Standard mode: random access by index
+        samples_for_this_gpu = len([
+            i for i in range(args.start_idx, len(dataset))
+            if i % args.total_gpus == args.gpu_id
+        ])
+        print(f"  Samples for this GPU: {samples_for_this_gpu:,}")
 
-        try:
-            example = dataset[idx]
-
-            if preprocessor.preprocess_example(example):
-                stats["processed"] += 1
-            pbar.update(1)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"Error processing sample {idx}: {e}")
-            stats["skipped"]["error"] += 1
-            pbar.update(1)
-            continue
+        pbar = tqdm(total=samples_for_this_gpu, desc=f"GPU {args.gpu_id}")
+        for idx in range(args.start_idx, len(dataset)):
+            if idx % args.total_gpus != args.gpu_id:
+                continue
+            if args.max_samples and stats["saved"] >= args.max_samples:
+                break
+            try:
+                example = dataset[idx]
+                if preprocessor.preprocess_example(example):
+                    stats["processed"] += 1
+                pbar.update(1)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"Error processing sample {idx}: {e}")
+                stats["skipped"]["error"] += 1
+                pbar.update(1)
+                continue
 
     # Final flush
     preprocessor.process_and_accumulate()
