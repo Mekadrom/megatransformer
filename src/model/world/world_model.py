@@ -40,12 +40,24 @@ class MegaTransformerWorldModel(nn.Module):
         super(MegaTransformerWorldModel, self).__init__()
 
         self.config = config
+        self.include_modes = set(config.include_modes)
 
-        # Feature extractors (VAE encoders optional - for inference only)
+        # Feature extractors — text is always required
         self.text_feature_extractor = TextFeatureExtractor(config.text_feature_config)
-        self.audio_feature_extractor = AudioVAEPreludeFeatureExtractor(config.audio_prelude_config)
-        self.voice_feature_extractor = AudioVAEPreludeFeatureExtractor(config.voice_prelude_config)
-        self.image_feature_extractor = ImageVAEPreludeFeatureExtractor(config.image_prelude_config)
+
+        # Modality-specific preludes (only instantiate if included)
+        self.audio_feature_extractor = (
+            AudioVAEPreludeFeatureExtractor(config.audio_prelude_config)
+            if "audio" in self.include_modes else None
+        )
+        self.voice_feature_extractor = (
+            AudioVAEPreludeFeatureExtractor(config.voice_prelude_config)
+            if "voice" in self.include_modes else None
+        )
+        self.image_feature_extractor = (
+            ImageVAEPreludeFeatureExtractor(config.image_prelude_config)
+            if "image" in self.include_modes else None
+        )
 
         # Token alignment
         self.token_interleaver = TokenInterleaver(config.token_interleaver_config)
@@ -54,16 +66,28 @@ class MegaTransformerWorldModel(nn.Module):
         # Main transformer
         self.recurrent_block = MegatransformerRecurrentBlock(config.recurrent_block_config)
 
-        # Generators/codas (VAE decoders optional - for inference only)
+        # Generators/codas — text is always required
         self.text_generator = TextCodaClassifierWithLoss(config.text_coda_config)
-        self.audio_generator = AudioCodaAndVAEWithLoss("audio", config.audio_coda_config)
-        self.voice_generator = AudioCodaAndVAEWithLoss("voice", config.voice_coda_config)
-        self.image_generator = ImageCodaAndVAEWithLoss(config.image_coda_config)
+
+        self.audio_generator = (
+            AudioCodaAndVAEWithLoss("audio", config.audio_coda_config)
+            if "audio" in self.include_modes else None
+        )
+        self.voice_generator = (
+            AudioCodaAndVAEWithLoss("voice", config.voice_coda_config)
+            if "voice" in self.include_modes else None
+        )
+        self.image_generator = (
+            ImageCodaAndVAEWithLoss(config.image_coda_config)
+            if "image" in self.include_modes else None
+        )
 
     def load_image_vae(self, encoder: ImageVAEEncoder, decoder: ImageVAEDecoder):
         """Load image VAE encoder/decoder for live encoding/decoding."""
-        self.image_feature_extractor.vae_encoder = encoder
-        self.image_generator.vae_decoder = decoder
+        if self.image_feature_extractor is not None:
+            self.image_feature_extractor.vae_encoder = encoder
+        if self.image_generator is not None:
+            self.image_generator.vae_decoder = decoder
 
     @classmethod
     def from_config(cls, config_name: str, **overrides) -> "MegaTransformerWorldModel":
@@ -139,20 +163,17 @@ class MegaTransformerWorldModel(nn.Module):
         text_hidden_states = self.text_feature_extractor(text_input_ids)
 
         audio_hidden_states = None
-        if audio_inputs is not None:
-            # audio_inputs: (batch, n_audio, ...) -> need to process each example
+        if audio_inputs is not None and self.audio_feature_extractor is not None:
             batch_size, n_audio = audio_inputs.shape[:2]
-            # Flatten batch and n_audio for processing
             audio_flat = audio_inputs.view(batch_size * n_audio, *audio_inputs.shape[2:])
             audio_hidden_flat = self.audio_feature_extractor(
                 audio_flat, precomputed_latents=precomputed_latents
             )
-            # Reshape back: (batch * n_audio, seq, d_model) -> (batch, n_audio, seq, d_model)
             seq_len, d_model = audio_hidden_flat.shape[1], audio_hidden_flat.shape[2]
             audio_hidden_states = audio_hidden_flat.view(batch_size, n_audio, seq_len, d_model)
 
         voice_hidden_states = None
-        if voice_inputs is not None:
+        if voice_inputs is not None and self.voice_feature_extractor is not None:
             batch_size, n_voice = voice_inputs.shape[:2]
             voice_flat = voice_inputs.view(batch_size * n_voice, *voice_inputs.shape[2:])
             voice_hidden_flat = self.voice_feature_extractor(
@@ -162,7 +183,7 @@ class MegaTransformerWorldModel(nn.Module):
             voice_hidden_states = voice_hidden_flat.view(batch_size, n_voice, seq_len, d_model)
 
         image_hidden_states = None
-        if image_inputs is not None:
+        if image_inputs is not None and self.image_feature_extractor is not None:
             batch_size, n_images = image_inputs.shape[:2]
             image_flat = image_inputs.view(batch_size * n_images, *image_inputs.shape[2:])
             image_hidden_flat = self.image_feature_extractor(
@@ -205,7 +226,7 @@ class MegaTransformerWorldModel(nn.Module):
             outputs.update(text_outputs)
 
         # Audio
-        if audio_batch is not None:
+        if audio_batch is not None and self.audio_generator is not None:
             audio_outputs = self.audio_generator(
                 audio_batch,
                 latent_labels=audio_latent_labels,
@@ -215,7 +236,7 @@ class MegaTransformerWorldModel(nn.Module):
             outputs.update(audio_outputs)
 
         # Voice
-        if voice_batch is not None:
+        if voice_batch is not None and self.voice_generator is not None:
             voice_outputs = self.voice_generator(
                 voice_batch,
                 latent_labels=voice_latent_labels,
@@ -225,7 +246,7 @@ class MegaTransformerWorldModel(nn.Module):
             outputs.update(voice_outputs)
 
         # Image
-        if image_batch is not None:
+        if image_batch is not None and self.image_generator is not None:
             image_outputs = self.image_generator(
                 image_batch,
                 latent_labels=image_latent_labels,
@@ -238,6 +259,8 @@ class MegaTransformerWorldModel(nn.Module):
     @property
     def image_num_patches(self) -> int:
         """Number of tokens the image coda expects (must be a perfect square)."""
+        if self.image_feature_extractor is None:
+            return 0
         nps = self.image_feature_extractor.num_patches_per_side
         return nps * nps
 
@@ -278,7 +301,7 @@ class MegaTransformerWorldModel(nn.Module):
 
         # Encode media through feature extractors
         audio_hidden = None
-        if audio_inputs is not None:
+        if audio_inputs is not None and self.audio_feature_extractor is not None:
             batch_size, n_audio = audio_inputs.shape[:2]
             audio_flat = audio_inputs.view(batch_size * n_audio, *audio_inputs.shape[2:])
             audio_hidden_flat = self.audio_feature_extractor(
@@ -288,7 +311,7 @@ class MegaTransformerWorldModel(nn.Module):
             audio_hidden = audio_hidden_flat.view(batch_size, n_audio, seq_len, d_model)
 
         voice_hidden = None
-        if voice_inputs is not None:
+        if voice_inputs is not None and self.voice_feature_extractor is not None:
             batch_size, n_voice = voice_inputs.shape[:2]
             voice_flat = voice_inputs.view(batch_size * n_voice, *voice_inputs.shape[2:])
             voice_hidden_flat = self.voice_feature_extractor(
@@ -298,7 +321,7 @@ class MegaTransformerWorldModel(nn.Module):
             voice_hidden = voice_hidden_flat.view(batch_size, n_voice, seq_len, d_model)
 
         image_hidden = None
-        if image_inputs is not None:
+        if image_inputs is not None and self.image_feature_extractor is not None:
             batch_size, n_images = image_inputs.shape[:2]
             image_flat = image_inputs.view(batch_size * n_images, *image_inputs.shape[2:])
             image_hidden_flat = self.image_feature_extractor(
@@ -328,9 +351,11 @@ class MegaTransformerWorldModel(nn.Module):
         """Finalize an audio/voice sequence through the appropriate coda."""
         if not sequences:
             return None
+        generator = self.audio_generator if prefix == "audio" else self.voice_generator
+        if generator is None:
+            return None
         hidden = torch.cat(sequences, dim=0)  # (seq, d_model)
         hidden = hidden.unsqueeze(0)  # (1, seq, d_model)
-        generator = self.audio_generator if prefix == "audio" else self.voice_generator
         out = generator(hidden)
         return out.get(f"{prefix}_latent_preds")
 
@@ -344,7 +369,7 @@ class MegaTransformerWorldModel(nn.Module):
         Pads or truncates to exactly image_num_patches tokens so the
         unpatchify layer can reshape to a square spatial grid.
         """
-        if not image_sequences_b:
+        if not image_sequences_b or self.image_generator is None:
             return None
         image_hidden = torch.cat(image_sequences_b, dim=0)  # (seq, d_model)
         expected = self.image_num_patches

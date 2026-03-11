@@ -179,19 +179,18 @@ class MegaTransformerCausalSelfAttention(nn.Module):
             attention_scores = 30.0 * torch.tanh(attention_scores / 30.0)
 
         # Causal masking: queries at position i can attend to keys at positions <= i
-        # For cached generation: query position = position_offset + local_pos
-        # Key position = 0 to T-1
-        # Query at pos p can attend to keys at pos <= p
-        max_seq_len = position_offset + t
-        if max_seq_len > min(self.causal_mask.shape[-1], self.causal_mask.shape[-2]):
-            # Recalculate causal mask with new longest length
-            new_size = max(max_seq_len, T)
+        # For cached generation with Huginn-style cache, position_offset tracks the
+        # global position while T (key length) may differ across cache slots.
+        # Use T-based offset so the mask always matches the actual key dimension.
+        eff_offset = max(T - t, 0)  # query positions relative to key positions
+        required_size = max(eff_offset + t, T)
+        if required_size > min(self.causal_mask.shape[-1], self.causal_mask.shape[-2]):
             self.causal_mask = torch.tril(
-                torch.ones(new_size, new_size, device=hidden_states.device)
-            ).view(1, 1, new_size, new_size)
+                torch.ones(required_size, required_size, device=hidden_states.device)
+            ).view(1, 1, required_size, required_size)
 
         # Slice causal mask for current query/key positions
-        causal_mask_slice = self.causal_mask[:, :, position_offset:position_offset + t, :T]
+        causal_mask_slice = self.causal_mask[:, :, eff_offset:eff_offset + t, :T]
         causal_mask_slice = causal_mask_slice.to(attention_scores.device)
         attention_scores = attention_scores.masked_fill(causal_mask_slice == 0, float("-inf"))
 

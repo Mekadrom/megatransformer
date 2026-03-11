@@ -295,23 +295,87 @@ class WorldModelTrainer(CommonTrainer):
             loss = self.compute_loss(model, inputs)
         return (loss, None, None)
 
+    @staticmethod
+    def _count_params(module):
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return total, trainable
+
     def start_train_print(self, args):
         model = self.model
-        print(f"World model structure: {model.__class__.__name__}")
-        print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-        print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-        print(f"Active modalities: text={self.include_text}, audio={self.include_audio}, "
+        print(f"Model architecture:\n{model}")
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        print(f"\n{'=' * 60}")
+        print(f"World model: {model.__class__.__name__}")
+        print(f"Total parameters:     {total_params:>14,}")
+        print(f"Trainable parameters: {trainable_params:>14,}")
+        print(f"{'=' * 60}")
+
+        # Preludes (feature extractors) — only show instantiated modules
+        preludes = {"Text embedding": model.text_feature_extractor}
+        if model.audio_feature_extractor is not None:
+            preludes["Audio prelude"] = model.audio_feature_extractor
+        if model.voice_feature_extractor is not None:
+            preludes["Voice prelude"] = model.voice_feature_extractor
+        if model.image_feature_extractor is not None:
+            preludes["Image prelude"] = model.image_feature_extractor
+
+        print(f"\n  Preludes (feature extractors):")
+        prelude_total = 0
+        for name, mod in preludes.items():
+            t, tr = self._count_params(mod)
+            prelude_total += t
+            frozen = " (frozen)" if tr == 0 and t > 0 else ""
+            print(f"    {name:<20s} {t:>12,}{frozen}")
+        print(f"    {'─' * 34}")
+        print(f"    {'Subtotal':<20s} {prelude_total:>12,}")
+
+        # Recurrent block
+        rec_t, rec_tr = self._count_params(model.recurrent_block)
+        print(f"\n  Recurrent block:       {rec_t:>12,}")
+
+        # Codas (generators) — only show instantiated modules
+        codas = {"Text coda": model.text_generator}
+        if model.audio_generator is not None:
+            codas["Audio coda"] = model.audio_generator
+        if model.voice_generator is not None:
+            codas["Voice coda"] = model.voice_generator
+        if model.image_generator is not None:
+            codas["Image coda"] = model.image_generator
+
+        print(f"\n  Codas (generators):")
+        coda_total = 0
+        for name, mod in codas.items():
+            t, tr = self._count_params(mod)
+            coda_total += t
+            frozen = " (frozen)" if tr == 0 and t > 0 else ""
+            print(f"    {name:<20s} {t:>12,}{frozen}")
+        print(f"    {'─' * 34}")
+        print(f"    {'Subtotal':<20s} {coda_total:>12,}")
+
+        # Summary
+        print(f"\n  {'─' * 40}")
+        print(f"  Preludes:              {prelude_total:>12,}  ({100*prelude_total/total_params:.1f}%)")
+        print(f"  Recurrent block:       {rec_t:>12,}  ({100*rec_t/total_params:.1f}%)")
+        print(f"  Codas:                 {coda_total:>12,}  ({100*coda_total/total_params:.1f}%)")
+        print(f"{'=' * 60}")
+
+        print(f"\nActive modalities: text={self.include_text}, audio={self.include_audio}, "
               f"voice={self.include_voice}, image={self.include_image}")
         print(f"Precomputed latents: {self.precomputed_latents}")
         print(f"Loss weights: text={self.text_loss_weight}, audio={self.audio_latent_loss_weight}, "
-              f"voice={self.voice_latent_loss_weight}, image={self.image_latent_loss_weight}")
+              f"voice={self.voice_latent_loss_weight}, image={self.image_latent_loss_weight}\n")
 
 
 def load_model(args):
+    include_modes = [m.strip() for m in args.include_modes.split(",")]
     return model_loading_utils.load_model(
         MegaTransformerWorldModel,
         args.config,
         checkpoint_path=args.resume_from_checkpoint,
+        overrides={"include_modes": include_modes},
     )
 
 

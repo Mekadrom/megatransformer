@@ -76,6 +76,12 @@ class ImageCodaAndVAEWithLoss(nn.Module):
             patch_size=config.image_config.latent_patch_size
         )
 
+        # Learnable denormalization: maps from normalized space back to original
+        # latent distribution. Initialized to identity (scale=1, bias=0).
+        # Shape: (latent_channels,) — broadcast over spatial dims.
+        self.output_scale = nn.Parameter(torch.ones(config.image_config.latent_channels))
+        self.output_bias = nn.Parameter(torch.zeros(config.image_config.latent_channels))
+
         self.vae_decoder = vae_decoder
 
         self.l1_loss = nn.L1Loss()
@@ -144,6 +150,9 @@ class ImageCodaAndVAEWithLoss(nn.Module):
         # seq_length should be 256 for a 256x256 image. this is because the vae latent space is 32x32 and we patchify into 2x2 patches
 
         latent_preds = self.unpatchify(coda_output)  # (batch, latent_channels, latent_h, latent_w)
+        # Denormalize: learnable scale and bias map back to original latent range
+        # output_scale/bias are (C,) — reshape to (1, C, 1, 1) for broadcasting
+        latent_preds = latent_preds * self.output_scale[None, :, None, None] + self.output_bias[None, :, None, None]
 
         outputs = {"image_latent_preds": latent_preds}
 

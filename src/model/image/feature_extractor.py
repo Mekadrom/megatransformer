@@ -66,6 +66,12 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
         prelude_config = config.prelude_config
         self.prelude = MegaTransformerBlock(prelude_config)
 
+        # Normalize raw image latents to zero-mean unit-variance before patch embedding.
+        # Image VAE latents (e.g. LiteVAE) can range [-10, 10]; normalizing puts them
+        # on a similar scale to text embeddings for stable interleaving.
+        # Applied per-pixel across channels: LayerNorm over the channel dim.
+        self.input_norm = nn.LayerNorm(config.image_config.latent_channels, elementwise_affine=False)
+
         self.patch_embedding = PatchEmbedding(
             in_channels=config.image_config.latent_channels,
             patch_size=config.image_config.latent_patch_size,
@@ -141,6 +147,9 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
             latent_images = self.vae_encoder(x)
 
         # Shape: (batch_size, latent_channels, latent_spatial_size, latent_spatial_size)
+        # Normalize per-pixel across channels: (B, C, H, W) -> (B, H, W, C) -> norm -> (B, C, H, W)
+        latent_images = self.input_norm(latent_images.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
         patch_embeddings = self.patch_embedding(latent_images)  # (batch_size, num_patches, d_model)
 
         # Add 2D positional encoding

@@ -61,6 +61,38 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
         self.trainer: Optional[Trainer] = None
 
+        # Static prompts for synthesis scenarios — avoids markup/JS garbage from web-scraped data
+        self.VOICE_SYNTHESIS_PROMPTS = [
+            "The quick brown fox jumps over the lazy dog near the riverbank.",
+            "She sold seashells by the seashore on a warm summer afternoon.",
+            "In a hole in the ground there lived a hobbit.",
+            "To be or not to be, that is the question.",
+            "The rain in Spain falls mainly on the plain.",
+            "All human beings are born free and equal in dignity and rights.",
+            "It was a bright cold day in April, and the clocks were striking thirteen.",
+            "The only thing we have to fear is fear itself.",
+        ]
+        self.IMAGE_SYNTHESIS_PROMPTS = [
+            "A golden retriever sitting in a sunny meadow with wildflowers.",
+            "A red sports car parked on a winding mountain road at sunset.",
+            "A cozy kitchen with a steaming cup of coffee on a wooden table.",
+            "A snow-covered cabin in the woods under a starry night sky.",
+            "A colorful hot air balloon floating above rolling green hills.",
+            "An old lighthouse standing on a rocky cliff above crashing waves.",
+            "A bustling city street at night with neon signs and reflections.",
+            "A bowl of fresh fruit on a marble countertop in natural light.",
+        ]
+
+    def _encode_static_prompt(self, text: str, suffix_tokens: list[int], max_new_tokens: int, device: torch.device) -> torch.Tensor:
+        """Tokenize a static text prompt, append suffix tokens, and cap to MAX_SEQ_LEN."""
+        self._ensure_tokenizer()
+        if self.tokenizer is None:
+            # Fallback: just use suffix tokens
+            return self._build_prompt_ids(suffix_tokens, device)
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        prompt_tokens = self._cap_prompt_tokens(token_ids, suffix_tokens, max_new_tokens)
+        return self._build_prompt_ids(prompt_tokens, device)
+
     def _ensure_tokenizer(self):
         """Lazy-load a tokenizer if none was provided."""
         if self.tokenizer is not None:
@@ -161,6 +193,27 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
         print(f"World model visualization complete at step {global_step}")
         writer.flush()
+
+    # Maximum total sequence length (prompt + generated) the model supports.
+    MAX_SEQ_LEN = 1024
+
+    def _cap_prompt_tokens(
+        self, text_tokens: list[int], suffix_tokens: list[int], max_new_tokens: int
+    ) -> list[int]:
+        """Truncate text_tokens so prompt + max_new_tokens <= MAX_SEQ_LEN.
+
+        Args:
+            text_tokens: The variable-length text portion of the prompt.
+            suffix_tokens: Fixed tokens appended after text (e.g. [BOV]).
+            max_new_tokens: How many tokens will be generated after the prompt.
+
+        Returns:
+            Full prompt token list (text_tokens + suffix_tokens), truncated if needed.
+        """
+        budget = self.MAX_SEQ_LEN - max_new_tokens - len(suffix_tokens)
+        if budget < 1:
+            budget = 1
+        return text_tokens[:budget] + suffix_tokens
 
     def _build_prompt_ids(self, tokens: list[int], device: torch.device) -> torch.Tensor:
         """Build a prompt tensor from a list of token IDs. Shape: (1, seq_len)."""
@@ -378,13 +431,17 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             if isinstance(text_length, torch.Tensor):
                 text_length = text_length.item()
 
-            # Use first half as prompt
+            # Use first half as prompt, cap so total doesn't exceed MAX_SEQ_LEN
             prompt_len = max(1, text_length // 2)
+            max_new = min(256, text_length)
+            # Ensure prompt + generation fits
+            prompt_len = min(prompt_len, self.MAX_SEQ_LEN - max_new)
+            prompt_len = max(1, prompt_len)
             prompt = token_ids[:prompt_len].unsqueeze(0).to(device)
 
             outputs = model.generate(
                 text_input_ids=prompt,
-                max_new_tokens=min(256, text_length),
+                max_new_tokens=max_new,
                 temperature=0.8,
                 top_p=0.9,
             )
@@ -402,35 +459,29 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             )
 
     def _scenario_text_to_voice(self, model, eval_dataset, collator, device, writer, global_step):
-        """Scenario 2: Text -> Voice synthesis."""
+        """Scenario 2: Text -> Voice synthesis using static prompts."""
         tag = "eval_world/2_text_to_voice"
+
+        # Use static prompts instead of dataset text (avoids markup/JS garbage)
+        n = min(self.num_eval_samples, len(self.VOICE_SYNTHESIS_PROMPTS))
+        # Still need samples for target voice comparison and speaker embeddings
         samples = self._get_eval_samples(
-            eval_dataset, collator, self.num_eval_samples, requires_voice=True
+            eval_dataset, collator, n, requires_voice=True
         )
-        if not samples:
-            return
 
-        for i, sample in enumerate(samples):
-            token_ids = sample.get("text_token_ids")
-            if token_ids is None:
-                continue
-
-            text_length = sample.get("text_text_length", token_ids.shape[0])
-            if isinstance(text_length, torch.Tensor):
-                text_length = text_length.item()
-
-            # Build prompt: [text] [BOV]
-            prompt_tokens = token_ids[:text_length].tolist() + [BOV_TOKEN_ID]
-            prompt = self._build_prompt_ids(prompt_tokens, device)
+        for i in range(n):
+            prompt_text = self.VOICE_SYNTHESIS_PROMPTS[i]
+            max_new = 512
+            prompt = self._encode_static_prompt(prompt_text, [BOV_TOKEN_ID], max_new, device)
 
             outputs = model.generate(
                 text_input_ids=prompt,
-                max_new_tokens=512,
+                max_new_tokens=max_new,
                 temperature=0.8,
             )
 
-            input_text = self._decode_tokens(token_ids[:text_length])
-            writer.add_text(f"{tag}/{i}/input_text", input_text, global_step)
+            writer.add_text(f"{tag}/{i}/input_text", prompt_text, global_step)
+            sample = samples[i] if i < len(samples) else {}
 
             # Log generated voice if available
             voice_preds = outputs.get("voice_latent_preds")
@@ -582,35 +633,29 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             )
 
     def _scenario_text_to_image(self, model, eval_dataset, collator, device, writer, global_step):
-        """Scenario 4: Text -> Image synthesis."""
+        """Scenario 4: Text -> Image synthesis using static prompts."""
         tag = "eval_world/4_text_to_image"
+
+        # Use static prompts instead of dataset text (avoids markup/JS garbage)
+        n = min(self.num_eval_samples, len(self.IMAGE_SYNTHESIS_PROMPTS))
+        # Still need samples for target image comparison
         samples = self._get_eval_samples(
-            eval_dataset, collator, self.num_eval_samples, requires_image=True
+            eval_dataset, collator, n, requires_image=True
         )
-        if not samples:
-            return
 
-        for i, sample in enumerate(samples):
-            token_ids = sample.get("text_token_ids")
-            if token_ids is None:
-                continue
-
-            text_length = sample.get("text_text_length", token_ids.shape[0])
-            if isinstance(text_length, torch.Tensor):
-                text_length = text_length.item()
-
-            # Build prompt: [text] [BOI]
-            prompt_tokens = token_ids[:text_length].tolist() + [BOI_TOKEN_ID]
-            prompt = self._build_prompt_ids(prompt_tokens, device)
+        for i in range(n):
+            prompt_text = self.IMAGE_SYNTHESIS_PROMPTS[i]
+            max_new = 512
+            prompt = self._encode_static_prompt(prompt_text, [BOI_TOKEN_ID], max_new, device)
 
             outputs = model.generate(
                 text_input_ids=prompt,
-                max_new_tokens=512,
+                max_new_tokens=max_new,
                 temperature=0.8,
             )
 
-            input_text = self._decode_tokens(token_ids[:text_length])
-            writer.add_text(f"{tag}/{i}/input_text", input_text, global_step)
+            writer.add_text(f"{tag}/{i}/input_text", prompt_text, global_step)
+            sample = samples[i] if i < len(samples) else {}
 
             image_preds = outputs.get("image_latent_preds")
             if image_preds is not None and image_preds.numel() > 0:

@@ -36,6 +36,11 @@ class AudioCodaAndVAEWithLoss(nn.Module):
 
         self.feature_projection = nn.Linear(coda_config.d_model, config.feature_channels)
 
+        # Learnable denormalization: maps from normalized space back to original
+        # latent distribution. Initialized to identity (scale=1, bias=0).
+        self.output_scale = nn.Parameter(torch.ones(config.feature_channels))
+        self.output_bias = nn.Parameter(torch.zeros(config.feature_channels))
+
         self.l1_loss = nn.L1Loss()
         self.mse_loss = nn.MSELoss()
 
@@ -84,6 +89,8 @@ class AudioCodaAndVAEWithLoss(nn.Module):
         coda_output = x + coda_hidden
 
         feature_preds = self.feature_projection(coda_output)  # (batch, seq_length, feature_channels)
+        # Denormalize: learnable scale and bias map back to original latent range
+        feature_preds = feature_preds * self.output_scale + self.output_bias
         feature_preds = feature_preds.permute(0, 2, 1)  # (batch, feature_channels, timesteps)
 
         outputs = {f"{self.prefix}_latent_preds": feature_preds}

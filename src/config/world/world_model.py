@@ -89,7 +89,15 @@ class MegaTransformerRecurrentConfig:
 class MegaTransformerWorldModelConfig:
     """
     Configuration for the Megatransformer world model, integrating audio, image, and text modalities.
+
+    include_modes controls which modality-specific preludes and codas are instantiated.
+    Text is always included. Omitted modalities save memory and parameters.
     """
+    # Which modalities to instantiate (text is always included)
+    include_modes: List[str] = dataclasses.field(
+        default_factory=lambda: ["text", "audio", "voice", "image"]
+    )
+
     # Feature extractor configs
     text_feature_config: TextFeatureExtractorConfig = dataclasses.field(
         default_factory=TextFeatureExtractorConfig
@@ -132,6 +140,59 @@ class MegaTransformerWorldModelConfig:
         return json.dumps(self.to_dict(), indent=2)
 
 
+# Slim prelude/coda block: lightweight adapter — just enough to translate
+# between modality-specific representations and the shared d_model space.
+_slim_block = lambda: MegaTransformerBlockConfig(
+    d_model=512,
+    n_heads=4,
+    d_queries=64,
+    d_values=64,
+    n_query_groups=2,
+    d_inner=1024,
+)
+
 WORLD_MODEL_CONFIGS = {
+    # Original config: equal-weight preludes/codas/recurrent.
     "default": MegaTransformerWorldModelConfig(),
+
+    # Researcher config: recurrent block dominates (~40-45% of params).
+    # Preludes and codas use slim single-block transformers.
+    # The recurrent block gets a wide FFN (12288) and 16 GQA heads,
+    # since it iterates many times per token — every parameter is reused.
+    "researcher": MegaTransformerWorldModelConfig(
+        # Slim preludes
+        audio_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
+            prelude_config=_slim_block(),
+        ),
+        voice_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
+            prelude_config=_slim_block(),
+        ),
+        image_prelude_config=ImageVAEPreludeFeatureExtractorConfig(
+            prelude_config=_slim_block(),
+        ),
+        # Heavy recurrent block: wide FFN, more heads, GQA
+        recurrent_block_config=MegaTransformerRecurrentConfig(
+            block_config=MegaTransformerBlockConfig(
+                d_model=1024,      # 2 * base d_model (concat input + thought)
+                n_heads=16,
+                d_queries=64,
+                d_values=64,
+                n_query_groups=4,  # GQA: 4 KV groups for 16 heads
+                d_inner=12288,     # wide FFN — bulk of the parameters
+            ),
+        ),
+        # Slim codas
+        text_coda_config=TextCodaClassifierConfig(
+            coda_config=_slim_block(),
+        ),
+        audio_coda_config=AudioCodaAndVAEConfig(
+            coda_config=_slim_block(),
+        ),
+        voice_coda_config=AudioCodaAndVAEConfig(
+            coda_config=_slim_block(),
+        ),
+        image_coda_config=ImageCodaAndVAEConfig(
+            coda_config=_slim_block(),
+        ),
+    ),
 }
