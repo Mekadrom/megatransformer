@@ -140,6 +140,11 @@ class AudioCVAEGANTrainer(CommonTrainer):
         # F0 predictor pretraining settings
         f0_predictor_freeze_steps: int = 0,  # Steps to keep F0 predictor frozen (0 = no freezing)
         f0_warmup_use_gt_steps: int = 0,  # Steps to use GT F0 instead of predicted (0 = disabled)
+        # SIVE perceptual loss: frozen SIVE as content-preserving loss
+        sive_perceptual_model: Optional[torch.nn.Module] = None,
+        sive_perceptual_loss_weight: float = 0.0,
+        sive_perceptual_loss_start_step: int = 0,
+        sive_perceptual_layer: int = -1,  # Which SIVE layer to extract (-1 = final)
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -222,6 +227,12 @@ class AudioCVAEGANTrainer(CommonTrainer):
         # F0 predictor pretraining settings
         self.f0_predictor_freeze_steps = f0_predictor_freeze_steps
         self.f0_warmup_use_gt_steps = f0_warmup_use_gt_steps
+
+        # SIVE perceptual loss: frozen SIVE encoder as content loss
+        self.sive_perceptual_model = sive_perceptual_model
+        self.sive_perceptual_loss_weight = sive_perceptual_loss_weight
+        self.sive_perceptual_loss_start_step = sive_perceptual_loss_start_step
+        self.sive_perceptual_layer = sive_perceptual_layer
 
         self.has_logged_cli = False
 
@@ -525,6 +536,52 @@ class AudioCVAEGANTrainer(CommonTrainer):
             audio_perceptual_loss_value = audio_perceptual_losses.get("total_perceptual_loss", torch.tensor(0.0, device=mel_specs.device))
             total_loss = total_loss + self.audio_perceptual_loss_weight * audio_perceptual_loss_value
 
+        # SIVE perceptual loss: run reconstructed mel spec through frozen SIVE and
+        # compare against the ground truth SIVE features from the dataset.
+        # Encourages content preservation — speaker-invariant by design.
+        sive_perceptual_loss_value = torch.tensor(0.0, device=mel_specs.device)
+        sive_perceptual_enabled = (
+            self.sive_perceptual_model is not None
+            and self.sive_perceptual_loss_weight > 0
+            and global_step >= self.sive_perceptual_loss_start_step
+        )
+        if sive_perceptual_enabled:
+            # Target: ground truth SIVE features from the dataset [B, C, T']
+            # Permute to [B, T', C] to match SIVE model output format
+            target_sive_features = features.permute(0, 2, 1)  # [B, T', C]
+
+            # Pred: run reconstructed mel spec through frozen SIVE at the same layer
+            pred_mel_3d = recon.squeeze(1)  # [B, n_mels, T]
+            pred_result = self.sive_perceptual_model(
+                pred_mel_3d, lengths=mel_lengths,
+                return_all_hiddens=(self.sive_perceptual_layer != -1),
+            )
+            if self.sive_perceptual_layer == -1:
+                pred_sive_features = pred_result["features"]
+            else:
+                pred_sive_features = pred_result["all_hiddens"][self.sive_perceptual_layer]
+
+            # L1 loss on SIVE features (masked for valid timesteps)
+            sive_feat_lengths = pred_result["feature_lengths"]
+            if sive_feat_lengths is not None:
+                T_sive = pred_sive_features.shape[1]
+                sive_mask = torch.arange(T_sive, device=pred_sive_features.device).unsqueeze(0) < sive_feat_lengths.unsqueeze(1)
+                sive_mask = sive_mask.unsqueeze(-1)  # [B, T, 1]
+                # Truncate to same length (conv subsampling can differ by 1)
+                min_t = min(pred_sive_features.shape[1], target_sive_features.shape[1])
+                pred_sive_features = pred_sive_features[:, :min_t]
+                target_sive_features = target_sive_features[:, :min_t]
+                sive_mask = sive_mask[:, :min_t]
+                diff = torch.abs(pred_sive_features - target_sive_features) * sive_mask
+                num_valid_elements = sive_mask.sum() * pred_sive_features.shape[-1]
+                sive_perceptual_loss_value = diff.sum() / num_valid_elements.clamp(min=1)
+            else:
+                min_t = min(pred_sive_features.shape[1], target_sive_features.shape[1])
+                sive_perceptual_loss_value = F.l1_loss(
+                    pred_sive_features[:, :min_t], target_sive_features[:, :min_t]
+                )
+            total_loss = total_loss + self.sive_perceptual_loss_weight * sive_perceptual_loss_value
+
         # Learned speaker embedding classification loss
         # Uses direct gradients (no reversal) to train the speaker head to be discriminative
         speaker_id_loss = torch.tensor(0.0, device=mel_specs.device)
@@ -757,6 +814,11 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 for loss_name, loss_val in audio_perceptual_losses.items():
                     self._log_scalar(f"{prefix}audio_perceptual/{loss_name}", loss_val, global_step)
                 self._log_scalar(f"{prefix}audio_perceptual_weighted", self.audio_perceptual_loss_weight * audio_perceptual_loss_value, global_step)
+
+            # Log SIVE perceptual loss
+            if sive_perceptual_enabled:
+                self._log_scalar(f"{prefix}sive_perceptual_loss", sive_perceptual_loss_value, global_step)
+                self._log_scalar(f"{prefix}sive_perceptual_weighted", self.sive_perceptual_loss_weight * sive_perceptual_loss_value, global_step)
 
             # Log speaker embedding statistics (learned or pretrained, whichever is used for decoding)
             if decode_speaker_embedding is not None:
@@ -1031,6 +1093,12 @@ class AudioCVAEGANTrainer(CommonTrainer):
             print(f"Instance norm on latents: enabled (removes speaker statistics from z)")
         if args.mu_only_recon_weight > 0:
             print(f"Mu-only reconstruction loss: weight={args.mu_only_recon_weight} (trains decoder for diffusion compatibility)")
+        if self.sive_perceptual_model is not None:
+            print(f"SIVE perceptual loss: enabled")
+            print(f"  Weight: {self.sive_perceptual_loss_weight}")
+            print(f"  Layer: {self.sive_perceptual_layer} (-1 = final)")
+            print(f"  Start step: {self.sive_perceptual_loss_start_step}")
+            print(f"  SIVE params: {sum(p.numel() for p in self.sive_perceptual_model.parameters()):,} (frozen)")
 
 
 def load_model(args):
@@ -1056,6 +1124,25 @@ def create_trainer(
     vocoder,
     device,
 ):
+    # Load frozen SIVE encoder for perceptual loss if requested
+    sive_perceptual_model = None
+    if args.sive_perceptual_loss_weight > 0 and args.sive_perceptual_checkpoint_path is not None:
+        from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
+        sive_perceptual_model = model_loading_utils.load_model(
+            SpeakerInvariantVoiceEncoder,
+            args.sive_perceptual_config,
+            checkpoint_path=args.sive_perceptual_checkpoint_path,
+            device=str(device),
+        )
+        for param in sive_perceptual_model.parameters():
+            param.requires_grad = False
+        sive_perceptual_model.eval()
+        print(f"Loaded frozen SIVE for perceptual loss: config={args.sive_perceptual_config}, "
+              f"layer={args.sive_perceptual_layer}, weight={args.sive_perceptual_loss_weight}, "
+              f"params={sum(p.numel() for p in sive_perceptual_model.parameters()):,}")
+    elif args.sive_perceptual_loss_weight > 0:
+        print("WARNING: sive_perceptual_loss_weight > 0 but no --sive_perceptual_checkpoint_path provided. SIVE perceptual loss disabled.")
+
     # Create waveform-domain loss criteria if enabled
     waveform_stft_loss = None
     waveform_mel_loss = None
@@ -1234,6 +1321,10 @@ def create_trainer(
         speaker_id_loss_rampup_steps=args.speaker_id_loss_rampup_steps,
         f0_predictor_freeze_steps=args.f0_predictor_freeze_steps,
         f0_warmup_use_gt_steps=args.f0_warmup_use_gt_steps,
+        sive_perceptual_model=sive_perceptual_model,
+        sive_perceptual_loss_weight=args.sive_perceptual_loss_weight,
+        sive_perceptual_loss_start_step=args.sive_perceptual_loss_start_step,
+        sive_perceptual_layer=args.sive_perceptual_layer,
     )
 
 
@@ -1326,6 +1417,18 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--audio_perceptual_loss_start_step", type=int, default=0,
                            help="Step to start applying audio perceptual loss (0 = from start)")
     
+    # SIVE perceptual loss: frozen SIVE encoder for content-preserving loss
+    sub_parser.add_argument("--sive_perceptual_loss_weight", type=float, default=0.0,
+                           help="Weight for SIVE perceptual loss (0 = disabled)")
+    sub_parser.add_argument("--sive_perceptual_checkpoint_path", type=str, default=None,
+                           help="Path to frozen SIVE checkpoint for perceptual loss")
+    sub_parser.add_argument("--sive_perceptual_config", type=str, default="tiny_deep_3xdownsample_conv2d_batchnorm_attentive",
+                           help="SIVE config name for perceptual loss model")
+    sub_parser.add_argument("--sive_perceptual_layer", type=int, default=-1,
+                           help="SIVE layer to extract features from (-1 = final, e.g. 10 for layer 10)")
+    sub_parser.add_argument("--sive_perceptual_loss_start_step", type=int, default=0,
+                           help="Step to start applying SIVE perceptual loss (0 = from start)")
+
     # Vocoder settings (optional - for audio generation during visualization AND waveform losses)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,
                            help="Path to pretrained vocoder checkpoint (for waveform generation/losses)")
