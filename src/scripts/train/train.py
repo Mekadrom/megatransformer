@@ -189,6 +189,7 @@ def get_dataset(command: str, args, split: str):
             voice_shard_dir=voice_dir,
             image_shard_dir=image_dir,
             cache_size=32,
+            max_samples=getattr(args, 'max_samples', None),
         )
     return dataset
 

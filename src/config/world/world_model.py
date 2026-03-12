@@ -187,12 +187,15 @@ WORLD_MODEL_CONFIGS = {
         ),
         audio_coda_config=AudioCodaAndVAEConfig(
             coda_config=_slim_block(),
+            output_mode="conv_refine",
         ),
         voice_coda_config=AudioCodaAndVAEConfig(
             coda_config=_slim_block(),
+            output_mode="conv_refine",
         ),
         image_coda_config=ImageCodaAndVAEConfig(
             coda_config=_slim_block(),
+            unpatchify_mode="pixel_shuffle",
         ),
     ),
 }

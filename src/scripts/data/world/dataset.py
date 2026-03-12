@@ -31,6 +31,7 @@ class MultimodalShardedDataset(Dataset):
         audio_columns: list[str] = None,
         voice_columns: list[str] = None,
         cache_size: int = 3,
+        max_samples: int = None,
     ):
         """
         Args:
@@ -42,6 +43,7 @@ class MultimodalShardedDataset(Dataset):
             audio_columns: Columns to load from audio shards. If None, loads all.
             voice_columns: Columns to load from voice shards. If None, mirrors audio_columns.
             cache_size: Number of shards to keep cached per modality
+            max_samples: If set, cap the effective dataset length (for overfitting experiments)
         """
         self.cache_size = cache_size
         self.modalities = {}
@@ -75,12 +77,17 @@ class MultimodalShardedDataset(Dataset):
         # Total length = max across modalities; shorter ones wrap via modulo
         self.total_samples = max(m["total_samples"] for m in self.modalities.values())
 
+        # Cap dataset length for overfitting experiments
+        if max_samples is not None and max_samples > 0:
+            self.total_samples = min(self.total_samples, max_samples)
+
         modality_summary = ", ".join(
             f"{name}: {m['total_samples']:,} samples / {len(m['shard_files'])} shards"
             for name, m in self.modalities.items()
         )
         print(f"[MultimodalShardedDataset] {modality_summary}")
-        print(f"[MultimodalShardedDataset] Effective length: {self.total_samples:,} (max across modalities)")
+        cap_note = f" (capped from max_samples={max_samples})" if max_samples is not None and self.total_samples <= max_samples else ""
+        print(f"[MultimodalShardedDataset] Effective length: {self.total_samples:,}{cap_note}")
 
     def _init_modality(self, shard_dir: str, name: str) -> dict:
         """Load or build shard index for a single modality."""
@@ -311,9 +318,12 @@ class MultimodalShardedDataset(Dataset):
 
         # Pick the modality with the most samples for shard-aware ordering
         largest = max(self.modalities.values(), key=lambda m: m["total_samples"])
+
+        # Use self.total_samples (which respects max_samples cap) rather than
+        # the raw modality total, so the sampler length matches __len__().
         return ShardAwareSampler(
             shard_offsets=largest["shard_offsets"],
-            total_samples=largest["total_samples"],
+            total_samples=self.total_samples,
             shuffle=shuffle,
             seed=seed,
         )

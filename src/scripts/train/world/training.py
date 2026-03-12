@@ -81,6 +81,9 @@ class WorldModelTrainer(CommonTrainer):
 
         self.writer = None
 
+        # Per-module gradient norm tracking — built lazily in _get_module_groups()
+        self._module_groups = None
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
 
@@ -283,6 +286,54 @@ class WorldModelTrainer(CommonTrainer):
             return total_loss, outputs
         return total_loss
 
+    def _get_module_groups(self):
+        """Build name→module mapping for gradient norm logging (cached)."""
+        if self._module_groups is not None:
+            return self._module_groups
+
+        model = self.model
+        groups = {"text_embedding": model.text_feature_extractor}
+        if model.audio_feature_extractor is not None:
+            groups["audio_prelude"] = model.audio_feature_extractor
+        if model.voice_feature_extractor is not None:
+            groups["voice_prelude"] = model.voice_feature_extractor
+        if model.image_feature_extractor is not None:
+            groups["image_prelude"] = model.image_feature_extractor
+        groups["recurrent_block"] = model.recurrent_block
+        groups["text_coda"] = model.text_generator
+        if model.audio_generator is not None:
+            groups["audio_coda"] = model.audio_generator
+        if model.voice_generator is not None:
+            groups["voice_coda"] = model.voice_generator
+        if model.image_generator is not None:
+            groups["image_coda"] = model.image_generator
+
+        self._module_groups = groups
+        return groups
+
+    def _log_grad_norms(self, global_step):
+        """Compute and log L2 and RMS gradient norms per module group."""
+        if self.writer is None:
+            return
+        for name, module in self._get_module_groups().items():
+            total_norm_sq = 0.0
+            num_params = 0
+            for p in module.parameters():
+                if p.grad is not None:
+                    total_norm_sq += p.grad.data.float().norm(2).item() ** 2
+                    num_params += p.numel()
+            self._log_scalar(f"world/grad_norm/{name}", total_norm_sq ** 0.5, global_step)
+            if num_params > 0:
+                self._log_scalar(f"world/grad_rms/{name}", (total_norm_sq / num_params) ** 0.5, global_step)
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override to log per-module gradient norms after backward."""
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        global_step = self.state.global_step + self.step_offset
+        if global_step % self.args.logging_steps == 0:
+            self._log_grad_norms(global_step)
+        return loss
+
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         """Override to route eval through compute_loss (same as training).
 
@@ -449,6 +500,10 @@ def add_cli_args(subparsers):
                             help="Whether media inputs are precomputed VAE latents (default: True)")
     sub_parser.add_argument("--no_precomputed_latents", action="store_false", dest="precomputed_latents",
                             help="Media inputs are raw (mel specs / images), not VAE latents")
+
+    # Dataset limiting (for overfitting experiments)
+    sub_parser.add_argument("--max_samples", type=int, default=None,
+                            help="Cap dataset size to N samples (for overfitting/memorization experiments)")
 
     # Max sequence length for text collator
     sub_parser.add_argument("--max_seq_len", type=int, default=2048,

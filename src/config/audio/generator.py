@@ -16,6 +16,8 @@ class AudioCodaAndVAEConfig:
         default_factory=MegaTransformerBlockConfig
     )
     feature_channels: int = 128
+    # "linear" (single linear, original) or "conv_refine" (linear + Conv1d refinement)
+    output_mode: str = "linear"
 
 
     def __post_init__(self):

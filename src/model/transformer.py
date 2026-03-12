@@ -77,6 +77,7 @@ class MegaTransformerCausalSelfAttention(nn.Module):
         self.register_buffer(
             "causal_mask",
             torch.tril(torch.ones(max_positions, max_positions)).view(1, 1, max_positions, max_positions),
+            persistent=False,
         )
 
     def forward(

@@ -45,6 +45,47 @@ class Unpatchify(nn.Module):
         return self.conv(x)   # (batch, latent_channels, H, W)
 
 
+class PixelShuffleUnpatchify(nn.Module):
+    """
+    Reconstructs spatial latent from patch token sequence using sub-pixel convolution.
+
+    Instead of bilinear interpolation (which blurs), learns to directly generate
+    sub-pixel values via Conv2d → PixelShuffle. Each spatial position produces
+    patch_size² sub-pixels per output channel, then PixelShuffle rearranges them
+    into the spatial grid.
+    """
+
+    def __init__(self, d_model: int, latent_channels: int, patch_size: int):
+        super().__init__()
+
+        self.patch_size = patch_size
+
+        # Project d_model → latent_channels * patch_size² so PixelShuffle
+        # can rearrange into (latent_channels, H*patch_size, W*patch_size)
+        self.conv = nn.Conv2d(
+            d_model, latent_channels * patch_size * patch_size,
+            kernel_size=3, stride=1, padding=1,
+        )
+        self.shuffle = nn.PixelShuffle(patch_size)
+        # Refinement conv: 3×3 on the upsampled output to smooth patch boundaries
+        self.refine = nn.Conv2d(
+            latent_channels, latent_channels,
+            kernel_size=3, stride=1, padding=1,
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 1)  # (batch, d_model, seq_length)
+        N, D, T = x.shape
+        spatial_size = int(T ** 0.5)
+        x = x.view(N, D, spatial_size, spatial_size)  # (batch, d_model, H/p, W/p)
+        x = self.conv(x)       # (batch, latent_ch * p², H/p, W/p)
+        x = self.shuffle(x)    # (batch, latent_ch, H, W)
+        x = self.act(x)
+        x = self.refine(x)     # (batch, latent_ch, H, W)
+        return x
+
+
 class ImageCodaAndVAEWithLoss(nn.Module):
     """
     Image output head for the multimodal world model.
@@ -70,11 +111,19 @@ class ImageCodaAndVAEWithLoss(nn.Module):
         coda_config = config.coda_config
         self.coda = MegaTransformerBlock(coda_config)
 
-        self.unpatchify = Unpatchify(
-            coda_config.d_model,
-            config.image_config.latent_channels,
-            patch_size=config.image_config.latent_patch_size
-        )
+        unpatchify_mode = getattr(config, 'unpatchify_mode', 'bilinear')
+        if unpatchify_mode == "pixel_shuffle":
+            self.unpatchify = PixelShuffleUnpatchify(
+                coda_config.d_model,
+                config.image_config.latent_channels,
+                patch_size=config.image_config.latent_patch_size,
+            )
+        else:
+            self.unpatchify = Unpatchify(
+                coda_config.d_model,
+                config.image_config.latent_channels,
+                patch_size=config.image_config.latent_patch_size,
+            )
 
         # Learnable denormalization: maps from normalized space back to original
         # latent distribution. Initialized to identity (scale=1, bias=0).

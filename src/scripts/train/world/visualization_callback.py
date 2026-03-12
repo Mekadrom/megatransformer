@@ -156,6 +156,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
         with torch.no_grad():
             with autocast(device.type, dtype=dtype, enabled=args.bf16 or args.fp16):
+                # Training data reconstruction — tracks memorization/overfitting
+                self._scenario_train_reconstruction(
+                    model, args, device, writer, global_step, dtype
+                )
+
                 # Scenario 1: Text-only generation
                 self._scenario_text_continuation(
                     model, eval_dataset, collator, device, writer, global_step
@@ -414,6 +419,198 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         tgt_flat = tgt_flat[:min_len]
         cos_sim = F.cosine_similarity(pred_flat.unsqueeze(0), tgt_flat.unsqueeze(0)).item()
         writer.add_scalar(f"{prefix}_cosine_sim", cos_sim, global_step)
+
+    def _scenario_train_reconstruction(self, model, args, device, writer, global_step, dtype):
+        """Run forward pass on fixed training samples and compare predictions to ground truth.
+
+        This tracks memorization/overfitting: as training progresses, the model's
+        predictions on its own training data should increasingly match the targets.
+        Uses the same fixed sample indices every eval for consistent comparison.
+        """
+        tag = "train_world/reconstruction"
+        train_dataset = self.trainer.train_dataset
+        if train_dataset is None or len(train_dataset) == 0:
+            return
+
+        collator = self.trainer.data_collator
+        n = min(self.num_eval_samples, len(train_dataset))
+
+        # Fixed indices — same samples every eval for consistent tracking
+        if not hasattr(self, '_train_recon_indices'):
+            gen = torch.Generator().manual_seed(42)
+            self._train_recon_indices = torch.randperm(len(train_dataset), generator=gen)[:n].tolist()
+
+        try:
+            samples = [train_dataset[i] for i in self._train_recon_indices]
+        except Exception as e:
+            print(f"Warning: Failed to load training samples for reconstruction: {e}")
+            return
+
+        # Collate into a batch
+        batch = collator(samples)
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+        # --- Forward pass (mirrors compute_loss logic) ---
+        from utils.constants import (
+            AUDIO_PLACEHOLDER_TOKEN_ID as APH,
+            VOICE_PLACEHOLDER_TOKEN_ID as VPH,
+            IMAGE_PLACEHOLDER_TOKEN_ID as IPH,
+        )
+        placeholder_ids = {APH, VPH, IPH}
+
+        text_input_ids = batch.get("text_token_ids")
+        text_targets = None
+        if text_input_ids is not None:
+            full_ids = text_input_ids
+            non_ph_mask_full = torch.ones_like(full_ids, dtype=torch.bool)
+            for pid in placeholder_ids:
+                non_ph_mask_full &= (full_ids != pid)
+
+            model_text_ids = full_ids[:, :-1].contiguous()
+
+            non_ph_input = torch.ones_like(model_text_ids, dtype=torch.bool)
+            for pid in placeholder_ids:
+                non_ph_input &= (model_text_ids != pid)
+
+            target_list = []
+            for b in range(full_ids.shape[0]):
+                clean = full_ids[b][non_ph_mask_full[b]]
+                shifted = clean[1:]
+                K = non_ph_input[b].sum().item()
+                if shifted.shape[0] >= K:
+                    target_list.append(shifted[:K])
+                else:
+                    target_list.append(torch.cat([shifted, shifted.new_zeros(K - shifted.shape[0])]))
+
+            max_len = max(t.shape[0] for t in target_list)
+            padded = [torch.cat([t, t.new_zeros(max_len - t.shape[0])]) if t.shape[0] < max_len else t for t in target_list]
+            text_targets = torch.stack(padded)
+            text_input_ids = model_text_ids
+
+        # Media inputs
+        audio_inputs, audio_lengths, audio_labels = None, None, None
+        audio_data = batch.get("audio_features")
+        if audio_data is not None:
+            audio_inputs = audio_data.unsqueeze(1)
+            audio_labels = audio_data.clone()
+            fl = batch.get("audio_feature_lengths")
+            if fl is not None:
+                audio_lengths = fl.unsqueeze(1)
+
+        voice_inputs, voice_lengths, voice_labels = None, None, None
+        voice_data = batch.get("voice_features")
+        if voice_data is not None:
+            voice_inputs = voice_data.unsqueeze(1)
+            voice_labels = voice_data.clone()
+            fl = batch.get("voice_feature_lengths")
+            if fl is not None:
+                voice_lengths = fl.unsqueeze(1)
+
+        image_inputs, image_labels = None, None
+        image_data = batch.get("image_images")
+        if image_data is not None:
+            image_inputs = image_data.unsqueeze(1)
+            image_labels = image_data.clone()
+
+        outputs = model(
+            text_input_ids=text_input_ids,
+            audio_inputs=audio_inputs,
+            audio_lengths=audio_lengths,
+            voice_inputs=voice_inputs,
+            voice_lengths=voice_lengths,
+            image_inputs=image_inputs,
+            precomputed_latents=True,
+            decode_outputs=False,
+        )
+
+        # --- Log text reconstruction quality ---
+        logits = outputs.get("logits")
+        if logits is not None and text_targets is not None:
+            B, T, V = logits.size()
+            T_min = min(T, text_targets.shape[1])
+            logits_aligned = logits[:, :T_min, :].contiguous()
+            targets_aligned = text_targets[:, :T_min].contiguous()
+
+            # Per-sample accuracy and loss
+            preds = logits_aligned.argmax(dim=-1)  # [B, T]
+            for i in range(min(n, B)):
+                # Mask out padding (target == 0)
+                valid = targets_aligned[i] != 0
+                if valid.sum() == 0:
+                    continue
+                correct = (preds[i][valid] == targets_aligned[i][valid]).float().mean().item()
+                writer.add_scalar(f"{tag}/text_accuracy/{i}", correct, global_step)
+
+                # Log predicted vs target text
+                pred_text = self._decode_tokens(preds[i][valid])
+                target_text = self._decode_tokens(targets_aligned[i][valid])
+                writer.add_text(f"{tag}/text/{i}/predicted", pred_text, global_step)
+                writer.add_text(f"{tag}/text/{i}/target", target_text, global_step)
+
+            # Batch-level CE loss
+            ce_loss = F.cross_entropy(
+                logits_aligned.reshape(-1, V), targets_aligned.reshape(-1), ignore_index=0,
+            )
+            writer.add_scalar(f"{tag}/text_ce_loss", ce_loss.item(), global_step)
+            if ce_loss.item() < 20:
+                writer.add_scalar(f"{tag}/text_perplexity", torch.exp(ce_loss).item(), global_step)
+
+        # --- Log voice reconstruction quality ---
+        voice_preds = outputs.get("voice_latent_preds")
+        if voice_preds is not None and voice_labels is not None:
+            v_l1 = F.l1_loss(voice_preds, voice_labels).item()
+            v_mse = F.mse_loss(voice_preds, voice_labels).item()
+            writer.add_scalar(f"{tag}/voice_latent_l1", v_l1, global_step)
+            writer.add_scalar(f"{tag}/voice_latent_mse", v_mse, global_step)
+
+            for i in range(min(n, voice_preds.shape[0])):
+                pred_lat = voice_preds[i]  # (C, T)
+                tgt_lat = voice_labels[i]  # (C, T)
+                writer.add_image(f"{tag}/voice/{i}/predicted", self._latent_to_image(pred_lat), global_step)
+                writer.add_image(f"{tag}/voice/{i}/target", self._latent_to_image(tgt_lat), global_step)
+
+                cos = F.cosine_similarity(pred_lat.flatten().unsqueeze(0), tgt_lat.flatten().unsqueeze(0)).item()
+                writer.add_scalar(f"{tag}/voice_cosine_sim/{i}", cos, global_step)
+
+                # Decode predicted voice to audio if CVAE available
+                sample = samples[i] if i < len(samples) else {}
+                self._log_audio_with_cvae(pred_lat, sample, writer, global_step, f"{tag}/voice/{i}/pred")
+
+            # Also decode target voice for comparison (first sample only)
+            if len(samples) > 0:
+                self._log_audio_with_cvae(voice_labels[0], samples[0], writer, global_step, f"{tag}/voice/0/target")
+
+        # --- Log audio reconstruction quality ---
+        audio_preds = outputs.get("audio_latent_preds")
+        if audio_preds is not None and audio_labels is not None:
+            a_l1 = F.l1_loss(audio_preds, audio_labels).item()
+            a_mse = F.mse_loss(audio_preds, audio_labels).item()
+            writer.add_scalar(f"{tag}/audio_latent_l1", a_l1, global_step)
+            writer.add_scalar(f"{tag}/audio_latent_mse", a_mse, global_step)
+
+            for i in range(min(n, audio_preds.shape[0])):
+                writer.add_image(f"{tag}/audio/{i}/predicted", self._latent_to_image(audio_preds[i]), global_step)
+                writer.add_image(f"{tag}/audio/{i}/target", self._latent_to_image(audio_labels[i]), global_step)
+
+        # --- Log image reconstruction quality ---
+        image_preds = outputs.get("image_latent_preds")
+        if image_preds is not None and image_labels is not None:
+            i_l1 = F.l1_loss(image_preds, image_labels).item()
+            i_mse = F.mse_loss(image_preds, image_labels).item()
+            writer.add_scalar(f"{tag}/image_latent_l1", i_l1, global_step)
+            writer.add_scalar(f"{tag}/image_latent_mse", i_mse, global_step)
+
+            for i in range(min(n, image_preds.shape[0])):
+                writer.add_image(f"{tag}/image/{i}/predicted", self._latent_to_image(image_preds[i]), global_step)
+                writer.add_image(f"{tag}/image/{i}/target", self._latent_to_image(image_labels[i]), global_step)
+
+                cos = F.cosine_similarity(image_preds[i].flatten().unsqueeze(0), image_labels[i].flatten().unsqueeze(0)).item()
+                writer.add_scalar(f"{tag}/image_cosine_sim/{i}", cos, global_step)
+
+                # Decode through image VAE if available
+                if self.image_vae_decoder is not None:
+                    self._try_decode_image(image_preds[i], writer, global_step, f"{tag}/image/{i}/pred_decoded")
+                    self._try_decode_image(image_labels[i], writer, global_step, f"{tag}/image/{i}/target_decoded")
 
     def _scenario_text_continuation(self, model, eval_dataset, collator, device, writer, global_step):
         """Scenario 1: Text-only generation (take text, generate continuation)."""

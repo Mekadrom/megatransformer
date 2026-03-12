@@ -162,6 +162,26 @@ class MegatransformerRecurrentBlock(nn.Module):
 
         iteration = 0
 
+        def _extend_mask_for_cache(mask, iter_cache):
+            """Extend attention mask to cover cached KV positions.
+
+            When the Huginn circular buffer reuses a slot, the cached keys
+            from a previous iteration are concatenated with new keys, making
+            the key dimension larger than the query dimension.  The attention
+            mask must cover [cached_positions | new_positions]; cached
+            positions are always attendable (1).
+            """
+            if mask is None or iter_cache is None or iter_cache.key_cache is None:
+                return mask
+            cached_len = iter_cache.seq_len
+            if cached_len == 0:
+                return mask
+            ones = torch.ones(
+                mask.shape[0], cached_len,
+                device=mask.device, dtype=mask.dtype,
+            )
+            return torch.cat([ones, mask], dim=-1)
+
         if n_steps_no_grad > 0:
             with torch.no_grad():
                 for _ in range(n_steps_no_grad):
@@ -172,7 +192,7 @@ class MegatransformerRecurrentBlock(nn.Module):
 
                     block_output, updated_cache = self.recurrent_block(
                         torch.cat([x_0, last_thought_state], dim=-1),
-                        attention_mask=attention_mask,
+                        attention_mask=_extend_mask_for_cache(attention_mask, iter_cache),
                         kv_cache=iter_cache,
                         position_offset=position_offset,
                         use_cache=use_cache,
@@ -210,7 +230,7 @@ class MegatransformerRecurrentBlock(nn.Module):
 
                 block_output, updated_cache = self.recurrent_block(
                     torch.cat([x_0, last_thought_state], dim=-1),
-                    attention_mask=attention_mask,
+                    attention_mask=_extend_mask_for_cache(attention_mask, iter_cache),
                     kv_cache=iter_cache,
                     position_offset=position_offset,
                     use_cache=use_cache,
@@ -267,13 +287,22 @@ class MegatransformerRecurrentBlock(nn.Module):
 
         last_thought_state = self.initialize_thinking_state(x_0)
 
+        def _extend_mask_for_cache(mask, cache):
+            if mask is None or cache is None or cache.key_cache is None:
+                return mask
+            cached_len = cache.seq_len
+            if cached_len == 0:
+                return mask
+            ones = torch.ones(mask.shape[0], cached_len, device=mask.device, dtype=mask.dtype)
+            return torch.cat([ones, mask], dim=-1)
+
         for iteration in range(max_iterations):
             # Get cache for this iteration slot
             iter_cache = kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
 
             block_output, updated_cache = self.recurrent_block(
                 torch.cat([x_0, last_thought_state], dim=-1),
-                attention_mask=attention_mask,
+                attention_mask=_extend_mask_for_cache(attention_mask, iter_cache),
                 kv_cache=iter_cache,
                 position_offset=position_offset,
                 use_cache=True,

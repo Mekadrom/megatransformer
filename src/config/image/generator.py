@@ -15,6 +15,8 @@ class ImageCodaAndVAEConfig:
     image_config: ImageConfig = dataclasses.field(
         default_factory=ImageConfig
     )
+    # "bilinear" (Upsample+Conv, original) or "pixel_shuffle" (SubPixelConv+Refine)
+    unpatchify_mode: str = "bilinear"
 
 
     def __post_init__(self):
