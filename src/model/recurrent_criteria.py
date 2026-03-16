@@ -20,3 +20,8 @@ class KLDivergenceCriteria(RecurrentExitCriteria):
 
         kl_divergence = F.kl_div(last_thought_state, current_thought_state, reduction="none", log_target=True).sum(dim=-1)
         return (kl_divergence < self.threshold).any()
+
+    def converged_mask(self, last_thought_state: torch.Tensor, current_thought_state: torch.Tensor) -> torch.Tensor:
+        """Per-token convergence mask. Shape: (batch, seq_len). True = converged."""
+        kl = F.kl_div(last_thought_state, current_thought_state, reduction="none", log_target=True).sum(dim=-1)
+        return kl < self.threshold

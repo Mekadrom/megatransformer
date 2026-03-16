@@ -1,5 +1,6 @@
 import argparse
 import math
+import numpy as np
 import os
 import psutil
 
@@ -44,6 +45,9 @@ from utils.audio_utils import SharedWindowBuffer
 from utils.train_utils import EarlyStoppingCallback
 
 
+torch.serialization.add_safe_globals([np._core.multiarray._reconstruct, np.ndarray, np.dtype])
+
+
 def create_or_load_model(args, shared_window_buffer: Optional[SharedWindowBuffer]) -> nn.Module:
     if args.command in ["audio-cvae", "audio-cvae-decoder"]:
         return audio_cvae_training.load_model(args)
@@ -60,9 +64,9 @@ def create_or_load_model(args, shared_window_buffer: Optional[SharedWindowBuffer
 
 
 def get_training_args(args, run_dir) -> TrainingArguments:
+    os.environ["TENSORBOARD_LOGGING_DIR"] = run_dir
     return TrainingArguments(
         output_dir=run_dir,
-        overwrite_output_dir=True,
         lr_scheduler_type=args.lr_scheduler_type,
         learning_rate=args.learning_rate,
         warmup_ratio=args.warmup_ratio,
@@ -76,7 +80,6 @@ def get_training_args(args, run_dir) -> TrainingArguments:
         report_to="tensorboard",
         logging_dir=run_dir,
         logging_steps=args.logging_steps,
-        save_safetensors=False,
         save_steps=args.save_steps,
         gradient_checkpointing=args.use_gradient_checkpointing,
         bf16=args.bf16,

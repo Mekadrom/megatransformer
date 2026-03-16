@@ -24,15 +24,27 @@ class MegatransformerRecurrentBlock(nn.Module):
         self.thought_initialization_method = self.config.thought_initialization_method
         self.exit_criteria = self.config.exit_criteria
         self.exit_criteria_threshold = self.config.exit_criteria_threshold
+        self.thought_init_std = self.config.thought_init_std
 
         self.lockstep_n = self.config.lockstep_n
         self.lockstep_k = self.config.lockstep_k
-        
-        self.recurrent_block = MegaTransformerBlock(config.block_config)
 
-        # block_config.d_model is 2*base_d_model (for concatenated [x_0, thought_state])
-        # Project back to base_d_model
-        self.projection = nn.Linear(config.block_config.d_model, config.block_config.d_model // 2)
+        self.n_recurrent_blocks = config.n_recurrent_blocks
+        self.injection_type = config.injection_type
+
+        # Bank of distinct blocks, cycled: iteration i uses block i % n
+        self.recurrent_blocks = nn.ModuleList([
+            MegaTransformerBlock(config.block_config)
+            for _ in range(self.n_recurrent_blocks)
+        ])
+
+        if self.injection_type == "concat":
+            # block_config.d_model is 2*base_d_model (for concatenated [x_0, thought_state])
+            # Project back to base_d_model
+            self.projection = nn.Linear(config.block_config.d_model, config.block_config.d_model // 2)
+        else:
+            # Additive injection: blocks operate at base d_model, no projection needed
+            self.projection = None
         
         if self.exit_criteria == 'kl_divergence':
             self.exit_criteria = recurrent_criteria.KLDivergenceCriteria(self.exit_criteria_threshold)
@@ -44,8 +56,50 @@ class MegatransformerRecurrentBlock(nn.Module):
 
         self._init_weights()
 
+    def _get_block_and_layer(self, iteration: int, share_kv_cache: bool = False):
+        """Get the recurrent block and KV cache layer_idx for a given iteration.
+
+        With n_recurrent_blocks=4, iteration i uses block i % 4.
+
+        Args:
+            share_kv_cache: If True, all blocks share layer_idx=0 (Huginn-style,
+                saves 4x cache memory). If False, each block gets its own layer_idx.
+        """
+        block_idx = iteration % self.n_recurrent_blocks
+        layer_idx = 0 if share_kv_cache else block_idx
+        return self.recurrent_blocks[block_idx], layer_idx
+
+    def _combine(self, x_0: torch.Tensor, thought: torch.Tensor) -> torch.Tensor:
+        """Combine input embedding with thought state for block input."""
+        if self.injection_type == "concat":
+            return torch.cat([x_0, thought], dim=-1)
+        else:
+            return x_0 + thought
+
+    def _extract_thought(self, block_output: torch.Tensor) -> torch.Tensor:
+        """Extract thought state from block output."""
+        if self.projection is not None:
+            return self.projection(block_output)
+        return block_output
+
     def _init_weights(self):
         self.apply(transformer_weight_init())
+        if not self.config.depth_scaled_init:
+            return
+        # Depth-scaled init for output projections (Huginn-inspired).
+        # Each block appears mean_thinking_steps times (not n_blocks * mean_steps),
+        # so per-block effective depth = mean_thinking_steps.
+        # Use base d_model (half of concat d_model) to avoid over-shrinking.
+        d_model = self.config.block_config.d_model
+        if self.injection_type == "concat":
+            d_model = d_model // 2  # use base width, not concat width
+        l_eff = self.mean_thinking_steps
+        out_std = (1.0 / (5 * d_model * l_eff)) ** 0.5
+        for block in self.recurrent_blocks:
+            if hasattr(block, 'self_attn') and hasattr(block.self_attn, 'o_proj'):
+                nn.init.normal_(block.self_attn.o_proj.weight, std=out_std)
+            if hasattr(block, 'ffn') and hasattr(block.ffn, 'condense'):
+                nn.init.normal_(block.ffn.condense.weight, std=out_std)
 
     def initialize_thinking_state(self, input_embeds):
         """
@@ -58,13 +112,8 @@ class MegatransformerRecurrentBlock(nn.Module):
         elif self.thought_initialization_method == "embed":
             x = torch.randn_like(input_embeds).mul(1 / math.sqrt(input_embeds.shape[-1]))
         elif self.thought_initialization_method == "like-init":
-            # initializes a thought state with the same shape as the input embeddings
-            # eg if a batch input is of the shape (N, T, D), then the thought state is of the shape (N, T, D)
-            # for example, (16, 1024, 512) is sampled from torch.randn_like
-            # and then the thought state is truncated to a normal distribution of the same shape as the embeddings
-            # where values outside of -3*0.02 and 3*0.02 are redrawn
             x = torch.randn_like(input_embeds)
-            std = 0.02
+            std = self.thought_init_std
             torch.nn.init.trunc_normal_(x, mean=0.0, std=std, a=-3 * std, b=3 * std)
         elif self.thought_initialization_method == "zero":
             x = torch.zeros_like(input_embeds)
@@ -122,6 +171,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         kv_cache: Optional[RecurrentKVCache] = None,
         position_offset: int = 0,
         use_cache: bool = False,
+        share_kv_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache], int, List[float]]:
         """
         Forward pass through recurrent block with optional KV caching.
@@ -155,6 +205,14 @@ class MegatransformerRecurrentBlock(nn.Module):
         track_kl = not self.training
         kl_per_iteration: List[float] = []
 
+        # Per-token convergence tracking (eval only)
+        converged: Optional[torch.Tensor] = None
+        if not self.training and self.exit_criteria is not None:
+            converged = torch.zeros(
+                x_0.shape[0], x_0.shape[1],
+                dtype=torch.bool, device=x_0.device,
+            )
+
         # Initialize or use existing cache
         new_kv_cache = kv_cache if use_cache and kv_cache is not None else None
         if use_cache and new_kv_cache is None:
@@ -185,13 +243,15 @@ class MegatransformerRecurrentBlock(nn.Module):
         if n_steps_no_grad > 0:
             with torch.no_grad():
                 for _ in range(n_steps_no_grad):
+                    block, layer_idx = self._get_block_and_layer(iteration, share_kv_cache=share_kv_cache)
+
                     # Get cache for this iteration (Huginn circular buffer)
                     iter_cache = None
                     if use_cache and new_kv_cache is not None:
-                        iter_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+                        iter_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=layer_idx)
 
-                    block_output, updated_cache = self.recurrent_block(
-                        torch.cat([x_0, last_thought_state], dim=-1),
+                    block_output, updated_cache = block(
+                        self._combine(x_0, last_thought_state),
                         attention_mask=_extend_mask_for_cache(attention_mask, iter_cache),
                         kv_cache=iter_cache,
                         position_offset=position_offset,
@@ -200,36 +260,44 @@ class MegatransformerRecurrentBlock(nn.Module):
 
                     # Update cache for this iteration slot
                     if use_cache and updated_cache is not None and new_kv_cache is not None:
-                        slot = iteration % new_kv_cache.cache_budget
-                        layer_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+                        layer_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=layer_idx)
                         layer_cache.key_cache = updated_cache.key_cache
                         layer_cache.value_cache = updated_cache.value_cache
 
-                    # Project back down to d_model
-                    thought_states = self.projection(block_output)
+                    new_thought = self._extract_thought(block_output)
 
                     if track_kl:
                         kl = F.kl_div(
-                            last_thought_state, thought_states,
+                            last_thought_state, new_thought,
                             reduction="none", log_target=True,
                         ).sum(dim=-1).mean().item()
                         kl_per_iteration.append(kl)
 
-                    if not self.training and self.exit_criteria is not None and self.exit_criteria.should_exit(last_thought_state, thought_states):
-                        return thought_states, new_kv_cache, iteration + 1, kl_per_iteration
+                    # Per-token freeze: only update non-converged tokens
+                    if converged is not None and hasattr(self.exit_criteria, 'converged_mask'):
+                        newly_converged = self.exit_criteria.converged_mask(last_thought_state, new_thought)
+                        converged = converged | newly_converged
+                        # Freeze converged tokens' thought states
+                        thought_states = torch.where(converged.unsqueeze(-1), last_thought_state, new_thought)
+                        if converged.all():
+                            return thought_states, new_kv_cache, iteration + 1, kl_per_iteration
+                    else:
+                        thought_states = new_thought
 
                     last_thought_state = thought_states
                     iteration += 1
 
         if k_steps_grad > 0:
             for _ in range(k_steps_grad):
+                block, layer_idx = self._get_block_and_layer(iteration, share_kv_cache=share_kv_cache)
+
                 # Get cache for this iteration
                 iter_cache = None
                 if use_cache and new_kv_cache is not None:
-                    iter_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+                    iter_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=layer_idx)
 
-                block_output, updated_cache = self.recurrent_block(
-                    torch.cat([x_0, last_thought_state], dim=-1),
+                block_output, updated_cache = block(
+                    self._combine(x_0, last_thought_state),
                     attention_mask=_extend_mask_for_cache(attention_mask, iter_cache),
                     kv_cache=iter_cache,
                     position_offset=position_offset,
@@ -238,11 +306,11 @@ class MegatransformerRecurrentBlock(nn.Module):
 
                 # Update cache for this iteration slot
                 if use_cache and updated_cache is not None and new_kv_cache is not None:
-                    layer_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+                    layer_cache = new_kv_cache.get_layer_at_iteration(iteration, layer_idx=layer_idx)
                     layer_cache.key_cache = updated_cache.key_cache
                     layer_cache.value_cache = updated_cache.value_cache
 
-                thought_states = self.projection(block_output)
+                thought_states = self._extract_thought(block_output)
 
                 if track_kl:
                     kl = F.kl_div(
@@ -263,6 +331,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         position_offset: int,
         attention_mask: Optional[torch.Tensor] = None,
         max_iterations: Optional[int] = None,
+        share_kv_cache: bool = False,
     ) -> Tuple[torch.Tensor, RecurrentKVCache, int]:
         """
         Single generation step with KV caching.
@@ -297,11 +366,13 @@ class MegatransformerRecurrentBlock(nn.Module):
             return torch.cat([ones, mask], dim=-1)
 
         for iteration in range(max_iterations):
-            # Get cache for this iteration slot
-            iter_cache = kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+            block, layer_idx = self._get_block_and_layer(iteration, share_kv_cache=share_kv_cache)
 
-            block_output, updated_cache = self.recurrent_block(
-                torch.cat([x_0, last_thought_state], dim=-1),
+            # Get cache for this iteration slot
+            iter_cache = kv_cache.get_layer_at_iteration(iteration, layer_idx=layer_idx)
+
+            block_output, updated_cache = block(
+                self._combine(x_0, last_thought_state),
                 attention_mask=_extend_mask_for_cache(attention_mask, iter_cache),
                 kv_cache=iter_cache,
                 position_offset=position_offset,
@@ -310,11 +381,11 @@ class MegatransformerRecurrentBlock(nn.Module):
 
             # Update cache
             if updated_cache is not None:
-                layer_cache = kv_cache.get_layer_at_iteration(iteration, layer_idx=0)
+                layer_cache = kv_cache.get_layer_at_iteration(iteration, layer_idx=layer_idx)
                 layer_cache.key_cache = updated_cache.key_cache
                 layer_cache.value_cache = updated_cache.value_cache
 
-            thought_states = self.projection(block_output)
+            thought_states = self._extract_thought(block_output)
 
             # Check exit criteria
             if self.exit_criteria is not None and self.exit_criteria.should_exit(last_thought_state, thought_states):

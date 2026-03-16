@@ -109,7 +109,10 @@ class ImageCodaAndVAEWithLoss(nn.Module):
         self.latent_spatial_size = config.image_config.image_size // config.image_config.latent_compression_factor
 
         coda_config = config.coda_config
-        self.coda = MegaTransformerBlock(coda_config)
+        self.coda = nn.ModuleList([
+            MegaTransformerBlock(coda_config)
+            for _ in range(config.n_layers)
+        ])
 
         unpatchify_mode = getattr(config, 'unpatchify_mode', 'bilinear')
         if unpatchify_mode == "pixel_shuffle":
@@ -141,7 +144,8 @@ class ImageCodaAndVAEWithLoss(nn.Module):
 
     def _init_weights(self):
         # Only init coda and projection; VAE decoder has its own init
-        self.coda.apply(transformer_weight_init())
+        for block in self.coda:
+            block.apply(transformer_weight_init())
         self.unpatchify.apply(conv2d_weight_init())
 
     @classmethod
@@ -193,8 +197,11 @@ class ImageCodaAndVAEWithLoss(nn.Module):
             - "latent_l1_loss", "latent_mse_loss": Latent space losses (if latent_labels provided)
             - "image_l1_loss", "image_mse_loss", "image_perceptual_loss": Image losses (if decode_to_image and image_labels provided)
         """
-        coda_hidden, _ = self.coda(x)  # (batch, seq_length, d_model)
-        coda_output: torch.Tensor = x + coda_hidden
+        h = x
+        for block in self.coda:
+            hidden, _ = block(h)
+            h = h + hidden
+        coda_output: torch.Tensor = h
 
         # seq_length should be 256 for a 256x256 image. this is because the vae latent space is 32x32 and we patchify into 2x2 patches
 

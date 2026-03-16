@@ -15,6 +15,7 @@ class AudioCodaAndVAEConfig:
     coda_config: MegaTransformerBlockConfig = dataclasses.field(
         default_factory=MegaTransformerBlockConfig
     )
+    n_layers: int = 1
     feature_channels: int = 128
     # "linear" (single linear, original) or "conv_refine" (linear + Conv1d refinement)
     output_mode: str = "linear"

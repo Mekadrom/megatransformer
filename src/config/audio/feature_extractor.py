@@ -18,6 +18,7 @@ class AudioVAEPreludeFeatureExtractorConfig:
     prelude_config: MegaTransformerBlockConfig = dataclasses.field(
         default_factory=MegaTransformerBlockConfig
     )
+    n_layers: int = 1
     feature_channels: int = 128
     sample_rate: int = 16000
     hop_length: int = 256

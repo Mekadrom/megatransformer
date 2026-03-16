@@ -12,6 +12,7 @@ class ImageVAEPreludeFeatureExtractorConfig:
     prelude_config: MegaTransformerBlockConfig = dataclasses.field(
         default_factory=MegaTransformerBlockConfig
     )
+    n_layers: int = 1
     image_config: ImageConfig = dataclasses.field(
         default_factory=ImageConfig
     )

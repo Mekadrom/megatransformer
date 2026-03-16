@@ -153,13 +153,13 @@ class SIVETrainer(Trainer):
                 self.writer = callback.tb_writer
                 return
 
-    def _get_train_sampler(self) -> Optional[Sampler]:
+    def _get_train_sampler(self, dataset=None) -> Optional[Sampler]:
         """Override to use shard-aware sampler for efficient shard loading."""
         if self._shard_sampler is not None:
             epoch = int(self.state.epoch) if self.state and self.state.epoch else 0
             self._shard_sampler.set_epoch(epoch)
             return self._shard_sampler
-        return super()._get_train_sampler()
+        return super()._get_train_sampler(dataset)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         global_step = self.state.global_step + self.step_offset

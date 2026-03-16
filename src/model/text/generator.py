@@ -25,7 +25,10 @@ class TextCodaClassifierWithLoss(nn.Module):
 
         self.config = config
         coda_config = config.coda_config
-        self.coda = MegaTransformerBlock(coda_config)
+        self.coda = nn.ModuleList([
+            MegaTransformerBlock(coda_config)
+            for _ in range(config.n_layers)
+        ])
 
         self.lm_head = nn.Linear(coda_config.d_model, config.vocab_size)
         self.loss_fn = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
@@ -45,10 +48,12 @@ class TextCodaClassifierWithLoss(nn.Module):
         Returns:
             dict[str, torch.Tensor]: A dictionary containing the logits and classification loss if targets are provided.
         """
-        coda_hidden, _ = self.coda(x)
-        coda_output = x + coda_hidden
+        h = x
+        for block in self.coda:
+            hidden, _ = block(h)
+            h = h + hidden
 
-        logits: torch.Tensor = self.lm_head(coda_output)
+        logits: torch.Tensor = self.lm_head(h)
 
         output = {"logits": logits}
 

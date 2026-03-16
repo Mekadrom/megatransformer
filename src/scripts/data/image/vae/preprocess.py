@@ -579,7 +579,7 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         self.shard_fields['shard_raw_text'] = []
         self.shard_fields['shard_token_ids'] = []
         self.shard_fields['shard_text_lengths'] = []
-        self.shard_fields['shard_idx'] += 1
+        self.shard_fields['shard_idx'] += self.args.total_gpus
 
     def process_and_accumulate(self):
         if not self.batch_accumulators['batch_images']:

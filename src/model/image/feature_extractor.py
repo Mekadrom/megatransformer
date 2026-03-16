@@ -64,7 +64,10 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
         self.config = config
 
         prelude_config = config.prelude_config
-        self.prelude = MegaTransformerBlock(prelude_config)
+        self.prelude = nn.ModuleList([
+            MegaTransformerBlock(prelude_config)
+            for _ in range(config.n_layers)
+        ])
 
         # Normalize raw image latents to zero-mean unit-variance before patch embedding.
         # Image VAE latents (e.g. LiteVAE) can range [-10, 10]; normalizing puts them
@@ -97,7 +100,8 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
         # Patch embedding uses conv2d
         self.patch_embedding.apply(conv2d_weight_init())
         # Prelude transformer
-        self.prelude.apply(transformer_weight_init())
+        for block in self.prelude:
+            block.apply(transformer_weight_init())
         # Initialize positional embedding with small values
         nn.init.trunc_normal_(self.pos_embedding, std=0.02)
 
@@ -155,7 +159,9 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
         # Add 2D positional encoding
         patch_embeddings = patch_embeddings + self.pos_embedding
 
-        prelude_hidden, _ = self.prelude(patch_embeddings)  # (batch_size, num_patches, d_model)
-        prelude_output = patch_embeddings + prelude_hidden
+        x = patch_embeddings
+        for block in self.prelude:
+            hidden, _ = block(x)
+            x = x + hidden
 
-        return prelude_output
+        return x

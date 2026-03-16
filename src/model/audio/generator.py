@@ -53,7 +53,10 @@ class AudioCodaAndVAEWithLoss(nn.Module):
         self.feature_channels = config.feature_channels
 
         coda_config = config.coda_config
-        self.coda = MegaTransformerBlock(coda_config)
+        self.coda = nn.ModuleList([
+            MegaTransformerBlock(coda_config)
+            for _ in range(config.n_layers)
+        ])
 
         self.feature_projection = nn.Linear(coda_config.d_model, config.feature_channels)
 
@@ -72,7 +75,8 @@ class AudioCodaAndVAEWithLoss(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.coda.apply(transformer_weight_init())
+        for block in self.coda:
+            block.apply(transformer_weight_init())
         self.feature_projection.apply(transformer_weight_init())
         if self.temporal_refine is not None:
             self.temporal_refine.apply(transformer_weight_init())
@@ -112,10 +116,12 @@ class AudioCodaAndVAEWithLoss(nn.Module):
             - "{prefix}_latent_preds": Predicted SIVE features (batch, feature_channels, timesteps)
             - "{prefix}_latent_l1_loss", "{prefix}_latent_mse_loss": Losses (if latent_labels provided)
         """
-        coda_hidden, _ = self.coda(x)  # (batch, seq_length, d_model)
-        coda_output = x + coda_hidden
+        h = x
+        for block in self.coda:
+            hidden, _ = block(h)
+            h = h + hidden
 
-        feature_preds = self.feature_projection(coda_output)  # (batch, seq_length, feature_channels)
+        feature_preds = self.feature_projection(h)  # (batch, seq_length, feature_channels)
         # Denormalize: learnable scale and bias map back to original latent range
         feature_preds = feature_preds * self.output_scale + self.output_bias
         feature_preds = feature_preds.permute(0, 2, 1)  # (batch, feature_channels, timesteps)

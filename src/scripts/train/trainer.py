@@ -1,5 +1,6 @@
 import abc
 import math
+import os
 
 import torch
 
@@ -11,7 +12,14 @@ from transformers.trainer import Trainer
 
 
 class CommonTrainer(abc.ABC, Trainer):
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+    def _save(self, output_dir=None, state_dict=None):
+        """Save with torch.save instead of safetensors to support tied weights."""
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        if state_dict is None:
+            state_dict = self.model.state_dict()
+        torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+    def _get_train_sampler(self, dataset=None) -> Optional[torch.utils.data.Sampler]:
         """
         Override to use shard-aware sampler for sharded datasets.
 
@@ -27,7 +35,7 @@ class CommonTrainer(abc.ABC, Trainer):
             return self._shard_sampler
 
         # Fall back to default sampler for non-sharded datasets
-        return super()._get_train_sampler()
+        return super()._get_train_sampler(dataset)
 
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """

@@ -282,31 +282,80 @@ class WorldModelTrainer(CommonTrainer):
             for name, value in loss_components.items():
                 self._log_scalar(f"world/{name}", value, global_step)
 
+            # Recurrent output stats (variance and entropy per modality)
+            for key, value in outputs.items():
+                if key.startswith("recurrent_out/"):
+                    self._log_scalar(f"world/{key}", value, global_step)
+
         if return_outputs:
             return total_loss, outputs
         return total_loss
 
     def _get_module_groups(self):
-        """Build name→module mapping for gradient norm logging (cached)."""
+        """Build name→module mapping for gradient norm logging (cached).
+
+        Provides both coarse (prelude/coda/recurrent) and fine-grained
+        (per-layer, per-submodule) groups for diagnosing gradient flow.
+        """
         if self._module_groups is not None:
             return self._module_groups
 
         model = self.model
-        groups = {"text_embedding": model.text_feature_extractor}
-        if model.audio_feature_extractor is not None:
-            groups["audio_prelude"] = model.audio_feature_extractor
-        if model.voice_feature_extractor is not None:
-            groups["voice_prelude"] = model.voice_feature_extractor
-        if model.image_feature_extractor is not None:
-            groups["image_prelude"] = model.image_feature_extractor
-        groups["recurrent_block"] = model.recurrent_block
-        groups["text_coda"] = model.text_generator
-        if model.audio_generator is not None:
-            groups["audio_coda"] = model.audio_generator
-        if model.voice_generator is not None:
-            groups["voice_coda"] = model.voice_generator
-        if model.image_generator is not None:
-            groups["image_coda"] = model.image_generator
+        groups = {}
+
+        # Text embedding
+        groups["text_embedding"] = model.text_feature_extractor
+        groups["text_embedding/wte"] = model.text_feature_extractor.wte
+
+        # Preludes: coarse + per-layer
+        for prefix, extractor in [
+            ("audio_prelude", model.audio_feature_extractor),
+            ("voice_prelude", model.voice_feature_extractor),
+            ("image_prelude", model.image_feature_extractor),
+        ]:
+            if extractor is None:
+                continue
+            groups[prefix] = extractor
+            if hasattr(extractor, 'projection'):
+                groups[f"{prefix}/projection"] = extractor.projection
+            if hasattr(extractor, 'prelude'):
+                for i, block in enumerate(extractor.prelude):
+                    groups[f"{prefix}/layer{i}"] = block
+                    groups[f"{prefix}/layer{i}/attn"] = block.self_attn
+                    groups[f"{prefix}/layer{i}/ffn"] = block.ffn
+
+        # Recurrent block: coarse + per-block + projection
+        groups["recurrent"] = model.recurrent_block
+        if model.recurrent_block.projection is not None:
+            groups["recurrent/projection"] = model.recurrent_block.projection
+        for i, block in enumerate(model.recurrent_block.recurrent_blocks):
+            groups[f"recurrent/block{i}"] = block
+            groups[f"recurrent/block{i}/attn"] = block.self_attn
+            groups[f"recurrent/block{i}/ffn"] = block.ffn
+
+        # Codas: coarse + per-layer
+        for prefix, generator in [
+            ("text_coda", model.text_generator),
+            ("audio_coda", model.audio_generator),
+            ("voice_coda", model.voice_generator),
+            ("image_coda", model.image_generator),
+        ]:
+            if generator is None:
+                continue
+            groups[prefix] = generator
+            if hasattr(generator, 'coda'):
+                for i, block in enumerate(generator.coda):
+                    groups[f"{prefix}/layer{i}"] = block
+                    groups[f"{prefix}/layer{i}/attn"] = block.self_attn
+                    groups[f"{prefix}/layer{i}/ffn"] = block.ffn
+            if hasattr(generator, 'lm_head'):
+                groups[f"{prefix}/lm_head"] = generator.lm_head
+            if hasattr(generator, 'feature_projection'):
+                groups[f"{prefix}/feature_proj"] = generator.feature_projection
+            if hasattr(generator, 'unpatchify'):
+                groups[f"{prefix}/unpatchify"] = generator.unpatchify
+            if hasattr(generator, 'temporal_refine') and generator.temporal_refine is not None:
+                groups[f"{prefix}/temporal_refine"] = generator.temporal_refine
 
         self._module_groups = groups
         return groups
@@ -415,18 +464,26 @@ class WorldModelTrainer(CommonTrainer):
 
         print(f"\nActive modalities: text={self.include_text}, audio={self.include_audio}, "
               f"voice={self.include_voice}, image={self.include_image}")
+        tied = getattr(model.config, 'tie_word_embeddings', False)
         print(f"Precomputed latents: {self.precomputed_latents}")
+        if tied:
+            tied_params = sum(p.numel() for p in model.text_feature_extractor.wte.parameters())
+            print(f"Tied word embeddings: True ({tied_params:,} params shared)")
         print(f"Loss weights: text={self.text_loss_weight}, audio={self.audio_latent_loss_weight}, "
               f"voice={self.voice_latent_loss_weight}, image={self.image_latent_loss_weight}\n")
 
 
-def load_model(args):
+def load_model(args, device='cuda'):
     include_modes = [m.strip() for m in args.include_modes.split(",")]
+    overrides = {"include_modes": include_modes}
+    if getattr(args, 'tie_word_embeddings', False):
+        overrides["tie_word_embeddings"] = True
     return model_loading_utils.load_model(
         MegaTransformerWorldModel,
         args.config,
         checkpoint_path=args.resume_from_checkpoint,
-        overrides={"include_modes": include_modes},
+        overrides=overrides,
+        device=device,
     )
 
 
@@ -494,6 +551,10 @@ def add_cli_args(subparsers):
     # Text loss
     sub_parser.add_argument("--text_label_smoothing", type=float, default=0.0,
                             help="Label smoothing for text cross-entropy loss")
+
+    # Weight tying
+    sub_parser.add_argument("--tie_word_embeddings", action="store_true", default=False,
+                            help="Tie LM head weights to input embedding matrix")
 
     # Precomputed latents flag
     sub_parser.add_argument("--precomputed_latents", action="store_true", default=True,

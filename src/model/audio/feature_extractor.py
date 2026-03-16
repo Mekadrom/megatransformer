@@ -32,7 +32,10 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         # on a similar scale to text embeddings for stable interleaving.
         self.input_norm = nn.LayerNorm(config.feature_channels, elementwise_affine=False)
 
-        self.prelude = MegaTransformerBlock(prelude_config)
+        self.prelude = nn.ModuleList([
+            MegaTransformerBlock(prelude_config)
+            for _ in range(config.n_layers)
+        ])
 
         self.projection = nn.Linear(config.feature_channels, prelude_config.d_model)
 
@@ -51,7 +54,8 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
 
     def _init_weights(self):
         self.projection.apply(transformer_weight_init())
-        self.prelude.apply(transformer_weight_init())
+        for block in self.prelude:
+            block.apply(transformer_weight_init())
 
     @classmethod
     def from_config(cls, config_name: str, **overrides) -> "AudioVAEPreludeFeatureExtractor":
@@ -85,7 +89,9 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         projected = self.projection(x)  # (batch, T, d_model)
         projected = self.pos_encoding(projected)
 
-        prelude_hidden, _ = self.prelude(projected)  # (batch, T, d_model)
-        output = projected + prelude_hidden
+        x = projected
+        for block in self.prelude:
+            hidden, _ = block(x)
+            x = x + hidden
 
-        return output
+        return x

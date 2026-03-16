@@ -1,4 +1,5 @@
 from typing import Optional, List, Dict, Tuple
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -81,6 +82,14 @@ class MegaTransformerWorldModel(nn.Module):
             ImageCodaAndVAEWithLoss(config.image_coda_config)
             if "image" in self.include_modes else None
         )
+
+        # Huginn-style embedding scale: multiply embeddings by sqrt(d_model) so
+        # the injected input x_0 matches the thought state initialization variance.
+        self.embed_scale = math.sqrt(config.text_feature_config.d_model) if config.scale_embeddings else 1.0
+
+        # Weight tying: share embedding matrix between input and output
+        if getattr(config, 'tie_word_embeddings', False):
+            self.text_generator.lm_head.weight = self.text_feature_extractor.wte.weight
 
     def load_image_vae(self, encoder: ImageVAEEncoder, decoder: ImageVAEDecoder):
         """Load image VAE encoder/decoder for live encoding/decoding."""
@@ -203,6 +212,9 @@ class MegaTransformerWorldModel(nn.Module):
             image_hidden_states=image_hidden_states,
         )
 
+        # Scale embeddings by sqrt(d_model) to match thought state initialization
+        interleaved_tokens = interleaved_tokens * self.embed_scale
+
         # Main Transformer (Recurrent Block)
         recurrent_output, _, _, _ = self.recurrent_block(
             interleaved_tokens,
@@ -219,6 +231,17 @@ class MegaTransformerWorldModel(nn.Module):
 
         # Generators/Codas
         outputs = {}
+
+        # Log variance and entropy of recurrent outputs per modality (coda inputs)
+        for name, batch in [("text", text_batch), ("voice", voice_batch),
+                            ("audio", audio_batch), ("image", image_batch)]:
+            if batch is not None:
+                # Per-token variance across d_model, averaged over batch and seq
+                outputs[f"recurrent_out/{name}_variance"] = batch.var(dim=-1).mean()
+                # Entropy of softmax over d_model (how spread the activation is)
+                probs = torch.softmax(batch, dim=-1)
+                entropy = -(probs * (probs + 1e-8).log()).sum(dim=-1).mean()
+                outputs[f"recurrent_out/{name}_entropy"] = entropy
 
         # Text
         if text_batch is not None:
@@ -415,12 +438,15 @@ class MegaTransformerWorldModel(nn.Module):
         voice_lengths: Optional[torch.Tensor] = None,
         image_inputs: Optional[torch.Tensor] = None,
         precomputed_latents: bool = True,
+        share_kv_cache: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Generate tokens autoregressively with KV caching.
 
         This method implements autoregressive generation through the recurrent block
         with efficient KV caching using the Huginn approach (circular buffer).
+        If share_kv_cache=True, all recurrent blocks share a single KV cache slot
+        per iteration (4x memory savings, Huginn-style).
 
         The generation flow:
         1. Process initial text input through text feature extractor
@@ -515,11 +541,12 @@ class MegaTransformerWorldModel(nn.Module):
         recurrent_kl_final: List[float] = []  # final KL per token (convergence measure)
 
         current_hidden, kv_cache, prompt_iters, prompt_kls = self.recurrent_block(
-            prompt_hidden,
+            prompt_hidden * self.embed_scale,
             attention_mask=prompt_attn_mask,
             kv_cache=kv_cache,
             position_offset=0,
             use_cache=True,
+            share_kv_cache=share_kv_cache,
         )
 
         position_offset = prompt_hidden.shape[1]
@@ -605,11 +632,12 @@ class MegaTransformerWorldModel(nn.Module):
 
             # Process through recurrent block with KV cache
             current_hidden, kv_cache, n_iters, kl_trace = self.recurrent_block(
-                next_hidden,
+                next_hidden * self.embed_scale,
                 attention_mask=None,
                 kv_cache=kv_cache,
                 position_offset=position_offset,
                 use_cache=True,
+                share_kv_cache=share_kv_cache,
             )
             recurrent_iteration_counts.append(n_iters)
             recurrent_kl_final.append(kl_trace[-1] if kl_trace else 0.0)
