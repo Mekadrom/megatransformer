@@ -4,6 +4,7 @@ import torch.nn as nn
 from model.norms import create_norm
 from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
 from model.transformer import MegaTransformerBlock
+from utils import megatransformer_utils
 from utils.megatransformer_utils import embedding_weight_init
 
 
@@ -64,11 +65,21 @@ class TextPreludeFeatureExtractor(nn.Module):
         """
         x = self.wte(input_ids)
 
+        megatransformer_utils.print_debug_tensor("embedding text prelude output", x)
+
         projected = self.pos_encoding(x)
+
+        megatransformer_utils.print_debug_tensor("positional encoding text prelude output", projected)
 
         x = projected
         for block in self.prelude:
             hidden, _ = block(x)
             x = x + hidden
+
+        megatransformer_utils.print_debug_tensor("prelude block text prelude output", x)
         
-        return self.norm(x)
+        normed = self.norm(x)
+
+        megatransformer_utils.print_debug_tensor("normed text prelude output", normed)
+
+        return normed

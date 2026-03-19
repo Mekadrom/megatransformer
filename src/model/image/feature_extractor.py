@@ -6,6 +6,7 @@ from typing import Optional
 from config.image.feature_extractor import IMAGE_PRELUDE_CONFIGS, ImageVAEPreludeFeatureExtractorConfig
 from model.image.vae.vae import ImageVAEEncoder
 from model.transformer import MegaTransformerBlock
+from utils import megatransformer_utils
 from utils.megatransformer_utils import conv2d_weight_init, transformer_weight_init
 
 
@@ -146,12 +147,18 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
 
         patch_embeddings = self.patch_embedding(latent_images)  # (batch_size, num_patches, d_model)
 
+        megatransformer_utils.print_debug_tensor("embedding image prelude output", x)
+
         # Add 2D positional encoding
         patch_embeddings = patch_embeddings + self.pos_embedding
+
+        megatransformer_utils.print_debug_tensor("positional encoding image prelude output", x)
 
         x = patch_embeddings
         for block in self.prelude:
             hidden, _ = block(x)
             x = x + hidden
+
+        megatransformer_utils.print_debug_tensor("prelude block image prelude output", x)
 
         return x
