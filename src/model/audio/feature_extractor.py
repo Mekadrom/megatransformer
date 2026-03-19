@@ -4,6 +4,7 @@ import torch.nn as nn
 from config.audio.feature_extractor import AUDIO_PRELUDE_CONFIGS, AudioVAEPreludeFeatureExtractorConfig
 from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
 from model.transformer import MegaTransformerBlock
+from utils import megatransformer_utils
 from utils.megatransformer_utils import transformer_weight_init
 
 
@@ -37,11 +38,12 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         )
         max_sive_timesteps = max_mel_timesteps // config.sive_temporal_stride
 
-        self.pos_encoding = SinusoidalPositionalEncoding(
-            d_model=prelude_config.d_model,
-            max_len=max_sive_timesteps * 2 + 1,
-            dropout=0.0
-        )
+        if not prelude_config.use_rotary_embedding:
+            self.pos_encoding = SinusoidalPositionalEncoding(
+                d_model=prelude_config.d_model,
+                max_len=max_sive_timesteps * 2 + 1,
+                dropout=0.0
+            )
 
         self._init_weights()
 
@@ -78,11 +80,19 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         x = x.permute(0, 2, 1).contiguous()
 
         projected = self.projection(x)  # (batch, T, d_model)
-        projected = self.pos_encoding(projected)
+
+        megatransformer_utils.print_debug_tensor("embedding audio prelude output", x)
+
+        if hasattr(self, 'pos_encoding'):
+            projected = self.pos_encoding(projected)
+
+            megatransformer_utils.print_debug_tensor("positional encoding audio prelude output", projected)
 
         x = projected
         for block in self.prelude:
             hidden, _ = block(x)
             x = x + hidden
+
+        megatransformer_utils.print_debug_tensor("prelude block audio prelude output", x)
 
         return x

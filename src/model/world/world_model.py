@@ -13,7 +13,6 @@ from model.audio.generator import AudioCodaAndVAEWithLoss
 from model.image.feature_extractor import ImageVAEPreludeFeatureExtractor
 from model.image.generator import ImageCodaAndVAEWithLoss
 from model.image.vae.vae import ImageVAEDecoder, ImageVAEEncoder
-from model.text import TextFeatureExtractor
 from model.text.feature_extractor import TextPreludeFeatureExtractor
 from model.text.generator import TextCodaClassifierWithLoss
 from model.world.kv_cache import RecurrentKVCache

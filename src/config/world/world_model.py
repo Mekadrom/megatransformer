@@ -1,12 +1,8 @@
 import dataclasses
 import json
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List
 
 from config.audio.feature_extractor import AudioVAEPreludeFeatureExtractorConfig
 from config.audio.generator import AudioCodaAndVAEConfig
@@ -172,6 +168,7 @@ _mha_block = lambda: MegaTransformerBlockConfig(
     d_values=64,
     n_query_groups=4,
     d_inner=1024,
+    use_rotary_embedding=True,
 )
 
 WORLD_MODEL_CONFIGS = {
@@ -206,6 +203,7 @@ WORLD_MODEL_CONFIGS = {
                 d_values=64,
                 n_query_groups=16,
                 d_inner=4096,
+                use_rotary_embedding=True,
             ),
         ),
         # Slim codas
