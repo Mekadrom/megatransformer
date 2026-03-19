@@ -4,15 +4,22 @@ import json
 
 from dataclasses import dataclass
 
+from config.common import MegaTransformerBlockConfig
+
 
 @dataclass
-class TextFeatureExtractorConfig:
+class TextPreludeFeatureExtractorConfig:
+    prelude_config: MegaTransformerBlockConfig = dataclasses.field(
+        default_factory=MegaTransformerBlockConfig
+    )
+    n_layers: int = 1
+
     d_model: int = 512
     vocab_size: int = 32009
     norm_type: str = "layernorm"
     layer_norm_epsilon: float = 1e-5
     hidden_dropout_prob: float = 0.1
-
+    max_position_embeddings: int = 1024
 
     def __post_init__(self):
         pass
@@ -27,5 +34,5 @@ class TextFeatureExtractorConfig:
 
 
 TEXT_FEATURE_EXTRACTOR_CONFIGS = {
-    "default": TextFeatureExtractorConfig(),
+    "default": TextPreludeFeatureExtractorConfig(),
 }

@@ -18,6 +18,7 @@ class ImageCodaAndVAEConfig:
     )
     # "bilinear" (Upsample+Conv, original) or "pixel_shuffle" (SubPixelConv+Refine)
     unpatchify_mode: str = "bilinear"
+    use_output_denorm: bool = True
 
 
     def __post_init__(self):

@@ -14,6 +14,7 @@ from model.image.feature_extractor import ImageVAEPreludeFeatureExtractor
 from model.image.generator import ImageCodaAndVAEWithLoss
 from model.image.vae.vae import ImageVAEDecoder, ImageVAEEncoder
 from model.text import TextFeatureExtractor
+from model.text.feature_extractor import TextPreludeFeatureExtractor
 from model.text.generator import TextCodaClassifierWithLoss
 from model.world.kv_cache import RecurrentKVCache
 from model.world.recurrent import MegatransformerRecurrentBlock
@@ -44,7 +45,7 @@ class MegaTransformerWorldModel(nn.Module):
         self.include_modes = set(config.include_modes)
 
         # Feature extractors — text is always required
-        self.text_feature_extractor = TextFeatureExtractor(config.text_feature_config)
+        self.text_feature_extractor = TextPreludeFeatureExtractor(config.text_prelude_config)
 
         # Modality-specific preludes (only instantiate if included)
         self.audio_feature_extractor = (
@@ -85,7 +86,7 @@ class MegaTransformerWorldModel(nn.Module):
 
         # Huginn-style embedding scale: multiply embeddings by sqrt(d_model) so
         # the injected input x_0 matches the thought state initialization variance.
-        self.embed_scale = math.sqrt(config.text_feature_config.d_model) if config.scale_embeddings else 1.0
+        self.embed_scale = math.sqrt(config.text_prelude_config.d_model) if config.scale_embeddings else 1.0
 
         # Weight tying: share embedding matrix between input and output
         if getattr(config, 'tie_word_embeddings', False):
@@ -236,9 +237,12 @@ class MegaTransformerWorldModel(nn.Module):
         for name, batch in [("text", text_batch), ("voice", voice_batch),
                             ("audio", audio_batch), ("image", image_batch)]:
             if batch is not None:
-                # Per-token variance across d_model, averaged over batch and seq
-                outputs[f"recurrent_out/{name}_variance"] = batch.var(dim=-1).mean()
-                # Entropy of softmax over d_model (how spread the activation is)
+                # Per-token activation variance across d_model, averaged over batch+seq
+                outputs[f"recurrent_out/{name}_token_var"] = batch.var(dim=-1).mean()
+                # Cross-token variance: how different tokens are from each other
+                # var across seq_len per feature dim, averaged over batch+d_model
+                outputs[f"recurrent_out/{name}_seq_var"] = batch.var(dim=1).mean()
+                # Entropy of softmax over d_model (activation spread per token)
                 probs = torch.softmax(batch, dim=-1)
                 entropy = -(probs * (probs + 1e-8).log()).sum(dim=-1).mean()
                 outputs[f"recurrent_out/{name}_entropy"] = entropy

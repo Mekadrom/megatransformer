@@ -33,6 +33,7 @@ from scripts.data.audio.data_collator import AudioDataCollator
 from scripts.data.audio.dataset import AudioShardedDataset
 from scripts.data.world.data_collator import MultimodalDataCollator
 from scripts.data.world.dataset import MultimodalShardedDataset
+from scripts.data.world.memorization_dataset import MultimodalMemorizationDataset
 from scripts.data.data_collator import DataCollator
 from scripts.train.audio.vae.visualization_callback import AudioCVAEVisualizationCallback
 from scripts.train.audio.vocoder.visualization_callback import VocoderVisualizationCallback
@@ -186,14 +187,26 @@ def get_dataset(command: str, args, split: str):
         audio_dir = _resolve_shard_dir(args.audio_cache_dir, split)
         voice_dir = _resolve_shard_dir(getattr(args, 'voice_cache_dir', None), split)
         image_dir = _resolve_shard_dir(args.image_cache_dir, split)
-        dataset = MultimodalShardedDataset(
-            text_shard_dir=text_dir,
-            audio_shard_dir=audio_dir,
-            voice_shard_dir=voice_dir,
-            image_shard_dir=image_dir,
-            cache_size=32,
-            max_samples=getattr(args, 'max_samples', None),
-        )
+        max_samples = getattr(args, 'max_samples', None)
+        use_memorization = getattr(args, 'use_memorization_dataset', False)
+
+        if use_memorization and max_samples is not None:
+            dataset = MultimodalMemorizationDataset(
+                text_shard_dir=text_dir,
+                audio_shard_dir=audio_dir,
+                voice_shard_dir=voice_dir,
+                image_shard_dir=image_dir,
+                max_samples=max_samples,
+            )
+        else:
+            dataset = MultimodalShardedDataset(
+                text_shard_dir=text_dir,
+                audio_shard_dir=audio_dir,
+                voice_shard_dir=voice_dir,
+                image_shard_dir=image_dir,
+                cache_size=32,
+                max_samples=max_samples,
+            )
     return dataset
 
 

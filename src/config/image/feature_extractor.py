@@ -13,6 +13,8 @@ class ImageVAEPreludeFeatureExtractorConfig:
         default_factory=MegaTransformerBlockConfig
     )
     n_layers: int = 1
+    use_input_norm: bool = True
+    input_norm_type: str = "instancenorm"  # "instancenorm" (per channel, across spatial) or "layernorm" (across channels)
     image_config: ImageConfig = dataclasses.field(
         default_factory=ImageConfig
     )
