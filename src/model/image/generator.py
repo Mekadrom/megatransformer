@@ -74,6 +74,9 @@ class PixelShuffleUnpatchify(nn.Module):
         )
         self.act = nn.GELU()
 
+        self.output_scale = nn.Parameter(torch.ones(latent_channels))
+        self.output_bias = nn.Parameter(torch.zeros(latent_channels))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.permute(0, 2, 1)  # (batch, d_model, seq_length)
         N, D, T = x.shape
@@ -83,6 +86,12 @@ class PixelShuffleUnpatchify(nn.Module):
         x = self.shuffle(x)    # (batch, latent_ch, H, W)
         x = self.act(x)
         x = self.refine(x)     # (batch, latent_ch, H, W)
+
+        # Learnable denormalization: maps from normalized space back to original
+        # latent distribution. Initialized to identity (scale=1, bias=0).
+        # this normalizes per channel, which is important for VAE latents where each channel has distinct semantics and scales.
+        x = x * self.output_scale[None, :, None, None] + self.output_bias[None, :, None, None]
+
         return x
 
 
@@ -109,6 +118,7 @@ class ImageCodaAndVAEWithLoss(nn.Module):
         self.latent_spatial_size = config.image_config.image_size // config.image_config.latent_compression_factor
 
         coda_config = config.coda_config
+
         self.coda = nn.ModuleList([
             MegaTransformerBlock(coda_config)
             for _ in range(config.n_layers)
@@ -127,12 +137,6 @@ class ImageCodaAndVAEWithLoss(nn.Module):
                 config.image_config.latent_channels,
                 patch_size=config.image_config.latent_patch_size,
             )
-
-        # Learnable denormalization: maps from normalized space back to original
-        # latent distribution. Initialized to identity (scale=1, bias=0).
-        # Shape: (latent_channels,) — broadcast over spatial dims.
-        self.output_scale = nn.Parameter(torch.ones(config.image_config.latent_channels))
-        self.output_bias = nn.Parameter(torch.zeros(config.image_config.latent_channels))
 
         self.vae_decoder = vae_decoder
 
@@ -206,9 +210,6 @@ class ImageCodaAndVAEWithLoss(nn.Module):
         # seq_length should be 256 for a 256x256 image. this is because the vae latent space is 32x32 and we patchify into 2x2 patches
 
         latent_preds = self.unpatchify(coda_output)  # (batch, latent_channels, latent_h, latent_w)
-        # Denormalize: learnable scale and bias map back to original latent range
-        # output_scale/bias are (C,) — reshape to (1, C, 1, 1) for broadcasting
-        latent_preds = latent_preds * self.output_scale[None, :, None, None] + self.output_bias[None, :, None, None]
 
         outputs = {"image_latent_preds": latent_preds}
 

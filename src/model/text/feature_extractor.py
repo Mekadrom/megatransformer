@@ -1,13 +1,20 @@
-from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from model.norms import RMSNorm
+from model.norms import create_norm
+from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
+from model.transformer import MegaTransformerBlock
 from utils.megatransformer_utils import embedding_weight_init
-from utils.model_utils import create_norm
 
 
-class TextFeatureExtractor(nn.Module):
+import torch
+import torch.nn as nn
+
+from config.text.feature_extractor import TextPreludeFeatureExtractorConfig
+from utils.megatransformer_utils import embedding_weight_init
+
+
+class TextPreludeFeatureExtractor(nn.Module):
     """
     Embeds text token IDs into dense vectors for the multimodal world model.
 
@@ -19,14 +26,26 @@ class TextFeatureExtractor(nn.Module):
     The embedding includes optional layer normalization and dropout for regularization.
     """
 
-    def __init__(self, config: TextFeatureExtractorConfig):
+    def __init__(self, config: TextPreludeFeatureExtractorConfig):
         super().__init__()
 
         self.config = config
+        prelude_config = config.prelude_config
 
         self.wte = nn.Embedding(config.vocab_size, config.d_model)
+
+        self.prelude = nn.ModuleList([
+            MegaTransformerBlock(prelude_config)
+            for _ in range(config.n_layers)
+        ])
+
+        self.pos_encoding = SinusoidalPositionalEncoding(
+            d_model=prelude_config.d_model,
+            max_len=config.max_position_embeddings * 2 + 1,
+            dropout=0.0
+        )
+
         self.norm = create_norm(config.d_model, config.norm_type, config.layer_norm_epsilon)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         self._init_weights()
 
@@ -43,6 +62,13 @@ class TextFeatureExtractor(nn.Module):
         Returns:
             Hidden states of shape (batch_size, seq_len, d_model).
         """
-        hidden_states = self.wte(input_ids)
-        hidden_states = self.norm(hidden_states)
-        return self.dropout(hidden_states)
+        x = self.wte(input_ids)
+
+        projected = self.pos_encoding(x)
+
+        x = projected
+        for block in self.prelude:
+            hidden, _ = block(x)
+            x = x + hidden
+        
+        return self.norm(x)

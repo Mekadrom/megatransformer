@@ -414,7 +414,7 @@ class WorldModelTrainer(CommonTrainer):
         print(f"{'=' * 60}")
 
         # Preludes (feature extractors) — only show instantiated modules
-        preludes = {"Text embedding": model.text_feature_extractor}
+        preludes = {"Text prelude": model.text_feature_extractor}
         if model.audio_feature_extractor is not None:
             preludes["Audio prelude"] = model.audio_feature_extractor
         if model.voice_feature_extractor is not None:
@@ -478,13 +478,62 @@ def load_model(args, device='cuda'):
     overrides = {"include_modes": include_modes}
     if getattr(args, 'tie_word_embeddings', False):
         overrides["tie_word_embeddings"] = True
-    return model_loading_utils.load_model(
+
+    # Pre-construction overrides for nested configs
+    needs_override = (getattr(args, 'iteration_norm', None) is not None or
+                      getattr(args, 'share_block_weights', False))
+    if needs_override:
+        import copy
+        from config.world.world_model import WORLD_MODEL_CONFIGS
+        config = copy.deepcopy(WORLD_MODEL_CONFIGS[args.config])
+        if getattr(args, 'iteration_norm', None) is not None:
+            config.recurrent_block_config.iteration_norm = args.iteration_norm
+        if getattr(args, 'share_block_weights', False):
+            config.recurrent_block_config.share_block_weights = True
+        for k, v in overrides.items():
+            setattr(config, k, v)
+        WORLD_MODEL_CONFIGS[args.config + "_cli_override"] = config
+        args_config = args.config + "_cli_override"
+    else:
+        args_config = args.config
+
+    model = model_loading_utils.load_model(
         MegaTransformerWorldModel,
-        args.config,
+        args_config,
         checkpoint_path=args.resume_from_checkpoint,
         overrides=overrides,
         device=device,
     )
+
+    # Apply CLI overrides to nested image configs (can't go through top-level overrides)
+    if model.image_feature_extractor is not None:
+        if getattr(args, 'no_image_input_norm', False):
+            model.image_feature_extractor.input_norm = None
+        elif getattr(args, 'image_input_norm_type', None) is not None:
+            import torch.nn as nn_mod
+            lat_ch = model.config.image_prelude_config.image_config.latent_channels
+            if args.image_input_norm_type == "instancenorm":
+                model.image_feature_extractor.input_norm = nn_mod.InstanceNorm2d(lat_ch, affine=False)
+            elif args.image_input_norm_type == "layernorm":
+                model.image_feature_extractor.input_norm = nn_mod.LayerNorm(lat_ch, elementwise_affine=False)
+    if getattr(args, 'no_image_output_denorm', False) and model.image_generator is not None:
+        model.image_generator.use_output_denorm = False
+    if getattr(args, 'backprop_depth', None) is not None:
+        model.recurrent_block.backprop_depth = args.backprop_depth
+    if getattr(args, 'block_init_gain', None) is not None:
+        gain = args.block_init_gain
+        for block in model.recurrent_block.recurrent_blocks:
+            for module in block.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_normal_(module.weight, gain=gain)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+    if getattr(args, 'projection_init_gain', None) is not None and model.recurrent_block.projection is not None:
+        nn.init.xavier_uniform_(model.recurrent_block.projection.weight, gain=args.projection_init_gain)
+        if model.recurrent_block.projection.bias is not None:
+            nn.init.zeros_(model.recurrent_block.projection.bias)
+
+    return model
 
 
 def create_trainer(
@@ -556,6 +605,14 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--tie_word_embeddings", action="store_true", default=False,
                             help="Tie LM head weights to input embedding matrix")
 
+    # Image normalization overrides
+    sub_parser.add_argument("--no_image_input_norm", action="store_true", default=False,
+                            help="Disable normalization on image latents before prelude")
+    sub_parser.add_argument("--image_input_norm_type", type=str, default=None, choices=["layernorm", "instancenorm"],
+                            help="Override image input normalization type (default: use config)")
+    sub_parser.add_argument("--no_image_output_denorm", action="store_true", default=False,
+                            help="Disable learnable scale/bias after image coda")
+
     # Precomputed latents flag
     sub_parser.add_argument("--precomputed_latents", action="store_true", default=True,
                             help="Whether media inputs are precomputed VAE latents (default: True)")
@@ -565,6 +622,21 @@ def add_cli_args(subparsers):
     # Dataset limiting (for overfitting experiments)
     sub_parser.add_argument("--max_samples", type=int, default=None,
                             help="Cap dataset size to N samples (for overfitting/memorization experiments)")
+    sub_parser.add_argument("--use_memorization_dataset", action="store_true", default=False,
+                            help="Preload all samples into RAM (fast, no shard I/O). Requires --max_samples.")
+
+    # Recurrent block overrides
+    sub_parser.add_argument("--backprop_depth", type=int, default=None,
+                            help="Override truncated BPTT depth (default: use config, typically 8)")
+    sub_parser.add_argument("--block_init_gain", type=float, default=None,
+                            help="Override recurrent block xavier init gain (default: 0.02)")
+    sub_parser.add_argument("--projection_init_gain", type=float, default=None,
+                            help="Override projection xavier init gain (default: use config, typically 1.0)")
+    sub_parser.add_argument("--share_block_weights", action="store_true", default=False,
+                            help="Share weights across all recurrent blocks (deeper 1-block)")
+    sub_parser.add_argument("--iteration_norm", type=str, default=None,
+                            choices=["none", "pre_projection", "post_projection"],
+                            help="Override per-iteration normalization placement")
 
     # Max sequence length for text collator
     sub_parser.add_argument("--max_seq_len", type=int, default=2048,

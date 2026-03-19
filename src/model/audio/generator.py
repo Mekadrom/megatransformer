@@ -53,6 +53,7 @@ class AudioCodaAndVAEWithLoss(nn.Module):
         self.feature_channels = config.feature_channels
 
         coda_config = config.coda_config
+
         self.coda = nn.ModuleList([
             MegaTransformerBlock(coda_config)
             for _ in range(config.n_layers)

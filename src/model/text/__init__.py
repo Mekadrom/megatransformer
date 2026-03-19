@@ -1,9 +1,8 @@
-from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from config.text.feature_extractor import TextFeatureExtractorConfig
-from model.norms import RMSNorm, create_norm
+from config.text.feature_extractor import TextPreludeFeatureExtractorConfig
+from model.norms import create_norm
 from utils.megatransformer_utils import embedding_weight_init
 
 
@@ -19,7 +18,7 @@ class TextFeatureExtractor(nn.Module):
     The embedding includes optional layer normalization and dropout for regularization.
     """
 
-    def __init__(self, config: TextFeatureExtractorConfig):
+    def __init__(self, config: TextPreludeFeatureExtractorConfig):
         super().__init__()
 
         self.config = config

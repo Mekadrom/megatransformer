@@ -254,7 +254,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         writer.add_scalar(f"{tag}/recurrent_iters_mean", counts.mean().item(), global_step)
         writer.add_scalar(f"{tag}/recurrent_iters_min", counts.min().item(), global_step)
         writer.add_scalar(f"{tag}/recurrent_iters_max", counts.max().item(), global_step)
-        writer.add_histogram(f"{tag}/recurrent_iters", counts, global_step)
+        try:
+            if counts.numel() > 1:
+                writer.add_histogram(f"{tag}/recurrent_iters", counts, global_step)
+        except ValueError:
+            pass
         prompt_iters = outputs.get("prompt_recurrent_iterations")
         if prompt_iters is not None:
             writer.add_scalar(f"{tag}/recurrent_iters_prompt", prompt_iters, global_step)
@@ -275,7 +279,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             return
         writer.add_scalar(f"{tag}/thought_kl_mean", valid.mean().item(), global_step)
         writer.add_scalar(f"{tag}/thought_kl_max", valid.max().item(), global_step)
-        writer.add_histogram(f"{tag}/thought_kl", valid, global_step)
+        try:
+            if valid.numel() > 1:
+                writer.add_histogram(f"{tag}/thought_kl", valid, global_step)
+        except ValueError:
+            pass
 
         # Also log prompt KL trace if available
         prompt_kls = outputs.get("prompt_recurrent_kl")
@@ -302,7 +310,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         writer.add_scalar(f"{tag}/token_entropy_mean", entropy.mean().item(), global_step)
         writer.add_scalar(f"{tag}/token_entropy_min", entropy.min().item(), global_step)
         writer.add_scalar(f"{tag}/token_entropy_max", entropy.max().item(), global_step)
-        writer.add_histogram(f"{tag}/token_entropy", entropy, global_step)
+        try:
+            if entropy.numel() > 1:
+                writer.add_histogram(f"{tag}/token_entropy", entropy, global_step)
+        except ValueError:
+            pass
 
     def _log_modality_timing(self, outputs: dict, writer, tag: str, global_step: int):
         """Log position of first BO*/EO* tokens in generated sequence.
@@ -1114,11 +1126,14 @@ class WorldModelVisualizationCallback(VisualizationCallback):
     def _decode_and_log_audio(self, pred_latent, speaker_embedding, writer, global_step, tag_prefix, speaker_label):
         """Decode latent -> mel via CVAE, then mel -> waveform via vocoder, logging both."""
         mel = self._decode_audio_latent_to_mel(pred_latent, speaker_embedding)
-        if mel is None:
+        if mel is None or mel.numel() == 0:
             return
 
         # Log mel spectrogram as image
-        mel_img = self._visualize_mel_spec(mel.numpy())
+        mel_np = mel.numpy()
+        if mel_np.size == 0 or mel_np.shape[0] == 0 or mel_np.shape[-1] == 0:
+            return
+        mel_img = self._visualize_mel_spec(mel_np)
         writer.add_image(
             f"{tag_prefix}/{speaker_label}_mel",
             mel_img, global_step,

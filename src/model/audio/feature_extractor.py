@@ -1,5 +1,3 @@
-import math
-
 import torch
 import torch.nn as nn
 
@@ -26,11 +24,6 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
 
         self.config = config
         prelude_config = config.prelude_config
-
-        # Normalize raw SIVE features to zero-mean unit-variance before projection.
-        # SIVE features can have large range (e.g. [-50, 50]); normalizing puts them
-        # on a similar scale to text embeddings for stable interleaving.
-        self.input_norm = nn.LayerNorm(config.feature_channels, elementwise_affine=False)
 
         self.prelude = nn.ModuleList([
             MegaTransformerBlock(prelude_config)
@@ -83,8 +76,6 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         """
         # x: (batch, C, T) -> (batch, T, C)
         x = x.permute(0, 2, 1).contiguous()
-
-        x = self.input_norm(x)  # normalize per-timestep across channels
 
         projected = self.projection(x)  # (batch, T, d_model)
         projected = self.pos_encoding(projected)
