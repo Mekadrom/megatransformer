@@ -16,10 +16,13 @@ class TextPreludeFeatureExtractorConfig:
 
     d_model: int = 512
     vocab_size: int = 32009
-    norm_type: str = "layernorm"
-    layer_norm_epsilon: float = 1e-5
     hidden_dropout_prob: float = 0.1
     max_position_embeddings: int = 1024
+    use_pos_emb_ovr: bool = False
+
+    use_output_norm: bool = False
+    norm_epsilon: float = 1e-5
+    output_norm_type: str = "layernorm"
 
     def __post_init__(self):
         pass

@@ -5,7 +5,8 @@ from typing import Optional
 
 from config.image.generator import IMAGE_CODA_CONFIGS, ImageCodaAndVAEConfig
 from model.image.vae.vae import ImageVAEDecoder
-from model.transformer import MegaTransformerBlock
+from model.norms import create_norm
+from model.transformer import MegaTransformerEncoderBlock
 from utils.megatransformer_utils import conv2d_weight_init, transformer_weight_init
 
 
@@ -74,9 +75,6 @@ class PixelShuffleUnpatchify(nn.Module):
         )
         self.act = nn.GELU()
 
-        self.output_scale = nn.Parameter(torch.ones(latent_channels))
-        self.output_bias = nn.Parameter(torch.zeros(latent_channels))
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.permute(0, 2, 1)  # (batch, d_model, seq_length)
         N, D, T = x.shape
@@ -86,12 +84,6 @@ class PixelShuffleUnpatchify(nn.Module):
         x = self.shuffle(x)    # (batch, latent_ch, H, W)
         x = self.act(x)
         x = self.refine(x)     # (batch, latent_ch, H, W)
-
-        # Learnable denormalization: maps from normalized space back to original
-        # latent distribution. Initialized to identity (scale=1, bias=0).
-        # this normalizes per channel, which is important for VAE latents where each channel has distinct semantics and scales.
-        x = x * self.output_scale[None, :, None, None] + self.output_bias[None, :, None, None]
-
         return x
 
 
@@ -119,8 +111,15 @@ class ImageCodaAndVAEWithLoss(nn.Module):
 
         coda_config = config.coda_config
 
+        if config.use_input_norm:
+            if config.input_norm_type == "scale_shift":
+                self.input_scale = nn.Parameter(torch.ones(coda_config.d_model))
+                self.input_bias = nn.Parameter(torch.zeros(coda_config.d_model))
+            else:
+                self.input_norm = create_norm(coda_config.d_model, config.input_norm_type, config.norm_epsilon)
+
         self.coda = nn.ModuleList([
-            MegaTransformerBlock(coda_config)
+            MegaTransformerEncoderBlock(coda_config)
             for _ in range(config.n_layers)
         ])
 
@@ -137,6 +136,13 @@ class ImageCodaAndVAEWithLoss(nn.Module):
                 config.image_config.latent_channels,
                 patch_size=config.image_config.latent_patch_size,
             )
+
+        if config.use_output_norm:
+            if config.output_norm_type == "scale_shift":
+                self.output_scale = nn.Parameter(torch.ones(config.image_config.latent_channels))
+                self.output_bias = nn.Parameter(torch.zeros(config.image_config.latent_channels))
+            else:
+                self.output_norm = create_norm(coda_config.d_model, config.output_norm_type, config.norm_epsilon)
 
         self.vae_decoder = vae_decoder
 
@@ -209,7 +215,18 @@ class ImageCodaAndVAEWithLoss(nn.Module):
 
         # seq_length should be 256 for a 256x256 image. this is because the vae latent space is 32x32 and we patchify into 2x2 patches
 
+        if hasattr(self, 'input_norm'):
+            coda_output = self.input_norm(coda_output)
+
         latent_preds = self.unpatchify(coda_output)  # (batch, latent_channels, latent_h, latent_w)
+
+        if hasattr(self, 'output_scale') and hasattr(self, 'output_bias'):
+            # Learnable denormalization: maps from normalized space back to original
+            # latent distribution. Initialized to identity (scale=1, bias=0).
+            # this normalizes per channel, which is important for VAE latents where each channel has distinct semantics and scales.
+            latent_preds = latent_preds * self.output_scale[None, :, None, None] + self.output_bias[None, :, None, None]
+        elif hasattr(self, 'output_norm'):
+            latent_preds = self.output_norm(latent_preds)
 
         outputs = {"image_latent_preds": latent_preds}
 

@@ -5,7 +5,8 @@ from typing import Optional
 
 from config.image.feature_extractor import IMAGE_PRELUDE_CONFIGS, ImageVAEPreludeFeatureExtractorConfig
 from model.image.vae.vae import ImageVAEEncoder
-from model.transformer import MegaTransformerBlock
+from model.norms import create_norm
+from model.transformer import MegaTransformerAxial2DEncoderBlock, MegaTransformerEncoderBlock
 from utils import megatransformer_utils
 from utils.megatransformer_utils import conv2d_weight_init, transformer_weight_init
 
@@ -65,10 +66,22 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
         self.config = config
 
         prelude_config = config.prelude_config
-        self.prelude = nn.ModuleList([
-            MegaTransformerBlock(prelude_config)
-            for _ in range(config.n_layers)
-        ])
+
+        if config.use_input_norm:
+            self.input_norm = create_norm(config.image_config.latent_channels, config.input_norm_type, config.norm_epsilon)
+
+        if prelude_config.use_rotary_embedding:
+            # eg 256 // 8 // 2 = 16; 16x16 patches for 256x256 image with compression factor 8 and patch size 2
+            m = config.image_config.image_size // config.image_config.latent_compression_factor // config.image_config.latent_patch_size
+            self.prelude = nn.ModuleList([
+                MegaTransformerAxial2DEncoderBlock(prelude_config, (m, m))
+                for _ in range(config.n_layers)
+            ])
+        else:
+            self.prelude = nn.ModuleList([
+                MegaTransformerEncoderBlock(prelude_config)
+                for _ in range(config.n_layers)
+            ])
 
         self.patch_embedding = PatchEmbedding(
             in_channels=config.image_config.latent_channels,
@@ -85,9 +98,13 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
         num_patches = num_patches_per_side ** 2
         self.num_patches_per_side = num_patches_per_side
 
-        self.pos_embedding = nn.Parameter(
-            torch.zeros(1, num_patches, prelude_config.d_model)
-        )
+        if not prelude_config.use_rotary_embedding:
+            self.pos_embedding = nn.Parameter(
+                torch.zeros(1, num_patches, prelude_config.d_model)
+            )
+
+        if config.use_output_norm:
+            self.output_norm = create_norm(prelude_config.d_model, config.output_norm_type, config.norm_epsilon)
 
         self._init_weights()
 
@@ -97,8 +114,10 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
         # Prelude transformer
         for block in self.prelude:
             block.apply(transformer_weight_init())
-        # Initialize positional embedding with small values
-        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+            
+        if hasattr(self, 'pos_embedding'):
+            # Initialize positional embedding with small values
+            nn.init.trunc_normal_(self.pos_embedding, std=0.02)
 
     @classmethod
     def from_config(cls, config_name: str, vae_encoder: Optional[ImageVAEEncoder]=None, **overrides) -> "ImageVAEPreludeFeatureExtractor":
@@ -145,20 +164,29 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
                                  "Either provide vae_encoder at init or use precomputed_latents=True.")
             latent_images = self.vae_encoder(x)
 
+        if hasattr(self, 'input_norm'):
+            latent_images = self.input_norm(latent_images)
+
         patch_embeddings = self.patch_embedding(latent_images)  # (batch_size, num_patches, d_model)
 
-        megatransformer_utils.print_debug_tensor("embedding image prelude output", x)
+        # megatransformer_utils.print_debug_tensor("embedding image prelude output", x)
 
         # Add 2D positional encoding
-        patch_embeddings = patch_embeddings + self.pos_embedding
+        if hasattr(self, 'pos_embedding'):
+            patch_embeddings = patch_embeddings + self.pos_embedding
 
-        megatransformer_utils.print_debug_tensor("positional encoding image prelude output", x)
+        # megatransformer_utils.print_debug_tensor("positional encoding image prelude output", x)
 
         x = patch_embeddings
         for block in self.prelude:
             hidden, _ = block(x)
             x = x + hidden
 
-        megatransformer_utils.print_debug_tensor("prelude block image prelude output", x)
+        # megatransformer_utils.print_debug_tensor("prelude block image prelude output", x)
+
+        if hasattr(self, 'post_norm'):
+            x = self.output_norm(x)
+
+            # megatransformer_utils.print_debug_tensor("normed image prelude output", x)
 
         return x

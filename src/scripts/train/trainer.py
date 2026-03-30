@@ -19,6 +19,7 @@ class CommonTrainer(abc.ABC, Trainer):
         if state_dict is None:
             state_dict = self.model.state_dict()
         torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+        
     def _get_train_sampler(self, dataset=None) -> Optional[torch.utils.data.Sampler]:
         """
         Override to use shard-aware sampler for sharded datasets.

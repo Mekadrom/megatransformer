@@ -20,6 +20,12 @@ class AudioCodaAndVAEConfig:
     # "linear" (single linear, original) or "conv_refine" (linear + Conv1d refinement)
     output_mode: str = "linear"
 
+    use_input_norm: bool = False
+    use_output_norm: bool = False
+    norm_epsilon: float = 1e-5
+    input_norm_type: str = "layernorm"
+    output_norm_type: str = "layernorm"
+
 
     def __post_init__(self):
         pass

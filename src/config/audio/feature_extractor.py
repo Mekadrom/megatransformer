@@ -25,6 +25,12 @@ class AudioVAEPreludeFeatureExtractorConfig:
     max_audio_duration: float = 30.0
     sive_temporal_stride: int = 4
 
+    use_input_norm: bool = False
+    use_output_norm: bool = False
+    norm_epsilon: float = 1e-5
+    input_norm_type: str = "layernorm"
+    output_norm_type: str = "layernorm"
+
 
     def __post_init__(self):
         pass
@@ -39,6 +45,5 @@ class AudioVAEPreludeFeatureExtractorConfig:
 
 
 AUDIO_PRELUDE_CONFIGS = {
-    "default": AudioVAEPreludeFeatureExtractorConfig(
-    ),
+    "default": AudioVAEPreludeFeatureExtractorConfig(),
 }

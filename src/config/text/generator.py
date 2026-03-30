@@ -17,6 +17,10 @@ class TextCodaClassifierConfig:
     vocab_size: int = 32009
     label_smoothing: float = 0.0
 
+    use_input_norm: bool = False
+    norm_epsilon: float = 1e-5
+    input_norm_type: str = "layernorm"  # "instancenorm" (
+
 
     def __post_init__(self):
         pass

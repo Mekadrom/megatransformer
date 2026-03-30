@@ -45,6 +45,7 @@ class MultimodalDataCollator(DataCollator):
         self.max_waveforms = max_waveforms
         self.max_mel_spec_frames = max_mel_spec_frames
         self.max_sive_feature_frames = max_sive_feature_frames
+        self.force_direction = None  # Set to "synthesis" or "transcription" to override random direction
 
     def __call__(self, examples: list[dict]) -> dict[str, torch.Tensor]:
         valid_examples = [ex for ex in examples if ex is not None]
@@ -53,13 +54,14 @@ class MultimodalDataCollator(DataCollator):
 
         batch = {}
 
-        # Detect which modalities are present
-        has_text = "text_token_ids" in valid_examples[0]
-        has_audio = any(k.startswith("audio_") for k in valid_examples[0])
-        has_voice = any(k.startswith("voice_") for k in valid_examples[0])
-        has_image = "image_image" in valid_examples[0]
+        # Detect which modalities are present. Check all samples (not just first)
+        # to handle mixed batches from eval dataloaders.
+        has_text = any("text_token_ids" in ex for ex in valid_examples)
+        has_audio = any(any(k.startswith("audio_") for k in ex) for ex in valid_examples)
+        has_voice = any(any(k.startswith("voice_") for k in ex) for ex in valid_examples)
+        has_image = any("image_image" in ex for ex in valid_examples)
 
-        # Collate non-text modalities first (text needs to know which are present)
+        # Collate non-text modalities (only from samples that have them)
         if has_audio:
             batch.update(self._collate_audio(valid_examples))
         if has_voice:
@@ -74,6 +76,7 @@ class MultimodalDataCollator(DataCollator):
                 has_audio=has_audio,
                 has_voice=has_voice,
                 has_image=has_image,
+                force_direction=self.force_direction,
             ))
 
         return batch
@@ -85,6 +88,7 @@ class MultimodalDataCollator(DataCollator):
         has_audio: bool,
         has_voice: bool,
         has_image: bool,
+        force_direction: str = None,  # None=random, "synthesis", "transcription"
     ) -> torch.Tensor:
         """Build a token sequence with boundary and placeholder tokens injected.
 
@@ -99,7 +103,7 @@ class MultimodalDataCollator(DataCollator):
 
         has_any_media = has_audio or has_voice or has_image
         if not has_any_media:
-            return text_tokens
+            return text_tokens, False  # text-only, no synthesis/transcription distinction
 
         # Build media token blocks in fixed order: audio, voice, image
         media_blocks = []
@@ -121,13 +125,19 @@ class MultimodalDataCollator(DataCollator):
 
         media_sequence = torch.cat(media_blocks)
 
-        # Randomly choose direction: synthesis or transcription
-        if random.random() < 0.5:
+        # Choose direction: synthesis or transcription
+        if force_direction == "synthesis":
+            is_synthesis = True
+        elif force_direction == "transcription":
+            is_synthesis = False
+        else:
+            is_synthesis = random.random() < 0.5
+        if is_synthesis:
             # Synthesis: [text] [media]
-            return torch.cat([text_tokens, media_sequence])
+            return torch.cat([text_tokens, media_sequence]), is_synthesis
         else:
             # Transcription: [media] [text]
-            return torch.cat([media_sequence, text_tokens])
+            return torch.cat([media_sequence, text_tokens]), is_synthesis
 
     def _collate_text(
         self,
@@ -135,27 +145,31 @@ class MultimodalDataCollator(DataCollator):
         has_audio: bool = False,
         has_voice: bool = False,
         has_image: bool = False,
+        force_direction: str = None,
     ) -> dict:
         all_token_ids = []
         all_text_lengths = []
         all_texts = []
+        all_is_synthesis = []
 
         for ex in examples:
             raw_token_ids = trim(ex["text_token_ids"], self.max_seq_len, dim=-1)
             text_length = ex["text_text_length"]
 
             # Inject boundary + placeholder tokens
-            injected = self._build_token_sequence(
+            injected, is_synthesis = self._build_token_sequence(
                 raw_token_ids,
                 text_length,
                 has_audio=has_audio,
                 has_voice=has_voice,
                 has_image=has_image,
+                force_direction=force_direction,
             )
 
             all_token_ids.append(injected)
             all_text_lengths.append(torch.tensor(injected.shape[0], dtype=torch.long))
             all_texts.append(ex.get("text_text", None))
+            all_is_synthesis.append(is_synthesis)
 
         padded_token_ids, token_masks = pad_and_mask(all_token_ids, all_text_lengths)
 
@@ -164,6 +178,61 @@ class MultimodalDataCollator(DataCollator):
             "text_lengths": torch.stack(all_text_lengths),
             "text_token_masks": torch.stack(token_masks),
             "text_texts": all_texts,
+            # Per-sample flag: True = synthesis (text→media), False = transcription (media→text)
+            "is_synthesis": torch.tensor(all_is_synthesis, dtype=torch.bool),
+        }
+
+    def _collate_text_per_sample(
+        self,
+        examples: list[dict],
+        per_sample_has_audio: list[bool],
+        per_sample_has_voice: list[bool],
+        per_sample_has_image: list[bool],
+        force_direction: str = None,
+    ) -> dict:
+        """Collate text with per-sample modality awareness.
+
+        Each sample gets placeholder tokens only for its own modalities.
+        Text-only samples get no placeholders. Voice samples get BOV/VOICE_PH/EOV.
+        Image samples get BOI/IMAGE_PH/EOI.
+        """
+        all_token_ids = []
+        all_text_lengths = []
+        all_texts = []
+        all_is_synthesis = []
+
+        for i, ex in enumerate(examples):
+            if "text_token_ids" not in ex:
+                # Skip samples without text (shouldn't happen, but defensive)
+                continue
+
+            raw_token_ids = trim(ex["text_token_ids"], self.max_seq_len, dim=-1)
+            text_length = ex.get("text_text_length", raw_token_ids.shape[0])
+            if isinstance(text_length, torch.Tensor):
+                text_length = text_length.item()
+
+            injected, is_synthesis = self._build_token_sequence(
+                raw_token_ids,
+                text_length,
+                has_audio=per_sample_has_audio[i],
+                has_voice=per_sample_has_voice[i],
+                has_image=per_sample_has_image[i],
+                force_direction=force_direction,
+            )
+
+            all_token_ids.append(injected)
+            all_text_lengths.append(torch.tensor(injected.shape[0], dtype=torch.long))
+            all_texts.append(ex.get("text_text", None))
+            all_is_synthesis.append(is_synthesis)
+
+        padded_token_ids, token_masks = pad_and_mask(all_token_ids, all_text_lengths)
+
+        return {
+            "text_token_ids": torch.stack(padded_token_ids),
+            "text_lengths": torch.stack(all_text_lengths),
+            "text_token_masks": torch.stack(token_masks),
+            "text_texts": all_texts,
+            "is_synthesis": torch.tensor(all_is_synthesis, dtype=torch.bool),
         }
 
     def _collate_audio_like(self, examples: list[dict], prefix: str) -> dict:
@@ -242,11 +311,15 @@ class MultimodalDataCollator(DataCollator):
         return batch
 
     def _collate_audio(self, examples: list[dict]) -> dict:
-        return self._collate_audio_like(examples, "audio")
+        filtered = [ex for ex in examples if any(k.startswith("audio_") for k in ex)]
+        return self._collate_audio_like(filtered, "audio") if filtered else {}
 
     def _collate_voice(self, examples: list[dict]) -> dict:
-        return self._collate_audio_like(examples, "voice")
+        filtered = [ex for ex in examples if any(k.startswith("voice_") for k in ex)]
+        return self._collate_audio_like(filtered, "voice") if filtered else {}
 
     def _collate_image(self, examples: list[dict]) -> dict:
-        images = [ex["image_image"] for ex in examples]
+        images = [ex["image_image"] for ex in examples if "image_image" in ex]
+        if not images:
+            return {}
         return {"image_images": torch.stack(images)}

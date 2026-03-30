@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 
 from config.text.generator import TextCodaClassifierConfig
-from model.transformer import MegaTransformerBlock
+from model.norms import create_norm
+from model.transformer import MegaTransformerEncoderBlock
 from utils.megatransformer_utils import transformer_weight_init
 
 
@@ -25,8 +26,12 @@ class TextCodaClassifierWithLoss(nn.Module):
 
         self.config = config
         coda_config = config.coda_config
+
+        if config.use_input_norm:
+            self.input_norm = create_norm(coda_config.d_model, config.input_norm_type, config.norm_epsilon)
+
         self.coda = nn.ModuleList([
-            MegaTransformerBlock(coda_config)
+            MegaTransformerEncoderBlock(coda_config)
             for _ in range(config.n_layers)
         ])
 
@@ -48,6 +53,10 @@ class TextCodaClassifierWithLoss(nn.Module):
         Returns:
             dict[str, torch.Tensor]: A dictionary containing the logits and classification loss if targets are provided.
         """
+
+        if hasattr(self, 'input_norm'):
+            x = self.input_norm(x)
+
         h = x
         for block in self.coda:
             hidden, _ = block(h)
