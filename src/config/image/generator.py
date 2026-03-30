@@ -18,7 +18,12 @@ class ImageCodaAndVAEConfig:
     )
     # "bilinear" (Upsample+Conv, original) or "pixel_shuffle" (SubPixelConv+Refine)
     unpatchify_mode: str = "bilinear"
-    use_output_denorm: bool = True
+
+    use_input_norm: bool = False
+    use_output_norm: bool = True
+    norm_epsilon: float = 1e-5
+    input_norm_type: str = "instancenorm"  # instancenorm, layernorm, scale_shift
+    output_norm_type: str = "scale_shift"
 
 
     def __post_init__(self):

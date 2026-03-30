@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from config.world.world_model import MegaTransformerRecurrentConfig
 from model import recurrent_criteria
-from model.transformer import MegaTransformerBlock
+from model.transformer import MegaTransformerEncoderBlock
 from model.world.kv_cache import RecurrentKVCache
 from utils.megatransformer_utils import transformer_weight_init
 
@@ -35,11 +35,11 @@ class MegatransformerRecurrentBlock(nn.Module):
         # Bank of recurrent blocks. If share_block_weights, all entries reference
         # the same module (deeper application of 1 block per iteration).
         if config.share_block_weights:
-            shared_block = MegaTransformerBlock(config.block_config)
+            shared_block = MegaTransformerEncoderBlock(config.block_config)
             self.recurrent_blocks = nn.ModuleList([shared_block] * self.n_recurrent_blocks)
         else:
             self.recurrent_blocks = nn.ModuleList([
-                MegaTransformerBlock(config.block_config)
+                MegaTransformerEncoderBlock(config.block_config)
                 for _ in range(self.n_recurrent_blocks)
             ])
 

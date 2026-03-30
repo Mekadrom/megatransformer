@@ -4,7 +4,8 @@ import torch.nn as nn
 from typing import Optional
 
 from config.audio.generator import AUDIO_CODA_CONFIGS, AudioCodaAndVAEConfig
-from model.transformer import MegaTransformerBlock
+from model.norms import create_norm
+from model.transformer import MegaTransformerEncoderBlock
 from utils.megatransformer_utils import transformer_weight_init
 
 
@@ -54,8 +55,11 @@ class AudioCodaAndVAEWithLoss(nn.Module):
 
         coda_config = config.coda_config
 
+        if config.use_input_norm:
+            self.input_norm = create_norm(coda_config.d_model, config.input_norm_type, config.norm_epsilon)
+
         self.coda = nn.ModuleList([
-            MegaTransformerBlock(coda_config)
+            MegaTransformerEncoderBlock(coda_config)
             for _ in range(config.n_layers)
         ])
 
@@ -67,8 +71,12 @@ class AudioCodaAndVAEWithLoss(nn.Module):
 
         # Learnable denormalization: maps from normalized space back to original
         # latent distribution. Initialized to identity (scale=1, bias=0).
-        self.output_scale = nn.Parameter(torch.ones(config.feature_channels))
-        self.output_bias = nn.Parameter(torch.zeros(config.feature_channels))
+        if config.use_output_norm:
+            if config.output_norm_type == "scale_shift":
+                self.output_scale = nn.Parameter(torch.ones(config.feature_channels))
+                self.output_bias = nn.Parameter(torch.zeros(config.feature_channels))
+            else:
+                self.output_norm = create_norm(coda_config.d_model, config.output_norm_type, config.norm_epsilon)
 
         self.l1_loss = nn.L1Loss()
         self.mse_loss = nn.MSELoss()
@@ -124,7 +132,11 @@ class AudioCodaAndVAEWithLoss(nn.Module):
 
         feature_preds = self.feature_projection(h)  # (batch, seq_length, feature_channels)
         # Denormalize: learnable scale and bias map back to original latent range
-        feature_preds = feature_preds * self.output_scale + self.output_bias
+        if hasattr(self, 'output_scale') and hasattr(self, 'output_bias'):
+            feature_preds = feature_preds * self.output_scale + self.output_bias
+        elif hasattr(self, 'output_norm'):
+            feature_preds = self.output_norm(feature_preds)
+            
         feature_preds = feature_preds.permute(0, 2, 1)  # (batch, feature_channels, timesteps)
 
         if self.temporal_refine is not None:

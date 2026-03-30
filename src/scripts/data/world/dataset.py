@@ -268,6 +268,11 @@ class MultimodalShardedDataset(Dataset):
         if "text" in shard and "text" in columns:
             sample["voice_text"] = shard["text"][local_idx]
 
+        # Extract transcript token IDs if available
+        if "token_ids" in shard:
+            sample["token_ids"] = shard["token_ids"][local_idx]
+            sample["text_length"] = shard["text_lengths"][local_idx]
+
         return sample
 
     def _get_image_sample(self, idx: int) -> dict:
@@ -276,54 +281,170 @@ class MultimodalShardedDataset(Dataset):
         shard_idx, local_idx = self._find_shard_for_idx(mod, wrapped_idx)
         shard = self._load_shard(mod, shard_idx)
 
+        sample = {}
         # Support both raw image shards ("images") and precomputed latent shards ("latents")
         if "latents" in shard:
-            return {"image": shard["latents"][local_idx]}
-        return {"image": shard["images"][local_idx]}
+            sample["image"] = shard["latents"][local_idx]
+        elif "images" in shard:
+            sample["image"] = shard["images"][local_idx]
+
+        # Extract caption text and token IDs if available
+        if "token_ids" in shard:
+            sample["token_ids"] = shard["token_ids"][local_idx]
+            sample["text_length"] = shard["text_lengths"][local_idx]
+        if "text" in shard:
+            sample["text"] = shard["text"][local_idx]
+
+        return sample
 
     def __len__(self):
         return self.total_samples
 
     def __getitem__(self, idx: int) -> dict:
-        sample = {}
+        """Return a single-modality sample with its own paired text.
 
-        if "text" in self.modalities:
-            text_sample = self._get_text_sample(idx)
+        Each sample is one of: text-only, text+voice, text+audio, or text+image.
+        Indices are distributed round-robin across configured modalities.
+
+        For media samples, the text comes from the media shard's own
+        transcript/caption, ensuring semantic pairing between text and media.
+        """
+        modality_names = list(self.modalities.keys())
+        n_modalities = len(modality_names)
+        modality_idx = idx % n_modalities
+        modality_name = modality_names[modality_idx]
+        within_modality_idx = idx // n_modalities
+
+        sample = {"_modality": modality_name}
+
+        if modality_name == "text":
+            text_sample = self._get_text_sample(within_modality_idx)
             sample.update({f"text_{k}": v for k, v in text_sample.items()})
 
-        if "audio" in self.modalities:
-            audio_sample = self._get_audio_sample(idx)
+        elif modality_name == "audio":
+            audio_sample = self._get_audio_sample(within_modality_idx)
             sample.update({f"audio_{k}": v for k, v in audio_sample.items()})
+            if "token_ids" in audio_sample:
+                sample["text_token_ids"] = audio_sample["token_ids"]
+                sample["text_text_length"] = audio_sample["text_length"]
 
-        if "voice" in self.modalities:
-            voice_sample = self._get_voice_sample(idx)
+        elif modality_name == "voice":
+            voice_sample = self._get_voice_sample(within_modality_idx)
             sample.update({f"voice_{k}": v for k, v in voice_sample.items()})
+            if "token_ids" in voice_sample:
+                sample["text_token_ids"] = voice_sample["token_ids"]
+                sample["text_text_length"] = voice_sample["text_length"]
+            if "voice_text" in voice_sample:
+                sample["text_text"] = voice_sample["voice_text"]
 
-        if "image" in self.modalities:
-            image_sample = self._get_image_sample(idx)
+        elif modality_name == "image":
+            image_sample = self._get_image_sample(within_modality_idx)
             sample.update({f"image_{k}": v for k, v in image_sample.items()})
+            if "token_ids" in image_sample:
+                sample["text_token_ids"] = image_sample["token_ids"]
+                sample["text_text_length"] = image_sample["text_length"]
+            if "text" in image_sample:
+                sample["text_text"] = image_sample["text"]
 
         return sample
 
-    def get_sampler(self, shuffle: bool = True, seed: int = 42):
+    def get_sampler(self, shuffle: bool = True, seed: int = 42,
+                    batch_size: int = 1, world_size: int = 1):
         """
-        Get a shard-aware sampler based on the largest modality.
+        Get a modality-grouped sampler that yields indices such that each
+        batch contains only one modality type.
 
-        Uses the shard structure of the modality with the most samples so that
-        the dominant modality's shards are accessed sequentially. Shorter
-        modalities wrap via modulo in __getitem__, which naturally stays
-        cache-friendly because their indices advance monotonically.
+        With round-robin index assignment (idx % n_modalities), indices for
+        each modality are strided. This sampler groups them into chunks
+        aligned to (world_size × batch_size) so all DDP/DeepSpeed ranks
+        receive the same modality at each step.
         """
-        from scripts.data.dataset import ShardAwareSampler
-
-        # Pick the modality with the most samples for shard-aware ordering
-        largest = max(self.modalities.values(), key=lambda m: m["total_samples"])
-
-        # Use self.total_samples (which respects max_samples cap) rather than
-        # the raw modality total, so the sampler length matches __len__().
-        return ShardAwareSampler(
-            shard_offsets=largest["shard_offsets"],
+        return ModalityGroupedSampler(
             total_samples=self.total_samples,
+            n_modalities=len(self.modalities),
             shuffle=shuffle,
             seed=seed,
+            batch_size=batch_size,
+            world_size=world_size,
         )
+
+
+class ModalityGroupedSampler(torch.utils.data.Sampler):
+    """Yields indices grouped by modality for homogeneous batches.
+
+    Given round-robin modality assignment (idx % n_modalities), this sampler
+    groups all indices of each modality together. Groups are interleaved in
+    chunks that align with (world_size × batch_size) so that all DDP/DeepSpeed
+    ranks receive the same modality type at each training step.
+
+    Args:
+        total_samples: Total dataset length.
+        n_modalities: Number of modality types (from dataset).
+        shuffle: Whether to shuffle within modality groups.
+        seed: Random seed for reproducibility across ranks.
+        batch_size: Per-device batch size (for alignment).
+        world_size: Number of distributed processes (for alignment).
+    """
+
+    def __init__(self, total_samples: int, n_modalities: int, shuffle: bool = True,
+                 seed: int = 42, batch_size: int = 1, world_size: int = 1):
+        self.total_samples = total_samples
+        self.n_modalities = n_modalities
+        self.shuffle = shuffle
+        self.seed = seed
+        self.batch_size = batch_size
+        self.world_size = world_size
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __len__(self):
+        return self.total_samples
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        # Build per-modality index lists
+        modality_indices = [[] for _ in range(self.n_modalities)]
+        for idx in range(self.total_samples):
+            mod = idx % self.n_modalities
+            modality_indices[mod].append(idx)
+
+        # Shuffle within each modality group
+        if self.shuffle:
+            for i in range(len(modality_indices)):
+                perm = torch.randperm(len(modality_indices[i]), generator=g).tolist()
+                modality_indices[i] = [modality_indices[i][p] for p in perm]
+
+        # Chunk size = world_size * batch_size ensures all ranks get the
+        # same modality at each step. We interleave modality chunks so
+        # training alternates modalities within each epoch.
+        chunk_size = max(self.world_size * self.batch_size, 1)
+
+        # Split each modality into chunks
+        chunked = []
+        for m in range(self.n_modalities):
+            indices = modality_indices[m]
+            for start in range(0, len(indices), chunk_size):
+                chunk = indices[start:start + chunk_size]
+                # Pad last chunk to full size so ranks stay aligned
+                while len(chunk) < chunk_size and indices:
+                    chunk.append(indices[len(chunk) % len(indices)])
+                chunked.append(chunk)
+
+        # Shuffle chunk order (all ranks use same seed, same order)
+        if self.shuffle:
+            perm = torch.randperm(len(chunked), generator=g).tolist()
+            chunked = [chunked[p] for p in perm]
+
+        # Flatten
+        all_indices = []
+        for chunk in chunked:
+            all_indices.extend(chunk)
+
+        # Trim to total_samples
+        all_indices = all_indices[:self.total_samples]
+
+        return iter(all_indices)

@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from model.world.world_model import MegaTransformerWorldModel
 from scripts.train.trainer import CommonTrainer
-from utils import model_loading_utils
+from utils import model_loading_utils, megatransformer_utils
 
 
 class WorldModelTrainer(CommonTrainer):
@@ -33,6 +34,7 @@ class WorldModelTrainer(CommonTrainer):
         audio_latent_loss_weight: float = 1.0,
         voice_latent_loss_weight: float = 1.0,
         image_latent_loss_weight: float = 1.0,
+        image_cross_loss_weight: float = 1.0,
         # Modality flags
         include_text: bool = True,
         include_audio: bool = True,
@@ -54,6 +56,7 @@ class WorldModelTrainer(CommonTrainer):
         self.audio_latent_loss_weight = audio_latent_loss_weight
         self.voice_latent_loss_weight = voice_latent_loss_weight
         self.image_latent_loss_weight = image_latent_loss_weight
+        self.image_cross_loss_weight = image_cross_loss_weight
 
         self.include_text = include_text
         self.include_audio = include_audio
@@ -66,7 +69,13 @@ class WorldModelTrainer(CommonTrainer):
         # Shard-aware sampler for efficient data loading
         self._shard_sampler = None
         if hasattr(self.train_dataset, 'get_sampler'):
-            self._shard_sampler = self.train_dataset.get_sampler(shuffle=True, seed=42)
+            import torch.distributed as dist
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            self._shard_sampler = self.train_dataset.get_sampler(
+                shuffle=True, seed=42,
+                batch_size=self.args.per_device_train_batch_size,
+                world_size=world_size,
+            )
 
         # GAN support stubs (required by CommonTrainer.is_gan_enabled)
         self.discriminator = None
@@ -109,6 +118,10 @@ class WorldModelTrainer(CommonTrainer):
         # The model still receives the full text_input_ids (with placeholders)
         # because the interleaver needs them to locate media insertion points.
         text_input_ids = inputs.get("text_token_ids")  # [B, T]
+        if text_input_ids is None:
+            print(f"[data_debug] text_token_ids is None! Batch keys: {sorted(inputs.keys())}")
+            # Return zero loss to skip this batch gracefully
+            return torch.tensor(0.0, device=next(model.parameters()).device, requires_grad=True)
         text_targets = None
         if text_input_ids is not None and self.include_text:
             from utils.constants import (
@@ -211,6 +224,41 @@ class WorldModelTrainer(CommonTrainer):
 
         # ── Forward pass (predictions only, no loss) ────────────────────
 
+        is_synthesis = inputs.get("is_synthesis")
+        if is_synthesis is not None:
+            is_synthesis = is_synthesis.to(text_input_ids.device if text_input_ids is not None else next(model.parameters()).device)
+
+        # Mixed eval batches: modality tensors may have fewer samples than text.
+        # Null out mismatched modalities to avoid assertion errors in the interleaver.
+        if text_input_ids is not None:
+            B = text_input_ids.shape[0]
+            if voice_inputs is not None and voice_inputs.shape[0] != B:
+                voice_inputs = None
+                voice_lengths = None
+                voice_latent_labels = None
+            if audio_inputs is not None and audio_inputs.shape[0] != B:
+                audio_inputs = None
+                audio_lengths = None
+                audio_latent_labels = None
+            if image_inputs is not None and image_inputs.shape[0] != B:
+                image_inputs = None
+                image_latent_labels = None
+
+        # print("World model inputs:")
+        # megatransformer_utils.print_debug_tensor("\ttext_input_ids", text_input_ids)
+        # if audio_inputs is not None:
+        #     megatransformer_utils.print_debug_tensor("\taudio_inputs", audio_inputs)
+        # if audio_latent_labels is not None:
+        #     megatransformer_utils.print_debug_tensor("\taudio_latent_labels", audio_latent_labels)
+        # if voice_inputs is not None:
+        #     megatransformer_utils.print_debug_tensor("\tvoice_inputs", voice_inputs)
+        # if voice_latent_labels is not None:
+        #     megatransformer_utils.print_debug_tensor("\tvoice_latent_labels", voice_latent_labels)
+        # if image_inputs is not None:
+        #     megatransformer_utils.print_debug_tensor("\timage_inputs", image_inputs)
+        # if image_latent_labels is not None:
+        #     megatransformer_utils.print_debug_tensor("\timage_latent_labels", image_latent_labels)
+
         outputs = model(
             text_input_ids=text_input_ids,
             audio_inputs=audio_inputs,
@@ -218,9 +266,15 @@ class WorldModelTrainer(CommonTrainer):
             voice_inputs=voice_inputs,
             voice_lengths=voice_lengths,
             image_inputs=image_inputs,
+            image_latent_labels=image_latent_labels,
             precomputed_latents=self.precomputed_latents,
             decode_outputs=False,
+            is_synthesis=is_synthesis,
         )
+
+        # for k, v in outputs.items():
+        #     if isinstance(v, torch.Tensor):
+        #         megatransformer_utils.print_debug_tensor(f"World model output: {k}", v)
 
         # ── Compute losses ──────────────────────────────────────────────
 
@@ -265,15 +319,60 @@ class WorldModelTrainer(CommonTrainer):
             loss_components["voice_latent_l1"] = voice_l1.detach()
             loss_components["voice_latent_mse"] = voice_mse.detach()
 
-        # Image: L1 + MSE on latent predictions vs latent labels
-        image_latent_preds = outputs.get("image_latent_preds")
-        if image_latent_preds is not None and image_latent_labels is not None:
-            image_l1 = self.latent_l1_loss(image_latent_preds, image_latent_labels)
-            image_mse = self.latent_mse_loss(image_latent_preds, image_latent_labels)
-            image_loss = image_l1 + image_mse
-            total_loss = total_loss + self.image_latent_loss_weight * image_loss
-            loss_components["image_latent_l1"] = image_l1.detach()
-            loss_components["image_latent_mse"] = image_mse.detach()
+        # Image losses: only compute for synthesis (text→image) samples.
+        # For transcription (image→text), image tokens are input-only — the model
+        # reads them to generate text, it doesn't need to predict/reconstruct them.
+        has_synthesis = is_synthesis is not None and is_synthesis.any()
+        # If is_synthesis is None (e.g. memorization test without collator direction),
+        # fall back to computing image loss on all samples (backward compat).
+        compute_image_loss = has_synthesis or is_synthesis is None
+
+        if compute_image_loss:
+            # Image: L1 + MSE on latent predictions vs latent labels
+            image_latent_preds = outputs.get("image_latent_preds")
+            if image_latent_preds is not None and image_latent_labels is not None:
+                if has_synthesis and not is_synthesis.all():
+                    # Mixed batch: only compute loss on synthesis samples
+                    synth_idx = is_synthesis.nonzero(as_tuple=True)[0]
+                    image_l1 = self.latent_l1_loss(image_latent_preds[synth_idx], image_latent_labels[synth_idx])
+                    image_mse = self.latent_mse_loss(image_latent_preds[synth_idx], image_latent_labels[synth_idx])
+                else:
+                    image_l1 = self.latent_l1_loss(image_latent_preds, image_latent_labels)
+                    image_mse = self.latent_mse_loss(image_latent_preds, image_latent_labels)
+                image_loss = image_l1 + image_mse
+                total_loss = total_loss + self.image_latent_loss_weight * image_loss
+                loss_components["image_latent_l1"] = image_l1.detach()
+                loss_components["image_latent_mse"] = image_mse.detach()
+
+            # Image content token monitoring (logged but not added to loss).
+            # The prelude target is computed from pixels while the recurrent block
+            # only sees text — exact matching is infeasible and produces conflicting
+            # gradients. The cross-decoder reconstruction loss is the proper training signal.
+            image_recurrent_tokens = outputs.get("image_recurrent_tokens")
+            image_prelude_tokens = outputs.get("image_prelude_tokens")
+            if image_recurrent_tokens is not None and image_prelude_tokens is not None:
+                with torch.no_grad():
+                    min_len = min(image_recurrent_tokens.shape[1], image_prelude_tokens.shape[1])
+                    rec_tok = image_recurrent_tokens[:, :min_len]
+                    pre_tok = image_prelude_tokens[:, :min_len]
+                    if has_synthesis and not is_synthesis.all():
+                        synth_idx = is_synthesis.nonzero(as_tuple=True)[0]
+                        rec_tok = rec_tok[synth_idx]
+                        pre_tok = pre_tok[synth_idx]
+                    loss_components["image_content_l1"] = self.latent_l1_loss(rec_tok, pre_tok)
+                    loss_components["image_content_mse"] = self.latent_mse_loss(rec_tok, pre_tok)
+                    loss_components["image_content_cosine"] = F.cosine_similarity(
+                        rec_tok.flatten(1), pre_tok.flatten(1), dim=1
+                    ).mean()
+
+            # Cross-attention image decoder reconstruction loss
+            image_cross_l1 = outputs.get("image_cross_l1_loss")
+            image_cross_mse = outputs.get("image_cross_mse_loss")
+            if image_cross_l1 is not None:
+                image_cross_loss = image_cross_l1 + image_cross_mse
+                total_loss = total_loss + self.image_cross_loss_weight * image_cross_loss
+                loss_components["image_cross_l1"] = image_cross_l1.detach()
+                loss_components["image_cross_mse"] = image_cross_mse.detach()
 
         # ── TensorBoard logging ─────────────────────────────────────────
 
@@ -392,7 +491,8 @@ class WorldModelTrainer(CommonTrainer):
         """
         model.eval()
         with torch.no_grad():
-            loss = self.compute_loss(model, inputs)
+            with torch.autocast(device_type=self.args.device.type, dtype=torch.bfloat16, enabled=self.args.bf16):
+                loss = self.compute_loss(model, inputs)
         return (loss, None, None)
 
     @staticmethod
@@ -561,6 +661,7 @@ def create_trainer(
         audio_latent_loss_weight=args.audio_latent_loss_weight,
         voice_latent_loss_weight=args.voice_latent_loss_weight,
         image_latent_loss_weight=args.image_latent_loss_weight,
+        image_cross_loss_weight=getattr(args, 'image_cross_loss_weight', 1.0),
         include_text="text" in include_modes,
         include_audio="audio" in include_modes,
         include_voice="voice" in include_modes,
@@ -595,7 +696,9 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--voice_latent_loss_weight", type=float, default=1.0,
                             help="Weight for voice latent prediction losses")
     sub_parser.add_argument("--image_latent_loss_weight", type=float, default=1.0,
-                            help="Weight for image latent prediction losses")
+                            help="Weight for image latent prediction losses (coda)")
+    sub_parser.add_argument("--image_cross_loss_weight", type=float, default=1.0,
+                            help="Weight for image cross-decoder reconstruction loss")
 
     # Text loss
     sub_parser.add_argument("--text_label_smoothing", type=float, default=0.0,

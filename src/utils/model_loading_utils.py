@@ -92,10 +92,21 @@ def _load_pretrained_hifigan():
             "Install it with: pip install speechbrain"
         )
 
-    hifi_gan = HIFIGAN.from_hparams(
-        source="speechbrain/tts-hifigan-libritts-16kHz",
-        savedir="pretrained_models/tts-hifigan-libritts-16kHz",
-    )
+    # Patch huggingface_hub to handle deprecated use_auth_token kwarg
+    import huggingface_hub
+    _original_hf_download = huggingface_hub.hf_hub_download
+    def _patched_hf_download(*args, **kwargs):
+        kwargs.pop("use_auth_token", None)
+        return _original_hf_download(*args, **kwargs)
+    huggingface_hub.hf_hub_download = _patched_hf_download
+
+    try:
+        hifi_gan = HIFIGAN.from_hparams(
+            source="speechbrain/tts-hifigan-libritts-16kHz",
+            savedir="pretrained_models/tts-hifigan-libritts-16kHz",
+        )
+    finally:
+        huggingface_hub.hf_hub_download = _original_hf_download
 
     # Extract the generator directly from SpeechBrain's ModuleDict and cast to float32.
     # We bypass decode_batch/infer because those only cast device (not dtype),

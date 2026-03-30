@@ -41,7 +41,7 @@ from scripts.train.ema_callback import EMAUpdateCallback
 from scripts.train.image.vae.visualization_callback import ImageVAEVisualizationCallback
 from scripts.train.trainer import CommonTrainer
 from scripts.train.visualization_callback import VisualizationCallback
-from utils import megatransformer_utils, model_loading_utils
+from utils import megatransformer_utils, metrics, model_loading_utils
 from utils.audio_utils import SharedWindowBuffer
 from utils.train_utils import EarlyStoppingCallback
 
@@ -70,7 +70,6 @@ def get_training_args(args, run_dir) -> TrainingArguments:
         output_dir=run_dir,
         lr_scheduler_type=args.lr_scheduler_type,
         learning_rate=args.learning_rate,
-        warmup_ratio=args.warmup_ratio,
         warmup_steps=args.warmup_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -183,10 +182,11 @@ def get_dataset(command: str, args, split: str):
             print(f"Warning: {candidate} not found, skipping this modality for {split} split")
             return None
 
-        text_dir = _resolve_shard_dir(args.text_cache_dir, split)
-        audio_dir = _resolve_shard_dir(args.audio_cache_dir, split)
-        voice_dir = _resolve_shard_dir(getattr(args, 'voice_cache_dir', None), split)
-        image_dir = _resolve_shard_dir(args.image_cache_dir, split)
+        include_modes = [m.strip() for m in args.include_modes.split(",")]
+        text_dir = _resolve_shard_dir(args.text_cache_dir, split) if "text" in include_modes else None
+        audio_dir = _resolve_shard_dir(args.audio_cache_dir, split) if "audio" in include_modes else None
+        voice_dir = _resolve_shard_dir(getattr(args, 'voice_cache_dir', None), split) if "voice" in include_modes else None
+        image_dir = _resolve_shard_dir(args.image_cache_dir, split) if "image" in include_modes else None
         max_samples = getattr(args, 'max_samples', None)
         use_memorization = getattr(args, 'use_memorization_dataset', False)
 
@@ -524,7 +524,6 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--max_steps', type=int, default=-1, help='Max steps for training')
         sub_parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
         sub_parser.add_argument('--gradient_accumulation_steps', type=int, default=32, help='Gradient accumulation steps')
-        sub_parser.add_argument('--warmup_ratio', type=float, default=0.0, help='Warmup ratio')
         sub_parser.add_argument('--warmup_steps', type=int, default=0, help='Warmup steps')
         sub_parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm')
         sub_parser.add_argument('--fp16', action='store_true', help='Whether to use fp16')
@@ -613,7 +612,12 @@ if __name__ == "__main__":
     # Parse extra arguments
     unk_dict = {}
     for i in range(0, len(unk), 2):
-        unk_dict[unk[i].lstrip('-')] = unk[i+1]
+        if '=' in unk[i]:
+            key, value = unk[i].split('=', 1)
+            unk_dict[key.lstrip('-')] = value
+            i -= 1
+        else:
+            unk_dict[unk[i].lstrip('-')] = unk[i+1]
 
     print(f"Unknown args: {unk_dict}")
 
@@ -644,6 +648,8 @@ if __name__ == "__main__":
     optimizer = get_optimizer(args, model)
 
     trainer: CommonTrainer = get_trainer(args.command, args, run_dir, model, optimizer, device, shared_window_buffer=shared_window_buffer)
+
+    metrics.init_metrics(trainer)
 
     if args.local_rank == 0 or not args.use_deepspeed:
         trainer.start_train_print(args)

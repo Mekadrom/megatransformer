@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 
 from config.audio.feature_extractor import AUDIO_PRELUDE_CONFIGS, AudioVAEPreludeFeatureExtractorConfig
+from model.norms import create_norm
 from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
-from model.transformer import MegaTransformerBlock
+from model.transformer import MegaTransformerEncoderBlock
 from utils import megatransformer_utils
 from utils.megatransformer_utils import transformer_weight_init
 
@@ -26,8 +27,11 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         self.config = config
         prelude_config = config.prelude_config
 
+        if config.use_input_norm:
+            self.input_norm = create_norm(config.feature_channels, config.input_norm_type, config.norm_epsilon)
+
         self.prelude = nn.ModuleList([
-            MegaTransformerBlock(prelude_config)
+            MegaTransformerEncoderBlock(prelude_config)
             for _ in range(config.n_layers)
         ])
 
@@ -44,6 +48,9 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
                 max_len=max_sive_timesteps * 2 + 1,
                 dropout=0.0
             )
+
+        if config.use_output_norm:
+            self.output_norm = create_norm(prelude_config.d_model, config.output_norm_type, config.norm_epsilon)
 
         self._init_weights()
 
@@ -64,7 +71,7 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
 
         return cls(config)
 
-    def forward(self, x: torch.Tensor, precomputed_latents: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Process SIVE features into token embeddings.
 
@@ -79,20 +86,28 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         # x: (batch, C, T) -> (batch, T, C)
         x = x.permute(0, 2, 1).contiguous()
 
+        if hasattr(self, 'input_norm'):
+            x = self.input_norm(x)
+
         projected = self.projection(x)  # (batch, T, d_model)
 
-        megatransformer_utils.print_debug_tensor("embedding audio prelude output", x)
+        # megatransformer_utils.print_debug_tensor("embedding audio prelude output", x)
 
         if hasattr(self, 'pos_encoding'):
             projected = self.pos_encoding(projected)
 
-            megatransformer_utils.print_debug_tensor("positional encoding audio prelude output", projected)
+            # megatransformer_utils.print_debug_tensor("positional encoding audio prelude output", projected)
 
         x = projected
         for block in self.prelude:
             hidden, _ = block(x)
             x = x + hidden
 
-        megatransformer_utils.print_debug_tensor("prelude block audio prelude output", x)
+        # megatransformer_utils.print_debug_tensor("prelude block audio prelude output", x)
+
+        if hasattr(self, 'output_norm'):
+            x = self.output_norm(x)
+
+            # megatransformer_utils.print_debug_tensor("normed audio prelude output", x)
 
         return x

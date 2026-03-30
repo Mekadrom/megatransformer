@@ -18,7 +18,7 @@ from model.text.generator import TextCodaClassifierWithLoss
 from model.world.kv_cache import RecurrentKVCache
 from model.world.recurrent import MegatransformerRecurrentBlock
 from model.world.token_alignment import TokenInterleaver, TokenUninterleaver
-from utils import constants
+from utils import constants, megatransformer_utils
 
 
 class MegaTransformerWorldModel(nn.Module):
@@ -83,6 +83,66 @@ class MegaTransformerWorldModel(nn.Module):
             if "image" in self.include_modes else None
         )
 
+        # Cross-attention image decoder (optional)
+        self.image_cross_decoder = None
+        if config.image_cross_decoder_config is not None and "image" in self.include_modes:
+            from model.image.cross_attention_decoder import (
+                CrossAttentionImageDecoder,
+                CrossAttentionImageDecoderConfig,
+            )
+            cross_config = CrossAttentionImageDecoderConfig(**config.image_cross_decoder_config)
+            self.image_cross_decoder = CrossAttentionImageDecoder(cross_config)
+            # Normalize recurrent output before cross-decoder to prevent
+            # activation explosion from saturating the decoder's attention
+            self.image_cross_input_norm = nn.LayerNorm(config.text_prelude_config.d_model)
+
+            # Learned image generation queries: replace prelude features at image
+            # placeholder positions for synthesis tasks. Init std=3.0 to match
+            # text magnitude after prelude (sinusoidal pos + 2 residual blocks
+            # amplify text from 0.036 to ~2.5). Includes learned 2D pos embedding.
+            d_model = config.text_prelude_config.d_model
+            n_patches = self.image_num_patches
+            self.image_gen_queries = nn.Parameter(
+                torch.randn(1, n_patches, d_model) * 3.0
+            )
+            self.image_gen_pos_embedding = nn.Parameter(
+                torch.zeros(1, n_patches, d_model)
+            )
+            nn.init.trunc_normal_(self.image_gen_pos_embedding, std=0.02)
+
+        # Learned voice/audio generation queries: used at voice/audio placeholder
+        # positions for synthesis tasks (and at inference). Each position gets a
+        # unique learned embedding + sinusoidal positional encoding so the recurrent
+        # block knows temporal position within the generated sequence.
+        d_model = config.text_prelude_config.d_model
+        if "voice" in self.include_modes:
+            from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
+            max_voice_tokens = int(
+                (config.voice_prelude_config.sample_rate * config.voice_prelude_config.max_audio_duration)
+                / config.voice_prelude_config.hop_length
+                / config.voice_prelude_config.sive_temporal_stride
+            )
+            self.voice_gen_queries = nn.Parameter(
+                torch.randn(1, max_voice_tokens, d_model) * 3.0
+            )
+            self.voice_gen_pos_encoding = SinusoidalPositionalEncoding(
+                d_model=d_model, max_len=max_voice_tokens * 2 + 1, dropout=0.0,
+            )
+
+        if "audio" in self.include_modes:
+            from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
+            max_audio_tokens = int(
+                (config.audio_prelude_config.sample_rate * config.audio_prelude_config.max_audio_duration)
+                / config.audio_prelude_config.hop_length
+                / config.audio_prelude_config.sive_temporal_stride
+            )
+            self.audio_gen_queries = nn.Parameter(
+                torch.randn(1, max_audio_tokens, d_model) * 3.0
+            )
+            self.audio_gen_pos_encoding = SinusoidalPositionalEncoding(
+                d_model=d_model, max_len=max_audio_tokens * 2 + 1, dropout=0.0,
+            )
+
         # Huginn-style embedding scale: multiply embeddings by sqrt(d_model) so
         # the injected input x_0 matches the thought state initialization variance.
         self.embed_scale = math.sqrt(config.text_prelude_config.d_model) if config.scale_embeddings else 1.0
@@ -140,6 +200,8 @@ class MegaTransformerWorldModel(nn.Module):
         # Mode flags
         precomputed_latents: bool = True,
         decode_outputs: bool = False,
+        # Per-sample direction: True = synthesis (text→media), False = transcription
+        is_synthesis: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass through the world model.
@@ -169,37 +231,125 @@ class MegaTransformerWorldModel(nn.Module):
         Returns:
             Dictionary containing predictions and losses for each modality.
         """
+        # Handle mixed-modality batches: null out modalities with mismatched batch size
+        if text_input_ids is not None:
+            B = text_input_ids.shape[0]
+            if voice_inputs is not None and voice_inputs.shape[0] != B:
+                voice_inputs = None
+                voice_lengths = None
+                voice_latent_labels = None
+            if audio_inputs is not None and audio_inputs.shape[0] != B:
+                audio_inputs = None
+                audio_lengths = None
+                audio_latent_labels = None
+            if image_inputs is not None and image_inputs.shape[0] != B:
+                image_inputs = None
+                image_latent_labels = None
+
         text_hidden_states = self.text_feature_extractor(text_input_ids)
 
         audio_hidden_states = None
         if audio_inputs is not None and self.audio_feature_extractor is not None:
             batch_size, n_audio = audio_inputs.shape[:2]
             audio_flat = audio_inputs.view(batch_size * n_audio, *audio_inputs.shape[2:])
-            audio_hidden_flat = self.audio_feature_extractor(
-                audio_flat, precomputed_latents=precomputed_latents
-            )
-            seq_len, d_model = audio_hidden_flat.shape[1], audio_hidden_flat.shape[2]
-            audio_hidden_states = audio_hidden_flat.view(batch_size, n_audio, seq_len, d_model)
+            audio_seq_len = audio_flat.shape[-1]
+
+            if is_synthesis is not None and is_synthesis.any() and hasattr(self, 'audio_gen_queries'):
+                gen_q = self.audio_gen_queries[:, :audio_seq_len, :]
+                gen_q = self.audio_gen_pos_encoding(gen_q)
+                gen_q = gen_q.expand(batch_size, -1, -1).unsqueeze(1)
+
+                if is_synthesis.all():
+                    audio_hidden_states = gen_q
+                else:
+                    audio_hidden_flat = self.audio_feature_extractor(audio_flat)
+                    seq_len, d_model = audio_hidden_flat.shape[1], audio_hidden_flat.shape[2]
+                    audio_hidden_states = audio_hidden_flat.view(batch_size, n_audio, seq_len, d_model)
+                    for b in range(batch_size):
+                        if is_synthesis[b]:
+                            audio_hidden_states[b, 0, :audio_seq_len] = gen_q[b, 0]
+            else:
+                audio_hidden_flat = self.audio_feature_extractor(audio_flat)
+                seq_len, d_model = audio_hidden_flat.shape[1], audio_hidden_flat.shape[2]
+                audio_hidden_states = audio_hidden_flat.view(batch_size, n_audio, seq_len, d_model)
 
         voice_hidden_states = None
         if voice_inputs is not None and self.voice_feature_extractor is not None:
             batch_size, n_voice = voice_inputs.shape[:2]
             voice_flat = voice_inputs.view(batch_size * n_voice, *voice_inputs.shape[2:])
-            voice_hidden_flat = self.voice_feature_extractor(
-                voice_flat, precomputed_latents=precomputed_latents
-            )
-            seq_len, d_model = voice_hidden_flat.shape[1], voice_hidden_flat.shape[2]
-            voice_hidden_states = voice_hidden_flat.view(batch_size, n_voice, seq_len, d_model)
+            voice_seq_len = voice_flat.shape[-1]  # T dimension of SIVE features
+
+            if is_synthesis is not None and is_synthesis.any() and hasattr(self, 'voice_gen_queries'):
+                # For synthesis: use learned generation queries + positional encoding
+                # instead of prelude features, matching what happens at inference.
+                gen_q = self.voice_gen_queries[:, :voice_seq_len, :]  # (1, T, d_model)
+                gen_q = self.voice_gen_pos_encoding(gen_q)
+                gen_q = gen_q.expand(batch_size, -1, -1).unsqueeze(1)  # (B, 1, T, d_model)
+
+                if is_synthesis.all():
+                    voice_hidden_states = gen_q
+                else:
+                    # Mixed batch: gen queries for synthesis, prelude for transcription
+                    voice_hidden_flat = self.voice_feature_extractor(voice_flat)
+                    seq_len, d_model = voice_hidden_flat.shape[1], voice_hidden_flat.shape[2]
+                    voice_hidden_states = voice_hidden_flat.view(batch_size, n_voice, seq_len, d_model)
+                    for b in range(batch_size):
+                        if is_synthesis[b]:
+                            voice_hidden_states[b, 0, :voice_seq_len] = gen_q[b, 0]
+            else:
+                # No synthesis masking: run prelude normally
+                voice_hidden_flat = self.voice_feature_extractor(voice_flat)
+                seq_len, d_model = voice_hidden_flat.shape[1], voice_hidden_flat.shape[2]
+                voice_hidden_states = voice_hidden_flat.view(batch_size, n_voice, seq_len, d_model)
 
         image_hidden_states = None
+        image_prelude_targets = None  # detached prelude output for content alignment
         if image_inputs is not None and self.image_feature_extractor is not None:
             batch_size, n_images = image_inputs.shape[:2]
             image_flat = image_inputs.view(batch_size * n_images, *image_inputs.shape[2:])
-            image_hidden_flat = self.image_feature_extractor(
-                image_flat, precomputed_latents=precomputed_latents
-            )
-            seq_len, d_model = image_hidden_flat.shape[1], image_hidden_flat.shape[2]
-            image_hidden_states = image_hidden_flat.view(batch_size, n_images, seq_len, d_model)
+
+            if is_synthesis is not None and is_synthesis.any():
+                # For synthesis samples: run prelude with no_grad for targets only,
+                # replace image embeddings with learned generation queries so the
+                # recurrent block gets informative input for image generation.
+                with torch.no_grad():
+                    image_hidden_flat = self.image_feature_extractor(
+                        image_flat, precomputed_latents=precomputed_latents
+                    )
+                seq_len, d_model = image_hidden_flat.shape[1], image_hidden_flat.shape[2]
+                image_hidden_states_full = image_hidden_flat.view(batch_size, n_images, seq_len, d_model)
+
+                # Save detached prelude output as content alignment target
+                image_prelude_targets = image_hidden_states_full[:, 0].detach()
+
+                # Use learned generation queries + 2D positional encoding for synthesis
+                gen_queries = (self.image_gen_queries + self.image_gen_pos_embedding).expand(batch_size, 1, -1, -1)  # (B, 1, n_patches, d_model)
+
+                if is_synthesis.all():
+                    # All samples are synthesis: use learned queries
+                    image_hidden_states = gen_queries
+                else:
+                    # Mixed batch: generation queries for synthesis, prelude output for transcription
+                    image_hidden_states = image_hidden_states_full.clone()
+                    for b in range(batch_size):
+                        if is_synthesis[b]:
+                            image_hidden_states[b] = gen_queries[b]
+            else:
+                # No direction info or all transcription: run prelude normally
+                image_hidden_flat = self.image_feature_extractor(
+                    image_flat, precomputed_latents=precomputed_latents
+                )
+                seq_len, d_model = image_hidden_flat.shape[1], image_hidden_flat.shape[2]
+                image_hidden_states = image_hidden_flat.view(batch_size, n_images, seq_len, d_model)
+
+        # print("\tInputs to token interleaver:")
+        # megatransformer_utils.print_debug_tensor("\t\ttext_hidden_states", text_hidden_states)
+        # if audio_hidden_states is not None:
+        #     megatransformer_utils.print_debug_tensor("\t\taudio_hidden_states", audio_hidden_states)
+        # if voice_hidden_states is not None:
+        #     megatransformer_utils.print_debug_tensor("\t\tvoice_hidden_states", voice_hidden_states)
+        # if image_hidden_states is not None:
+        #     megatransformer_utils.print_debug_tensor("\t\timage_hidden_states", image_hidden_states)
 
         # Token Interleaving
         interleaved_tokens, attn_mask, modality_map = self.token_interleaver(
@@ -215,11 +365,18 @@ class MegaTransformerWorldModel(nn.Module):
         # Scale embeddings by sqrt(d_model) to match thought state initialization
         interleaved_tokens = interleaved_tokens * self.embed_scale
 
+        # print("\tInputs to recurrent block:")
+        # megatransformer_utils.print_debug_tensor("\t\tinterleaved_tokens", interleaved_tokens)
+
         # Main Transformer (Recurrent Block)
         recurrent_output, _, _, _ = self.recurrent_block(
             interleaved_tokens,
             attention_mask=attn_mask  # True for attend, False for padding
         )
+
+        # print("\tInputs to uninterleaver:")
+        # megatransformer_utils.print_debug_tensor("\t\trecurrent_output", recurrent_output)
+        # megatransformer_utils.print_debug_tensor("\t\tmodality_map", modality_map)
 
         # Token Uninterleaving
         uninterleaved = self.token_uninterleaver(recurrent_output, modality_map)
@@ -228,6 +385,16 @@ class MegaTransformerWorldModel(nn.Module):
         audio_batch = uninterleaved["audio"]
         voice_batch = uninterleaved["voice"]
         image_batch = uninterleaved["image"]
+
+        # print("\tOutputs of token uninterleaver:")
+        # if text_batch is not None:
+        #     megatransformer_utils.print_debug_tensor("\t\ttext_batch", text_batch)
+        # if audio_batch is not None:
+        #     megatransformer_utils.print_debug_tensor("\t\taudio_batch", audio_batch)
+        # if voice_batch is not None:
+        #     megatransformer_utils.print_debug_tensor("\t\tvoice_batch", voice_batch)
+        # if image_batch is not None:
+        #     megatransformer_utils.print_debug_tensor("\t\timage_batch", image_batch)
 
         # Generators/Codas
         outputs = {}
@@ -280,6 +447,29 @@ class MegaTransformerWorldModel(nn.Module):
             )
             outputs.update(image_outputs)
 
+        # Image content tokens: save recurrent output (before coda) and prelude output
+        # for content alignment loss in training
+        if image_batch is not None:
+            outputs["image_recurrent_tokens"] = image_batch
+        if image_prelude_targets is not None:
+            # From synthesis path: prelude ran with no_grad, already detached
+            outputs["image_prelude_tokens"] = image_prelude_targets
+        elif image_hidden_states is not None:
+            # From transcription path: detach prelude output for target
+            outputs["image_prelude_tokens"] = image_hidden_states[:, 0].detach()
+
+        # Cross-attention image decoder: reconstruct image from content tokens
+        if image_batch is not None and hasattr(self, 'image_cross_decoder') and self.image_cross_decoder is not None:
+            cross_input = self.image_cross_input_norm(image_batch)
+            cross_outputs = self.image_cross_decoder(
+                encoder_hidden_states=cross_input,
+                latent_labels=image_latent_labels,
+            )
+            outputs["image_cross_latent_preds"] = cross_outputs["image_latent_preds"]
+            if "image_latent_l1_loss" in cross_outputs:
+                outputs["image_cross_l1_loss"] = cross_outputs["image_latent_l1_loss"]
+                outputs["image_cross_mse_loss"] = cross_outputs["image_latent_mse_loss"]
+
         return outputs
 
     @property
@@ -330,9 +520,7 @@ class MegaTransformerWorldModel(nn.Module):
         if audio_inputs is not None and self.audio_feature_extractor is not None:
             batch_size, n_audio = audio_inputs.shape[:2]
             audio_flat = audio_inputs.view(batch_size * n_audio, *audio_inputs.shape[2:])
-            audio_hidden_flat = self.audio_feature_extractor(
-                audio_flat, precomputed_latents=precomputed_latents
-            )
+            audio_hidden_flat = self.audio_feature_extractor(audio_flat)
             seq_len, d_model = audio_hidden_flat.shape[1], audio_hidden_flat.shape[2]
             audio_hidden = audio_hidden_flat.view(batch_size, n_audio, seq_len, d_model)
 
@@ -340,9 +528,7 @@ class MegaTransformerWorldModel(nn.Module):
         if voice_inputs is not None and self.voice_feature_extractor is not None:
             batch_size, n_voice = voice_inputs.shape[:2]
             voice_flat = voice_inputs.view(batch_size * n_voice, *voice_inputs.shape[2:])
-            voice_hidden_flat = self.voice_feature_extractor(
-                voice_flat, precomputed_latents=precomputed_latents
-            )
+            voice_hidden_flat = self.voice_feature_extractor(voice_flat)
             seq_len, d_model = voice_hidden_flat.shape[1], voice_hidden_flat.shape[2]
             voice_hidden = voice_hidden_flat.view(batch_size, n_voice, seq_len, d_model)
 
@@ -589,17 +775,30 @@ class MegaTransformerWorldModel(nn.Module):
                 # controls finalization, not sampled EO* tokens. The text coda
                 # runs every step but its output is only meaningful in text mode.
                 if current_modality[b] in ("audio", "voice", "image"):
-                    # Still need to feed something to the recurrent block.
-                    # Re-embed the BO* token as a continuation signal.
-                    bo_token = {
-                        "audio": constants.BOA_TOKEN_ID,
-                        "voice": constants.BOV_TOKEN_ID,
-                        "image": constants.BOI_TOKEN_ID,
-                    }[current_modality[b]]
-                    token_embed = self.text_feature_extractor(
-                        torch.tensor([[bo_token]], device=device)
-                    )
-                    next_hidden_list.append(token_embed[0])
+                    # Use learned generation queries for voice/audio,
+                    # matching what the model sees during training.
+                    mod = current_modality[b]
+                    if mod == "voice" and hasattr(self, 'voice_gen_queries'):
+                        pos = len(voice_sequences[b])
+                        q = self.voice_gen_queries[:, pos:pos+1, :]  # (1, 1, d_model)
+                        q = self.voice_gen_pos_encoding(q)
+                        next_hidden_list.append(q[0])
+                    elif mod == "audio" and hasattr(self, 'audio_gen_queries'):
+                        pos = len(audio_sequences[b])
+                        q = self.audio_gen_queries[:, pos:pos+1, :]
+                        q = self.audio_gen_pos_encoding(q)
+                        next_hidden_list.append(q[0])
+                    else:
+                        # Fallback: re-embed BO* token
+                        bo_token = {
+                            "audio": constants.BOA_TOKEN_ID,
+                            "voice": constants.BOV_TOKEN_ID,
+                            "image": constants.BOI_TOKEN_ID,
+                        }[mod]
+                        token_embed = self.text_feature_extractor(
+                            torch.tensor([[bo_token]], device=device)
+                        )
+                        next_hidden_list.append(token_embed[0])
 
                 # Text mode: check for begin-of-modality tokens
                 elif token_id == constants.BOA_TOKEN_ID:
@@ -677,18 +876,44 @@ class MegaTransformerWorldModel(nn.Module):
                         generated_tokens[b].append(constants.EOV_TOKEN_ID)
 
                 elif current_modality[b] == "image":
-                    image_sequences[b].append(current_hidden[b])
-
-                    # Force EOI after exactly image_token_budget tokens
-                    if len(image_sequences[b]) >= image_token_budget:
-                        current_modality[b] = None
-                        image_pred = self._finalize_image_sequence(
-                            image_sequences[b], decode_outputs
+                    # Single-shot image generation: feed learned generation queries
+                    # through recurrent block and decode with cross-attention decoder.
+                    if hasattr(self, 'image_gen_queries') and self.image_gen_queries is not None:
+                        image_input = (self.image_gen_queries + self.image_gen_pos_embedding)[:1].to(device=device, dtype=current_hidden.dtype)
+                    else:
+                        d_model = current_hidden.shape[-1]
+                        image_input = torch.zeros(
+                            1, image_token_budget, d_model,
+                            device=device, dtype=current_hidden.dtype,
                         )
-                        if image_pred is not None:
-                            completed_image[b].append(image_pred)
-                        image_sequences[b] = []
-                        generated_tokens[b].append(constants.EOI_TOKEN_ID)
+                    # Run through recurrent block (single pass, all 256 at once)
+                    image_hidden, _, _, _ = self.recurrent_block(
+                        image_input * self.embed_scale,
+                        attention_mask=None,
+                        kv_cache=kv_cache,
+                        position_offset=position_offset,
+                        use_cache=True,
+                        share_kv_cache=share_kv_cache,
+                    )
+                    position_offset += image_token_budget
+
+                    # Decode through cross-attention decoder if available
+                    if self.image_cross_decoder is not None:
+                        cross_out = self.image_cross_decoder(
+                            encoder_hidden_states=image_hidden,
+                        )
+                        image_pred = cross_out["image_latent_preds"].squeeze(0)  # (C, H, W)
+                    else:
+                        # Fallback to coda if no cross-decoder
+                        image_pred = self._finalize_image_sequence(
+                            [image_hidden[0, i:i+1] for i in range(image_hidden.shape[1])],
+                            decode_outputs,
+                        )
+
+                    if image_pred is not None:
+                        completed_image[b].append(image_pred)
+                    current_modality[b] = None
+                    generated_tokens[b].append(constants.EOI_TOKEN_ID)
 
             # Get logits for next token
             text_output = self.text_generator(current_hidden)

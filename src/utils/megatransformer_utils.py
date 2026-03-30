@@ -72,22 +72,25 @@ def conv2d_weight_init():
 
 def print_debug_tensor(pre: str, tensor: torch.Tensor):
     # avoid printing on devices other than cuda:0
+    ind = '\t' * (pre.count('\t') + 1)
     if not isinstance(tensor, torch.Tensor):
-        print(f"{pre}:\n\tNot a tensor {type(tensor)}")
+        print(f"{pre}:\n{ind}Not a tensor {type(tensor)}")
         return
     if tensor is None:
-        print(f"{pre}: None\n\t")
+        print(f"{pre}: None\n")
     elif tensor.numel() == 0:
-        print(f"{pre}: empty tensor\n\tshape {tensor.shape}")
+        print(f"{pre}: empty tensor\n{ind}shape {tensor.shape}")
+    elif tensor.numel() == 1:
+        print(f"{pre}: single element tensor\n{ind} with value {tensor.item()}")
     elif tensor.dtype in [torch.float16, torch.float32, torch.float64, torch.bfloat16]:
-        print(f"{pre}:\n\tptr: {tensor.data_ptr()}\n\tdtype: {tensor.dtype}\n\tdevice: {tensor.device}\n\tshape: {tensor.shape}\n\tmean: {tensor.mean()}\n\tstd: {tensor.std()}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tnorm: {tensor.norm()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
+        print(f"{pre}:\n{ind}ptr: {tensor.data_ptr()}\n{ind}dtype: {tensor.dtype}\n{ind}device: {tensor.device}\n{ind}shape: {tensor.shape}\n{ind}mean: {tensor.mean()}\n{ind}std: {tensor.std()}\n{ind}min: {tensor.min()}\n{ind}max: {tensor.max()}\n{ind}norm: {tensor.norm()}\n{ind}any nan: {tensor.isnan().any()}\n{ind}any inf: {tensor.isinf().any()}")
         if tensor.numel() < 100:
-            print(f"\t{tensor}")
+            print(f"{ind}{tensor}")
     else:
         # non-float tensors
-        print(f"{pre}:\n\tdtype: {tensor.dtype}\n\tdevice: {tensor.device}\n\tshape: {tensor.shape}\n\tmin: {tensor.min()}\n\tmax: {tensor.max()}\n\tany nan: {tensor.isnan().any()}\n\tany inf: {tensor.isinf().any()}")
+        print(f"{pre}:\n{ind}dtype: {tensor.dtype}\n{ind}device: {tensor.device}\n{ind}shape: {tensor.shape}\n{ind}min: {tensor.min()}\n{ind}max: {tensor.max()}\n{ind}any nan: {tensor.isnan().any()}\n{ind}any inf: {tensor.isinf().any()}")
         if tensor.numel() < 100:
-            print(f"\t{tensor}")
+            print(f"{ind}{tensor}")
 
 
 def sanitize_model(model):

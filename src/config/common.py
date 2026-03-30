@@ -25,14 +25,17 @@ class MegaTransformerBlockConfig:
     max_position_embeddings: int = 1024
     hidden_dropout_prob: float = 0.1
     attention_probs_dropout_prob: float = 0.1
+    ffn_type: str = "mlp"
+    activation_function: str = "gelu"
+    causal: bool = True  # If False, no causal mask (bidirectional attention)
+
     norm_type: str = "layernorm"
     norm_eps: float = 1e-5
-    ffn_type: str = "mlp"
     pre_attn_norm: bool = True
+    inter_attn_norm: bool = False  # only applies to blocks with cross-attention
     post_attn_norm: bool = False
     pre_ffn_norm: bool = True
     post_ffn_norm: bool = False
-    activation_function: str = "gelu"
 
     def __post_init__(self):
         pass
