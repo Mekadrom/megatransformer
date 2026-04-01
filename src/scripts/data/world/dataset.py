@@ -300,36 +300,52 @@ class MultimodalShardedDataset(Dataset):
     def __len__(self):
         return self.total_samples
 
-    def __getitem__(self, idx: int) -> dict:
-        """Return a single-modality sample with its own paired text.
+    @property
+    def task_types(self) -> list:
+        """List of task types based on configured modalities.
 
-        Each sample is one of: text-only, text+voice, text+audio, or text+image.
-        Indices are distributed round-robin across configured modalities.
-
-        For media samples, the text comes from the media shard's own
-        transcript/caption, ensuring semantic pairing between text and media.
+        Each media modality produces two tasks (synthesis + transcription).
+        Text-only is always included. Returns list of (task_name, modality, direction).
         """
-        modality_names = list(self.modalities.keys())
-        n_modalities = len(modality_names)
-        modality_idx = idx % n_modalities
-        modality_name = modality_names[modality_idx]
-        within_modality_idx = idx // n_modalities
+        tasks = [("text_continuation", "text", None)]
+        for mod in self.modalities:
+            if mod == "text":
+                continue
+            tasks.append((f"{mod}_synthesis", mod, "synthesis"))
+            tasks.append((f"{mod}_transcription", mod, "transcription"))
+        return tasks
 
-        sample = {"_modality": modality_name}
+    def __getitem__(self, idx: int) -> dict:
+        """Return a task-specific sample with paired text.
+
+        Indices are distributed round-robin across task types:
+        text_continuation, voice_synthesis, voice_transcription,
+        image_synthesis, image_transcription, etc.
+
+        Each sample includes a _task field indicating the task type and
+        a _direction field for the collator to use.
+        """
+        tasks = self.task_types
+        n_tasks = len(tasks)
+        task_idx = idx % n_tasks
+        task_name, modality_name, direction = tasks[task_idx]
+        within_task_idx = idx // n_tasks
+
+        sample = {"_modality": modality_name, "_task": task_name, "_direction": direction}
 
         if modality_name == "text":
-            text_sample = self._get_text_sample(within_modality_idx)
+            text_sample = self._get_text_sample(within_task_idx)
             sample.update({f"text_{k}": v for k, v in text_sample.items()})
 
         elif modality_name == "audio":
-            audio_sample = self._get_audio_sample(within_modality_idx)
+            audio_sample = self._get_audio_sample(within_task_idx)
             sample.update({f"audio_{k}": v for k, v in audio_sample.items()})
             if "token_ids" in audio_sample:
                 sample["text_token_ids"] = audio_sample["token_ids"]
                 sample["text_text_length"] = audio_sample["text_length"]
 
         elif modality_name == "voice":
-            voice_sample = self._get_voice_sample(within_modality_idx)
+            voice_sample = self._get_voice_sample(within_task_idx)
             sample.update({f"voice_{k}": v for k, v in voice_sample.items()})
             if "token_ids" in voice_sample:
                 sample["text_token_ids"] = voice_sample["token_ids"]
@@ -338,7 +354,7 @@ class MultimodalShardedDataset(Dataset):
                 sample["text_text"] = voice_sample["voice_text"]
 
         elif modality_name == "image":
-            image_sample = self._get_image_sample(within_modality_idx)
+            image_sample = self._get_image_sample(within_task_idx)
             sample.update({f"image_{k}": v for k, v in image_sample.items()})
             if "token_ids" in image_sample:
                 sample["text_token_ids"] = image_sample["token_ids"]
@@ -351,17 +367,18 @@ class MultimodalShardedDataset(Dataset):
     def get_sampler(self, shuffle: bool = True, seed: int = 42,
                     batch_size: int = 1, world_size: int = 1):
         """
-        Get a modality-grouped sampler that yields indices such that each
-        batch contains only one modality type.
+        Get a task-grouped sampler that yields indices such that each
+        batch contains only one task type (e.g., all voice_synthesis or
+        all image_transcription).
 
-        With round-robin index assignment (idx % n_modalities), indices for
-        each modality are strided. This sampler groups them into chunks
+        With round-robin task assignment (idx % n_tasks), indices for
+        each task are strided. This sampler groups them into chunks
         aligned to (world_size × batch_size) so all DDP/DeepSpeed ranks
-        receive the same modality at each step.
+        receive the same task type at each step.
         """
         return ModalityGroupedSampler(
             total_samples=self.total_samples,
-            n_modalities=len(self.modalities),
+            n_modalities=len(self.task_types),
             shuffle=shuffle,
             seed=seed,
             batch_size=batch_size,

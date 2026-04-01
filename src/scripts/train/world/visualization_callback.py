@@ -156,13 +156,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
         with torch.no_grad():
             with autocast(device.type, dtype=dtype, enabled=args.bf16 or args.fp16):
-                # Training data reconstruction — tracks memorization/overfitting
-                self._scenario_train_reconstruction(
-                    model, args, device, writer, global_step, dtype
-                )
-
-                # Training data generation — same samples as reconstruction
-                # but generates media autoregressively from text prompts only
+                # Training data generation — generates media from text prompts
                 self._scenario_train_generation(
                     model, args, device, writer, global_step, dtype
                 )
@@ -170,41 +164,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 # Training data transcription — provide media, generate text
                 self._scenario_train_transcription(
                     model, args, device, writer, global_step, dtype
-                )
-
-                # Scenario 1: Text-only generation
-                self._scenario_text_continuation(
-                    model, eval_dataset, collator, device, writer, global_step
-                )
-
-                # Scenario 2: Text -> Voice synthesis
-                self._scenario_text_to_voice(
-                    model, eval_dataset, collator, device, writer, global_step
-                )
-
-                # Scenario 3: Voice -> Text transcription
-                self._scenario_voice_to_text(
-                    model, eval_dataset, collator, device, writer, global_step
-                )
-
-                # Scenario 4: Text -> Image synthesis
-                self._scenario_text_to_image(
-                    model, eval_dataset, collator, device, writer, global_step
-                )
-
-                # Scenario 5: Image -> Text description
-                self._scenario_image_to_text(
-                    model, eval_dataset, collator, device, writer, global_step
-                )
-
-                # Scenario 6: Voice -> Image
-                self._scenario_voice_to_image(
-                    model, eval_dataset, collator, device, writer, global_step
-                )
-
-                # Scenario 7: Image -> Voice
-                self._scenario_image_to_voice(
-                    model, eval_dataset, collator, device, writer, global_step
                 )
 
         print(f"World model visualization complete at step {global_step}")
@@ -655,24 +614,36 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             # Find indices for each modality type by inspecting actual samples
             voice_indices = []
             image_indices = []
+            seen_image_hashes = set()
+            seen_voice_hashes = set()
             for idx in range(len(train_dataset)):
                 try:
                     sample = train_dataset[idx]
                 except Exception:
                     continue
-                # Check by modality tag or by presence of media keys
                 mod = sample.get("_modality", None)
                 has_voice = mod == "voice" or any(k.startswith("voice_") for k in sample)
                 has_image = mod == "image" or "image_image" in sample
+                # Skip duplicates by hashing the media content
                 if has_voice and len(voice_indices) < n:
-                    voice_indices.append(idx)
+                    feat = sample.get("voice_features")
+                    h = hash(feat.data_ptr()) if feat is not None else idx
+                    if feat is not None:
+                        h = feat.flatten()[:16].sum().item()  # rough content hash
+                    if h not in seen_voice_hashes:
+                        seen_voice_hashes.add(h)
+                        voice_indices.append(idx)
                 elif has_image and len(image_indices) < n:
-                    image_indices.append(idx)
+                    img = sample.get("image_image")
+                    h = img.flatten()[:16].sum().item() if img is not None else idx
+                    if h not in seen_image_hashes:
+                        seen_image_hashes.add(h)
+                        image_indices.append(idx)
                 if len(voice_indices) >= n and len(image_indices) >= n:
                     break
             self._train_gen_voice_indices = voice_indices
             self._train_gen_image_indices = image_indices
-            print(f"[gen_debug] Found {len(voice_indices)} voice indices, {len(image_indices)} image indices")
+            print(f"[gen_debug] Found {len(voice_indices)} unique voice, {len(image_indices)} unique image")
 
         from utils.constants import (
             BOV_TOKEN_ID, EOV_TOKEN_ID,
@@ -698,8 +669,10 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 bov_pos = bov_positions[0].item()
                 prompt = text_ids[:bov_pos + 1].unsqueeze(0).to(device)
 
-                # Log prompt text
+                # Log prompt text (decode from token_ids if raw text not available)
                 prompt_text = sample.get("text_text", sample.get("voice_voice_text", ""))
+                if not prompt_text and "text_token_ids" in sample:
+                    prompt_text = self._decode_tokens(sample["text_token_ids"])
                 if prompt_text:
                     writer.add_text(f"{tag}/voice/{i}/prompt", str(prompt_text)[:500], global_step)
                 decoded = self._decode_tokens(text_ids[:bov_pos + 1])
@@ -779,7 +752,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
     def _scenario_train_transcription(self, model, args, device, writer, global_step, dtype):
         """Transcribe/describe training media: provide voice/image, generate text.
 
-        Uses the same fixed training samples as reconstruction/generation.
+        Uses the same per-modality indices as _scenario_train_generation.
         For voice: provides voice features as input, generates text transcription.
         For image: provides image as input, generates text description.
         """
@@ -791,15 +764,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         collator = self.trainer.data_collator
         n = min(self.num_eval_samples, len(train_dataset))
 
-        if not hasattr(self, '_train_recon_indices'):
-            gen = torch.Generator().manual_seed(42)
-            self._train_recon_indices = torch.randperm(len(train_dataset), generator=gen)[:n].tolist()
-
-        try:
-            samples = [train_dataset[i] for i in self._train_recon_indices]
-        except Exception as e:
-            print(f"Warning: Failed to load training samples for transcription: {e}")
+        # Reuse per-modality indices from generation (ensures we get actual voice/image samples)
+        if not hasattr(self, '_train_gen_voice_indices') or not hasattr(self, '_train_gen_image_indices'):
+            print(f"[transcription_debug] Indices not populated, skipping")
             return
+        print(f"[transcription_debug] voice_indices={self._train_gen_voice_indices}, image_indices={self._train_gen_image_indices}")
 
         from utils.constants import (
             BOV_TOKEN_ID, EOV_TOKEN_ID,
@@ -808,92 +777,105 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             IMAGE_PLACEHOLDER_TOKEN_ID as IPH,
         )
 
-        for i, sample in enumerate(samples[:n]):
-            # Voice transcription: provide voice, generate text
-            voice_features = sample.get("voice_features")
-            if voice_features is not None:
-                try:
-                    # Build prompt: [BOV] [VOICE_PH] [EOV]
-                    prompt = torch.tensor(
-                        [[BOV_TOKEN_ID, VPH, EOV_TOKEN_ID]],
-                        dtype=torch.long, device=device,
+        # Voice transcription
+        for i, idx in enumerate(self._train_gen_voice_indices):
+            try:
+                sample = train_dataset[idx]
+                voice_features = sample.get("voice_features")
+                if voice_features is None:
+                    continue
+
+                # Build transcription prompt: [BOV] [VOICE_PH] [EOV]
+                # The prelude processes the voice, it gets interleaved, then the
+                # model generates text after EOV.
+                prompt = torch.tensor(
+                    [[BOV_TOKEN_ID, VPH, EOV_TOKEN_ID]],
+                    dtype=torch.long, device=device,
+                )
+                voice_input = voice_features.unsqueeze(0).unsqueeze(0).to(device)
+                voice_len = torch.tensor([[voice_features.shape[-1]]], device=device)
+
+                outputs = model.generate(
+                    text_input_ids=prompt,
+                    max_new_tokens=256,
+                    temperature=0.8,
+                    voice_inputs=voice_input,
+                    voice_lengths=voice_len,
+                    precomputed_latents=True,
+                )
+
+                gen_ids = outputs.get("generated_token_ids")
+                if gen_ids is not None:
+                    gen_text = self._decode_tokens(gen_ids[0])
+                    writer.add_text(f"{tag}/voice/{i}/transcription", gen_text[:500], global_step)
+
+                # Log target text (decode from token_ids if raw text not available)
+                target_text = sample.get("text_text", sample.get("voice_voice_text", ""))
+                if isinstance(target_text, list):
+                    target_text = target_text[0] if target_text else ""
+                if not target_text and "text_token_ids" in sample:
+                    target_text = self._decode_tokens(sample["text_token_ids"])
+                if target_text:
+                    writer.add_text(f"{tag}/voice/{i}/target_text", str(target_text)[:500], global_step)
+
+                # Log input audio
+                self._log_audio_with_cvae(
+                    voice_features, sample, writer, global_step,
+                    f"{tag}/voice/{i}/input"
+                )
+            except Exception as e:
+                print(f"Warning: Train transcription (voice) failed for sample {i}: {e}")
+
+        # Image description
+        for i, idx in enumerate(self._train_gen_image_indices):
+            try:
+                sample = train_dataset[idx]
+                image_data = sample.get("image_image")
+                if image_data is None:
+                    continue
+
+                # Build description prompt: [BOI] [IMAGE_PH] [EOI]
+                prompt = torch.tensor(
+                    [[BOI_TOKEN_ID, IPH, EOI_TOKEN_ID]],
+                    dtype=torch.long, device=device,
+                )
+                image_input = image_data.unsqueeze(0).unsqueeze(0).to(device)
+
+                outputs = model.generate(
+                    text_input_ids=prompt,
+                    max_new_tokens=256,
+                    temperature=0.8,
+                    image_inputs=image_input,
+                    precomputed_latents=True,
+                )
+
+                gen_ids = outputs.get("generated_token_ids")
+                if gen_ids is not None:
+                    gen_text = self._decode_tokens(gen_ids[0])
+                    writer.add_text(f"{tag}/image/{i}/description", gen_text[:500], global_step)
+
+                # Log target text (decode from token_ids if raw text not available)
+                target_text = sample.get("text_text", sample.get("image_text", ""))
+                if isinstance(target_text, list):
+                    target_text = target_text[0] if target_text else ""
+                if not target_text and "text_token_ids" in sample:
+                    target_text = self._decode_tokens(sample["text_token_ids"])
+                if target_text:
+                    writer.add_text(f"{tag}/image/{i}/target_text", str(target_text)[:500], global_step)
+
+                # Log input image
+                if self.image_vae_decoder is not None:
+                    self._try_decode_image(
+                        image_data, writer, global_step,
+                        f"{tag}/image/{i}/input_image"
                     )
-                    voice_input = voice_features.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, C, T)
-                    voice_len = torch.tensor([[voice_features.shape[-1]]], device=device)
-
-                    outputs = model.generate(
-                        text_input_ids=prompt,
-                        max_new_tokens=256,
-                        temperature=0.8,
-                        voice_inputs=voice_input,
-                        voice_lengths=voice_len,
-                        precomputed_latents=True,
-                    )
-
-                    gen_ids = outputs.get("generated_token_ids")
-                    if gen_ids is not None:
-                        gen_text = self._decode_tokens(gen_ids[0])
-                        writer.add_text(f"{tag}/voice/{i}/transcription", gen_text[:500], global_step)
-
-                    # Log target text for comparison
-                    target_text = sample.get("voice_voice_text", sample.get("voice_texts", ""))
-                    if isinstance(target_text, list):
-                        target_text = target_text[0] if target_text else ""
-                    if target_text:
-                        writer.add_text(f"{tag}/voice/{i}/target_text", str(target_text)[:500], global_step)
-
-                    # Log target audio for reference
-                    self._log_audio_with_cvae(
-                        voice_features, sample, writer, global_step,
-                        f"{tag}/voice/{i}/input"
-                    )
-                except Exception as e:
-                    print(f"Warning: Train transcription (voice) failed for sample {i}: {e}")
-
-            # Image description: provide image, generate text
-            image_data = sample.get("image_image")
-            if image_data is not None:
-                try:
-                    # Build prompt: [BOI] [IMAGE_PH] [EOI]
-                    prompt = torch.tensor(
-                        [[BOI_TOKEN_ID, IPH, EOI_TOKEN_ID]],
-                        dtype=torch.long, device=device,
-                    )
-                    image_input = image_data.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, C, H, W)
-
-                    outputs = model.generate(
-                        text_input_ids=prompt,
-                        max_new_tokens=256,
-                        temperature=0.8,
-                        image_inputs=image_input,
-                        precomputed_latents=True,
-                    )
-
-                    gen_ids = outputs.get("generated_token_ids")
-                    if gen_ids is not None:
-                        gen_text = self._decode_tokens(gen_ids[0])
-                        writer.add_text(f"{tag}/image/{i}/description", gen_text[:500], global_step)
-
-                    # Log target text for comparison
-                    target_text = sample.get("text_text", "")
-                    if isinstance(target_text, list):
-                        target_text = target_text[0] if target_text else ""
-                    if target_text:
-                        writer.add_text(f"{tag}/image/{i}/target_text", str(target_text)[:500], global_step)
-
-                    # Log input image for reference
-                    if self.image_vae_decoder is not None:
-                        self._try_decode_image(
-                            image_data, writer, global_step,
-                            f"{tag}/image/{i}/input_image"
-                        )
-                    writer.add_image(
-                        f"{tag}/image/{i}/input_latent",
-                        self._latent_to_image(image_data),
-                        global_step,
-                    )
-                except Exception as e:
-                    print(f"Warning: Train transcription (image) failed for sample {i}: {e}")
+                writer.add_image(
+                    f"{tag}/image/{i}/input_latent",
+                    self._latent_to_image(image_data),
+                    global_step,
+                )
+            except Exception as e:
+                print(f"Warning: Train transcription (image) failed for sample {i}: {e}")
 
     def _scenario_text_continuation(self, model, eval_dataset, collator, device, writer, global_step):
         """Scenario 1: Text-only generation (take text, generate continuation)."""

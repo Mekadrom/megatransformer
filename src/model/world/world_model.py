@@ -1,11 +1,10 @@
-from typing import Optional, List, Dict, Tuple
+import copy
 import math
+from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-from typing import Dict, List, Optional
 
 from config.world.world_model import WORLD_MODEL_CONFIGS, MegaTransformerWorldModelConfig
 from model.audio.feature_extractor import AudioVAEPreludeFeatureExtractor
@@ -13,8 +12,11 @@ from model.audio.generator import AudioCodaAndVAEWithLoss
 from model.image.feature_extractor import ImageVAEPreludeFeatureExtractor
 from model.image.generator import ImageCodaAndVAEWithLoss
 from model.image.vae.vae import ImageVAEDecoder, ImageVAEEncoder
+from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
 from model.text.feature_extractor import TextPreludeFeatureExtractor
 from model.text.generator import TextCodaClassifierWithLoss
+from model.image.cross_attention_decoder import CrossAttentionImageDecoder, CrossAttentionImageDecoderConfig
+from model.transformer import MegaTransformerDecoderBlock
 from model.world.kv_cache import RecurrentKVCache
 from model.world.recurrent import MegatransformerRecurrentBlock
 from model.world.token_alignment import TokenInterleaver, TokenUninterleaver
@@ -86,10 +88,6 @@ class MegaTransformerWorldModel(nn.Module):
         # Cross-attention image decoder (optional)
         self.image_cross_decoder = None
         if config.image_cross_decoder_config is not None and "image" in self.include_modes:
-            from model.image.cross_attention_decoder import (
-                CrossAttentionImageDecoder,
-                CrossAttentionImageDecoderConfig,
-            )
             cross_config = CrossAttentionImageDecoderConfig(**config.image_cross_decoder_config)
             self.image_cross_decoder = CrossAttentionImageDecoder(cross_config)
             # Normalize recurrent output before cross-decoder to prevent
@@ -110,13 +108,21 @@ class MegaTransformerWorldModel(nn.Module):
             )
             nn.init.trunc_normal_(self.image_gen_pos_embedding, std=0.02)
 
+            # Text-conditioning cross-attention: injects text-specific information
+            # into the generation queries BEFORE they enter the interleaved sequence.
+            # Without this, the recurrent block's causal attention is the only path
+            # for text→image information flow, which produces nearly identical
+            # generation tokens regardless of prompt (>90% cosine similarity).
+            text_cond_config = copy.deepcopy(config.text_prelude_config.prelude_config)
+            text_cond_config.causal = False
+            self.image_text_conditioning = MegaTransformerDecoderBlock(text_cond_config)
+
         # Learned voice/audio generation queries: used at voice/audio placeholder
         # positions for synthesis tasks (and at inference). Each position gets a
         # unique learned embedding + sinusoidal positional encoding so the recurrent
         # block knows temporal position within the generated sequence.
         d_model = config.text_prelude_config.d_model
         if "voice" in self.include_modes:
-            from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
             max_voice_tokens = int(
                 (config.voice_prelude_config.sample_rate * config.voice_prelude_config.max_audio_duration)
                 / config.voice_prelude_config.hop_length
@@ -128,9 +134,12 @@ class MegaTransformerWorldModel(nn.Module):
             self.voice_gen_pos_encoding = SinusoidalPositionalEncoding(
                 d_model=d_model, max_len=max_voice_tokens * 2 + 1, dropout=0.0,
             )
+            # Text conditioning for voice generation queries
+            voice_cond_config = copy.deepcopy(config.text_prelude_config.prelude_config)
+            voice_cond_config.causal = False
+            self.voice_text_conditioning = MegaTransformerDecoderBlock(voice_cond_config)
 
         if "audio" in self.include_modes:
-            from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
             max_audio_tokens = int(
                 (config.audio_prelude_config.sample_rate * config.audio_prelude_config.max_audio_duration)
                 / config.audio_prelude_config.hop_length
@@ -142,6 +151,10 @@ class MegaTransformerWorldModel(nn.Module):
             self.audio_gen_pos_encoding = SinusoidalPositionalEncoding(
                 d_model=d_model, max_len=max_audio_tokens * 2 + 1, dropout=0.0,
             )
+            # Text conditioning for audio generation queries
+            audio_cond_config = copy.deepcopy(config.text_prelude_config.prelude_config)
+            audio_cond_config.causal = False
+            self.audio_text_conditioning = MegaTransformerDecoderBlock(audio_cond_config)
 
         # Huginn-style embedding scale: multiply embeddings by sqrt(d_model) so
         # the injected input x_0 matches the thought state initialization variance.
@@ -257,7 +270,16 @@ class MegaTransformerWorldModel(nn.Module):
             if is_synthesis is not None and is_synthesis.any() and hasattr(self, 'audio_gen_queries'):
                 gen_q = self.audio_gen_queries[:, :audio_seq_len, :]
                 gen_q = self.audio_gen_pos_encoding(gen_q)
-                gen_q = gen_q.expand(batch_size, -1, -1).unsqueeze(1)
+                gen_q = gen_q.expand(batch_size, -1, -1)
+
+                # Text-condition audio generation queries
+                if hasattr(self, 'audio_text_conditioning') and text_hidden_states is not None:
+                    gen_q, _ = self.audio_text_conditioning(
+                        gen_q,
+                        encoder_hidden_states=text_hidden_states,
+                    )
+
+                gen_q = gen_q.unsqueeze(1)
 
                 if is_synthesis.all():
                     audio_hidden_states = gen_q
@@ -281,15 +303,23 @@ class MegaTransformerWorldModel(nn.Module):
 
             if is_synthesis is not None and is_synthesis.any() and hasattr(self, 'voice_gen_queries'):
                 # For synthesis: use learned generation queries + positional encoding
-                # instead of prelude features, matching what happens at inference.
+                # + text conditioning, matching what happens at inference.
                 gen_q = self.voice_gen_queries[:, :voice_seq_len, :]  # (1, T, d_model)
                 gen_q = self.voice_gen_pos_encoding(gen_q)
-                gen_q = gen_q.expand(batch_size, -1, -1).unsqueeze(1)  # (B, 1, T, d_model)
+                gen_q = gen_q.expand(batch_size, -1, -1)  # (B, T, d_model)
+
+                # Text-condition voice generation queries
+                if hasattr(self, 'voice_text_conditioning') and text_hidden_states is not None:
+                    gen_q, _ = self.voice_text_conditioning(
+                        gen_q,
+                        encoder_hidden_states=text_hidden_states,
+                    )
+
+                gen_q = gen_q.unsqueeze(1)  # (B, 1, T, d_model)
 
                 if is_synthesis.all():
                     voice_hidden_states = gen_q
                 else:
-                    # Mixed batch: gen queries for synthesis, prelude for transcription
                     voice_hidden_flat = self.voice_feature_extractor(voice_flat)
                     seq_len, d_model = voice_hidden_flat.shape[1], voice_hidden_flat.shape[2]
                     voice_hidden_states = voice_hidden_flat.view(batch_size, n_voice, seq_len, d_model)
@@ -323,13 +353,25 @@ class MegaTransformerWorldModel(nn.Module):
                 image_prelude_targets = image_hidden_states_full[:, 0].detach()
 
                 # Use learned generation queries + 2D positional encoding for synthesis
-                gen_queries = (self.image_gen_queries + self.image_gen_pos_embedding).expand(batch_size, 1, -1, -1)  # (B, 1, n_patches, d_model)
+                raw_gen_queries = (self.image_gen_queries + self.image_gen_pos_embedding).expand(batch_size, -1, -1)  # (B, n_patches, d_model)
+
+                # Text-condition the generation queries: cross-attend to text embeddings
+                # so each query carries prompt-specific information before entering
+                # the interleaved sequence. This is the primary path for text→image
+                # information flow during generation.
+                if hasattr(self, 'image_text_conditioning') and text_hidden_states is not None:
+                    conditioned_queries, _ = self.image_text_conditioning(
+                        raw_gen_queries,
+                        encoder_hidden_states=text_hidden_states,
+                    )
+                else:
+                    conditioned_queries = raw_gen_queries
+
+                gen_queries = conditioned_queries.unsqueeze(1)  # (B, 1, n_patches, d_model)
 
                 if is_synthesis.all():
-                    # All samples are synthesis: use learned queries
                     image_hidden_states = gen_queries
                 else:
-                    # Mixed batch: generation queries for synthesis, prelude output for transcription
                     image_hidden_states = image_hidden_states_full.clone()
                     for b in range(batch_size):
                         if is_synthesis[b]:
@@ -510,10 +552,12 @@ class MegaTransformerWorldModel(nn.Module):
         if not has_media:
             # Text-only prompt — no interleaving needed
             prompt_hidden = self.text_feature_extractor(text_input_ids)
+            self._last_text_hidden = prompt_hidden  # for text-conditioning generation queries
             return prompt_hidden, None
 
         # Encode text
         text_hidden = self.text_feature_extractor(text_input_ids)
+        self._last_text_hidden = text_hidden  # for text-conditioning generation queries
 
         # Encode media through feature extractors
         audio_hidden = None
@@ -782,11 +826,19 @@ class MegaTransformerWorldModel(nn.Module):
                         pos = len(voice_sequences[b])
                         q = self.voice_gen_queries[:, pos:pos+1, :]  # (1, 1, d_model)
                         q = self.voice_gen_pos_encoding(q)
+                        # Text-condition the voice query
+                        if hasattr(self, 'voice_text_conditioning') and hasattr(self, '_last_text_hidden'):
+                            text_ctx = self._last_text_hidden[:1].to(device=device, dtype=q.dtype)
+                            q, _ = self.voice_text_conditioning(q, encoder_hidden_states=text_ctx)
                         next_hidden_list.append(q[0])
                     elif mod == "audio" and hasattr(self, 'audio_gen_queries'):
                         pos = len(audio_sequences[b])
                         q = self.audio_gen_queries[:, pos:pos+1, :]
                         q = self.audio_gen_pos_encoding(q)
+                        # Text-condition the audio query
+                        if hasattr(self, 'audio_text_conditioning') and hasattr(self, '_last_text_hidden'):
+                            text_ctx = self._last_text_hidden[:1].to(device=device, dtype=q.dtype)
+                            q, _ = self.audio_text_conditioning(q, encoder_hidden_states=text_ctx)
                         next_hidden_list.append(q[0])
                     else:
                         # Fallback: re-embed BO* token
@@ -876,10 +928,19 @@ class MegaTransformerWorldModel(nn.Module):
                         generated_tokens[b].append(constants.EOV_TOKEN_ID)
 
                 elif current_modality[b] == "image":
-                    # Single-shot image generation: feed learned generation queries
-                    # through recurrent block and decode with cross-attention decoder.
+                    # Single-shot image generation: feed text-conditioned generation
+                    # queries through recurrent block and decode with cross-attention decoder.
                     if hasattr(self, 'image_gen_queries') and self.image_gen_queries is not None:
-                        image_input = (self.image_gen_queries + self.image_gen_pos_embedding)[:1].to(device=device, dtype=current_hidden.dtype)
+                        raw_queries = (self.image_gen_queries + self.image_gen_pos_embedding)[:1].to(device=device, dtype=current_hidden.dtype)
+                        # Text-condition the queries using cached text hidden states
+                        if hasattr(self, 'image_text_conditioning') and hasattr(self, '_last_text_hidden'):
+                            text_ctx = self._last_text_hidden[:1].to(device=device, dtype=raw_queries.dtype)
+                            image_input, _ = self.image_text_conditioning(
+                                raw_queries,
+                                encoder_hidden_states=text_ctx,
+                            )
+                        else:
+                            image_input = raw_queries
                     else:
                         d_model = current_hidden.shape[-1]
                         image_input = torch.zeros(
