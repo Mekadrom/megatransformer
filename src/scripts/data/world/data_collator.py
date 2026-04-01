@@ -156,6 +156,9 @@ class MultimodalDataCollator(DataCollator):
             raw_token_ids = trim(ex["text_token_ids"], self.max_seq_len, dim=-1)
             text_length = ex["text_text_length"]
 
+            # Use sample's _direction if available, otherwise use force_direction or random
+            direction = force_direction or ex.get("_direction", None)
+
             # Inject boundary + placeholder tokens
             injected, is_synthesis = self._build_token_sequence(
                 raw_token_ids,
@@ -163,7 +166,7 @@ class MultimodalDataCollator(DataCollator):
                 has_audio=has_audio,
                 has_voice=has_voice,
                 has_image=has_image,
-                force_direction=force_direction,
+                force_direction=direction,
             )
 
             all_token_ids.append(injected)

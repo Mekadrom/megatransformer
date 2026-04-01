@@ -1,6 +1,7 @@
 
 import argparse
 import os
+import re
 import torch
 import torch.nn.functional as F
 import traceback
@@ -22,6 +23,39 @@ from utils.audio_utils import SharedWindowBuffer, extract_mels
 from utils.model_loading_utils import load_model
 from utils.speaker_encoder import SpeakerEncoderType, get_speaker_embedding_dim, get_speaker_encoder, get_speaker_encoder_input_type
 from utils.text_encoder import TextEncoderType
+
+
+def normalize_transcript(text: str) -> str:
+    """Normalize audio transcript to consistent casing and punctuation.
+
+    Converts ALL CAPS transcripts (e.g. LibriSpeech) to sentence case with
+    trailing punctuation, matching the style of image captions and text-only data.
+
+    "THE QUICK BROWN FOX JUMPED" -> "The quick brown fox jumped."
+    "Already normal text." -> "Already normal text."
+    """
+    if not text or not text.strip():
+        return text
+
+    text = text.strip()
+
+    # Only normalize if text appears to be ALL CAPS (>80% uppercase letters)
+    alpha_chars = [c for c in text if c.isalpha()]
+    if alpha_chars and sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars) > 0.8:
+        text = text.lower()
+
+    # Capitalize first letter of each sentence
+    text = re.sub(r'(^|[.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), text)
+
+    # Ensure first character is capitalized
+    if text and text[0].islower():
+        text = text[0].upper() + text[1:]
+
+    # Add period at end if no punctuation
+    if text and text[-1] not in '.!?':
+        text = text + '.'
+
+    return text
 
 
 def extract_f0_batch_gpu(
@@ -887,6 +921,8 @@ class AudioDatasetPreprocessor(Preprocessor):
             self.batch_accumulators['batch_speaker_ids'].append(speaker_id)
         if self.args.extract_conditions or self.args.tokenize_text:
             conditions = example[self.args.text_conditions_column]
+            if isinstance(conditions, str):
+                conditions = normalize_transcript(conditions)
             self.batch_accumulators['batch_conditions'].append(conditions)
 
         # Process batch when full
