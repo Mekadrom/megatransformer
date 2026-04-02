@@ -6,9 +6,9 @@ from model.discriminator import compute_adaptive_weight
 from model.image.vae.discriminator import InstanceNoiseScheduler, MultiScalePatchDiscriminator, add_instance_noise, compute_discriminator_loss, compute_generator_gan_loss, r1_gradient_penalty
 from model.image.vae.vae import ImageVAE
 from scripts.train.trainer import CommonTrainer
-from transformers.integrations.integration_utils import TensorBoardCallback
 from typing import Any, Mapping, Optional, Union
 
+from utils import metrics
 from utils import model_loading_utils
 
 
@@ -51,7 +51,6 @@ class ImageVAEGANTrainer(CommonTrainer):
         **kwargs
     ):
         super().__init__(*args, **kwargs)
-        self.writer = None
 
         self.step_offset = step_offset if step_offset is not None else 0
         self.cmdline = cmdline
@@ -100,11 +99,9 @@ class ImageVAEGANTrainer(CommonTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
 
-        self._ensure_tensorboard_writer()
-
         if not self.has_logged_cli:
-            self.writer.add_text("training/command_line", self.cmdline, global_step)
-            self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            metrics.log_text("training/command_line", self.cmdline, global_step)
+            metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
             self.has_logged_cli = True
 
         image = inputs["image"]
@@ -174,20 +171,20 @@ class ImageVAEGANTrainer(CommonTrainer):
                     d_loss = d_loss + self.r1_penalty_weight * r1_loss
 
                 # Log discriminator diagnostics
-                if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                if global_step % self.args.logging_steps == 0:
                     for key, val in d_loss_dict.items():
-                        self._log_scalar(f"train/{key}", val, global_step)
+                        metrics.log_scalar(f"train/{key}", val, global_step)
                     if self.r1_penalty_weight > 0:
-                        self._log_scalar("train/r1_penalty", r1_loss, global_step)
+                        metrics.log_scalar("train/r1_penalty", r1_loss, global_step)
                     if noise_std > 0:
-                        self._log_scalar("train/instance_noise_std", noise_std, global_step)
+                        metrics.log_scalar("train/instance_noise_std", noise_std, global_step)
 
                     # Log how different real and fake images are
                     with torch.no_grad():
                         real_fake_mse = torch.nn.functional.mse_loss(image, recon).item()
                         real_fake_l1 = torch.nn.functional.l1_loss(image, recon).item()
-                        self._log_scalar("train/real_fake_mse", real_fake_mse, global_step)
-                        self._log_scalar("train/real_fake_l1", real_fake_l1, global_step)
+                        metrics.log_scalar("train/real_fake_mse", real_fake_mse, global_step)
+                        metrics.log_scalar("train/real_fake_l1", real_fake_l1, global_step)
 
                 # Update discriminator (only during training when gradients are enabled)
                 if self.discriminator_optimizer is not None and self.discriminator.training and torch.is_grad_enabled():
@@ -195,13 +192,13 @@ class ImageVAEGANTrainer(CommonTrainer):
                     d_loss.backward()
 
                     # Log gradient statistics to diagnose training issues
-                    if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                    if global_step % self.args.logging_steps == 0:
                         total_grad_norm = 0.0
                         for p in self.discriminator.parameters():
                             if p.grad is not None:
                                 total_grad_norm += p.grad.norm().item() ** 2
                         total_grad_norm = total_grad_norm ** 0.5
-                        self._log_scalar("train/d_grad_norm", total_grad_norm, global_step)
+                        metrics.log_scalar("train/d_grad_norm", total_grad_norm, global_step)
 
                     self.discriminator_optimizer.step()
 
@@ -216,11 +213,11 @@ class ImageVAEGANTrainer(CommonTrainer):
                     feature_matching_weight=self.feature_matching_weight,
                 )
 
-            if global_step % self.args.logging_steps == 0 and self.writer is not None:
+            if global_step % self.args.logging_steps == 0:
                 for key, val in g_loss_dict.items():
-                    self._log_scalar(f"train/{key}", val, global_step)
+                    metrics.log_scalar(f"train/{key}", val, global_step)
                 # Log warmup factor
-                self._log_scalar("train/gan_warmup_factor", gan_warmup_factor, global_step)
+                metrics.log_scalar("train/gan_warmup_factor", gan_warmup_factor, global_step)
 
             # Apply warmup factor to GAN loss
             g_gan_loss = gan_warmup_factor * g_gan_loss
@@ -245,22 +242,22 @@ class ImageVAEGANTrainer(CommonTrainer):
         total_loss = vae_loss + adaptive_weight * g_gan_loss
 
         # Log losses
-        if global_step % self.args.logging_steps == 0 and self.writer is not None:
+        if global_step % self.args.logging_steps == 0:
             prefix = "train/" if model.training else "eval/"
             for loss_name, loss in losses.items():
-                self._log_scalar(f"{prefix}vae_{loss_name}", loss.mean(), global_step)
+                metrics.log_scalar(f"{prefix}vae_{loss_name}", loss.mean(), global_step)
             # Log mu and logvar stats
-            self._log_scalar(f"{prefix}vae_mu_mean", mu.mean(), global_step)
-            self._log_scalar(f"{prefix}vae_mu_std", mu.std(), global_step)
-            self._log_scalar(f"{prefix}vae_logvar_mean", logvar.mean(), global_step)
+            metrics.log_scalar(f"{prefix}vae_mu_mean", mu.mean(), global_step)
+            metrics.log_scalar(f"{prefix}vae_mu_std", mu.std(), global_step)
+            metrics.log_scalar(f"{prefix}vae_logvar_mean", logvar.mean(), global_step)
             # Mean variance (what diffusion will see) - useful for setting latent_std
-            self._log_scalar(f"{prefix}vae_mean_variance", logvar.exp().mean(), global_step)
-            self._log_scalar(f"{prefix}vae_mean_std", logvar.exp().mean().sqrt(), global_step)
-            self._log_scalar(f"{prefix}g_gan_loss", g_gan_loss, global_step)
-            self._log_scalar(f"{prefix}total_loss", total_loss.mean(), global_step)
+            metrics.log_scalar(f"{prefix}vae_mean_variance", logvar.exp().mean(), global_step)
+            metrics.log_scalar(f"{prefix}vae_mean_std", logvar.exp().mean().sqrt(), global_step)
+            metrics.log_scalar(f"{prefix}g_gan_loss", g_gan_loss, global_step)
+            metrics.log_scalar(f"{prefix}total_loss", total_loss.mean(), global_step)
             # Log adaptive weight when using adaptive weighting
             if self.use_adaptive_weight and self.gan_already_started:
-                self._log_scalar(f"{prefix}adaptive_gan_weight", adaptive_weight, global_step)
+                metrics.log_scalar(f"{prefix}adaptive_gan_weight", adaptive_weight, global_step)
 
             # Per-channel latent statistics (for detecting channel collapse)
             # mu shape: [B, C, H, W] - compute stats per channel
@@ -271,14 +268,14 @@ class ImageVAEGANTrainer(CommonTrainer):
             per_channel_kl = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).mean(dim=(0, 2, 3))  # [C]
 
             for c in range(mu.shape[1]):
-                self._log_scalar(f"{prefix}channel_{c}/mu_mean", per_channel_mu_mean[c], global_step)
-                self._log_scalar(f"{prefix}channel_{c}/mu_std", per_channel_mu_std[c], global_step)
-                self._log_scalar(f"{prefix}channel_{c}/variance", per_channel_var[c], global_step)
-                self._log_scalar(f"{prefix}channel_{c}/kl", per_channel_kl[c], global_step)
+                metrics.log_scalar(f"{prefix}channel_{c}/mu_mean", per_channel_mu_mean[c], global_step)
+                metrics.log_scalar(f"{prefix}channel_{c}/mu_std", per_channel_mu_std[c], global_step)
+                metrics.log_scalar(f"{prefix}channel_{c}/variance", per_channel_var[c], global_step)
+                metrics.log_scalar(f"{prefix}channel_{c}/kl", per_channel_kl[c], global_step)
 
             # Log KL weight multiplier if annealing is enabled
             if self.kl_annealing_steps > 0:
-                self._log_scalar(f"{prefix}kl_weight_multiplier", kl_weight_multiplier, global_step)
+                metrics.log_scalar(f"{prefix}kl_weight_multiplier", kl_weight_multiplier, global_step)
 
         outputs = {
             "loss": total_loss,
@@ -286,24 +283,6 @@ class ImageVAEGANTrainer(CommonTrainer):
         }
 
         return (total_loss, outputs) if return_outputs else total_loss
-
-    def _log_scalar(self, tag, value, global_step):
-        if self.writer is not None:
-            if isinstance(value, torch.Tensor):
-                value = value.item()
-            if value != 0.0:
-                self.writer.add_scalar(tag, value, global_step)
-
-    def _ensure_tensorboard_writer(self):
-        if hasattr(self, "writer") and self.writer is not None:
-            return
-
-        for callback in self.callback_handler.callbacks:
-            if isinstance(callback, TensorBoardCallback):
-                self.writer = callback.tb_writer
-                return
-
-        self.writer = None
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         """Save both VAE and discriminator."""

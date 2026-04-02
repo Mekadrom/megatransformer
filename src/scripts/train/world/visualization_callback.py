@@ -7,7 +7,11 @@ import torch.nn.functional as F
 from torch.amp import autocast
 from transformers import Trainer
 
+from matplotlib import pyplot as plt
+
 from scripts.train.visualization_callback import VisualizationCallback
+from utils import metrics
+from utils import visualization
 from utils.constants import (
     BOA_TOKEN_ID, EOA_TOKEN_ID,
     BOV_TOKEN_ID, EOV_TOKEN_ID,
@@ -16,7 +20,6 @@ from utils.constants import (
     VOICE_PLACEHOLDER_TOKEN_ID,
     IMAGE_PLACEHOLDER_TOKEN_ID,
 )
-from utils.train_utils import get_writer
 
 
 class WorldModelVisualizationCallback(VisualizationCallback):
@@ -136,9 +139,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if not state.is_world_process_zero:
             return
 
-        writer = get_writer(self.trainer)
-        if writer is None:
-            print("No TensorBoard writer found, skipping world model visualization...")
+        logger = metrics.get_logger()
+        if logger is None:
+            print("No metrics logger found, skipping world model visualization...")
             return
 
         eval_dataset = self.trainer.eval_dataset
@@ -158,12 +161,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             with autocast(device.type, dtype=dtype, enabled=args.bf16 or args.fp16):
                 # Training data generation — generates media from text prompts
                 self._scenario_train_generation(
-                    model, args, device, writer, global_step, dtype
+                    model, args, device, global_step, dtype
                 )
 
                 # Training data transcription — provide media, generate text
                 self._scenario_train_transcription(
-                    model, args, device, writer, global_step, dtype
+                    model, args, device, global_step, dtype
                 )
 
                 # Eval scenarios — generation and transcription with eval dataset
@@ -178,12 +181,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 ]
                 for scenario_fn in eval_scenarios:
                     try:
-                        scenario_fn(model, eval_dataset, collator, device, writer, global_step)
+                        scenario_fn(model, eval_dataset, collator, device, global_step)
                     except Exception as e:
                         print(f"Warning: Eval scenario {scenario_fn.__name__} failed: {e}")
 
         print(f"World model visualization complete at step {global_step}")
-        writer.flush()
+        metrics.flush()
 
     # Maximum total sequence length (prompt + generated) the model supports.
     MAX_SEQ_LEN = 1024
@@ -212,44 +215,44 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _log_generation_metrics(
         self, outputs: dict, sample: dict, model, device,
-        writer, tag: str, sample_idx: int, global_step: int,
+        tag: str, sample_idx: int, global_step: int,
         pred_latent=None, target_latent=None, modality: str = "",
     ):
         """Log all generation quality metrics for a single sample."""
         t = f"{tag}/{sample_idx}"
-        self._log_recurrent_iterations(outputs, writer, t, global_step)
-        self._log_thought_convergence(outputs, writer, t, global_step)
-        self._log_token_entropy(outputs, writer, t, global_step)
-        self._log_modality_timing(outputs, writer, t, global_step)
-        self._log_token_repetition(outputs, writer, t, global_step)
-        self._log_text_perplexity(outputs, model, device, writer, t, global_step)
+        self._log_recurrent_iterations(outputs, t, global_step)
+        self._log_thought_convergence(outputs, t, global_step)
+        self._log_token_entropy(outputs, t, global_step)
+        self._log_modality_timing(outputs, t, global_step)
+        self._log_token_repetition(outputs, t, global_step)
+        self._log_text_perplexity(outputs, model, device, t, global_step)
         if pred_latent is not None and target_latent is not None:
-            self._log_latent_statistics(pred_latent, target_latent, writer, t, global_step, modality)
-            self._log_latent_similarity(pred_latent, target_latent, writer, t, global_step, modality)
+            self._log_latent_statistics(pred_latent, target_latent, t, global_step, modality)
+            self._log_latent_similarity(pred_latent, target_latent, t, global_step, modality)
         elif pred_latent is not None:
-            self._log_latent_statistics(pred_latent, None, writer, t, global_step, modality)
+            self._log_latent_statistics(pred_latent, None, t, global_step, modality)
 
     # --- Individual metric loggers ---
 
-    def _log_recurrent_iterations(self, outputs: dict, writer, tag: str, global_step: int):
+    def _log_recurrent_iterations(self, outputs: dict, tag: str, global_step: int):
         """Log recurrent iteration count statistics from generate() outputs."""
         iter_counts = outputs.get("recurrent_iteration_counts")
         if not iter_counts:
             return
         counts = torch.tensor(iter_counts, dtype=torch.float32)
-        writer.add_scalar(f"{tag}/recurrent_iters_mean", counts.mean().item(), global_step)
-        writer.add_scalar(f"{tag}/recurrent_iters_min", counts.min().item(), global_step)
-        writer.add_scalar(f"{tag}/recurrent_iters_max", counts.max().item(), global_step)
+        metrics.log_scalar(f"{tag}/recurrent_iters_mean", counts.mean().item(), global_step)
+        metrics.log_scalar(f"{tag}/recurrent_iters_min", counts.min().item(), global_step)
+        metrics.log_scalar(f"{tag}/recurrent_iters_max", counts.max().item(), global_step)
         try:
             if counts.numel() > 1:
-                writer.add_histogram(f"{tag}/recurrent_iters", counts, global_step)
+                metrics.log_histogram(f"{tag}/recurrent_iters", counts, global_step)
         except ValueError:
             pass
         prompt_iters = outputs.get("prompt_recurrent_iterations")
         if prompt_iters is not None:
-            writer.add_scalar(f"{tag}/recurrent_iters_prompt", prompt_iters, global_step)
+            metrics.log_scalar(f"{tag}/recurrent_iters_prompt", prompt_iters, global_step)
 
-    def _log_thought_convergence(self, outputs: dict, writer, tag: str, global_step: int):
+    def _log_thought_convergence(self, outputs: dict, tag: str, global_step: int):
         """Log per-token KL divergence between final consecutive thought states.
 
         Shows how converged the recurrent thinking was for each generated token.
@@ -263,11 +266,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         valid = kl_tensor[torch.isfinite(kl_tensor)]
         if valid.numel() == 0:
             return
-        writer.add_scalar(f"{tag}/thought_kl_mean", valid.mean().item(), global_step)
-        writer.add_scalar(f"{tag}/thought_kl_max", valid.max().item(), global_step)
+        metrics.log_scalar(f"{tag}/thought_kl_mean", valid.mean().item(), global_step)
+        metrics.log_scalar(f"{tag}/thought_kl_max", valid.max().item(), global_step)
         try:
             if valid.numel() > 1:
-                writer.add_histogram(f"{tag}/thought_kl", valid, global_step)
+                metrics.log_histogram(f"{tag}/thought_kl", valid, global_step)
         except ValueError:
             pass
 
@@ -277,9 +280,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             prompt_kl = torch.tensor(prompt_kls, dtype=torch.float32)
             prompt_valid = prompt_kl[torch.isfinite(prompt_kl)]
             if prompt_valid.numel() > 0:
-                writer.add_scalar(f"{tag}/thought_kl_prompt_final", prompt_valid[-1].item(), global_step)
+                metrics.log_scalar(f"{tag}/thought_kl_prompt_final", prompt_valid[-1].item(), global_step)
 
-    def _log_token_entropy(self, outputs: dict, writer, tag: str, global_step: int):
+    def _log_token_entropy(self, outputs: dict, tag: str, global_step: int):
         """Log entropy of the softmax distribution at each generated token.
 
         High entropy = model is uncertain. Low entropy = confident prediction.
@@ -293,16 +296,16 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         probs = F.softmax(logits_b, dim=-1)
         log_probs = F.log_softmax(logits_b, dim=-1)
         entropy = -(probs * log_probs).sum(dim=-1)  # (seq,)
-        writer.add_scalar(f"{tag}/token_entropy_mean", entropy.mean().item(), global_step)
-        writer.add_scalar(f"{tag}/token_entropy_min", entropy.min().item(), global_step)
-        writer.add_scalar(f"{tag}/token_entropy_max", entropy.max().item(), global_step)
+        metrics.log_scalar(f"{tag}/token_entropy_mean", entropy.mean().item(), global_step)
+        metrics.log_scalar(f"{tag}/token_entropy_min", entropy.min().item(), global_step)
+        metrics.log_scalar(f"{tag}/token_entropy_max", entropy.max().item(), global_step)
         try:
             if entropy.numel() > 1:
-                writer.add_histogram(f"{tag}/token_entropy", entropy, global_step)
+                metrics.log_histogram(f"{tag}/token_entropy", entropy, global_step)
         except ValueError:
             pass
 
-    def _log_modality_timing(self, outputs: dict, writer, tag: str, global_step: int):
+    def _log_modality_timing(self, outputs: dict, tag: str, global_step: int):
         """Log position of first BO*/EO* tokens in generated sequence.
 
         Tracks when the model decides to begin/end media generation.
@@ -318,9 +321,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         }
         for name, tid in modality_tokens.items():
             if tid in ids:
-                writer.add_scalar(f"{tag}/first_{name}_position", ids.index(tid), global_step)
+                metrics.log_scalar(f"{tag}/first_{name}_position", ids.index(tid), global_step)
 
-    def _log_token_repetition(self, outputs: dict, writer, tag: str, global_step: int):
+    def _log_token_repetition(self, outputs: dict, tag: str, global_step: int):
         """Log fraction of generated tokens that repeat the previous token.
 
         High repetition rate indicates degenerate looping behavior.
@@ -333,7 +336,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             return
         repeats = sum(1 for j in range(1, len(ids)) if ids[j] == ids[j - 1])
         rate = repeats / (len(ids) - 1)
-        writer.add_scalar(f"{tag}/token_repetition_rate", rate, global_step)
+        metrics.log_scalar(f"{tag}/token_repetition_rate", rate, global_step)
 
         # Also log longest consecutive repeat streak
         max_streak = 0
@@ -344,10 +347,10 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 max_streak = max(max_streak, current_streak)
             else:
                 current_streak = 0
-        writer.add_scalar(f"{tag}/token_max_repeat_streak", max_streak, global_step)
+        metrics.log_scalar(f"{tag}/token_max_repeat_streak", max_streak, global_step)
 
     def _log_text_perplexity(
-        self, outputs: dict, model, device, writer, tag: str, global_step: int,
+        self, outputs: dict, model, device, tag: str, global_step: int,
     ):
         """Log perplexity of generated text by feeding it back through the model.
 
@@ -374,13 +377,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             )
             perplexity = torch.exp(loss).item()
             if math.isfinite(perplexity):
-                writer.add_scalar(f"{tag}/text_perplexity", perplexity, global_step)
+                metrics.log_scalar(f"{tag}/text_perplexity", perplexity, global_step)
         except Exception as e:
             print(f"Warning: perplexity computation failed: {e}")
 
     def _log_latent_statistics(
         self, pred_latent: torch.Tensor, target_latent: Optional[torch.Tensor],
-        writer, tag: str, global_step: int, modality: str,
+        tag: str, global_step: int, modality: str,
     ):
         """Log mean/std/min/max of generated (and target) latents.
 
@@ -388,21 +391,21 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         """
         prefix = f"{tag}/{modality}_latent" if modality else f"{tag}/latent"
         pred = pred_latent.float().cpu()
-        writer.add_scalar(f"{prefix}_pred_mean", pred.mean().item(), global_step)
-        writer.add_scalar(f"{prefix}_pred_std", pred.std().item(), global_step)
-        writer.add_scalar(f"{prefix}_pred_min", pred.min().item(), global_step)
-        writer.add_scalar(f"{prefix}_pred_max", pred.max().item(), global_step)
+        metrics.log_scalar(f"{prefix}_pred_mean", pred.mean().item(), global_step)
+        metrics.log_scalar(f"{prefix}_pred_std", pred.std().item(), global_step)
+        metrics.log_scalar(f"{prefix}_pred_min", pred.min().item(), global_step)
+        metrics.log_scalar(f"{prefix}_pred_max", pred.max().item(), global_step)
 
         if target_latent is not None:
             tgt = target_latent.float().cpu()
-            writer.add_scalar(f"{prefix}_target_mean", tgt.mean().item(), global_step)
-            writer.add_scalar(f"{prefix}_target_std", tgt.std().item(), global_step)
-            writer.add_scalar(f"{prefix}_target_min", tgt.min().item(), global_step)
-            writer.add_scalar(f"{prefix}_target_max", tgt.max().item(), global_step)
+            metrics.log_scalar(f"{prefix}_target_mean", tgt.mean().item(), global_step)
+            metrics.log_scalar(f"{prefix}_target_std", tgt.std().item(), global_step)
+            metrics.log_scalar(f"{prefix}_target_min", tgt.min().item(), global_step)
+            metrics.log_scalar(f"{prefix}_target_max", tgt.max().item(), global_step)
 
     def _log_latent_similarity(
         self, pred_latent: torch.Tensor, target_latent: torch.Tensor,
-        writer, tag: str, global_step: int, modality: str,
+        tag: str, global_step: int, modality: str,
     ):
         """Log cosine similarity between generated and target latents.
 
@@ -416,9 +419,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         pred_flat = pred_flat[:min_len]
         tgt_flat = tgt_flat[:min_len]
         cos_sim = F.cosine_similarity(pred_flat.unsqueeze(0), tgt_flat.unsqueeze(0)).item()
-        writer.add_scalar(f"{prefix}_cosine_sim", cos_sim, global_step)
+        metrics.log_scalar(f"{prefix}_cosine_sim", cos_sim, global_step)
 
-    def _scenario_train_reconstruction(self, model, args, device, writer, global_step, dtype):
+    def _scenario_train_reconstruction(self, model, args, device, global_step, dtype):
         """Run forward pass on fixed training samples and compare predictions to ground truth.
 
         This tracks memorization/overfitting: as training progresses, the model's
@@ -537,80 +540,80 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 if valid.sum() == 0:
                     continue
                 correct = (preds[i][valid] == targets_aligned[i][valid]).float().mean().item()
-                writer.add_scalar(f"{tag}/text_accuracy/{i}", correct, global_step)
+                metrics.log_scalar(f"{tag}/text_accuracy/{i}", correct, global_step)
 
                 # Log predicted vs target text
                 pred_text = self._decode_tokens(preds[i][valid])
                 target_text = self._decode_tokens(targets_aligned[i][valid])
-                writer.add_text(f"{tag}/text/{i}/predicted", pred_text, global_step)
-                writer.add_text(f"{tag}/text/{i}/target", target_text, global_step)
+                metrics.log_text(f"{tag}/text/{i}/predicted", pred_text, global_step)
+                metrics.log_text(f"{tag}/text/{i}/target", target_text, global_step)
 
             # Batch-level CE loss
             ce_loss = F.cross_entropy(
                 logits_aligned.reshape(-1, V), targets_aligned.reshape(-1), ignore_index=0,
             )
-            writer.add_scalar(f"{tag}/text_ce_loss", ce_loss.item(), global_step)
+            metrics.log_scalar(f"{tag}/text_ce_loss", ce_loss.item(), global_step)
             if ce_loss.item() < 20:
-                writer.add_scalar(f"{tag}/text_perplexity", torch.exp(ce_loss).item(), global_step)
+                metrics.log_scalar(f"{tag}/text_perplexity", torch.exp(ce_loss).item(), global_step)
 
         # --- Log voice reconstruction quality ---
         voice_preds = outputs.get("voice_latent_preds")
         if voice_preds is not None and voice_labels is not None:
             v_l1 = F.l1_loss(voice_preds, voice_labels).item()
             v_mse = F.mse_loss(voice_preds, voice_labels).item()
-            writer.add_scalar(f"{tag}/voice_latent_l1", v_l1, global_step)
-            writer.add_scalar(f"{tag}/voice_latent_mse", v_mse, global_step)
+            metrics.log_scalar(f"{tag}/voice_latent_l1", v_l1, global_step)
+            metrics.log_scalar(f"{tag}/voice_latent_mse", v_mse, global_step)
 
             for i in range(min(n, voice_preds.shape[0])):
                 pred_lat = voice_preds[i]  # (C, T)
                 tgt_lat = voice_labels[i]  # (C, T)
-                writer.add_image(f"{tag}/voice/{i}/predicted", self._latent_to_image(pred_lat), global_step)
-                writer.add_image(f"{tag}/voice/{i}/target", self._latent_to_image(tgt_lat), global_step)
+                metrics.log_image(f"{tag}/voice/{i}/predicted", self._latent_to_image(pred_lat), global_step)
+                metrics.log_image(f"{tag}/voice/{i}/target", self._latent_to_image(tgt_lat), global_step)
 
                 cos = F.cosine_similarity(pred_lat.flatten().unsqueeze(0), tgt_lat.flatten().unsqueeze(0)).item()
-                writer.add_scalar(f"{tag}/voice_cosine_sim/{i}", cos, global_step)
+                metrics.log_scalar(f"{tag}/voice_cosine_sim/{i}", cos, global_step)
 
                 # Decode predicted voice to audio if CVAE available
                 sample = samples[i] if i < len(samples) else {}
-                self._log_audio_with_cvae(pred_lat, sample, writer, global_step, f"{tag}/voice/{i}/pred")
+                self._log_audio_with_cvae(pred_lat, sample, global_step, f"{tag}/voice/{i}/pred")
 
             # Also decode target voice for comparison (first sample only)
             if len(samples) > 0:
-                self._log_audio_with_cvae(voice_labels[0], samples[0], writer, global_step, f"{tag}/voice/0/target")
+                self._log_audio_with_cvae(voice_labels[0], samples[0], global_step, f"{tag}/voice/0/target")
 
         # --- Log audio reconstruction quality ---
         audio_preds = outputs.get("audio_latent_preds")
         if audio_preds is not None and audio_labels is not None:
             a_l1 = F.l1_loss(audio_preds, audio_labels).item()
             a_mse = F.mse_loss(audio_preds, audio_labels).item()
-            writer.add_scalar(f"{tag}/audio_latent_l1", a_l1, global_step)
-            writer.add_scalar(f"{tag}/audio_latent_mse", a_mse, global_step)
+            metrics.log_scalar(f"{tag}/audio_latent_l1", a_l1, global_step)
+            metrics.log_scalar(f"{tag}/audio_latent_mse", a_mse, global_step)
 
             for i in range(min(n, audio_preds.shape[0])):
-                writer.add_image(f"{tag}/audio/{i}/predicted", self._latent_to_image(audio_preds[i]), global_step)
-                writer.add_image(f"{tag}/audio/{i}/target", self._latent_to_image(audio_labels[i]), global_step)
+                metrics.log_image(f"{tag}/audio/{i}/predicted", self._latent_to_image(audio_preds[i]), global_step)
+                metrics.log_image(f"{tag}/audio/{i}/target", self._latent_to_image(audio_labels[i]), global_step)
 
         # --- Log image reconstruction quality ---
         image_preds = outputs.get("image_latent_preds")
         if image_preds is not None and image_labels is not None:
             i_l1 = F.l1_loss(image_preds, image_labels).item()
             i_mse = F.mse_loss(image_preds, image_labels).item()
-            writer.add_scalar(f"{tag}/image_latent_l1", i_l1, global_step)
-            writer.add_scalar(f"{tag}/image_latent_mse", i_mse, global_step)
+            metrics.log_scalar(f"{tag}/image_latent_l1", i_l1, global_step)
+            metrics.log_scalar(f"{tag}/image_latent_mse", i_mse, global_step)
 
             for i in range(min(n, image_preds.shape[0])):
-                writer.add_image(f"{tag}/image/{i}/predicted", self._latent_to_image(image_preds[i]), global_step)
-                writer.add_image(f"{tag}/image/{i}/target", self._latent_to_image(image_labels[i]), global_step)
+                metrics.log_image(f"{tag}/image/{i}/predicted", self._latent_to_image(image_preds[i]), global_step)
+                metrics.log_image(f"{tag}/image/{i}/target", self._latent_to_image(image_labels[i]), global_step)
 
                 cos = F.cosine_similarity(image_preds[i].flatten().unsqueeze(0), image_labels[i].flatten().unsqueeze(0)).item()
-                writer.add_scalar(f"{tag}/image_cosine_sim/{i}", cos, global_step)
+                metrics.log_scalar(f"{tag}/image_cosine_sim/{i}", cos, global_step)
 
                 # Decode through image VAE if available
                 if self.image_vae_decoder is not None:
-                    self._try_decode_image(image_preds[i], writer, global_step, f"{tag}/image/{i}/pred_decoded")
-                    self._try_decode_image(image_labels[i], writer, global_step, f"{tag}/image/{i}/target_decoded")
+                    self._try_decode_image(image_preds[i], global_step, f"{tag}/image/{i}/pred_decoded")
+                    self._try_decode_image(image_labels[i], global_step, f"{tag}/image/{i}/target_decoded")
 
-    def _scenario_train_generation(self, model, args, device, writer, global_step, dtype):
+    def _scenario_train_generation(self, model, args, device, global_step, dtype):
         """Generate media autoregressively from training sample text prompts.
 
         Selects fixed voice and image samples (by modality) from the training
@@ -690,9 +693,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 if not prompt_text and "text_token_ids" in sample:
                     prompt_text = self._decode_tokens(sample["text_token_ids"])
                 if prompt_text:
-                    writer.add_text(f"{tag}/voice/{i}/prompt", str(prompt_text)[:500], global_step)
+                    metrics.log_text(f"{tag}/voice/{i}/prompt", str(prompt_text)[:500], global_step)
                 decoded = self._decode_tokens(text_ids[:bov_pos + 1])
-                writer.add_text(f"{tag}/voice/{i}/prompt_decoded", decoded[:500], global_step)
+                metrics.log_text(f"{tag}/voice/{i}/prompt_decoded", decoded[:500], global_step)
 
                 outputs = model.generate(
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
@@ -701,17 +704,17 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 voice_preds = outputs.get("voice_latent_preds")
                 if voice_preds is not None and voice_preds.numel() > 0:
                     pred_lat = voice_preds[0, 0]
-                    writer.add_image(f"{tag}/voice/{i}/generated", self._latent_to_image(pred_lat), global_step)
+                    metrics.log_image(f"{tag}/voice/{i}/generated", self._latent_to_image(pred_lat), global_step)
 
                     tgt_lat = voice_batch.get("voice_features")
                     if tgt_lat is not None:
                         tgt_lat = tgt_lat[0]
-                        writer.add_image(f"{tag}/voice/{i}/target", self._latent_to_image(tgt_lat), global_step)
+                        metrics.log_image(f"{tag}/voice/{i}/target", self._latent_to_image(tgt_lat), global_step)
                         cos = F.cosine_similarity(pred_lat.flatten().unsqueeze(0), tgt_lat.flatten().to(pred_lat.device).unsqueeze(0)).item()
-                        writer.add_scalar(f"{tag}/voice_cosine_sim/{i}", cos, global_step)
-                        self._log_audio_with_cvae(tgt_lat, sample, writer, global_step, f"{tag}/voice/{i}/target")
+                        metrics.log_scalar(f"{tag}/voice_cosine_sim/{i}", cos, global_step)
+                        self._log_audio_with_cvae(tgt_lat, sample, global_step, f"{tag}/voice/{i}/target")
 
-                    self._log_audio_with_cvae(pred_lat, sample, writer, global_step, f"{tag}/voice/{i}/generated")
+                    self._log_audio_with_cvae(pred_lat, sample, global_step, f"{tag}/voice/{i}/generated")
             except Exception as e:
                 print(f"Warning: Train generation (voice) failed for sample {i}: {e}")
 
@@ -736,9 +739,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 # Log prompt text
                 prompt_text = sample.get("text_text", sample.get("image_text", ""))
                 if prompt_text:
-                    writer.add_text(f"{tag}/image/{i}/prompt", str(prompt_text)[:500], global_step)
+                    metrics.log_text(f"{tag}/image/{i}/prompt", str(prompt_text)[:500], global_step)
                 decoded = self._decode_tokens(text_ids[:boi_pos + 1])
-                writer.add_text(f"{tag}/image/{i}/prompt_decoded", decoded[:500], global_step)
+                metrics.log_text(f"{tag}/image/{i}/prompt_decoded", decoded[:500], global_step)
 
                 outputs = model.generate(
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
@@ -747,25 +750,25 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 image_preds = outputs.get("image_latent_preds")
                 if image_preds is not None and image_preds.numel() > 0:
                     pred_lat = image_preds[0, 0]
-                    writer.add_image(f"{tag}/image/{i}/generated", self._latent_to_image(pred_lat), global_step)
+                    metrics.log_image(f"{tag}/image/{i}/generated", self._latent_to_image(pred_lat), global_step)
 
                     tgt_lat = image_batch.get("image_images")
                     if tgt_lat is not None:
                         tgt_lat = tgt_lat[0]
-                        writer.add_image(f"{tag}/image/{i}/target", self._latent_to_image(tgt_lat), global_step)
+                        metrics.log_image(f"{tag}/image/{i}/target", self._latent_to_image(tgt_lat), global_step)
                         cos = F.cosine_similarity(pred_lat.flatten().unsqueeze(0), tgt_lat.flatten().to(pred_lat.device).unsqueeze(0)).item()
-                        writer.add_scalar(f"{tag}/image_cosine_sim/{i}", cos, global_step)
+                        metrics.log_scalar(f"{tag}/image_cosine_sim/{i}", cos, global_step)
 
                     if self.image_vae_decoder is not None:
-                        self._try_decode_image(pred_lat, writer, global_step, f"{tag}/image/{i}/generated_decoded")
+                        self._try_decode_image(pred_lat, global_step, f"{tag}/image/{i}/generated_decoded")
                         if tgt_lat is not None:
-                            self._try_decode_image(tgt_lat, writer, global_step, f"{tag}/image/{i}/target_decoded")
+                            self._try_decode_image(tgt_lat, global_step, f"{tag}/image/{i}/target_decoded")
             except Exception as e:
                 print(f"Warning: Train generation (image) failed for sample {i}: {e}")
 
         collator.force_direction = prev_direction
 
-    def _scenario_train_transcription(self, model, args, device, writer, global_step, dtype):
+    def _scenario_train_transcription(self, model, args, device, global_step, dtype):
         """Transcribe/describe training media: provide voice/image, generate text.
 
         Uses the same per-modality indices as _scenario_train_generation.
@@ -823,7 +826,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 gen_ids = outputs.get("generated_token_ids")
                 if gen_ids is not None:
                     gen_text = self._decode_tokens(gen_ids[0])
-                    writer.add_text(f"{tag}/voice/{i}/transcription", gen_text[:500], global_step)
+                    metrics.log_text(f"{tag}/voice/{i}/transcription", gen_text[:500], global_step)
 
                 # Log target text (decode from token_ids if raw text not available)
                 target_text = sample.get("text_text", sample.get("voice_voice_text", ""))
@@ -832,11 +835,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 if not target_text and "text_token_ids" in sample:
                     target_text = self._decode_tokens(sample["text_token_ids"])
                 if target_text:
-                    writer.add_text(f"{tag}/voice/{i}/target_text", str(target_text)[:500], global_step)
+                    metrics.log_text(f"{tag}/voice/{i}/target_text", str(target_text)[:500], global_step)
 
                 # Log input audio
                 self._log_audio_with_cvae(
-                    voice_features, sample, writer, global_step,
+                    voice_features, sample, global_step,
                     f"{tag}/voice/{i}/input"
                 )
             except Exception as e:
@@ -868,7 +871,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 gen_ids = outputs.get("generated_token_ids")
                 if gen_ids is not None:
                     gen_text = self._decode_tokens(gen_ids[0])
-                    writer.add_text(f"{tag}/image/{i}/description", gen_text[:500], global_step)
+                    metrics.log_text(f"{tag}/image/{i}/description", gen_text[:500], global_step)
 
                 # Log target text (decode from token_ids if raw text not available)
                 target_text = sample.get("text_text", sample.get("image_text", ""))
@@ -877,15 +880,15 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 if not target_text and "text_token_ids" in sample:
                     target_text = self._decode_tokens(sample["text_token_ids"])
                 if target_text:
-                    writer.add_text(f"{tag}/image/{i}/target_text", str(target_text)[:500], global_step)
+                    metrics.log_text(f"{tag}/image/{i}/target_text", str(target_text)[:500], global_step)
 
                 # Log input image
                 if self.image_vae_decoder is not None:
                     self._try_decode_image(
-                        image_data, writer, global_step,
+                        image_data, global_step,
                         f"{tag}/image/{i}/input_image"
                     )
-                writer.add_image(
+                metrics.log_image(
                     f"{tag}/image/{i}/input_latent",
                     self._latent_to_image(image_data),
                     global_step,
@@ -893,7 +896,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             except Exception as e:
                 print(f"Warning: Train transcription (image) failed for sample {i}: {e}")
 
-    def _scenario_text_continuation(self, model, eval_dataset, collator, device, writer, global_step):
+    def _scenario_text_continuation(self, model, eval_dataset, collator, device, global_step):
         """Scenario 1: Text-only generation (take text, generate continuation)."""
         tag = "eval_world/1_text_continuation"
         samples = self._get_eval_samples(eval_dataset, collator, self.num_eval_samples)
@@ -929,14 +932,14 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             gen_text = self._decode_tokens(gen_ids)
             full_target = self._decode_tokens(token_ids[:text_length])
 
-            writer.add_text(f"{tag}/{i}/input", input_text, global_step)
-            writer.add_text(f"{tag}/{i}/generated", gen_text, global_step)
-            writer.add_text(f"{tag}/{i}/target", full_target, global_step)
+            metrics.log_text(f"{tag}/{i}/input", input_text, global_step)
+            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step)
+            metrics.log_text(f"{tag}/{i}/target", full_target, global_step)
             self._log_generation_metrics(
-                outputs, sample, model, device, writer, tag, i, global_step,
+                outputs, sample, model, device, tag, i, global_step,
             )
 
-    def _scenario_text_to_voice(self, model, eval_dataset, collator, device, writer, global_step):
+    def _scenario_text_to_voice(self, model, eval_dataset, collator, device, global_step):
         """Scenario 2: Text -> Voice synthesis using static prompts."""
         tag = "eval_world/2_text_to_voice"
 
@@ -958,27 +961,27 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 temperature=0.8,
             )
 
-            writer.add_text(f"{tag}/{i}/input_text", prompt_text, global_step)
+            metrics.log_text(f"{tag}/{i}/input_text", prompt_text, global_step)
             sample = samples[i] if i < len(samples) else {}
 
             # Log generated voice if available
             voice_preds = outputs.get("voice_latent_preds")
             if voice_preds is not None and voice_preds.numel() > 0:
                 pred_latent = voice_preds[0, 0]  # (C, T)
-                writer.add_image(
+                metrics.log_image(
                     f"{tag}/{i}/generated_latent",
                     self._latent_to_image(pred_latent),
                     global_step,
                 )
 
                 self._log_audio_with_cvae(
-                    pred_latent, sample, writer, global_step, f"{tag}/{i}"
+                    pred_latent, sample, global_step, f"{tag}/{i}"
                 )
 
             # Log target voice for comparison
             target_features = sample.get("voice_features")
             if target_features is not None:
-                writer.add_image(
+                metrics.log_image(
                     f"{tag}/{i}/target_latent",
                     self._latent_to_image(target_features),
                     global_step,
@@ -987,7 +990,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             voice_preds = outputs.get("voice_latent_preds")
             gen_latent = voice_preds[0, 0] if voice_preds is not None and voice_preds.numel() > 0 else None
             self._log_generation_metrics(
-                outputs, sample, model, device, writer, tag, i, global_step,
+                outputs, sample, model, device, tag, i, global_step,
                 pred_latent=gen_latent, target_latent=target_features, modality="voice",
             )
 
@@ -1066,7 +1069,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             image_data = image_data.unsqueeze(0)
         return image_data
 
-    def _scenario_voice_to_text(self, model, eval_dataset, collator, device, writer, global_step):
+    def _scenario_voice_to_text(self, model, eval_dataset, collator, device, global_step):
         """Scenario 3: Voice -> Text transcription."""
         tag = "eval_world/3_voice_to_text"
         samples = self._get_eval_samples(
@@ -1104,13 +1107,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             gen_text = self._decode_tokens(gen_ids)
             target_text = self._decode_tokens(token_ids[:text_length])
 
-            writer.add_text(f"{tag}/{i}/generated", gen_text, global_step)
-            writer.add_text(f"{tag}/{i}/target", target_text, global_step)
+            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step)
+            metrics.log_text(f"{tag}/{i}/target", target_text, global_step)
             self._log_generation_metrics(
-                outputs, sample, model, device, writer, tag, i, global_step,
+                outputs, sample, model, device, tag, i, global_step,
             )
 
-    def _scenario_text_to_image(self, model, eval_dataset, collator, device, writer, global_step):
+    def _scenario_text_to_image(self, model, eval_dataset, collator, device, global_step):
         """Scenario 4: Text -> Image synthesis using static prompts."""
         tag = "eval_world/4_text_to_image"
 
@@ -1132,13 +1135,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 temperature=0.8,
             )
 
-            writer.add_text(f"{tag}/{i}/input_text", prompt_text, global_step)
+            metrics.log_text(f"{tag}/{i}/input_text", prompt_text, global_step)
             sample = samples[i] if i < len(samples) else {}
 
             image_preds = outputs.get("image_latent_preds")
             if image_preds is not None and image_preds.numel() > 0:
                 pred_latent = image_preds[0, 0]  # (C, H, W)
-                writer.add_image(
+                metrics.log_image(
                     f"{tag}/{i}/generated_latent",
                     self._latent_to_image(pred_latent),
                     global_step,
@@ -1147,7 +1150,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 # Decode through image VAE if available
                 if self.image_vae_decoder is not None:
                     self._try_decode_image(
-                        pred_latent, writer, global_step,
+                        pred_latent, global_step,
                         f"{tag}/{i}/generated_image"
                     )
 
@@ -1156,14 +1159,14 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             if target_image is None:
                 target_image = sample.get("image_image")
             if target_image is not None:
-                writer.add_image(
+                metrics.log_image(
                     f"{tag}/{i}/target_latent",
                     self._latent_to_image(target_image),
                     global_step,
                 )
                 if self.image_vae_decoder is not None:
                     self._try_decode_image(
-                        target_image, writer, global_step,
+                        target_image, global_step,
                         f"{tag}/{i}/target_image"
                     )
 
@@ -1173,11 +1176,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             if target_image_latent is None:
                 target_image_latent = sample.get("image_image")
             self._log_generation_metrics(
-                outputs, sample, model, device, writer, tag, i, global_step,
+                outputs, sample, model, device, tag, i, global_step,
                 pred_latent=gen_latent, target_latent=target_image_latent, modality="image",
             )
 
-    def _scenario_image_to_text(self, model, eval_dataset, collator, device, writer, global_step):
+    def _scenario_image_to_text(self, model, eval_dataset, collator, device, global_step):
         """Scenario 5: Image -> Text description."""
         tag = "eval_world/5_image_to_text"
         samples = self._get_eval_samples(
@@ -1213,13 +1216,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             gen_text = self._decode_tokens(gen_ids)
             target_text = self._decode_tokens(token_ids[:text_length])
 
-            writer.add_text(f"{tag}/{i}/generated", gen_text, global_step)
-            writer.add_text(f"{tag}/{i}/target", target_text, global_step)
+            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step)
+            metrics.log_text(f"{tag}/{i}/target", target_text, global_step)
             self._log_generation_metrics(
-                outputs, sample, model, device, writer, tag, i, global_step,
+                outputs, sample, model, device, tag, i, global_step,
             )
 
-    def _scenario_voice_to_image(self, model, eval_dataset, collator, device, writer, global_step):
+    def _scenario_voice_to_image(self, model, eval_dataset, collator, device, global_step):
         """Scenario 6: Voice -> Image cross-modal generation."""
         tag = "eval_world/6_voice_to_image"
         samples = self._get_eval_samples(
@@ -1249,7 +1252,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             image_preds = outputs.get("image_latent_preds")
             if image_preds is not None and image_preds.numel() > 0:
                 pred_latent = image_preds[0, 0]
-                writer.add_image(
+                metrics.log_image(
                     f"{tag}/{i}/generated_image_latent",
                     self._latent_to_image(pred_latent),
                     global_step,
@@ -1257,18 +1260,18 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
                 if self.image_vae_decoder is not None:
                     self._try_decode_image(
-                        pred_latent, writer, global_step,
+                        pred_latent, global_step,
                         f"{tag}/{i}/generated_image"
                     )
 
             img_preds = outputs.get("image_latent_preds")
             gen_img = img_preds[0, 0] if img_preds is not None and img_preds.numel() > 0 else None
             self._log_generation_metrics(
-                outputs, sample, model, device, writer, tag, i, global_step,
+                outputs, sample, model, device, tag, i, global_step,
                 pred_latent=gen_img, modality="image",
             )
 
-    def _scenario_image_to_voice(self, model, eval_dataset, collator, device, writer, global_step):
+    def _scenario_image_to_voice(self, model, eval_dataset, collator, device, global_step):
         """Scenario 7: Image -> Voice cross-modal generation."""
         tag = "eval_world/7_image_to_voice"
         samples = self._get_eval_samples(
@@ -1297,7 +1300,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             voice_preds = outputs.get("voice_latent_preds")
             if voice_preds is not None and voice_preds.numel() > 0:
                 pred_latent = voice_preds[0, 0]
-                writer.add_image(
+                metrics.log_image(
                     f"{tag}/{i}/generated_voice_latent",
                     self._latent_to_image(pred_latent),
                     global_step,
@@ -1305,13 +1308,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
                 # Image->voice has no ground-truth speaker, use static only
                 self._log_audio_with_cvae(
-                    pred_latent, sample, writer, global_step, f"{tag}/{i}"
+                    pred_latent, sample, global_step, f"{tag}/{i}"
                 )
 
             voice_preds = outputs.get("voice_latent_preds")
             gen_voice = voice_preds[0, 0] if voice_preds is not None and voice_preds.numel() > 0 else None
             self._log_generation_metrics(
-                outputs, sample, model, device, writer, tag, i, global_step,
+                outputs, sample, model, device, tag, i, global_step,
                 pred_latent=gen_voice, modality="voice",
             )
 
@@ -1400,7 +1403,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             traceback.print_exc()
             return None
 
-    def _decode_and_log_audio(self, pred_latent, speaker_embedding, writer, global_step, tag_prefix, speaker_label):
+    def _decode_and_log_audio(self, pred_latent, speaker_embedding, global_step, tag_prefix, speaker_label):
         """Decode latent -> mel via CVAE, then mel -> waveform via vocoder, logging both."""
         mel = self._decode_audio_latent_to_mel(pred_latent, speaker_embedding)
         if mel is None:
@@ -1416,23 +1419,27 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if mel_np.size == 0 or mel_np.shape[0] == 0 or mel_np.shape[-1] == 0:
             return
         mel_img = self._visualize_mel_spec(mel_np)
-        writer.add_image(
+        metrics.log_image(
             f"{tag_prefix}/{speaker_label}_mel",
             mel_img, global_step,
         )
 
         # Vocode to audio if possible
         if self.vocoder is not None:
-            self._log_vocoder_audio(writer, mel, global_step, f"{tag_prefix}/{speaker_label}_audio")
+            try:
+                waveform = visualization.render_vocoder_audio(self.vocoder, mel)
+                metrics.log_audio(f"{tag_prefix}/{speaker_label}_audio", waveform, global_step, self.audio_sample_rate)
+            except Exception as e:
+                print(f"Warning: Vocoder audio rendering failed for {tag_prefix}/{speaker_label}_audio: {e}")
 
-    def _log_audio_with_cvae(self, pred_latent, sample, writer, global_step, tag_prefix):
+    def _log_audio_with_cvae(self, pred_latent, sample, global_step, tag_prefix):
         """Run dual-speaker CVAE decoding: ground-truth speaker + static speaker."""
         if self.voice_cvae_decoder is None:
             print(f"[audio_debug] No CVAE decoder available for {tag_prefix}")
             # Fallback to direct vocoder (old behavior)
             if self.vocoder is not None:
                 self._try_vocoder_from_latent(
-                    None, pred_latent, writer, global_step,
+                    None, pred_latent, global_step,
                     f"{tag_prefix}/generated_audio"
                 )
             return
@@ -1449,7 +1456,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if gt_speaker_emb is not None:
             print(f"[audio_debug] Decoding {tag_prefix} with gt_speaker (shape={gt_speaker_emb.shape}, latent shape={pred_latent.shape})")
             self._decode_and_log_audio(
-                pred_latent, gt_speaker_emb, writer, global_step,
+                pred_latent, gt_speaker_emb, global_step,
                 tag_prefix, "gt_speaker"
             )
         else:
@@ -1459,13 +1466,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if self.static_speaker_embedding is not None:
             print(f"[audio_debug] Decoding {tag_prefix} with static_speaker")
             self._decode_and_log_audio(
-                pred_latent, self.static_speaker_embedding, writer, global_step,
+                pred_latent, self.static_speaker_embedding, global_step,
                 tag_prefix, "static_speaker"
             )
         else:
             print(f"[audio_debug] No static speaker embedding available")
 
-    def _try_vocoder_from_latent(self, model, latent, writer, global_step, tag):
+    def _try_vocoder_from_latent(self, model, latent, global_step, tag):
         """Try to decode SIVE feature latent directly through vocoder.
 
         Note: This is a fallback — SIVE features are not mel spectrograms, so
@@ -1478,11 +1485,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
             mel = latent.float().cpu()
             # SIVE features are (C, T) — use directly as (n_mels, T) if C matches
-            self._log_vocoder_audio(writer, mel, global_step, tag)
+            waveform = visualization.render_vocoder_audio(self.vocoder, mel)
+            metrics.log_audio(tag, waveform, global_step, self.audio_sample_rate)
         except Exception as e:
             print(f"Warning: Vocoder decoding failed for {tag}: {e}")
 
-    def _try_decode_image(self, latent, writer, global_step, tag):
+    def _try_decode_image(self, latent, global_step, tag):
         """Try to decode image latent through image VAE decoder."""
         try:
             if self.image_vae_decoder is None:
@@ -1504,6 +1512,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             # decoded: (1, 3, H, W) — normalize to [0, 1]
             img = decoded[0].float().cpu()
             img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-            writer.add_image(tag, img, global_step)
+            metrics.log_image(tag, img, global_step)
         except Exception as e:
             print(f"Warning: Image VAE decoding failed for {tag}: {e}")

@@ -7,7 +7,6 @@ import torch
 
 from typing import Any, Mapping, Optional, Union
 
-from transformers.integrations.integration_utils import TensorBoardCallback
 from transformers.trainer import Trainer
 
 
@@ -82,25 +81,6 @@ class CommonTrainer(abc.ABC, Trainer):
             return vae_loss.item() < threshold
 
         return False
-
-    def _log_scalar(self, tag, value, global_step, skip_zero=True):
-        if self.writer is not None:
-            if isinstance(value, torch.Tensor):
-                value = value.detach().item()
-            # Skip zero values by default (for unused losses), but allow explicit logging of zeros
-            if not skip_zero or value != 0.0:
-                self.writer.add_scalar(tag, value, global_step)
-
-    def _ensure_tensorboard_writer(self):
-        if hasattr(self, "writer") and self.writer is not None:
-            return
-
-        for callback in self.callback_handler.callbacks:
-            if isinstance(callback, TensorBoardCallback):
-                self.writer = callback.tb_writer
-                return
-
-        self.writer = None
 
     @abc.abstractmethod
     def start_train_print(self, args):

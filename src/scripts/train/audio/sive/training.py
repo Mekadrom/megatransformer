@@ -5,11 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Sampler
-from transformers.integrations.integration_utils import TensorBoardCallback
 from transformers.trainer import Trainer
 from model.audio.sive.ctc_vocab import CTCVocab
 from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
-from utils import model_loading_utils
+from utils import metrics, model_loading_utils
 from utils.megatransformer_utils import print_debug_tensor
 
 
@@ -94,8 +93,6 @@ class SIVETrainer(Trainer):
         if hasattr(self.train_dataset, 'get_sampler'):
             self._shard_sampler = self.train_dataset.get_sampler(shuffle=True, seed=42)
 
-        # TensorBoard writer (lazily initialized)
-        self.writer = None
 
     def create_optimizer(self):
         """
@@ -144,15 +141,6 @@ class SIVETrainer(Trainer):
 
         return self.optimizer
 
-    def _ensure_tensorboard_writer(self):
-        """Get TensorBoard writer from callback."""
-        if self.writer is not None:
-            return
-        for callback in self.callback_handler.callbacks:
-            if isinstance(callback, TensorBoardCallback):
-                self.writer = callback.tb_writer
-                return
-
     def _get_train_sampler(self, dataset=None) -> Optional[Sampler]:
         """Override to use shard-aware sampler for efficient shard loading."""
         if self._shard_sampler is not None:
@@ -163,12 +151,11 @@ class SIVETrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         global_step = self.state.global_step + self.step_offset
-        self._ensure_tensorboard_writer()
 
         # Log CLI and git hash on first call (logs at resumed step if resuming)
-        if not self.has_logged_cli and self.writer is not None:
-            self.writer.add_text("training/command_line", self.cmdline, global_step)
-            self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+        if not self.has_logged_cli:
+            metrics.log_text("training/command_line", self.cmdline, global_step)
+            metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
             self.has_logged_cli = True
 
         mel_specs = inputs["mel_specs"]
@@ -227,17 +214,17 @@ class SIVETrainer(Trainer):
         total_loss = self.ctc_weight * ctc_loss + self.grl_weight * speaker_loss
 
         # Log to TensorBoard
-        if self.writer is not None and global_step % self.args.logging_steps == 0:
-            self.writer.add_scalar("train/ctc_loss", ctc_loss.item(), global_step)
-            self.writer.add_scalar("train/speaker_loss", speaker_loss.item(), global_step)
-            self.writer.add_scalar("train/speaker_accuracy", speaker_acc, global_step)
-            self.writer.add_scalar("train/grl_alpha", grl_alpha, global_step)
-            self.writer.add_scalar("train/total_loss", total_loss.item(), global_step)
-            self.writer.add_scalar("train/grl_pretraining", float(in_pretraining), global_step)
+        if global_step % self.args.logging_steps == 0:
+            metrics.log_scalar("train/ctc_loss", ctc_loss, global_step)
+            metrics.log_scalar("train/speaker_loss", speaker_loss, global_step)
+            metrics.log_scalar("train/speaker_accuracy", speaker_acc, global_step)
+            metrics.log_scalar("train/grl_alpha", grl_alpha, global_step)
+            metrics.log_scalar("train/total_loss", total_loss, global_step)
+            metrics.log_scalar("train/grl_pretraining", float(in_pretraining), global_step)
             # Diagnostics for speaker classifier behavior
-            self.writer.add_scalar("train/speaker_pred_entropy", pred_entropy, global_step)
-            self.writer.add_scalar("train/speaker_unique_preds", unique_preds, global_step)
-            self.writer.add_scalar("train/speaker_max_prob", max_prob, global_step)
+            metrics.log_scalar("train/speaker_pred_entropy", pred_entropy, global_step)
+            metrics.log_scalar("train/speaker_unique_preds", unique_preds, global_step)
+            metrics.log_scalar("train/speaker_max_prob", max_prob, global_step)
 
         if return_outputs:
             return total_loss, result

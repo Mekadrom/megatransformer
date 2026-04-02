@@ -1,18 +1,4 @@
-from typing import Optional
-
-from torch.utils.tensorboard import SummaryWriter
-from transformers import Trainer, TrainerCallback
-from transformers.integrations import TensorBoardCallback
-
-
-def get_writer(trainer: Trainer) -> Optional[SummaryWriter]:
-    """Get TensorBoard writer from trainer callbacks."""
-    if hasattr(trainer, 'callback_handler'):
-        for callback in trainer.callback_handler.callbacks:
-            if isinstance(callback, TensorBoardCallback):
-                if callback.tb_writer is not None:
-                    return callback.tb_writer
-    return None
+from transformers import TrainerCallback
 
 
 class EarlyStoppingCallback(TrainerCallback):
