@@ -521,6 +521,7 @@ WORLD_MODEL_CONFIGS = {
         recurrent_block_config=MegaTransformerRecurrentConfig(
             n_recurrent_blocks=4,
             depth_scaled_init=False,
+            iteration_norm="post_projection",
             block_config=MegaTransformerBlockConfig(
                 d_model=768 * 2,
                 n_heads=12,

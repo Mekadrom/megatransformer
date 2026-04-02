@@ -57,6 +57,25 @@ python -m src.scripts.data.preprocess_dataset stat-shards --output_dir ../cached
 python -m src.scripts.data.preprocess_dataset audio --gpu_id 0 --total_gpus 4 ...
 ```
 
+### Testing
+
+```bash
+pytest tests/                          # Run all tests
+python -m pytest tests/ -v             # Verbose output
+python -m pytest tests/test_collator_token_placement.py  # Single test file
+```
+
+Tests cover data collation logic (BO*/PH/EO* token placement, text target alignment). No linting or formatting tools are configured.
+
+### Inference / Evaluation
+
+```bash
+# Voice cloning demo (Gradio UI) — combines SIVE + CVAE + vocoder pipeline
+python -m src.scripts.eval.audio.cvae.voice_clone --sive_checkpoint_path ./checkpoints/sive --cvae_checkpoint_path ./checkpoints/cvae --vocoder_checkpoint_path ./checkpoints/vocoder
+```
+
+Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
+
 ### TensorBoard
 
 ```bash
@@ -130,6 +149,12 @@ model = load_model(AudioVAE, "small", checkpoint_path=path, overrides={"latent_c
 DeepSpeed configs are in root: `ds_config.json`, `ds_config_zero-*.json`, `ds_config_int8.json`
 
 Runs are logged to `runs/<run_name>/` (TensorBoard + checkpoints).
+
+## Environment
+
+- Python 3.10, CUDA 12.4
+- Dependencies: `pip install -r requirements.txt`
+- venv: `source venv/bin/activate`
 
 ## Import Convention
 

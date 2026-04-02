@@ -106,7 +106,7 @@ class MegaTransformerWorldModel(nn.Module):
             self.image_gen_pos_embedding = nn.Parameter(
                 torch.zeros(1, n_patches, d_model)
             )
-            nn.init.trunc_normal_(self.image_gen_pos_embedding, std=0.02)
+            nn.init.trunc_normal_(self.image_gen_pos_embedding, std=3.0)
 
             # Text-conditioning cross-attention: injects text-specific information
             # into the generation queries BEFORE they enter the interleaved sequence.
