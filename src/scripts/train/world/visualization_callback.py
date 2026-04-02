@@ -166,6 +166,22 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     model, args, device, writer, global_step, dtype
                 )
 
+                # Eval scenarios — generation and transcription with eval dataset
+                eval_scenarios = [
+                    self._scenario_text_continuation,
+                    self._scenario_text_to_voice,
+                    self._scenario_voice_to_text,
+                    self._scenario_text_to_image,
+                    self._scenario_image_to_text,
+                    self._scenario_voice_to_image,
+                    self._scenario_image_to_voice,
+                ]
+                for scenario_fn in eval_scenarios:
+                    try:
+                        scenario_fn(model, eval_dataset, collator, device, writer, global_step)
+                    except Exception as e:
+                        print(f"Warning: Eval scenario {scenario_fn.__name__} failed: {e}")
+
         print(f"World model visualization complete at step {global_step}")
         writer.flush()
 

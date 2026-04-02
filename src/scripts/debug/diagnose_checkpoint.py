@@ -58,8 +58,31 @@ def diagnose(model, batch, label=""):
         print(f"  image_cross_input_norm weight: mean={model.image_cross_input_norm.weight.mean():.4f}")
         print(f"  image_cross_input_norm bias: mean={model.image_cross_input_norm.bias.mean():.4f}")
 
-    # Forward pass
+    # Forward pass with intermediate probes
     print("\n--- Forward Pass ---")
+    probes = {}
+
+    def hook_token_interleaver(module, args, output):
+        interleaved, attn_mask, modality_map = output
+        probes['interleaved_pre_scale'] = interleaved.detach().clone()
+        probes['modality_map'] = modality_map
+        return output
+
+    def hook_recurrent_block(module, args, output):
+        probes['recurrent_output'] = output[0].detach().clone()
+        return output
+
+    def hook_image_text_conditioning(module, args, output):
+        conditioned, _ = output
+        probes['conditioned_queries'] = conditioned.detach().clone()
+        return output
+
+    handles = []
+    handles.append(model.token_interleaver.register_forward_hook(hook_token_interleaver))
+    handles.append(model.recurrent_block.register_forward_hook(hook_recurrent_block))
+    if hasattr(model, 'image_text_conditioning'):
+        handles.append(model.image_text_conditioning.register_forward_hook(hook_image_text_conditioning))
+
     model.eval()
     with torch.no_grad():
         outputs = model(
@@ -71,6 +94,26 @@ def diagnose(model, batch, label=""):
             precomputed_latents=True,
             is_synthesis=batch.get('is_synthesis'),
         )
+
+    for h in handles:
+        h.remove()
+
+    # Intermediate probes
+    print("\n  -- Intermediate Activations --")
+    if 'conditioned_queries' in probes:
+        r("after_text_conditioning", probes['conditioned_queries'])
+    if 'interleaved_pre_scale' in probes:
+        r("interleaved_pre_scale", probes['interleaved_pre_scale'])
+        if 'modality_map' in probes:
+            mmap = probes['modality_map']
+            interleaved = probes['interleaved_pre_scale']
+            for mod_name in ['text', 'image', 'voice']:
+                mask = (mmap == {'text': 0, 'image': 3, 'voice': 2, 'audio': 1}.get(mod_name, -1))
+                if mask.any():
+                    mod_tokens = interleaved[mask]
+                    r(f"interleaved[{mod_name}]", mod_tokens)
+    if 'recurrent_output' in probes:
+        r("recurrent_output_raw", probes['recurrent_output'])
 
         for key in ['image_recurrent_tokens', 'image_prelude_tokens',
                      'image_cross_latent_preds', 'image_latent_preds',
@@ -112,16 +155,19 @@ def diagnose(model, batch, label=""):
         is_synthesis=batch.get('is_synthesis'),
     )
 
-    loss = torch.tensor(0.0)
+    loss = torch.tensor(0.0, requires_grad=True)
     for k, v in outputs.items():
         if 'loss' in k and isinstance(v, torch.Tensor) and v.requires_grad:
             loss = loss + v
-    if loss.item() == 0:
+    if loss.grad_fn is None:
         for k in ['image_cross_latent_preds', 'image_latent_preds', 'voice_latent_preds']:
             v = outputs.get(k)
             if v is not None and v.requires_grad:
                 loss = loss + v.sum() * 1e-6
-    loss.backward()
+    if loss.grad_fn is not None:
+        loss.backward()
+    else:
+        print("  WARNING: no differentiable outputs — skipping gradient analysis")
 
     groups = {
         'image_gen_queries': model.image_gen_queries,
@@ -157,12 +203,26 @@ def main():
         image_shard_dir='./cached_datasets/image_vae_train',
         cache_size=1, max_samples=args.max_samples,
     )
-    modality_names = list(ds.modalities.keys())
-    image_indices = [i for i in range(len(ds)) if modality_names[i % len(modality_names)] == 'image'][:2]
+    tasks = ds.task_types
+    image_indices = [i for i in range(len(ds)) if tasks[i % len(tasks)][1] == 'image'][:2]
     collator = MultimodalDataCollator(max_seq_len=1024)
     collator.force_direction = 'synthesis'
     samples = [ds[i] for i in image_indices]
     batch = collator(samples)
+
+    print("\n--- Batch Contents ---")
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            print(f"  {k}: shape={list(v.shape)}, dtype={v.dtype}")
+        elif isinstance(v, list):
+            print(f"  {k}: list len={len(v)}")
+        else:
+            print(f"  {k}: {v}")
+    if 'text_token_ids' in batch:
+        ids = batch['text_token_ids']
+        print(f"  text_token_ids unique: {sorted(ids.unique().tolist())}")
+    if 'is_synthesis' in batch:
+        print(f"  is_synthesis: {batch['is_synthesis']}")
 
     for ckpt in args.checkpoint:
         model = load_model(args.config, ckpt)
