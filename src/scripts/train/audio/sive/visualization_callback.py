@@ -13,7 +13,7 @@ from model.audio.vocoder.vocoder import Vocoder
 from scripts.train.visualization_callback import VisualizationCallback
 from transformers.trainer import Trainer
 
-from utils.train_utils import get_writer
+from utils import metrics, visualization
 
 
 def levenshtein_distance(s1, s2) -> int:
@@ -149,9 +149,9 @@ class SIVEVisualizationCallback(VisualizationCallback):
             print("  [Visualization] Skipping: model is None")
             return
 
-        writer = get_writer(kwargs.get("trainer", self.trainer))
-        if writer is None:
-            print("  [Visualization] Skipping: TensorBoard writer is None")
+        logger = metrics.get_logger()
+        if logger is None:
+            print("  [Visualization] Skipping: metrics logger is None")
             return
 
         # Lazily load CTC decoder
@@ -161,10 +161,10 @@ class SIVEVisualizationCallback(VisualizationCallback):
         device = next(model.parameters()).device
 
         try:
-            self._log_tsne(model, writer, state.global_step, device)
-            self._log_transcriptions_with_alignment(model, writer, state.global_step, device)
-            self._log_feature_health(model, writer, state.global_step, device)
-            self._log_audio_samples(model, writer, state.global_step, device)
+            self._log_tsne(model, state.global_step, device)
+            self._log_transcriptions_with_alignment(model, state.global_step, device)
+            self._log_feature_health(model, state.global_step, device)
+            self._log_audio_samples(model, state.global_step, device)
         except Exception as e:
             print(f"Visualization error at step {state.global_step}: {e}")
             import traceback
@@ -173,7 +173,7 @@ class SIVEVisualizationCallback(VisualizationCallback):
         model.train()
 
     @torch.no_grad()
-    def _log_tsne(self, model, writer, step, device):
+    def _log_tsne(self, model, step, device):
         """Log PCA and t-SNE visualization of features colored by speaker."""
         features_list = []
         speakers_list = []
@@ -244,11 +244,11 @@ class SIVEVisualizationCallback(VisualizationCallback):
         axes[1].set_ylabel("t-SNE 2")
 
         plt.tight_layout()
-        writer.add_figure("visualizations/pca_tsne_by_speaker", fig, step)
+        metrics.log_figure("visualizations/pca_tsne_by_speaker", fig, step)
         plt.close(fig)
 
     @torch.no_grad()
-    def _log_transcriptions_with_alignment(self, model, writer, step, device):
+    def _log_transcriptions_with_alignment(self, model, step, device):
         """Log sample transcriptions with CER/WER and CTC alignment visualization."""
         transcriptions = []
         total_cer = 0
@@ -348,7 +348,7 @@ class SIVEVisualizationCallback(VisualizationCallback):
                 elif feat_upscaled.shape[1] > self.max_mel_frames:
                     feat_upscaled = feat_upscaled[:, :self.max_mel_frames]
                 # Flip vertically so feature dim 0 is at bottom (origin="lower")
-                writer.add_image(f"ctc_alignment/sample_{i}/features_grid", feat_upscaled[::-1][np.newaxis], step, dataformats='CHW')
+                metrics.log_image(f"ctc_alignment/sample_{i}/features_grid", feat_upscaled[::-1][np.newaxis], step)
 
                 im1 = axes[1].imshow(feat_np, aspect="auto", origin="lower", cmap="viridis")
                 axes[1].set_title(f"SIVE Features (T'={feature_length}, D={feat_np.shape[0]})")
@@ -432,16 +432,16 @@ class SIVEVisualizationCallback(VisualizationCallback):
                 # rect=[left, bottom, right, top] - leave room at top for metrics, bottom for text
                 top_margin = 0.94 if cer_lm is not None else 0.96  # More room if LM metrics shown
                 plt.tight_layout(rect=[0, bottom_margin, 1, top_margin])
-                writer.add_figure(f"ctc_alignment/sample_{i}", fig, step)
+                metrics.log_figure(f"ctc_alignment/sample_{i}", fig, step)
                 plt.close(fig)
 
         # Log greedy metrics (consistent with previous runs)
         avg_cer = total_cer / len(transcriptions) if transcriptions else 0
         avg_wer = total_wer / len(transcriptions) if transcriptions else 0
         avg_length_ratio = sum(t['length_ratio'] for t in transcriptions) / len(transcriptions) if transcriptions else 1.0
-        writer.add_scalar("eval/cer", avg_cer, step)
-        writer.add_scalar("eval/wer", avg_wer, step)
-        writer.add_scalar("eval/length_ratio", avg_length_ratio, step)
+        metrics.log_scalar("eval/cer", avg_cer, step)
+        metrics.log_scalar("eval/wer", avg_wer, step)
+        metrics.log_scalar("eval/length_ratio", avg_length_ratio, step)
 
         # Log LM metrics if available
         if self.ctc_decoder is not None:
@@ -452,9 +452,9 @@ class SIVEVisualizationCallback(VisualizationCallback):
                 avg_cer_lm = sum(lm_cers) / len(lm_cers)
                 avg_wer_lm = sum(lm_wers) / len(lm_wers)
                 avg_length_ratio_lm = sum(lm_ratios) / len(lm_ratios)
-                writer.add_scalar("eval/cer_lm", avg_cer_lm, step)
-                writer.add_scalar("eval/wer_lm", avg_wer_lm, step)
-                writer.add_scalar("eval/length_ratio_lm", avg_length_ratio_lm, step)
+                metrics.log_scalar("eval/cer_lm", avg_cer_lm, step)
+                metrics.log_scalar("eval/wer_lm", avg_wer_lm, step)
+                metrics.log_scalar("eval/length_ratio_lm", avg_length_ratio_lm, step)
 
         # Log sample transcriptions as text
         text_summary = f"**Step {step} Sample Transcriptions**\n\n"
@@ -470,10 +470,10 @@ class SIVEVisualizationCallback(VisualizationCallback):
                 text_summary += f"  Beam+LM: `{t['pred_lm'][:100]}` (CER={t['cer_lm']:.3f})\n"
             text_summary += "\n"
 
-        writer.add_text("transcriptions/samples", text_summary, step)
+        metrics.log_text("transcriptions/samples", text_summary, step)
 
     @torch.no_grad()
-    def _log_feature_health(self, model, writer, step, device, num_samples: int = 50):
+    def _log_feature_health(self, model, step, device, num_samples: int = 50):
         """Log feature health metrics and visualization (global stats, temporal smoothness, etc.)."""
         all_features = []
         temporal_sims_norm = []
@@ -508,13 +508,13 @@ class SIVEVisualizationCallback(VisualizationCallback):
         # Global statistics
         global_mean = np.mean(all_features)
         global_std = np.std(all_features)
-        writer.add_scalar("feature_health/global_mean", global_mean, step)
-        writer.add_scalar("feature_health/global_std", global_std, step)
+        metrics.log_scalar("feature_health/global_mean", global_mean, step)
+        metrics.log_scalar("feature_health/global_std", global_std, step)
 
         # Feature norms
         feature_norms = np.linalg.norm(all_features, axis=-1)
-        writer.add_scalar("feature_health/mean_norm", np.mean(feature_norms), step)
-        writer.add_scalar("feature_health/std_norm", np.std(feature_norms), step)
+        metrics.log_scalar("feature_health/mean_norm", np.mean(feature_norms), step)
+        metrics.log_scalar("feature_health/std_norm", np.std(feature_norms), step)
 
         # Per-dimension statistics
         dim_means = np.mean(all_features, axis=0)  # [D]
@@ -522,25 +522,25 @@ class SIVEVisualizationCallback(VisualizationCallback):
 
         # Dead dimension detection (std < 0.01)
         dead_dims = np.sum(dim_stds < 0.01)
-        writer.add_scalar("feature_health/dead_dimensions", dead_dims, step)
-        writer.add_scalar("feature_health/dead_dim_ratio", dead_dims / feat_dim, step)
+        metrics.log_scalar("feature_health/dead_dimensions", dead_dims, step)
+        metrics.log_scalar("feature_health/dead_dim_ratio", dead_dims / feat_dim, step)
 
         # Effective dimensionality (via explained variance ratio using entropy)
         var_per_dim = dim_stds ** 2
         var_normalized = var_per_dim / (var_per_dim.sum() + 1e-8)
         entropy = -np.sum(var_normalized * np.log(var_normalized + 1e-8))
         effective_dim = np.exp(entropy)
-        writer.add_scalar("feature_health/effective_dimensionality", effective_dim, step)
-        writer.add_scalar("feature_health/dim_utilization_ratio", effective_dim / feat_dim, step)
+        metrics.log_scalar("feature_health/effective_dimensionality", effective_dim, step)
+        metrics.log_scalar("feature_health/dim_utilization_ratio", effective_dim / feat_dim, step)
 
         # Temporal smoothness (log both pre-norm and post-norm for comparison)
         if temporal_sims_unnorm:
             mean_smoothness_unnorm = np.mean(temporal_sims_unnorm)
-            writer.add_scalar("feature_health/temporal_smoothness_unnorm", mean_smoothness_unnorm, step)
-            writer.add_scalar("feature_health/temporal_smoothness", mean_smoothness_unnorm, step)
+            metrics.log_scalar("feature_health/temporal_smoothness_unnorm", mean_smoothness_unnorm, step)
+            metrics.log_scalar("feature_health/temporal_smoothness", mean_smoothness_unnorm, step)
         if temporal_sims_norm:
             mean_smoothness_norm = np.mean(temporal_sims_norm)
-            writer.add_scalar("feature_health/temporal_smoothness_norm", mean_smoothness_norm, step)
+            metrics.log_scalar("feature_health/temporal_smoothness_norm", mean_smoothness_norm, step)
 
         # Debug print to console
         if temporal_sims_unnorm and temporal_sims_norm:
@@ -621,7 +621,7 @@ class SIVEVisualizationCallback(VisualizationCallback):
 
         plt.suptitle(f"Feature Space Health (Step {step})", fontsize=14)
         plt.tight_layout()
-        writer.add_figure("visualizations/feature_space_health", fig, step)
+        metrics.log_figure("visualizations/feature_space_health", fig, step)
         plt.close(fig)
 
         # Log summary to console
@@ -630,7 +630,7 @@ class SIVEVisualizationCallback(VisualizationCallback):
               f"effective_dim={effective_dim:.1f}")
 
     @torch.no_grad()
-    def _log_audio_samples(self, model, writer, step, device):
+    def _log_audio_samples(self, model, step, device):
         """Log audio samples with vocoder output aligned with transcription."""
         if self.vocoder is None:
             return
@@ -656,13 +656,14 @@ class SIVEVisualizationCallback(VisualizationCallback):
             )
 
             # Generate audio from mel spectrogram
-            self._log_vocoder_audio(
-                writer, mel_cropped, step,
-                tag=f"audio_samples/sample_{i}"
-            )
+            try:
+                waveform = visualization.render_vocoder_audio(self.vocoder, mel_cropped)
+                metrics.log_audio(f"audio_samples/sample_{i}", waveform, step, self.audio_sample_rate)
+            except Exception as e:
+                print(f"Failed to generate audio with vocoder: {e}")
 
             # Log the transcription for this sample
-            writer.add_text(
+            metrics.log_text(
                 f"audio_samples/sample_{i}_text",
                 f"**Sample {i}**: {target_text}",
                 step

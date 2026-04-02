@@ -1,6 +1,5 @@
 import os
 
-import librosa
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -9,14 +8,13 @@ import torchaudio
 
 from typing import Optional
 
-from torch.utils.tensorboard.writer import SummaryWriter
 from transformers.trainer import Trainer
 
 from scripts.train.visualization_callback import VisualizationCallback
 from utils import audio_utils
+from utils import metrics
+from utils import visualization
 from utils.audio_utils import SharedWindowBuffer
-from utils.megatransformer_utils import pad_and_mask
-from utils.train_utils import get_writer
 
 
 class VocoderVisualizationCallback(VisualizationCallback):
@@ -54,9 +52,9 @@ class VocoderVisualizationCallback(VisualizationCallback):
         if not state.is_world_process_zero:
             return
 
-        writer = get_writer(self.trainer)
-        if writer is None:
-            print("No TensorBoard writer found, skipping eval visualization...")
+        logger = metrics.get_logger()
+        if logger is None:
+            print("No metrics logger found, skipping eval visualization...")
             return
 
         # Get eval dataset from trainer
@@ -179,13 +177,13 @@ class VocoderVisualizationCallback(VisualizationCallback):
                     pred_audio = torch.clamp(pred_aligned, -1.0, 1.0).float().cpu()
                     gt_audio = gt_aligned.float().cpu()
 
-                    writer.add_audio(
+                    metrics.log_audio(
                         f"eval_vocoder/audio/{i}/output",
                         pred_audio,
                         global_step,
                         sample_rate=self.audio_sample_rate
                     )
-                    writer.add_audio(
+                    metrics.log_audio(
                         f"eval_vocoder/audio/{i}/target",
                         gt_audio,
                         global_step,
@@ -196,44 +194,45 @@ class VocoderVisualizationCallback(VisualizationCallback):
                     if i < 4:
                         # Waveform comparison
                         self.log_waveform_visualization(
-                            writer, pred_audio, gt_audio, global_step,
+                            pred_audio, gt_audio, global_step,
                             tag=f"eval_vocoder/waveform_comparison/{i}"
                         )
 
                         # Mel comparison (target vs output vs error)
-                        self.log_mel_comparison(
-                            writer, pred_mel, gt_mel, global_step,
-                            tag=f"eval_vocoder/mel_comparison/{i}"
-                        )
+                        fig = visualization.render_mel_comparison(pred_mel, gt_mel)
+                        metrics.log_figure(f"eval_vocoder/mel_comparison/{i}", fig, global_step)
+                        plt.close(fig)
 
                         # STFT magnitude comparison
                         self.log_stft_magnitude_comparison(
-                            writer, pred_stft, gt_stft, global_step,
+                            pred_stft, gt_stft, global_step,
                             tag=f"eval_vocoder/stft_magnitude_comparison/{i}"
                         )
 
                         # Phase error
                         self.log_phase_error(
-                            writer, pred_stft, gt_stft, global_step,
+                            pred_stft, gt_stft, global_step,
                             tag=f"eval_vocoder/phase_comparison/{i}"
                         )
 
                         # IF comparison
                         self.log_if_comparison(
-                            writer, pred_stft, gt_stft, global_step,
+                            pred_stft, gt_stft, global_step,
                             tag=f"eval_vocoder/if_comparison/{i}"
                         )
 
         print(f"Eval visualization complete: {num_samples} samples logged")
-        writer.flush()
+        metrics.flush()
 
-    def log_audio(self, writer: SummaryWriter, waveform: torch.Tensor, global_step, tag: str):
-        writer.add_audio(tag, waveform, global_step, sample_rate=self.audio_sample_rate)
+    def log_audio(self, waveform: torch.Tensor, global_step, tag: str):
+        metrics.log_audio(tag, waveform, global_step, sample_rate=self.audio_sample_rate)
 
-    def log_mel_spec_visualization(self, writer: SummaryWriter, mel_spec: torch.Tensor, global_step: int, tag: str):
-        writer.add_image(tag, self._visualize_mel_spec(mel_spec.numpy(), self.audio_sample_rate), global_step)
+    def log_mel_spec_visualization(self, mel_spec: torch.Tensor, global_step: int, tag: str):
+        fig = visualization.render_mel_spectrogram(mel_spec, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
+        metrics.log_figure(tag, fig, global_step)
+        plt.close(fig)
 
-    def log_phase_error(self, writer: SummaryWriter, pred_stft, target_stft, global_step: int, tag: str):
+    def log_phase_error(self, pred_stft, target_stft, global_step: int, tag: str):
         """Log magnitude-weighted phase error map to tensorboard."""
 
         if pred_stft.dim() == 3:
@@ -268,10 +267,10 @@ class VocoderVisualizationCallback(VisualizationCallback):
         ax.set_xlabel('Time frame')
         ax.set_title('Phase Error Map (weighted by magnitude)')
 
-        writer.add_figure(tag, fig, global_step)
+        metrics.log_figure(tag, fig, global_step)
         plt.close(fig)
 
-    def log_instantaneous_frequency(self, writer: SummaryWriter, stft, global_step: int, tag: str):
+    def log_instantaneous_frequency(self, stft, global_step: int, tag: str):
         """Log instantaneous frequency deviation to tensorboard, masked by magnitude."""
 
         if stft.dim() == 3:
@@ -300,10 +299,10 @@ class VocoderVisualizationCallback(VisualizationCallback):
         ax.set_xlabel('Time frame')
         ax.set_title('Instantaneous Frequency Deviation (magnitude-masked)')
 
-        writer.add_figure(tag, fig, global_step)
+        metrics.log_figure(tag, fig, global_step)
         plt.close(fig)
 
-    def log_waveform_visualization(self, writer: SummaryWriter, pred_waveform: torch.Tensor, target_waveform: torch.Tensor, global_step: int, tag: str):
+    def log_waveform_visualization(self, pred_waveform: torch.Tensor, target_waveform: torch.Tensor, global_step: int, tag: str):
         """Log waveform comparison visualization with phase-invariant metrics to tensorboard."""
         # Keep tensors for metric computation
         pred_tensor = pred_waveform.cpu().flatten()
@@ -388,19 +387,19 @@ class VocoderVisualizationCallback(VisualizationCallback):
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
         plt.tight_layout(rect=[0, 0, 1, 0.95])  # Leave room for metrics text
-        writer.add_figure(tag, fig, global_step)
+        metrics.log_figure(tag, fig, global_step)
         plt.close(fig)
 
         # Log scalar metrics
         base_tag = tag.rsplit('/', 1)[0]  # Remove sample index from tag
-        writer.add_scalar(f"{base_tag}/si_snr_db", si_snr, global_step)
-        writer.add_scalar(f"{base_tag}/mr_stft_loss", mr_stft_loss, global_step)
-        writer.add_scalar(f"{base_tag}/envelope_l1", envelope_l1, global_step)
-        writer.add_scalar(f"{base_tag}/aligned_waveform_l1", aligned_diff.mean(), global_step)
-        writer.add_scalar(f"{base_tag}/unaligned_waveform_l1", unaligned_diff.mean(), global_step)
-        writer.add_scalar(f"{base_tag}/alignment_shift_samples", abs(shift), global_step)
+        metrics.log_scalar(f"{base_tag}/si_snr_db", si_snr, global_step)
+        metrics.log_scalar(f"{base_tag}/mr_stft_loss", mr_stft_loss, global_step)
+        metrics.log_scalar(f"{base_tag}/envelope_l1", envelope_l1, global_step)
+        metrics.log_scalar(f"{base_tag}/aligned_waveform_l1", aligned_diff.mean(), global_step)
+        metrics.log_scalar(f"{base_tag}/unaligned_waveform_l1", unaligned_diff.mean(), global_step)
+        metrics.log_scalar(f"{base_tag}/alignment_shift_samples", abs(shift), global_step)
 
-    def log_stft_magnitude_comparison(self, writer: SummaryWriter, pred_stft: torch.Tensor, target_stft: torch.Tensor, global_step: int, tag: str):
+    def log_stft_magnitude_comparison(self, pred_stft: torch.Tensor, target_stft: torch.Tensor, global_step: int, tag: str):
         """Log STFT magnitude comparison visualization to tensorboard."""
 
         if pred_stft.dim() == 3:
@@ -446,58 +445,10 @@ class VocoderVisualizationCallback(VisualizationCallback):
         plt.colorbar(im2, ax=axes[2])
 
         plt.tight_layout()
-        writer.add_figure(tag, fig, global_step)
+        metrics.log_figure(tag, fig, global_step)
         plt.close(fig)
 
-    def log_mel_comparison(self, writer: SummaryWriter, pred_mel: np.ndarray, target_mel: np.ndarray, global_step: int, tag: str):
-        """Log mel spectrogram comparison (target, predicted, error) to tensorboard."""
-        # Handle tensor input
-        if hasattr(pred_mel, 'numpy'):
-            pred_mel = pred_mel.numpy()
-        if hasattr(target_mel, 'numpy'):
-            target_mel = target_mel.numpy()
-
-        # Ensure 2D
-        if pred_mel.ndim == 3:
-            pred_mel = pred_mel.squeeze(0)
-        if target_mel.ndim == 3:
-            target_mel = target_mel.squeeze(0)
-
-        # Align lengths
-        min_t = min(pred_mel.shape[-1], target_mel.shape[-1])
-        pred_mel = pred_mel[..., :min_t]
-        target_mel = target_mel[..., :min_t]
-
-        vmin = min(pred_mel.min(), target_mel.min())
-        vmax = max(pred_mel.max(), target_mel.max())
-
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-
-        im0 = axes[0].imshow(target_mel, aspect='auto', origin='lower', cmap='magma', vmin=vmin, vmax=vmax)
-        axes[0].set_title('Target Mel')
-        axes[0].set_ylabel('Mel bin')
-        axes[0].set_xlabel('Time frame')
-        plt.colorbar(im0, ax=axes[0])
-
-        im1 = axes[1].imshow(pred_mel, aspect='auto', origin='lower', cmap='magma', vmin=vmin, vmax=vmax)
-        axes[1].set_title('Reconstructed Mel')
-        axes[1].set_ylabel('Mel bin')
-        axes[1].set_xlabel('Time frame')
-        plt.colorbar(im1, ax=axes[1])
-
-        # Error map
-        error = np.abs(pred_mel - target_mel)
-        im2 = axes[2].imshow(error, aspect='auto', origin='lower', cmap='viridis')
-        axes[2].set_title(f'Absolute Error (mean={error.mean():.4f})')
-        axes[2].set_ylabel('Mel bin')
-        axes[2].set_xlabel('Time frame')
-        plt.colorbar(im2, ax=axes[2])
-
-        plt.tight_layout()
-        writer.add_figure(tag, fig, global_step)
-        plt.close(fig)
-
-    def log_if_comparison(self, writer: SummaryWriter, pred_stft, target_stft, global_step: int, tag: str):
+    def log_if_comparison(self, pred_stft, target_stft, global_step: int, tag: str):
         if pred_stft.dim() == 3:
             pred_stft = pred_stft.squeeze(0)
         if target_stft.dim() == 3:
@@ -555,7 +506,7 @@ class VocoderVisualizationCallback(VisualizationCallback):
         plt.colorbar(im2, ax=axes[2], label='Hz')
 
         plt.tight_layout()
-        writer.add_figure(tag, fig, global_step)
+        metrics.log_figure(tag, fig, global_step)
         plt.close(fig)
 
     def _save_audio_to_file(
@@ -587,48 +538,6 @@ class VocoderVisualizationCallback(VisualizationCallback):
         )
         print(f"Audio saved to {filepath}")
 
-    def _visualize_mel_spec(self, mel_spec: np.ndarray, sample_rate: int) -> np.ndarray:
-        """Generate mel spectrogram visualization for TensorBoard."""
-        # Handle tensor input
-        if hasattr(mel_spec, 'numpy'):
-            mel_spec = mel_spec.numpy()
-
-        # Ensure 2D
-        if mel_spec.ndim == 3:
-            mel_spec = mel_spec.squeeze(0)
-
-        # Normalize to [0, 1] range
-        mel_spec_norm = (mel_spec - mel_spec.min()) / (mel_spec.max() - mel_spec.min() + 1e-8)
-
-        # Create figure with Agg backend to avoid display issues
-        fig, ax = plt.subplots(figsize=(10, 4))
-        img = librosa.display.specshow(
-            mel_spec_norm,
-            hop_length=self.audio_hop_length,
-            x_axis='time',
-            y_axis='mel',
-            sr=sample_rate,
-            n_fft=self.audio_n_fft,
-            fmin=0,
-            fmax=8000,
-            ax=ax,
-        )
-        plt.colorbar(img, format='%+2.0f dB')
-        plt.title('Mel Spectrogram')
-        plt.tight_layout()
-
-        # Convert figure to numpy array using Agg renderer
-        fig.canvas.draw()
-        width, height = fig.canvas.get_width_height()
-        data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-        data = data.reshape((height, width, 4))[:, :, :3]  # Drop alpha channel
-
-        plt.close(fig)
-
-        # TensorBoard expects (C, H, W) for add_image
-        data = data.transpose(2, 0, 1)  # (H, W, C) -> (C, H, W)
-
-        return data
 
 
 def align_waveforms_xcorr(target: torch.Tensor, reconstructed: torch.Tensor, max_shift: int = 1000) -> tuple[torch.Tensor, int]:

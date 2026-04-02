@@ -649,7 +649,14 @@ if __name__ == "__main__":
 
     trainer: CommonTrainer = get_trainer(args.command, args, run_dir, model, optimizer, device, shared_window_buffer=shared_window_buffer)
 
-    metrics.init_metrics(trainer)
+    # Initialize centralized metrics logger
+    is_main_process = args.local_rank <= 0 or not args.use_deepspeed
+    if is_main_process:
+        from utils.metrics_backend import TensorBoardBackend
+        metrics.init_metrics(TensorBoardBackend(log_dir=run_dir))
+    else:
+        from utils.metrics_backend import NoOpBackend
+        metrics.init_metrics(NoOpBackend())
 
     if args.local_rank == 0 or not args.use_deepspeed:
         trainer.start_train_print(args)

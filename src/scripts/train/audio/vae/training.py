@@ -23,6 +23,7 @@ from model.audio.vae.discriminator import (
 from model.audio.vae.vae import AudioCVAEDecoderOnly, AudioVAE
 from model.discriminator import compute_adaptive_weight
 from scripts.train.trainer import CommonTrainer
+from utils import metrics
 from utils import model_loading_utils
 
 
@@ -154,8 +155,6 @@ class AudioCVAEGANTrainer(CommonTrainer):
         if hasattr(self.train_dataset, 'get_sampler'):
             self._shard_sampler = self.train_dataset.get_sampler(shuffle=True, seed=42)
             print("Using ShardAwareSampler for efficient shard loading")
-        self.writer = None
-
         self.step_offset = step_offset if step_offset is not None else 0
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
@@ -239,12 +238,10 @@ class AudioCVAEGANTrainer(CommonTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
 
-        self._ensure_tensorboard_writer()
-
         # gets reset any time training is resumed; it can be assumed that the cli changed, so log at the step value it was resumed from
-        if not self.has_logged_cli and self.writer is not None:
-            self.writer.add_text("training/command_line", self.cmdline, global_step)
-            self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+        if not self.has_logged_cli:
+            metrics.log_text("training/command_line", self.cmdline, global_step)
+            metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
             self.has_logged_cli = True
 
         # Unfreeze F0 predictor after freeze_steps
@@ -443,20 +440,20 @@ class AudioCVAEGANTrainer(CommonTrainer):
                     d_loss = d_loss + self.r1_penalty_weight * r1_loss
 
                 # Log discriminator diagnostics
-                if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                if global_step % self.args.logging_steps == 0:
                     for key, val in d_loss_dict.items():
-                        self._log_scalar(f"train/{key}", val, global_step)
+                        metrics.log_scalar(f"train/{key}", val, global_step)
                     if self.r1_penalty_weight > 0:
-                        self._log_scalar("train/r1_penalty", r1_loss, global_step)
+                        metrics.log_scalar("train/r1_penalty", r1_loss, global_step)
                     if noise_std > 0:
-                        self._log_scalar("train/instance_noise_std", noise_std, global_step)
+                        metrics.log_scalar("train/instance_noise_std", noise_std, global_step)
 
                     # Log how different real and fake mel spectrograms are
                     with torch.no_grad():
                         real_fake_mse = torch.nn.functional.mse_loss(mel_specs, recon).item()
                         real_fake_l1 = torch.nn.functional.l1_loss(mel_specs, recon).item()
-                        self._log_scalar("train/real_fake_mse", real_fake_mse, global_step)
-                        self._log_scalar("train/real_fake_l1", real_fake_l1, global_step)
+                        metrics.log_scalar("train/real_fake_mse", real_fake_mse, global_step)
+                        metrics.log_scalar("train/real_fake_l1", real_fake_l1, global_step)
 
                 # Update discriminator (only during training when gradients are enabled)
                 if self.discriminator_optimizer is not None and self.discriminator.training and torch.is_grad_enabled():
@@ -464,13 +461,13 @@ class AudioCVAEGANTrainer(CommonTrainer):
                     d_loss.backward()
 
                     # Log gradient statistics to diagnose training issues
-                    if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                    if global_step % self.args.logging_steps == 0:
                         total_grad_norm = 0.0
                         for p in self.discriminator.parameters():
                             if p.grad is not None:
                                 total_grad_norm += p.grad.norm().item() ** 2
                         total_grad_norm = total_grad_norm ** 0.5
-                        self._log_scalar("train/d_grad_norm", total_grad_norm, global_step)
+                        metrics.log_scalar("train/d_grad_norm", total_grad_norm, global_step)
 
                     self.discriminator_optimizer.step()
 
@@ -488,11 +485,11 @@ class AudioCVAEGANTrainer(CommonTrainer):
                     feature_matching_weight=self.feature_matching_weight,
                 )
 
-            if global_step % self.args.logging_steps == 0 and self.writer is not None:
+            if global_step % self.args.logging_steps == 0:
                 for key, val in g_loss_dict.items():
-                    self._log_scalar(f"train/{key}", val, global_step)
+                    metrics.log_scalar(f"train/{key}", val, global_step)
                 # Log warmup factor
-                self._log_scalar("train/gan_warmup_factor", gan_warmup_factor, global_step)
+                metrics.log_scalar("train/gan_warmup_factor", gan_warmup_factor, global_step)
 
             # Apply warmup factor to GAN loss
             g_gan_loss = gan_warmup_factor * g_gan_loss
@@ -680,13 +677,13 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 total_loss = total_loss + effective_speaker_id_weight * speaker_id_loss
 
                 # Log speaker ID metrics
-                if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                if global_step % self.args.logging_steps == 0:
                     prefix = "train/" if model.training else "eval/"
-                    self._log_scalar(f"{prefix}speaker_id/loss", speaker_id_loss, global_step)
-                    self._log_scalar(f"{prefix}speaker_id/accuracy", speaker_id_acc, global_step, skip_zero=False)
-                    self._log_scalar(f"{prefix}speaker_id/weighted_loss", effective_speaker_id_weight * speaker_id_loss, global_step)
-                    self._log_scalar(f"{prefix}speaker_id/effective_weight", effective_speaker_id_weight, global_step)
-                    self._log_scalar(f"{prefix}speaker_id/ramp_progress", ramp_progress, global_step, skip_zero=False)
+                    metrics.log_scalar(f"{prefix}speaker_id/loss", speaker_id_loss, global_step)
+                    metrics.log_scalar(f"{prefix}speaker_id/accuracy", speaker_id_acc, global_step, skip_zero=False)
+                    metrics.log_scalar(f"{prefix}speaker_id/weighted_loss", effective_speaker_id_weight * speaker_id_loss, global_step)
+                    metrics.log_scalar(f"{prefix}speaker_id/effective_weight", effective_speaker_id_weight, global_step)
+                    metrics.log_scalar(f"{prefix}speaker_id/ramp_progress", ramp_progress, global_step, skip_zero=False)
 
         # FiLM contrastive loss - encourages different speaker embeddings to produce different outputs
         # This penalizes the decoder for ignoring speaker embeddings
@@ -756,43 +753,43 @@ class AudioCVAEGANTrainer(CommonTrainer):
             total_loss = total_loss + self.film_contrastive_loss_weight * film_contrastive_loss
 
             # Log FiLM contrastive metrics
-            if global_step % self.args.logging_steps == 0 and self.writer is not None:
+            if global_step % self.args.logging_steps == 0:
                 prefix = "train/" if model.training else "eval/"
                 # Use skip_zero=False for metrics that start at 0 due to margin rampup
-                self._log_scalar(f"{prefix}film_contrastive/loss", film_contrastive_loss, global_step, skip_zero=False)
-                self._log_scalar(f"{prefix}film_contrastive/output_diff_mean", output_diff_per_sample.mean(), global_step)
-                self._log_scalar(f"{prefix}film_contrastive/emb_similarity_mean", emb_similarity.mean(), global_step)
-                self._log_scalar(f"{prefix}film_contrastive/emb_diff_weight_mean", emb_diff_weight.mean(), global_step)
-                self._log_scalar(f"{prefix}film_contrastive/margin", margin, global_step, skip_zero=False)
-                self._log_scalar(f"{prefix}film_contrastive/margin_alpha", film_contrastive_margin_alpha, global_step, skip_zero=False)
-                self._log_scalar(f"{prefix}film_contrastive/weighted_loss",
+                metrics.log_scalar(f"{prefix}film_contrastive/loss", film_contrastive_loss, global_step, skip_zero=False)
+                metrics.log_scalar(f"{prefix}film_contrastive/output_diff_mean", output_diff_per_sample.mean(), global_step)
+                metrics.log_scalar(f"{prefix}film_contrastive/emb_similarity_mean", emb_similarity.mean(), global_step)
+                metrics.log_scalar(f"{prefix}film_contrastive/emb_diff_weight_mean", emb_diff_weight.mean(), global_step)
+                metrics.log_scalar(f"{prefix}film_contrastive/margin", margin, global_step, skip_zero=False)
+                metrics.log_scalar(f"{prefix}film_contrastive/margin_alpha", film_contrastive_margin_alpha, global_step, skip_zero=False)
+                metrics.log_scalar(f"{prefix}film_contrastive/weighted_loss",
                                self.film_contrastive_loss_weight * film_contrastive_loss, global_step, skip_zero=False)
 
         # Log losses (skip non-loss values like learned_speaker_embedding)
-        if global_step % self.args.logging_steps == 0 and self.writer is not None:
+        if global_step % self.args.logging_steps == 0:
             prefix = "train/" if model.training else "eval/"
             for loss_name, loss in losses.items():
                 # Skip non-scalar tensors (e.g., learned_speaker_embedding)
                 if isinstance(loss, torch.Tensor) and loss.numel() > 1 and not loss_name.endswith("_loss"):
                     continue
-                self._log_scalar(f"{prefix}vae_{loss_name}", loss.mean() if isinstance(loss, torch.Tensor) else loss, global_step)
+                metrics.log_scalar(f"{prefix}vae_{loss_name}", loss.mean() if isinstance(loss, torch.Tensor) else loss, global_step)
             # Log mu and logvar stats
             if mu is not None and logvar is not None:
-                self._log_scalar(f"{prefix}vae_mu_mean", mu.mean(), global_step)
-                self._log_scalar(f"{prefix}vae_mu_std", mu.std(), global_step)
-                self._log_scalar(f"{prefix}vae_logvar_mean", logvar.mean(), global_step)
+                metrics.log_scalar(f"{prefix}vae_mu_mean", mu.mean(), global_step)
+                metrics.log_scalar(f"{prefix}vae_mu_std", mu.std(), global_step)
+                metrics.log_scalar(f"{prefix}vae_logvar_mean", logvar.mean(), global_step)
                 # Mean variance (what diffusion will see) - useful for setting latent_std
-                self._log_scalar(f"{prefix}vae_mean_variance", logvar.exp().mean(), global_step)
-                self._log_scalar(f"{prefix}vae_mean_std", logvar.exp().mean().sqrt(), global_step)
+                metrics.log_scalar(f"{prefix}vae_mean_variance", logvar.exp().mean(), global_step)
+                metrics.log_scalar(f"{prefix}vae_mean_std", logvar.exp().mean().sqrt(), global_step)
 
-            self._log_scalar(f"{prefix}g_gan_loss", g_gan_loss, global_step)
-            self._log_scalar(f"{prefix}total_loss", total_loss.mean(), global_step)
+            metrics.log_scalar(f"{prefix}g_gan_loss", g_gan_loss, global_step)
+            metrics.log_scalar(f"{prefix}total_loss", total_loss.mean(), global_step)
             # Log adaptive weight when using adaptive weighting
             if self.use_adaptive_weight and self.gan_already_started:
-                self._log_scalar(f"{prefix}adaptive_gan_weight", adaptive_weight, global_step)
+                metrics.log_scalar(f"{prefix}adaptive_gan_weight", adaptive_weight, global_step)
             # Log KL weight multiplier when annealing is enabled
             if self.kl_annealing_steps > 0 and mu is not None and logvar is not None:
-                self._log_scalar(f"{prefix}kl_weight_multiplier", kl_weight_multiplier, global_step)
+                metrics.log_scalar(f"{prefix}kl_weight_multiplier", kl_weight_multiplier, global_step)
 
             # Per-channel latent statistics (for detecting channel collapse)
             # mu shape: [B, C, T] - compute stats per channel (average over batch, mel, time)
@@ -804,36 +801,36 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 per_channel_kl = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).mean(dim=(0, 2))  # [C]
 
                 for c in range(mu.shape[1]):
-                    self._log_scalar(f"{prefix}channel_{c}/mu_mean", per_channel_mu_mean[c], global_step)
-                    self._log_scalar(f"{prefix}channel_{c}/mu_std", per_channel_mu_std[c], global_step)
-                    self._log_scalar(f"{prefix}channel_{c}/variance", per_channel_var[c], global_step)
-                    self._log_scalar(f"{prefix}channel_{c}/kl", per_channel_kl[c], global_step)
+                    metrics.log_scalar(f"{prefix}channel_{c}/mu_mean", per_channel_mu_mean[c], global_step)
+                    metrics.log_scalar(f"{prefix}channel_{c}/mu_std", per_channel_mu_std[c], global_step)
+                    metrics.log_scalar(f"{prefix}channel_{c}/variance", per_channel_var[c], global_step)
+                    metrics.log_scalar(f"{prefix}channel_{c}/kl", per_channel_kl[c], global_step)
 
             # Log audio perceptual losses
             if audio_perceptual_losses:
                 for loss_name, loss_val in audio_perceptual_losses.items():
-                    self._log_scalar(f"{prefix}audio_perceptual/{loss_name}", loss_val, global_step)
-                self._log_scalar(f"{prefix}audio_perceptual_weighted", self.audio_perceptual_loss_weight * audio_perceptual_loss_value, global_step)
+                    metrics.log_scalar(f"{prefix}audio_perceptual/{loss_name}", loss_val, global_step)
+                metrics.log_scalar(f"{prefix}audio_perceptual_weighted", self.audio_perceptual_loss_weight * audio_perceptual_loss_value, global_step)
 
             # Log SIVE perceptual loss
             if sive_perceptual_enabled:
-                self._log_scalar(f"{prefix}sive_perceptual_loss", sive_perceptual_loss_value, global_step)
-                self._log_scalar(f"{prefix}sive_perceptual_weighted", self.sive_perceptual_loss_weight * sive_perceptual_loss_value, global_step)
+                metrics.log_scalar(f"{prefix}sive_perceptual_loss", sive_perceptual_loss_value, global_step)
+                metrics.log_scalar(f"{prefix}sive_perceptual_weighted", self.sive_perceptual_loss_weight * sive_perceptual_loss_value, global_step)
 
             # Log speaker embedding statistics (learned or pretrained, whichever is used for decoding)
             if decode_speaker_embedding is not None:
                 # Flatten to [B, D] if needed
                 spk_emb = decode_speaker_embedding.squeeze(1) if decode_speaker_embedding.dim() == 3 else decode_speaker_embedding
-                self._log_scalar(f"{prefix}speaker_emb/mean", spk_emb.mean(), global_step)
-                self._log_scalar(f"{prefix}speaker_emb/std", spk_emb.std(), global_step)
+                metrics.log_scalar(f"{prefix}speaker_emb/mean", spk_emb.mean(), global_step)
+                metrics.log_scalar(f"{prefix}speaker_emb/std", spk_emb.std(), global_step)
                 # L2 norm per sample, then average
                 l2_norms = torch.norm(spk_emb, p=2, dim=-1)
-                self._log_scalar(f"{prefix}speaker_emb/l2_norm_mean", l2_norms.mean(), global_step)
-                self._log_scalar(f"{prefix}speaker_emb/l2_norm_min", l2_norms.min(), global_step)
-                self._log_scalar(f"{prefix}speaker_emb/l2_norm_max", l2_norms.max(), global_step)
+                metrics.log_scalar(f"{prefix}speaker_emb/l2_norm_mean", l2_norms.mean(), global_step)
+                metrics.log_scalar(f"{prefix}speaker_emb/l2_norm_min", l2_norms.min(), global_step)
+                metrics.log_scalar(f"{prefix}speaker_emb/l2_norm_max", l2_norms.max(), global_step)
                 # Log whether using learned embedding
                 if learned_speaker_embedding is not None:
-                    self._log_scalar(f"{prefix}speaker_emb/is_learned", 1.0, global_step)
+                    metrics.log_scalar(f"{prefix}speaker_emb/is_learned", 1.0, global_step)
 
                     # Log within-speaker vs between-speaker similarity (measures embedding separability)
                     speaker_ids = inputs.get("speaker_ids", None)
@@ -860,25 +857,25 @@ class AudioCVAEGANTrainer(CommonTrainer):
 
                         if within_mask.any():
                             within_sim = sim_matrix[within_mask].mean()
-                            self._log_scalar(f"{prefix}speaker_emb/within_speaker_sim", within_sim, global_step)
+                            metrics.log_scalar(f"{prefix}speaker_emb/within_speaker_sim", within_sim, global_step)
 
                         if between_mask.any():
                             between_sim = sim_matrix[between_mask].mean()
-                            self._log_scalar(f"{prefix}speaker_emb/between_speaker_sim", between_sim, global_step)
+                            metrics.log_scalar(f"{prefix}speaker_emb/between_speaker_sim", between_sim, global_step)
 
                         if within_mask.any() and between_mask.any():
                             sim_margin = within_sim - between_sim
-                            self._log_scalar(f"{prefix}speaker_emb/sim_margin", sim_margin, global_step)
+                            metrics.log_scalar(f"{prefix}speaker_emb/sim_margin", sim_margin, global_step)
 
                         # === Debug metrics for diagnosing embedding collapse ===
 
                         # 1. All-pairs similarity statistics (excluding self-similarity)
                         off_diag_mask = ~eye_mask
                         all_pairs_sim = sim_matrix[off_diag_mask]
-                        self._log_scalar(f"{prefix}speaker_emb/all_pairs_sim_min", all_pairs_sim.min(), global_step)
-                        self._log_scalar(f"{prefix}speaker_emb/all_pairs_sim_max", all_pairs_sim.max(), global_step)
-                        self._log_scalar(f"{prefix}speaker_emb/all_pairs_sim_median", all_pairs_sim.median(), global_step)
-                        self._log_scalar(f"{prefix}speaker_emb/all_pairs_sim_std", all_pairs_sim.std(), global_step)
+                        metrics.log_scalar(f"{prefix}speaker_emb/all_pairs_sim_min", all_pairs_sim.min(), global_step)
+                        metrics.log_scalar(f"{prefix}speaker_emb/all_pairs_sim_max", all_pairs_sim.max(), global_step)
+                        metrics.log_scalar(f"{prefix}speaker_emb/all_pairs_sim_median", all_pairs_sim.median(), global_step)
+                        metrics.log_scalar(f"{prefix}speaker_emb/all_pairs_sim_std", all_pairs_sim.std(), global_step)
 
                         # 2. Per-dimension statistics (detect dimension collapse)
                         # emb_flat shape: [B, D]
@@ -887,22 +884,22 @@ class AudioCVAEGANTrainer(CommonTrainer):
                         # Count how many dimensions have very low variance (< 0.01)
                         collapsed_dims = (per_dim_std < 0.01).sum().item()
                         active_dims = (per_dim_std >= 0.01).sum().item()
-                        self._log_scalar(f"{prefix}speaker_emb/collapsed_dims", collapsed_dims, global_step, skip_zero=False)
-                        self._log_scalar(f"{prefix}speaker_emb/active_dims", active_dims, global_step, skip_zero=False)
-                        self._log_scalar(f"{prefix}speaker_emb/per_dim_std_mean", per_dim_std.mean(), global_step)
-                        self._log_scalar(f"{prefix}speaker_emb/per_dim_std_min", per_dim_std.min(), global_step)
-                        self._log_scalar(f"{prefix}speaker_emb/per_dim_std_max", per_dim_std.max(), global_step)
+                        metrics.log_scalar(f"{prefix}speaker_emb/collapsed_dims", collapsed_dims, global_step, skip_zero=False)
+                        metrics.log_scalar(f"{prefix}speaker_emb/active_dims", active_dims, global_step, skip_zero=False)
+                        metrics.log_scalar(f"{prefix}speaker_emb/per_dim_std_mean", per_dim_std.mean(), global_step)
+                        metrics.log_scalar(f"{prefix}speaker_emb/per_dim_std_min", per_dim_std.min(), global_step)
+                        metrics.log_scalar(f"{prefix}speaker_emb/per_dim_std_max", per_dim_std.max(), global_step)
 
                         # 3. Similarity to batch centroid (are all embeddings collapsing to same point?)
                         centroid = emb_flat.mean(dim=0, keepdim=True)  # [1, D]
                         centroid_norm = F.normalize(centroid, dim=-1)
                         sim_to_centroid = (emb_norm * centroid_norm).sum(dim=-1)  # [B]
-                        self._log_scalar(f"{prefix}speaker_emb/sim_to_centroid_mean", sim_to_centroid.mean(), global_step)
-                        self._log_scalar(f"{prefix}speaker_emb/sim_to_centroid_min", sim_to_centroid.min(), global_step)
+                        metrics.log_scalar(f"{prefix}speaker_emb/sim_to_centroid_mean", sim_to_centroid.mean(), global_step)
+                        metrics.log_scalar(f"{prefix}speaker_emb/sim_to_centroid_min", sim_to_centroid.min(), global_step)
                         # High mean + low variance = collapse
 
                         # 4. L2 norm variance (should have some variation across samples)
-                        self._log_scalar(f"{prefix}speaker_emb/l2_norm_std", l2_norms.std(), global_step)
+                        metrics.log_scalar(f"{prefix}speaker_emb/l2_norm_std", l2_norms.std(), global_step)
 
                         # 5. Effective dimensionality via PCA-like measure
                         # Compute variance explained by top-k principal components
@@ -920,18 +917,18 @@ class AudioCVAEGANTrainer(CommonTrainer):
                                 # Effective dimensionality: how many dims to explain 95% variance
                                 eff_dims_95 = (cumvar < 0.95).sum().item() + 1
                                 eff_dims_90 = (cumvar < 0.90).sum().item() + 1
-                                self._log_scalar(f"{prefix}speaker_emb/eff_dims_95pct", eff_dims_95, global_step, skip_zero=False)
-                                self._log_scalar(f"{prefix}speaker_emb/eff_dims_90pct", eff_dims_90, global_step, skip_zero=False)
+                                metrics.log_scalar(f"{prefix}speaker_emb/eff_dims_95pct", eff_dims_95, global_step, skip_zero=False)
+                                metrics.log_scalar(f"{prefix}speaker_emb/eff_dims_90pct", eff_dims_90, global_step, skip_zero=False)
                                 # Top singular value ratio (if top is dominant, embeddings are 1D)
                                 top1_ratio = var_explained[0].item() if len(var_explained) > 0 else 0.0
-                                self._log_scalar(f"{prefix}speaker_emb/top1_var_ratio", top1_ratio, global_step)
+                                metrics.log_scalar(f"{prefix}speaker_emb/top1_var_ratio", top1_ratio, global_step)
                             except Exception:
                                 pass  # SVD can fail on degenerate matrices
 
             # Log FiLM statistics (for diagnosing speaker conditioning health)
             if film_stats is not None:
                 for stat_name, stat_value in film_stats.items():
-                    self._log_scalar(f"{prefix}film/{stat_name}", stat_value, global_step)
+                    metrics.log_scalar(f"{prefix}film/{stat_name}", stat_value, global_step)
 
         outputs = {
             "loss": total_loss,

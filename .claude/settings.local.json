@@ -3,6 +3,10 @@
     "allow": [
       "WebSearch",
       "Bash(pip show:*)",
+      "Bash(python -c*)",
+      "Bash(python3 -c*)",
+      "Bash(PYTHONPATH=* python -c*)",
+      "Bash(PYTHONPATH=* python3 -c*)",
       "Bash(grep:*)",
       "Bash(tree:*)",
       "Bash(cat:*)",

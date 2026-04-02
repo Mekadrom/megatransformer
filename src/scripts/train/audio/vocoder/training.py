@@ -7,15 +7,13 @@ import torch.nn.functional as F
 
 from typing import Any, Optional
 
-from transformers.integrations.integration_utils import TensorBoardCallback
-
 from config.audio.vocoder.vocoder import VocoderConfig
 from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss, Wav2Vec2PerceptualLoss
 from model.audio.vocoder.discriminator import WaveformDomainDiscriminator, compute_discriminator_losses, compute_generator_losses
 from model.audio.vocoder.vocoder import Vocoder
 from model.discriminator import compute_adaptive_weight
 from scripts.train.trainer import CommonTrainer
-from utils import model_loading_utils
+from utils import metrics, model_loading_utils
 from utils.audio_utils import SharedWindowBuffer
 
 
@@ -134,7 +132,6 @@ class VocoderGANTrainer(CommonTrainer):
         self.msd_fm_loss_weight = msd_fm_loss_weight
         self.mrsd_fm_loss_weight = mrsd_fm_loss_weight
         self.use_adaptive_weight = use_adaptive_weight
-        self.writer = None
 
         self.has_logged_cli = False
 
@@ -171,11 +168,9 @@ class VocoderGANTrainer(CommonTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
 
-        self._ensure_tensorboard_writer()
-
         if not self.has_logged_cli:
-            self.writer.add_text("training/command_line", self.cmdline, global_step)
-            self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            metrics.log_text("training/command_line", self.cmdline, global_step)
+            metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
             self.has_logged_cli = True
 
         # Forward pass through generator (vocoder)
@@ -357,16 +352,16 @@ class VocoderGANTrainer(CommonTrainer):
                         wav2vec2_loss_weight * wav2vec2_loss_value)
 
         # log weights
-        if global_step % self.args.logging_steps == 0 and self.writer is not None:
-            self._log_scalar("train/loss_weights/sc_loss_weight", sc_loss_weight)
-            self._log_scalar("train/loss_weights/mag_loss_weight", mag_loss_weight)
-            self._log_scalar("train/loss_weights/waveform_l1_loss_weight", waveform_l1_loss_weight)
-            self._log_scalar("train/loss_weights/phase_loss_weight", phase_loss_weight)
-            self._log_scalar("train/loss_weights/high_freq_stft_loss_weight", high_freq_stft_loss_weight)
-            self._log_scalar("train/loss_weights/high_freq_mag_penalty_weight", high_freq_mag_penalty_weight)
-            self._log_scalar("train/loss_weights/direct_mag_loss_weight", direct_mag_loss_weight)
-            self._log_scalar("train/loss_weights/mel_recon_loss_weight", mel_recon_loss_weight)
-            self._log_scalar("train/loss_weights/wav2vec2_loss_weight", wav2vec2_loss_weight)
+        if global_step % self.args.logging_steps == 0:
+            metrics.log_scalar("train/loss_weights/sc_loss_weight", sc_loss_weight, global_step)
+            metrics.log_scalar("train/loss_weights/mag_loss_weight", mag_loss_weight, global_step)
+            metrics.log_scalar("train/loss_weights/waveform_l1_loss_weight", waveform_l1_loss_weight, global_step)
+            metrics.log_scalar("train/loss_weights/phase_loss_weight", phase_loss_weight, global_step)
+            metrics.log_scalar("train/loss_weights/high_freq_stft_loss_weight", high_freq_stft_loss_weight, global_step)
+            metrics.log_scalar("train/loss_weights/high_freq_mag_penalty_weight", high_freq_mag_penalty_weight, global_step)
+            metrics.log_scalar("train/loss_weights/direct_mag_loss_weight", direct_mag_loss_weight, global_step)
+            metrics.log_scalar("train/loss_weights/mel_recon_loss_weight", mel_recon_loss_weight, global_step)
+            metrics.log_scalar("train/loss_weights/wav2vec2_loss_weight", wav2vec2_loss_weight, global_step)
 
         outputs.update({
             "loss": recon_loss,
@@ -433,19 +428,19 @@ class VocoderGANTrainer(CommonTrainer):
                 
                 d_loss = self.mpd_loss_weight * d_loss_mpd + self.msd_loss_weight * d_loss_msd + self.mrsd_loss_weight * d_loss_mrsd
 
-                if global_step % self.args.logging_steps == 0 and self.writer is not None:
+                if global_step % self.args.logging_steps == 0:
                     for disc_crit in disc_real.keys():
                         for o, output in enumerate(disc_real[disc_crit][0]):
-                            self._log_scalar(f"train/disc_real_{disc_crit}/{o}/avg", output.mean())
+                            metrics.log_scalar(f"train/disc_real_{disc_crit}/{o}/avg", output.mean(), global_step)
 
                     for disc_crit in disc_fake.keys():
                         for o, output in enumerate(disc_fake[disc_crit][0]):
-                            self._log_scalar(f"train/disc_fake_{disc_crit}/{o}/avg", output.mean())
-                        
-                    self._log_scalar("train/d_loss_mpd", d_loss_mpd)
-                    self._log_scalar("train/d_loss_msd", d_loss_msd)
-                    self._log_scalar("train/d_loss_mrsd", d_loss_mrsd)
-                    self._log_scalar("train/d_loss_total", d_loss)
+                            metrics.log_scalar(f"train/disc_fake_{disc_crit}/{o}/avg", output.mean(), global_step)
+
+                    metrics.log_scalar("train/d_loss_mpd", d_loss_mpd, global_step)
+                    metrics.log_scalar("train/d_loss_msd", d_loss_msd, global_step)
+                    metrics.log_scalar("train/d_loss_mrsd", d_loss_mrsd, global_step)
+                    metrics.log_scalar("train/d_loss_total", d_loss, global_step)
 
                 # Update discriminator (only during training when gradients are enabled)
                 if self.discriminator_optimizer is not None and self.discriminator.training and torch.is_grad_enabled():
@@ -475,16 +470,16 @@ class VocoderGANTrainer(CommonTrainer):
             g_loss_fm = self.mpd_fm_loss_weight * g_fm_mpd + self.msd_fm_loss_weight * g_fm_msd + self.mrsd_fm_loss_weight * g_fm_mrsd
             g_loss_gan = self.gan_adv_loss_weight * g_loss_adv + self.gan_feature_matching_loss_weight * g_loss_fm
 
-            if global_step % self.args.logging_steps == 0 and self.writer is not None:
-                self._log_scalar("train/g_adv_mpd", g_adv_mpd)
-                self._log_scalar("train/g_fm_mpd", g_fm_mpd)
-                self._log_scalar("train/g_adv_msd", g_adv_msd)
-                self._log_scalar("train/g_fm_msd", g_fm_msd)
-                self._log_scalar("train/g_adv_mrsd", g_adv_mrsd)
-                self._log_scalar("train/g_fm_mrsd", g_fm_mrsd)
-                self._log_scalar("train/g_adv_total", g_loss_adv)
-                self._log_scalar("train/g_fm_total", g_loss_fm)
-                self._log_scalar("train/g_loss_total", g_loss_gan)
+            if global_step % self.args.logging_steps == 0:
+                metrics.log_scalar("train/g_adv_mpd", g_adv_mpd, global_step)
+                metrics.log_scalar("train/g_fm_mpd", g_fm_mpd, global_step)
+                metrics.log_scalar("train/g_adv_msd", g_adv_msd, global_step)
+                metrics.log_scalar("train/g_fm_msd", g_fm_msd, global_step)
+                metrics.log_scalar("train/g_adv_mrsd", g_adv_mrsd, global_step)
+                metrics.log_scalar("train/g_fm_mrsd", g_fm_mrsd, global_step)
+                metrics.log_scalar("train/g_adv_total", g_loss_adv, global_step)
+                metrics.log_scalar("train/g_fm_total", g_loss_fm, global_step)
+                metrics.log_scalar("train/g_loss_total", g_loss_gan, global_step)
 
         # Total generator loss with optional adaptive weighting
         adaptive_weight = torch.tensor(self.gan_adv_loss_weight, device=mel_specs.device)
@@ -511,20 +506,20 @@ class VocoderGANTrainer(CommonTrainer):
         total_loss = recon_loss + adaptive_weight * g_loss_gan
 
         # Log individual losses
-        if global_step % self.args.logging_steps == 0 and self.writer is not None:
+        if global_step % self.args.logging_steps == 0:
             prefix = "train/" if model.training else "eval/"
-            self._log_scalar(f"{prefix}waveform_l1", outputs.get("waveform_l1", 0))
-            self._log_scalar(f"{prefix}sc_loss", outputs.get("sc_loss", 0))
-            self._log_scalar(f"{prefix}mag_loss", outputs.get("mag_loss", 0))
-            self._log_scalar(f"{prefix}mel_recon_loss", outputs.get("mel_recon_loss", 0))
-            self._log_scalar(f"{prefix}phase_ip_loss", outputs.get("phase_ip_loss", 0))
-            self._log_scalar(f"{prefix}phase_iaf_loss", outputs.get("phase_iaf_loss", 0))
-            self._log_scalar(f"{prefix}phase_gd_loss", outputs.get("phase_gd_loss", 0))
-            self._log_scalar(f"{prefix}phase_loss", outputs.get("phase_loss", 0))
-            self._log_scalar(f"{prefix}high_freq_stft_loss", outputs.get("high_freq_stft_loss", 0))
-            self._log_scalar(f"{prefix}wav2vec2_loss", outputs.get("wav2vec2_loss", 0))
-            self._log_scalar(f"{prefix}recon_loss", recon_loss)
-            self._log_scalar(f"{prefix}total_loss", total_loss)
+            metrics.log_scalar(f"{prefix}waveform_l1", outputs.get("waveform_l1", 0), global_step)
+            metrics.log_scalar(f"{prefix}sc_loss", outputs.get("sc_loss", 0), global_step)
+            metrics.log_scalar(f"{prefix}mag_loss", outputs.get("mag_loss", 0), global_step)
+            metrics.log_scalar(f"{prefix}mel_recon_loss", outputs.get("mel_recon_loss", 0), global_step)
+            metrics.log_scalar(f"{prefix}phase_ip_loss", outputs.get("phase_ip_loss", 0), global_step)
+            metrics.log_scalar(f"{prefix}phase_iaf_loss", outputs.get("phase_iaf_loss", 0), global_step)
+            metrics.log_scalar(f"{prefix}phase_gd_loss", outputs.get("phase_gd_loss", 0), global_step)
+            metrics.log_scalar(f"{prefix}phase_loss", outputs.get("phase_loss", 0), global_step)
+            metrics.log_scalar(f"{prefix}high_freq_stft_loss", outputs.get("high_freq_stft_loss", 0), global_step)
+            metrics.log_scalar(f"{prefix}wav2vec2_loss", outputs.get("wav2vec2_loss", 0), global_step)
+            metrics.log_scalar(f"{prefix}recon_loss", recon_loss, global_step)
+            metrics.log_scalar(f"{prefix}total_loss", total_loss, global_step)
 
         return (total_loss, outputs) if return_outputs else total_loss
 
@@ -555,25 +550,6 @@ class VocoderGANTrainer(CommonTrainer):
 
         # Return (loss, logits, labels) - for VAE we don't have traditional logits/labels
         return (loss, None, None)
-
-    def _log_scalar(self, tag, value):
-        global_step = self.state.global_step + self.step_offset
-        if self.writer is not None:
-            if isinstance(value, torch.Tensor):
-                value = value.item()
-            if value != 0.0:
-                self.writer.add_scalar(tag, value, global_step)
-
-    def _ensure_tensorboard_writer(self):
-        if hasattr(self, "writer") and self.writer is not None:
-            return
-
-        for callback in self.callback_handler.callbacks:
-            if isinstance(callback, TensorBoardCallback):
-                self.writer = callback.tb_writer
-                return
-
-        self.writer = None
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         """Save both generator and discriminator."""

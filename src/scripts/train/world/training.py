@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from model.world.world_model import MegaTransformerWorldModel
 from scripts.train.trainer import CommonTrainer
-from utils import model_loading_utils, megatransformer_utils
+from utils import model_loading_utils, megatransformer_utils, metrics
 
 
 class WorldModelTrainer(CommonTrainer):
@@ -88,19 +88,15 @@ class WorldModelTrainer(CommonTrainer):
         self.latent_l1_loss = nn.L1Loss()
         self.latent_mse_loss = nn.MSELoss()
 
-        self.writer = None
-
         # Per-module gradient norm tracking — built lazily in _get_module_groups()
         self._module_groups = None
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
 
-        self._ensure_tensorboard_writer()
-
-        if not self.has_logged_cli and self.writer is not None:
-            self.writer.add_text("training/command_line", self.cmdline, global_step)
-            self.writer.add_text("training/git_commit_hash", self.git_commit_hash, global_step)
+        if not self.has_logged_cli:
+            metrics.log_text("training/command_line", self.cmdline, global_step)
+            metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
             self.has_logged_cli = True
 
         # ── Prepare inputs for world model forward ──────────────────────
@@ -376,15 +372,15 @@ class WorldModelTrainer(CommonTrainer):
 
         # ── TensorBoard logging ─────────────────────────────────────────
 
-        if self.writer is not None and global_step % self.args.logging_steps == 0:
-            self._log_scalar("world/total_loss", total_loss, global_step)
+        if global_step % self.args.logging_steps == 0:
+            metrics.log_scalar("world/total_loss", total_loss, global_step)
             for name, value in loss_components.items():
-                self._log_scalar(f"world/{name}", value, global_step)
+                metrics.log_scalar(f"world/{name}", value, global_step)
 
             # Recurrent output stats (variance and entropy per modality)
             for key, value in outputs.items():
                 if key.startswith("recurrent_out/"):
-                    self._log_scalar(f"world/{key}", value, global_step)
+                    metrics.log_scalar(f"world/{key}", value, global_step)
 
         if return_outputs:
             return total_loss, outputs
@@ -461,8 +457,6 @@ class WorldModelTrainer(CommonTrainer):
 
     def _log_grad_norms(self, global_step):
         """Compute and log L2 and RMS gradient norms per module group."""
-        if self.writer is None:
-            return
         for name, module in self._get_module_groups().items():
             total_norm_sq = 0.0
             num_params = 0
@@ -470,9 +464,9 @@ class WorldModelTrainer(CommonTrainer):
                 if p.grad is not None:
                     total_norm_sq += p.grad.data.float().norm(2).item() ** 2
                     num_params += p.numel()
-            self._log_scalar(f"world/grad_norm/{name}", total_norm_sq ** 0.5, global_step)
+            metrics.log_scalar(f"world/grad_norm/{name}", total_norm_sq ** 0.5, global_step)
             if num_params > 0:
-                self._log_scalar(f"world/grad_rms/{name}", (total_norm_sq / num_params) ** 0.5, global_step)
+                metrics.log_scalar(f"world/grad_rms/{name}", (total_norm_sq / num_params) ** 0.5, global_step)
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Override to log per-module gradient norms after backward."""

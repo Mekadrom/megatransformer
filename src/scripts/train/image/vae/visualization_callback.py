@@ -6,14 +6,14 @@ import torch
 
 from PIL import Image
 from torch.amp import autocast
-from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from transformers import Trainer
 from typing import Optional
 
 from model.image.vae.vae import ImageVAE
 from scripts.train.visualization_callback import VisualizationCallback
-from utils.train_utils import get_writer
+from utils import metrics
+from utils import visualization
 
 
 class ImageVAEVisualizationCallback(VisualizationCallback):
@@ -55,7 +55,7 @@ class ImageVAEVisualizationCallback(VisualizationCallback):
         else:
             return torch.device("cpu")
 
-    def _log_reconstruction(self, writer, model, image, global_step, prefix, idx, args, log_attention: bool = True):
+    def _log_reconstruction(self, model, image, global_step, prefix, idx, args, log_attention: bool = True):
         """Log a single image reconstruction to TensorBoard."""
         device = self._get_device()
         dtype = torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32
@@ -78,26 +78,26 @@ class ImageVAEVisualizationCallback(VisualizationCallback):
                 recon_unnorm = torch.clamp(recon_unnorm, 0, 1)
 
                 # Log original and reconstructed images
-                writer.add_image(f"{prefix}/original/{idx}", orig_unnorm, global_step)
-                writer.add_image(f"{prefix}/recon/{idx}", recon_unnorm, global_step)
+                metrics.log_image(f"{prefix}/original/{idx}", orig_unnorm, global_step)
+                metrics.log_image(f"{prefix}/recon/{idx}", recon_unnorm, global_step)
 
                 # Generate mu-only reconstruction (no sampling, z = mu)
                 # This is what diffusion will see during inference
                 recon_mu_only = model.decode(mu)
                 recon_mu_only_unnorm = self.unnormalize(recon_mu_only[0].float().cpu())
                 recon_mu_only_unnorm = torch.clamp(recon_mu_only_unnorm, 0, 1)
-                writer.add_image(f"{prefix}/recon_mu_only/{idx}", recon_mu_only_unnorm, global_step)
+                metrics.log_image(f"{prefix}/recon_mu_only/{idx}", recon_mu_only_unnorm, global_step)
 
                 # Log per-example losses
                 for loss_name, loss_val in losses.items():
                     if isinstance(loss_val, torch.Tensor):
                         loss_val = loss_val.item()
-                    writer.add_scalar(f"{prefix}/example_{idx}/{loss_name}", loss_val, global_step)
+                    metrics.log_scalar(f"{prefix}/example_{idx}/{loss_name}", loss_val, global_step)
 
                 # Normalize and log mu as latent_dim number of grayscale images
                 mu_unnorm = (mu[0].float().cpu() - mu[0].float().cpu().min()) / (mu[0].float().cpu().max() - mu[0].float().cpu().min() + 1e-5)
                 for c in range(mu_unnorm.shape[0]):
-                    writer.add_image(f"{prefix}/example_{idx}/mu_channel_{c}", mu_unnorm[c:c+1, :, :], global_step)
+                    metrics.log_image(f"{prefix}/example_{idx}/mu_channel_{c}", mu_unnorm[c:c+1, :, :], global_step)
 
                 # Log attention weights if available
                 if log_attention:
@@ -107,20 +107,18 @@ class ImageVAEVisualizationCallback(VisualizationCallback):
                     # Log encoder attention
                     enc_weights = enc_attn.get("weights") if enc_attn else None
                     if enc_weights is not None:
-                        self._log_attention_weights(
-                            writer, enc_weights, global_step,
-                            tag_prefix=f"{prefix}/example_{idx}/encoder_attention",
-                            H=H, W=W,
-                        )
+                        figs = visualization.render_attention_weights(enc_weights, H, W)
+                        for subtag, fig in figs.items():
+                            metrics.log_figure(f"{prefix}/example_{idx}/encoder_attention/{subtag}", fig, global_step)
+                            plt.close(fig)
 
                     # Log decoder attention
                     dec_weights = dec_attn.get("weights") if dec_attn else None
                     if dec_weights is not None:
-                        self._log_attention_weights(
-                            writer, dec_weights, global_step,
-                            tag_prefix=f"{prefix}/example_{idx}/decoder_attention",
-                            H=H, W=W,
-                        )
+                        figs = visualization.render_attention_weights(dec_weights, H, W)
+                        for subtag, fig in figs.items():
+                            metrics.log_figure(f"{prefix}/example_{idx}/decoder_attention/{subtag}", fig, global_step)
+                            plt.close(fig)
 
     def on_evaluate(self, args, state, control, model: ImageVAE = None, **kwargs):
         """Generate and log reconstructions during evaluation."""
@@ -129,9 +127,9 @@ class ImageVAEVisualizationCallback(VisualizationCallback):
         if not state.is_world_process_zero:
             return
 
-        writer = get_writer(self.trainer)
-        if writer is None:
-            print("No TensorBoard writer found, skipping eval visualization...")
+        logger = metrics.get_logger()
+        if logger is None:
+            print("No metrics logger found, skipping eval visualization...")
             return
 
         print(f"Generating eval image reconstructions at step {global_step}...")
@@ -151,6 +149,6 @@ class ImageVAEVisualizationCallback(VisualizationCallback):
         for i, idx in enumerate(indices):
             sample = eval_dataset[idx]
             image = sample["image"]
-            self._log_reconstruction(writer, model, image, global_step, "eval_vae", i, args)
+            self._log_reconstruction(model, image, global_step, "eval_vae", i, args)
 
-        writer.flush()
+        metrics.flush()
