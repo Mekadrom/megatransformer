@@ -66,6 +66,8 @@ def create_or_load_model(args, shared_window_buffer: Optional[SharedWindowBuffer
 
 def get_training_args(args, run_dir) -> TrainingArguments:
     os.environ["TENSORBOARD_LOGGING_DIR"] = run_dir
+    backend = getattr(args, 'metrics_backend', 'tensorboard')
+    report_to = backend if backend in ("tensorboard", "wandb") else "none"
     return TrainingArguments(
         output_dir=run_dir,
         lr_scheduler_type=args.lr_scheduler_type,
@@ -77,7 +79,7 @@ def get_training_args(args, run_dir) -> TrainingArguments:
         num_train_epochs=args.num_train_epochs if args.num_train_epochs > 0 else 1,
         max_steps=args.max_steps if args.max_steps > 0 else -1,
         weight_decay=args.weight_decay,
-        report_to="tensorboard",
+        report_to=report_to,
         logging_dir=run_dir,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
@@ -571,6 +573,7 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--eval_strategy', type=str, default='epoch', help='Evaluation strategy: steps or epoch')
         sub_parser.add_argument('--eval_steps', type=int, default=0, help='Evaluation steps')
         sub_parser.add_argument('--save_steps', type=int, default=500, help='Save steps')
+        sub_parser.add_argument('--metrics_backend', type=str, default='tensorboard', choices=['tensorboard', 'wandb'], help='Metrics logging backend')
 
         sub_parser.add_argument('--stop_step', type=int, default=-1, help='Step to stop training at. For preserving the LR schedule while not training further.')
         sub_parser.add_argument('--commit_hash', type=str, default='', help='Git commit hash for this run. Logged in tensorboard.')
@@ -652,8 +655,13 @@ if __name__ == "__main__":
     # Initialize centralized metrics logger
     is_main_process = args.local_rank <= 0 or not args.use_deepspeed
     if is_main_process:
-        from utils.metrics_backend import TensorBoardBackend
-        metrics.init_metrics(TensorBoardBackend(log_dir=run_dir))
+        backend_type = getattr(args, 'metrics_backend', 'tensorboard')
+        if backend_type == 'wandb':
+            from utils.wandb_backend import WandBBackend
+            metrics.init_metrics(WandBBackend(project="megatransformer", run_name=args.run_name, log_dir=run_dir))
+        else:
+            from utils.metrics_backend import TensorBoardBackend
+            metrics.init_metrics(TensorBoardBackend(log_dir=run_dir))
     else:
         from utils.metrics_backend import NoOpBackend
         metrics.init_metrics(NoOpBackend())

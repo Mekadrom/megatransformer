@@ -366,7 +366,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
             # Run through text feature extractor + recurrent block + text coda
             text_hidden = model.text_feature_extractor(input_ids)
-            recurrent_out, _, _, _ = model.recurrent_block(text_hidden)
+            recurrent_out, _, _, _, _ = model.recurrent_block(text_hidden * model.embed_scale)
             text_out = model.text_generator(recurrent_out)
             logits = text_out["logits"]  # (1, seq-1, vocab)
 
@@ -692,10 +692,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 prompt_text = sample.get("text_text", sample.get("voice_voice_text", ""))
                 if not prompt_text and "text_token_ids" in sample:
                     prompt_text = self._decode_tokens(sample["text_token_ids"])
-                if prompt_text:
-                    metrics.log_text(f"{tag}/voice/{i}/prompt", str(prompt_text)[:500], global_step)
                 decoded = self._decode_tokens(text_ids[:bov_pos + 1])
-                metrics.log_text(f"{tag}/voice/{i}/prompt_decoded", decoded[:500], global_step)
 
                 outputs = model.generate(
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
@@ -704,7 +701,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 voice_preds = outputs.get("voice_latent_preds")
                 if voice_preds is not None and voice_preds.numel() > 0:
                     pred_lat = voice_preds[0, 0]
-                    metrics.log_image(f"{tag}/voice/{i}/generated", self._latent_to_image(pred_lat), global_step)
+                    metrics.log_image(f"{tag}/voice/{i}/generated", self._latent_to_image(pred_lat), global_step, context={
+                        "prompt": str(prompt_text)[:500] if prompt_text else decoded[:500],
+                    })
 
                     tgt_lat = voice_batch.get("voice_features")
                     if tgt_lat is not None:
@@ -738,10 +737,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
                 # Log prompt text
                 prompt_text = sample.get("text_text", sample.get("image_text", ""))
-                if prompt_text:
-                    metrics.log_text(f"{tag}/image/{i}/prompt", str(prompt_text)[:500], global_step)
                 decoded = self._decode_tokens(text_ids[:boi_pos + 1])
-                metrics.log_text(f"{tag}/image/{i}/prompt_decoded", decoded[:500], global_step)
 
                 outputs = model.generate(
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
@@ -750,7 +746,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 image_preds = outputs.get("image_latent_preds")
                 if image_preds is not None and image_preds.numel() > 0:
                     pred_lat = image_preds[0, 0]
-                    metrics.log_image(f"{tag}/image/{i}/generated", self._latent_to_image(pred_lat), global_step)
+                    metrics.log_image(f"{tag}/image/{i}/generated", self._latent_to_image(pred_lat), global_step, context={
+                        "prompt": str(prompt_text)[:500] if prompt_text else decoded[:500],
+                    })
 
                     tgt_lat = image_batch.get("image_images")
                     if tgt_lat is not None:
@@ -824,9 +822,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 )
 
                 gen_ids = outputs.get("generated_token_ids")
-                if gen_ids is not None:
-                    gen_text = self._decode_tokens(gen_ids[0])
-                    metrics.log_text(f"{tag}/voice/{i}/transcription", gen_text[:500], global_step)
 
                 # Log target text (decode from token_ids if raw text not available)
                 target_text = sample.get("text_text", sample.get("voice_voice_text", ""))
@@ -834,8 +829,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     target_text = target_text[0] if target_text else ""
                 if not target_text and "text_token_ids" in sample:
                     target_text = self._decode_tokens(sample["text_token_ids"])
-                if target_text:
-                    metrics.log_text(f"{tag}/voice/{i}/target_text", str(target_text)[:500], global_step)
+
+                if gen_ids is not None:
+                    gen_text = self._decode_tokens(gen_ids[0])
+                    target_ctx = {}
+                    if target_text:
+                        target_ctx["target"] = str(target_text)[:500]
+                    metrics.log_text(f"{tag}/voice/{i}/transcription", gen_text[:500], global_step, context=target_ctx)
 
                 # Log input audio
                 self._log_audio_with_cvae(
@@ -869,9 +869,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 )
 
                 gen_ids = outputs.get("generated_token_ids")
-                if gen_ids is not None:
-                    gen_text = self._decode_tokens(gen_ids[0])
-                    metrics.log_text(f"{tag}/image/{i}/description", gen_text[:500], global_step)
 
                 # Log target text (decode from token_ids if raw text not available)
                 target_text = sample.get("text_text", sample.get("image_text", ""))
@@ -879,8 +876,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     target_text = target_text[0] if target_text else ""
                 if not target_text and "text_token_ids" in sample:
                     target_text = self._decode_tokens(sample["text_token_ids"])
-                if target_text:
-                    metrics.log_text(f"{tag}/image/{i}/target_text", str(target_text)[:500], global_step)
+
+                if gen_ids is not None:
+                    gen_text = self._decode_tokens(gen_ids[0])
+                    target_ctx = {}
+                    if target_text:
+                        target_ctx["target"] = str(target_text)[:500]
+                    metrics.log_text(f"{tag}/image/{i}/description", gen_text[:500], global_step, context=target_ctx)
 
                 # Log input image
                 if self.image_vae_decoder is not None:
@@ -932,9 +934,10 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             gen_text = self._decode_tokens(gen_ids)
             full_target = self._decode_tokens(token_ids[:text_length])
 
-            metrics.log_text(f"{tag}/{i}/input", input_text, global_step)
-            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step)
-            metrics.log_text(f"{tag}/{i}/target", full_target, global_step)
+            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step, context={
+                "input": input_text,
+                "target": full_target,
+            })
             self._log_generation_metrics(
                 outputs, sample, model, device, tag, i, global_step,
             )
@@ -961,7 +964,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 temperature=0.8,
             )
 
-            metrics.log_text(f"{tag}/{i}/input_text", prompt_text, global_step)
             sample = samples[i] if i < len(samples) else {}
 
             # Log generated voice if available
@@ -972,6 +974,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     f"{tag}/{i}/generated_latent",
                     self._latent_to_image(pred_latent),
                     global_step,
+                    context={"prompt": prompt_text},
                 )
 
                 self._log_audio_with_cvae(
@@ -1107,8 +1110,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             gen_text = self._decode_tokens(gen_ids)
             target_text = self._decode_tokens(token_ids[:text_length])
 
-            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step)
-            metrics.log_text(f"{tag}/{i}/target", target_text, global_step)
+            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step, context={
+                "target": target_text,
+            })
             self._log_generation_metrics(
                 outputs, sample, model, device, tag, i, global_step,
             )
@@ -1135,7 +1139,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 temperature=0.8,
             )
 
-            metrics.log_text(f"{tag}/{i}/input_text", prompt_text, global_step)
             sample = samples[i] if i < len(samples) else {}
 
             image_preds = outputs.get("image_latent_preds")
@@ -1145,6 +1148,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     f"{tag}/{i}/generated_latent",
                     self._latent_to_image(pred_latent),
                     global_step,
+                    context={"prompt": prompt_text},
                 )
 
                 # Decode through image VAE if available
@@ -1216,8 +1220,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             gen_text = self._decode_tokens(gen_ids)
             target_text = self._decode_tokens(token_ids[:text_length])
 
-            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step)
-            metrics.log_text(f"{tag}/{i}/target", target_text, global_step)
+            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step, context={
+                "target": target_text,
+            })
             self._log_generation_metrics(
                 outputs, sample, model, device, tag, i, global_step,
             )
@@ -1414,23 +1419,23 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             return
         print(f"[audio_debug] Got mel shape={mel.shape} for {tag_prefix}/{speaker_label}")
 
-        # Log mel spectrogram as image
+        # Log mel spectrogram as figure
         mel_np = mel.numpy()
         if mel_np.size == 0 or mel_np.shape[0] == 0 or mel_np.shape[-1] == 0:
             return
-        mel_img = self._visualize_mel_spec(mel_np)
-        metrics.log_image(
-            f"{tag_prefix}/{speaker_label}_mel",
-            mel_img, global_step,
-        )
-
-        # Vocode to audio if possible
+        fig = visualization.render_mel_spectrogram(mel_np, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
         if self.vocoder is not None:
             try:
                 waveform = visualization.render_vocoder_audio(self.vocoder, mel)
-                metrics.log_audio(f"{tag_prefix}/{speaker_label}_audio", waveform, global_step, self.audio_sample_rate)
+                metrics.log_audio(f"{tag_prefix}/{speaker_label}_audio", waveform, global_step, self.audio_sample_rate, context={
+                    "mel": fig,
+                })
             except Exception as e:
                 print(f"Warning: Vocoder audio rendering failed for {tag_prefix}/{speaker_label}_audio: {e}")
+                metrics.log_figure(f"{tag_prefix}/{speaker_label}_mel", fig, global_step)
+        else:
+            metrics.log_figure(f"{tag_prefix}/{speaker_label}_mel", fig, global_step)
+        plt.close(fig)
 
     def _log_audio_with_cvae(self, pred_latent, sample, global_step, tag_prefix):
         """Run dual-speaker CVAE decoding: ground-truth speaker + static speaker."""

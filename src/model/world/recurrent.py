@@ -72,6 +72,7 @@ class MegatransformerRecurrentBlock(nn.Module):
             raise ValueError(f"Invalid exit criteria: {self.exit_criteria}")
         
         self.step = 0
+        self.track_iteration_stats = False
 
         self._init_weights()
 
@@ -191,6 +192,25 @@ class MegatransformerRecurrentBlock(nn.Module):
             x = (x - mean) / std
         return x
     
+    @torch.no_grad()
+    def _compute_thought_stats(self, thought: torch.Tensor) -> dict:
+        """Compute per-token activation stats for a thought state tensor.
+
+        Args:
+            thought: (batch, seq_len, d_model)
+
+        Returns:
+            Dict with per-token stats, each shaped (batch, seq_len).
+        """
+        t = thought.float()
+        return {
+            "std": t.std(dim=-1).cpu(),       # (batch, seq_len)
+            "mean": t.mean(dim=-1).cpu(),
+            "max": t.max(dim=-1).values.cpu(),
+            "min": t.min(dim=-1).values.cpu(),
+            "norm": t.norm(dim=-1).cpu(),
+        }
+
     def n_k_steps(self, mean_steps, backprop_depth):
         """
         This randomly samples the number of total steps that the model will think for (to get a diverse range of thinking steps during training)
@@ -273,6 +293,11 @@ class MegatransformerRecurrentBlock(nn.Module):
         track_kl = not self.training
         kl_per_iteration: List[float] = []
 
+        # Per-iteration activation stats (controlled by flag, works in both train and eval)
+        iteration_stats: Optional[List[dict]] = None
+        if getattr(self, 'track_iteration_stats', False):
+            iteration_stats = []
+
         # Per-token convergence tracking (eval only)
         converged: Optional[torch.Tensor] = None
         if not self.training and self.exit_criteria is not None:
@@ -317,12 +342,14 @@ class MegatransformerRecurrentBlock(nn.Module):
                         use_cache, share_kv_cache, _extend_mask_for_cache,
                     )
 
-                    if track_kl:
-                        kl = F.kl_div(
+                    kl_per_token = None
+                    if track_kl or iteration_stats is not None:
+                        kl_per_token = F.kl_div(
                             last_thought_state, new_thought,
                             reduction="none", log_target=True,
-                        ).sum(dim=-1).mean().item()
-                        kl_per_iteration.append(kl)
+                        ).sum(dim=-1)  # (batch, seq_len)
+                    if track_kl and kl_per_token is not None:
+                        kl_per_iteration.append(kl_per_token.mean().item())
 
                     # Per-token freeze: only update non-converged tokens
                     if converged is not None and hasattr(self.exit_criteria, 'converged_mask'):
@@ -330,9 +357,20 @@ class MegatransformerRecurrentBlock(nn.Module):
                         converged = converged | newly_converged
                         thought_states = torch.where(converged.unsqueeze(-1), last_thought_state, new_thought)
                         if converged.all():
-                            return thought_states, new_kv_cache, iteration + 1, kl_per_iteration
+                            if iteration_stats is not None:
+                                stats = self._compute_thought_stats(thought_states)
+                                if kl_per_token is not None:
+                                    stats["kl"] = kl_per_token.cpu()
+                                iteration_stats.append(stats)
+                            return thought_states, new_kv_cache, iteration + 1, kl_per_iteration, iteration_stats
                     else:
                         thought_states = new_thought
+
+                    if iteration_stats is not None:
+                        stats = self._compute_thought_stats(thought_states)
+                        if kl_per_token is not None:
+                            stats["kl"] = kl_per_token.cpu()
+                        iteration_stats.append(stats)
 
                     last_thought_state = thought_states
                     iteration += 1
@@ -345,17 +383,25 @@ class MegatransformerRecurrentBlock(nn.Module):
                     use_cache, share_kv_cache, _extend_mask_for_cache,
                 )
 
-                if track_kl:
-                    kl = F.kl_div(
-                        last_thought_state, thought_states,
+                kl_per_token = None
+                if track_kl or iteration_stats is not None:
+                    kl_per_token = F.kl_div(
+                        last_thought_state.detach(), thought_states.detach(),
                         reduction="none", log_target=True,
-                    ).sum(dim=-1).mean().item()
-                    kl_per_iteration.append(kl)
+                    ).sum(dim=-1)  # (batch, seq_len)
+                if track_kl and kl_per_token is not None:
+                    kl_per_iteration.append(kl_per_token.mean().item())
+
+                if iteration_stats is not None:
+                    stats = self._compute_thought_stats(thought_states)
+                    if kl_per_token is not None:
+                        stats["kl"] = kl_per_token.cpu()
+                    iteration_stats.append(stats)
 
                 last_thought_state = thought_states
                 iteration += 1
 
-        return last_thought_state, new_kv_cache, iteration, kl_per_iteration
+        return last_thought_state, new_kv_cache, iteration, kl_per_iteration, iteration_stats
 
     def generate_step(
         self,

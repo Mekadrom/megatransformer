@@ -34,7 +34,6 @@ class WorldModelTrainer(CommonTrainer):
         audio_latent_loss_weight: float = 1.0,
         voice_latent_loss_weight: float = 1.0,
         image_latent_loss_weight: float = 1.0,
-        image_cross_loss_weight: float = 1.0,
         # Modality flags
         include_text: bool = True,
         include_audio: bool = True,
@@ -56,7 +55,6 @@ class WorldModelTrainer(CommonTrainer):
         self.audio_latent_loss_weight = audio_latent_loss_weight
         self.voice_latent_loss_weight = voice_latent_loss_weight
         self.image_latent_loss_weight = image_latent_loss_weight
-        self.image_cross_loss_weight = image_cross_loss_weight
 
         self.include_text = include_text
         self.include_audio = include_audio
@@ -255,6 +253,12 @@ class WorldModelTrainer(CommonTrainer):
         # if image_latent_labels is not None:
         #     megatransformer_utils.print_debug_tensor("\timage_latent_labels", image_latent_labels)
 
+        # Enable per-iteration stat tracking at logging steps
+        should_log = global_step % self.args.logging_steps == 0
+        model_for_stats = model.module if hasattr(model, 'module') else model
+        if should_log and hasattr(model_for_stats, 'recurrent_block'):
+            model_for_stats.recurrent_block.track_iteration_stats = True
+
         outputs = model(
             text_input_ids=text_input_ids,
             audio_inputs=audio_inputs,
@@ -267,6 +271,9 @@ class WorldModelTrainer(CommonTrainer):
             decode_outputs=False,
             is_synthesis=is_synthesis,
         )
+
+        if should_log and hasattr(model_for_stats, 'recurrent_block'):
+            model_for_stats.recurrent_block.track_iteration_stats = False
 
         # for k, v in outputs.items():
         #     if isinstance(v, torch.Tensor):
@@ -324,26 +331,10 @@ class WorldModelTrainer(CommonTrainer):
         compute_image_loss = has_synthesis or is_synthesis is None
 
         if compute_image_loss:
-            # Image: L1 + MSE on latent predictions vs latent labels
-            image_latent_preds = outputs.get("image_latent_preds")
-            if image_latent_preds is not None and image_latent_labels is not None:
-                if has_synthesis and not is_synthesis.all():
-                    # Mixed batch: only compute loss on synthesis samples
-                    synth_idx = is_synthesis.nonzero(as_tuple=True)[0]
-                    image_l1 = self.latent_l1_loss(image_latent_preds[synth_idx], image_latent_labels[synth_idx])
-                    image_mse = self.latent_mse_loss(image_latent_preds[synth_idx], image_latent_labels[synth_idx])
-                else:
-                    image_l1 = self.latent_l1_loss(image_latent_preds, image_latent_labels)
-                    image_mse = self.latent_mse_loss(image_latent_preds, image_latent_labels)
-                image_loss = image_l1 + image_mse
-                total_loss = total_loss + self.image_latent_loss_weight * image_loss
-                loss_components["image_latent_l1"] = image_l1.detach()
-                loss_components["image_latent_mse"] = image_mse.detach()
-
             # Image content token monitoring (logged but not added to loss).
             # The prelude target is computed from pixels while the recurrent block
             # only sees text — exact matching is infeasible and produces conflicting
-            # gradients. The cross-decoder reconstruction loss is the proper training signal.
+            # gradients. The image coda reconstruction loss is the proper training signal.
             image_recurrent_tokens = outputs.get("image_recurrent_tokens")
             image_prelude_tokens = outputs.get("image_prelude_tokens")
             if image_recurrent_tokens is not None and image_prelude_tokens is not None:
@@ -361,14 +352,14 @@ class WorldModelTrainer(CommonTrainer):
                         rec_tok.flatten(1), pre_tok.flatten(1), dim=1
                     ).mean()
 
-            # Cross-attention image decoder reconstruction loss
-            image_cross_l1 = outputs.get("image_cross_l1_loss")
-            image_cross_mse = outputs.get("image_cross_mse_loss")
-            if image_cross_l1 is not None:
-                image_cross_loss = image_cross_l1 + image_cross_mse
-                total_loss = total_loss + self.image_cross_loss_weight * image_cross_loss
-                loss_components["image_cross_l1"] = image_cross_l1.detach()
-                loss_components["image_cross_mse"] = image_cross_mse.detach()
+            # Image coda reconstruction loss
+            image_l1 = outputs.get("image_l1_loss")
+            image_mse = outputs.get("image_mse_loss")
+            if image_l1 is not None:
+                image_loss = image_l1 + image_mse
+                total_loss = total_loss + self.image_latent_loss_weight * image_loss
+                loss_components["image_l1"] = image_l1.detach()
+                loss_components["image_mse"] = image_mse.detach()
 
         # ── TensorBoard logging ─────────────────────────────────────────
 
@@ -381,6 +372,15 @@ class WorldModelTrainer(CommonTrainer):
             for key, value in outputs.items():
                 if key.startswith("recurrent_out/"):
                     metrics.log_scalar(f"world/{key}", value, global_step)
+
+            # Per-iteration activation stats from recurrent block
+            iteration_stats = outputs.get("iteration_stats")
+            if iteration_stats:
+                from utils import visualization
+                fig = visualization.render_iteration_stats(iteration_stats)
+                metrics.log_figure("world/iteration_stats", fig, global_step)
+                from matplotlib import pyplot as plt
+                plt.close(fig)
 
         if return_outputs:
             return total_loss, outputs
@@ -433,7 +433,7 @@ class WorldModelTrainer(CommonTrainer):
             ("text_coda", model.text_generator),
             ("audio_coda", model.audio_generator),
             ("voice_coda", model.voice_generator),
-            ("image_coda", model.image_generator),
+            ("image_generator", model.image_generator),
         ]:
             if generator is None:
                 continue
@@ -654,8 +654,7 @@ def create_trainer(
         text_loss_weight=args.text_loss_weight,
         audio_latent_loss_weight=args.audio_latent_loss_weight,
         voice_latent_loss_weight=args.voice_latent_loss_weight,
-        image_latent_loss_weight=args.image_latent_loss_weight,
-        image_cross_loss_weight=getattr(args, 'image_cross_loss_weight', 1.0),
+        image_latent_loss_weight=getattr(args, 'image_latent_loss_weight', 1.0),
         include_text="text" in include_modes,
         include_audio="audio" in include_modes,
         include_voice="voice" in include_modes,
@@ -690,9 +689,7 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--voice_latent_loss_weight", type=float, default=1.0,
                             help="Weight for voice latent prediction losses")
     sub_parser.add_argument("--image_latent_loss_weight", type=float, default=1.0,
-                            help="Weight for image latent prediction losses (coda)")
-    sub_parser.add_argument("--image_cross_loss_weight", type=float, default=1.0,
-                            help="Weight for image cross-decoder reconstruction loss")
+                            help="Weight for image image coda reconstruction loss")
 
     # Text loss
     sub_parser.add_argument("--text_label_smoothing", type=float, default=0.0,

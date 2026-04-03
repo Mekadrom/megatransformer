@@ -10,7 +10,6 @@ from config.world.world_model import WORLD_MODEL_CONFIGS, MegaTransformerWorldMo
 from model.audio.feature_extractor import AudioVAEPreludeFeatureExtractor
 from model.audio.generator import AudioCodaAndVAEWithLoss
 from model.image.feature_extractor import ImageVAEPreludeFeatureExtractor
-from model.image.generator import ImageCodaAndVAEWithLoss
 from model.image.vae.vae import ImageVAEDecoder, ImageVAEEncoder
 from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
 from model.text.feature_extractor import TextPreludeFeatureExtractor
@@ -80,19 +79,14 @@ class MegaTransformerWorldModel(nn.Module):
             AudioCodaAndVAEWithLoss("voice", config.voice_coda_config)
             if "voice" in self.include_modes else None
         )
-        self.image_generator = (
-            ImageCodaAndVAEWithLoss(config.image_coda_config)
-            if "image" in self.include_modes else None
-        )
-
-        # Cross-attention image decoder (optional)
-        self.image_cross_decoder = None
-        if config.image_cross_decoder_config is not None and "image" in self.include_modes:
-            cross_config = CrossAttentionImageDecoderConfig(**config.image_cross_decoder_config)
-            self.image_cross_decoder = CrossAttentionImageDecoder(cross_config)
+        # Cross-attention image decoder
+        self.image_generator = None
+        if config.image_generator_config is not None and "image" in self.include_modes:
+            cross_config = CrossAttentionImageDecoderConfig(**config.image_coda_config)
+            self.image_generator = CrossAttentionImageDecoder(cross_config)
             # Normalize recurrent output before cross-decoder to prevent
             # activation explosion from saturating the decoder's attention
-            self.image_cross_input_norm = nn.LayerNorm(config.text_prelude_config.d_model)
+            self.image_coda_input_norm = nn.LayerNorm(config.text_prelude_config.d_model)
 
             # Learned image generation queries: replace prelude features at image
             # placeholder positions for synthesis tasks. Init std=3.0 to match
@@ -168,8 +162,6 @@ class MegaTransformerWorldModel(nn.Module):
         """Load image VAE encoder/decoder for live encoding/decoding."""
         if self.image_feature_extractor is not None:
             self.image_feature_extractor.vae_encoder = encoder
-        if self.image_generator is not None:
-            self.image_generator.vae_decoder = decoder
 
     @classmethod
     def from_config(cls, config_name: str, **overrides) -> "MegaTransformerWorldModel":
@@ -411,7 +403,7 @@ class MegaTransformerWorldModel(nn.Module):
         # megatransformer_utils.print_debug_tensor("\t\tinterleaved_tokens", interleaved_tokens)
 
         # Main Transformer (Recurrent Block)
-        recurrent_output, _, _, _ = self.recurrent_block(
+        recurrent_output, _, _, _, iteration_stats = self.recurrent_block(
             interleaved_tokens,
             attention_mask=attn_mask  # True for attend, False for padding
         )
@@ -440,6 +432,9 @@ class MegaTransformerWorldModel(nn.Module):
 
         # Generators/Codas
         outputs = {}
+
+        if iteration_stats is not None:
+            outputs["iteration_stats"] = iteration_stats
 
         # Log variance and entropy of recurrent outputs per modality (coda inputs)
         for name, batch in [("text", text_batch), ("voice", voice_batch),
@@ -480,15 +475,6 @@ class MegaTransformerWorldModel(nn.Module):
             )
             outputs.update(voice_outputs)
 
-        # Image
-        if image_batch is not None and self.image_generator is not None:
-            image_outputs = self.image_generator(
-                image_batch,
-                latent_labels=image_latent_labels,
-                decode_to_image=decode_outputs,
-            )
-            outputs.update(image_outputs)
-
         # Image content tokens: save recurrent output (before coda) and prelude output
         # for content alignment loss in training
         if image_batch is not None:
@@ -501,16 +487,16 @@ class MegaTransformerWorldModel(nn.Module):
             outputs["image_prelude_tokens"] = image_hidden_states[:, 0].detach()
 
         # Cross-attention image decoder: reconstruct image from content tokens
-        if image_batch is not None and hasattr(self, 'image_cross_decoder') and self.image_cross_decoder is not None:
-            cross_input = self.image_cross_input_norm(image_batch)
-            cross_outputs = self.image_cross_decoder(
+        if image_batch is not None and hasattr(self, 'image_generator') and self.image_generator is not None:
+            cross_input = self.image_coda_input_norm(image_batch)
+            cross_outputs = self.image_generator(
                 encoder_hidden_states=cross_input,
                 latent_labels=image_latent_labels,
             )
-            outputs["image_cross_latent_preds"] = cross_outputs["image_latent_preds"]
+            outputs["image_latent_preds"] = cross_outputs["image_latent_preds"]
             if "image_latent_l1_loss" in cross_outputs:
-                outputs["image_cross_l1_loss"] = cross_outputs["image_latent_l1_loss"]
-                outputs["image_cross_mse_loss"] = cross_outputs["image_latent_mse_loss"]
+                outputs["image_l1_loss"] = cross_outputs["image_latent_l1_loss"]
+                outputs["image_mse_loss"] = cross_outputs["image_latent_mse_loss"]
 
         return outputs
 
@@ -620,10 +606,10 @@ class MegaTransformerWorldModel(nn.Module):
         image_sequences_b: List[torch.Tensor],
         decode_outputs: bool,
     ) -> Optional[torch.Tensor]:
-        """Finalize an image sequence through the image coda.
+        """Finalize an image sequence through the cross-attention image decoder.
 
         Pads or truncates to exactly image_num_patches tokens so the
-        unpatchify layer can reshape to a square spatial grid.
+        decoder can reshape to a square spatial grid.
         """
         if not image_sequences_b or self.image_generator is None:
             return None
@@ -640,9 +626,9 @@ class MegaTransformerWorldModel(nn.Module):
         elif actual > expected:
             image_hidden = image_hidden[:expected]
         image_hidden = image_hidden.unsqueeze(0)  # (1, num_patches, d_model)
+        cross_input = self.image_coda_input_norm(image_hidden)
         image_out = self.image_generator(
-            image_hidden,
-            decode_to_image=decode_outputs,
+            encoder_hidden_states=cross_input,
         )
         preds = image_out.get("image_latent_preds")
         if preds is not None:
@@ -773,7 +759,7 @@ class MegaTransformerWorldModel(nn.Module):
         recurrent_iteration_counts: List[int] = []
         recurrent_kl_final: List[float] = []  # final KL per token (convergence measure)
 
-        current_hidden, kv_cache, prompt_iters, prompt_kls = self.recurrent_block(
+        current_hidden, kv_cache, prompt_iters, prompt_kls, _ = self.recurrent_block(
             prompt_hidden * self.embed_scale,
             attention_mask=prompt_attn_mask,
             kv_cache=kv_cache,
@@ -885,7 +871,7 @@ class MegaTransformerWorldModel(nn.Module):
             next_hidden = torch.stack(next_hidden_list, dim=0)
 
             # Process through recurrent block with KV cache
-            current_hidden, kv_cache, n_iters, kl_trace = self.recurrent_block(
+            current_hidden, kv_cache, n_iters, kl_trace, _ = self.recurrent_block(
                 next_hidden * self.embed_scale,
                 attention_mask=None,
                 kv_cache=kv_cache,
@@ -948,7 +934,7 @@ class MegaTransformerWorldModel(nn.Module):
                             device=device, dtype=current_hidden.dtype,
                         )
                     # Run through recurrent block (single pass, all 256 at once)
-                    image_hidden, _, _, _ = self.recurrent_block(
+                    image_hidden, _, _, _, _ = self.recurrent_block(
                         image_input * self.embed_scale,
                         attention_mask=None,
                         kv_cache=kv_cache,
@@ -958,18 +944,15 @@ class MegaTransformerWorldModel(nn.Module):
                     )
                     position_offset += image_token_budget
 
-                    # Decode through cross-attention decoder if available
-                    if self.image_cross_decoder is not None:
-                        cross_out = self.image_cross_decoder(
-                            encoder_hidden_states=image_hidden,
+                    # Decode through cross-attention decoder
+                    if self.image_generator is not None:
+                        cross_input = self.image_coda_input_norm(image_hidden)
+                        cross_out = self.image_generator(
+                            encoder_hidden_states=cross_input,
                         )
                         image_pred = cross_out["image_latent_preds"].squeeze(0)  # (C, H, W)
                     else:
-                        # Fallback to coda if no cross-decoder
-                        image_pred = self._finalize_image_sequence(
-                            [image_hidden[0, i:i+1] for i in range(image_hidden.shape[1])],
-                            decode_outputs,
-                        )
+                        image_pred = None
 
                     if image_pred is not None:
                         completed_image[b].append(image_pred)
