@@ -150,16 +150,26 @@ def analyze(model, batch, label):
         # Codas
         print("\n--- Codas ---")
 
-        # Image coda detail
+        # Image cross-decoder detail
         if uninterleaved["image"] is not None:
             ic = model.image_generator
             h = uninterleaved["image"]
-            r("image_coda_input", h)
-            for i, block in enumerate(ic.coda):
+            r("image_generator_input", h)
+            # Encoder: self-attention over content tokens
+            for i, block in enumerate(ic.encoder_layers):
                 hidden, _ = block(h)
                 h = h + hidden
-                r(f"image_coda_layer{i}", h)
-            preds = ic.unpatchify(h)
+                r(f"image_encoder_layer{i}", h)
+            h = ic.encoder_output_norm(h)
+            r("image_encoder_normed", h)
+            # Decoder: spatial queries cross-attend to encoded content
+            B = h.shape[0]
+            queries = ic.spatial_queries.expand(B, -1, -1) + ic.pos_embedding
+            r("image_spatial_queries", queries)
+            for i, block in enumerate(ic.layers):
+                queries, _ = block(queries, encoder_hidden_states=h)
+                r(f"image_decoder_layer{i}", queries)
+            preds = ic.unpatchify(queries)
             r("image_before_denorm", preds)
             if ic.use_output_denorm:
                 preds = preds * ic.output_scale[None,:,None,None] + ic.output_bias[None,:,None,None]
@@ -168,8 +178,9 @@ def analyze(model, batch, label):
             print(f"    L1={F.l1_loss(preds, image_data).item():.4f}, MSE={F.mse_loss(preds, image_data).item():.4f}")
 
             # Check output_scale/bias
-            print(f"    output_scale: mean={ic.output_scale.data.mean():.4f}, std={ic.output_scale.data.std():.4f}")
-            print(f"    output_bias: mean={ic.output_bias.data.mean():.4f}, std={ic.output_bias.data.std():.4f}")
+            if hasattr(ic, 'output_scale'):
+                print(f"    output_scale: mean={ic.output_scale.data.mean():.4f}, std={ic.output_scale.data.std():.4f}")
+                print(f"    output_bias: mean={ic.output_bias.data.mean():.4f}, std={ic.output_bias.data.std():.4f}")
 
         # Voice coda
         if uninterleaved["voice"] is not None:
@@ -213,7 +224,7 @@ def analyze(model, batch, label):
         "recurrent/proj": model.recurrent_block.projection,
         "text_coda": model.text_generator,
         "voice_coda": model.voice_generator,
-        "image_coda": model.image_generator,
+        "image_generator": model.image_generator,
     }
     for i, block in enumerate(model.recurrent_block.recurrent_blocks):
         modules[f"rec/block{i}"] = block

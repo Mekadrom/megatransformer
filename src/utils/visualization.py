@@ -193,3 +193,172 @@ def render_vocoder_audio(
 
     waveform = waveform / (waveform.abs().max() + 1e-8)
     return waveform.numpy()
+
+
+def _resolve_stat_value(value):
+    """Convert a stat value to a scalar (averages tensors)."""
+    if isinstance(value, torch.Tensor):
+        return value.float().mean().item()
+    return value
+
+
+def render_iteration_stats(
+    iteration_stats: list[dict],
+) -> plt.Figure:
+    """Render averaged per-iteration activation stats from the recurrent block.
+
+    Stats may be scalars or per-token tensors (batch, seq_len) — tensors
+    are averaged down to scalars for the overview figure.
+
+    Args:
+        iteration_stats: List of dicts, one per iteration. Each dict has
+            keys "std", "mean", "max", "min", "norm", and optionally "kl".
+
+    Returns:
+        matplotlib Figure with one subplot per stat.
+    """
+    stat_names = ["std", "mean", "max", "min", "norm"]
+    has_kl = any("kl" in s for s in iteration_stats)
+    if has_kl:
+        stat_names.append("kl")
+
+    iterations = list(range(len(iteration_stats)))
+
+    fig, axes = plt.subplots(len(stat_names), 1, figsize=(10, 2.5 * len(stat_names)), sharex=True)
+    if len(stat_names) == 1:
+        axes = [axes]
+
+    for ax, name in zip(axes, stat_names):
+        values = [_resolve_stat_value(s.get(name, 0.0)) for s in iteration_stats]
+        ax.plot(iterations, values, marker='.', markersize=3, linewidth=1)
+        ax.set_ylabel(name)
+        ax.grid(True, alpha=0.3)
+        if name == "kl":
+            ax.set_yscale('symlog', linthresh=1e-6)
+            ax.set_ylabel('KL divergence')
+
+    axes[-1].set_xlabel('Iteration')
+    fig.suptitle('Thought state activation stats per recurrent iteration', fontsize=12)
+    plt.tight_layout()
+    return fig
+
+
+def render_token_iteration_stats(
+    iteration_stats: list[dict],
+    token_idx: int,
+    batch_idx: int = 0,
+    title: str = "",
+) -> plt.Figure:
+    """Render per-iteration stats for a single token position.
+
+    Args:
+        iteration_stats: List of dicts, one per iteration. Values are
+            tensors of shape (batch, seq_len).
+        token_idx: Token position in the sequence.
+        batch_idx: Batch index (default 0).
+        title: Optional title override.
+
+    Returns:
+        matplotlib Figure with one subplot per stat.
+    """
+    stat_names = ["std", "mean", "max", "min", "norm"]
+    has_kl = any("kl" in s for s in iteration_stats)
+    if has_kl:
+        stat_names.append("kl")
+
+    iterations = list(range(len(iteration_stats)))
+
+    fig, axes = plt.subplots(len(stat_names), 1, figsize=(8, 2 * len(stat_names)), sharex=True)
+    if len(stat_names) == 1:
+        axes = [axes]
+
+    for ax, name in zip(axes, stat_names):
+        values = []
+        for s in iteration_stats:
+            v = s.get(name)
+            if v is None:
+                values.append(0.0)
+            elif isinstance(v, torch.Tensor):
+                values.append(v[batch_idx, token_idx].item())
+            else:
+                values.append(v)
+        ax.plot(iterations, values, marker='.', markersize=3, linewidth=1)
+        ax.set_ylabel(name)
+        ax.grid(True, alpha=0.3)
+        if name == "kl":
+            ax.set_yscale('symlog', linthresh=1e-6)
+            ax.set_ylabel('KL divergence')
+
+    axes[-1].set_xlabel('Iteration')
+    fig.suptitle(title or f'Token {token_idx} — activation stats per iteration', fontsize=10)
+    plt.tight_layout()
+    return fig
+
+
+def render_all_tokens_iteration_stats(
+    iteration_stats: list[dict],
+    batch_idx: int = 0,
+    modality_map: Optional[torch.Tensor] = None,
+) -> plt.Figure:
+    """Render all tokens' per-iteration stats overlaid on the same axes.
+
+    Each token is a line, colored by modality. All tokens share the same
+    y-axis scale so magnitudes are directly comparable.
+
+    Args:
+        iteration_stats: List of dicts, one per iteration. Values are
+            tensors of shape (batch, seq_len).
+        batch_idx: Batch index (default 0).
+        modality_map: Optional (batch, seq_len) tensor of modality IDs.
+
+    Returns:
+        matplotlib Figure with one subplot per stat, all tokens overlaid.
+    """
+    stat_names = ["std", "mean", "max", "min", "norm"]
+    has_kl = any("kl" in s for s in iteration_stats)
+    if has_kl:
+        stat_names.append("kl")
+
+    seq_len = iteration_stats[0]["std"].shape[1]
+    iterations = list(range(len(iteration_stats)))
+
+    modality_colors = {0: "#1f77b4", 1: "#ff7f0e", 2: "#2ca02c", 3: "#d62728"}  # text, audio, voice, image
+    modality_names = {0: "text", 1: "audio", 2: "voice", 3: "image"}
+
+    fig, axes = plt.subplots(len(stat_names), 1, figsize=(12, 3 * len(stat_names)), sharex=True)
+    if len(stat_names) == 1:
+        axes = [axes]
+
+    for ax, name in zip(axes, stat_names):
+        legend_added = set()
+        for tok in range(seq_len):
+            values = []
+            for s in iteration_stats:
+                v = s.get(name)
+                if v is None:
+                    values.append(0.0)
+                elif isinstance(v, torch.Tensor):
+                    values.append(v[batch_idx, tok].item())
+                else:
+                    values.append(v)
+
+            mod_id = modality_map[batch_idx, tok].item() if modality_map is not None else -1
+            color = modality_colors.get(mod_id, "#999999")
+            label = modality_names.get(mod_id, None) if mod_id not in legend_added else None
+            if label:
+                legend_added.add(mod_id)
+
+            ax.plot(iterations, values, linewidth=0.5, alpha=0.4, color=color, label=label)
+
+        ax.set_ylabel(name)
+        ax.grid(True, alpha=0.3)
+        if legend_added:
+            ax.legend(fontsize=8, loc='upper right')
+        if name == "kl":
+            ax.set_yscale('symlog', linthresh=1e-6)
+            ax.set_ylabel('KL divergence')
+
+    axes[-1].set_xlabel('Iteration')
+    fig.suptitle(f'All {seq_len} tokens — activation stats per iteration (colored by modality)', fontsize=12)
+    plt.tight_layout()
+    return fig

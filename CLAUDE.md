@@ -38,6 +38,7 @@ Common training arguments:
 - `--use_muon`: Use Muon+AdamW optimizer (with `--lr_muon`, `--lr_adamw`)
 - `--use_ema --ema_decay 0.9999`: Exponential moving average
 - `--compile_model`: torch.compile the model
+- `--metrics_backend tensorboard|wandb`: Logging backend (default: tensorboard)
 
 ### Data Preprocessing
 
@@ -108,6 +109,10 @@ Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
   - `audio/`, `image/`, `text/`, `world/`: Per-modality dataset, collator, and preprocessor implementations
 
 - `src/utils/`: Shared utilities
+  - `metrics.py`: Central metrics logging module (backend-agnostic singleton)
+  - `metrics_backend.py`: `MetricsBackend` protocol, `TensorBoardBackend`, `NoOpBackend`
+  - `wandb_backend.py`: `WandBBackend` with context-aware media grouping
+  - `visualization.py`: Pure rendering functions (mel specs, attention weights, vocoder audio)
   - `model_loading_utils.py`: `load_model()` function for loading from config + checkpoint
   - `audio_utils.py`: `SharedWindowBuffer` for efficient STFT/mel computation
   - `speaker_encoder.py`: ECAPA-TDNN and WavLM speaker encoders
@@ -121,13 +126,51 @@ model = load_model(AudioVAE, "small", checkpoint_path=path, overrides={"latent_c
 
 **Sharded datasets**: Training data is preprocessed into `.pt` shards with a `shard_index.json` manifest. Dataset classes (e.g. `AudioShardedDataset`, `MultimodalShardedDataset`) handle lazy loading with LRU caching. `ShardAwareSampler` groups indices by shard to minimize disk I/O.
 
-**Custom trainers**: Each training script has a trainer class extending `CommonTrainer` (which extends HuggingFace `Trainer`). Each module exports `add_cli_args(subparsers)` and `load_model(args)` functions. Trainers implement `compute_loss()` with model-specific loss computation and TensorBoard logging.
+**Custom trainers**: Each training script has a trainer class extending `CommonTrainer` (which extends HuggingFace `Trainer`). Each module exports `add_cli_args(subparsers)` and `load_model(args)` functions. Trainers implement `compute_loss()` with model-specific loss computation.
 
 **GAN training**: VAE trainers support optional discriminator training with configurable start conditions (`--gan_start_condition_key step/loss`), adaptive weighting, R1 penalty, and instance noise.
 
 **Training module convention**: Each training submodule in `src/scripts/train/` (e.g. `audio/vae/training.py`) must export:
 - `add_cli_args(subparsers)`: Registers the subcommand and its args
 - `load_model(args)`: Creates/loads the model from config and optional checkpoint
+
+### Metrics Logging
+
+All metrics logging goes through the centralized `src/utils/metrics.py` module — trainers and visualization callbacks never interact with TensorBoard/W&B directly.
+
+**Architecture** (3 layers):
+- `metrics.py`: `MetricsLogger` class + module-level convenience functions (`log_scalar`, `log_image`, `log_audio`, `log_figure`, `log_text`, `log_histogram`, `flush`). Initialized once via `metrics.init_metrics(backend)` in `train.py`.
+- `metrics_backend.py`: `MetricsBackend` protocol + `TensorBoardBackend` + `NoOpBackend`. Backend is selected by `--metrics_backend tensorboard|wandb`.
+- `visualization.py`: Pure rendering functions that return matplotlib `Figure` objects or numpy arrays — never log anything. Includes `render_mel_spectrogram()`, `render_mel_comparison()`, `render_attention_weights()`, `render_vocoder_audio()`.
+
+**Usage in trainers** — call module-level functions directly:
+```python
+from utils import metrics
+metrics.log_scalar("train/loss", loss, global_step)
+metrics.log_text("training/command_line", cmdline, global_step)
+```
+
+**Usage in visualization callbacks** — check logger exists, use `metrics.*` and `visualization.*`:
+```python
+from utils import metrics, visualization
+logger = metrics.get_logger()
+if logger is None:
+    return
+fig = visualization.render_mel_comparison(pred_mel, target_mel)
+metrics.log_figure("eval/mel_comparison", fig, global_step)
+plt.close(fig)
+```
+
+**Context grouping** — every `log_*` method accepts an optional `context` dict to group related media:
+```python
+metrics.log_audio("eval/voice/0", waveform, step, sr, context={
+    "mel": mel_figure,           # Figure → logged as figure
+    "transcription": "hello",    # str → logged as text
+})
+```
+For TensorBoard, context items are logged as sibling tags (`eval/voice/0/mel`, `eval/voice/0/transcription`). The `WandBBackend` (`supports_context=True`) renders them in unified panels with captions.
+
+**Adding a new backend**: Implement the `MetricsBackend` protocol (8 methods: `add_scalar`, `add_image`, `add_audio`, `add_figure`, `add_text`, `add_histogram`, `flush`, `close`). All methods accept `**kw` to receive the optional `context` kwarg. Set `supports_context = True` on the class to handle context natively (otherwise `MetricsLogger` falls back to sibling-tag dispatch).
 
 ### World Model Architecture
 
@@ -148,7 +191,7 @@ model = load_model(AudioVAE, "small", checkpoint_path=path, overrides={"latent_c
 
 DeepSpeed configs are in root: `ds_config.json`, `ds_config_zero-*.json`, `ds_config_int8.json`
 
-Runs are logged to `runs/<run_name>/` (TensorBoard + checkpoints).
+Runs are logged to `runs/<run_name>/` (metrics + checkpoints). Backend is selected via `--metrics_backend` (tensorboard or wandb).
 
 ## Environment
 

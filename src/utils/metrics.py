@@ -73,6 +73,14 @@ class MetricsLogger:
                     audio = audio.detach().float().cpu().numpy()
                 self._backend.add_audio(subtag, audio, global_step, sr)
 
+    def _dispatch_context(self, tag: str, global_step: int, context: Optional[dict]) -> None:
+        """Route context to the backend or fall back to sibling tags."""
+        if not context:
+            return
+        if getattr(self._backend, 'supports_context', False):
+            return  # backend already received context via its add_* method
+        self._log_context(tag, global_step, context)
+
     # -- primary log methods -------------------------------------------------
 
     def log_scalar(
@@ -83,9 +91,8 @@ class MetricsLogger:
             value = value.detach().item()
         if skip_zero and value == 0.0:
             return
-        self._backend.add_scalar(tag, value, global_step)
-        if context:
-            self._log_context(tag, global_step, context)
+        self._backend.add_scalar(tag, value, global_step, context=context)
+        self._dispatch_context(tag, global_step, context)
 
     def log_scalars(
         self, tag_value_dict: dict, global_step: int, skip_zero: bool = True,
@@ -116,9 +123,8 @@ class MetricsLogger:
             else:
                 image = torch.zeros_like(image)
             image = image.numpy()
-        self._backend.add_image(tag, image, global_step)
-        if context:
-            self._log_context(tag, global_step, context)
+        self._backend.add_image(tag, image, global_step, context=context)
+        self._dispatch_context(tag, global_step, context)
 
     def log_audio(
         self, tag: str, audio: Union[np.ndarray, torch.Tensor], global_step: int,
@@ -126,25 +132,22 @@ class MetricsLogger:
     ) -> None:
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().float().cpu().numpy()
-        self._backend.add_audio(tag, audio, global_step, sample_rate)
-        if context:
-            self._log_context(tag, global_step, context)
+        self._backend.add_audio(tag, audio, global_step, sample_rate, context=context)
+        self._dispatch_context(tag, global_step, context)
 
     def log_figure(
         self, tag: str, figure: Figure, global_step: int,
         context: Optional[dict] = None,
     ) -> None:
-        self._backend.add_figure(tag, figure, global_step)
-        if context:
-            self._log_context(tag, global_step, context)
+        self._backend.add_figure(tag, figure, global_step, context=context)
+        self._dispatch_context(tag, global_step, context)
 
     def log_text(
         self, tag: str, text: str, global_step: int,
         context: Optional[dict] = None,
     ) -> None:
-        self._backend.add_text(tag, text, global_step)
-        if context:
-            self._log_context(tag, global_step, context)
+        self._backend.add_text(tag, text, global_step, context=context)
+        self._dispatch_context(tag, global_step, context)
 
     def log_histogram(
         self, tag: str, values: Union[torch.Tensor, np.ndarray], global_step: int,
@@ -152,9 +155,8 @@ class MetricsLogger:
     ) -> None:
         if isinstance(values, torch.Tensor):
             values = values.detach().cpu().numpy()
-        self._backend.add_histogram(tag, values, global_step)
-        if context:
-            self._log_context(tag, global_step, context)
+        self._backend.add_histogram(tag, values, global_step, context=context)
+        self._dispatch_context(tag, global_step, context)
 
     def flush(self) -> None:
         self._backend.flush()

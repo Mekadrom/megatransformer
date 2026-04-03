@@ -48,15 +48,15 @@ def diagnose(model, batch, label=""):
     if hasattr(model, 'voice_gen_queries'):
         print(f"  voice_gen_queries: std={model.voice_gen_queries.std():.4f}")
     print(f"  projection weight: std={model.recurrent_block.projection.weight.std():.6f}")
-    if model.image_cross_decoder is not None:
-        cd = model.image_cross_decoder
-        print(f"  cross_decoder spatial_queries: std={cd.spatial_queries.std():.4f}")
+    if model.image_generator is not None:
+        cd = model.image_generator
+        print(f"  image_coda spatial_queries: std={cd.spatial_queries.std():.4f}")
         if hasattr(cd, 'output_scale'):
-            print(f"  cross_decoder output_scale: mean={cd.output_scale.data.mean():.4f}, std={cd.output_scale.data.std():.4f}")
-            print(f"  cross_decoder output_bias: mean={cd.output_bias.data.mean():.4f}, std={cd.output_bias.data.std():.4f}")
-    if hasattr(model, 'image_cross_input_norm'):
-        print(f"  image_cross_input_norm weight: mean={model.image_cross_input_norm.weight.mean():.4f}")
-        print(f"  image_cross_input_norm bias: mean={model.image_cross_input_norm.bias.mean():.4f}")
+            print(f"  image_coda output_scale: mean={cd.output_scale.data.mean():.4f}, std={cd.output_scale.data.std():.4f}")
+            print(f"  image_coda output_bias: mean={cd.output_bias.data.mean():.4f}, std={cd.output_bias.data.std():.4f}")
+    if hasattr(model, 'image_coda_input_norm'):
+        print(f"  image_coda_input_norm weight: mean={model.image_coda_input_norm.weight.mean():.4f}")
+        print(f"  image_coda_input_norm bias: mean={model.image_coda_input_norm.bias.mean():.4f}")
 
     # Forward pass with intermediate probes
     print("\n--- Forward Pass ---")
@@ -116,7 +116,7 @@ def diagnose(model, batch, label=""):
         r("recurrent_output_raw", probes['recurrent_output'])
 
         for key in ['image_recurrent_tokens', 'image_prelude_tokens',
-                     'image_cross_latent_preds', 'image_latent_preds',
+                     'image_latent_preds',
                      'voice_latent_preds']:
             v = outputs.get(key)
             if v is not None:
@@ -131,15 +131,15 @@ def diagnose(model, batch, label=""):
 
         # Check normalized cross-decoder input
         rec = outputs.get('image_recurrent_tokens')
-        if rec is not None and hasattr(model, 'image_cross_input_norm'):
-            normed = model.image_cross_input_norm(rec)
-            print(f"  cross_input_normed: std={normed.std():.4f}, seq_var={normed.var(dim=1).mean():.6f}")
+        if rec is not None and hasattr(model, 'image_coda_input_norm'):
+            normed = model.image_coda_input_norm(rec)
+            print(f"  coda_input_normed: std={normed.std():.4f}, seq_var={normed.var(dim=1).mean():.6f}")
 
         # Per-sample cross output
-        cross = outputs.get('image_cross_latent_preds')
+        cross = outputs.get('image_latent_preds')
         if cross is not None:
             for b in range(cross.shape[0]):
-                print(f"  cross_preds sample {b}: std={cross[b].std():.4f}, mean={cross[b].mean():.4f}")
+                print(f"  coda_preds sample {b}: std={cross[b].std():.4f}, mean={cross[b].mean():.4f}")
 
     # Gradient analysis
     print("\n--- Gradients ---")
@@ -160,7 +160,7 @@ def diagnose(model, batch, label=""):
         if 'loss' in k and isinstance(v, torch.Tensor) and v.requires_grad:
             loss = loss + v
     if loss.grad_fn is None:
-        for k in ['image_cross_latent_preds', 'image_latent_preds', 'voice_latent_preds']:
+        for k in ['image_latent_preds', 'voice_latent_preds']:
             v = outputs.get(k)
             if v is not None and v.requires_grad:
                 loss = loss + v.sum() * 1e-6
@@ -175,11 +175,11 @@ def diagnose(model, batch, label=""):
     }
     if hasattr(model, 'image_gen_pos_embedding'):
         groups['image_gen_pos_embedding'] = model.image_gen_pos_embedding
-    if model.image_cross_decoder is not None:
-        for li, layer in enumerate(model.image_cross_decoder.layers):
+    if model.image_generator is not None:
+        for li, layer in enumerate(model.image_generator.layers):
             sq = sum(p.grad.norm().item() ** 2 for p in layer.parameters() if p.grad is not None)
-            groups[f'cross_decoder/layer{li}'] = None
-            print(f"  cross_decoder/layer{li}: grad L2={sq ** 0.5:.6f}")
+            groups[f'image_coda/layer{li}'] = None
+            print(f"  image_coda/layer{li}: grad L2={sq ** 0.5:.6f}")
 
     for name, param in groups.items():
         if param is None:

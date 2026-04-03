@@ -8,7 +8,6 @@ from config.audio.feature_extractor import AudioVAEPreludeFeatureExtractorConfig
 from config.audio.generator import AudioCodaAndVAEConfig
 from config.common import MegaTransformerBlockConfig
 from config.image.feature_extractor import ImageVAEPreludeFeatureExtractorConfig
-from config.image.generator import ImageCodaAndVAEConfig
 from config.text.feature_extractor import TextPreludeFeatureExtractorConfig
 from config.text.generator import TextCodaClassifierConfig
 from utils.constants import (
@@ -133,12 +132,8 @@ class MegaTransformerWorldModelConfig:
     voice_coda_config: AudioCodaAndVAEConfig = dataclasses.field(
         default_factory=AudioCodaAndVAEConfig
     )
-    image_coda_config: ImageCodaAndVAEConfig = dataclasses.field(
-        default_factory=ImageCodaAndVAEConfig
-    )
-
     # Cross-attention image decoder (optional, for non-autoregressive image generation)
-    image_cross_decoder_config: Optional[dict] = None  # None = disabled
+    image_coda_config: Optional[dict] = None  # None = disabled
 
     # Scale embeddings by sqrt(d_model) before recurrent block (Huginn-style)
     scale_embeddings: bool = False
@@ -213,11 +208,6 @@ WORLD_MODEL_CONFIGS = {
             coda_config=_mha_block(),
             output_mode="conv_refine",
         ),
-        image_coda_config=ImageCodaAndVAEConfig(
-            n_layers=2,
-            coda_config=_mha_block(),
-            unpatchify_mode="pixel_shuffle",
-        ),
     ),
 
     "huginn_tiny_text_sinusoidal_and_rotary": MegaTransformerWorldModelConfig(
@@ -272,11 +262,6 @@ WORLD_MODEL_CONFIGS = {
             n_layers=2,
             coda_config=_mha_block(),
             output_mode="conv_refine",
-        ),
-        image_coda_config=ImageCodaAndVAEConfig(
-            n_layers=2,
-            coda_config=_mha_block(),
-            unpatchify_mode="pixel_shuffle",
         ),
     ),
 
@@ -333,11 +318,6 @@ WORLD_MODEL_CONFIGS = {
             n_layers=2,
             coda_config=_mha_block(d_model=768),
             output_mode="conv_refine",
-        ),
-        image_coda_config=ImageCodaAndVAEConfig(
-            n_layers=2,
-            coda_config=_mha_block(d_model=768),
-            unpatchify_mode="pixel_shuffle",
         ),
     ),
 
@@ -396,11 +376,6 @@ WORLD_MODEL_CONFIGS = {
             coda_config=_mha_block(d_model=768),
             output_mode="conv_refine",
         ),
-        image_coda_config=ImageCodaAndVAEConfig(
-            n_layers=2,
-            coda_config=_mha_block(d_model=768),
-            unpatchify_mode="pixel_shuffle",
-        ),
     ),
 
     "huginn_small_bidirectional_preludes_cross_attn_image_gen": MegaTransformerWorldModelConfig(
@@ -458,12 +433,7 @@ WORLD_MODEL_CONFIGS = {
             coda_config=_mha_block(d_model=768),
             output_mode="conv_refine",
         ),
-        image_coda_config=ImageCodaAndVAEConfig(
-            n_layers=2,
-            coda_config=_mha_block(d_model=768),
-            unpatchify_mode="pixel_shuffle",
-        ),
-        image_cross_decoder_config={
+        image_coda_config={
             "decoder_config": {
                 "d_model": 768,
                 "n_heads": 12,
@@ -546,12 +516,7 @@ WORLD_MODEL_CONFIGS = {
             coda_config=_mha_block(d_model=768),
             output_mode="conv_refine",
         ),
-        image_coda_config=ImageCodaAndVAEConfig(
-            n_layers=2,
-            coda_config=_mha_block(d_model=768),
-            unpatchify_mode="pixel_shuffle",
-        ),
-        image_cross_decoder_config={
+        image_coda_config={
             "decoder_config": {
                 "d_model": 768,
                 "n_heads": 12,

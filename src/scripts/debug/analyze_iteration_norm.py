@@ -186,11 +186,20 @@ def analyze_model(model, batch, label):
         if uninterleaved["image"] is not None:
             ic = model.image_generator
             h = uninterleaved["image"]
-            for i, block in enumerate(ic.coda):
+            # Encoder: self-attention over content tokens
+            for i, block in enumerate(ic.encoder_layers):
                 hidden, _ = block(h)
                 h = h + hidden
-                report(f"image_coda_layer{i}", h)
-            latent_preds = ic.unpatchify(h)
+                report(f"image_encoder_layer{i}", h)
+            h = ic.encoder_output_norm(h)
+            report("image_encoder_normed", h)
+            # Decoder: spatial queries cross-attend to encoded content
+            B = h.shape[0]
+            queries = ic.spatial_queries.expand(B, -1, -1) + ic.pos_embedding
+            for i, block in enumerate(ic.layers):
+                queries, _ = block(queries, encoder_hidden_states=h)
+                report(f"image_decoder_layer{i}", queries)
+            latent_preds = ic.unpatchify(queries)
             report("image_before_denorm", latent_preds)
             if ic.use_output_denorm:
                 latent_preds = latent_preds * ic.output_scale[None, :, None, None] + ic.output_bias[None, :, None, None]
@@ -231,7 +240,7 @@ def analyze_model(model, batch, label):
         "image_prelude": model.image_feature_extractor,
         "text_coda": model.text_generator,
         "voice_coda": model.voice_generator,
-        "image_coda": model.image_generator,
+        "image_generator": model.image_generator,
     }
 
     # Per recurrent block
