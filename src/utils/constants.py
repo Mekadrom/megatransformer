@@ -1,4 +1,7 @@
 
+# Mistral base tokenizer special tokens
+EOS_TOKEN_ID = 2  # End of Sequence (Mistral-7B EOS)
+
 # Special token IDs (base vocab = 32000 from Mistral tokenizer)
 BOA_TOKEN_ID = 32_000  # Begin of Audio
 EOA_TOKEN_ID = 32_001  # End of Audio

@@ -1,14 +1,14 @@
 """
-Diagnose a world model checkpoint by tracing activations and gradients.
+Diagnose a world model checkpoint by tracing activations and gradients
+across all modalities (text, voice, image).
 
 Usage:
-    PYTHONPATH=src python3 -m scripts.debug.diagnose_checkpoint \
-        --checkpoint ./runs/world/<run>/checkpoint-<step> \
-        --config huginn_small_causal_cross_attn
+    PYTHONPATH=src python3 -m scripts.debug.diagnose_checkpoint --checkpoint ./runs/world/<run>/checkpoint-<step> --config small_sum_dit --text_cache_dir ./cached_datasets/text_pile --voice_cache_dir ./cached_datasets/audio_sive_tiny_deep_3xdownsample_conv2d_batchnorm_0_0_layer10 --image_cache_dir ./cached_datasets/image_vae
 """
 
 import argparse
 import copy
+import math
 import os
 import torch
 
@@ -18,9 +18,12 @@ from scripts.data.world.dataset import MultimodalShardedDataset
 from scripts.data.world.data_collator import MultimodalDataCollator
 
 
-def load_model(config_name, checkpoint_path, tie_word_embeddings=False, gen_query_mode=None, n_image_gen_positions=None):
+def load_model(config_name, checkpoint_path, tie_word_embeddings=False,
+               gen_query_mode=None, n_image_gen_positions=None,
+               include_modes=None):
     config = copy.deepcopy(WORLD_MODEL_CONFIGS[config_name])
-    config.include_modes = ['text', 'voice', 'image']
+    if include_modes is not None:
+        config.include_modes = include_modes
     if tie_word_embeddings:
         config.tie_word_embeddings = True
     if gen_query_mode is not None:
@@ -28,10 +31,18 @@ def load_model(config_name, checkpoint_path, tie_word_embeddings=False, gen_quer
     if n_image_gen_positions is not None:
         config.n_image_gen_positions = n_image_gen_positions
     model = MegaTransformerWorldModel(config)
-    sd = torch.load(f'{checkpoint_path}/pytorch_model.bin', map_location='cpu', weights_only=True)
-    # Filter out parameters whose shapes don't match the current model (e.g.
-    # checkpoints trained before a config change like patch_size or max_audio_duration).
-    # This lets us load what we can and skip the rest with a warning.
+
+    ckpt_file = os.path.join(checkpoint_path, 'pytorch_model.bin')
+    if not os.path.exists(ckpt_file):
+        safetensors_file = os.path.join(checkpoint_path, 'model.safetensors')
+        if os.path.exists(safetensors_file):
+            from safetensors.torch import load_file
+            sd = load_file(safetensors_file, device='cpu')
+        else:
+            raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
+    else:
+        sd = torch.load(ckpt_file, map_location='cpu', weights_only=True)
+
     model_sd = model.state_dict()
     filtered_sd = {}
     skipped = []
@@ -53,15 +64,11 @@ def r(name, tensor, indent=2):
         print(f"{' ' * indent}{name}: None")
         return
     t = tensor.float()
-    print(f"{' ' * indent}{name}: std={t.std():.6f}, mean={t.mean():.6f}, range=[{t.min():.4f}, {t.max():.4f}]")
+    print(f"{' ' * indent}{name}: shape={list(t.shape)}, std={t.std():.6f}, mean={t.mean():.6f}, range=[{t.min():.4f}, {t.max():.4f}]")
 
 
 def save_latent_grid(latents: torch.Tensor, save_path: str, title: str):
-    """Save a (B, C, H, W) latent tensor as a grid of per-sample, per-channel images.
-
-    Each sample becomes a row, each channel a column. Useful for visually
-    verifying that latents are not all zeros / not collapsed.
-    """
+    """Save a (B, C, H, W) latent tensor as a grid of per-sample, per-channel images."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -88,41 +95,86 @@ def save_latent_grid(latents: torch.Tensor, save_path: str, title: str):
     print(f"  saved {save_path}")
 
 
-def diagnose(model, batch, label=""):
-    print(f"\n{'=' * 70}")
-    print(f"Checkpoint: {label}")
-    print(f"{'=' * 70}")
+# ──────────────────────────────────────────────────────────────────────
+# Learned parameter summary
+# ──────────────────────────────────────────────────────────────────────
 
-    # Learned parameters
+def report_learned_params(model):
     print("\n--- Learned Parameters ---")
+
+    # Recurrent block
+    rb = model.recurrent_block
+    if rb.projection is not None:
+        r("recurrent/projection.weight", rb.projection.weight)
+    for i, block in enumerate(rb.recurrent_blocks):
+        total_params = sum(p.numel() for p in block.parameters())
+        weight_std = torch.cat([p.flatten() for p in block.parameters()]).std()
+        print(f"  recurrent/block{i}: {total_params:,} params, weight std={weight_std:.6f}")
+
+    # Text prelude
+    if model.text_feature_extractor is not None:
+        fe = model.text_feature_extractor
+        print(f"  text_prelude: {sum(p.numel() for p in fe.parameters()):,} params")
+        if hasattr(fe, 'embedding'):
+            r("text_prelude/embedding.weight", fe.embedding.weight)
+
+    # Text coda
+    if model.text_generator is not None:
+        tg = model.text_generator
+        print(f"  text_coda: {sum(p.numel() for p in tg.parameters()):,} params")
+        if hasattr(tg, 'lm_head'):
+            r("text_coda/lm_head.weight", tg.lm_head.weight)
+
+    # Voice prelude
+    if model.voice_feature_extractor is not None:
+        vfe = model.voice_feature_extractor
+        print(f"  voice_prelude: {sum(p.numel() for p in vfe.parameters()):,} params")
+        r("voice_prelude/projection.weight", vfe.projection.weight)
+
+    # Voice coda
+    if model.voice_generator is not None:
+        vg = model.voice_generator
+        print(f"  voice_coda: {sum(p.numel() for p in vg.parameters()):,} params")
+        r("voice_coda/feature_projection.weight", vg.feature_projection.weight)
+        if hasattr(vg, 'stop_head'):
+            r("voice_coda/stop_head.weight", vg.stop_head.weight)
+            print(f"  voice_coda/stop_head.bias: {vg.stop_head.bias.data.item():.4f}")
+
+    # Audio prelude/coda (if present)
+    if model.audio_feature_extractor is not None:
+        print(f"  audio_prelude: {sum(p.numel() for p in model.audio_feature_extractor.parameters()):,} params")
+    if model.audio_generator is not None:
+        print(f"  audio_coda: {sum(p.numel() for p in model.audio_generator.parameters()):,} params")
+
+    # Image prelude
+    if model.image_feature_extractor is not None:
+        ife = model.image_feature_extractor
+        print(f"  image_prelude: {sum(p.numel() for p in ife.parameters()):,} params")
+
+    # Image coda
+    if model.image_generator is not None:
+        cd = model.image_generator
+        print(f"  image_coda: {sum(p.numel() for p in cd.parameters()):,} params, class={type(cd).__name__}")
+        if hasattr(cd, 'bridge') and hasattr(cd.bridge, 'queries'):
+            r("image_coda/bridge.queries", cd.bridge.queries)
+        if hasattr(cd, 'output_scale'):
+            r("image_coda/output_scale", cd.output_scale.data)
+            r("image_coda/output_bias", cd.output_bias.data)
+
+    # Image gen queries
     if hasattr(model, 'image_gen_queries'):
-        print(f"  image_gen_queries: std={model.image_gen_queries.std():.4f}")
+        r("image_gen_queries", model.image_gen_queries)
     else:
         print(f"  image_gen_queries: not present (positional_only mode)")
     if hasattr(model, 'image_gen_pos_embedding'):
         print(f"  image_gen_pos_embedding (frozen): std={model.image_gen_pos_embedding.pe.std():.4f}")
-    # Voice/audio gen queries removed — voice uses autoregressive generation
-    if hasattr(model.recurrent_block, 'projection') and model.recurrent_block.projection is not None:
-        print(f"  projection weight: std={model.recurrent_block.projection.weight.std():.6f}")
-    if model.image_generator is not None:
-        cd = model.image_generator
-        print(f"  image_coda class: {type(cd).__name__}")
-        # ImageDecoder in cross_attention mode has spatial_queries; in direct
-        # mode it does not. DiffusionBridgeImageDecoder has bridge.queries.
-        if hasattr(cd, 'spatial_queries'):
-            print(f"  image_coda spatial_queries: std={cd.spatial_queries.std():.4f}")
-        elif hasattr(cd, 'bridge') and hasattr(cd.bridge, 'queries'):
-            print(f"  image_coda bridge.queries: std={cd.bridge.queries.std():.4f}")
-        else:
-            print(f"  image_coda has no learned spatial/bridge queries (direct mode)")
-        if hasattr(cd, 'output_scale'):
-            print(f"  image_coda output_scale: mean={cd.output_scale.data.mean():.4f}, std={cd.output_scale.data.std():.4f}")
-            print(f"  image_coda output_bias: mean={cd.output_bias.data.mean():.4f}, std={cd.output_bias.data.std():.4f}")
-    if hasattr(model, 'image_coda_input_norm'):
-        print(f"  image_coda_input_norm weight: mean={model.image_coda_input_norm.weight.mean():.4f}")
-        print(f"  image_coda_input_norm bias: mean={model.image_coda_input_norm.bias.mean():.4f}")
 
-    # Forward pass with intermediate probes
+
+# ──────────────────────────────────────────────────────────────────────
+# Forward pass with activation probes
+# ──────────────────────────────────────────────────────────────────────
+
+def report_activations(model, batch, save_dir):
     print("\n--- Forward Pass ---")
     probes = {}
 
@@ -136,16 +188,10 @@ def diagnose(model, batch, label=""):
         probes['recurrent_output'] = output[0].detach().clone()
         return output
 
-    def hook_image_text_conditioning(module, args, output):
-        conditioned, _ = output
-        probes['conditioned_queries'] = conditioned.detach().clone()
-        return output
-
-    handles = []
-    handles.append(model.token_interleaver.register_forward_hook(hook_token_interleaver))
-    handles.append(model.recurrent_block.register_forward_hook(hook_recurrent_block))
-    if hasattr(model, 'image_text_conditioning'):
-        handles.append(model.image_text_conditioning.register_forward_hook(hook_image_text_conditioning))
+    handles = [
+        model.token_interleaver.register_forward_hook(hook_token_interleaver),
+        model.recurrent_block.register_forward_hook(hook_recurrent_block),
+    ]
 
     model.eval()
     with torch.no_grad():
@@ -162,82 +208,182 @@ def diagnose(model, batch, label=""):
     for h in handles:
         h.remove()
 
-    # Save input + predicted latents as visualization grids so the user can
-    # eyeball that the input isn't all zeros and the predictions aren't collapsed.
-    save_dir = os.path.join(label, "diagnose")
+    # Latent visualizations
     os.makedirs(save_dir, exist_ok=True)
     print(f"\n  -- Saving Latent Visualizations to {save_dir} --")
     if 'image_images' in batch:
-        save_latent_grid(
-            batch['image_images'],
-            os.path.join(save_dir, "input_latents.png"),
-            "INPUT image_latent_labels",
-        )
-        # Also save raw tensor for re-loading later
-        torch.save(batch['image_images'].detach().cpu(), os.path.join(save_dir, "input_latents.pt"))
-    pred_latents = outputs.get('image_latent_preds')
-    if pred_latents is not None:
-        save_latent_grid(
-            pred_latents,
-            os.path.join(save_dir, "pred_latents.png"),
-            "PREDICTED image_latent_preds",
-        )
-        torch.save(pred_latents.detach().cpu(), os.path.join(save_dir, "pred_latents.pt"))
+        save_latent_grid(batch['image_images'], os.path.join(save_dir, "input_image_latents.png"), "INPUT image latents")
+        torch.save(batch['image_images'].detach().cpu(), os.path.join(save_dir, "input_image_latents.pt"))
+    pred_image = outputs.get('image_latent_preds')
+    if pred_image is not None:
+        save_latent_grid(pred_image, os.path.join(save_dir, "pred_image_latents.png"), "PREDICTED image latents")
+        torch.save(pred_image.detach().cpu(), os.path.join(save_dir, "pred_image_latents.pt"))
 
-    # Intermediate probes
+    if 'voice_features' in batch:
+        torch.save(batch['voice_features'].detach().cpu(), os.path.join(save_dir, "input_voice_features.pt"))
+    pred_voice = outputs.get('voice_latent_preds')
+    if pred_voice is not None:
+        torch.save(pred_voice.detach().cpu(), os.path.join(save_dir, "pred_voice_features.pt"))
+
+    # Interleaved activations per modality
     print("\n  -- Intermediate Activations --")
-    if 'conditioned_queries' in probes:
-        r("after_text_conditioning", probes['conditioned_queries'])
     if 'interleaved_pre_scale' in probes:
         r("interleaved_pre_scale", probes['interleaved_pre_scale'])
         if 'modality_map' in probes:
             mmap = probes['modality_map']
             interleaved = probes['interleaved_pre_scale']
-            for mod_name in ['text', 'image', 'voice']:
-                mask = (mmap == {'text': 0, 'image': 3, 'voice': 2, 'audio': 1}.get(mod_name, -1))
+            mod_ids = {'text': 0, 'audio': 1, 'voice': 2, 'image': 3}
+            for mod_name, mod_id in mod_ids.items():
+                mask = (mmap == mod_id)
                 if mask.any():
                     mod_tokens = interleaved[mask]
                     r(f"interleaved[{mod_name}]", mod_tokens)
+
+    # Recurrent output
     if 'recurrent_output' in probes:
         r("recurrent_output_raw", probes['recurrent_output'])
 
-        for key in ['image_recurrent_tokens', 'image_latent_preds', 'voice_latent_preds']:
-            v = outputs.get(key)
-            if v is not None:
-                r(key, v)
-
-        for key in ['recurrent_out/text_token_var', 'recurrent_out/text_seq_var',
-                     'recurrent_out/voice_token_var', 'recurrent_out/voice_seq_var',
-                     'recurrent_out/image_token_var', 'recurrent_out/image_seq_var']:
+    # Per-modality recurrent output stats
+    print("\n  -- Per-Modality Recurrent Output Stats --")
+    for mod in ['text', 'voice', 'audio', 'image']:
+        for stat in ['token_var', 'seq_var', 'entropy']:
+            key = f"recurrent_out/{mod}_{stat}"
             v = outputs.get(key)
             if v is not None:
                 print(f"  {key}: {v:.6f}")
 
-        # Check normalized cross-decoder input
-        rec = outputs.get('image_recurrent_tokens')
-        if rec is not None and hasattr(model, 'image_coda_input_norm'):
-            normed = model.image_coda_input_norm(rec)
-            print(f"  coda_input_normed: std={normed.std():.4f}, seq_var={normed.var(dim=1).mean():.6f}")
+    # Coda predictions
+    print("\n  -- Coda Predictions --")
+    for key in ['image_latent_preds', 'voice_latent_preds', 'audio_latent_preds']:
+        v = outputs.get(key)
+        if v is not None:
+            r(key, v)
+            if v.shape[0] >= 2:
+                diff = (v[0] - v[1]).abs()
+                print(f"    |sample0 - sample1|: max={diff.max():.6e}, mean={diff.mean():.6e}")
 
-        # Per-sample cross output
-        cross = outputs.get('image_latent_preds')
-        if cross is not None:
-            for b in range(cross.shape[0]):
-                print(f"  coda_preds sample {b}: std={cross[b].std():.4f}, mean={cross[b].mean():.4f}")
-            if cross.shape[0] >= 2:
-                diff = (cross[0] - cross[1]).abs()
-                print(f"  coda_preds |sample0 - sample1|: max={diff.max():.6e}, mean={diff.mean():.6e}")
-
-        # Per-sample recurrent output at image positions: confirms whether the
-        # recurrent block routes any sample-specific info to image positions.
-        rec = outputs.get('image_recurrent_tokens')
-        if rec is not None and rec.shape[0] >= 2:
-            for b in range(rec.shape[0]):
-                print(f"  image_recurrent_tokens sample {b}: std={rec[b].std():.6f}, mean={rec[b].mean():.6f}")
+    # Image recurrent tokens and normalized coda input
+    rec = outputs.get('image_recurrent_tokens')
+    if rec is not None:
+        r("image_recurrent_tokens", rec)
+        if rec.shape[0] >= 2:
             diff = (rec[0] - rec[1]).abs()
-            print(f"  image_recurrent_tokens |sample0 - sample1|: max={diff.max():.6e}, mean={diff.mean():.6e}")
+            print(f"    |sample0 - sample1|: max={diff.max():.6e}, mean={diff.mean():.6e}")
+        if hasattr(model, 'image_coda_input_norm'):
+            normed = model.image_coda_input_norm(rec)
+            print(f"  image_coda_input_normed: std={normed.std():.4f}, seq_var={normed.var(dim=1).mean():.6f}")
 
-    # Gradient analysis
+    return outputs
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Gradient analysis
+# ──────────────────────────────────────────────────────────────────────
+
+def compute_loss(outputs, batch):
+    """Replicate the trainer's loss computation so all modalities get gradients.
+
+    This mirrors WorldModelTrainer.compute_loss() but without requiring a
+    full trainer instance.
+    """
+    import torch.nn.functional as F
+
+    device = next(v.device for v in outputs.values() if isinstance(v, torch.Tensor))
+    total_loss = torch.tensor(0.0, device=device)
+    components = {}
+    eps = 1e-7
+
+    # ── Text cross-entropy ──
+    logits = outputs.get("logits")
+    text_targets = batch.get("text_token_ids")
+    if logits is not None and text_targets is not None:
+        # Shifted targets: predict token t+1 from position t
+        text_targets = text_targets[:, 1:]  # drop first token
+        B, T, V = logits.size()
+        T_min = min(T, text_targets.shape[1])
+        logits_aligned = logits[:, :T_min, :].contiguous()
+        targets_aligned = text_targets[:, :T_min].contiguous()
+        text_loss_raw = F.cross_entropy(
+            logits_aligned.reshape(-1, V),
+            targets_aligned.reshape(-1),
+            ignore_index=-100,
+        )
+        log_vocab = math.log(V)
+        text_loss_norm = text_loss_raw / log_vocab
+        total_loss = total_loss + text_loss_norm
+        components["text_loss_raw"] = text_loss_raw.detach()
+        components["text_loss_norm"] = text_loss_norm.detach()
+
+    # ── Voice/Audio reconstruction (whitened L1+MSE + var loss) ──
+    for mod, label_key, length_key in [
+        ("voice", "voice_features", "voice_feature_lengths"),
+        ("audio", "audio_features", "audio_feature_lengths"),
+    ]:
+        preds = outputs.get(f"{mod}_latent_preds")
+        labels = batch.get(label_key)
+        if preds is None or labels is None or preds.numel() == 0:
+            continue
+        labels = labels.to(preds.device)
+        lengths = batch.get(length_key)
+
+        # Masked stats
+        if lengths is not None:
+            lengths = lengths.to(preds.device).view(-1)
+            T_feat = preds.shape[-1]
+            mask = torch.arange(T_feat, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+            while mask.dim() < preds.dim():
+                mask = mask.unsqueeze(1)
+            preds_m = preds * mask
+            labels_m = labels * mask
+            n_real = mask.expand_as(preds).sum().clamp_min(1).float()
+            label_std = labels_m.detach().pow(2).sum().div(n_real).sqrt().clamp_min(eps)
+            diff = preds_m - labels_m
+            l1_raw = diff.abs().sum() / n_real
+            mse_raw = diff.pow(2).sum() / n_real
+        else:
+            label_std = labels.detach().std().clamp_min(eps)
+            l1_raw = F.l1_loss(preds, labels)
+            mse_raw = F.mse_loss(preds, labels)
+
+        label_var = label_std * label_std
+        l1_norm = l1_raw / label_std
+        mse_norm = mse_raw / label_var
+        recon = l1_norm + mse_norm
+
+        # Variance loss
+        pred_std = preds.flatten(1).std(dim=1)
+        label_std_per = labels.detach().flatten(1).std(dim=1).clamp_min(eps)
+        var_loss = (pred_std / label_std_per - 1.0).abs().mean()
+
+        mod_loss = recon + var_loss
+        total_loss = total_loss + mod_loss
+        components[f"{mod}_latent_l1_raw"] = l1_raw.detach()
+        components[f"{mod}_latent_l1_norm"] = l1_norm.detach()
+        components[f"{mod}_latent_mse_raw"] = mse_raw.detach()
+        components[f"{mod}_latent_mse_norm"] = mse_norm.detach()
+        components[f"{mod}_latent_var_loss"] = var_loss.detach()
+
+        # Stop loss
+        stop_logits = outputs.get(f"{mod}_stop_logits")
+        if stop_logits is not None and lengths is not None:
+            T_stop = stop_logits.shape[-1]
+            stop_target = (torch.arange(T_stop, device=device).unsqueeze(0)
+                           >= lengths.unsqueeze(1)).float()
+            stop_loss_raw = F.binary_cross_entropy_with_logits(stop_logits, stop_target)
+            stop_loss_norm = stop_loss_raw / 0.6931471805599453
+            total_loss = total_loss + stop_loss_norm
+            components[f"{mod}_stop_loss_norm"] = stop_loss_norm.detach()
+
+    # ── Image diffusion loss (already computed inside the model) ──
+    img_diff_loss = outputs.get("image_diffusion_loss")
+    if img_diff_loss is not None and img_diff_loss.requires_grad:
+        total_loss = total_loss + img_diff_loss
+        components["image_diffusion_loss"] = img_diff_loss.detach()
+
+    return total_loss, components
+
+
+def report_gradients(model, batch):
     print("\n--- Gradients ---")
     model.train()
     model.zero_grad()
@@ -251,112 +397,253 @@ def diagnose(model, batch, label=""):
         is_synthesis=batch.get('is_synthesis'),
     )
 
-    # Print loss components so we can tell whether the loss is actually small
-    # or whether the gradient chain is broken.
+    # Compute full loss (text CE + voice/audio recon + image diffusion)
+    loss, components = compute_loss(outputs, batch)
+
     print("\n  -- Loss Components --")
-    for k, v in outputs.items():
-        if 'loss' in k and isinstance(v, torch.Tensor):
-            print(f"  {k}: value={v.item():.6e}, requires_grad={v.requires_grad}, grad_fn={v.grad_fn is not None}")
+    for k, v in sorted(components.items()):
+        print(f"  {k}: {v.item():.6e}")
+    print(f"\n  total_loss: {loss.item():.6e}")
 
-    loss = torch.tensor(0.0, requires_grad=True)
-    used_fallback = False
-    for k, v in outputs.items():
-        if 'loss' in k and isinstance(v, torch.Tensor) and v.requires_grad:
-            loss = loss + v
     if loss.grad_fn is None:
-        used_fallback = True
-        for k in ['image_latent_preds', 'voice_latent_preds']:
-            v = outputs.get(k)
-            if v is not None and v.requires_grad:
-                loss = loss + v.sum() * 1e-6
-    print(f"  total_loss: value={loss.item():.6e}, used_fallback={used_fallback}")
-    if loss.grad_fn is not None:
-        loss.backward()
-    else:
-        print("  WARNING: no differentiable outputs — skipping gradient analysis")
+        print("  WARNING: no differentiable loss — skipping gradient analysis")
+        return
 
-    groups = {
-        'recurrent/proj': model.recurrent_block.projection.weight if model.recurrent_block.projection is not None else None,
-    }
-    if hasattr(model, 'image_gen_queries'):
-        groups['image_gen_queries'] = model.image_gen_queries
-    # image_gen_pos_embedding is a frozen buffer, no gradients to track
+    loss.backward()
 
+    def grad_summary(name, module):
+        """Print aggregate gradient stats for a module."""
+        grads = [p.grad for p in module.parameters() if p.grad is not None]
+        if not grads:
+            print(f"  {name}: NO GRADS")
+            return
+        flat = torch.cat([g.flatten() for g in grads])
+        print(f"  {name}: grad L2={flat.norm():.6f}, max={flat.abs().max():.6f}, mean_abs={flat.abs().mean():.6f}")
+
+    def per_layer_grad(name, layers):
+        """Print per-layer gradient norms for a ModuleList."""
+        for i, layer in enumerate(layers):
+            grads = [p.grad for p in layer.parameters() if p.grad is not None]
+            if grads:
+                l2 = torch.cat([g.flatten() for g in grads]).norm()
+                print(f"  {name}/layer{i}: grad L2={l2:.6f}")
+            else:
+                print(f"  {name}/layer{i}: NO GRADS")
+
+    # Recurrent block
+    print("\n  -- Recurrent Block Gradients --")
+    grad_summary("recurrent_block (all)", model.recurrent_block)
+    if model.recurrent_block.projection is not None:
+        grad_summary("recurrent/projection", model.recurrent_block.projection)
+    per_layer_grad("recurrent/block", model.recurrent_block.recurrent_blocks)
+
+    # Text prelude
+    if model.text_feature_extractor is not None:
+        print("\n  -- Text Prelude Gradients --")
+        grad_summary("text_prelude (all)", model.text_feature_extractor)
+        if hasattr(model.text_feature_extractor, 'prelude'):
+            per_layer_grad("text_prelude", model.text_feature_extractor.prelude)
+
+    # Text coda
+    if model.text_generator is not None:
+        print("\n  -- Text Coda Gradients --")
+        grad_summary("text_coda (all)", model.text_generator)
+        if hasattr(model.text_generator, 'coda'):
+            per_layer_grad("text_coda", model.text_generator.coda)
+
+    # Voice prelude
+    if model.voice_feature_extractor is not None:
+        print("\n  -- Voice Prelude Gradients --")
+        grad_summary("voice_prelude (all)", model.voice_feature_extractor)
+        if hasattr(model.voice_feature_extractor, 'prelude'):
+            per_layer_grad("voice_prelude", model.voice_feature_extractor.prelude)
+
+    # Voice coda
+    if model.voice_generator is not None:
+        print("\n  -- Voice Coda Gradients --")
+        grad_summary("voice_coda (all)", model.voice_generator)
+        if hasattr(model.voice_generator, 'coda'):
+            per_layer_grad("voice_coda", model.voice_generator.coda)
+        if hasattr(model.voice_generator, 'stop_head'):
+            grad_summary("voice_coda/stop_head", model.voice_generator.stop_head)
+
+    # Audio prelude/coda
+    if model.audio_feature_extractor is not None:
+        print("\n  -- Audio Prelude Gradients --")
+        grad_summary("audio_prelude (all)", model.audio_feature_extractor)
+    if model.audio_generator is not None:
+        print("\n  -- Audio Coda Gradients --")
+        grad_summary("audio_coda (all)", model.audio_generator)
+
+    # Image prelude
+    if model.image_feature_extractor is not None:
+        print("\n  -- Image Prelude Gradients --")
+        grad_summary("image_prelude (all)", model.image_feature_extractor)
+        if hasattr(model.image_feature_extractor, 'prelude'):
+            per_layer_grad("image_prelude", model.image_feature_extractor.prelude)
+
+    # Image coda
     if model.image_generator is not None:
+        print("\n  -- Image Coda Gradients --")
         gen = model.image_generator
-        # Pick the layer stack to inspect based on which decoder is in use:
-        # - ImageDecoder direct mode → encoder_layers (the only stack)
-        # - ImageDecoder cross_attention mode → decoder_layers ("layers")
-        # - DiffusionBridgeImageDecoder → dit.blocks (and bridge.layers)
-        if hasattr(gen, 'layers'):
-            stack_label = "image_coda"
-            stack = gen.layers
-        elif hasattr(gen, 'encoder_layers') and not hasattr(gen, 'dit'):
-            stack_label = "image_coda_enc"
-            stack = gen.encoder_layers
-        elif hasattr(gen, 'dit') and hasattr(gen.dit, 'blocks'):
-            stack_label = "image_dit"
-            stack = gen.dit.blocks
-        else:
-            stack_label = None
-            stack = []
-        if stack is not None:
-            for li, layer in enumerate(stack):
-                sq = sum(p.grad.norm().item() ** 2 for p in layer.parameters() if p.grad is not None)
-                print(f"  {stack_label}/layer{li}: grad L2={sq ** 0.5:.6f}")
-        # For the diffusion bridge also report the bridge stack separately.
+        grad_summary("image_coda (all)", gen)
+        if hasattr(gen, 'dit') and hasattr(gen.dit, 'blocks'):
+            per_layer_grad("image_dit", gen.dit.blocks)
         if hasattr(gen, 'bridge') and hasattr(gen.bridge, 'layers'):
-            for li, layer in enumerate(gen.bridge.layers):
-                sq = sum(p.grad.norm().item() ** 2 for p in layer.parameters() if p.grad is not None)
-                print(f"  image_bridge/layer{li}: grad L2={sq ** 0.5:.6f}")
+            per_layer_grad("image_bridge", gen.bridge.layers)
+        if hasattr(gen, 'layers'):
+            per_layer_grad("image_coda", gen.layers)
+        if hasattr(gen, 'encoder_layers') and not hasattr(gen, 'dit'):
+            per_layer_grad("image_coda_enc", gen.encoder_layers)
 
-    for name, param in groups.items():
-        if param is None:
-            continue
-        if param.grad is not None:
-            print(f"  {name}: grad L2={param.grad.norm():.6f}, max={param.grad.abs().max():.6f}")
-        else:
-            print(f"  {name}: NO GRAD")
+    # Image gen queries
+    if hasattr(model, 'image_gen_queries') and model.image_gen_queries.grad is not None:
+        r("image_gen_queries grad", model.image_gen_queries.grad)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────
+
+def diagnose(model, batch, label=""):
+    print(f"\n{'=' * 70}")
+    print(f"Checkpoint: {label}")
+    print(f"{'=' * 70}")
+
+    report_learned_params(model)
+
+    save_dir = os.path.join(label, "diagnose")
+    report_activations(model, batch, save_dir)
+    report_gradients(model, batch)
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Diagnose world model checkpoint across all modalities")
     parser.add_argument('--checkpoint', type=str, required=True, nargs='+')
-    parser.add_argument('--config', type=str, default='huginn_small_causal_cross_attn')
+    parser.add_argument('--config', type=str, default='small_sum_dit')
+    parser.add_argument('--include_modes', type=str, default='text,voice,image')
     parser.add_argument('--max_samples', type=int, default=32)
-    parser.add_argument('--tie_word_embeddings', action='store_true', help='Tie text embedding and LM head weights')
-    parser.add_argument('--gen_query_mode', type=str, default=None, choices=['learned', 'positional_only'],
-                        help='Generation query mode (default: use config)')
-    parser.add_argument('--n_image_gen_positions', type=int, default=None,
-                        help='Number of image gen query positions (default: use config)')
+    parser.add_argument('--batch_size', type=int, default=2, help='Samples per batch for diagnosis')
+    parser.add_argument('--direction', type=str, default='synthesis', choices=['synthesis', 'transcription', 'mixed'],
+                        help='Force collator direction for diagnosis')
+    parser.add_argument('--tie_word_embeddings', action='store_true')
+    parser.add_argument('--gen_query_mode', type=str, default=None, choices=['learned', 'positional_only'])
+    parser.add_argument('--n_image_gen_positions', type=int, default=None)
+    # Dataset paths
+    parser.add_argument('--text_cache_dir', type=str, default=None)
+    parser.add_argument('--voice_cache_dir', type=str, default=None)
+    parser.add_argument('--audio_cache_dir', type=str, default=None)
+    parser.add_argument('--image_cache_dir', type=str, default=None)
+    parser.add_argument('--cache_dir', type=str, default=None, help='Base cache dir (uses <dir>_train)')
+    parser.add_argument('--use_memorization_dataset', action='store_true')
     args = parser.parse_args()
 
-    ds = MultimodalShardedDataset(
-        text_shard_dir='./cached_datasets/text_pile_train',
-        voice_shard_dir='./cached_datasets/audio_sive_tiny_deep_3xdownsample_conv2d_batchnorm_0_0_layer10_train',
-        image_shard_dir='./cached_datasets/image_vae_train',
-        cache_size=1, max_samples=args.max_samples,
-    )
-    tasks = ds.task_types
-    n_tasks = len(tasks)
-    # Find the first index whose task is image_synthesis. Striding by n_tasks
-    # then walks through distinct within_task_idx values for the SAME task,
-    # so we get genuinely different image samples (not the same image picked
-    # via image_synthesis vs image_transcription, which both map to within=0).
-    image_synth_base = next(
-        (i for i in range(n_tasks) if tasks[i][1] == 'image' and tasks[i][2] == 'synthesis'),
-        None,
-    )
-    if image_synth_base is None:
-        raise RuntimeError("No image_synthesis task found in dataset task_types")
-    image_indices = [image_synth_base + n_tasks * k for k in range(2)]
+    include_modes = [m.strip() for m in args.include_modes.split(',')]
+
+    # Resolve shard dirs
+    def resolve(specific, base):
+        d = specific or base
+        if d is None:
+            return None
+        candidate = d + "_train"
+        if os.path.isdir(candidate):
+            return candidate
+        if os.path.isdir(d):
+            return d
+        print(f"Warning: {candidate} not found")
+        return None
+
+    text_dir = resolve(args.text_cache_dir, args.cache_dir) if 'text' in include_modes else None
+    voice_dir = resolve(args.voice_cache_dir, args.cache_dir) if 'voice' in include_modes else None
+    audio_dir = resolve(args.audio_cache_dir, args.cache_dir) if 'audio' in include_modes else None
+    image_dir = resolve(args.image_cache_dir, args.cache_dir) if 'image' in include_modes else None
+
+    if args.use_memorization_dataset:
+        from scripts.data.world.memorization_dataset import MultimodalMemorizationDataset
+        ds = MultimodalMemorizationDataset(
+            text_shard_dir=text_dir,
+            voice_shard_dir=voice_dir,
+            audio_shard_dir=audio_dir,
+            image_shard_dir=image_dir,
+            max_samples=args.max_samples,
+        )
+    else:
+        ds = MultimodalShardedDataset(
+            text_shard_dir=text_dir,
+            voice_shard_dir=voice_dir,
+            audio_shard_dir=audio_dir,
+            image_shard_dir=image_dir,
+            cache_size=1,
+            max_samples=args.max_samples,
+        )
+
+    print(f"Dataset: {len(ds)} samples")
+    if hasattr(ds, 'task_types'):
+        tasks = ds.task_types
+        print(f"Task types ({len(tasks)}):")
+        for i, t in enumerate(tasks):
+            print(f"  {i}: {t}")
+
+    # Build a batch that covers requested modalities
     collator = MultimodalDataCollator(max_seq_len=1024)
-    collator.force_direction = 'synthesis'
-    samples = [ds[i] for i in image_indices]
+    if args.direction != 'mixed':
+        collator.force_direction = args.direction
+
+    # Try to pick samples that have all requested modalities
+    tasks = ds.task_types if hasattr(ds, 'task_types') else []
+    n_tasks = len(tasks) if tasks else 1
+    n = args.batch_size
+
+    # Find indices per modality
+    modality_indices = {}
+    for mod in include_modes:
+        if mod == 'text':
+            continue
+        indices = []
+        target_dir = args.direction if args.direction != 'mixed' else 'synthesis'
+        for i in range(n_tasks):
+            if tasks and tasks[i][1] == mod and tasks[i][2] == target_dir:
+                for k in range(n):
+                    idx = i + n_tasks * k
+                    if idx < len(ds):
+                        indices.append(idx)
+                break
+        if not indices:
+            # Fallback: any task with this modality
+            for i in range(n_tasks):
+                if tasks and tasks[i][1] == mod:
+                    for k in range(n):
+                        idx = i + n_tasks * k
+                        if idx < len(ds):
+                            indices.append(idx)
+                    break
+        modality_indices[mod] = indices[:n]
+
+    # Combine all indices, deduplicate
+    all_indices = set()
+    for indices in modality_indices.values():
+        all_indices.update(indices)
+    # Add text indices if needed
+    if 'text' in include_modes and not all_indices:
+        for i in range(n_tasks):
+            if tasks and tasks[i][1] == 'text':
+                for k in range(n):
+                    idx = i + n_tasks * k
+                    if idx < len(ds):
+                        all_indices.add(idx)
+                break
+    all_indices = sorted(all_indices)[:max(n, len(all_indices))]
+
+    if not all_indices:
+        # Fallback: just use first n samples
+        all_indices = list(range(min(n, len(ds))))
+
+    print(f"\nUsing sample indices: {all_indices}")
+    samples = [ds[i] for i in all_indices]
     batch = collator(samples)
 
     print("\n--- Batch Contents ---")
-    for k, v in batch.items():
+    for k, v in sorted(batch.items()):
         if isinstance(v, torch.Tensor):
             print(f"  {k}: shape={list(v.shape)}, dtype={v.dtype}")
         elif isinstance(v, list):
@@ -370,7 +657,13 @@ def main():
         print(f"  is_synthesis: {batch['is_synthesis']}")
 
     for ckpt in args.checkpoint:
-        model = load_model(args.config, ckpt, tie_word_embeddings=args.tie_word_embeddings, gen_query_mode=args.gen_query_mode, n_image_gen_positions=args.n_image_gen_positions)
+        model = load_model(
+            args.config, ckpt,
+            tie_word_embeddings=args.tie_word_embeddings,
+            gen_query_mode=args.gen_query_mode,
+            n_image_gen_positions=args.n_image_gen_positions,
+            include_modes=include_modes,
+        )
         diagnose(model, batch, label=ckpt)
 
 

@@ -720,6 +720,8 @@ class MegaTransformerWorldModel(nn.Module):
         # Track which modality we're currently generating for each batch item
         # None = text, "audio", "voice", "image"
         current_modality: List[Optional[str]] = [None for _ in range(batch_size)]
+        # Per-batch-item EOS flag — stops text generation once EOS is sampled
+        finished: List[bool] = [False for _ in range(batch_size)]
 
         # Completed modality outputs (list of tensors per batch item to support multiple media)
         completed_audio: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
@@ -1028,7 +1030,16 @@ class MegaTransformerWorldModel(nn.Module):
                 for b in range(batch_size):
                     generated_tokens[b].append(next_token_ids[b].item())
 
-            # Check for EOS (could add EOS_TOKEN_ID check here)
+            # Check for EOS — stop generation for batch items that produced it
+            if not any_media:
+                all_done = True
+                for b in range(batch_size):
+                    if next_token_ids[b].item() == constants.EOS_TOKEN_ID:
+                        finished[b] = True
+                    if not finished[b]:
+                        all_done = False
+                if all_done:
+                    break
 
         # Compile outputs
         outputs: Dict[str, torch.Tensor] = {}

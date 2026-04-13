@@ -10,6 +10,7 @@ from utils.constants import (
     AUDIO_PLACEHOLDER_TOKEN_ID,
     VOICE_PLACEHOLDER_TOKEN_ID,
     IMAGE_PLACEHOLDER_TOKEN_ID,
+    EOS_TOKEN_ID,
 )
 from utils.megatransformer_utils import pad_and_mask, trim
 
@@ -98,12 +99,19 @@ class MultimodalDataCollator(DataCollator):
         Returns:
             1D tensor of token IDs with boundary/placeholder tokens inserted.
         """
-        # Trim text to actual length
+        # Trim text to actual length (strips any preprocessor padding)
         text_tokens = text_token_ids[:text_length]
+        eos = torch.tensor([EOS_TOKEN_ID], dtype=text_tokens.dtype)
+
+        # Only append EOS when the text wasn't truncated — truncated samples
+        # were cut off mid-content and didn't genuinely end.
+        text_truncated = text_length >= self.max_seq_len
 
         has_any_media = has_audio or has_voice or has_image
         if not has_any_media:
-            return text_tokens, False  # text-only, no synthesis/transcription distinction
+            if text_truncated:
+                return text_tokens, False
+            return torch.cat([text_tokens, eos]), False
 
         # Build media token blocks in fixed order: audio, voice, image
         media_blocks = []
@@ -133,11 +141,11 @@ class MultimodalDataCollator(DataCollator):
         else:
             is_synthesis = random.random() < 0.5
         if is_synthesis:
-            # Synthesis: [text] [media]
-            return torch.cat([text_tokens, media_sequence]), is_synthesis
+            # Synthesis: [text] [media] [EOS]
+            return torch.cat([text_tokens, media_sequence, eos]), is_synthesis
         else:
-            # Transcription: [media] [text]
-            return torch.cat([media_sequence, text_tokens]), is_synthesis
+            # Transcription: [media] [text] [EOS]
+            return torch.cat([media_sequence, text_tokens, eos]), is_synthesis
 
     def _collate_text(
         self,
