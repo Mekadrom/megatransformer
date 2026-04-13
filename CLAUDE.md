@@ -88,15 +88,16 @@ Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
 ### Directory Structure
 
 - `src/model/`: Neural network modules
-  - `world/`: Core world model (`MegaTransformerWorldModel`, recurrent transformer, KV cache)
-  - `audio/`: Audio models (VAE, SIVE conformer, vocoder)
-  - `image/`: Image VAE models
-  - `text/`: Text feature extractor and generator
+  - `world/`: Core world model (`MegaTransformerWorldModel`, recurrent transformer, KV cache, token interleaving)
+  - `audio/`: Audio models (VAE, SIVE conformer, vocoder, prelude feature extractor, coda generator)
+  - `image/`: Image models (VAE, prelude feature extractor, `decoder.py` direct decoder, `diffusion_decoder.py` flow-matching DiT)
+  - `text/`: Text feature extractor (prelude with causal transformer) and generator (coda classifier)
   - `transformer.py`: `MegaTransformerBlock` with GQA, rotary embeddings, ALiBi
 
 - `src/config/`: Dataclass configs with predefined configurations (small, medium, large)
   - Each model has `*_CONFIGS` dicts mapping config names to dataclass instances
   - `common.py`: `MegaTransformerBlockConfig` shared across models
+  - `image/decoder.py`: `ImageDecoderConfig` (direct) and `DiffusionBridgeImageDecoderConfig` (flow-matching DiT)
 
 - `src/scripts/train/`: Training scripts
   - `train.py`: Main entry point with subcommand routing
@@ -116,6 +117,8 @@ Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
   - `model_loading_utils.py`: `load_model()` function for loading from config + checkpoint
   - `audio_utils.py`: `SharedWindowBuffer` for efficient STFT/mel computation
   - `speaker_encoder.py`: ECAPA-TDNN and WavLM speaker encoders
+  - `voice_silence_mask.py`: Inference-only silence detection/masking for CVAE-decoded mel spectrograms
+  - `megatransformer_utils.py`: Weight init helpers (`linear_weight_init`, `apply_depth_scaled_residual_init`, `conv2d_weight_init`)
 
 ### Key Design Patterns
 
@@ -175,11 +178,21 @@ For TensorBoard, context items are logged as sibling tags (`eval/voice/0/mel`, `
 ### World Model Architecture
 
 `MegaTransformerWorldModel` processes multimodal sequences:
-1. Modality-specific feature extractors (text embedding, audio/image VAE encoders)
+1. Modality-specific feature extractors / preludes (text embedding + causal transformer, audio/voice/image VAE encoders)
 2. `TokenInterleaver`: Interleaves modality tokens based on placeholder positions in text
-3. `MegatransformerRecurrentBlock`: Recurrent transformer with thought vector mechanism
+3. `MegatransformerRecurrentBlock`: Recurrent transformer with thought vector mechanism (Huginn-style, additive injection)
 4. `TokenUninterleaver`: Separates tokens back to modality-specific sequences
-5. Modality-specific generators/codas (text classifier, audio/image VAE decoders)
+5. Modality-specific generators/codas (text classifier, audio/voice SIVE predictors, image DiT decoder)
+
+**Generation approaches by modality:**
+- **Text**: Autoregressive token-by-token. Text prelude (causal) + recurrent block + text coda (causal). All three use KV caching at inference.
+- **Voice/Audio**: Autoregressive frame-by-frame. Uses shifted teacher forcing during training (position 0 = zero vector, position t = prelude(frame t-1), target = frame t). Voice prelude is causal with KV caching. Voice coda is causal with KV caching. Includes a stop prediction head (`nn.Linear(d_model, 1)`) to end generation early. No generation queries.
+- **Image**: Single-shot via generation queries. Positional-only gen queries → recurrent block → `DiffusionBridgeImageDecoder` (Q-Former bridge + flow-matching DiT with AdaLN-Zero). Not autoregressive.
+
+**Critical inference rules:**
+- Every module with causal self-attention must have KV caching during generation, or self-attention becomes a no-op (seq_len=1).
+- The text coda must NOT run during voice/audio/image generation steps. During training, the uninterleaver only gives it text positions — feeding media hidden states pollutes its KV cache.
+- The `generate()` method in `world_model.py` threads KV caches through: text prelude, recurrent block, text coda, voice/audio prelude, and voice/audio coda.
 
 ### Audio Pipeline
 

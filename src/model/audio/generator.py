@@ -1,12 +1,16 @@
 import torch
 import torch.nn as nn
 
-from typing import Optional
+from typing import List, Optional
 
 from config.audio.generator import AUDIO_CODA_CONFIGS, AudioCodaAndVAEConfig
 from model.norms import create_norm
 from model.transformer import MegaTransformerEncoderBlock
-from utils.megatransformer_utils import transformer_weight_init
+from utils.megatransformer_utils import (
+    apply_depth_scaled_residual_init,
+    conv2d_weight_init,
+    linear_weight_init,
+)
 
 
 class TemporalRefine(nn.Module):
@@ -16,6 +20,11 @@ class TemporalRefine(nn.Module):
     receptive field (~240ms at 16kHz / hop=256 / SIVE 3x downsample),
     roughly one phoneme — enough for local coherence without smearing
     across phoneme boundaries.
+
+    WARNING: This module has a train/inference mismatch for autoregressive
+    generation. During training the Conv1d sees 3-frame context, but during
+    autoregressive inference (seq_len=1) it sees only zero-padded single
+    frames. Use ``FramewiseRefine`` for autoregressive codas.
     """
 
     def __init__(self, channels: int):
@@ -27,6 +36,33 @@ class TemporalRefine(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (batch, channels, timesteps)"""
         return x + self.conv2(self.act(self.conv1(x)))
+
+
+class FramewiseRefine(nn.Module):
+    """Per-frame nonlinear refinement for SIVE feature predictions.
+
+    A small residual MLP operating independently on each frame in the
+    feature channel space (post-projection, typically 128-dim). Unlike
+    ``TemporalRefine`` (Conv1d-based), this has no temporal dependency —
+    no train/inference mismatch for autoregressive generation.
+
+    The coda's causal transformer already provides sequential context in
+    d_model space via KV caching. This adds nonlinear capacity in the
+    lower-dimensional feature space where the transformer cannot operate.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.fc1 = nn.Linear(channels, channels * 2)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(channels * 2, channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (batch, channels, timesteps)"""
+        # Linear layers need (batch, timesteps, channels)
+        h = x.permute(0, 2, 1)
+        h = self.fc2(self.act(self.fc1(h)))
+        return x + h.permute(0, 2, 1)
 
 
 class AudioCodaAndVAEWithLoss(nn.Module):
@@ -65,9 +101,14 @@ class AudioCodaAndVAEWithLoss(nn.Module):
 
         self.feature_projection = nn.Linear(coda_config.d_model, config.feature_channels)
 
-        # Optional temporal refinement after linear projection
+        # Optional refinement after linear projection
         output_mode = getattr(config, 'output_mode', 'linear')
-        self.temporal_refine = TemporalRefine(config.feature_channels) if output_mode == "conv_refine" else None
+        if output_mode == "conv_refine":
+            self.temporal_refine = TemporalRefine(config.feature_channels)
+        elif output_mode == "framewise_refine":
+            self.temporal_refine = FramewiseRefine(config.feature_channels)
+        else:
+            self.temporal_refine = None
 
         # Learnable denormalization: maps from normalized space back to original
         # latent distribution. Initialized to identity (scale=1, bias=0).
@@ -78,17 +119,31 @@ class AudioCodaAndVAEWithLoss(nn.Module):
             else:
                 self.output_norm = create_norm(coda_config.d_model, config.output_norm_type, config.norm_epsilon)
 
+        # Stop prediction head: single linear → scalar logit per frame.
+        # Predicts whether the current frame is the last real frame (or past it).
+        self.stop_head = nn.Linear(coda_config.d_model, 1)
+
         self.l1_loss = nn.L1Loss()
         self.mse_loss = nn.MSELoss()
 
         self._init_weights()
 
     def _init_weights(self):
+        init_linear = linear_weight_init(gain=1.0)
         for block in self.coda:
-            block.apply(transformer_weight_init())
-        self.feature_projection.apply(transformer_weight_init())
+            block.apply(init_linear)
+        apply_depth_scaled_residual_init(self.coda)
+        self.feature_projection.apply(init_linear)
+        # Bias the stop head toward "continue" at init so an untrained model
+        # generates full sequences instead of stopping immediately.
+        nn.init.zeros_(self.stop_head.weight)
+        nn.init.constant_(self.stop_head.bias, -5.0)  # sigmoid(-5) ≈ 0.007
         if self.temporal_refine is not None:
-            self.temporal_refine.apply(transformer_weight_init())
+            if isinstance(self.temporal_refine, TemporalRefine):
+                # TemporalRefine uses Conv1d — Kaiming init for ReLU/GELU.
+                self.temporal_refine.apply(conv2d_weight_init())
+            elif isinstance(self.temporal_refine, FramewiseRefine):
+                self.temporal_refine.apply(init_linear)
 
     @classmethod
     def from_config(cls, prefix: str, config_name: str, **overrides) -> "AudioCodaAndVAEWithLoss":
@@ -108,6 +163,9 @@ class AudioCodaAndVAEWithLoss(nn.Module):
         latent_labels: Optional[torch.Tensor] = None,
         lengths: Optional[torch.Tensor] = None,
         decode_to_mel: bool = False,
+        kv_caches: Optional[List] = None,
+        position_offset: int = 0,
+        use_cache: bool = False,
         **kwargs
     ) -> dict[str, torch.Tensor]:
         """
@@ -119,16 +177,35 @@ class AudioCodaAndVAEWithLoss(nn.Module):
                 Shape: (batch, feature_channels, timesteps)
             lengths: Unused (kept for interface compatibility).
             decode_to_mel: Unused (kept for interface compatibility).
+            kv_caches: Optional list of KVCache objects, one per coda layer.
+                When provided, the coda's self-attention attends to cached
+                representations from previous positions (inference only).
+            position_offset: RoPE position offset for cached generation.
+            use_cache: If True, return updated KV caches in the output dict.
 
         Returns:
             Dictionary containing:
             - "{prefix}_latent_preds": Predicted SIVE features (batch, feature_channels, timesteps)
             - "{prefix}_latent_l1_loss", "{prefix}_latent_mse_loss": Losses (if latent_labels provided)
+            - "kv_caches": Updated KV caches (if use_cache=True)
         """
+        if hasattr(self, 'input_norm'):
+            x = self.input_norm(x)
+
+        # MegaTransformerEncoderBlock.forward already adds residuals internally,
+        # so the loop just chains layers without re-adding the input.
         h = x
-        for block in self.coda:
-            hidden, _ = block(h)
-            h = h + hidden
+        new_kv_caches = []
+        for i, block in enumerate(self.coda):
+            block_cache = kv_caches[i] if kv_caches is not None else None
+            h, new_cache = block(
+                h,
+                kv_cache=block_cache,
+                position_offset=position_offset,
+                use_cache=use_cache,
+            )
+            if use_cache:
+                new_kv_caches.append(new_cache)
 
         feature_preds = self.feature_projection(h)  # (batch, seq_length, feature_channels)
         # Denormalize: learnable scale and bias map back to original latent range
@@ -136,13 +213,21 @@ class AudioCodaAndVAEWithLoss(nn.Module):
             feature_preds = feature_preds * self.output_scale + self.output_bias
         elif hasattr(self, 'output_norm'):
             feature_preds = self.output_norm(feature_preds)
-            
+
         feature_preds = feature_preds.permute(0, 2, 1)  # (batch, feature_channels, timesteps)
 
         if self.temporal_refine is not None:
             feature_preds = self.temporal_refine(feature_preds)
 
-        outputs = {f"{self.prefix}_latent_preds": feature_preds}
+        # Stop logits: (batch, timesteps) — probability that this frame is at/past the end
+        stop_logits = self.stop_head(h).squeeze(-1)  # (batch, seq_length)
+
+        outputs = {
+            f"{self.prefix}_latent_preds": feature_preds,
+            f"{self.prefix}_stop_logits": stop_logits,
+        }
+        if use_cache:
+            outputs["kv_caches"] = new_kv_caches
 
         if latent_labels is not None:
             outputs[f"{self.prefix}_latent_l1_loss"] = self.l1_loss(feature_preds, latent_labels)

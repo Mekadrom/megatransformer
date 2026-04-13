@@ -159,6 +159,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
         with torch.no_grad():
             with autocast(device.type, dtype=dtype, enabled=args.bf16 or args.fp16):
+                # Training data text continuation — complete memorized text
+                self._scenario_train_text_continuation(
+                    model, args, device, global_step, dtype
+                )
+
                 # Training data generation — generates media from text prompts
                 self._scenario_train_generation(
                     model, args, device, global_step, dtype
@@ -613,6 +618,72 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     self._try_decode_image(image_preds[i], global_step, f"{tag}/image/{i}/pred_decoded")
                     self._try_decode_image(image_labels[i], global_step, f"{tag}/image/{i}/target_decoded")
 
+    def _scenario_train_text_continuation(self, model, args, device, global_step, dtype):
+        """Complete memorized text from training samples.
+
+        Finds text-only samples (text_continuation tasks) from the training
+        dataset, slices each partway through, and has the model generate the
+        rest. Logs the generated continuation alongside the target text so
+        memorization quality can be assessed at a glance.
+        """
+        tag = "train_world/text_continuation"
+        train_dataset = self.trainer.train_dataset
+        if train_dataset is None or len(train_dataset) == 0:
+            return
+
+        n = min(self.num_eval_samples, len(train_dataset))
+
+        # Find text-only indices (text_continuation tasks), cached
+        if not hasattr(self, '_train_text_indices'):
+            tasks = train_dataset.task_types if hasattr(train_dataset, 'task_types') else []
+            n_tasks = len(tasks) if tasks else 1
+            text_indices = []
+            for idx in range(len(train_dataset)):
+                task_idx = idx % n_tasks
+                if tasks and tasks[task_idx][1] == "text":
+                    text_indices.append(idx)
+                    if len(text_indices) >= n:
+                        break
+            self._train_text_indices = text_indices
+
+        for i, idx in enumerate(self._train_text_indices):
+            try:
+                sample = train_dataset[idx]
+                token_ids = sample.get("text_token_ids")
+                if token_ids is None:
+                    continue
+
+                text_length = sample.get("text_text_length", token_ids.shape[0])
+                if isinstance(text_length, torch.Tensor):
+                    text_length = text_length.item()
+
+                # Use first half as prompt
+                prompt_len = max(1, text_length // 2)
+                max_new = min(256, text_length)
+                prompt_len = min(prompt_len, 1024 - max_new)
+                prompt_len = max(1, prompt_len)
+                prompt = token_ids[:prompt_len].unsqueeze(0).to(device)
+
+                outputs = model.generate(
+                    text_input_ids=prompt,
+                    max_new_tokens=max_new,
+                    temperature=0.8,
+                    top_p=0.9,
+                )
+
+                gen_ids = outputs.get("generated_token_ids")
+                if gen_ids is not None:
+                    input_text = self._decode_tokens(token_ids[:prompt_len])
+                    gen_text = self._decode_tokens(gen_ids[0])
+                    full_target = self._decode_tokens(token_ids[:text_length])
+
+                    metrics.log_text(f"{tag}/{i}/generated", gen_text[:500], global_step, context={
+                        "prompt": input_text[:500],
+                        "target": full_target[:500],
+                    })
+            except Exception as e:
+                print(f"Warning: Train text continuation failed for sample {i}: {e}")
+
     def _scenario_train_generation(self, model, args, device, global_step, dtype):
         """Generate media autoregressively from training sample text prompts.
 
@@ -698,6 +769,19 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
                 )
 
+                # Log the generated text alongside the media so memorization
+                # tests can verify what text the model produced for the prompt.
+                gen_ids = outputs.get("generated_token_ids")
+                if gen_ids is not None:
+                    gen_text = self._decode_tokens(gen_ids[0])
+                    target_text_full = sample.get("text_text", sample.get("voice_voice_text", ""))
+                    if isinstance(target_text_full, list):
+                        target_text_full = target_text_full[0] if target_text_full else ""
+                    ctx = {"prompt": str(prompt_text)[:500] if prompt_text else decoded[:500]}
+                    if target_text_full:
+                        ctx["target"] = str(target_text_full)[:500]
+                    metrics.log_text(f"{tag}/voice/{i}/generated_text", gen_text[:500], global_step, context=ctx)
+
                 voice_preds = outputs.get("voice_latent_preds")
                 if voice_preds is not None and voice_preds.numel() > 0:
                     pred_lat = voice_preds[0, 0]
@@ -742,6 +826,18 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 outputs = model.generate(
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
                 )
+
+                # Log the generated text alongside the media.
+                gen_ids = outputs.get("generated_token_ids")
+                if gen_ids is not None:
+                    gen_text = self._decode_tokens(gen_ids[0])
+                    target_text_full = sample.get("text_text", sample.get("image_text", ""))
+                    if isinstance(target_text_full, list):
+                        target_text_full = target_text_full[0] if target_text_full else ""
+                    ctx = {"prompt": str(prompt_text)[:500] if prompt_text else decoded[:500]}
+                    if target_text_full:
+                        ctx["target"] = str(target_text_full)[:500]
+                    metrics.log_text(f"{tag}/image/{i}/generated_text", gen_text[:500], global_step, context=ctx)
 
                 image_preds = outputs.get("image_latent_preds")
                 if image_preds is not None and image_preds.numel() > 0:
@@ -943,28 +1039,35 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             )
 
     def _scenario_text_to_voice(self, model, eval_dataset, collator, device, global_step):
-        """Scenario 2: Text -> Voice synthesis using static prompts."""
+        """Scenario 2: Text -> Voice synthesis using dataset captions.
+
+        Uses the actual transcript from each eval sample as the prompt, so the
+        target voice matches the text the model is conditioned on.
+        """
         tag = "eval_world/2_text_to_voice"
 
-        # Use static prompts instead of dataset text (avoids markup/JS garbage)
-        n = min(self.num_eval_samples, len(self.VOICE_SYNTHESIS_PROMPTS))
-        # Still need samples for target voice comparison and speaker embeddings
         samples = self._get_eval_samples(
-            eval_dataset, collator, n, requires_voice=True
+            eval_dataset, collator, self.num_eval_samples, requires_voice=True
         )
+        if not samples:
+            return
 
-        for i in range(n):
-            prompt_text = self.VOICE_SYNTHESIS_PROMPTS[i]
+        for i, sample in enumerate(samples):
+            # Get transcript from dataset sample
+            prompt_text = sample.get("text_text", "")
+            if not prompt_text and "text_token_ids" in sample:
+                prompt_text = self._decode_tokens(sample["text_token_ids"])
+            if not prompt_text:
+                continue
+
             max_new = 512
-            prompt = self._encode_static_prompt(prompt_text, [BOV_TOKEN_ID], max_new, device)
+            prompt = self._encode_static_prompt(str(prompt_text)[:500], [BOV_TOKEN_ID], max_new, device)
 
             outputs = model.generate(
                 text_input_ids=prompt,
                 max_new_tokens=max_new,
                 temperature=0.8,
             )
-
-            sample = samples[i] if i < len(samples) else {}
 
             # Log generated voice if available
             voice_preds = outputs.get("voice_latent_preds")
@@ -1110,6 +1213,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             gen_text = self._decode_tokens(gen_ids)
             target_text = self._decode_tokens(token_ids[:text_length])
 
+            # Log input voice audio alongside generated/target text
+            self._log_audio_with_cvae(voice_features, sample, global_step, f"{tag}/{i}/input")
+
             metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step, context={
                 "target": target_text,
             })
@@ -1118,28 +1224,35 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             )
 
     def _scenario_text_to_image(self, model, eval_dataset, collator, device, global_step):
-        """Scenario 4: Text -> Image synthesis using static prompts."""
+        """Scenario 4: Text -> Image synthesis using dataset captions.
+
+        Uses the actual caption from each eval sample as the prompt, so the
+        target image matches the text the model is conditioned on.
+        """
         tag = "eval_world/4_text_to_image"
 
-        # Use static prompts instead of dataset text (avoids markup/JS garbage)
-        n = min(self.num_eval_samples, len(self.IMAGE_SYNTHESIS_PROMPTS))
-        # Still need samples for target image comparison
         samples = self._get_eval_samples(
-            eval_dataset, collator, n, requires_image=True
+            eval_dataset, collator, self.num_eval_samples, requires_image=True
         )
+        if not samples:
+            return
 
-        for i in range(n):
-            prompt_text = self.IMAGE_SYNTHESIS_PROMPTS[i]
+        for i, sample in enumerate(samples):
+            # Get caption from dataset sample
+            prompt_text = sample.get("text_text", "")
+            if not prompt_text and "text_token_ids" in sample:
+                prompt_text = self._decode_tokens(sample["text_token_ids"])
+            if not prompt_text:
+                continue
+
             max_new = 512
-            prompt = self._encode_static_prompt(prompt_text, [BOI_TOKEN_ID], max_new, device)
+            prompt = self._encode_static_prompt(str(prompt_text)[:500], [BOI_TOKEN_ID], max_new, device)
 
             outputs = model.generate(
                 text_input_ids=prompt,
                 max_new_tokens=max_new,
                 temperature=0.8,
             )
-
-            sample = samples[i] if i < len(samples) else {}
 
             image_preds = outputs.get("image_latent_preds")
             if image_preds is not None and image_preds.numel() > 0:
@@ -1148,17 +1261,16 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     f"{tag}/{i}/generated_latent",
                     self._latent_to_image(pred_latent),
                     global_step,
-                    context={"prompt": prompt_text},
+                    context={"prompt": str(prompt_text)[:500]},
                 )
 
-                # Decode through image VAE if available
                 if self.image_vae_decoder is not None:
                     self._try_decode_image(
                         pred_latent, global_step,
                         f"{tag}/{i}/generated_image"
                     )
 
-            # Log target image
+            # Log target image (matches the caption used as prompt)
             target_image = sample.get("image_images")
             if target_image is None:
                 target_image = sample.get("image_image")
@@ -1220,9 +1332,18 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             gen_text = self._decode_tokens(gen_ids)
             target_text = self._decode_tokens(token_ids[:text_length])
 
-            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step, context={
-                "target": target_text,
-            })
+            # Log input image alongside generated/target text
+            context = {"target": target_text}
+
+            image_data = sample.get("image_images")
+            if image_data is None:
+                image_data = sample.get("image_image")
+            if image_data is not None:
+                metrics.log_image(f"{tag}/{i}/input_latent", self._latent_to_image(image_data), global_step)
+                if self.image_vae_decoder is not None:
+                    self._try_decode_image(image_data, global_step, f"{tag}/{i}/input_image")
+
+            metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step, context=context)
             self._log_generation_metrics(
                 outputs, sample, model, device, tag, i, global_step,
             )

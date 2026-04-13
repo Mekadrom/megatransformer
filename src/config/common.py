@@ -64,5 +64,5 @@ class ImageConfig:
     image_size: int = 256
     latent_channels: int = 12
     latent_compression_factor: int = 8
-    latent_patch_size: int = 2
+    latent_patch_size: int = 4
 

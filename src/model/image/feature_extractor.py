@@ -8,7 +8,11 @@ from model.image.vae.vae import ImageVAEEncoder
 from model.norms import create_norm
 from model.transformer import MegaTransformerAxial2DEncoderBlock, MegaTransformerEncoderBlock
 from utils import megatransformer_utils
-from utils.megatransformer_utils import conv2d_weight_init, transformer_weight_init
+from utils.megatransformer_utils import (
+    apply_depth_scaled_residual_init,
+    conv2d_weight_init,
+    linear_weight_init,
+)
 
 
 class PatchEmbedding(nn.Module):
@@ -111,10 +115,12 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
     def _init_weights(self):
         # Patch embedding uses conv2d
         self.patch_embedding.apply(conv2d_weight_init())
-        # Prelude transformer
+        # Prelude transformer: standard Xavier + depth-scaled residual outputs
+        init_linear = linear_weight_init(gain=1.0)
         for block in self.prelude:
-            block.apply(transformer_weight_init())
-            
+            block.apply(init_linear)
+        apply_depth_scaled_residual_init(self.prelude)
+
         if hasattr(self, 'pos_embedding'):
             # Initialize positional embedding with small values
             nn.init.trunc_normal_(self.pos_embedding, std=0.02)
@@ -177,16 +183,20 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
 
         # megatransformer_utils.print_debug_tensor("positional encoding image prelude output", x)
 
+        # MegaTransformerEncoderBlock.forward already adds residuals internally,
+        # so the loop just chains layers without re-adding the input.
         x = patch_embeddings
         for block in self.prelude:
-            hidden, _ = block(x)
-            x = x + hidden
+            x, _ = block(x)
 
         # megatransformer_utils.print_debug_tensor("prelude block image prelude output", x)
 
-        if hasattr(self, 'post_norm'):
+        # Output norm caps the magnitude of the prelude output before it
+        # reaches the recurrent block. Critical when the dataset's latents
+        # have non-unit std (e.g. LiteVAE) — the prelude faithfully amplifies
+        # the input, and without this norm the recurrent block sees image
+        # positions at much larger magnitudes than text positions.
+        if hasattr(self, 'output_norm'):
             x = self.output_norm(x)
-
-            # megatransformer_utils.print_debug_tensor("normed image prelude output", x)
 
         return x

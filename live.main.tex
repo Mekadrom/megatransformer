@@ -47,7 +47,60 @@
   arrow/.style={-{Stealth[length=5pt, width=4pt]}, line width=0.7pt, color=darkgray},
   thickarrow/.style={-{Stealth[length=6pt, width=5pt]}, line width=1.0pt, color=#1},
   dasharrow/.style={-{Stealth[length=5pt, width=4pt]}, line width=0.7pt, color=darkgray, dashed},
-  thickdasharrow/.style={-{Stealth[length=6pt, width=5pt]}, line width=1.0pt, color=#1, dashed},
+  seclabel/.style={font=\footnotesize\sffamily\bfseries, text=#1},
+}
+
+\begin{document}
+
+\documentclass[border=12pt]{standalone}
+\usepackage{tikz}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usetikzlibrary{
+  positioning,
+  arrows.meta,
+  fit,
+  backgrounds,
+  calc,
+  shapes.geometric,
+}
+
+% ── Colour palette ──────────────────────────────────────────────────
+\definecolor{textblue}{HTML}{4A90D9}
+\definecolor{voicegreen}{HTML}{27AE60}
+\definecolor{imagered}{HTML}{E74C3C}
+\definecolor{recurrentpurple}{HTML}{8E44AD}
+\definecolor{interleaveamber}{HTML}{F39C12}
+\definecolor{darkgray}{HTML}{2C3E50}
+
+% ── Styles ──────────────────────────────────────────────────────────
+\tikzset{
+  modbox/.style={
+    draw=#1, fill=#1!8, rounded corners=4pt,
+    minimum width=3.2cm, minimum height=0.8cm,
+    font=\footnotesize\sffamily, align=center, line width=0.8pt,
+  },
+  widebox/.style={
+    draw=#1, fill=#1!8, rounded corners=4pt,
+    minimum height=0.8cm,
+    font=\footnotesize\sffamily, align=center, line width=0.8pt,
+  },
+  annobox/.style={
+    draw=#1!60, fill=#1!5, rounded corners=2pt,
+    minimum width=2.4cm, minimum height=0.55cm,
+    font=\scriptsize\sffamily, align=center, line width=0.5pt, dashed,
+  },
+  iolabel/.style={font=\scriptsize\sffamily\itshape, text=darkgray, align=center},
+  attnlabel/.style={
+    font=\tiny\sffamily\bfseries, rounded corners=2pt,
+    fill=#1!15, draw=#1!40, inner sep=2pt,
+  },
+  groupbg/.style={
+    draw=#1!40, fill=#1!4, rounded corners=6pt, line width=0.6pt, dashed,
+  },
+  arrow/.style={-{Stealth[length=5pt, width=4pt]}, line width=0.7pt, color=darkgray},
+  thickarrow/.style={-{Stealth[length=6pt, width=5pt]}, line width=1.0pt, color=#1},
+  dasharrow/.style={-{Stealth[length=5pt, width=4pt]}, line width=0.7pt, color=darkgray, dashed},
   seclabel/.style={font=\footnotesize\sffamily\bfseries, text=#1},
 }
 
@@ -67,7 +120,7 @@
 % ════════════════════════════════════════════════════════════════════
 \node[iolabel] (voice_in) at (\voiceX, 0) {SIVE Features\\$(B, C, T)$};
 \node[iolabel] (text_in)  at (\textX, 0)  {Token IDs\\$(B, T)$};
-\node[iolabel] (image_in) at (\imageX, 0) {Image Latents\\$(B, C, H, W)$};
+\node[iolabel] (image_in) at (\imageX, 0) {VAE Latents\\$(B, C, H, W)$};
 
 % ════════════════════════════════════════════════════════════════════
 % FEATURE EXTRACTORS / PRELUDES
@@ -141,11 +194,11 @@
 \node[annobox=interleaveamber] (scale) at (\centerX, 11.2) {$\times \sqrt{d_{model}}$};
 
 % Arrows into interleaver — from preludes and from text conditioning
-\draw[thickarrow=voicegreen] (voice_prelude) -- ++(0, 2.0) -| ([xshift=-4.5cm]interleaver.south);
-\draw[thickdasharrow=voicegreen] (voice_textcond) -- ++(0, 0.8) -| ([xshift=-2.8cm]interleaver.south);
-\draw[thickarrow=textblue] (text_prelude) -- ++(0, 1.5) -| ([xshift=0cm]interleaver.south);
-\draw[thickarrow=imagered] (image_prelude) -- ++(0, 2.0) -| ([xshift=4.5cm]interleaver.south);
-\draw[thickdasharrow=imagered] (image_textcond) -- ++(0, 0.8) -| ([xshift=2.8cm]interleaver.south);
+\draw[arrow] (voice_prelude) -- ++(0, 2.0) -| ([xshift=-4.5cm]interleaver.south);
+\draw[dasharrow] (voice_textcond) -- ++(0, 0.8) -| ([xshift=-2.8cm]interleaver.south);
+\draw[arrow] (text_prelude) -- ++(0, 1.5) -| ([xshift=0cm]interleaver.south);
+\draw[arrow] (image_prelude) -- ++(0, 2.0) -| ([xshift=4.5cm]interleaver.south);
+\draw[dasharrow] (image_textcond) -- ++(0, 0.8) -| ([xshift=2.8cm]interleaver.south);
 
 \draw[arrow] (interleaver) -- (scale);
 
@@ -182,7 +235,7 @@
 \coordinate (rec_left_pad) at ([xshift=-3.0cm]recblocks.west);
 \begin{scope}[on background layer]
   \node[groupbg=recurrentpurple, inner sep=16pt,
-    fit=(scale)(postnorm)(rec_right_pad)(rec_left_pad), yshift=10pt] (recbg) {};
+    fit=(scale)(postnorm)(rec_right_pad)(rec_left_pad)] (recbg) {};
 \end{scope}
 
 \node[seclabel=recurrentpurple, anchor=north west] at (recbg.north west)
@@ -266,4 +319,6 @@
 \draw[arrow] (image_unpatch) -- (image_out);
 
 \end{tikzpicture}
+\end{document}
+
 \end{document}

@@ -37,9 +37,11 @@ from scripts.data.world.dataset import MultimodalShardedDataset
 from scripts.data.world.data_collator import MultimodalDataCollator
 
 
-def load_model(config_name, checkpoint_path):
+def load_model(config_name, checkpoint_path, tie_word_embeddings=False):
     config = copy.deepcopy(WORLD_MODEL_CONFIGS[config_name])
     config.include_modes = ['text', 'voice', 'image']
+    if tie_word_embeddings:
+        config.tie_word_embeddings = True
     model = MegaTransformerWorldModel(config)
     sd = torch.load(f'{checkpoint_path}/pytorch_model.bin', map_location='cpu', weights_only=True)
     model.load_state_dict(sd, strict=False)
@@ -217,6 +219,7 @@ def main():
     parser.add_argument('--modality', type=str, default='image', choices=['text', 'voice', 'image'], help='Which modality task to generate samples for')
     parser.add_argument('--direction', type=str, default='synthesis', choices=['synthesis', 'transcription'], help='Task direction')
     parser.add_argument('--all', action='store_true', dest='all_tasks', help='Run all modalities and directions, saving separate images')
+    parser.add_argument('--tie_word_embeddings', action='store_true', help='Tie text embedding and LM head weights')
     args = parser.parse_args()
 
     ds = MultimodalShardedDataset(
@@ -237,7 +240,7 @@ def main():
         all_stats = []
         labels = []
         for ckpt in args.checkpoint:
-            model = load_model(args.config, ckpt)
+            model = load_model(args.config, ckpt, tie_word_embeddings=args.tie_word_embeddings)
             stats, _ = collect_iteration_stats(model, batch)
             if stats:
                 all_stats.append(stats)
@@ -256,7 +259,7 @@ def main():
     output_base = os.path.splitext(args.output)[0]
 
     for ckpt in args.checkpoint:
-        model = load_model(args.config, ckpt)
+        model = load_model(args.config, ckpt, tie_word_embeddings=args.tie_word_embeddings)
         ckpt_name = os.path.basename(ckpt)
 
         if len(args.checkpoint) > 1:

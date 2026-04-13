@@ -21,8 +21,10 @@ class ImageVAEPreludeFeatureExtractorConfig:
     use_output_norm: bool = False
     norm_type: str = "layernorm"
     norm_epsilon: float = 1e-5
-    input_norm_type: str = "instancenorm"  # "instancenorm" (per channel, across spatial) or "layernorm" (across channels)
-    output_norm_type: str = "instancenorm"  # "instancenorm" (per channel, across spatial) or "layernorm" (across channels)
+    # Both must be one of the types `create_norm` understands ("layernorm" or
+    # "rmsnorm"). "instancenorm" is NOT supported and will raise at construction.
+    input_norm_type: str = "layernorm"
+    output_norm_type: str = "layernorm"
 
 
     def __post_init__(self):

@@ -12,7 +12,7 @@ from model import activations
 from model.activations import get_activation_type
 from model.norms import create_norm
 from model.world.kv_cache import KVCache
-from utils.megatransformer_utils import transformer_weight_init
+from utils.megatransformer_utils import linear_weight_init
 
 
 def create_alibi_bias(n_heads, maxlen):
@@ -378,7 +378,10 @@ class MegaTransformerEncoderBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(transformer_weight_init())
+        # Per-block default: standard Xavier (gain=1.0). Parent stacks should
+        # call `apply_depth_scaled_residual_init` after constructing all blocks
+        # to depth-scale the residual-output layers (o_proj, condense).
+        self.apply(linear_weight_init(gain=1.0))
 
     def forward(
         self,
@@ -468,7 +471,10 @@ class MegaTransformerAxial2DEncoderBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(transformer_weight_init())
+        # Per-block default: standard Xavier (gain=1.0). Parent stacks should
+        # call `apply_depth_scaled_residual_init` after constructing all blocks
+        # to depth-scale the residual-output layers (o_proj, condense).
+        self.apply(linear_weight_init(gain=1.0))
 
     def forward(
         self,
@@ -536,7 +542,10 @@ class MegaTransformerDecoderBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(transformer_weight_init())
+        # Per-block default: standard Xavier (gain=1.0). Parent stacks should
+        # call `apply_depth_scaled_residual_init` after constructing all blocks
+        # to depth-scale the residual-output layers (o_proj, condense).
+        self.apply(linear_weight_init(gain=1.0))
 
     def forward(
         self,

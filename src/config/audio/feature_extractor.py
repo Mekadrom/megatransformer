@@ -22,7 +22,7 @@ class AudioVAEPreludeFeatureExtractorConfig:
     feature_channels: int = 128
     sample_rate: int = 16000
     hop_length: int = 256
-    max_audio_duration: float = 30.0
+    max_audio_duration: float = 10.0
     sive_temporal_stride: int = 4
 
     use_input_norm: bool = False

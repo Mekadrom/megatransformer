@@ -1,12 +1,17 @@
 import torch
 import torch.nn as nn
 
+from typing import Dict, List, Optional, Tuple, Union
+
 from config.audio.feature_extractor import AUDIO_PRELUDE_CONFIGS, AudioVAEPreludeFeatureExtractorConfig
 from model.norms import create_norm
 from model.sinusoidal_positional_encoding import SinusoidalPositionalEncoding
 from model.transformer import MegaTransformerEncoderBlock
 from utils import megatransformer_utils
-from utils.megatransformer_utils import transformer_weight_init
+from utils.megatransformer_utils import (
+    apply_depth_scaled_residual_init,
+    linear_weight_init,
+)
 
 
 class AudioVAEPreludeFeatureExtractor(nn.Module):
@@ -55,9 +60,11 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.projection.apply(transformer_weight_init())
+        init_linear = linear_weight_init(gain=1.0)
+        self.projection.apply(init_linear)
         for block in self.prelude:
-            block.apply(transformer_weight_init())
+            block.apply(init_linear)
+        apply_depth_scaled_residual_init(self.prelude)
 
     @classmethod
     def from_config(cls, config_name: str, **overrides) -> "AudioVAEPreludeFeatureExtractor":
@@ -71,17 +78,27 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
 
         return cls(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_caches: Optional[List] = None,
+        position_offset: int = 0,
+        use_cache: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List]]:
         """
         Process SIVE features into token embeddings.
 
         Args:
             x: SIVE features of shape (batch, feature_channels, timesteps).
-            precomputed_latents: Ignored (kept for interface compatibility).
-                SIVE features are always precomputed.
+            kv_caches: Optional list of KVCache objects, one per prelude layer.
+                Used for autoregressive voice synthesis at inference time so
+                that frame t's prelude self-attention sees frames 0..t-1.
+            position_offset: RoPE position offset for cached generation.
+            use_cache: If True, return (embeddings, kv_caches) tuple.
 
         Returns:
             Token embeddings of shape (batch, timesteps, d_model).
+            If use_cache=True, returns (embeddings, new_kv_caches) tuple.
         """
         # x: (batch, C, T) -> (batch, T, C)
         x = x.permute(0, 2, 1).contiguous()
@@ -91,23 +108,27 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
 
         projected = self.projection(x)  # (batch, T, d_model)
 
-        # megatransformer_utils.print_debug_tensor("embedding audio prelude output", x)
-
         if hasattr(self, 'pos_encoding'):
-            projected = self.pos_encoding(projected)
+            projected = self.pos_encoding(projected, offset=position_offset)
 
-            # megatransformer_utils.print_debug_tensor("positional encoding audio prelude output", projected)
-
+        # MegaTransformerEncoderBlock.forward already adds residuals internally,
+        # so the loop just chains layers without re-adding the input.
         x = projected
-        for block in self.prelude:
-            hidden, _ = block(x)
-            x = x + hidden
-
-        # megatransformer_utils.print_debug_tensor("prelude block audio prelude output", x)
+        new_kv_caches = []
+        for i, block in enumerate(self.prelude):
+            block_cache = kv_caches[i] if kv_caches is not None else None
+            x, new_cache = block(
+                x,
+                kv_cache=block_cache,
+                position_offset=position_offset,
+                use_cache=use_cache,
+            )
+            if use_cache:
+                new_kv_caches.append(new_cache)
 
         if hasattr(self, 'output_norm'):
             x = self.output_norm(x)
 
-            # megatransformer_utils.print_debug_tensor("normed audio prelude output", x)
-
+        if use_cache:
+            return x, new_kv_caches
         return x
