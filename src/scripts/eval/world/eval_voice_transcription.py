@@ -39,6 +39,8 @@ def parse_args():
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--tie_word_embeddings", action="store_true")
     p.add_argument("--split", type=str, default="val", help="Dataset split (train/val)")
+    p.add_argument("--log_dir", type=str, default=None, help="TensorBoard log dir for metrics")
+    p.add_argument("--step", type=int, default=None, help="Step number (inferred from checkpoint path if omitted)")
     p.add_argument("--device", type=str, default=None)
     return p.parse_args()
 
@@ -199,6 +201,15 @@ def main():
         print(f"  Max WER:        {scores.max():.4f}")
         print(f"  Perfect (0.0):  {(scores == 0).sum().item()}/{len(wer_scores)}")
         print(f"{'='*60}")
+
+        from scripts.eval.world.eval_utils import infer_step_from_checkpoint, init_eval_metrics, log_eval_scalars
+        step = args.step if args.step is not None else infer_step_from_checkpoint(args.checkpoint_path)
+        init_eval_metrics(args.log_dir, args.checkpoint_path)
+        log_eval_scalars({
+            "eval/voice_transcription_wer_corpus": corpus_wer,
+            "eval/voice_transcription_wer_mean": scores.mean().item(),
+            "eval/voice_transcription_wer_median": scores.median().item(),
+        }, step)
     else:
         print("No voice samples found in dataset.")
 

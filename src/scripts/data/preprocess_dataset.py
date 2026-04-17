@@ -26,55 +26,117 @@ preprocessor_clss: list[type[Preprocessor]] = [
 ]
 
 
-def _stat_shards(args):
-    # Build shard index for existing shards
-    shard_dir = args.output_dir
+def _collect_shard_info(shard_dir, col=None):
+    """Scan a shard directory: return (shard_files, sample_counts, unique_speaker_ids)."""
     shard_files = sorted([
         f for f in os.listdir(shard_dir)
         if f.startswith("shard_") and f.endswith(".pt")
     ])
+    sample_counts = []
+    speaker_ids = set()
+    for shard_file in shard_files:
+        shard = torch.load(os.path.join(shard_dir, shard_file), map_location="cpu", weights_only=False)
+        sample_counts.append(shard["num_samples"])
+        if col is not None and col in shard:
+            ids = shard[col]
+            if isinstance(ids, torch.Tensor):
+                speaker_ids.update(ids.tolist())
+            elif isinstance(ids, list):
+                speaker_ids.update(ids)
+    return shard_files, sample_counts, speaker_ids
 
-    if not shard_files:
-        print(f"No shard files found in {shard_dir}")
-        exit(1)
 
-    print(f"Building index for {len(shard_files)} shards in {shard_dir}...")
-
-    shard_offsets = []
-    total_samples = 0
-
-    highest_speaker_id = -1
-    if args.speaker_id_column is not None:
-        highest_speaker_id = 0
-
-    for shard_file in tqdm(shard_files):
-        shard_offsets.append(total_samples)
+def _remap_shards(shard_dir, shard_files, col, id_to_seq):
+    """Rewrite speaker IDs in shards using the global mapping."""
+    for shard_file in tqdm(shard_files, desc=f"Remapping {shard_dir}"):
         shard_path = os.path.join(shard_dir, shard_file)
-        shard = torch.load(shard_path, map_location="cpu", weights_only=True)
-        total_samples += shard["num_samples"]
+        shard = torch.load(shard_path, map_location="cpu", weights_only=False)
+        if col in shard:
+            ids = shard[col]
+            if isinstance(ids, torch.Tensor):
+                remapped = torch.tensor([id_to_seq[x.item()] for x in ids], dtype=torch.long)
+            elif isinstance(ids, list):
+                remapped = torch.tensor([id_to_seq[x] for x in ids], dtype=torch.long)
+            else:
+                continue
+            shard[col] = remapped
+            torch.save(shard, shard_path)
 
-        if args.speaker_id_column is not None:
-            highest_speaker_id = max(highest_speaker_id, shard[args.speaker_id_column].max().item())
+
+def _write_index(shard_dir, shard_files, sample_counts, num_speakers, command):
+    """Write shard_index.json for a directory."""
+    shard_offsets = []
+    total = 0
+    for count in sample_counts:
+        shard_offsets.append(total)
+        total += count
 
     index_data = {
         "shard_files": shard_files,
         "shard_offsets": shard_offsets,
-        "total_samples": total_samples,
-        "dataset_type": args.command,
+        "total_samples": total,
+        "dataset_type": command,
     }
-
-    if args.speaker_id_column is not None:
-        index_data["num_speakers"] = highest_speaker_id + 1  # assuming IDs are 0-indexed
+    if num_speakers > 0:
+        index_data["num_speakers"] = num_speakers
 
     index_path = os.path.join(shard_dir, "shard_index.json")
     with open(index_path, "w") as f:
         json.dump(index_data, f, indent=2)
+    print(f"  {shard_dir}: {len(shard_files)} shards, {total:,} samples → {index_path}")
 
-    print(f"\nIndex built successfully!")
-    print(f"  Shards: {len(shard_files)}")
-    print(f"  Total samples: {total_samples:,}")
-    print(f"  Dataset type: {args.command}")
-    print(f"  Saved to: {index_path}")
+
+def _stat_shards(args):
+    """Build shard index for existing shards, and optionally remap speaker IDs
+    to dense sequential integers across all directories (train + val)."""
+    col = args.speaker_id_column
+    all_dirs = [args.output_dir] + (args.additional_shard_dirs or [])
+
+    # Pass 1: scan all directories, collect unique speaker IDs globally
+    dir_info = {}  # dir → (shard_files, sample_counts)
+    all_speaker_ids = set()
+
+    for d in all_dirs:
+        if not os.path.isdir(d):
+            print(f"Warning: {d} not found, skipping")
+            continue
+        print(f"Scanning {d}...")
+        shard_files, sample_counts, spk_ids = _collect_shard_info(d, col)
+        if not shard_files:
+            print(f"  No shard files found, skipping")
+            continue
+        dir_info[d] = (shard_files, sample_counts)
+        all_speaker_ids.update(spk_ids)
+
+    if not dir_info:
+        print("No shard files found in any directory.")
+        exit(1)
+
+    # Build global dense mapping
+    num_speakers = 0
+    if col is not None and all_speaker_ids:
+        sorted_ids = sorted(all_speaker_ids)
+        id_to_seq = {native: seq for seq, native in enumerate(sorted_ids)}
+        num_speakers = len(sorted_ids)
+        is_already_dense = (
+            all(isinstance(x, (int, float)) for x in sorted_ids)
+            and len(sorted_ids) == (max(sorted_ids) - min(sorted_ids) + 1)
+            and min(sorted_ids) == 0
+        )
+
+        if is_already_dense:
+            print(f"Speaker IDs already dense: {num_speakers} speakers, range [0, {num_speakers - 1}]")
+        else:
+            print(f"Remapping {num_speakers} unique speaker IDs to dense [0, {num_speakers - 1}] across {len(dir_info)} dirs...")
+            # Pass 2: rewrite speaker IDs in all directories
+            for d, (shard_files, _) in dir_info.items():
+                _remap_shards(d, shard_files, col, id_to_seq)
+
+    # Write index for each directory
+    print()
+    for d, (shard_files, sample_counts) in dir_info.items():
+        _write_index(d, shard_files, sample_counts, num_speakers, args.command)
+    print(f"\nDone.")
 
 
 def get_preprocessor(command: str, args, dataset, output_dir, shard_fields, batch_accumulators, stats, device: str) -> Preprocessor:
@@ -96,7 +158,8 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
     sub_parser = subparsers.add_parser("stat-shards", help="Produces the index file for existing shards. Combine manually for multi-gpu processing.")
     sub_parser.add_argument("--output_dir", type=str, required=True, help="Output directory for shards")
-    sub_parser.add_argument("--speaker_id_column", type=str, default=None, help="If specified, compute highest speaker ID from shards")
+    sub_parser.add_argument("--speaker_id_column", type=str, default=None, help="If specified, remap speaker IDs to dense sequential integers")
+    sub_parser.add_argument("--additional_shard_dirs", type=str, nargs="*", default=[], help="Extra shard dirs (e.g. val split) to include in global speaker ID mapping. These dirs also get remapped and their own shard_index.json written.")
     for preprocessor_cls in preprocessor_clss:
         # Dataset
         sub_parser = preprocessor_cls.add_cli_args(subparsers)

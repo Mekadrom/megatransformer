@@ -44,6 +44,8 @@ def parse_args():
     p.add_argument("--save_images", type=str, default=None,
                    help="Directory to save generated images")
     p.add_argument("--split", type=str, default="val", help="Dataset split (train/val)")
+    p.add_argument("--log_dir", type=str, default=None, help="TensorBoard log dir for metrics")
+    p.add_argument("--step", type=int, default=None, help="Step number (inferred from checkpoint path if omitted)")
     p.add_argument("--device", type=str, default=None)
     return p.parse_args()
 
@@ -277,6 +279,19 @@ def main():
             print("  FID: skipped (torchmetrics not available)")
         except Exception as e:
             print(f"  FID: failed ({e})")
+
+    # Log to TensorBoard
+    from scripts.eval.world.eval_utils import infer_step_from_checkpoint, init_eval_metrics, log_eval_scalars
+    step = args.step if args.step is not None else infer_step_from_checkpoint(args.checkpoint_path)
+    init_eval_metrics(args.log_dir, args.checkpoint_path)
+    metrics_dict = {}
+    if clip_scores:
+        scores = torch.tensor(clip_scores)
+        metrics_dict["eval/image_synthesis_clipscore_mean"] = scores.mean().item()
+    if 'fid_score' in dir():
+        metrics_dict["eval/image_synthesis_fid"] = fid_score
+    if metrics_dict:
+        log_eval_scalars(metrics_dict, step)
 
     print(f"{'='*60}")
 

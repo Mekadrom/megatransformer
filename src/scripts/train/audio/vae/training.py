@@ -239,9 +239,11 @@ class AudioCVAEGANTrainer(CommonTrainer):
         global_step = self.state.global_step + self.step_offset
 
         # gets reset any time training is resumed; it can be assumed that the cli changed, so log at the step value it was resumed from
-        if not self.has_logged_cli:
+        if not self.has_logged_cli and torch.distributed.get_rank() == 0:
             metrics.log_text("training/command_line", self.cmdline, global_step)
             metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            metrics.log_text("training/model_architecture", str(model), global_step)
+            metrics.log_text("training/model_param_count", f"{sum(p.numel() for p in model.parameters()):,}", global_step)
             self.has_logged_cli = True
 
         # Unfreeze F0 predictor after freeze_steps

@@ -32,6 +32,8 @@ def parse_args():
     p.add_argument("--tie_word_embeddings", action="store_true")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--split", type=str, default="val", help="Dataset split (train/val)")
+    p.add_argument("--log_dir", type=str, default=None, help="TensorBoard log dir for metrics")
+    p.add_argument("--step", type=int, default=None, help="Step number (inferred from checkpoint path if omitted)")
     p.add_argument("--device", type=str, default=None)
     return p.parse_args()
 
@@ -135,12 +137,22 @@ def main():
     if total_tokens > 0:
         avg_ce = total_loss / total_tokens
         perplexity = math.exp(avg_ce)
+        bpt = avg_ce / math.log(2)
         print(f"\n{'='*60}")
         print(f"Text Perplexity Results ({total_tokens:,} tokens from {len(dataset)} samples)")
         print(f"  Cross-entropy:  {avg_ce:.4f} nats")
         print(f"  Perplexity:     {perplexity:.2f}")
-        print(f"  Bits per token: {avg_ce / math.log(2):.4f}")
+        print(f"  Bits per token: {bpt:.4f}")
         print(f"{'='*60}")
+
+        from scripts.eval.world.eval_utils import infer_step_from_checkpoint, init_eval_metrics, log_eval_scalars
+        step = args.step if args.step is not None else infer_step_from_checkpoint(args.checkpoint_path)
+        init_eval_metrics(args.log_dir, args.checkpoint_path)
+        log_eval_scalars({
+            "eval/text_cross_entropy": avg_ce,
+            "eval/text_perplexity": perplexity,
+            "eval/text_bits_per_token": bpt,
+        }, step)
     else:
         print("No text samples found.")
 

@@ -136,6 +136,13 @@ class WorldModelTrainer(CommonTrainer):
         # Per-module gradient norm tracking — built lazily in _get_module_groups()
         self._module_groups = None
 
+        # Per-task eval loss accumulator. Populated during evaluation (see
+        # evaluate() / prediction_step); None outside of eval so compute_loss
+        # doesn't spend cycles on it during training.
+        self._eval_task_accumulator = None
+        self._last_loss_components = None
+        self._last_task_type = None
+
     def _compute_modality_recon_loss(
         self,
         name: str,
@@ -277,9 +284,11 @@ class WorldModelTrainer(CommonTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
 
-        if not self.has_logged_cli:
+        if not self.has_logged_cli and torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             metrics.log_text("training/command_line", self.cmdline, global_step)
             metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            metrics.log_text("training/model_architecture", str(model), global_step)
+            metrics.log_text("training/model_param_count", f"{sum(p.numel() for p in model.parameters()):,}", global_step)
             self.has_logged_cli = True
 
         # ── Prepare inputs for world model forward ──────────────────────
@@ -542,7 +551,28 @@ class WorldModelTrainer(CommonTrainer):
             loss_components.update(voice_components)
 
         # Stop loss for audio/voice autoregressive generation.
-        # Target: 0 for real frames, 1 for frames at or past the real length.
+        #
+        # Previously the target was `1 for all frames at or past the real length`
+        # and the loss was BCE over ALL T positions. That lets the stop head
+        # reach near-zero loss by learning the easy signal "my input is a
+        # padding frame" — which never fires at inference (autoregressive
+        # predictions never produce padding-shaped frames). Diagnosis in
+        # feedback_stop_head_exposure_bias.md.
+        #
+        # Revised formulation:
+        # 1. Supervise ONLY real-content positions [0, length-1] (mask out
+        #    all padding positions). The model never sees padding in its
+        #    supervised range, so it can't learn padding-detection as a
+        #    proxy for stop.
+        # 2. Target is 1 ONLY at position `length-1` (the last real frame's
+        #    own position) — meaning "after predicting this frame, stop."
+        #    At inference this fires the right iteration: we generate
+        #    exactly `length` real frames total.
+        # 3. Class imbalance is severe (1 positive per ~length negatives
+        #    per sample). Use BCEWithLogits pos_weight ~= mean(length-1) to
+        #    balance, otherwise the loss is dominated by the easy negative
+        #    class and the stop head never learns to fire.
+        #
         # Whitened by log(2) (random-guess BCE baseline) so loss_weight=1.0
         # gives it equal footing with other whitened losses.
         log2 = 0.6931471805599453  # math.log(2)
@@ -554,12 +584,22 @@ class WorldModelTrainer(CommonTrainer):
             if stop_logits is not None and lengths is not None and weight > 0:
                 T = stop_logits.shape[-1]
                 lengths_flat = lengths.view(-1)  # (B,)
-                # Target: 1 at and past the last real frame, 0 before
-                stop_target = (torch.arange(T, device=stop_logits.device).unsqueeze(0)
-                               >= lengths_flat.unsqueeze(1)).float()
-                stop_loss_raw = torch.nn.functional.binary_cross_entropy_with_logits(
-                    stop_logits, stop_target,
+                device = stop_logits.device
+                pos = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
+                # Supervised positions: [0, length-1] inclusive. Padding masked out.
+                supervised_mask = pos < lengths_flat.unsqueeze(1)  # (B, T)
+                # Target: 1 only at position == length-1 (last real frame).
+                stop_target = (pos == (lengths_flat - 1).unsqueeze(1)).float()
+                # Per-batch class balancing: pos_weight ≈ mean(length-1) gives
+                # roughly equal loss contribution from positive and negative
+                # classes per sample. Clamp ≥1 for degenerate short samples.
+                avg_neg = (lengths_flat.float() - 1.0).clamp(min=1.0).mean()
+                pos_weight = avg_neg.detach()
+                stop_loss_per_pos = torch.nn.functional.binary_cross_entropy_with_logits(
+                    stop_logits, stop_target, pos_weight=pos_weight, reduction="none",
                 )
+                mask_f = supervised_mask.float()
+                stop_loss_raw = (stop_loss_per_pos * mask_f).sum() / mask_f.sum().clamp(min=1.0)
                 stop_loss_norm = stop_loss_raw / log2
                 total_loss = total_loss + weight * stop_loss_norm
                 loss_components[f"{mod}_stop_loss_raw"] = stop_loss_raw.detach()
@@ -629,6 +669,11 @@ class WorldModelTrainer(CommonTrainer):
                 f"  components: {breakdown}\n"
                 f"  is_synthesis: {is_synthesis.tolist() if is_synthesis is not None else None}"
             )
+
+        # Stash the task type and loss components so prediction_step can
+        # accumulate them for per-task eval curves (no-op during training).
+        self._last_task_type = task_type
+        self._last_loss_components = loss_components
 
         if global_step % self.args.logging_steps == 0:
             metrics.log_scalar("world/total_loss", total_loss, global_step)
@@ -776,9 +821,22 @@ class WorldModelTrainer(CommonTrainer):
         # step hasn't happened yet). Log norms at logging frequency.
         global_step = self.state.global_step + self.step_offset
         if global_step % self.args.logging_steps == 0:
-            has_grads = any(p.grad is not None for p in model_to_use.parameters())
-            if has_grads:
-                self._log_grad_norms(global_step)
+            if self.is_deepspeed_enabled:
+                # Under ZeRO, per-param .grad is sharded/None — per-module norms
+                # aren't meaningful. Log the engine's global grad norm instead.
+                grad_norm = None
+                try:
+                    grad_norm = model.get_global_grad_norm()
+                except Exception:
+                    pass
+                if grad_norm is not None:
+                    if hasattr(grad_norm, "item"):
+                        grad_norm = grad_norm.item()
+                    metrics.log_scalar("world/grad_norm/global", grad_norm, global_step, skip_zero=False)
+            else:
+                has_grads = any(p.grad is not None for p in model_to_use.parameters())
+                if has_grads:
+                    self._log_grad_norms(global_step)
 
         return loss
 
@@ -793,7 +851,56 @@ class WorldModelTrainer(CommonTrainer):
         with torch.no_grad():
             with torch.autocast(device_type=self.args.device.type, dtype=torch.bfloat16, enabled=self.args.bf16):
                 loss = self.compute_loss(model, inputs)
+
+        # Accumulate per-task eval metrics if evaluate() has set up the buffer.
+        if self._eval_task_accumulator is not None and self._last_task_type is not None:
+            bucket = self._eval_task_accumulator.setdefault(self._last_task_type, {})
+            def _add(key, val):
+                if not math.isfinite(val):
+                    return
+                cur_sum, cur_count = bucket.get(key, (0.0, 0))
+                bucket[key] = (cur_sum + val, cur_count + 1)
+
+            if torch.is_tensor(loss):
+                try:
+                    _add("total_loss", float(loss.item()))
+                except Exception:
+                    pass
+            for k, v in (self._last_loss_components or {}).items():
+                if torch.is_tensor(v) and v.numel() == 1:
+                    try:
+                        _add(k, float(v.item()))
+                    except Exception:
+                        pass
         return (loss, None, None)
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        """Run evaluation, accumulating per-task losses, then log them.
+
+        Produces `world_eval/{task_type}/{component}` curves alongside HF's
+        default `eval_loss`. Task type is inferred from batch composition in
+        compute_loss (ModalityGroupedSampler makes each batch homogeneous).
+        """
+        self._eval_task_accumulator = {}
+        try:
+            output = super().evaluate(
+                eval_dataset=eval_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+        finally:
+            global_step = self.state.global_step + self.step_offset
+            for task_type, bucket in self._eval_task_accumulator.items():
+                for component, (s, c) in bucket.items():
+                    if c > 0:
+                        metrics.log_scalar(
+                            f"world_eval/{task_type}/{component}",
+                            s / c,
+                            global_step,
+                            skip_zero=False,
+                        )
+            self._eval_task_accumulator = None
+        return output
 
     @staticmethod
     def _count_params(module):

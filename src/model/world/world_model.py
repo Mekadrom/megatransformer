@@ -728,6 +728,14 @@ class MegaTransformerWorldModel(nn.Module):
         completed_voice: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         completed_image: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
 
+        # Per-frame stop-head logit traces for diagnostics. One list per batch
+        # item, appended to on every voice/audio generation iter. Returned in
+        # the outputs dict so callers can visualize the stop head's signal and
+        # diagnose why a budget-hit occurred (flat at -5 → head not learning;
+        # rising but < 0 → distribution-shift; crosses 0 late → positional bias).
+        voice_stop_logit_trace: List[List[float]] = [[] for _ in range(batch_size)]
+        audio_stop_logit_trace: List[List[float]] = [[] for _ in range(batch_size)]
+
         # Process initial prompt — replace placeholders with media if provided.
         # Also initialize text prelude KV caches so subsequent tokens get the
         # same causal context the prelude sees during training.
@@ -815,6 +823,35 @@ class MegaTransformerWorldModel(nn.Module):
             # Check for modality transitions and handle accordingly
             next_hidden_list = []
 
+            # Per-batch forced next-token override. When a media block finalizes
+            # in this iteration, we set forced_next_token[b] = EO*_TOKEN_ID so
+            # that EO* becomes the sampled token for this step — replacing the
+            # text coda's free-sampled token from the BO* position. This lets
+            # the next iteration feed EO* through text_prelude → recurrent →
+            # text_coda, advancing all three KV caches in the same sequence the
+            # uninterleaver produced at training time ([..., BO*, EO*, text]).
+            # Without this override, EO* would only exist as a marker in
+            # generated_tokens and the actual token driving iter N+1 would be
+            # whatever BO*'s logits sampled — breaking train/inference parity.
+            forced_next_token: List[Optional[int]] = [None for _ in range(batch_size)]
+            # just_entered_streaming[b] = "voice"/"audio" when BO* transitioned
+            # current_modality from None this iter. For image (single-shot) the
+            # shared text_coda call naturally processes BOI because the image
+            # branch resets current_modality in the same iter, so any_media
+            # becomes False. For voice/audio, any_media stays True throughout
+            # streaming, so the shared call never runs — BO* never enters the
+            # text coda's KV cache. We fix this by making a separate one-item
+            # text coda call at the entry iter.
+            just_entered_streaming: List[Optional[str]] = [None for _ in range(batch_size)]
+            # just_finalized_streaming[b] = "voice"/"audio" when the voice or
+            # audio branch finalizes this iter. At the finalizing iter,
+            # `current_hidden` holds the LAST streaming-frame's recurrent
+            # output (a MODALITY_VOICE/AUDIO position). At training the text
+            # coda never sees these positions, so we must SKIP the shared
+            # text_coda call at finalizing iters and emit EO* directly as
+            # the next token.
+            just_finalized_streaming: List[Optional[str]] = [None for _ in range(batch_size)]
+
             for b in range(batch_size):
                 token_id = next_token_ids[b].item()
 
@@ -859,10 +896,15 @@ class MegaTransformerWorldModel(nn.Module):
                 else:
                     if token_id == constants.BOA_TOKEN_ID:
                         current_modality[b] = "audio"
+                        just_entered_streaming[b] = "audio"
                     elif token_id == constants.BOV_TOKEN_ID:
                         current_modality[b] = "voice"
+                        just_entered_streaming[b] = "voice"
                     elif token_id == constants.BOI_TOKEN_ID:
                         current_modality[b] = "image"
+                        # No flag — image is single-shot and resets current_modality
+                        # in the same iter, so the shared text_coda call below
+                        # naturally processes BOI's current_hidden.
 
                     token_embed, text_prelude_kv_caches = self.text_feature_extractor(
                         torch.tensor([[token_id]], device=device),
@@ -892,8 +934,33 @@ class MegaTransformerWorldModel(nn.Module):
             # Accumulate hidden states and run codas for non-text modalities
             for b in range(batch_size):
                 if current_modality[b] == "audio":
-                    # Run audio coda autoregressively with KV cache
-                    hidden_b = current_hidden[b:b+1]  # (1, 1, d_model)
+                    # Run audio coda autoregressively with KV cache.
+                    # On mid-generation BOA entry (just_entered_streaming=="audio"),
+                    # the coda's first input must be recurrent(zero_vec), not
+                    # recurrent(BOA_embed) — matching training where position 0
+                    # of a voice/audio block is a literal zero vector in d_model
+                    # space (world_model.py:291-294 for voice; same shape for
+                    # audio). For trailing-BOA prompts, this path is already
+                    # handled naturally by the line-896 zero_vec in iter 0;
+                    # here we emulate the same behavior when BOA is sampled
+                    # mid-generation so both entry paths converge.
+                    if just_entered_streaming[b] == "audio":
+                        d_model_ = self.config.text_prelude_config.d_model
+                        zero_hidden = torch.zeros(
+                            1, 1, d_model_, device=device, dtype=current_hidden.dtype,
+                        )
+                        entry_hidden, kv_cache, _, _, _ = self.recurrent_block(
+                            zero_hidden * self.embed_scale,
+                            attention_mask=None,
+                            kv_cache=kv_cache,
+                            position_offset=position_offset,
+                            use_cache=True,
+                            share_kv_cache=share_kv_cache,
+                        )
+                        position_offset += 1
+                        hidden_b = entry_hidden  # (1, 1, d_model)
+                    else:
+                        hidden_b = current_hidden[b:b+1]  # (1, 1, d_model)
                     should_stop_audio = False
                     if self.audio_generator is not None:
                         coda_out = self.audio_generator(
@@ -909,7 +976,9 @@ class MegaTransformerWorldModel(nn.Module):
                         last_audio_pred[b] = frame_pred.squeeze(0)  # (C, 1)
                         # Check stop probability
                         stop_logit = coda_out["audio_stop_logits"]  # (1, 1)
-                        if torch.sigmoid(stop_logit[0, 0]).item() > 0.5:
+                        stop_logit_val = stop_logit[0, 0].item()
+                        audio_stop_logit_trace[b].append(stop_logit_val)
+                        if torch.sigmoid(torch.tensor(stop_logit_val)).item() > 0.5:
                             should_stop_audio = True
                     else:
                         audio_sequences[b].append(current_hidden[b])
@@ -926,11 +995,46 @@ class MegaTransformerWorldModel(nn.Module):
                         audio_coda_kv_caches[b] = None
                         audio_coda_position_offsets[b] = 0
                         last_audio_pred[b] = None
-                        generated_tokens[b].append(constants.EOA_TOKEN_ID)
+                        # Inject AUDIO_PLACEHOLDER into text_prelude KV cache so
+                        # EOA's causal attention in iter N+1 sees APH between
+                        # BOA and EOA (matching training [..., BOA, APH, EOA]).
+                        _, text_prelude_kv_caches = self.text_feature_extractor(
+                            torch.tensor([[constants.AUDIO_PLACEHOLDER_TOKEN_ID]], device=device),
+                            kv_caches=text_prelude_kv_caches,
+                            position_offset=text_prelude_position_offset,
+                            use_cache=True,
+                        )
+                        text_prelude_position_offset += 1
+                        forced_next_token[b] = constants.EOA_TOKEN_ID
+                        just_finalized_streaming[b] = "audio"
 
                 elif current_modality[b] == "voice":
-                    # Run voice coda autoregressively with KV cache
-                    hidden_b = current_hidden[b:b+1]  # (1, 1, d_model)
+                    # Run voice coda autoregressively with KV cache.
+                    # On mid-generation BOV entry (just_entered_streaming=="voice"),
+                    # the coda's first input must be recurrent(zero_vec), not
+                    # recurrent(BOV_embed) — matching training where position 0
+                    # of a voice block is a literal zero vector in d_model space
+                    # (world_model.py:291-294). For trailing-BOV prompts, this
+                    # path is already handled naturally by the line-896 zero_vec
+                    # in iter 0; here we emulate the same behavior when BOV is
+                    # sampled mid-generation so both entry paths converge.
+                    if just_entered_streaming[b] == "voice":
+                        d_model_ = self.config.text_prelude_config.d_model
+                        zero_hidden = torch.zeros(
+                            1, 1, d_model_, device=device, dtype=current_hidden.dtype,
+                        )
+                        entry_hidden, kv_cache, _, _, _ = self.recurrent_block(
+                            zero_hidden * self.embed_scale,
+                            attention_mask=None,
+                            kv_cache=kv_cache,
+                            position_offset=position_offset,
+                            use_cache=True,
+                            share_kv_cache=share_kv_cache,
+                        )
+                        position_offset += 1
+                        hidden_b = entry_hidden  # (1, 1, d_model)
+                    else:
+                        hidden_b = current_hidden[b:b+1]  # (1, 1, d_model)
                     should_stop_voice = False
                     if self.voice_generator is not None:
                         coda_out = self.voice_generator(
@@ -946,7 +1050,9 @@ class MegaTransformerWorldModel(nn.Module):
                         last_voice_pred[b] = frame_pred.squeeze(0)  # (C, 1)
                         # Check stop probability
                         stop_logit = coda_out["voice_stop_logits"]  # (1, 1)
-                        if torch.sigmoid(stop_logit[0, 0]).item() > 0.5:
+                        stop_logit_val = stop_logit[0, 0].item()
+                        voice_stop_logit_trace[b].append(stop_logit_val)
+                        if torch.sigmoid(torch.tensor(stop_logit_val)).item() > 0.5:
                             should_stop_voice = True
                     else:
                         voice_sequences[b].append(current_hidden[b])
@@ -963,7 +1069,18 @@ class MegaTransformerWorldModel(nn.Module):
                         voice_coda_kv_caches[b] = None
                         voice_coda_position_offsets[b] = 0
                         last_voice_pred[b] = None
-                        generated_tokens[b].append(constants.EOV_TOKEN_ID)
+                        # Inject VOICE_PLACEHOLDER into text_prelude KV cache so
+                        # EOV's causal attention in iter N+1 sees VPH between
+                        # BOV and EOV (matching training [..., BOV, VPH, EOV]).
+                        _, text_prelude_kv_caches = self.text_feature_extractor(
+                            torch.tensor([[constants.VOICE_PLACEHOLDER_TOKEN_ID]], device=device),
+                            kv_caches=text_prelude_kv_caches,
+                            position_offset=text_prelude_position_offset,
+                            use_cache=True,
+                        )
+                        text_prelude_position_offset += 1
+                        forced_next_token[b] = constants.EOV_TOKEN_ID
+                        just_finalized_streaming[b] = "voice"
 
                 elif current_modality[b] == "image":
                     # Single-shot image generation: feed generation queries through
@@ -1003,7 +1120,41 @@ class MegaTransformerWorldModel(nn.Module):
                     if image_pred is not None:
                         completed_image[b].append(image_pred)
                     current_modality[b] = None
-                    generated_tokens[b].append(constants.EOI_TOKEN_ID)
+                    # Defer EOI emission to the shared text-coda path below,
+                    # and first inject IMAGE_PLACEHOLDER into text_prelude's KV
+                    # cache so EOI's causal self-attention in iter N+1 sees
+                    # IPH between BOI and EOI — matching training's text
+                    # sequence [..., BOI, IPH, EOI, ...]. The prelude's IPH
+                    # embedding is discarded (the interleaver strips it at
+                    # training too); we only need it in the causal KV cache.
+                    _, text_prelude_kv_caches = self.text_feature_extractor(
+                        torch.tensor([[constants.IMAGE_PLACEHOLDER_TOKEN_ID]], device=device),
+                        kv_caches=text_prelude_kv_caches,
+                        position_offset=text_prelude_position_offset,
+                        use_cache=True,
+                    )
+                    text_prelude_position_offset += 1
+                    forced_next_token[b] = constants.EOI_TOKEN_ID
+
+            # Voice/audio ENTRY: run text_coda once on BO*'s current_hidden to
+            # add BO* to the text coda's KV cache, matching training (where the
+            # uninterleaver feeds the text coda the BO* position). Without this,
+            # the shared call below is skipped (any_media=True during streaming)
+            # and BO* is silently dropped from the text coda's view.
+            if any(just_entered_streaming[b] is not None for b in range(batch_size)):
+                entry_coda_out = self.text_generator(
+                    current_hidden,  # BO*'s recurrent output
+                    kv_caches=text_coda_kv_caches,
+                    position_offset=text_coda_position_offset,
+                    use_cache=True,
+                )
+                text_coda_kv_caches = entry_coda_out.get("kv_caches")
+                text_coda_position_offset += 1
+                # Logits from this call are the BO*-position predictions (trained
+                # to predict EO*). We don't sample; we're staying in media mode.
+                # Note: text_coda KV is shared across batch — correct handling
+                # for mixed batches (some entering, some not) would require
+                # per-item KV slices. This path effectively assumes batch=1.
 
             # Get logits for next token. Only run the text coda when ALL batch
             # items are in text mode. During voice/audio/image generation the
@@ -1012,7 +1163,14 @@ class MegaTransformerWorldModel(nn.Module):
             # hidden states through the text coda would pollute its KV cache with
             # out-of-distribution entries.
             any_media = any(current_modality[b] is not None for b in range(batch_size))
-            if not any_media:
+            # Skip shared text_coda at voice/audio finalization iters:
+            # current_hidden holds the LAST streaming-frame's recurrent output,
+            # which is a MODALITY_VOICE/AUDIO position — OOD for the text coda.
+            # EO* will be emitted directly via forced_next_token below and
+            # processed by text_coda in the next iter (when EO* is fed as the
+            # regular next token).
+            skip_shared_coda = any(just_finalized_streaming[b] is not None for b in range(batch_size))
+            if not any_media and not skip_shared_coda:
                 text_coda_output = self.text_generator(
                     current_hidden,
                     kv_caches=text_coda_kv_caches,
@@ -1024,11 +1182,27 @@ class MegaTransformerWorldModel(nn.Module):
                 logits = text_coda_output["logits"][:, 0, :]  # (batch, vocab_size)
                 all_logits.append(logits.unsqueeze(1))
 
-            # Sample next tokens (only meaningful in text mode)
+            # Sample / emit next tokens
             if not any_media:
-                next_token_ids = self._sample_tokens(logits, temperature, top_k, top_p)
-                for b in range(batch_size):
-                    generated_tokens[b].append(next_token_ids[b].item())
+                if skip_shared_coda:
+                    # Finalizing iter: emit forced EO* directly, no sampling.
+                    forced_ids = [forced_next_token[b] if forced_next_token[b] is not None else constants.EOS_TOKEN_ID for b in range(batch_size)]
+                    next_token_ids = torch.tensor(forced_ids, device=device)
+                    for b in range(batch_size):
+                        generated_tokens[b].append(next_token_ids[b].item())
+                else:
+                    sampled = self._sample_tokens(logits, temperature, top_k, top_p)
+                    # Override sample with forced EO* for batch items that just
+                    # finalized a media block (e.g. image) — this turns EO*
+                    # into the actual next token driving iter N+1, so
+                    # text_prelude → recurrent → text_coda all process EO* as
+                    # a real position matching training.
+                    for b in range(batch_size):
+                        if forced_next_token[b] is not None:
+                            sampled[b] = forced_next_token[b]
+                    next_token_ids = sampled
+                    for b in range(batch_size):
+                        generated_tokens[b].append(next_token_ids[b].item())
 
             # Check for EOS — stop generation for batch items that produced it
             if not any_media:
@@ -1089,6 +1263,12 @@ class MegaTransformerWorldModel(nn.Module):
             outputs["image_latent_preds"] = stacked  # (batch, max_n, C, H, W)
             outputs["image_counts"] = counts  # (batch,)
             # No lengths needed for images since spatial dims are fixed
+
+        # Per-frame stop-head logit traces (diagnostic — see init comment).
+        # List-of-list Python objects (not tensors) since lengths vary per
+        # batch item. Empty list when no voice/audio was generated.
+        outputs["voice_stop_logit_trace"] = voice_stop_logit_trace
+        outputs["audio_stop_logit_trace"] = audio_stop_logit_trace
 
         return outputs
 

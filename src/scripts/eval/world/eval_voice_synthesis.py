@@ -47,6 +47,8 @@ def parse_args():
                    help="Directory to save generated .wav files")
     p.add_argument("--sample_rate", type=int, default=16000)
     p.add_argument("--split", type=str, default="val", help="Dataset split (train/val)")
+    p.add_argument("--log_dir", type=str, default=None, help="TensorBoard log dir for metrics")
+    p.add_argument("--step", type=int, default=None, help="Step number (inferred from checkpoint path if omitted)")
     p.add_argument("--device", type=str, default=None)
     return p.parse_args()
 
@@ -332,6 +334,18 @@ def main():
         print(f"  Std:              {sims.std():.4f}")
         print(f"  Min:              {sims.min():.4f}")
         print(f"  Max:              {sims.max():.4f}")
+
+    # Log to TensorBoard
+    from scripts.eval.world.eval_utils import infer_step_from_checkpoint, init_eval_metrics, log_eval_scalars
+    step = args.step if args.step is not None else infer_step_from_checkpoint(args.checkpoint_path)
+    init_eval_metrics(args.log_dir, args.checkpoint_path)
+    metrics_dict = {}
+    if mcd_scores:
+        metrics_dict["eval/voice_synthesis_mcd_mean"] = torch.tensor(mcd_scores).mean().item()
+    if spk_similarities:
+        metrics_dict["eval/voice_synthesis_sive_cosine_mean"] = torch.tensor(spk_similarities).mean().item()
+    if metrics_dict:
+        log_eval_scalars(metrics_dict, step)
 
     print(f"{'='*60}")
 

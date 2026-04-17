@@ -231,149 +231,10 @@ WORLD_MODEL_CONFIGS = {
     # Original config: equal-weight preludes/codas/recurrent.
     "default": MegaTransformerWorldModelConfig(),
 
-    "small_concat": MegaTransformerWorldModelConfig(
-        gen_query_mode='positional_only',
-        text_prelude_config=TextPreludeFeatureExtractorConfig(
-            n_layers=2,
-            use_pos_emb_ovr=True,
-            d_model=768,
-            prelude_config=MegaTransformerBlockConfig(
-                d_model=768,
-                n_heads=4,
-                d_queries=64,
-                d_values=64,
-                n_query_groups=4,
-                d_inner=1024,
-                use_rotary_embedding=True,
-                causal=True,
-            ),
-        ),
-        audio_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
-            n_layers=2,
-            prelude_config=_mha_block(d_model=768, causal=False),
-        ),
-        voice_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
-            n_layers=2,
-            prelude_config=_mha_block(d_model=768, causal=True),
-        ),
-        image_prelude_config=ImageVAEPreludeFeatureExtractorConfig(
-            n_layers=2,
-            prelude_config=_mha_block(d_model=768, causal=False),
-            # LiteVAE latents arrive at the prelude with std much larger than 1
-            # (range roughly [-7.5, 7.5]). Output norm caps the prelude output
-            # at std~1 before it reaches the recurrent block, so image positions
-            # don't dominate text positions in the interleaved sequence.
-            use_output_norm=True,
-            output_norm_type="layernorm",
-        ),
-        recurrent_block_config=MegaTransformerRecurrentConfig(
-            n_recurrent_blocks=4,
-            depth_scaled_init=False,
-            iteration_norm="post_projection",
-            block_config=MegaTransformerBlockConfig(
-                d_model=768 * 2,
-                n_heads=12,
-                d_queries=128,
-                d_values=128,
-                n_query_groups=12,
-                d_inner=768 * 8,
-                use_rotary_embedding=True,
-            ),
-        ),
-        text_coda_config=TextCodaClassifierConfig(
-            n_layers=2,
-            coda_config=_mha_block(d_model=768),
-        ),
-        audio_coda_config=AudioCodaAndVAEConfig(
-            n_layers=2,
-            coda_config=_mha_block(d_model=768),
-            output_mode="conv_refine",
-        ),
-        voice_coda_config=AudioCodaAndVAEConfig(
-            n_layers=2,
-            coda_config=_mha_block(d_model=768),
-            output_mode="framewise_refine",
-        ),
-        image_coda_config=_image_decoder(d_model=768, mode="direct"),
-    ),
-
     "small_sum": MegaTransformerWorldModelConfig(
         gen_query_mode='positional_only',
         text_prelude_config=TextPreludeFeatureExtractorConfig(
             n_layers=2,
-            use_pos_emb_ovr=True,
-            d_model=768,
-            prelude_config=MegaTransformerBlockConfig(
-                d_model=768,
-                n_heads=4,
-                d_queries=64,
-                d_values=64,
-                n_query_groups=4,
-                d_inner=1024,
-                use_rotary_embedding=True,
-                causal=True,
-            ),
-        ),
-        audio_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
-            n_layers=2,
-            prelude_config=_mha_block(d_model=768, causal=False),
-        ),
-        voice_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
-            n_layers=2,
-            prelude_config=_mha_block(d_model=768, causal=True),
-        ),
-        image_prelude_config=ImageVAEPreludeFeatureExtractorConfig(
-            n_layers=2,
-            prelude_config=_mha_block(d_model=768, causal=False),
-            # LiteVAE latents arrive at the prelude with std much larger than 1
-            # (range roughly [-7.5, 7.5]). Output norm caps the prelude output
-            # at std~1 before it reaches the recurrent block, so image positions
-            # don't dominate text positions in the interleaved sequence.
-            use_output_norm=True,
-            output_norm_type="layernorm",
-        ),
-        recurrent_block_config=MegaTransformerRecurrentConfig(
-            n_recurrent_blocks=4,
-            injection_type='add',
-            depth_scaled_init=True,
-            iteration_norm="post_projection",
-            block_config=MegaTransformerBlockConfig(
-                d_model=768,
-                n_heads=12,
-                d_queries=64,
-                d_values=64,
-                n_query_groups=12,
-                d_inner=768 * 4,
-                use_rotary_embedding=True,
-            ),
-        ),
-        text_coda_config=TextCodaClassifierConfig(
-            n_layers=2,
-            coda_config=_mha_block(d_model=768),
-        ),
-        audio_coda_config=AudioCodaAndVAEConfig(
-            n_layers=2,
-            coda_config=_mha_block(d_model=768),
-            output_mode="conv_refine",
-        ),
-        voice_coda_config=AudioCodaAndVAEConfig(
-            n_layers=2,
-            coda_config=_mha_block(d_model=768),
-            output_mode="framewise_refine",
-        ),
-        image_coda_config=_image_decoder(
-            d_model=768, mode="direct", use_output_denorm=False,
-        ),
-    ),
-
-    # `small_sum_dit`: identical to `small_sum` but with the image decoder swapped
-    # for the flow-matching diffusion bridge. Built via dataclasses.replace so the
-    # only diff is the image_coda_config field — text/voice/recurrent are shared.
-    "small_sum_dit": MegaTransformerWorldModelConfig(
-        gen_query_mode='positional_only',
-        text_prelude_config=TextPreludeFeatureExtractorConfig(
-            n_layers=2,
-            use_pos_emb_ovr=True,
             d_model=768,
             prelude_config=MegaTransformerBlockConfig(
                 d_model=768,
@@ -456,4 +317,178 @@ WORLD_MODEL_CONFIGS = {
             num_inference_steps=16,
         ),
     ),
+
+    "small_sum_gen_queries": MegaTransformerWorldModelConfig(
+        gen_query_mode='learned',
+        text_prelude_config=TextPreludeFeatureExtractorConfig(
+            n_layers=2,
+            d_model=768,
+            prelude_config=MegaTransformerBlockConfig(
+                d_model=768,
+                n_heads=4,
+                d_queries=64,
+                d_values=64,
+                n_query_groups=4,
+                d_inner=1024,
+                use_rotary_embedding=True,
+                causal=True,
+            ),
+        ),
+        audio_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
+            n_layers=2,
+            prelude_config=_mha_block(d_model=768, causal=False),
+        ),
+        voice_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
+            n_layers=2,
+            prelude_config=_mha_block(d_model=768, causal=True),
+        ),
+        image_prelude_config=ImageVAEPreludeFeatureExtractorConfig(
+            n_layers=2,
+            prelude_config=_mha_block(d_model=768, causal=False),
+            # LiteVAE latents arrive at the prelude with std much larger than 1
+            # (range roughly [-7.5, 7.5]). Output norm caps the prelude output
+            # at std~1 before it reaches the recurrent block, so image positions
+            # don't dominate text positions in the interleaved sequence.
+            use_output_norm=True,
+            output_norm_type="layernorm",
+        ),
+        recurrent_block_config=MegaTransformerRecurrentConfig(
+            n_recurrent_blocks=6,
+            injection_type='add',
+            depth_scaled_init=True,
+            iteration_norm="post_projection",
+            block_config=MegaTransformerBlockConfig(
+                d_model=768,
+                n_heads=12,
+                d_queries=64,
+                d_values=64,
+                n_query_groups=12,
+                d_inner=768 * 16,
+                use_rotary_embedding=True,
+            ),
+        ),
+        text_coda_config=TextCodaClassifierConfig(
+            n_layers=2,
+            coda_config=_mha_block(d_model=768),
+        ),
+        audio_coda_config=AudioCodaAndVAEConfig(
+            n_layers=2,
+            coda_config=_mha_block(d_model=768),
+            output_mode="conv_refine",
+        ),
+        voice_coda_config=AudioCodaAndVAEConfig(
+            n_layers=2,
+            coda_config=_mha_block(d_model=768),
+            output_mode="framewise_refine",
+        ),
+        image_coda_config=DiffusionBridgeImageDecoderConfig(
+            # Match the recurrent block's d_model so the bridge doesn't need a
+            # cross-d_model projection at its input.
+            d_model=768,
+            # Bridge: 4 layers with 64 learnable queries cross-attending to the
+            # recurrent block's image-position outputs.
+            n_bridge_layers=1,
+            n_bridge_queries=64,
+            # DiT: 12 layers — comparable depth to the small_sum recurrent block
+            # so the parameter budget is similar to the direct decoder it replaces.
+            n_dit_layers=1,
+            # Match the LiteVAE latent shape from the existing image dataset.
+            latent_channels=12,
+            latent_spatial_size=32,
+            patch_size=2,
+            # SD3/Flux-style timestep distribution: biases mid-range timesteps
+            # which are typically the most informative to train on.
+            timestep_sampling="logit_normal",
+            # Inference: Euler integration steps. 16 is conservative for
+            # from-scratch training; can be lowered after the model has trained.
+            num_inference_steps=16,
+        ),
+    ),
+
+    "small_concat": MegaTransformerWorldModelConfig(
+        gen_query_mode='positional_only',
+        text_prelude_config=TextPreludeFeatureExtractorConfig(
+            n_layers=2,
+            d_model=768,
+            prelude_config=MegaTransformerBlockConfig(
+                d_model=768,
+                n_heads=4,
+                d_queries=64,
+                d_values=64,
+                n_query_groups=4,
+                d_inner=1024,
+                use_rotary_embedding=True,
+                causal=True,
+            ),
+        ),
+        audio_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
+            n_layers=2,
+            prelude_config=_mha_block(d_model=768, causal=False),
+        ),
+        voice_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
+            n_layers=2,
+            prelude_config=_mha_block(d_model=768, causal=True),
+        ),
+        image_prelude_config=ImageVAEPreludeFeatureExtractorConfig(
+            n_layers=2,
+            prelude_config=_mha_block(d_model=768, causal=False),
+            # LiteVAE latents arrive at the prelude with std much larger than 1
+            # (range roughly [-7.5, 7.5]). Output norm caps the prelude output
+            # at std~1 before it reaches the recurrent block, so image positions
+            # don't dominate text positions in the interleaved sequence.
+            use_output_norm=True,
+            output_norm_type="layernorm",
+        ),
+        recurrent_block_config=MegaTransformerRecurrentConfig(
+            n_recurrent_blocks=4,
+            depth_scaled_init=False,
+            iteration_norm="post_projection",
+            block_config=MegaTransformerBlockConfig(
+                d_model=768 * 2,
+                n_heads=12,
+                d_queries=128,
+                d_values=128,
+                n_query_groups=12,
+                d_inner=768 * 16,
+                use_rotary_embedding=True,
+            ),
+        ),
+        text_coda_config=TextCodaClassifierConfig(
+            n_layers=2,
+            coda_config=_mha_block(d_model=768),
+        ),
+        audio_coda_config=AudioCodaAndVAEConfig(
+            n_layers=2,
+            coda_config=_mha_block(d_model=768),
+            output_mode="conv_refine",
+        ),
+        voice_coda_config=AudioCodaAndVAEConfig(
+            n_layers=2,
+            coda_config=_mha_block(d_model=768),
+            output_mode="framewise_refine",
+        ),
+        image_coda_config=DiffusionBridgeImageDecoderConfig(
+            # Match the recurrent block's d_model so the bridge doesn't need a
+            # cross-d_model projection at its input.
+            d_model=768,
+            # Bridge: 4 layers with 64 learnable queries cross-attending to the
+            # recurrent block's image-position outputs.
+            n_bridge_layers=1,
+            n_bridge_queries=64,
+            # DiT: 12 layers — comparable depth to the small_sum recurrent block
+            # so the parameter budget is similar to the direct decoder it replaces.
+            n_dit_layers=1,
+            # Match the LiteVAE latent shape from the existing image dataset.
+            latent_channels=12,
+            latent_spatial_size=32,
+            patch_size=2,
+            # SD3/Flux-style timestep distribution: biases mid-range timesteps
+            # which are typically the most informative to train on.
+            timestep_sampling="logit_normal",
+            # Inference: Euler integration steps. 16 is conservative for
+            # from-scratch training; can be lowered after the model has trained.
+            num_inference_steps=16,
+        ),
+    ),
+
 }

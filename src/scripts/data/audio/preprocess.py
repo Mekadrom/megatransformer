@@ -377,8 +377,8 @@ class AudioDatasetPreprocessor(Preprocessor):
         print(f"  Total samples in dataset: {len(self.dataset):,}")
 
         self.num_unique_speaker_ids = 0
-        if args.compute_speaker_embeddings:
-            self._convert_speaker_ids()
+        # Speaker ID remapping is now handled globally by stat-shards
+        # (after all splits/GPUs finish), so we store native IDs as-is.
 
         self.shared_window_buffer = SharedWindowBuffer()
 
@@ -695,7 +695,14 @@ class AudioDatasetPreprocessor(Preprocessor):
 
         if self.args.compute_speaker_embeddings:
             shard_data["speaker_embeddings"] = torch.cat(self.shard_fields['shard_speaker_embeddings'], dim=0)
-            shard_data["speaker_ids"] = torch.tensor(self.shard_fields['shard_speaker_ids'], dtype=torch.long)
+            # Store native speaker IDs (may be strings or ints). stat-shards
+            # will remap these to dense sequential integers globally.
+            native_ids = self.shard_fields['shard_speaker_ids']
+            try:
+                shard_data["speaker_ids"] = torch.tensor(native_ids, dtype=torch.long)
+            except (ValueError, TypeError):
+                # Native IDs are strings — store as list; stat-shards handles remapping
+                shard_data["speaker_ids"] = native_ids
             self.shard_fields['shard_speaker_embeddings'] = []
             self.shard_fields['shard_speaker_ids'] = []
 
