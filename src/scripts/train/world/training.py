@@ -65,9 +65,23 @@ class WorldModelTrainer(CommonTrainer):
         precomputed_latents: bool = True,
         # Text loss label smoothing
         text_label_smoothing: float = 0.0,
+        # DiT-specific LR override. When not None, parameters under
+        # model.image_generator (the DiffusionBridgeImageDecoder / ImageDecoder)
+        # get this LR instead of args.learning_rate. Useful when the DiT path
+        # is the destabilizing module and a lower LR keeps training on-rails.
+        lr_dit: Optional[float] = None,
+        # If True, skip text loss in image_synthesis / voice_synthesis batches
+        # where text is conditioning rather than target. Default False for
+        # backward compatibility with existing runs. Standard practice in
+        # multimodal LMs (Flamingo, GIT, BLIP) is True — applying text loss
+        # during synthesis competes with the generation objective.
+        mask_text_loss_in_synthesis: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+
+        self.lr_dit = lr_dit
+        self.mask_text_loss_in_synthesis = mask_text_loss_in_synthesis
 
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
@@ -116,6 +130,26 @@ class WorldModelTrainer(CommonTrainer):
             self._shard_sampler = self.train_dataset.get_sampler(
                 shuffle=True, seed=42,
                 batch_size=self.args.per_device_train_batch_size,
+                world_size=world_size,
+            )
+
+        # Eval sampler — mirrors the train sampler structure to ensure eval
+        # batches are homogeneous by task type. Without this, HF Trainer's
+        # default SequentialSampler produces mixed-modality eval batches,
+        # which trigger the batch-size-mismatch null-out in world_model.py
+        # forward and collapse all eval task_type classification to
+        # text_continuation (because voice/image get nulled for non-text-heavy
+        # batches). Result: only `world_eval/text_continuation/*` metrics
+        # get logged, and eval_loss ends up being text-only rather than a
+        # true average across task types.
+        self._eval_shard_sampler = None
+        if self.eval_dataset is not None and hasattr(self.eval_dataset, 'get_sampler'):
+            import torch.distributed as dist
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            self._eval_shard_sampler = self.eval_dataset.get_sampler(
+                shuffle=False,  # deterministic eval for reproducibility across runs
+                seed=42,
+                batch_size=self.args.per_device_eval_batch_size,
                 world_size=world_size,
             )
 
@@ -272,12 +306,12 @@ class WorldModelTrainer(CommonTrainer):
         )
 
         return modality_total, {
-            f"{name}_l1_raw": l1_raw.detach(),
-            f"{name}_mse_raw": mse_raw.detach(),
-            f"{name}_l1_norm": l1_norm.detach(),
-            f"{name}_mse_norm": mse_norm.detach(),
+            f"{name}_l1_loss_raw": l1_raw.detach(),
+            f"{name}_mse_loss_raw": mse_raw.detach(),
+            f"{name}_l1_loss_norm": l1_norm.detach(),
+            f"{name}_mse_loss_norm": mse_norm.detach(),
             f"{name}_var_loss": var_loss.detach(),
-            f"{name}_var_barrier": var_barrier.detach(),
+            f"{name}_var_barrier_loss": var_barrier.detach(),
             f"{name}_label_std": label_std_global.detach(),
         }
 
@@ -505,8 +539,14 @@ class WorldModelTrainer(CommonTrainer):
         # Whitened by log(vocab_size) so that the trivial uniform-prediction
         # baseline corresponds to a normalized loss of 1.0, matching the predict-
         # the-mean baseline of the whitened image/voice/audio reconstruction losses.
+        # Optionally skip text loss when text is conditioning rather than target
+        # (image_synthesis / voice_synthesis). Standard practice in Flamingo/GIT/BLIP.
+        skip_text_loss = (
+            self.mask_text_loss_in_synthesis
+            and task_type in ("image_synthesis", "voice_synthesis")
+        )
         logits = outputs.get("logits")
-        if logits is not None and text_targets is not None:
+        if logits is not None and text_targets is not None and not skip_text_loss:
             B, T, V = logits.size()
             # Align logits and targets (may differ by at most 1 due to
             # uninterleaver padding vs target padding across batch items)
@@ -634,7 +674,7 @@ class WorldModelTrainer(CommonTrainer):
                     x_0_est = outputs.get("image_latent_preds")
                     if x_0_est is not None and image_latent_labels is not None:
                         label_std = image_latent_labels.std().clamp_min(self._loss_eps)
-                        loss_components["image_diffusion_x0_est_l1_norm"] = (
+                        loss_components["image_diffusion_x0_est_l1_loss_norm"] = (
                             self.latent_l1_loss(x_0_est, image_latent_labels) / label_std
                         )
             else:
@@ -651,8 +691,10 @@ class WorldModelTrainer(CommonTrainer):
 
         # ── TensorBoard logging ─────────────────────────────────────────
 
-        # Surface NaN/Inf at the source instead of letting them propagate
-        # silently and trip an unrelated CUDA assert at checkpoint save.
+        # Non-finite loss handling: skip the batch instead of crashing. We build
+        # a zero-valued loss that is graph-connected to a model parameter so
+        # backward() produces zero gradients without errors. The offending
+        # batch is logged (once per step) for post-hoc analysis.
         if not torch.isfinite(total_loss):
             breakdown = {}
             for k, v in loss_components.items():
@@ -663,12 +705,25 @@ class WorldModelTrainer(CommonTrainer):
                         breakdown[k] = "<tensor read failed>"
                 else:
                     breakdown[k] = v
-            raise RuntimeError(
-                f"Non-finite world model loss at step {global_step}: "
-                f"total_loss={float(total_loss.item())}\n"
+
+            self._nan_skip_count = getattr(self, "_nan_skip_count", 0) + 1
+            try:
+                loss_scalar = float(total_loss.item())
+            except Exception:
+                loss_scalar = float("nan")
+            print(
+                f"[NaN skip #{self._nan_skip_count}] Non-finite world model loss at step {global_step}, "
+                f"skipping batch. total_loss={loss_scalar}\n"
                 f"  components: {breakdown}\n"
-                f"  is_synthesis: {is_synthesis.tolist() if is_synthesis is not None else None}"
+                f"  is_synthesis: {is_synthesis.tolist() if is_synthesis is not None else None}",
+                flush=True,
             )
+
+            any_param = next(p for p in model.parameters() if p.requires_grad)
+            zero_loss = any_param.sum() * 0.0
+            if return_outputs:
+                return zero_loss, outputs
+            return zero_loss
 
         # Stash the task type and loss components so prediction_step can
         # accumulate them for per-task eval curves (no-op during training).
@@ -811,6 +866,99 @@ class WorldModelTrainer(CommonTrainer):
             if num_params > 0:
                 metrics.log_scalar(f"world/grad_rms/{name}", (total_norm_sq / num_params) ** 0.5, global_step, skip_zero=False)
 
+    def _get_eval_sampler(self, eval_dataset) -> Optional[torch.utils.data.Sampler]:
+        """Group eval batches by task type so per-modality eval metrics fire.
+
+        Without this override, HF Trainer uses SequentialSampler at eval.
+        With `MultimodalShardedDataset`'s round-robin task assignment
+        (idx % n_tasks), sequential iteration produces mixed-modality batches,
+        which trigger the batch-size-mismatch null-out in world_model.py
+        forward. All eval batches collapse to `text_continuation` task_type
+        and voice/image eval metrics never appear. Using
+        `ModalityGroupedSampler` at eval produces homogeneous batches like
+        training does, so per-task eval curves (e.g.
+        `world_eval/voice_synthesis/voice_latent_l1_norm`) populate correctly.
+        """
+        if eval_dataset is self.eval_dataset and self._eval_shard_sampler is not None:
+            return self._eval_shard_sampler
+
+        # Ad-hoc eval with a different dataset — build a matching sampler
+        # on the fly if the dataset supports it.
+        if eval_dataset is not None and hasattr(eval_dataset, 'get_sampler'):
+            import torch.distributed as dist
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            return eval_dataset.get_sampler(
+                shuffle=False,
+                seed=42,
+                batch_size=self.args.per_device_eval_batch_size,
+                world_size=world_size,
+            )
+
+        return super()._get_eval_sampler(eval_dataset)
+
+    def create_optimizer(self):
+        """Build optimizer with optional DiT-specific LR group.
+
+        HF Trainer's default builds two groups (decay / no-decay) at a single
+        LR. When `lr_dit` is set, we subdivide into four groups so parameters
+        under `model.image_generator` get their own LR — useful when the DiT
+        is the destabilizing module and needs a lower LR than the rest of
+        the model. When `lr_dit` is None or when `optimizers=(..)` was passed
+        pre-built (e.g. Muon), this delegates to HF's default.
+        """
+        if self.optimizer is not None:
+            return self.optimizer
+        if self.lr_dit is None:
+            return super().create_optimizer()
+
+        from transformers import Trainer as _HFTrainer
+
+        opt_model = self.model_wrapped if hasattr(self, "model_wrapped") else self.model
+        decay_parameters = set(self.get_decay_parameter_names(opt_model))
+
+        def is_dit(name: str) -> bool:
+            # Match both plain and DDP/DeepSpeed-wrapped param names.
+            return ".image_generator." in f".{name}" or name.startswith("image_generator.")
+
+        groups = {
+            "dit_decay": {"params": [], "weight_decay": self.args.weight_decay, "lr": self.lr_dit},
+            "dit_no_decay": {"params": [], "weight_decay": 0.0, "lr": self.lr_dit},
+            "main_decay": {"params": [], "weight_decay": self.args.weight_decay, "lr": self.args.learning_rate},
+            "main_no_decay": {"params": [], "weight_decay": 0.0, "lr": self.args.learning_rate},
+        }
+
+        for n, p in opt_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            in_dit = is_dit(n)
+            in_decay = n in decay_parameters
+            key = (
+                "dit_decay" if in_dit and in_decay else
+                "dit_no_decay" if in_dit else
+                "main_decay" if in_decay else
+                "main_no_decay"
+            )
+            groups[key]["params"].append(p)
+
+        optimizer_grouped_parameters = [g for g in groups.values() if g["params"]]
+
+        optimizer_cls, optimizer_kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(self.args, opt_model)
+        # The 'lr' baked into each group takes precedence, but optimizer_kwargs
+        # still needs a default 'lr' for AdamW's constructor signature.
+        self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+        # Print a summary so the user can verify routing.
+        if self.args.local_rank in (-1, 0):
+            dit_params = sum(p.numel() for g in ("dit_decay", "dit_no_decay") for p in groups[g]["params"])
+            main_params = sum(p.numel() for g in ("main_decay", "main_no_decay") for p in groups[g]["params"])
+            print(
+                f"[create_optimizer] DiT LR split enabled:\n"
+                f"  DiT params  (image_generator.*): {dit_params:,} @ lr={self.lr_dit}\n"
+                f"  Main params (everything else):   {main_params:,} @ lr={self.args.learning_rate}"
+            )
+
+        return self.optimizer
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Override to capture gradient norms between backward and optimizer step."""
         model_to_use = model.module if hasattr(model, 'module') else model
@@ -877,10 +1025,20 @@ class WorldModelTrainer(CommonTrainer):
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         """Run evaluation, accumulating per-task losses, then log them.
 
+        Saves a checkpoint BEFORE eval+visualization so that long-running eval
+        or visualization errors don't lose trained weights.
+
         Produces `world_eval/{task_type}/{component}` curves alongside HF's
         default `eval_loss`. Task type is inferred from batch composition in
         compute_loss (ModalityGroupedSampler makes each batch homogeneous).
         """
+        # Save checkpoint before eval/visualization to avoid losing progress
+        # if eval crashes (e.g. missing dependency, shape mismatch, OOM).
+        try:
+            self._save_checkpoint(self.model, trial=None)
+        except Exception as e:
+            print(f"Warning: pre-eval checkpoint save failed: {e}")
+
         self._eval_task_accumulator = {}
         try:
             output = super().evaluate(
@@ -992,15 +1150,34 @@ def load_model(args, device='cuda'):
 
     # Pre-construction overrides for nested configs
     needs_override = (getattr(args, 'iteration_norm', None) is not None or
-                      getattr(args, 'share_block_weights', False))
+                      getattr(args, 'share_block_weights', False) or
+                      getattr(args, 'max_seq_len', None) is not None)
     if needs_override:
         import copy
         from config.world.world_model import WORLD_MODEL_CONFIGS
+        from config.common import MegaTransformerBlockConfig
         config = copy.deepcopy(WORLD_MODEL_CONFIGS[args.config])
         if getattr(args, 'iteration_norm', None) is not None:
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if getattr(args, 'share_block_weights', False):
             config.recurrent_block_config.share_block_weights = True
+        if getattr(args, 'max_seq_len', None) is not None:
+            # Size causal masks for the full interleaved sequence length:
+            # text max_seq_len + worst-case media tokens (voice ~210, image ~64)
+            # + boundary tokens. Use a generous buffer so new modalities or
+            # longer media don't immediately trip the mask-too-small error.
+            mpe = args.max_seq_len + 512
+            # Top-level field (text prelude also has one; keep in sync)
+            config.text_prelude_config.max_position_embeddings = mpe
+            # Walk every nested MegaTransformerBlockConfig and bump its buffer
+            def _bump_mpe(obj):
+                if isinstance(obj, MegaTransformerBlockConfig):
+                    obj.max_position_embeddings = mpe
+                    return
+                if hasattr(obj, '__dict__'):
+                    for v in vars(obj).values():
+                        _bump_mpe(v)
+            _bump_mpe(config)
         for k, v in overrides.items():
             setattr(config, k, v)
         WORLD_MODEL_CONFIGS[args.config + "_cli_override"] = config
@@ -1049,6 +1226,17 @@ def load_model(args, device='cuda'):
     # — silently ignored for the direct ImageDecoder.
     from model.image.diffusion_decoder import DiffusionBridgeImageDecoder
     if isinstance(model.image_generator, DiffusionBridgeImageDecoder):
+        # min_snr_gamma runtime override. Setting to 0 disables min-SNR
+        # weighting entirely (config field becomes None).
+        mgs_override = getattr(args, 'min_snr_gamma', None)
+        if mgs_override is not None:
+            if mgs_override <= 0:
+                model.image_generator.config.min_snr_gamma = None
+                print("[load_model] min-SNR weighting disabled (--min_snr_gamma <= 0)")
+            else:
+                model.image_generator.config.min_snr_gamma = float(mgs_override)
+                print(f"[load_model] min_snr_gamma overridden to {float(mgs_override)}")
+
         new_scale = None
         if getattr(args, 'image_latent_channel_scales', None) is not None:
             scales = [float(s) for s in args.image_latent_channel_scales.split(',')]
@@ -1110,6 +1298,8 @@ def create_trainer(
         include_image="image" in include_modes,
         precomputed_latents=args.precomputed_latents,
         text_label_smoothing=args.text_label_smoothing,
+        lr_dit=getattr(args, 'lr_dit', None),
+        mask_text_loss_in_synthesis=getattr(args, 'mask_text_loss_in_synthesis', False),
     )
 
 
@@ -1118,15 +1308,36 @@ def add_cli_args(subparsers):
         "world", help="Train the multimodal world model (text + audio + image)"
     )
 
-    # Data directories
+    # Data directories. For each modality, you can either:
+    #   (a) pass --<mod>_cache_dir as a base (the code appends _train / _val), or
+    #   (b) pass --<mod>_train_cache_dir and --<mod>_val_cache_dir explicitly.
+    # Explicit per-split dirs take precedence and avoid symlink tricks when
+    # train and val shards live at unrelated paths (e.g. tmpfs for train,
+    # disk for val).
     sub_parser.add_argument("--text_cache_dir", type=str, default=None,
-                            help="Directory for preprocessed text shards")
+                            help="Base dir for text shards (code appends _train/_val)")
+    sub_parser.add_argument("--text_train_cache_dir", type=str, default=None,
+                            help="Explicit text train shard dir (overrides --text_cache_dir)")
+    sub_parser.add_argument("--text_val_cache_dir", type=str, default=None,
+                            help="Explicit text val shard dir (overrides --text_cache_dir)")
     sub_parser.add_argument("--audio_cache_dir", type=str, default=None,
-                            help="Directory for preprocessed audio shards")
+                            help="Base dir for audio shards (code appends _train/_val)")
+    sub_parser.add_argument("--audio_train_cache_dir", type=str, default=None,
+                            help="Explicit audio train shard dir (overrides --audio_cache_dir)")
+    sub_parser.add_argument("--audio_val_cache_dir", type=str, default=None,
+                            help="Explicit audio val shard dir (overrides --audio_cache_dir)")
     sub_parser.add_argument("--voice_cache_dir", type=str, default=None,
-                            help="Directory for preprocessed voice shards")
+                            help="Base dir for voice shards (code appends _train/_val)")
+    sub_parser.add_argument("--voice_train_cache_dir", type=str, default=None,
+                            help="Explicit voice train shard dir (overrides --voice_cache_dir)")
+    sub_parser.add_argument("--voice_val_cache_dir", type=str, default=None,
+                            help="Explicit voice val shard dir (overrides --voice_cache_dir)")
     sub_parser.add_argument("--image_cache_dir", type=str, default=None,
-                            help="Directory for preprocessed image shards")
+                            help="Base dir for image shards (code appends _train/_val)")
+    sub_parser.add_argument("--image_train_cache_dir", type=str, default=None,
+                            help="Explicit image train shard dir (overrides --image_cache_dir)")
+    sub_parser.add_argument("--image_val_cache_dir", type=str, default=None,
+                            help="Explicit image val shard dir (overrides --image_cache_dir)")
     sub_parser.add_argument("--cache_dir", type=str, default=None,
                             help="Unused for world model — use per-modality cache dirs instead")
 
@@ -1187,6 +1398,25 @@ def add_cli_args(subparsers):
     # Text loss
     sub_parser.add_argument("--text_label_smoothing", type=float, default=0.0,
                             help="Label smoothing for text cross-entropy loss")
+    sub_parser.add_argument("--mask_text_loss_in_synthesis", action="store_true", default=False,
+                            help="Skip text cross-entropy loss in image_synthesis and voice_synthesis batches "
+                                 "where text is conditioning rather than target. Standard practice in Flamingo/GIT/BLIP. "
+                                 "Default off for backward compat with existing runs; enable for new from-scratch runs. "
+                                 "Text prelude still gets gradient on synthesis batches via the recurrent block + media losses.")
+
+    # Per-module LR overrides
+    sub_parser.add_argument("--lr_dit", type=float, default=None,
+                            help="Override LR for model.image_generator (DiT) parameters. "
+                                 "If set, DiT params get this LR while everything else uses --learning_rate. "
+                                 "Use to tame the DiT when it's the destabilizing module. "
+                                 "Ignored when --use_muon is set (Muon has its own LR split).")
+
+    # DiT loss-weighting override (only applies to DiffusionBridgeImageDecoder)
+    sub_parser.add_argument("--min_snr_gamma", type=float, default=None,
+                            help="Runtime override for DiT min-SNR gamma. Lowering from the config "
+                                 "default (typically 5.0) reduces gradient amplification at the hardest "
+                                 "timesteps (t near 1), trading a small amount of hard-timestep focus "
+                                 "for stability. Set <= 0 to disable min-SNR weighting entirely.")
 
     # Weight tying
     sub_parser.add_argument("--tie_word_embeddings", action="store_true", default=False,

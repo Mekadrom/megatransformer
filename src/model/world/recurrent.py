@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from config.world.world_model import MegaTransformerRecurrentConfig
 from model import recurrent_criteria
@@ -30,6 +31,7 @@ class MegatransformerRecurrentBlock(nn.Module):
 
         self.lockstep_n = self.config.lockstep_n
         self.lockstep_k = self.config.lockstep_k
+        self.gradient_checkpointing = False
 
         self.n_recurrent_blocks = config.n_recurrent_blocks
         self.injection_type = config.injection_type
@@ -120,13 +122,19 @@ class MegatransformerRecurrentBlock(nn.Module):
 
             mask = _extend_mask_fn(attention_mask, iter_cache) if _extend_mask_fn else attention_mask
 
-            h, updated_cache = block(
-                h,
-                attention_mask=mask,
-                kv_cache=iter_cache,
-                position_offset=position_offset,
-                use_cache=use_cache,
-            )
+            if self.gradient_checkpointing and self.training and not use_cache:
+                h, updated_cache = torch_checkpoint(
+                    block, h, mask, None, iter_cache, position_offset, use_cache,
+                    use_reentrant=False,
+                )
+            else:
+                h, updated_cache = block(
+                    h,
+                    attention_mask=mask,
+                    kv_cache=iter_cache,
+                    position_offset=position_offset,
+                    use_cache=use_cache,
+                )
 
             if use_cache and updated_cache is not None and kv_cache is not None:
                 layer_idx = 0 if share_kv_cache else block_idx
@@ -264,6 +272,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         position_offset: int = 0,
         use_cache: bool = False,
         share_kv_cache: bool = False,
+        max_iterations_override: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache], int, List[float]]:
         """
         Forward pass through recurrent block with optional KV caching.
@@ -291,7 +300,14 @@ class MegatransformerRecurrentBlock(nn.Module):
             kl_per_iteration: Per-iteration KL divergence between consecutive
                 thought states (mean over batch and sequence). Empty during training.
         """
-        n_steps_no_grad, k_steps_grad = self.n_k_steps(self.mean_thinking_steps, self.backprop_depth)
+        # max_iterations_override only applies in eval (training uses stochastic
+        # Poisson-log-normal sampling + backprop_depth). During eval the sampler
+        # deterministically returns (mean_thinking_steps, 0), so swapping in the
+        # override as the no_grad step count is equivalent to a per-call cap.
+        effective_mean_steps = self.mean_thinking_steps
+        if max_iterations_override is not None and not self.training:
+            effective_mean_steps = max_iterations_override
+        n_steps_no_grad, k_steps_grad = self.n_k_steps(effective_mean_steps, self.backprop_depth)
 
         last_thought_state = self.initialize_thinking_state(x_0)  # (batch_size, seq_len, d_model)
         track_kl = not self.training

@@ -66,6 +66,14 @@ def parse_args():
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--voice_token_budget", type=int, default=209)
     p.add_argument("--audio_token_budget", type=int, default=209)
+    p.add_argument("--image_iteration_override", type=int, default=None,
+                   help="Override recurrent iteration count for image gen query positions (eval-only). "
+                        "If unset, uses mean_thinking_steps with KL early-exit.")
+    p.add_argument("--image_num_inference_steps", type=int, default=None,
+                   help="Override DiT sampling steps. If unset, uses the decoder's config default.")
+    p.add_argument("--image_sampler", type=str, default="euler",
+                   choices=["euler", "heun", "midpoint"],
+                   help="Diffusion sampler. heun/midpoint are 2nd-order (2× NFE per step).")
 
     # SIVE (voice/audio input encoding)
     p.add_argument("--sive_checkpoint_path", type=str, default=None)
@@ -482,10 +490,52 @@ def main():
     import tempfile
     wav_tmpdir = tempfile.mkdtemp(prefix="mm_chat_wavs_")
 
-    def on_submit(msg_text, state, gen_hint):
+    def on_submit(
+        msg_text,
+        state,
+        gen_hint,
+        temperature_in,
+        top_p_in,
+        top_k_in,
+        max_new_tokens_in,
+        voice_budget_in,
+        audio_budget_in,
+        seed_in,
+        image_iter_override_in,
+        image_steps_in,
+        image_sampler_in,
+    ):
         if not msg_text or not msg_text.strip():
             return "", [], [], "Empty prompt."
         state = state or {}
+
+        # Normalize UI values into the generate() API. 0 / None / negative
+        # means "disabled" for top_p / top_k / seed, matching the underlying
+        # generate() contract (Optional sentinels).
+        temperature = float(temperature_in) if temperature_in is not None else args.temperature
+        top_p = float(top_p_in) if top_p_in and top_p_in > 0.0 else None
+        top_k = int(top_k_in) if top_k_in and top_k_in > 0 else None
+        max_new_tokens = int(max_new_tokens_in) if max_new_tokens_in else args.max_new_tokens
+        voice_budget = int(voice_budget_in) if voice_budget_in else args.voice_token_budget
+        audio_budget = int(audio_budget_in) if audio_budget_in else args.audio_token_budget
+        # 0/negative → "use model default" (mean_thinking_steps + KL early-exit)
+        image_iter_override: Optional[int] = None
+        if image_iter_override_in is not None and int(image_iter_override_in) > 0:
+            image_iter_override = int(image_iter_override_in)
+        elif args.image_iteration_override is not None and args.image_iteration_override > 0:
+            image_iter_override = args.image_iteration_override
+
+        # Diffusion sampler params. 0/negative on steps → decoder default.
+        image_num_steps: Optional[int] = None
+        if image_steps_in is not None and int(image_steps_in) > 0:
+            image_num_steps = int(image_steps_in)
+        elif args.image_num_inference_steps is not None and args.image_num_inference_steps > 0:
+            image_num_steps = args.image_num_inference_steps
+        image_sampler_choice: str = (image_sampler_in or args.image_sampler or "euler").lower()
+        if seed_in is not None and int(seed_in) >= 0:
+            torch.manual_seed(int(seed_in))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(seed_in))
 
         token_ids, media_sequence = parse_prompt(msg_text, state, tokenizer)
 
@@ -522,21 +572,35 @@ def main():
         except Exception:
             pass
 
+        # Report effective sampling params so repro is obvious.
+        status_lines.append(
+            f"Sampling: T={temperature:.2f}, top_p={top_p}, top_k={top_k}, "
+            f"max_new_tokens={max_new_tokens}, voice_budget={voice_budget}, "
+            f"audio_budget={audio_budget}, seed={int(seed_in) if seed_in is not None and int(seed_in) >= 0 else 'none'}, "
+            f"image_iter_override={image_iter_override if image_iter_override is not None else 'off'}, "
+            f"image_sampler={image_sampler_choice}, "
+            f"image_num_inference_steps={image_num_steps if image_num_steps is not None else 'default'}"
+        )
+
         with torch.no_grad():
             with autocast(device, dtype=dtype, enabled=args.bf16):
                 outputs = model.generate(
                     text_input_ids=prompt,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    audio_token_budget=args.audio_token_budget,
-                    voice_token_budget=args.voice_token_budget,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    audio_token_budget=audio_budget,
+                    voice_token_budget=voice_budget,
                     audio_inputs=audio_inputs,
                     audio_lengths=audio_lengths,
                     voice_inputs=voice_inputs,
                     voice_lengths=voice_lengths,
                     image_inputs=image_inputs,
                     precomputed_latents=True,
+                    image_iteration_override=image_iter_override,
+                    image_num_inference_steps=image_num_steps,
+                    image_sampler=image_sampler_choice,
                 )
 
         # Authoritative counts from generate() — spurious BO*/EO* sampled by
@@ -567,9 +631,13 @@ def main():
         gallery_images: list[tuple[Image.Image, str]] = []
         image_preds = outputs.get("image_latent_preds")
         image_counts = outputs.get("image_counts")
+        image_iters_per_item = outputs.get("image_recurrent_iterations") or []
         if image_preds is not None and image_counts is not None:
             n_img = int(image_counts[0].item())
             status_lines.append(f"image_latent_preds: shape={tuple(image_preds.shape) if image_preds.numel() else 'empty'}, counts[0]={n_img}")
+            if image_iters_per_item and image_iters_per_item[0]:
+                iters_str = ", ".join(str(i) for i in image_iters_per_item[0])
+                status_lines.append(f"Image recurrent iterations per block: [{iters_str}]")
             if litevae is None:
                 status_lines.append("LiteVAE not loaded — skipping image decode")
             else:
@@ -683,6 +751,54 @@ def main():
                     submit_btn = gr.Button("Generate", variant="primary")
                     clear_btn = gr.Button("Clear")
 
+                with gr.Accordion("Sampling parameters", open=False):
+                    with gr.Row():
+                        temperature_slider = gr.Slider(
+                            minimum=0.05, maximum=2.0, step=0.05,
+                            value=args.temperature, label="Temperature",
+                        )
+                        top_p_slider = gr.Slider(
+                            minimum=0.0, maximum=1.0, step=0.01,
+                            value=args.top_p, label="top_p (0 = off)",
+                        )
+                        top_k_slider = gr.Slider(
+                            minimum=0, maximum=500, step=1,
+                            value=0, label="top_k (0 = off)",
+                        )
+                    with gr.Row():
+                        max_new_tokens_num = gr.Number(
+                            value=args.max_new_tokens, precision=0,
+                            label="max_new_tokens",
+                        )
+                        voice_budget_num = gr.Number(
+                            value=args.voice_token_budget, precision=0,
+                            label="voice_token_budget",
+                        )
+                        audio_budget_num = gr.Number(
+                            value=args.audio_token_budget, precision=0,
+                            label="audio_token_budget",
+                        )
+                        seed_num = gr.Number(
+                            value=-1, precision=0,
+                            label="seed (-1 = random)",
+                        )
+                        image_iter_override_num = gr.Number(
+                            value=(args.image_iteration_override or 0),
+                            precision=0,
+                            label="image iteration override (0 = off, uses mean_thinking_steps + KL early-exit)",
+                        )
+                    with gr.Row():
+                        image_steps_num = gr.Number(
+                            value=(args.image_num_inference_steps or 0),
+                            precision=0,
+                            label="image diffusion steps (0 = decoder default)",
+                        )
+                        image_sampler_dd = gr.Dropdown(
+                            choices=["euler", "heun", "midpoint"],
+                            value=args.image_sampler,
+                            label="image diffusion sampler (heun/midpoint = 2× NFE/step)",
+                        )
+
                 status_box = gr.Textbox(label="Status", interactive=False, lines=3)
 
                 gr.Markdown("### Outputs")
@@ -717,7 +833,13 @@ def main():
         )
         submit_btn.click(
             on_submit,
-            inputs=[msg_box, state, gen_hint],
+            inputs=[
+                msg_box, state, gen_hint,
+                temperature_slider, top_p_slider, top_k_slider,
+                max_new_tokens_num, voice_budget_num, audio_budget_num,
+                seed_num, image_iter_override_num,
+                image_steps_num, image_sampler_dd,
+            ],
             outputs=[out_text, out_gallery, out_audio_files, status_box],
         )
         clear_btn.click(

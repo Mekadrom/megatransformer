@@ -15,7 +15,11 @@
       "Bash(find:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "mcp__ide__getDiagnostics",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(PYTHONPATH=src python3 -m scripts.debug.diagnose_checkpoint*)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(CUDA_VISIBLE_DEVICES=\"\" PYTHONPATH=src python3 -m scripts.debug.diagnose_checkpoint*)",
+      "Bash(git log *)"
     ],
     "deny": [],
     "ask": []

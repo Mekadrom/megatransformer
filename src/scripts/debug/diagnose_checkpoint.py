@@ -246,7 +246,7 @@ def report_activations(model, batch, save_dir):
     # Per-modality recurrent output stats
     print("\n  -- Per-Modality Recurrent Output Stats --")
     for mod in ['text', 'voice', 'audio', 'image']:
-        for stat in ['token_var', 'seq_var', 'entropy']:
+        for stat in ['token_var', 'seq_var', 'syn_seq_var', 'trans_seq_var', 'entropy']:
             key = f"recurrent_out/{mod}_{stat}"
             v = outputs.get(key)
             if v is not None:
@@ -505,7 +505,81 @@ def report_gradients(model, batch):
 # Main
 # ──────────────────────────────────────────────────────────────────────
 
-def diagnose(model, batch, label=""):
+def repeated_forward_stats(model, batch, n_repeats):
+    """Run the forward pass N times and aggregate stochastic metrics.
+
+    The DiT training_forward samples a random timestep and noise per call,
+    and the recurrent block samples a variable iteration count, so single-run
+    loss/gradient numbers are noisy. This collects N samples of each stochastic
+    scalar and reports mean ± stddev so trajectory comparisons aren't fooled
+    by per-batch random draws.
+    """
+    model.eval()
+    collected: dict[str, list[float]] = {}
+
+    def _add(name: str, value):
+        if not isinstance(value, (int, float)):
+            try:
+                value = float(value.item())
+            except Exception:
+                return
+        if not math.isfinite(value):
+            return
+        collected.setdefault(name, []).append(value)
+
+    for _ in range(n_repeats):
+        with torch.no_grad():
+            outputs = model(
+                text_input_ids=batch['text_token_ids'][:, :-1],
+                image_inputs=batch.get('image_images', torch.zeros(1)).unsqueeze(1) if 'image_images' in batch else None,
+                image_latent_labels=batch.get('image_images'),
+                voice_inputs=batch.get('voice_features', torch.zeros(1)).unsqueeze(1) if 'voice_features' in batch else None,
+                voice_lengths=batch.get('voice_feature_lengths', torch.zeros(1)).unsqueeze(1) if 'voice_feature_lengths' in batch else None,
+                precomputed_latents=True,
+                is_synthesis=batch.get('is_synthesis'),
+            )
+        # Per-modality recurrent output stats (deterministic-ish; included for completeness)
+        for mod in ('text', 'voice', 'audio', 'image'):
+            for stat in ('token_var', 'seq_var', 'syn_seq_var', 'trans_seq_var', 'entropy'):
+                key = f"recurrent_out/{mod}_{stat}"
+                if outputs.get(key) is not None:
+                    _add(key, outputs[key])
+        # Cross-sample diffs (depend on stochastic forward)
+        for key in ('image_latent_preds', 'voice_latent_preds', 'audio_latent_preds', 'image_recurrent_tokens'):
+            v = outputs.get(key)
+            if v is not None and v.shape[0] >= 2:
+                diff = (v[0] - v[1]).abs()
+                _add(f"{key}/cross_sample_mean", diff.mean())
+                _add(f"{key}/cross_sample_max", diff.max())
+        # Loss components (the noisy ones live here)
+        _, components = compute_loss(outputs, batch)
+        for k, v in components.items():
+            _add(k, v)
+        # compute_loss gates image_diffusion_loss on requires_grad, which is
+        # False under no_grad — pull it directly from outputs so it's tracked.
+        for k in ("image_diffusion_loss", "image_diffusion_loss_raw"):
+            v = outputs.get(k)
+            if v is not None:
+                _add(k, v)
+
+    return collected
+
+
+def print_repeated_summary(collected, n_repeats):
+    print(f"\n--- Aggregated Stats over {n_repeats} Forwards ---")
+    print(f"  {'metric':<50}  {'mean':>14}  {'std':>14}  {'rel_std':>8}")
+    for name in sorted(collected.keys()):
+        values = collected[name]
+        if len(values) < 2:
+            continue
+        t = torch.tensor(values, dtype=torch.float64)
+        mean = t.mean().item()
+        std = t.std().item()
+        rel = (std / abs(mean)) if abs(mean) > 1e-12 else float('nan')
+        print(f"  {name:<50}  {mean:>14.6e}  {std:>14.6e}  {rel:>8.2%}")
+
+
+def diagnose(model, batch, label="", n_repeats=1):
     print(f"\n{'=' * 70}")
     print(f"Checkpoint: {label}")
     print(f"{'=' * 70}")
@@ -515,6 +589,10 @@ def diagnose(model, batch, label=""):
     save_dir = os.path.join(label, "diagnose")
     report_activations(model, batch, save_dir)
     report_gradients(model, batch)
+
+    if n_repeats > 1:
+        collected = repeated_forward_stats(model, batch, n_repeats)
+        print_repeated_summary(collected, n_repeats)
 
 
 def main():
@@ -536,6 +614,8 @@ def main():
     parser.add_argument('--image_cache_dir', type=str, default=None)
     parser.add_argument('--cache_dir', type=str, default=None, help='Base cache dir (uses <dir>_train)')
     parser.add_argument('--use_memorization_dataset', action='store_true')
+    parser.add_argument('--n_repeats', type=int, default=1,
+                        help='Run the forward pass N times and report mean ± stddev for stochastic metrics (loss, gradients from random timestep/noise draws). Use 5-10 for stable trajectory comparisons.')
     args = parser.parse_args()
 
     include_modes = [m.strip() for m in args.include_modes.split(',')]
@@ -664,7 +744,7 @@ def main():
             n_image_gen_positions=args.n_image_gen_positions,
             include_modes=include_modes,
         )
-        diagnose(model, batch, label=ckpt)
+        diagnose(model, batch, label=ckpt, n_repeats=args.n_repeats)
 
 
 if __name__ == '__main__':

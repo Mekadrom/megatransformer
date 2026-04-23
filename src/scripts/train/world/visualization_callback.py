@@ -574,8 +574,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if voice_preds is not None and voice_labels is not None:
             v_l1 = F.l1_loss(voice_preds, voice_labels).item()
             v_mse = F.mse_loss(voice_preds, voice_labels).item()
-            metrics.log_scalar(f"{tag}/voice_latent_l1", v_l1, global_step)
-            metrics.log_scalar(f"{tag}/voice_latent_mse", v_mse, global_step)
+            metrics.log_scalar(f"{tag}/voice_latent_l1_loss", v_l1, global_step)
+            metrics.log_scalar(f"{tag}/voice_latent_mse_loss", v_mse, global_step)
 
             for i in range(min(n, voice_preds.shape[0])):
                 pred_lat = voice_preds[i]  # (C, T)
@@ -599,8 +599,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if audio_preds is not None and audio_labels is not None:
             a_l1 = F.l1_loss(audio_preds, audio_labels).item()
             a_mse = F.mse_loss(audio_preds, audio_labels).item()
-            metrics.log_scalar(f"{tag}/audio_latent_l1", a_l1, global_step)
-            metrics.log_scalar(f"{tag}/audio_latent_mse", a_mse, global_step)
+            metrics.log_scalar(f"{tag}/audio_latent_l1_loss", a_l1, global_step)
+            metrics.log_scalar(f"{tag}/audio_latent_mse_loss", a_mse, global_step)
 
             for i in range(min(n, audio_preds.shape[0])):
                 metrics.log_image(f"{tag}/audio/{i}/predicted", self._latent_to_image(audio_preds[i]), global_step)
@@ -611,8 +611,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if image_preds is not None and image_labels is not None:
             i_l1 = F.l1_loss(image_preds, image_labels).item()
             i_mse = F.mse_loss(image_preds, image_labels).item()
-            metrics.log_scalar(f"{tag}/image_latent_l1", i_l1, global_step)
-            metrics.log_scalar(f"{tag}/image_latent_mse", i_mse, global_step)
+            metrics.log_scalar(f"{tag}/image_latent_l1_loss", i_l1, global_step)
+            metrics.log_scalar(f"{tag}/image_latent_mse_loss", i_mse, global_step)
 
             for i in range(min(n, image_preds.shape[0])):
                 metrics.log_image(f"{tag}/image/{i}/predicted", self._latent_to_image(image_preds[i]), global_step)

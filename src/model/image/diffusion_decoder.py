@@ -1,4 +1,5 @@
 """Flow-matching DiT image decoder for the world model.
+# ruff: noqa: E402
 
 Drop-in alternative to `model.image.decoder.ImageDecoder`. Trains a flow-
 matching DiT (Flux-style architecture) on the same image latent labels as the
@@ -40,6 +41,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from typing import Optional, Tuple
 
@@ -247,13 +249,20 @@ class _Bridge(nn.Module):
             MegaTransformerDecoderBlock(config.bridge_block_config)
             for _ in range(config.n_bridge_layers)
         ])
+        self.gradient_checkpointing = False
 
     def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
         # encoder_hidden_states: (B, n_image_positions, d_model)
         B = encoder_hidden_states.shape[0]
         q = self.queries.expand(B, -1, -1)
         for layer in self.layers:
-            q, _ = layer(q, encoder_hidden_states=encoder_hidden_states)
+            if self.gradient_checkpointing and self.training:
+                q, _ = torch_checkpoint(
+                    layer, q, None, None, None, 0, False, encoder_hidden_states, None,
+                    use_reentrant=False,
+                )
+            else:
+                q, _ = layer(q, encoder_hidden_states=encoder_hidden_states)
         return q  # (B, n_bridge_queries, d_model)
 
 
@@ -290,6 +299,7 @@ class _DiTBackbone(nn.Module):
         self.blocks = nn.ModuleList([
             DiTBlock(config.dit_block_config) for _ in range(config.n_dit_layers)
         ])
+        self.gradient_checkpointing = False
 
         # Final layer: norm → AdaLN modulation → linear projection to patch dim.
         self.final_norm = nn.LayerNorm(d_model, elementwise_affine=False)
@@ -333,7 +343,10 @@ class _DiTBackbone(nn.Module):
         c = t_emb + cond_global
 
         for block in self.blocks:
-            x = block(x, c, cond_kv)
+            if self.gradient_checkpointing and self.training:
+                x = torch_checkpoint(block, x, c, cond_kv, use_reentrant=False)
+            else:
+                x = block(x, c, cond_kv)
 
         # Final modulation → linear → unpatchify.
         # The final modulation is computed in float32 for the same reason
@@ -397,6 +410,7 @@ class DiffusionBridgeImageDecoder(nn.Module):
         # Shape (1, C, 1, 1) for broadcasting over (B, C, H, W).
         self.register_buffer("latent_scale", scale_tensor.view(1, c, 1, 1))
 
+        self.gradient_checkpointing = False
         self._init_weights()
 
     def _init_weights(self):
@@ -497,7 +511,11 @@ class DiffusionBridgeImageDecoder(nn.Module):
         """
         if latent_labels is not None:
             return self._training_forward(encoder_hidden_states, latent_labels)
-        return self._sampling_forward(encoder_hidden_states)
+        return self._sampling_forward(
+            encoder_hidden_states,
+            num_inference_steps=kwargs.get("num_inference_steps"),
+            sampler=kwargs.get("sampler"),
+        )
 
     def _training_forward(
         self, encoder_hidden_states: torch.Tensor, x_0: torch.Tensor
@@ -539,15 +557,46 @@ class DiffusionBridgeImageDecoder(nn.Module):
         cond_kv, cond_global = self._compute_conditioning(encoder_hidden_states)
         v_pred = self.dit(x_t, t, cond_global, cond_kv)
 
-        loss_raw = F.mse_loss(v_pred, v_target)
+        # Diagnostic: if v_pred is non-finite, log the offending timesteps so
+        # we can tell whether NaNs cluster at high-t (min-SNR amplification at
+        # hard timesteps) or are uniform (DiT-internal issue). Stderr log only
+        # — the trainer-level NaN skip handles the actual loss fallback.
+        if not torch.isfinite(v_pred).all():
+            reduce_dims = tuple(range(1, v_pred.ndim))
+            bad_mask = ~torch.isfinite(v_pred).all(dim=reduce_dims)
+            bad_ts = t[bad_mask].detach().cpu().tolist()
+            print(
+                f"[DiT NaN] non-finite v_pred on {int(bad_mask.sum())}/{v_pred.shape[0]} samples; "
+                f"timesteps={[round(x, 4) for x in bad_ts]}",
+                flush=True,
+            )
 
-        # Whiten the loss so the trivial baseline (predict zero velocity) gives
-        # ~1.0, matching the whitened text and voice loss baselines. The target
+        # Per-sample MSE (unreduced) for min-SNR weighting.
+        per_sample_mse = F.mse_loss(v_pred, v_target, reduction="none")
+        per_sample_mse = per_sample_mse.mean(dim=list(range(1, per_sample_mse.ndim)))
+
+        # Unweighted raw MSE — used for monitoring (comparable across runs
+        # regardless of min-SNR gamma) and for whitening.
+        loss_raw_unweighted = per_sample_mse.mean()
+
+        # Min-SNR loss weighting (Hang et al., 2023). For flow matching with
+        # linear interpolation, SNR(t) = (1-t)^2 / t^2. The weight
+        # min(SNR, gamma)/SNR downweights easy low-noise timesteps.
+        # Only affects the training gradient, not the monitoring metric.
+        if self.config.min_snr_gamma is not None:
+            snr = ((1.0 - t) / t.clamp(min=1e-6)) ** 2
+            min_snr_weight = torch.clamp(snr, max=self.config.min_snr_gamma) / snr.clamp(min=1e-6)
+            loss_train = (per_sample_mse * min_snr_weight).mean()
+        else:
+            loss_train = loss_raw_unweighted
+
+        # Whiten the training loss so the trivial baseline (predict zero velocity)
+        # gives ~1.0, matching the whitened text and voice loss baselines. The target
         # velocity v_target = noise - x_0_scaled has var ≈ var(noise) + var(x_0_scaled)
         # ≈ 1 + 1 = 2 (since both are ~unit variance after latent scaling). Dividing
         # by this puts the diffusion loss on the same scale as the other modalities,
         # so `image_latent_loss_weight` becomes a true emphasis multiplier.
-        loss = loss_raw / 2.0
+        loss = loss_train / 2.0
 
         # Rough clean-latent estimate for monitoring (NOT a high quality sample).
         # In scaled space: x_0_scaled ≈ x_t - t · v_pred. Unscale to original
@@ -558,17 +607,31 @@ class DiffusionBridgeImageDecoder(nn.Module):
 
         return {
             "image_diffusion_loss": loss,
-            "image_diffusion_loss_raw": loss_raw.detach(),
+            "image_diffusion_loss_raw": loss_raw_unweighted.detach(),
             "image_latent_preds": x_0_est,
         }
 
     @torch.no_grad()
-    def _sampling_forward(self, encoder_hidden_states: torch.Tensor) -> dict:
-        """Sample a clean latent by Euler-integrating from noise.
+    def _sampling_forward(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        num_inference_steps: Optional[int] = None,
+        sampler: Optional[str] = None,
+    ) -> dict:
+        """Sample a clean latent by integrating the velocity field from noise.
 
         Sampling happens in the scaled (~unit variance) diffusion working
         space, then the final result is divided back by `latent_scale` to
         return latents in the original VAE space the dataset uses.
+
+        Args:
+            encoder_hidden_states: bridge input, (B, n_positions, d_model).
+            num_inference_steps: override for cfg.num_inference_steps. The
+                effective NFE depends on the sampler: Euler = n_steps,
+                Heun/Midpoint = 2·n_steps (with a 1-NFE last step for Heun).
+            sampler: one of "euler" (default), "heun", "midpoint". Heun and
+                midpoint are 2nd-order predictor/corrector schemes — more
+                accurate per step but cost an extra DiT call per step.
         """
         B = encoder_hidden_states.shape[0]
         device = encoder_hidden_states.device
@@ -577,6 +640,11 @@ class DiffusionBridgeImageDecoder(nn.Module):
         dtype = encoder_hidden_states.dtype
         cfg = self.config
 
+        n_steps = num_inference_steps if num_inference_steps is not None else cfg.num_inference_steps
+        sampler = (sampler or "euler").lower()
+        if sampler not in ("euler", "heun", "midpoint"):
+            raise ValueError(f"unknown sampler: {sampler!r}; must be euler/heun/midpoint")
+
         cond_kv, cond_global = self._compute_conditioning(encoder_hidden_states)
 
         x = torch.randn(
@@ -584,16 +652,35 @@ class DiffusionBridgeImageDecoder(nn.Module):
             device=device, dtype=dtype,
         )
 
-        n_steps = cfg.num_inference_steps
         dt = 1.0 / n_steps
         for i in range(n_steps):
             # Walk t from 1.0 down to 0 in n_steps. At t=1 the input is pure
             # noise; at t=0 it should be a clean latent (in scaled space).
             # `t` must be in the model's working dtype to avoid promoting
             # `x` back to float32 inside the DiT block computations.
-            t = torch.full((B,), 1.0 - i * dt, device=device, dtype=dtype)
+            t_cur = 1.0 - i * dt
+            t = torch.full((B,), t_cur, device=device, dtype=dtype)
             v = self.dit(x, t, cond_global, cond_kv)
-            x = x - dt * v
+
+            if sampler == "euler":
+                x = x - dt * v
+            elif sampler == "midpoint":
+                # 2nd-order midpoint: evaluate v at the midpoint of the step
+                # and use that as the update direction.
+                x_mid = x - 0.5 * dt * v
+                t_mid = torch.full((B,), t_cur - 0.5 * dt, device=device, dtype=dtype)
+                v_mid = self.dit(x_mid, t_mid, cond_global, cond_kv)
+                x = x - dt * v_mid
+            else:  # heun (trapezoidal predictor-corrector)
+                if i == n_steps - 1:
+                    # Last step lands at t=0 exactly; skip the corrector to
+                    # avoid a second DiT eval whose t would be 0 (no signal).
+                    x = x - dt * v
+                else:
+                    x_pred = x - dt * v
+                    t_next = torch.full((B,), t_cur - dt, device=device, dtype=dtype)
+                    v_next = self.dit(x_pred, t_next, cond_global, cond_kv)
+                    x = x - 0.5 * dt * (v + v_next)
 
         # Unscale back to the original VAE latent space.
         x = x / self.latent_scale

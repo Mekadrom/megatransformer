@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -57,6 +58,7 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         if config.use_output_norm:
             self.output_norm = create_norm(prelude_config.d_model, config.output_norm_type, config.norm_epsilon)
 
+        self.gradient_checkpointing = False
         self._init_weights()
 
     def _init_weights(self):
@@ -117,12 +119,18 @@ class AudioVAEPreludeFeatureExtractor(nn.Module):
         new_kv_caches = []
         for i, block in enumerate(self.prelude):
             block_cache = kv_caches[i] if kv_caches is not None else None
-            x, new_cache = block(
-                x,
-                kv_cache=block_cache,
-                position_offset=position_offset,
-                use_cache=use_cache,
-            )
+            if self.gradient_checkpointing and self.training and not use_cache:
+                x, new_cache = torch_checkpoint(
+                    block, x, None, None, block_cache, position_offset, use_cache,
+                    use_reentrant=False,
+                )
+            else:
+                x, new_cache = block(
+                    x,
+                    kv_cache=block_cache,
+                    position_offset=position_offset,
+                    use_cache=use_cache,
+                )
             if use_cache:
                 new_kv_caches.append(new_cache)
 

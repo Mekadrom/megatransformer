@@ -74,7 +74,7 @@ def get_training_args(args, run_dir) -> TrainingArguments:
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.eval_batch_size if args.eval_batch_size > 0 else args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.num_train_epochs if args.num_train_epochs > 0 else 1,
         max_steps=args.max_steps if args.max_steps > 0 else -1,
@@ -99,6 +99,8 @@ def get_training_args(args, run_dir) -> TrainingArguments:
         remove_unused_columns=False,
         eval_strategy=args.eval_strategy,
         eval_steps=args.eval_steps,
+        dataloader_num_workers=args.dataloader_num_workers,
+        dataloader_pin_memory=True,
     )
 
 
@@ -174,21 +176,41 @@ def get_dataset(command: str, args, split: str):
         )
     elif command in ["world"]:
 
-        def _resolve_shard_dir(cache_dir, split):
-            """Resolve shard directory, skipping if the split-specific dir doesn't exist."""
-            if cache_dir is None:
-                return None
-            candidate = cache_dir + "_" + split
-            if os.path.isdir(candidate):
-                return candidate
-            print(f"Warning: {candidate} not found, skipping this modality for {split} split")
-            return None
+        def _resolve_shard_dir(modality, split):
+            """Resolve shard directory for a requested modality. Prefers the
+            explicit per-split arg (--<mod>_<split>_cache_dir) when present,
+            otherwise appends _train/_val to --<mod>_cache_dir. Hard-fails if
+            the resolved directory is missing — silently skipping an explicitly
+            requested modality hides data corruption and lets training proceed
+            without the modality it was supposed to include.
+            """
+            explicit = getattr(args, f"{modality}_{split}_cache_dir", None)
+            if explicit is not None:
+                candidate = explicit
+                source = f"--{modality}_{split}_cache_dir={explicit}"
+            else:
+                base = getattr(args, f"{modality}_cache_dir", None)
+                if base is None:
+                    raise ValueError(
+                        f"Modality '{modality}' is in --include_modes but no "
+                        f"cache_dir was provided. Pass --{modality}_cache_dir "
+                        f"or both --{modality}_train_cache_dir and "
+                        f"--{modality}_val_cache_dir."
+                    )
+                candidate = base + "_" + split
+                source = f"--{modality}_cache_dir={base}, split={split}"
+            if not os.path.isdir(candidate):
+                raise FileNotFoundError(
+                    f"Shard directory for modality '{modality}' not found: "
+                    f"{candidate} (from {source})."
+                )
+            return candidate
 
         include_modes = [m.strip() for m in args.include_modes.split(",")]
-        text_dir = _resolve_shard_dir(args.text_cache_dir, split) if "text" in include_modes else None
-        audio_dir = _resolve_shard_dir(args.audio_cache_dir, split) if "audio" in include_modes else None
-        voice_dir = _resolve_shard_dir(getattr(args, 'voice_cache_dir', None), split) if "voice" in include_modes else None
-        image_dir = _resolve_shard_dir(args.image_cache_dir, split) if "image" in include_modes else None
+        text_dir = _resolve_shard_dir("text", split) if "text" in include_modes else None
+        audio_dir = _resolve_shard_dir("audio", split) if "audio" in include_modes else None
+        voice_dir = _resolve_shard_dir("voice", split) if "voice" in include_modes else None
+        image_dir = _resolve_shard_dir("image", split) if "image" in include_modes else None
         max_samples = getattr(args, 'max_samples', None)
         use_memorization = getattr(args, 'use_memorization_dataset', False)
 
@@ -206,7 +228,7 @@ def get_dataset(command: str, args, split: str):
                 audio_shard_dir=audio_dir,
                 voice_shard_dir=voice_dir,
                 image_shard_dir=image_dir,
-                cache_size=32,
+                cache_size=args.shard_cache_size,
                 max_samples=max_samples,
             )
     return dataset
@@ -436,6 +458,26 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, optimizer: Option
         early_stopping_callback = EarlyStoppingCallback(stop_step=args.stop_step)
         trainer.add_callback(early_stopping_callback)
 
+    # Under DDP + reentrant gradient checkpointing (use_reentrant=True), each
+    # checkpointed region's backward re-enters the autograd engine, which
+    # causes DDP's per-parameter gradient hooks to fire more than once per
+    # iteration. DDP rejects this by default ("marked ready twice"). Static
+    # graph mode tells DDP the graph is stable across iterations so repeated
+    # hook firing is allowed. Must be set before the first forward pass.
+    if not args.use_deepspeed and args.use_gradient_checkpointing:
+        from transformers.trainer_callback import TrainerCallback
+
+        class DDPStaticGraphCallback(TrainerCallback):
+            def __init__(self, trainer_ref):
+                self.trainer_ref = trainer_ref
+
+            def on_train_begin(self, cb_args, state, control, **kwargs):
+                wrapped = self.trainer_ref.model_wrapped
+                if hasattr(wrapped, '_set_static_graph'):
+                    wrapped._set_static_graph()
+
+        trainer.add_callback(DDPStaticGraphCallback(trainer))
+
     return trainer
 
 
@@ -525,7 +567,10 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--num_train_epochs', type=int, default=-1, help='Number of training epochs')
         sub_parser.add_argument('--max_steps', type=int, default=-1, help='Max steps for training')
         sub_parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
+        sub_parser.add_argument('--eval_batch_size', type=int, default=0, help='Eval batch size (0 = match --batch_size)')
         sub_parser.add_argument('--gradient_accumulation_steps', type=int, default=32, help='Gradient accumulation steps')
+        sub_parser.add_argument('--dataloader_num_workers', type=int, default=4, help='Number of dataloader worker processes')
+        sub_parser.add_argument('--shard_cache_size', type=int, default=8, help='Per-modality shard cache size (multiplied across workers/GPUs)')
         sub_parser.add_argument('--warmup_steps', type=int, default=0, help='Warmup steps')
         sub_parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm')
         sub_parser.add_argument('--fp16', action='store_true', help='Whether to use fp16')

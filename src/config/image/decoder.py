@@ -155,6 +155,14 @@ class DiffusionBridgeImageDecoderConfig:
     # "logit_normal" → t = sigmoid(N(0, 1)), biases mid-range timesteps,
     #                  used by SD3/Flux as a quality improvement.
     timestep_sampling: str = "logit_normal"
+    # Min-SNR loss weighting (Hang et al., 2023). Downweights easy low-noise
+    # timesteps where the model can predict the target almost perfectly,
+    # preventing them from dominating gradients. For flow matching with linear
+    # interpolation x_t = (1-t)*x_0 + t*noise, SNR(t) = (1-t)^2 / t^2.
+    # The per-sample weight is min(SNR(t), gamma) / SNR(t).
+    #   gamma=5.0: recommended default from the paper
+    #   gamma=None: disabled (uniform weighting)
+    min_snr_gamma: Optional[float] = 5.0
     # Number of Euler integration steps for inference sampling.
     num_inference_steps: int = 16
 

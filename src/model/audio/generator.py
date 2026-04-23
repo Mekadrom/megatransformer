@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from typing import List, Optional
 
@@ -126,6 +127,7 @@ class AudioCodaAndVAEWithLoss(nn.Module):
         self.l1_loss = nn.L1Loss()
         self.mse_loss = nn.MSELoss()
 
+        self.gradient_checkpointing = False
         self._init_weights()
 
     def _init_weights(self):
@@ -198,12 +200,18 @@ class AudioCodaAndVAEWithLoss(nn.Module):
         new_kv_caches = []
         for i, block in enumerate(self.coda):
             block_cache = kv_caches[i] if kv_caches is not None else None
-            h, new_cache = block(
-                h,
-                kv_cache=block_cache,
-                position_offset=position_offset,
-                use_cache=use_cache,
-            )
+            if self.gradient_checkpointing and self.training and not use_cache:
+                h, new_cache = torch_checkpoint(
+                    block, h, None, None, block_cache, position_offset, use_cache,
+                    use_reentrant=False,
+                )
+            else:
+                h, new_cache = block(
+                    h,
+                    kv_cache=block_cache,
+                    position_offset=position_offset,
+                    use_cache=use_cache,
+                )
             if use_cache:
                 new_kv_caches.append(new_cache)
 

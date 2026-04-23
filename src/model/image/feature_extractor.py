@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from typing import Optional
 
@@ -110,6 +111,7 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
         if config.use_output_norm:
             self.output_norm = create_norm(prelude_config.d_model, config.output_norm_type, config.norm_epsilon)
 
+        self.gradient_checkpointing = False
         self._init_weights()
 
     def _init_weights(self):
@@ -187,7 +189,10 @@ class ImageVAEPreludeFeatureExtractor(nn.Module):
         # so the loop just chains layers without re-adding the input.
         x = patch_embeddings
         for block in self.prelude:
-            x, _ = block(x)
+            if self.gradient_checkpointing and self.training:
+                x, _ = torch_checkpoint(block, x, use_reentrant=False)
+            else:
+                x, _ = block(x)
 
         # megatransformer_utils.print_debug_tensor("prelude block image prelude output", x)
 

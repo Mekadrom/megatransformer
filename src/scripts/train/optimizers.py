@@ -336,6 +336,16 @@ class MuonAdamW(Optimizer):
         defaults = dict(lr=lr_muon)  # Nominal, actual LRs are in sub-optimizers
         super().__init__(all_params, defaults)
 
+        # Replace parent's param_groups with references to sub-optimizers' groups.
+        # This way LR schedulers that modify param_groups[i]['lr'] actually affect
+        # the sub-optimizers (the inner dicts are shared by reference).
+        combined = []
+        if self.muon_optimizer is not None:
+            combined.extend(self.muon_optimizer.param_groups)
+        if self.adamw_optimizer is not None:
+            combined.extend(self.adamw_optimizer.param_groups)
+        self.param_groups = combined
+
     def _route_parameter(self, name: str, param: torch.nn.Parameter) -> str:
         """
         Determine whether a parameter should use Muon or AdamW.
@@ -406,17 +416,6 @@ class MuonAdamW(Optimizer):
         if self.adamw_optimizer is not None and state_dict.get("adamw") is not None:
             self.adamw_optimizer.load_state_dict(state_dict["adamw"])
 
-    @property
-    def param_groups(self):
-        """Return combined param groups for compatibility."""
-        groups = []
-        if self.muon_optimizer is not None:
-            for g in self.muon_optimizer.param_groups:
-                groups.append({**g, "optimizer": "muon"})
-        if self.adamw_optimizer is not None:
-            for g in self.adamw_optimizer.param_groups:
-                groups.append({**g, "optimizer": "adamw"})
-        return groups
 
     def get_lr(self) -> dict:
         """Get current learning rates."""

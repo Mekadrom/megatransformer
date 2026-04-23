@@ -145,6 +145,34 @@ class MegaTransformerWorldModel(nn.Module):
         if getattr(config, 'tie_word_embeddings', False):
             self.text_generator.lm_head.weight = self.text_feature_extractor.wte.weight
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable gradient checkpointing on all sub-modules that support it."""
+        modules = [
+            self.text_feature_extractor,
+            self.audio_feature_extractor,
+            self.voice_feature_extractor,
+            self.image_feature_extractor,
+            self.recurrent_block,
+            self.text_generator,
+            self.audio_generator,
+            self.voice_generator,
+            self.image_generator,
+        ]
+        for mod in modules:
+            if mod is not None and hasattr(mod, 'gradient_checkpointing'):
+                mod.gradient_checkpointing = True
+        # Propagate to nested modules (bridge, dit inside image_generator)
+        if self.image_generator is not None:
+            for child in self.image_generator.modules():
+                if hasattr(child, 'gradient_checkpointing'):
+                    child.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing on all sub-modules."""
+        for mod in self.modules():
+            if hasattr(mod, 'gradient_checkpointing'):
+                mod.gradient_checkpointing = False
+
     def load_image_vae(self, encoder: ImageVAEEncoder, decoder: ImageVAEDecoder):
         """Load image VAE encoder/decoder for live encoding/decoding."""
         if self.image_feature_extractor is not None:
@@ -412,13 +440,25 @@ class MegaTransformerWorldModel(nn.Module):
             if batch is not None:
                 # Per-token activation variance across d_model, averaged over batch+seq
                 outputs[f"recurrent_out/{name}_token_var"] = batch.var(dim=-1).mean()
-                # Cross-token variance: how different tokens are from each other
-                # var across seq_len per feature dim, averaged over batch+d_model
-                outputs[f"recurrent_out/{name}_seq_var"] = batch.var(dim=1).mean()
                 # Entropy of softmax over d_model (activation spread per token)
                 probs = torch.softmax(batch, dim=-1)
                 entropy = -(probs * (probs + 1e-8).log()).sum(dim=-1).mean()
                 outputs[f"recurrent_out/{name}_entropy"] = entropy
+                # Cross-token variance: how different tokens are from each other
+                # var across seq_len per feature dim, averaged over batch+d_model.
+                # For image, split by direction: synthesis positions are gen
+                # queries (near-identical across positions → low cross-token var)
+                # while transcription positions are prelude-encoded patches
+                # (high cross-token var). Averaging them together produces a
+                # meaningless mean of two very different regimes.
+                if name == "image" and is_synthesis is not None:
+                    syn_mask = is_synthesis.bool().to(batch.device)
+                    if syn_mask.any():
+                        outputs["recurrent_out/image_syn_seq_var"] = batch[syn_mask].var(dim=1).mean()
+                    if (~syn_mask).any():
+                        outputs["recurrent_out/image_trans_seq_var"] = batch[~syn_mask].var(dim=1).mean()
+                else:
+                    outputs[f"recurrent_out/{name}_seq_var"] = batch.var(dim=1).mean()
 
         # Text
         if text_batch is not None:
@@ -624,6 +664,9 @@ class MegaTransformerWorldModel(nn.Module):
         image_inputs: Optional[torch.Tensor] = None,
         precomputed_latents: bool = True,
         share_kv_cache: bool = False,
+        image_iteration_override: Optional[int] = None,
+        image_num_inference_steps: Optional[int] = None,
+        image_sampler: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Generate tokens autoregressively with KV caching.
@@ -727,6 +770,9 @@ class MegaTransformerWorldModel(nn.Module):
         completed_audio: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         completed_voice: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         completed_image: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+        # Recurrent iterations actually performed per generated image (one list per
+        # batch item, one entry per image block).
+        image_recurrent_iterations: List[List[int]] = [[] for _ in range(batch_size)]
 
         # Per-frame stop-head logit traces for diagnostics. One list per batch
         # item, appended to on every voice/audio generation iter. Returned in
@@ -1097,21 +1143,30 @@ class MegaTransformerWorldModel(nn.Module):
                             device=device, dtype=current_hidden.dtype,
                         )
                     # Run through recurrent block (single pass, all 256 at once)
-                    image_hidden, _, _, _, _ = self.recurrent_block(
+                    image_hidden, _, image_iters, _, _ = self.recurrent_block(
                         image_input * self.embed_scale,
                         attention_mask=None,
                         kv_cache=kv_cache,
                         position_offset=position_offset,
                         use_cache=True,
                         share_kv_cache=share_kv_cache,
+                        max_iterations_override=image_iteration_override,
                     )
+                    image_recurrent_iterations[b].append(int(image_iters))
                     position_offset += image_token_budget
 
                     # Decode through cross-attention decoder
                     if self.image_generator is not None:
                         cross_input = self.image_coda_input_norm(image_hidden)
+                        gen_kwargs = {}
+                        if isinstance(self.image_generator, DiffusionBridgeImageDecoder):
+                            if image_num_inference_steps is not None:
+                                gen_kwargs["num_inference_steps"] = image_num_inference_steps
+                            if image_sampler is not None:
+                                gen_kwargs["sampler"] = image_sampler
                         cross_out = self.image_generator(
                             encoder_hidden_states=cross_input,
+                            **gen_kwargs,
                         )
                         image_pred = cross_out["image_latent_preds"].squeeze(0)  # (C, H, W)
                     else:
@@ -1263,6 +1318,10 @@ class MegaTransformerWorldModel(nn.Module):
             outputs["image_latent_preds"] = stacked  # (batch, max_n, C, H, W)
             outputs["image_counts"] = counts  # (batch,)
             # No lengths needed for images since spatial dims are fixed
+
+        # Per-image recurrent iteration counts (list-of-list; one entry per
+        # completed image per batch item). Empty list if no images generated.
+        outputs["image_recurrent_iterations"] = image_recurrent_iterations
 
         # Per-frame stop-head logit traces (diagnostic — see init comment).
         # List-of-list Python objects (not tensors) since lengths vary per

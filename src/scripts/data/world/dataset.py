@@ -74,8 +74,13 @@ class MultimodalShardedDataset(Dataset):
         if self.voice_columns is None and "voice" in self.modalities:
             self.voice_columns = _default_audio_columns
 
-        # Total length = max across modalities; shorter ones wrap via modulo
-        self.total_samples = max(m["total_samples"] for m in self.modalities.values())
+        # Total length = max across modalities × number of task types, so one
+        # "epoch" covers every sample in the largest modality across all tasks
+        # (synthesis + transcription). Shorter modalities wrap via modulo.
+        # Without the ×n_tasks factor, __getitem__'s `within_task_idx = idx // n_tasks`
+        # caps at total_samples // n_tasks, leaving most samples unreachable.
+        n_tasks = len(self.task_types)
+        self.total_samples = max(m["total_samples"] for m in self.modalities.values()) * n_tasks
 
         # Cap dataset length for overfitting experiments
         if max_samples is not None and max_samples > 0:
