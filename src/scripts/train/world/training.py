@@ -76,12 +76,17 @@ class WorldModelTrainer(CommonTrainer):
         # multimodal LMs (Flamingo, GIT, BLIP) is True — applying text loss
         # during synthesis competes with the generation objective.
         mask_text_loss_in_synthesis: bool = False,
+        # Group within-modality samples by shard when shuffling. Default
+        # True. Set False to reproduce the legacy uniform shuffle order
+        # when resuming a checkpoint from a pre-shard-aware run.
+        shard_aware_sampler: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
 
         self.lr_dit = lr_dit
         self.mask_text_loss_in_synthesis = mask_text_loss_in_synthesis
+        self.shard_aware_sampler = shard_aware_sampler
 
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
@@ -131,6 +136,7 @@ class WorldModelTrainer(CommonTrainer):
                 shuffle=True, seed=42,
                 batch_size=self.args.per_device_train_batch_size,
                 world_size=world_size,
+                shard_aware=self.shard_aware_sampler,
             )
 
         # Eval sampler — mirrors the train sampler structure to ensure eval
@@ -151,6 +157,7 @@ class WorldModelTrainer(CommonTrainer):
                 seed=42,
                 batch_size=self.args.per_device_eval_batch_size,
                 world_size=world_size,
+                shard_aware=self.shard_aware_sampler,
             )
 
         # GAN support stubs (required by CommonTrainer.is_gan_enabled)
@@ -1300,6 +1307,7 @@ def create_trainer(
         text_label_smoothing=args.text_label_smoothing,
         lr_dit=getattr(args, 'lr_dit', None),
         mask_text_loss_in_synthesis=getattr(args, 'mask_text_loss_in_synthesis', False),
+        shard_aware_sampler=getattr(args, 'shard_aware_sampler', True),
     )
 
 
@@ -1403,6 +1411,15 @@ def add_cli_args(subparsers):
                                  "where text is conditioning rather than target. Standard practice in Flamingo/GIT/BLIP. "
                                  "Default off for backward compat with existing runs; enable for new from-scratch runs. "
                                  "Text prelude still gets gradient on synthesis batches via the recurrent block + media losses.")
+
+    # Shard-aware sampler (default on). Pass --no_shard_aware_sampler to
+    # disable — required when resuming a checkpoint from a run trained
+    # with the prior uniform-shuffle sampler, since enabling it changes
+    # the per-epoch index order and breaks HF Trainer's batch-skip resume.
+    sub_parser.add_argument("--no_shard_aware_sampler", action="store_false",
+                            dest="shard_aware_sampler", default=True,
+                            help="Disable shard-aware modality sampling (reverts to legacy uniform shuffle). "
+                                 "Required for resuming checkpoints from pre-shard-aware runs.")
 
     # Per-module LR overrides
     sub_parser.add_argument("--lr_dit", type=float, default=None,

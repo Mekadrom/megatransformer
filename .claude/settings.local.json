@@ -19,7 +19,10 @@
       "Bash(PYTHONPATH=src python3 -m scripts.debug.diagnose_checkpoint*)",
       "Bash(echo \"EXIT=$?\")",
       "Bash(CUDA_VISIBLE_DEVICES=\"\" PYTHONPATH=src python3 -m scripts.debug.diagnose_checkpoint*)",
-      "Bash(git log *)"
+      "Bash(git log *)",
+      "Bash(sort -t- -k2 -n)",
+      "Bash(CUDA_VISIBLE_DEVICES=\"\" PYTHONPATH=src python3 -m scripts.debug.diagnose_checkpoint --checkpoint ./runs/world/small_sum_0_0/checkpoint-1000 ./runs/world/small_sum_0_0/checkpoint-2000 ./runs/world/small_sum_0_0/checkpoint-3000 ./runs/world/small_sum_0_0/checkpoint-4000 ./runs/world/small_sum_0_0/checkpoint-5000 ./runs/world/small_sum_0_0/checkpoint-6000 ./runs/world/small_sum_0_0/checkpoint-7000 ./runs/world/small_sum_0_0/checkpoint-8000 --config small_sum --include_modes text,image --text_cache_dir ./cached_datasets/text_pile --image_cache_dir ./cached_datasets/image_vae --tie_word_embeddings --batch_size 2 --n_repeats 4 --direction synthesis)",
+      "Bash(echo \"started PID $!\")"
     ],
     "deny": [],
     "ask": []

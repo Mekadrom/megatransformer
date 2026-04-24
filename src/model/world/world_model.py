@@ -123,8 +123,9 @@ class MegaTransformerWorldModel(nn.Module):
 
             self.gen_query_mode = config.gen_query_mode
             if config.gen_query_mode == "learned":
+                init_std = getattr(config, 'image_gen_query_init_std', 3.0)
                 self.image_gen_queries = nn.Parameter(
-                    torch.randn(1, n_gen, d_model) * 3.0
+                    torch.randn(1, n_gen, d_model) * init_std
                 )
             # Frozen 2D sinusoidal positional encoding for image gen queries.
             # Sized to the gen query grid (nps_gen × nps_gen), which may differ

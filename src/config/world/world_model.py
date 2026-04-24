@@ -172,6 +172,20 @@ class MegaTransformerWorldModelConfig:
     # bridge is sequence-length agnostic so any value works.
     n_image_gen_positions: Optional[int] = None
 
+    # Standard deviation of the initial image_gen_queries parameter (when
+    # gen_query_mode="learned"). Historically 3.0, which made gen queries 3×
+    # larger than the image prelude output (LayerNormed to std~1) and
+    # comparable-to-slightly-larger than the text prelude output (~3.5). That
+    # dominance may have prevented text self-attention updates inside the
+    # recurrent block from overtaking the gen-query signal, keeping
+    # prompt-conditional information low at the bridge input.
+    #
+    # 1.0 matches the image prelude output std so synthesis and transcription
+    # positions enter the recurrent block at parity, and text-pulled updates
+    # (each ~O(1/sqrt(n_blocks)) via depth-scaled residual init) compete on
+    # equal footing from the first layer.
+    image_gen_query_init_std: float = 3.0
+
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 

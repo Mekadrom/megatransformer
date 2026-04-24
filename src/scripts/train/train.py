@@ -101,6 +101,8 @@ def get_training_args(args, run_dir) -> TrainingArguments:
         eval_steps=args.eval_steps,
         dataloader_num_workers=args.dataloader_num_workers,
         dataloader_pin_memory=True,
+        dataloader_persistent_workers=args.dataloader_num_workers > 0,
+        dataloader_prefetch_factor=6 if args.dataloader_num_workers > 0 else None,
     )
 
 

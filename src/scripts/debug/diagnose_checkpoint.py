@@ -188,10 +188,19 @@ def report_activations(model, batch, save_dir):
         probes['recurrent_output'] = output[0].detach().clone()
         return output
 
+    def hook_bridge(module, args, output):
+        # output: (B, n_bridge_queries, d_model) — bridge K/V tokens for the DiT
+        probes['bridge_output'] = output.detach().clone()
+        return output
+
     handles = [
         model.token_interleaver.register_forward_hook(hook_token_interleaver),
         model.recurrent_block.register_forward_hook(hook_recurrent_block),
     ]
+    if model.image_generator is not None and hasattr(model.image_generator, 'bridge'):
+        handles.append(
+            model.image_generator.bridge.register_forward_hook(hook_bridge)
+        )
 
     model.eval()
     with torch.no_grad():
@@ -272,6 +281,25 @@ def report_activations(model, batch, save_dir):
         if hasattr(model, 'image_coda_input_norm'):
             normed = model.image_coda_input_norm(rec)
             print(f"  image_coda_input_normed: std={normed.std():.4f}, seq_var={normed.var(dim=1).mean():.6f}")
+
+    # Bridge output — is the bridge amplifying or preserving the prompt signal
+    # in image_recurrent_tokens (its input)?
+    bridge_out = probes.get('bridge_output')
+    if bridge_out is not None:
+        r("bridge_output (cond_kv)", bridge_out)
+        if bridge_out.shape[0] >= 2:
+            diff = (bridge_out[0] - bridge_out[1]).abs()
+            print(f"    |sample0 - sample1|: max={diff.max():.6e}, mean={diff.mean():.6e}")
+        # Cross-token variance and entropy — analogous to recurrent_out stats
+        bo = bridge_out.float()
+        print(f"    bridge seq_var: {bo.var(dim=1).mean():.6f}  (cross-token var per d_model dim)")
+        print(f"    bridge token_var: {bo.var(dim=-1).mean():.6f}  (cross-d_model var per token)")
+        # Mean-pooled global vector that feeds AdaLN modulation
+        cond_global = bo.mean(dim=1)
+        r("cond_global (AdaLN input)", cond_global)
+        if cond_global.shape[0] >= 2:
+            gdiff = (cond_global[0] - cond_global[1]).abs()
+            print(f"    cond_global |sample0 - sample1|: max={gdiff.max():.6e}, mean={gdiff.mean():.6e}")
 
     return outputs
 
@@ -517,6 +545,16 @@ def repeated_forward_stats(model, batch, n_repeats):
     model.eval()
     collected: dict[str, list[float]] = {}
 
+    bridge_probe: dict = {}
+
+    def _bridge_hook(module, args, output):
+        bridge_probe['out'] = output.detach()
+        return output
+
+    bridge_handle = None
+    if model.image_generator is not None and hasattr(model.image_generator, 'bridge'):
+        bridge_handle = model.image_generator.bridge.register_forward_hook(_bridge_hook)
+
     def _add(name: str, value):
         if not isinstance(value, (int, float)):
             try:
@@ -551,6 +589,25 @@ def repeated_forward_stats(model, batch, n_repeats):
                 diff = (v[0] - v[1]).abs()
                 _add(f"{key}/cross_sample_mean", diff.mean())
                 _add(f"{key}/cross_sample_max", diff.max())
+        # Bridge output stats (cond_kv) and pooled cond_global. The bridge
+        # itself is deterministic given recurrent output, but recurrent output
+        # has stochastic iteration count, so re-aggregating per repeat catches
+        # any iteration-count-driven variance.
+        bo = bridge_probe.get('out')
+        if bo is not None:
+            bf = bo.float()
+            _add("bridge_out/std", bf.std())
+            _add("bridge_out/seq_var", bf.var(dim=1).mean())
+            _add("bridge_out/token_var", bf.var(dim=-1).mean())
+            if bf.shape[0] >= 2:
+                diff = (bf[0] - bf[1]).abs()
+                _add("bridge_out/cross_sample_mean", diff.mean())
+                _add("bridge_out/cross_sample_max", diff.max())
+                cond_global = bf.mean(dim=1)
+                gdiff = (cond_global[0] - cond_global[1]).abs()
+                _add("cond_global/cross_sample_mean", gdiff.mean())
+                _add("cond_global/cross_sample_max", gdiff.max())
+                _add("cond_global/std", cond_global.std())
         # Loss components (the noisy ones live here)
         _, components = compute_loss(outputs, batch)
         for k, v in components.items():
@@ -562,6 +619,8 @@ def repeated_forward_stats(model, batch, n_repeats):
             if v is not None:
                 _add(k, v)
 
+    if bridge_handle is not None:
+        bridge_handle.remove()
     return collected
 
 
