@@ -8,9 +8,9 @@ from typing import Any, Optional
 from torch.amp import autocast
 from torch.nn import functional as F
 
-from model.audio.criteria import MultiResolutionSTFTLoss, MultiScaleMelLoss
-from model.audio.vae.criteria import ArcFaceLoss, AudioPerceptualLoss, MultiScaleMelSpectrogramLoss
-from model.audio.vae.discriminator import (
+from model.voice.criteria import MultiResolutionSTFTLoss, MultiScaleMelLoss
+from model.smg.criteria import ArcFaceLoss, AudioPerceptualLoss, MultiScaleMelSpectrogramLoss
+from model.smg.discriminator import (
     MelDomainCombinedDiscriminator,
     MelDomainMultiPeriodDiscriminator,
     MelDomainMultiScaleDiscriminator,
@@ -20,7 +20,7 @@ from model.audio.vae.discriminator import (
     compute_mel_generator_gan_loss,
     r1_mel_gradient_penalty
 )
-from model.audio.vae.vae import AudioCVAEDecoderOnly, AudioVAE
+from model.smg.smg import SMG
 from model.discriminator import compute_adaptive_weight
 from scripts.train.trainer import CommonTrainer
 from utils import metrics
@@ -79,9 +79,9 @@ class LearnedSpeakerClassifier(torch.nn.Module):
         return self.classifier(speaker_embedding)
 
 
-class AudioCVAEGANTrainer(CommonTrainer):
+class SMGTrainer(CommonTrainer):
     """
-    Custom trainer for VAE with optional GAN training.
+    Custom trainer for SMG with optional GAN training.
     Handles alternating generator/discriminator updates.
 
     Supports discriminator regularization:
@@ -278,36 +278,19 @@ class AudioCVAEGANTrainer(CommonTrainer):
                      global_step < self.f0_warmup_use_gt_steps and
                      f0 is not None and vuv is not None)
         
-        is_vae = hasattr(model, "encoder") and model.encoder is not None
-
-        if is_vae:
-            # Forward pass through VAE model (with optional mask for reconstruction loss and lengths for attention)
-            # Request FiLM stats if logging is enabled
-            recon, mu, logvar, losses = model(
-                features=features,
-                target=mel_specs,
-                mask=mel_spec_masks,
-                speaker_embedding=speaker_embedding,
-                length=mel_lengths,
-                kl_weight_multiplier=kl_weight_multiplier,
-                return_film_stats=self.log_film_stats,
-                target_f0=f0,
-                target_voiced=vuv,
-                use_gt_f0=use_gt_f0,
-            )
-        else:
-            recon, losses = model(
-                features=features,
-                target=mel_specs,
-                mask=mel_spec_masks,
-                speaker_embedding=speaker_embedding,
-                return_film_stats=self.log_film_stats,
-                target_f0=f0,
-                target_voiced=vuv,
-                use_gt_f0=use_gt_f0,
-            )
-            mu = None
-            logvar = None
+        # SMG is decoder-only (no encoder/reparameterization); there is no mu/logvar
+        recon, losses = model(
+            features=features,
+            target=mel_specs,
+            mask=mel_spec_masks,
+            speaker_embedding=speaker_embedding,
+            return_film_stats=self.log_film_stats,
+            target_f0=f0,
+            target_voiced=vuv,
+            use_gt_f0=use_gt_f0,
+        )
+        mu = None
+        logvar = None
 
         # Extract FiLM stats if available
         film_stats = losses.pop("film_stats", None) if self.log_film_stats else None
@@ -318,8 +301,8 @@ class AudioCVAEGANTrainer(CommonTrainer):
         learned_speaker_embedding = losses.get("learned_speaker_embedding", None)
         decode_speaker_embedding = learned_speaker_embedding if learned_speaker_embedding is not None else speaker_embedding
 
-        # Get VAE reconstruction loss
-        vae_loss = losses["total_loss"]
+        # Get SMG reconstruction loss
+        smg_loss = losses["total_loss"]
 
         # Mu-only reconstruction loss (trains decoder to produce good outputs from mu directly)
         # This ensures diffusion-generated latents decode well without needing reparameterization noise
@@ -362,14 +345,14 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 if mu_only_recon_loss.item() == 0.0:
                     mu_only_recon_loss = F.mse_loss(recon_mu_only, mel_specs)
 
-            vae_loss = vae_loss + self.mu_only_recon_weight * mu_only_recon_loss
+            smg_loss = smg_loss + self.mu_only_recon_weight * mu_only_recon_loss
             losses["mu_only_recon_loss"] = mu_only_recon_loss
 
         # GAN losses (only after condition is met)
         g_gan_loss = torch.tensor(0.0, device=mel_specs.device)
         d_loss = torch.tensor(0.0, device=mel_specs.device)
 
-        if self.is_gan_enabled(global_step, vae_loss):
+        if self.is_gan_enabled(global_step, smg_loss):
             if not self.gan_already_started:
                 # First step of GAN training - record start step for warmup
                 self.gan_start_step = global_step
@@ -504,7 +487,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
             try:
                 last_layer = model.decoder.final_conv.weight
                 adaptive_weight = compute_adaptive_weight(
-                    vae_loss, g_gan_loss, last_layer, self.gan_loss_weight
+                    smg_loss, g_gan_loss, last_layer, self.gan_loss_weight
                 )
             except (AttributeError, RuntimeError) as e:
                 # Fallback to fixed weight if adaptive weight fails
@@ -513,7 +496,7 @@ class AudioCVAEGANTrainer(CommonTrainer):
                     print(f"Warning: adaptive weight computation failed ({e}), using fixed weight")
                 adaptive_weight = torch.tensor(self.gan_loss_weight, device=mel_specs.device)
 
-        total_loss = vae_loss + adaptive_weight * g_gan_loss
+        total_loss = smg_loss + adaptive_weight * g_gan_loss
 
         # Audio perceptual loss (requires vocoder for waveform-based losses)
         # Only apply after audio_perceptual_loss_start_step to let L1/MSE settle first
@@ -728,12 +711,9 @@ class AudioCVAEGANTrainer(CommonTrainer):
             # - Very different speakers (sim ≈ 0.3) → weight ≈ 0.7 → stronger penalty
             emb_diff_weight = (1.0 - emb_similarity).clamp(0, 1)  # [B]
 
-            # Decode with shuffled speaker embeddings (detach mu to only train decoder's FiLM)
+            # Decode with shuffled speaker embeddings
             # Pass features for F0 prediction if enabled
-            if is_vae:
-                recon_shuffled = model.decode(mu.detach(), speaker_embedding=shuffled_speaker_embedding, features=features)
-            else:
-                recon_shuffled = model.decode(features, speaker_embedding=shuffled_speaker_embedding, features=features)
+            recon_shuffled = model.decode(features, speaker_embedding=shuffled_speaker_embedding, features=features)
 
             # Handle 2D decoder output: [B, 1, 80, T] -> [B, 80, T]
             if recon_shuffled.dim() == 4 and recon_shuffled.shape[1] == 1:
@@ -774,15 +754,15 @@ class AudioCVAEGANTrainer(CommonTrainer):
                 # Skip non-scalar tensors (e.g., learned_speaker_embedding)
                 if isinstance(loss, torch.Tensor) and loss.numel() > 1 and not loss_name.endswith("_loss"):
                     continue
-                metrics.log_scalar(f"{prefix}vae_{loss_name}", loss.mean() if isinstance(loss, torch.Tensor) else loss, global_step)
+                metrics.log_scalar(f"{prefix}smg_{loss_name}", loss.mean() if isinstance(loss, torch.Tensor) else loss, global_step)
             # Log mu and logvar stats
             if mu is not None and logvar is not None:
-                metrics.log_scalar(f"{prefix}vae_mu_mean", mu.mean(), global_step)
-                metrics.log_scalar(f"{prefix}vae_mu_std", mu.std(), global_step)
-                metrics.log_scalar(f"{prefix}vae_logvar_mean", logvar.mean(), global_step)
+                metrics.log_scalar(f"{prefix}smg_mu_mean", mu.mean(), global_step)
+                metrics.log_scalar(f"{prefix}smg_mu_std", mu.std(), global_step)
+                metrics.log_scalar(f"{prefix}smg_logvar_mean", logvar.mean(), global_step)
                 # Mean variance (what diffusion will see) - useful for setting latent_std
-                metrics.log_scalar(f"{prefix}vae_mean_variance", logvar.exp().mean(), global_step)
-                metrics.log_scalar(f"{prefix}vae_mean_std", logvar.exp().mean().sqrt(), global_step)
+                metrics.log_scalar(f"{prefix}smg_mean_variance", logvar.exp().mean(), global_step)
+                metrics.log_scalar(f"{prefix}smg_mean_std", logvar.exp().mean().sqrt(), global_step)
 
             metrics.log_scalar(f"{prefix}g_gan_loss", g_gan_loss, global_step)
             metrics.log_scalar(f"{prefix}total_loss", total_loss.mean(), global_step)
@@ -947,8 +927,8 @@ class AudioCVAEGANTrainer(CommonTrainer):
         ignore_keys=None,
     ):
         """
-        Override prediction_step to handle VAE inputs correctly during evaluation.
-        The default Trainer calls model(**inputs) which doesn't work with VAE.forward().
+        Override prediction_step to handle SMG inputs correctly during evaluation.
+        The default Trainer calls model(**inputs) which doesn't work with SMG.forward().
         """
         model.eval()
 
@@ -983,11 +963,11 @@ class AudioCVAEGANTrainer(CommonTrainer):
 
                 loss = losses["total_loss"]
 
-        # Return (loss, logits, labels) - for VAE we don't have traditional logits/labels
+        # Return (loss, logits, labels) - for SMG we don't have traditional logits/labels
         return (loss, None, None)
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
-        """Save both VAE and discriminator."""
+        """Save both SMG and discriminator."""
         super().save_model(output_dir, _internal_call)
 
         if output_dir is None:
@@ -1025,16 +1005,14 @@ class AudioCVAEGANTrainer(CommonTrainer):
         vocoder = self.vocoder if hasattr(self, 'vocoder') else None
         print(f"Model structure: {model}")
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-        if hasattr(model, 'encoder') and model.encoder is not None:
-            print(f"  VAE Encoder parameters: {sum(p.numel() for p in model.encoder.parameters()):,}")
-        print(f"  VAE Decoder parameters: {sum(p.numel() for p in model.decoder.parameters()):,}")
+        print(f"  SMG Decoder parameters: {sum(p.numel() for p in model.decoder.parameters()):,}")
         print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-        print(f"Audio settings:")
-        print(f"  Sample rate: {args.audio_sample_rate}")
-        print(f"  N mels: {args.audio_n_mels}")
-        print(f"  N FFT: {args.audio_n_fft}")
-        print(f"  Hop length: {args.audio_hop_length}")
-        print(f"  Max audio: {args.audio_max_seconds} seconds")
+        print(f"Voice settings:")
+        print(f"  Sample rate: {args.voice_sample_rate}")
+        print(f"  N mels: {args.voice_n_mels}")
+        print(f"  N FFT: {args.voice_n_fft}")
+        print(f"  Hop length: {args.voice_hop_length}")
+        print(f"  Max voice: {args.voice_max_seconds} seconds")
         print(f"  Latent channels: {args.latent_channels}")
         print(f"  Speaker encoder type: {args.speaker_encoder_type}")
         print(f"  Speaker embedding dim: {args.speaker_embedding_dim}")
@@ -1101,14 +1079,9 @@ class AudioCVAEGANTrainer(CommonTrainer):
 
 
 def load_model(args):
-    if "_decoder_only" in args.config:
-        return model_loading_utils.load_model(AudioCVAEDecoderOnly, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
-            "latent_channels": args.latent_channels,
-        })
-    else:
-        return model_loading_utils.load_model(AudioVAE, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
-            "latent_channels": args.latent_channels,
-        })
+    return model_loading_utils.load_model(SMG, args.config, checkpoint_path=args.resume_from_checkpoint, overrides={
+        "latent_channels": args.latent_channels,
+    })
 
 
 def create_trainer(
@@ -1126,7 +1099,7 @@ def create_trainer(
     # Load frozen SIVE encoder for perceptual loss if requested
     sive_perceptual_model = None
     if args.sive_perceptual_loss_weight > 0 and args.sive_perceptual_checkpoint_path is not None:
-        from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
+        from model.voice.sive.sive import SpeakerInvariantVoiceEncoder
         sive_perceptual_model = model_loading_utils.load_model(
             SpeakerInvariantVoiceEncoder,
             args.sive_perceptual_config,
@@ -1159,8 +1132,8 @@ def create_trainer(
         if args.waveform_mel_loss_weight > 0:
             waveform_mel_loss = MultiScaleMelLoss(
                 shared_window_buffer=shared_window_buffer,
-                sample_rate=args.audio_sample_rate,
-                n_mels=args.audio_n_mels,
+                sample_rate=args.voice_sample_rate,
+                n_mels=args.voice_n_mels,
             )
             waveform_mel_loss.to(device)
             print(f"Created MultiScaleMelLoss (weight={args.waveform_mel_loss_weight})")
@@ -1278,7 +1251,7 @@ def create_trainer(
         print("WARNING: speaker_id_loss_weight > 0 but learn_speaker_embedding is False. "
               "Speaker ID loss requires learned speaker embeddings. Disabling speaker ID loss.")
 
-    return AudioCVAEGANTrainer(
+    return SMGTrainer(
         model=model,
         optimizers=(optimizer, None),
         args=training_args,
@@ -1328,24 +1301,24 @@ def create_trainer(
 
 
 def add_cli_args(subparsers):
-    sub_parser = subparsers.add_parser("audio-cvae", help="Train audio CVAE model with speaker conditioning via FiLM")
+    sub_parser = subparsers.add_parser("smg", help="Train SMG (SIVE-Mel Generator) model with speaker conditioning via FiLM")
 
-    sub_parser.add_argument('--audio_max_seconds', type=float, default=10.0,
-                            help="Maximum audio length in seconds (overrides config file)")
-    sub_parser.add_argument("--audio_n_mels", type=int, default=80,
+    sub_parser.add_argument('--voice_max_seconds', type=float, default=10.0,
+                            help="Maximum voice clip length in seconds (overrides config file)")
+    sub_parser.add_argument("--voice_n_mels", type=int, default=80,
                             help="Number of mel frequency bins (overrides config file)")
-    sub_parser.add_argument("--audio_sample_rate", type=int, default=16000,
-                            help="Audio sample rate (overrides config file)")
-    sub_parser.add_argument("--audio_n_fft", type=int, default=1024,
-                            help="FFT size for audio mel spectrograms (overrides config file)")
-    sub_parser.add_argument("--audio_hop_length", type=int, default=256,
-                            help="Hop length for audio mel spectrograms (overrides config file)")
+    sub_parser.add_argument("--voice_sample_rate", type=int, default=16000,
+                            help="Voice sample rate (overrides config file)")
+    sub_parser.add_argument("--voice_n_fft", type=int, default=1024,
+                            help="FFT size for voice mel spectrograms (overrides config file)")
+    sub_parser.add_argument("--voice_hop_length", type=int, default=256,
+                            help="Hop length for voice mel spectrograms (overrides config file)")
     sub_parser.add_argument("--sive_total_stride", type=int, default=4,
                             help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
 
-    # VAE settings
+    # SMG settings
     sub_parser.add_argument("--latent_channels", type=int, default=32,
-                           help="Number of latent channels in VAE bottleneck")
+                           help="Number of latent channels in the SMG input (from SIVE upstream)")
     # Speaker encoder type determines embedding dimension
     sub_parser.add_argument("--speaker_encoder_type", type=str, default="ecapa_tdnn",
                            help="Type of pretrained speaker encoder to use (ecapa_tdnn or wavlm)")
@@ -1389,7 +1362,7 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--film_contrastive_margin_rampup_steps", type=int, default=5000,
                            help="Number of steps to ramp up FiLM contrastive margin")
 
-    # VAE loss weights
+    # SMG loss weights
     sub_parser.add_argument("--recon_loss_weight", type=float, default=1.0,
                            help="Weight for reconstruction loss")
     sub_parser.add_argument("--mse_loss_weight", type=float, default=1.0,
@@ -1538,7 +1511,11 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--vuv_loss_weight", type=float, default=0.1,
                            help="Weight for V/UV prediction loss")
 
-    sub_parser.add_argument("--cache_dir", type=str, default="../cached_datasets/sive_cvae_f0",
-                           help="Directory for cached datasets")
+    sub_parser.add_argument("--cache_dir", type=str, default="../cached_datasets/sive_smg_f0",
+                           help="Base dir for cached shards (code appends _train/_val)")
+    sub_parser.add_argument("--train_cache_dir", type=str, default=None,
+                           help="Explicit train shard dir (overrides --cache_dir)")
+    sub_parser.add_argument("--val_cache_dir", type=str, default=None,
+                           help="Explicit val shard dir (overrides --cache_dir)")
 
     return sub_parser

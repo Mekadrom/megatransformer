@@ -490,6 +490,10 @@ def add_cli_args(subparsers):
 
     # Dataset caching directory
     sub_parser.add_argument("--cache_dir", type=str, default=None,
-                           help="Directory to cache datasets")
-    
+                           help="Base dir for cached shards (code appends _train/_val)")
+    sub_parser.add_argument("--train_cache_dir", type=str, default=None,
+                           help="Explicit train shard dir (overrides --cache_dir)")
+    sub_parser.add_argument("--val_cache_dir", type=str, default=None,
+                           help="Explicit val shard dir (overrides --cache_dir)")
+
     return sub_parser

@@ -5,14 +5,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-from config.audio.sive.sive import CONFIGS as SIVE_CONFIGS
+from config.voice.sive.sive import CONFIGS as SIVE_CONFIGS
 from utils.megatransformer_utils import print_debug_tensor
 
-from config.audio.sive.sive import SpeakerInvariantVoiceEncoderConfig
-from model.audio.sive.conv_subsampling import Conv2dSubsampling, ConvSubsampling
-from model.audio.sive.grl import GradientReversalFunction, SpeakerClassifier
-from model.audio.sive.sive_block import SpeakerInvariantVoiceEncoderBlock
-from model.audio.sive.spec_augment import SpecAugment
+from config.voice.sive.sive import SpeakerInvariantVoiceEncoderConfig
+from model.voice.sive.conv_subsampling import Conv2dSubsampling, ConvSubsampling
+from model.voice.sive.grl import GradientReversalFunction, SpeakerClassifier
+from model.voice.sive.mel_augment import MelFrequencyResponse, MelGaussianNoise
+from model.voice.sive.sive_block import SpeakerInvariantVoiceEncoderBlock
+from model.voice.sive.spec_augment import SpecAugment
 
 
 class SpeakerInvariantVoiceEncoder(nn.Module):
@@ -42,18 +43,38 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         else:
             self.spec_augment = None
 
+        # Mel-space frequency-response modulation (simulates channel/mic EQ).
+        if config.use_mel_freq_response:
+            self.mel_freq_response = MelFrequencyResponse(
+                strength=config.mel_freq_response_strength,
+                prob=config.mel_freq_response_prob,
+                smoothing_kernel=config.mel_freq_response_smoothing,
+            )
+        else:
+            self.mel_freq_response = None
+
+        # Mel-space additive Gaussian noise at a random SNR (robustness prior).
+        if config.use_mel_noise:
+            self.mel_noise = MelGaussianNoise(
+                snr_min_db=config.mel_noise_snr_min_db,
+                snr_max_db=config.mel_noise_snr_max_db,
+                prob=config.mel_noise_prob,
+            )
+        else:
+            self.mel_noise = None
+
         # Convolutional subsampling frontend with optional Dropout1d
         if config.use_conv2d_frontend:
             self.conv_subsample = Conv2dSubsampling(
                 out_channels=config.encoder_dim,
-                n_mels=config.audio_n_mels,
+                n_mels=config.voice_n_mels,
                 kernel_sizes=config.conv_kernel_sizes,
                 strides=config.conv_strides,
                 dropout=config.conv_dropout if config.conv_dropout > 0 else config.dropout,
             )
         else:
             self.conv_subsample = ConvSubsampling(
-                in_channels=config.audio_n_mels,
+                in_channels=config.voice_n_mels,
                 out_channels=config.encoder_dim,
                 kernel_sizes=config.conv_kernel_sizes,
                 strides=config.conv_strides,
@@ -174,7 +195,15 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 - temporal_smoothness: scalar metric (if variance_reg enabled and training)
                 - all_hiddens: list of [B, T', D] if return_all_hiddens=True
         """
-        # Apply SpecAugment (only during training)
+        # Mel-space augmentations (training-only; all no-op in eval mode).
+        # Order: EQ-like gain first, then additive noise, then SpecAugment masks.
+        # This matches the physical intuition of channel coloration applied to
+        # the clean signal, ambient noise added on top, and finally training-
+        # only masking applied to the noisy-colored mel.
+        if self.mel_freq_response is not None:
+            mel_spec = self.mel_freq_response(mel_spec)
+        if self.mel_noise is not None:
+            mel_spec = self.mel_noise(mel_spec)
         if self.spec_augment is not None:
             mel_spec = self.spec_augment(mel_spec)
 
@@ -182,6 +211,10 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         x: torch.Tensor = self.conv_subsample(mel_spec)  # [B, encoder_dim, T']
 
         x = x.permute(0, 2, 1)  # [B, T', encoder_dim]
+
+        # InstanceNorm in conv_subsample upcasts to float32 internally; match
+        # encoder block parameter dtype so LayerNorm doesn't error under bf16.
+        x = x.to(next(self.encoder_blocks.parameters()).dtype)
 
         # Calculate output lengths
         feature_lengths = None

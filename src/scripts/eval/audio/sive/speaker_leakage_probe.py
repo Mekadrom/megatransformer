@@ -49,8 +49,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
-from scripts.data.audio.dataset import AudioShardedDataset
+from model.voice.sive.sive import SpeakerInvariantVoiceEncoder
+from scripts.data.voice.dataset import VoiceShardedDataset
 from utils.model_loading_utils import load_model
 
 
@@ -61,7 +61,7 @@ from utils.model_loading_utils import load_model
 @torch.no_grad()
 def extract_all_layer_features(
     model: SpeakerInvariantVoiceEncoder,
-    dataset: AudioShardedDataset,
+    dataset: VoiceShardedDataset,
     max_samples: int,
     device: str,
     batch_size: int = 32,
@@ -487,7 +487,7 @@ def main():
 
     # ---- 2. Load dataset ----
     print(f"Loading dataset from {args.cache_dir}...")
-    dataset = AudioShardedDataset(
+    dataset = VoiceShardedDataset(
         args.cache_dir, columns=["mel_specs", "speaker_ids", "ctc_tokens"],
     )
 

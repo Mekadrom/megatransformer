@@ -16,8 +16,8 @@ from typing import Any, Dict, Optional
 
 from datasets import load_dataset, Audio
 
-from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
-from scripts.data.preprocessor import BatchProcessor, Preprocessor
+from model.voice.sive.sive import SpeakerInvariantVoiceEncoder
+from scripts.data.preprocessor import BatchProcessor, Preprocessor, validate_shard_alignment
 from utils import audio_utils
 from utils.audio_utils import SharedWindowBuffer, extract_mels
 from utils.model_loading_utils import load_model
@@ -208,7 +208,7 @@ class SpeakerEmbeddingBatchProcessor(BatchProcessor):
         shared_window_buffer: SharedWindowBuffer,
         sample_rate: int = 16000,
         hop_length: int = 256,
-        audio_max_seconds: int = 30,
+        voice_max_seconds: int = 30,
         speaker_encoder_type: SpeakerEncoderType = "ecapa_tdnn",
         device: str = "cuda",
     ):
@@ -217,7 +217,7 @@ class SpeakerEmbeddingBatchProcessor(BatchProcessor):
         self.hop_length = hop_length
         self.device = device
 
-        self.audio_max_frames = (audio_max_seconds * sample_rate) // hop_length
+        self.voice_max_frames = (voice_max_seconds * sample_rate) // hop_length
 
         # Speaker encoder (uses centralized cached singleton)
         self.speaker_encoder = None
@@ -287,7 +287,7 @@ class F0VUVBatchProcessor(BatchProcessor):
         shared_window_buffer: SharedWindowBuffer,
         sample_rate: int = 16000,
         hop_length: int = 256,
-        audio_max_seconds: int = 30,
+        voice_max_seconds: int = 30,
         f0_fmin: float = 50.0,
         f0_fmax: float = 550.0,
         f0_batch_size: int = 512,
@@ -301,7 +301,7 @@ class F0VUVBatchProcessor(BatchProcessor):
         self.f0_batch_size = f0_batch_size
         self.device = device
 
-        self.audio_max_frames = (audio_max_seconds * sample_rate) // hop_length
+        self.voice_max_frames = (voice_max_seconds * sample_rate) // hop_length
 
     @torch.no_grad()
     def process_batch(
@@ -343,12 +343,12 @@ class F0VUVBatchProcessor(BatchProcessor):
         # log_f0_batch: [B, T'], voiced_batch: [B, T']
 
         # Pad or truncate to max_audio_frames (same as mel)
-        if log_f0_batch.shape[-1] < self.audio_max_frames:
-            log_f0_batch = F.pad(log_f0_batch, (0, self.audio_max_frames - log_f0_batch.shape[-1]), value=0)
-            vuv_batch = F.pad(vuv_batch, (0, self.audio_max_frames - vuv_batch.shape[-1]), value=0)
-        elif log_f0_batch.shape[-1] > self.audio_max_frames:
-            log_f0_batch = log_f0_batch[..., :self.audio_max_frames]
-            vuv_batch = vuv_batch[..., :self.audio_max_frames]
+        if log_f0_batch.shape[-1] < self.voice_max_frames:
+            log_f0_batch = F.pad(log_f0_batch, (0, self.voice_max_frames - log_f0_batch.shape[-1]), value=0)
+            vuv_batch = F.pad(vuv_batch, (0, self.voice_max_frames - vuv_batch.shape[-1]), value=0)
+        elif log_f0_batch.shape[-1] > self.voice_max_frames:
+            log_f0_batch = log_f0_batch[..., :self.voice_max_frames]
+            vuv_batch = vuv_batch[..., :self.voice_max_frames]
 
         return {
             "f0": log_f0_batch,  # [B, T]
@@ -356,7 +356,7 @@ class F0VUVBatchProcessor(BatchProcessor):
         }
 
 
-class AudioDatasetPreprocessor(Preprocessor):
+class VoiceDatasetPreprocessor(Preprocessor):
     """Preprocess dataset to extract and save SIVE features."""
 
     def __init__(self, args, dataset, output_dir, shard_fields, batch_accumulators, stats_accumulator, device):
@@ -371,10 +371,21 @@ class AudioDatasetPreprocessor(Preprocessor):
         assert args.save_waveforms or args.save_mel_specs or args.sive_checkpoint_path is not None, \
             "At least one of --save_waveforms, --save_mel_specs, or --sive_checkpoint_path must be specified."
 
-        self.audio_max_frames = (args.audio_max_seconds * args.sample_rate) // args.hop_length
+        self.voice_max_frames = (args.voice_max_seconds * args.sample_rate) // args.hop_length
 
         self.dataset = self.dataset.cast_column("audio", Audio(sampling_rate=args.sample_rate))
-        print(f"  Total samples in dataset: {len(self.dataset):,}")
+        try:
+            print(f"  Total samples in dataset: {len(self.dataset):,}")
+        except TypeError:
+            print(f"  Total samples in dataset: (streaming, size unknown)")
+        if getattr(args, "max_hours", None):
+            print(f"  Max hours budget: {args.max_hours} h ({args.max_hours * 3600:.0f} s)")
+        if getattr(args, "duration_column", None):
+            print(f"  Duration column: {args.duration_column} (capped at {args.voice_max_seconds}s)")
+
+        # Counter used by the main loop's --max_hours stop check. Tracks the
+        # cumulative stored (post-truncation) duration of accepted samples.
+        stats_accumulator.setdefault("seconds_saved", 0.0)
 
         self.num_unique_speaker_ids = 0
         # Speaker ID remapping is now handled globally by stat-shards
@@ -428,7 +439,7 @@ class AudioDatasetPreprocessor(Preprocessor):
                 shared_window_buffer=self.shared_window_buffer,
                 sample_rate=self.args.sample_rate,
                 hop_length=self.args.hop_length,
-                audio_max_seconds=self.args.audio_max_seconds,
+                voice_max_seconds=self.args.voice_max_seconds,
                 speaker_encoder_type=self.args.speaker_encoder_type,
                 device=self.device,
             )
@@ -439,7 +450,7 @@ class AudioDatasetPreprocessor(Preprocessor):
                 shared_window_buffer=self.shared_window_buffer,
                 sample_rate=self.args.sample_rate,
                 hop_length=self.args.hop_length,
-                audio_max_seconds=self.args.audio_max_seconds,
+                voice_max_seconds=self.args.voice_max_seconds,
                 f0_fmin=self.args.f0_fmin,
                 f0_fmax=self.args.f0_fmax,
                 f0_batch_size=self.args.f0_batch_size,
@@ -544,7 +555,7 @@ class AudioDatasetPreprocessor(Preprocessor):
 
     @classmethod
     def add_cli_args(cls, subparsers):
-        sub_parser = subparsers.add_parser("audio", help="Preprocess audio dataset through SIVE for VAE training")
+        sub_parser = subparsers.add_parser("voice", help="Preprocess voice dataset through SIVE for VAE training")
     
         # SIVE model
         sub_parser.add_argument("--sive_checkpoint_path", type=str,
@@ -564,8 +575,14 @@ class AudioDatasetPreprocessor(Preprocessor):
         sub_parser.add_argument("--n_mels", type=int, default=80)
         sub_parser.add_argument("--n_fft", type=int, default=1024)
         sub_parser.add_argument("--hop_length", type=int, default=256)
-        sub_parser.add_argument("--audio_max_seconds", type=int, default=10,
+        sub_parser.add_argument("--voice_max_seconds", type=int, default=10,
                             help="Maximum audio length in seconds")
+        sub_parser.add_argument("--min_audio_seconds", type=float, default=0.1,
+                            help="Minimum audio length in seconds. Samples shorter than "
+                                 "max(n_fft + 1 samples, min_audio_seconds * sample_rate) "
+                                 "are skipped to avoid STFT padding errors. Default 0.1s (100ms), "
+                                 "which comfortably exceeds typical n_fft windows and filters "
+                                 "sub-utterance fragments (e.g. AMI back-channels).")
 
         # Speaker embeddings
         sub_parser.add_argument("--compute_speaker_embeddings", action="store_true")
@@ -627,8 +644,22 @@ class AudioDatasetPreprocessor(Preprocessor):
                             help="Tokenize text into token IDs (for world model text input)")
         sub_parser.add_argument("--tokenizer_name", type=str, default="mistralai/Mistral-7B-v0.1",
                             help="HuggingFace tokenizer for --tokenize_text")
-        sub_parser.add_argument("--max_seq_len", type=int, default=128,
+        sub_parser.add_argument("--max_seq_len", type=int, default=256,
                             help="Maximum token sequence length for --tokenize_text")
+
+        # Cumulative-duration budget (separate from --voice_max_seconds, which
+        # is PER-SAMPLE). Use for corpus sizing; preprocessing stops when the
+        # cumulative stored audio duration reaches max_hours.
+        sub_parser.add_argument("--max_hours", type=float, default=None,
+                            help="Cumulative stored-audio budget in hours across all emitted samples "
+                                 "(DIFFERENT from --voice_max_seconds, which is per-sample). "
+                                 "Preprocessing stops when reached; processing continues through "
+                                 "the in-flight sample so actual total lands at-or-just-beyond.")
+        sub_parser.add_argument("--duration_column", type=str, default=None,
+                            help="Optional column name containing per-sample audio duration in "
+                                 "seconds. If provided, used as the authoritative duration (capped "
+                                 "at --voice_max_seconds to reflect truncation). If not provided, "
+                                 "duration is computed from the waveform length after truncation.")
 
         return sub_parser
 
@@ -741,6 +772,7 @@ class AudioDatasetPreprocessor(Preprocessor):
             shard_data["ctc_tokens"] = torch.cat(padded_ctc_tokens, dim=0)
             shard_data["ctc_lengths"] = torch.cat(self.shard_fields['shard_ctc_lengths'], dim=0)
             self.shard_fields['shard_ctc_tokens'] = []
+            self.shard_fields['shard_ctc_lengths'] = []
 
         if self.args.tokenize_text and self.shard_fields['shard_token_ids']:
             max_len = max(t.shape[-1] for t in self.shard_fields['shard_token_ids'])
@@ -756,6 +788,9 @@ class AudioDatasetPreprocessor(Preprocessor):
             self.shard_fields['shard_text_lengths'] = []
 
         shard_data["num_samples"] = num_samples
+
+        # Catch accumulator-lifecycle bugs before they go to disk.
+        validate_shard_alignment(shard_data, num_samples)
 
         shard_path = os.path.join(self.output_dir, f"shard_{self.shard_fields['shard_idx']:06d}.pt")
         torch.save(shard_data, shard_path)
@@ -782,14 +817,14 @@ class AudioDatasetPreprocessor(Preprocessor):
                 hop_length=self.args.hop_length,
             )
 
-            mel_length = min(mel.shape[-1], self.audio_max_frames)
+            mel_length = min(mel.shape[-1], self.voice_max_frames)
             mel_lengths.append(mel_length)
 
             # Pad or truncate to max frames
-            if mel.shape[-1] < self.audio_max_frames:
-                mel = F.pad(mel, (0, self.audio_max_frames - mel.shape[-1]), value=0)
-            elif mel.shape[-1] > self.audio_max_frames:
-                mel = mel[..., :self.audio_max_frames]
+            if mel.shape[-1] < self.voice_max_frames:
+                mel = F.pad(mel, (0, self.voice_max_frames - mel.shape[-1]), value=0)
+            elif mel.shape[-1] > self.voice_max_frames:
+                mel = mel[..., :self.voice_max_frames]
 
             mel_specs.append(mel)
 
@@ -817,8 +852,9 @@ class AudioDatasetPreprocessor(Preprocessor):
             if self.args.extract_f0:
                 f0_vuv_result = self.f0_vuv_batch_processor.process_batch(waveforms, waveform_lengths)
 
+            conditions = self.batch_accumulators.get('batch_conditions', [])
+
             if self.args.extract_conditions:
-                conditions = self.batch_accumulators['batch_conditions']
                 conditions_result = self.conditions_processor.process_batch(conditions)
 
             if self.args.extract_ctc_tokens:
@@ -886,11 +922,14 @@ class AudioDatasetPreprocessor(Preprocessor):
             traceback.print_exc()
             self.stats_accumulator["skipped"]["error"] += len(self.batch_accumulators['batch_waveforms'])
 
-        # reset batch accumulators
+        # reset batch accumulators. Must mirror the populate sites in
+        # preprocess_example exactly — if any populate condition includes a
+        # flag that the reset condition omits, the corresponding accumulator
+        # grows monotonically across batches and inflates downstream tensors.
         self.batch_accumulators['batch_waveforms'] = []
         if self.args.compute_speaker_embeddings:
             self.batch_accumulators['batch_speaker_ids'] = []
-        if self.args.extract_conditions or self.args.tokenize_text:
+        if self.args.extract_conditions or self.args.tokenize_text or self.args.extract_ctc_tokens:
             self.batch_accumulators['batch_conditions'] = []
     
     def preprocess_example(self, example) -> bool:
@@ -898,6 +937,19 @@ class AudioDatasetPreprocessor(Preprocessor):
         audio = example[self.args.audio_column]
 
         waveform = torch.tensor(audio["array"], dtype=torch.float32)
+
+        # Skip samples shorter than the STFT window. torch.stft pads by
+        # n_fft/2 on each side and asserts pad < input_length, so an n_fft
+        # of 1024 requires strictly more than 512 samples to avoid a hard
+        # crash further down in encode_to_mels. We require at least
+        # --min_audio_seconds (default covers n_fft with a bit of headroom).
+        min_required_samples = max(
+            self.args.n_fft + 1,
+            int(self.args.min_audio_seconds * self.args.sample_rate),
+        )
+        if len(waveform) < min_required_samples:
+            self.stats_accumulator["skipped"]["too_short"] += 1
+            return False
 
         # Skip silent/near-silent audio
         if waveform.abs().max() < self.args.min_audio_energy or waveform.std() < self.args.min_audio_std:
@@ -910,15 +962,32 @@ class AudioDatasetPreprocessor(Preprocessor):
             waveform = audio_utils.remove_mains_hum(waveform.unsqueeze(0), self.args.sample_rate).squeeze(0)
 
         # Truncate if too long
-        max_samples = self.args.audio_max_seconds * self.args.sample_rate
+        max_samples = self.args.voice_max_seconds * self.args.sample_rate
         if len(waveform) > max_samples:
             waveform = waveform[:max_samples]
+
+        # Compute effective stored duration (post-truncation) for --max_hours
+        # budget tracking. Prefer the dataset's duration column when available,
+        # but cap at voice_max_seconds to reflect the truncation we just did.
+        if self.args.duration_column and self.args.duration_column in example:
+            try:
+                raw_duration = float(example[self.args.duration_column])
+            except (TypeError, ValueError):
+                raw_duration = len(waveform) / self.args.sample_rate
+            effective_duration = min(raw_duration, float(self.args.voice_max_seconds))
+        else:
+            effective_duration = len(waveform) / self.args.sample_rate
+        self.stats_accumulator["seconds_saved"] = (
+            self.stats_accumulator.get("seconds_saved", 0.0) + effective_duration
+        )
 
         if 'batch_waveforms' not in self.batch_accumulators:
             self.batch_accumulators['batch_waveforms'] = []
         if 'batch_speaker_ids' not in self.batch_accumulators and self.args.compute_speaker_embeddings:
             self.batch_accumulators['batch_speaker_ids'] = []
-        if 'batch_conditions' not in self.batch_accumulators and (self.args.extract_conditions or self.args.tokenize_text):
+        if 'batch_conditions' not in self.batch_accumulators and (
+            self.args.extract_conditions or self.args.tokenize_text or self.args.extract_ctc_tokens
+        ):
             self.batch_accumulators['batch_conditions'] = []
 
         # Add to batch
@@ -926,7 +995,7 @@ class AudioDatasetPreprocessor(Preprocessor):
         if self.args.compute_speaker_embeddings:
             speaker_id = example.get(self.args.speaker_id_column, "unknown")
             self.batch_accumulators['batch_speaker_ids'].append(speaker_id)
-        if self.args.extract_conditions or self.args.tokenize_text:
+        if self.args.extract_conditions or self.args.tokenize_text or self.args.extract_ctc_tokens:
             conditions = example[self.args.text_conditions_column]
             if isinstance(conditions, str):
                 conditions = normalize_transcript(conditions)
@@ -951,7 +1020,7 @@ class AudioDatasetPreprocessor(Preprocessor):
             "n_mels": self.args.n_mels,
             "n_fft": self.args.n_fft,
             "hop_length": self.args.hop_length,
-            "audio_max_seconds": self.args.audio_max_seconds,
+            "voice_max_seconds": self.args.voice_max_seconds,
             "compute_speaker_embeddings": self.args.compute_speaker_embeddings,
             "speaker_encoder_type": self.args.speaker_encoder_type,
             "speaker_embedding_dim": self.speaker_feature_batch_processor.speaker_embedding_dim if self.speaker_feature_batch_processor is not None else 0,

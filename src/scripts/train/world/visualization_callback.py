@@ -41,26 +41,26 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         tokenizer=None,
         vocoder: Optional[torch.nn.Module] = None,
         image_vae_decoder: Optional[torch.nn.Module] = None,
-        voice_cvae_decoder: Optional[torch.nn.Module] = None,
+        voice_smg_decoder: Optional[torch.nn.Module] = None,
         static_speaker_embedding: Optional[torch.Tensor] = None,
         num_eval_samples: int = 4,
         step_offset: int = 0,
-        audio_sample_rate: int = 16000,
-        audio_n_mels: int = 80,
-        audio_n_fft: int = 1024,
-        audio_hop_length: int = 256,
+        voice_sample_rate: int = 16000,
+        voice_n_mels: int = 80,
+        voice_n_fft: int = 1024,
+        voice_hop_length: int = 256,
     ):
         self.tokenizer = tokenizer
         self.vocoder = vocoder
         self.image_vae_decoder = image_vae_decoder
-        self.voice_cvae_decoder = voice_cvae_decoder
+        self.voice_smg_decoder = voice_smg_decoder
         self.static_speaker_embedding = static_speaker_embedding
         self.num_eval_samples = num_eval_samples
         self.step_offset = step_offset if step_offset is not None else 0
-        self.audio_sample_rate = audio_sample_rate
-        self.audio_n_mels = audio_n_mels
-        self.audio_n_fft = audio_n_fft
-        self.audio_hop_length = audio_hop_length
+        self.voice_sample_rate = voice_sample_rate
+        self.voice_n_mels = voice_n_mels
+        self.voice_n_fft = voice_n_fft
+        self.voice_hop_length = voice_hop_length
 
         self.trainer: Optional[Trainer] = None
 
@@ -586,13 +586,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 cos = F.cosine_similarity(pred_lat.flatten().unsqueeze(0), tgt_lat.flatten().unsqueeze(0)).item()
                 metrics.log_scalar(f"{tag}/voice_cosine_sim/{i}", cos, global_step)
 
-                # Decode predicted voice to audio if CVAE available
+                # Decode predicted voice to audio if SMG available
                 sample = samples[i] if i < len(samples) else {}
-                self._log_audio_with_cvae(pred_lat, sample, global_step, f"{tag}/voice/{i}/pred")
+                self._log_audio_with_smg(pred_lat, sample, global_step, f"{tag}/voice/{i}/pred")
 
             # Also decode target voice for comparison (first sample only)
             if len(samples) > 0:
-                self._log_audio_with_cvae(voice_labels[0], samples[0], global_step, f"{tag}/voice/0/target")
+                self._log_audio_with_smg(voice_labels[0], samples[0], global_step, f"{tag}/voice/0/target")
 
         # --- Log audio reconstruction quality ---
         audio_preds = outputs.get("audio_latent_preds")
@@ -785,6 +785,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     target_text_full = sample.get("text_text", sample.get("voice_voice_text", ""))
                     if isinstance(target_text_full, list):
                         target_text_full = target_text_full[0] if target_text_full else ""
+                    if not target_text_full and "text_token_ids" in sample:
+                        target_text_full = self._decode_tokens(sample["text_token_ids"])
                     ctx = {"prompt": str(prompt_text)[:500] if prompt_text else decoded[:500]}
                     if target_text_full:
                         ctx["target"] = str(target_text_full)[:500]
@@ -803,9 +805,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                         metrics.log_image(f"{tag}/voice/{i}/target", self._latent_to_image(tgt_lat), global_step)
                         cos = F.cosine_similarity(pred_lat.flatten().unsqueeze(0), tgt_lat.flatten().to(pred_lat.device).unsqueeze(0)).item()
                         metrics.log_scalar(f"{tag}/voice_cosine_sim/{i}", cos, global_step)
-                        self._log_audio_with_cvae(tgt_lat, sample, global_step, f"{tag}/voice/{i}/target")
+                        self._log_audio_with_smg(tgt_lat, sample, global_step, f"{tag}/voice/{i}/target")
 
-                    self._log_audio_with_cvae(pred_lat, sample, global_step, f"{tag}/voice/{i}/generated")
+                    self._log_audio_with_smg(pred_lat, sample, global_step, f"{tag}/voice/{i}/generated")
             except Exception as e:
                 print(f"Warning: Train generation (voice) failed for sample {i}: {e}")
 
@@ -829,6 +831,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
                 # Log prompt text
                 prompt_text = sample.get("text_text", sample.get("image_text", ""))
+                if not prompt_text and "text_token_ids" in sample:
+                    prompt_text = self._decode_tokens(sample["text_token_ids"])
                 decoded = self._decode_tokens(text_ids[:boi_pos + 1])
 
                 outputs = model.generate(
@@ -842,6 +846,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     target_text_full = sample.get("text_text", sample.get("image_text", ""))
                     if isinstance(target_text_full, list):
                         target_text_full = target_text_full[0] if target_text_full else ""
+                    if not target_text_full and "text_token_ids" in sample:
+                        target_text_full = self._decode_tokens(sample["text_token_ids"])
                     ctx = {"prompt": str(prompt_text)[:500] if prompt_text else decoded[:500]}
                     if target_text_full:
                         ctx["target"] = str(target_text_full)[:500]
@@ -942,7 +948,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     metrics.log_text(f"{tag}/voice/{i}/transcription", gen_text[:500], global_step, context=target_ctx)
 
                 # Log input audio
-                self._log_audio_with_cvae(
+                self._log_audio_with_smg(
                     voice_features, sample, global_step,
                     f"{tag}/voice/{i}/input"
                 )
@@ -1056,7 +1062,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     self._latent_to_image(voice_features),
                     global_step,
                 )
-                self._log_audio_with_cvae(
+                self._log_audio_with_smg(
                     voice_features, sample, global_step,
                     f"{tag}/voice_to_voice/{i}/input"
                 )
@@ -1070,7 +1076,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                         self._latent_to_image(pred_latent),
                         global_step,
                     )
-                    self._log_audio_with_cvae(
+                    self._log_audio_with_smg(
                         pred_latent, sample, global_step,
                         f"{tag}/voice_to_voice/{i}/generated"
                     )
@@ -1229,7 +1235,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     context={"prompt": prompt_text},
                 )
 
-                self._log_audio_with_cvae(
+                self._log_audio_with_smg(
                     pred_latent, sample, global_step, f"{tag}/{i}"
                 )
 
@@ -1363,7 +1369,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             target_text = self._decode_tokens(token_ids[:text_length])
 
             # Log input voice audio alongside generated/target text
-            self._log_audio_with_cvae(voice_features, sample, global_step, f"{tag}/{i}/input")
+            self._log_audio_with_smg(voice_features, sample, global_step, f"{tag}/{i}/input")
 
             metrics.log_text(f"{tag}/{i}/generated", gen_text, global_step, context={
                 "target": target_text,
@@ -1582,7 +1588,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 )
 
                 # Image->voice has no ground-truth speaker, use static only
-                self._log_audio_with_cvae(
+                self._log_audio_with_smg(
                     pred_latent, sample, global_step, f"{tag}/{i}"
                 )
 
@@ -1637,7 +1643,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         return grid.unsqueeze(0).numpy()  # (1, grid_H, grid_W)
 
     def _decode_audio_latent_to_mel(self, latent: torch.Tensor, speaker_embedding: torch.Tensor) -> Optional[torch.Tensor]:
-        """Decode SIVE feature latent through CVAE decoder to mel spectrogram.
+        """Decode SIVE feature latent through SMG decoder to mel spectrogram.
 
         Args:
             latent: (C, T) predicted SIVE features from the world model's audio coda
@@ -1647,18 +1653,18 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             mel_spec (n_mels, T) or None on failure
         """
         try:
-            if self.voice_cvae_decoder is None:
+            if self.voice_smg_decoder is None:
                 return None
 
-            device = next(self.voice_cvae_decoder.parameters()).device
-            dtype = next(self.voice_cvae_decoder.parameters()).dtype
+            device = next(self.voice_smg_decoder.parameters()).device
+            dtype = next(self.voice_smg_decoder.parameters()).dtype
 
             z = latent.to(device=device, dtype=dtype).unsqueeze(0)  # (1, C, T)
             spk = speaker_embedding.to(device=device, dtype=dtype).unsqueeze(0)  # (1, speaker_dim)
 
             with torch.no_grad():
                 # Pass features=z so the F0 predictor can run (SIVE features are the latent)
-                mel = self.voice_cvae_decoder.decode(z=z, speaker_embedding=spk, features=z)
+                mel = self.voice_smg_decoder.decode(z=z, speaker_embedding=spk, features=z)
 
             # mel: (1, n_mels, T) -> (n_mels, T)
             if isinstance(mel, tuple):
@@ -1667,19 +1673,19 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 mel = mel.get("reconstructed", mel.get("output", next(iter(mel.values()))))
             if isinstance(mel, torch.Tensor):
                 if mel.numel() == 0:
-                    print(f"Warning: CVAE decode returned empty tensor with shape {mel.shape}")
+                    print(f"Warning: SMG decode returned empty tensor with shape {mel.shape}")
                     return None
                 return mel[0].float().cpu()
-            print(f"Warning: CVAE decode returned unexpected type: {type(mel)}")
+            print(f"Warning: SMG decode returned unexpected type: {type(mel)}")
             return None
         except Exception as e:
             import traceback
-            print(f"Warning: CVAE decode failed: {e}")
+            print(f"Warning: SMG decode failed: {e}")
             traceback.print_exc()
             return None
 
     def _decode_and_log_audio(self, pred_latent, speaker_embedding, global_step, tag_prefix, speaker_label):
-        """Decode latent -> mel via CVAE, then mel -> waveform via vocoder, logging both."""
+        """Decode latent -> mel via SMG, then mel -> waveform via vocoder, logging both."""
         mel = self._decode_audio_latent_to_mel(pred_latent, speaker_embedding)
         if mel is None:
             print(f"[audio_debug] _decode_audio_latent_to_mel returned None for {tag_prefix}/{speaker_label}")
@@ -1693,11 +1699,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         mel_np = mel.numpy()
         if mel_np.size == 0 or mel_np.shape[0] == 0 or mel_np.shape[-1] == 0:
             return
-        fig = visualization.render_mel_spectrogram(mel_np, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
+        fig = visualization.render_mel_spectrogram(mel_np, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
         if self.vocoder is not None:
             try:
                 waveform = visualization.render_vocoder_audio(self.vocoder, mel)
-                metrics.log_audio(f"{tag_prefix}/{speaker_label}_audio", waveform, global_step, self.audio_sample_rate, context={
+                metrics.log_audio(f"{tag_prefix}/{speaker_label}_audio", waveform, global_step, self.voice_sample_rate, context={
                     "mel": fig,
                 })
             except Exception as e:
@@ -1707,10 +1713,10 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             metrics.log_figure(f"{tag_prefix}/{speaker_label}_mel", fig, global_step)
         plt.close(fig)
 
-    def _log_audio_with_cvae(self, pred_latent, sample, global_step, tag_prefix):
-        """Run dual-speaker CVAE decoding: ground-truth speaker + static speaker."""
-        if self.voice_cvae_decoder is None:
-            print(f"[audio_debug] No CVAE decoder available for {tag_prefix}")
+    def _log_audio_with_smg(self, pred_latent, sample, global_step, tag_prefix):
+        """Run dual-speaker SMG decoding: ground-truth speaker + static speaker."""
+        if self.voice_smg_decoder is None:
+            print(f"[audio_debug] No SMG decoder available for {tag_prefix}")
             # Fallback to direct vocoder (old behavior)
             if self.vocoder is not None:
                 self._try_vocoder_from_latent(
@@ -1752,7 +1758,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
         Note: This is a fallback — SIVE features are not mel spectrograms, so
         direct vocoding only makes sense if feature_channels == n_mels.
-        Prefer using CVAE decoder → vocoder for proper audio synthesis.
+        Prefer using SMG decoder → vocoder for proper audio synthesis.
         """
         try:
             if self.vocoder is None:
@@ -1761,7 +1767,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             mel = latent.float().cpu()
             # SIVE features are (C, T) — use directly as (n_mels, T) if C matches
             waveform = visualization.render_vocoder_audio(self.vocoder, mel)
-            metrics.log_audio(tag, waveform, global_step, self.audio_sample_rate)
+            metrics.log_audio(tag, waveform, global_step, self.voice_sample_rate)
         except Exception as e:
             print(f"Warning: Vocoder decoding failed for {tag}: {e}")
 

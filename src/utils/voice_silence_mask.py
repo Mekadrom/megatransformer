@@ -1,6 +1,6 @@
-"""Post-processing utility for masking silence in CVAE-decoded mel spectrograms.
+"""Post-processing utility for masking silence in SMG-decoded mel spectrograms.
 
-The CVAE produces structured noise for silence regions because it was trained
+The SMG produces structured noise for silence regions because it was trained
 on speech-only SIVE features — near-zero SIVE input is out-of-distribution.
 This module detects silence in the SIVE feature space (by comparing to a
 precomputed silence reference vector) and replaces the corresponding mel
@@ -9,10 +9,10 @@ frames with actual silence values.
 Usage:
     mask = SilenceMask.from_checkpoint("path/to/sive/checkpoint")
 
-    # After CVAE decode:
-    mel = cvae.decode(sive_features, speaker_embeddings=spk)
+    # After SMG decode:
+    mel = smg.decode(sive_features, speaker_embeddings=spk)
     mel = mask.apply(mel, sive_features)
-    # → silence regions now have mel_silence_value instead of CVAE noise
+    # → silence regions now have mel_silence_value instead of SMG noise
 """
 
 import os
@@ -23,7 +23,7 @@ import torch.nn as nn
 
 
 class SilenceMask(nn.Module):
-    """Detects and masks silence in CVAE-decoded mel spectrograms.
+    """Detects and masks silence in SMG-decoded mel spectrograms.
 
     Compares each SIVE frame to a precomputed silence reference vector.
     Frames closer than `threshold` (L2 distance) are classified as silence.
@@ -103,10 +103,10 @@ class SilenceMask(nn.Module):
         sive_features: torch.Tensor,
         lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Replace silence regions in a CVAE-decoded mel spectrogram.
+        """Replace silence regions in an SMG-decoded mel spectrogram.
 
         Args:
-            mel: (B, n_mels, T_mel) — CVAE-decoded mel spectrogram.
+            mel: (B, n_mels, T_mel) — SMG-decoded mel spectrogram.
             sive_features: (B, C, T_sive) — the SIVE features that were decoded.
             lengths: Optional (B,) — real SIVE feature lengths. If provided,
                 everything past lengths[b] is also marked as silence regardless

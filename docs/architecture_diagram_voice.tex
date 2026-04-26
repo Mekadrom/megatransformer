@@ -20,7 +20,7 @@
 \definecolor{darkgray}{HTML}{2C3E50}
 \definecolor{ditteal}{HTML}{16A085}
 \definecolor{sivecyan}{HTML}{2980B9}
-\definecolor{cvaeorange}{HTML}{D35400}
+\definecolor{smgorange}{HTML}{D35400}
 \definecolor{spkpink}{HTML}{C0392B}
 
 % ── Styles ──────────────────────────────────────────────────────────
@@ -63,7 +63,7 @@
 \def\voiceX{0}
 \def\textX{5}
 \def\imageX{10}
-% \def\cvaeX{-4.5}
+% \def\smgX{-4.5}
 \def\centerX{5}
 \def\siveY{1}
 
@@ -282,7 +282,7 @@
   {Linear $d \to C$\\+ Framewise MLP};
 \node[attnlabel=voicegreen, anchor=east] at ([xshift=-5pt]voice_coda.west) {CAUSAL, RoPE};
 
-\pgfmathsetmacro\cvaeX{0}
+\pgfmathsetmacro\smgX{0}
 
 \node[modbox=voicegreen, minimum width=2.4cm] (voice_stop) at ([xshift=-3.5cm]voice_proj_out.west)
   {Stop Head\\Linear $d \to 1$};
@@ -407,21 +407,21 @@
 
 
 % ════════════════════════════════════════════════════════════════════
-% CVAE DECODER (below voice output — synthesis decode path)
+% SMG DECODER (below voice output — synthesis decode path)
 % ════════════════════════════════════════════════════════════════════
 
-\pgfmathsetmacro\cvaeBaseY{\outY-2}
+\pgfmathsetmacro\smgBaseY{\outY-2}
 
 % 1D stage
-\node[modbox=cvaeorange, minimum width=3.4cm] (cvae_1d) at (\cvaeX, \cvaeBaseY+3.2)
+\node[modbox=smgorange, minimum width=3.4cm] (smg_1d) at (\smgX, \smgBaseY+3.2)
   {Conv1d Stage\\+ FiLM (speaker)\\+ Residual Blocks};
 
 % 1D→2D transition
-\node[modbox=cvaeorange, minimum width=3.4cm] (cvae_reshape) at (\cvaeX, \cvaeBaseY+5.0)
+\node[modbox=smgorange, minimum width=3.4cm] (smg_reshape) at (\smgX, \smgBaseY+5.0)
   {Reshape 1D $\to$ 2D\\$+ f_0$ injection (additive)};
 
 % F0 predictor
-\node[modbox=cvaeorange, minimum width=3.0cm] (f0_pred) at ([xshift=-2.5cm]cvae_reshape.west)
+\node[modbox=smgorange, minimum width=3.0cm] (f0_pred) at ([xshift=-2.5cm]smg_reshape.west)
   {F0 Predictor\\spk + SIVE $\to \hat{f}_0$};
 
 % Speaker embedding input
@@ -429,55 +429,55 @@
   {Speaker Embedding\\$(B, 192)$};
 
 % 2D stages
-\node[modbox=cvaeorange, minimum width=3.6cm] (cvae_2d) at (\cvaeX, \cvaeBaseY+6.8)
+\node[modbox=smgorange, minimum width=3.6cm] (smg_2d) at (\smgX, \smgBaseY+6.8)
   {Conv2d Upsample $\times 3$\\FiLM (speaker) per stage\\$(2\times, 2\times) \to (2\times, 2\times) \to (2\times, 1\times)$};
 
 % Final conv
-\node[modbox=cvaeorange] (cvae_out_conv) at (\cvaeX, \cvaeBaseY+8.3)
+\node[modbox=smgorange] (smg_out_conv) at (\smgX, \smgBaseY+8.3)
   {Conv2d $\to$ 1 channel};
 
 % Mel output
-\node[iolabel] (mel_out) at (\cvaeX, \cvaeBaseY+9.5)
+\node[iolabel] (mel_out) at (\smgX, \smgBaseY+9.5)
   {Mel Spectrogram\\$(B, 80, T)$};
 
-% CVAE arrows
-\draw[arrow] (voice_proj_out.north) -- (cvae_1d.south);
+% SMG arrows
+\draw[arrow] (voice_proj_out.north) -- (smg_1d.south);
 
 \draw[arrow] (spk_in) -- (f0_pred);
-\draw[arrow] (f0_pred) |- (cvae_1d);
-\draw[arrow] (cvae_1d) -- (cvae_reshape);
-\draw[arrow] (cvae_reshape) -- (cvae_2d);
-\draw[arrow] (cvae_2d) -- (cvae_out_conv);
-\draw[arrow] (cvae_out_conv) -- (mel_out);
+\draw[arrow] (f0_pred) |- (smg_1d);
+\draw[arrow] (smg_1d) -- (smg_reshape);
+\draw[arrow] (smg_reshape) -- (smg_2d);
+\draw[arrow] (smg_2d) -- (smg_out_conv);
+\draw[arrow] (smg_out_conv) -- (mel_out);
 
 % Speaker embedding arrows to FiLM layers
 \draw[dasharrow, rounded corners=4pt]
-  (spk_in.south) |- (cvae_1d.west)
+  (spk_in.south) |- (smg_1d.west)
   node[pos=0.2, left, font=\tiny\sffamily\itshape, text=spkpink] {FiLM};
 \draw[dasharrow, rounded corners=4pt]
-  (spk_in.north) |- (cvae_2d.west)
+  (spk_in.north) |- (smg_2d.west)
   node[pos=0.25, left, font=\tiny\sffamily\itshape, text=spkpink] {FiLM};
 
 % F0 to reshape
 \draw[dasharrow, rounded corners=4pt]
-  (f0_pred.east) -- (cvae_reshape.west)
-  node[pos=0.5, yshift=-0.25cm, font=\tiny\sffamily\itshape, text=cvaeorange] {$f_0$ embed};
+  (f0_pred.east) -- (smg_reshape.west)
+  node[pos=0.5, yshift=-0.25cm, font=\tiny\sffamily\itshape, text=smgorange] {$f_0$ embed};
 
-% CVAE background
+% SMG background
 \begin{scope}[on background layer]
-  \node[groupbg=cvaeorange, inner sep=12pt,
-    fit=(spk_in)(f0_pred)(cvae_1d)(cvae_reshape)(cvae_2d)(cvae_out_conv)(mel_out)] (cvaebg) {};
+  \node[groupbg=smgorange, inner sep=12pt,
+    fit=(spk_in)(f0_pred)(smg_1d)(smg_reshape)(smg_2d)(smg_out_conv)(mel_out)] (smgbg) {};
 \end{scope}
-\node[seclabel=cvaeorange, anchor=north west] at ([xshift=4pt, yshift=-2pt]cvaebg.north west)
-  {CVAE Decoder (pretrained, speaker-conditioned)};
+\node[seclabel=smgorange, anchor=north west] at ([xshift=4pt, yshift=-2pt]smgbg.north west)
+  {SMG Decoder (pretrained, speaker-conditioned)};
 
 % ════════════════════════════════════════════════════════════════════
 % VOCODER (final stage)
 % ════════════════════════════════════════════════════════════════════
 
-\node[modbox=darkgray, minimum width=3.2cm] (vocoder) at (\cvaeX, \cvaeBaseY+11.0)
+\node[modbox=darkgray, minimum width=3.2cm] (vocoder) at (\smgX, \smgBaseY+11.0)
   {HiFi-GAN Vocoder\\mel $\to$ waveform};
-\node[iolabel] (wav_out) at (\cvaeX, \cvaeBaseY+12.3) {Waveform $(B, S)$};
+\node[iolabel] (wav_out) at (\smgX, \smgBaseY+12.3) {Waveform $(B, S)$};
 
 \draw[arrow] (mel_out) -- (vocoder);
 \draw[arrow] (vocoder) -- (wav_out);

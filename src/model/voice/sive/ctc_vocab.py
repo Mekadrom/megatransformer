@@ -2,8 +2,8 @@ from typing import Optional
 import torch
 
 
+"""Character-level vocabulary for CTC ASR."""
 class CTCVocab:
-    """Character-level vocabulary for CTC ASR."""
 
     # Standard character set for English ASR
     CHARS = " 'abcdefghijklmnopqrstuvwxyz"

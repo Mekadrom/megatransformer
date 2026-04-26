@@ -3,10 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config.audio.vocoder.vocoder import VOCODER_CONFIGS, VocoderConfig
+from config.voice.vocoder.vocoder import VOCODER_CONFIGS, VocoderConfig
 from model import activations
-from model.audio.vocoder.convnext import ConvNeXtBlock
-from model.audio.vocoder.frequency_attention_block import FrequencyAttentionBlock
+from model.voice.vocoder.convnext import ConvNeXtBlock
+from model.voice.vocoder.frequency_attention_block import FrequencyAttentionBlock
 from utils.audio_utils import SharedWindowBuffer
 
 

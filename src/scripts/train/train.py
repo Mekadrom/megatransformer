@@ -6,13 +6,13 @@ import psutil
 
 import matplotlib
 
-from model.audio.sive.ctc_vocab import CTCVocab
+from model.voice.sive.ctc_vocab import CTCVocab
 from scripts.train.audio.sive.visualization_callback import SIVEVisualizationCallback
 matplotlib.use('Agg')
 import torch
 import torch.nn as nn
 
-import scripts.train.audio.vae.training as audio_cvae_training
+import scripts.train.smg.training as smg_training
 import scripts.train.audio.sive.training as audio_sive_training
 import scripts.train.audio.vocoder.training as audio_vocoder_training
 import scripts.train.image.vae.training as image_vae_training
@@ -29,13 +29,13 @@ from scripts.train.optimizers import MuonAdamW, create_muon_adamw_optimizer
 from model.ema import EMAModel
 from scripts.data.image.vae.data_collator import ImageVAEDataCollator
 from scripts.data.image.vae.dataset import ImageVAEShardedDataset
-from scripts.data.audio.data_collator import AudioDataCollator
-from scripts.data.audio.dataset import AudioShardedDataset
+from scripts.data.voice.data_collator import VoiceDataCollator
+from scripts.data.voice.dataset import VoiceShardedDataset
 from scripts.data.world.data_collator import MultimodalDataCollator
 from scripts.data.world.dataset import MultimodalShardedDataset
 from scripts.data.world.memorization_dataset import MultimodalMemorizationDataset
 from scripts.data.data_collator import DataCollator
-from scripts.train.audio.vae.visualization_callback import AudioCVAEVisualizationCallback
+from scripts.train.smg.visualization_callback import SMGVisualizationCallback
 from scripts.train.audio.vocoder.visualization_callback import VocoderVisualizationCallback
 from scripts.train.ema_callback import EMAUpdateCallback
 from scripts.train.image.vae.visualization_callback import ImageVAEVisualizationCallback
@@ -46,12 +46,13 @@ from utils.audio_utils import SharedWindowBuffer
 from utils.train_utils import EarlyStoppingCallback
 
 
-torch.serialization.add_safe_globals([np._core.multiarray._reconstruct, np.ndarray, np.dtype])
+_np_multiarray = getattr(np, "_core", np.core).multiarray
+torch.serialization.add_safe_globals([_np_multiarray._reconstruct, np.ndarray, np.dtype])
 
 
 def create_or_load_model(args, shared_window_buffer: Optional[SharedWindowBuffer]) -> nn.Module:
-    if args.command in ["audio-cvae", "audio-cvae-decoder"]:
-        return audio_cvae_training.load_model(args)
+    if args.command in ["smg"]:
+        return smg_training.load_model(args)
     elif args.command in ["audio-sive", "sive"]:
         return audio_sive_training.load_model(args)
     elif args.command in ["vocoder"]:
@@ -61,7 +62,7 @@ def create_or_load_model(args, shared_window_buffer: Optional[SharedWindowBuffer
     elif args.command in ["world"]:
         return world_training.load_model(args)
     else:
-        raise ValueError(f"Unknown command: {args.command}. Available: audio-cvae, audio-cvae-decoder, vocoder, image-vae, world")
+        raise ValueError(f"Unknown command: {args.command}. Available: smg, vocoder, image-vae, world")
 
 
 def get_training_args(args, run_dir) -> TrainingArguments:
@@ -107,31 +108,45 @@ def get_training_args(args, run_dir) -> TrainingArguments:
 
 
 def get_data_collator(command: str, args) -> Optional[DataCollator]:
-    if command in ["audio-cvae", 'audio-cvae-decoder', 'vocoder', 'audio-sive', 'sive']:
-        audio_max_frames = args.audio_max_seconds * args.audio_sample_rate // args.audio_hop_length
-        collator =  AudioDataCollator(
-            max_waveforms=args.audio_max_seconds * args.audio_sample_rate,
-            max_mel_spec_frames=audio_max_frames,
-            max_sive_feature_frames=math.ceil(audio_max_frames / args.sive_total_stride),
+    if command in ["smg", 'vocoder', 'audio-sive', 'sive']:
+        voice_max_frames = int(args.voice_max_seconds * args.voice_sample_rate // args.voice_hop_length)
+        collator =  VoiceDataCollator(
+            max_waveforms=int(args.voice_max_seconds * args.voice_sample_rate),
+            max_mel_spec_frames=voice_max_frames,
+            max_sive_feature_frames=math.ceil(voice_max_frames / args.sive_total_stride),
             speaker_embedding_dim=args.speaker_embedding_dim if hasattr(args, 'speaker_embedding_dim') else 192,
         )
     elif command in ["image-vae"]:
         collator = ImageVAEDataCollator()
     elif command in ["world"]:
-        audio_max_frames = int(args.audio_max_seconds * args.audio_sample_rate // args.audio_hop_length)
+        voice_max_frames = int(args.voice_max_seconds * args.voice_sample_rate // args.voice_hop_length)
         collator = MultimodalDataCollator(
             max_seq_len=args.max_seq_len,
-            max_waveforms=int(args.audio_max_seconds * args.audio_sample_rate),
-            max_mel_spec_frames=audio_max_frames,
-            max_sive_feature_frames=math.ceil(audio_max_frames / args.sive_total_stride),
+            max_waveforms=int(args.voice_max_seconds * args.voice_sample_rate),
+            max_mel_spec_frames=voice_max_frames,
+            max_sive_feature_frames=math.ceil(voice_max_frames / args.sive_total_stride),
         )
     return collator
 
 
+def _resolve_single_shard_dir(args, split: str) -> Optional[str]:
+    """Resolve the shard directory for a non-world command. Prefers the
+    explicit per-split arg (--train_cache_dir / --val_cache_dir) when
+    present, otherwise appends _train/_val to --cache_dir.
+    """
+    explicit = getattr(args, f"{split}_cache_dir", None)
+    if explicit is not None:
+        return explicit
+    base = getattr(args, "cache_dir", None)
+    if base is None:
+        return None
+    return base + "_" + split
+
+
 def get_dataset(command: str, args, split: str):
-    shard_dir = (args.cache_dir + "_" + split) if args.cache_dir else None
-    if command in ["audio-cvae", 'audio-cvae-decoder']:
-        dataset = AudioShardedDataset(
+    shard_dir = _resolve_single_shard_dir(args, split)
+    if command in ["smg"]:
+        dataset = VoiceShardedDataset(
             shard_dir=shard_dir,
             cache_size=32,
             columns=[
@@ -145,7 +160,7 @@ def get_dataset(command: str, args, split: str):
             ]
         )
     elif command in ['vocoder']:
-        dataset = AudioShardedDataset(
+        dataset = VoiceShardedDataset(
             shard_dir=shard_dir,
             cache_size=3,
             columns=[
@@ -156,7 +171,7 @@ def get_dataset(command: str, args, split: str):
             ]
         )
     elif command in ['audio-sive', 'sive']:
-        dataset = AudioShardedDataset(
+        dataset = VoiceShardedDataset(
             shard_dir=shard_dir,
             cache_size=32,
             columns=[
@@ -237,15 +252,15 @@ def get_dataset(command: str, args, split: str):
 
 
 def get_visualization_callback(args, command: str, model: nn.Module, shared_window_buffer=None, legacy_vocoder: bool = False) -> VisualizationCallback:
-    if command in ["audio-cvae", 'audio-cvae-decoder']:
+    if command in ["smg"]:
         vocoder = model_loading_utils.load_vocoder(args.vocoder_checkpoint_path, args.vocoder_config, shared_window_buffer, is_wrapped=legacy_vocoder)
-        callback = AudioCVAEVisualizationCallback(
+        callback = SMGVisualizationCallback(
             shared_window_buffer=shared_window_buffer,
             step_offset=args.start_step,
-            audio_sample_rate=args.audio_sample_rate,
-            audio_n_mels=args.audio_n_mels,
-            audio_n_fft=args.audio_n_fft,
-            audio_hop_length=args.audio_hop_length,
+            voice_sample_rate=args.voice_sample_rate,
+            voice_n_mels=args.voice_n_mels,
+            voice_n_fft=args.voice_n_fft,
+            voice_hop_length=args.voice_hop_length,
             vocoder_checkpoint_path=args.vocoder_checkpoint_path,
             vocoder=vocoder,
             vocoder_config=args.vocoder_config,
@@ -257,9 +272,9 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
         callback = SIVEVisualizationCallback(
             vocoder=vocoder,
             vocab=CTCVocab(),
-            audio_sample_rate=args.audio_sample_rate,
-            audio_n_fft=args.audio_n_fft,
-            audio_hop_length=args.audio_hop_length,
+            voice_sample_rate=args.voice_sample_rate,
+            voice_n_fft=args.voice_n_fft,
+            voice_hop_length=args.voice_hop_length,
             num_audio_samples=args.num_audio_samples,
             # LM decoder settings
             kenlm_model_path=args.kenlm_model_path,
@@ -270,10 +285,10 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
     elif command in ["vocoder"]:
         callback = VocoderVisualizationCallback(
             shared_window_buffer=shared_window_buffer,
-            audio_sample_rate=args.audio_sample_rate,
-            audio_n_mels=args.audio_n_mels,
-            audio_n_fft=args.audio_n_fft,
-            audio_hop_length=args.audio_hop_length,
+            voice_sample_rate=args.voice_sample_rate,
+            voice_n_mels=args.voice_n_mels,
+            voice_n_fft=args.voice_n_fft,
+            voice_hop_length=args.voice_hop_length,
         )
     elif command in ["image-vae"]:
         callback = ImageVAEVisualizationCallback(
@@ -319,23 +334,23 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             except Exception as e:
                 print(f"Warning: Failed to load image VAE decoder for world model visualization: {e}")
 
-        voice_cvae_decoder = None
-        if getattr(args, 'voice_cvae_checkpoint_path', None):
+        voice_smg_decoder = None
+        if getattr(args, 'voice_smg_checkpoint_path', None):
             try:
-                from model.audio.vae.vae import AudioCVAEDecoderOnly
-                cvae_overrides = {}
-                if getattr(args, 'voice_cvae_latent_channels', None) is not None:
-                    cvae_overrides["latent_channels"] = args.voice_cvae_latent_channels
-                voice_cvae_decoder = model_loading_utils.load_model(
-                    AudioCVAEDecoderOnly,
-                    getattr(args, 'voice_cvae_config', 'small'),
-                    checkpoint_path=args.voice_cvae_checkpoint_path,
+                from model.smg.smg import SMG
+                smg_overrides = {}
+                if getattr(args, 'voice_smg_latent_channels', None) is not None:
+                    smg_overrides["latent_channels"] = args.voice_smg_latent_channels
+                voice_smg_decoder = model_loading_utils.load_model(
+                    SMG,
+                    getattr(args, 'voice_smg_config', 'small'),
+                    checkpoint_path=args.voice_smg_checkpoint_path,
                     strict=False,
-                    overrides=cvae_overrides,
+                    overrides=smg_overrides,
                 )
-                voice_cvae_decoder.eval()
+                voice_smg_decoder.eval()
             except Exception as e:
-                print(f"Warning: Failed to load voice CVAE decoder for world model visualization: {e}")
+                print(f"Warning: Failed to load voice SMG decoder for world model visualization: {e}")
 
         static_speaker_embedding = None
         if getattr(args, 'static_speaker_embedding_path', None):
@@ -351,14 +366,14 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             tokenizer=None,  # Will be set up in callback if needed
             vocoder=vocoder,
             image_vae_decoder=image_vae_decoder,
-            voice_cvae_decoder=voice_cvae_decoder,
+            voice_smg_decoder=voice_smg_decoder,
             static_speaker_embedding=static_speaker_embedding,
             num_eval_samples=getattr(args, 'num_eval_samples', 4),
             step_offset=args.start_step,
-            audio_sample_rate=getattr(args, 'audio_sample_rate', 16000),
-            audio_n_mels=getattr(args, 'audio_n_mels', 80),
-            audio_n_fft=getattr(args, 'audio_n_fft', 1024),
-            audio_hop_length=getattr(args, 'audio_hop_length', 256),
+            voice_sample_rate=getattr(args, 'voice_sample_rate', 16000),
+            voice_n_mels=getattr(args, 'voice_n_mels', 80),
+            voice_n_fft=getattr(args, 'voice_n_fft', 1024),
+            voice_hop_length=getattr(args, 'voice_hop_length', 256),
         )
     return callback
 
@@ -391,8 +406,8 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, optimizer: Option
     visualization_callback = get_visualization_callback(args, command, model, shared_window_buffer=shared_window_buffer, legacy_vocoder=args.legacy_vocoder)
     ema = get_ema_callback(args)
     
-    if command in ["audio-cvae", "audio-cvae-decoder"]:
-        trainer: Trainer = audio_cvae_training.create_trainer(
+    if command in ["smg"]:
+        trainer: Trainer = smg_training.create_trainer(
             args,
             model,
             optimizer,
@@ -447,7 +462,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, optimizer: Option
             eval_dataset,
         )
     else:
-        raise ValueError(f"Unknown command: {command}. Available: audio-cvae, audio-cvae-decoder, vocoder, image-vae, world")
+        raise ValueError(f"Unknown command: {command}. Available: smg, vocoder, image-vae, world")
 
     if visualization_callback is not None:
         trainer.add_callback(visualization_callback)
@@ -528,7 +543,7 @@ def get_optimizer(args, model: nn.Module) -> Optional[MuonAdamW]:
 
 
 training_modules: list = [
-    audio_cvae_training,
+    smg_training,
     audio_sive_training,
     audio_vocoder_training,
     image_vae_training,
@@ -640,7 +655,7 @@ def get_process_cmdline(pid):
 
 
 command_to_module = {
-    "audio-cvae": audio_cvae_training,
+    "smg": smg_training,
     "audio-sive": audio_sive_training,
     "vocoder": audio_vocoder_training,
     "image-vae": image_vae_training,
@@ -681,9 +696,9 @@ if __name__ == "__main__":
 
     module = command_to_module.get(args.command, None)
     if module is None:
-        raise ValueError(f"Unknown command: {args.command}. Available: audio-cvae, image-vae")
+        raise ValueError(f"Unknown command: {args.command}. Available: smg, image-vae")
 
-    if module in [audio_cvae_training, audio_vocoder_training, world_training]:
+    if module in [smg_training, audio_vocoder_training, world_training]:
         shared_window_buffer = SharedWindowBuffer()
     else:
         shared_window_buffer = None

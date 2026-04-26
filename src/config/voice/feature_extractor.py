@@ -8,7 +8,7 @@ from config.common import MegaTransformerBlockConfig
 
 
 @dataclass
-class AudioVAEPreludeFeatureExtractorConfig:
+class VoiceSIVEPreludeFeatureExtractorConfig:
     """Config for the audio prelude feature extractor that accepts SIVE features.
 
     SIVE features are (B, feature_channels, T) — 1D sequences of feature vectors.
@@ -44,6 +44,6 @@ class AudioVAEPreludeFeatureExtractorConfig:
         return json.dumps(self.to_dict(), indent=2)
 
 
-AUDIO_PRELUDE_CONFIGS = {
-    "default": AudioVAEPreludeFeatureExtractorConfig(),
+VOICE_PRELUDE_CONFIGS = {
+    "default": VoiceSIVEPreludeFeatureExtractorConfig(),
 }

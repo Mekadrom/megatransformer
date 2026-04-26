@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config.audio.vae.discriminator import MEL_COMBINED_DISCRIMINATOR_CONFIGS, MelDomainCombinedDiscriminatorConfig, MelDomainMultiPeriodDiscriminatorConfig, MelDomainMultiScaleDiscriminatorConfig
+from config.smg.discriminator import MEL_COMBINED_DISCRIMINATOR_CONFIGS, MelDomainCombinedDiscriminatorConfig, MelDomainMultiPeriodDiscriminatorConfig, MelDomainMultiScaleDiscriminatorConfig
 
 
 class MelDomainPeriodSubDiscriminator(nn.Module):

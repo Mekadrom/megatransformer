@@ -7,10 +7,10 @@ import torch.nn.functional as F
 
 from typing import Any, Optional
 
-from config.audio.vocoder.vocoder import VocoderConfig
-from model.audio.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss, Wav2Vec2PerceptualLoss
-from model.audio.vocoder.discriminator import WaveformDomainDiscriminator, compute_discriminator_losses, compute_generator_losses
-from model.audio.vocoder.vocoder import Vocoder
+from config.voice.vocoder.vocoder import VocoderConfig
+from model.voice.criteria import HighFreqSTFTLoss, MultiResolutionSTFTLoss, PhaseLoss, StableMelSpectrogramLoss, Wav2Vec2PerceptualLoss
+from model.voice.vocoder.discriminator import WaveformDomainDiscriminator, compute_discriminator_losses, compute_generator_losses
+from model.voice.vocoder.vocoder import Vocoder
 from model.discriminator import compute_adaptive_weight
 from scripts.train.trainer import CommonTrainer
 from utils import metrics, model_loading_utils
@@ -671,8 +671,8 @@ def create_trainer(
         shared_window_buffer=shared_window_buffer,
         config=model.config,
         step_offset=args.start_step,
-        n_fft=args.audio_n_fft,
-        hop_length=args.audio_hop_length,
+        n_fft=args.voice_n_fft,
+        hop_length=args.voice_hop_length,
         cmdline=args.cmdline,
         git_commit_hash=args.commit_hash,
         data_collator=data_collator,
@@ -701,16 +701,16 @@ def create_trainer(
 def add_cli_args(subparsers):
     sub_parser = subparsers.add_parser("vocoder", help="Preprocess audio dataset through SIVE for VAE training")
 
-    sub_parser.add_argument('--audio_max_seconds', type=float, default=10.0,
-                            help="Maximum audio length in seconds (overrides config file)")
-    sub_parser.add_argument("--audio_n_mels", type=int, default=80,
+    sub_parser.add_argument('--voice_max_seconds', type=float, default=10.0,
+                            help="Maximum voice clip length in seconds (overrides config file)")
+    sub_parser.add_argument("--voice_n_mels", type=int, default=80,
                             help="Number of mel frequency bins (overrides config file)")
-    sub_parser.add_argument("--audio_sample_rate", type=int, default=16000,
-                            help="Audio sample rate (overrides config file)")
-    sub_parser.add_argument("--audio_n_fft", type=int, default=1024,
-                            help="FFT size for audio mel spectrograms (overrides config file)")
-    sub_parser.add_argument("--audio_hop_length", type=int, default=256,
-                            help="Hop length for audio mel spectrograms (overrides config file)")
+    sub_parser.add_argument("--voice_sample_rate", type=int, default=16000,
+                            help="Voice sample rate (overrides config file)")
+    sub_parser.add_argument("--voice_n_fft", type=int, default=1024,
+                            help="FFT size for voice mel spectrograms (overrides config file)")
+    sub_parser.add_argument("--voice_hop_length", type=int, default=256,
+                            help="Hop length for voice mel spectrograms (overrides config file)")
     sub_parser.add_argument("--sive_total_stride", type=int, default=4,
                             help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
 
@@ -808,6 +808,10 @@ def add_cli_args(subparsers):
                             help="Multi-resolution discriminator feature matching loss weight")
 
     sub_parser.add_argument("--cache_dir", type=str, default="../cached_datasets/audio",
-                           help="Directory for cached datasets")
+                           help="Base dir for cached shards (code appends _train/_val)")
+    sub_parser.add_argument("--train_cache_dir", type=str, default=None,
+                           help="Explicit train shard dir (overrides --cache_dir)")
+    sub_parser.add_argument("--val_cache_dir", type=str, default=None,
+                           help="Explicit val shard dir (overrides --cache_dir)")
 
     return sub_parser

@@ -28,19 +28,19 @@ class VocoderVisualizationCallback(VisualizationCallback):
         shared_window_buffer: SharedWindowBuffer,
         step_offset: int = 0,
         generation_steps: int = 1000,
-        audio_sample_rate: int = 16000,
-        audio_n_mels: int = 80,
-        audio_n_fft: int = 1024,
-        audio_hop_length: int = 256,
+        voice_sample_rate: int = 16000,
+        voice_n_mels: int = 80,
+        voice_n_fft: int = 1024,
+        voice_hop_length: int = 256,
         num_eval_samples: int = 8,
     ):
         self.trainer: Optional[Trainer] = None
         self.step_offset = self.step_offset = step_offset if step_offset is not None else 0
         self.generation_steps = generation_steps
-        self.audio_sample_rate = audio_sample_rate
-        self.audio_n_mels = audio_n_mels
-        self.audio_n_fft = audio_n_fft
-        self.audio_hop_length = audio_hop_length
+        self.voice_sample_rate = voice_sample_rate
+        self.voice_n_mels = voice_n_mels
+        self.voice_n_fft = voice_n_fft
+        self.voice_hop_length = voice_hop_length
         self.num_eval_samples = num_eval_samples
 
         self.shared_window_buffer = shared_window_buffer
@@ -138,18 +138,18 @@ class VocoderVisualizationCallback(VisualizationCallback):
                     pred_mel = audio_utils.extract_mels(
                         self.shared_window_buffer,
                         pred_aligned.float().cpu(),
-                        sr=self.audio_sample_rate,
-                        n_mels=self.audio_n_mels,
-                        n_fft=self.audio_n_fft,
-                        hop_length=self.audio_hop_length,
+                        sr=self.voice_sample_rate,
+                        n_mels=self.voice_n_mels,
+                        n_fft=self.voice_n_fft,
+                        hop_length=self.voice_hop_length,
                     )
                     gt_mel = audio_utils.extract_mels(
                         self.shared_window_buffer,
                         gt_aligned.float().cpu(),
-                        sr=self.audio_sample_rate,
-                        n_mels=self.audio_n_mels,
-                        n_fft=self.audio_n_fft,
-                        hop_length=self.audio_hop_length,
+                        sr=self.voice_sample_rate,
+                        n_mels=self.voice_n_mels,
+                        n_fft=self.voice_n_fft,
+                        hop_length=self.voice_hop_length,
                     )
                     mel_min_len = min(pred_mel.shape[-1], gt_mel.shape[-1])
                     mel_l1 = torch.abs(pred_mel[..., :mel_min_len] - gt_mel[..., :mel_min_len]).mean().item()
@@ -158,16 +158,16 @@ class VocoderVisualizationCallback(VisualizationCallback):
                     # STFT magnitude error
                     pred_stft = torch.stft(
                         pred_aligned.float().cpu(),
-                        n_fft=self.audio_n_fft,
-                        hop_length=self.audio_hop_length,
-                        window=self.shared_window_buffer.get_window(self.audio_n_fft, "cpu"),
+                        n_fft=self.voice_n_fft,
+                        hop_length=self.voice_hop_length,
+                        window=self.shared_window_buffer.get_window(self.voice_n_fft, "cpu"),
                         return_complex=True,
                     )
                     gt_stft = torch.stft(
                         gt_aligned.float().cpu(),
-                        n_fft=self.audio_n_fft,
-                        hop_length=self.audio_hop_length,
-                        window=self.shared_window_buffer.get_window(self.audio_n_fft, "cpu"),
+                        n_fft=self.voice_n_fft,
+                        hop_length=self.voice_hop_length,
+                        window=self.shared_window_buffer.get_window(self.voice_n_fft, "cpu"),
                         return_complex=True,
                     )
                     stft_mag_error = torch.abs(torch.abs(pred_stft) - torch.abs(gt_stft)).mean().item()
@@ -181,13 +181,13 @@ class VocoderVisualizationCallback(VisualizationCallback):
                         f"eval_vocoder/audio/{i}/output",
                         pred_audio,
                         global_step,
-                        sample_rate=self.audio_sample_rate
+                        sample_rate=self.voice_sample_rate
                     )
                     metrics.log_audio(
                         f"eval_vocoder/audio/{i}/target",
                         gt_audio,
                         global_step,
-                        sample_rate=self.audio_sample_rate
+                        sample_rate=self.voice_sample_rate
                     )
 
                     # Log visualizations for first few samples
@@ -225,10 +225,10 @@ class VocoderVisualizationCallback(VisualizationCallback):
         metrics.flush()
 
     def log_audio(self, waveform: torch.Tensor, global_step, tag: str):
-        metrics.log_audio(tag, waveform, global_step, sample_rate=self.audio_sample_rate)
+        metrics.log_audio(tag, waveform, global_step, sample_rate=self.voice_sample_rate)
 
     def log_mel_spec_visualization(self, mel_spec: torch.Tensor, global_step: int, tag: str):
-        fig = visualization.render_mel_spectrogram(mel_spec, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
+        fig = visualization.render_mel_spectrogram(mel_spec, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
         metrics.log_figure(tag, fig, global_step)
         plt.close(fig)
 
@@ -281,7 +281,7 @@ class VocoderVisualizationCallback(VisualizationCallback):
 
         inst_freq = torch.diff(phase, dim=-1)
         inst_freq = torch.atan2(torch.sin(inst_freq), torch.cos(inst_freq))
-        inst_freq_hz = inst_freq * self.audio_sample_rate / (2 * np.pi * self.audio_hop_length)
+        inst_freq_hz = inst_freq * self.voice_sample_rate / (2 * np.pi * self.voice_hop_length)
 
         # Mask out low-energy regions to reduce noise
         mag_for_weight = mag[..., :-1]  # align with diff output
@@ -289,7 +289,7 @@ class VocoderVisualizationCallback(VisualizationCallback):
         threshold = 0.01
         inst_freq_masked = torch.where(mag_normalized > threshold, inst_freq_hz, torch.full_like(inst_freq_hz, float('nan')))
 
-        max_if = self.audio_sample_rate / (2 * self.audio_hop_length)
+        max_if = self.voice_sample_rate / (2 * self.voice_hop_length)
 
         fig, ax = plt.subplots(figsize=(10, 4))
         im = ax.imshow(inst_freq_masked.cpu().numpy(), aspect='auto', origin='lower',
@@ -332,8 +332,8 @@ class VocoderVisualizationCallback(VisualizationCallback):
         aligned_wav = aligned_pred.numpy()
 
         # Create time axis in seconds
-        time_axis = np.arange(min_len) / self.audio_sample_rate
-        env_time_axis = np.arange(env_min_len) * 256 / self.audio_sample_rate
+        time_axis = np.arange(min_len) / self.voice_sample_rate
+        env_time_axis = np.arange(env_min_len) * 256 / self.voice_sample_rate
 
         # Unaligned and aligned differences
         unaligned_diff = np.abs(pred_wav - target_wav)
@@ -459,7 +459,7 @@ class VocoderVisualizationCallback(VisualizationCallback):
             mag = torch.abs(stft)
             inst_freq = torch.diff(phase, dim=-1)
             inst_freq = torch.atan2(torch.sin(inst_freq), torch.cos(inst_freq))
-            inst_freq_hz = inst_freq * self.audio_sample_rate / (2 * np.pi * self.audio_hop_length)
+            inst_freq_hz = inst_freq * self.voice_sample_rate / (2 * np.pi * self.voice_hop_length)
 
             # Mask by magnitude
             mag_for_weight = mag[..., :-1]
@@ -479,7 +479,7 @@ class VocoderVisualizationCallback(VisualizationCallback):
         target_if = target_if[..., :min_t]
         pred_mag = pred_mag[..., :min_t]
 
-        max_if = self.audio_sample_rate / (2 * self.audio_hop_length)
+        max_if = self.voice_sample_rate / (2 * self.voice_hop_length)
 
         fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 

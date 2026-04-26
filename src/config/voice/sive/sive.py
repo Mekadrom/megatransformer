@@ -8,7 +8,7 @@ from typing import Optional, Union
 @dataclass
 class SpeakerInvariantVoiceEncoderConfig:
     """Configuration for SIVE model."""
-    audio_n_mels: int = 80
+    voice_n_mels: int = 80
     encoder_dim: int = 256
     num_layers: int = 4
     num_heads: int = 4
@@ -38,6 +38,20 @@ class SpeakerInvariantVoiceEncoderConfig:
     spec_freq_mask_param: int = 20   # Max frequency mask width (F)
     spec_num_time_masks: int = 2     # Number of time masks
     spec_num_freq_masks: int = 2     # Number of frequency masks
+
+    # Mel-space noise injection (robustness augmentation; alternative to
+    # waveform-level noise addition that doesn't require storing waveforms).
+    use_mel_noise: bool = False
+    mel_noise_snr_min_db: float = 5.0    # lower bound on sampled target SNR
+    mel_noise_snr_max_db: float = 20.0   # upper bound on sampled target SNR
+    mel_noise_prob: float = 0.5          # per-utterance application probability
+
+    # Mel-space frequency-response modulation (simulates mic/channel EQ
+    # variation). Multiplies each mel band by a random smooth gain curve.
+    use_mel_freq_response: bool = False
+    mel_freq_response_strength: float = 0.3  # std of pre-smoothing gain noise
+    mel_freq_response_prob: float = 0.5      # per-utterance application probability
+    mel_freq_response_smoothing: int = 7     # smoothing kernel width (odd; larger = smoother EQ)
 
     # Stochastic Depth (drop entire residual paths)
     drop_path_rate: float = 0.0  # Max drop rate (linearly scaled per layer, 0=disabled)

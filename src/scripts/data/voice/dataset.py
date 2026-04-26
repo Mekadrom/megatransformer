@@ -9,9 +9,9 @@ from tqdm import tqdm
 from scripts.data.dataset import ShardAwareSampler
 
 
-class AudioShardedDataset(Dataset):
+class VoiceShardedDataset(Dataset):
     """
-    Efficient dataset for loading preprocessed audio shards.
+    Efficient dataset for loading preprocessed voice shards.
 
     Loads shards containing:
     - features: optional - SIVE encoder features

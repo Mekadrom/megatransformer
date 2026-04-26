@@ -1,12 +1,12 @@
 """Evaluate voice synthesis (text → voice) quality.
 
 For each text sample, generates voice via the world model, decodes through
-CVAE + vocoder, and computes:
+SMG + vocoder, and computes:
 1. Mel Cepstral Distortion (MCD) against ground-truth mel spectrogram
 2. Speaker embedding cosine similarity (if speaker encoder available)
 
 Usage:
-    python -m src.scripts.eval.world.eval_voice_synthesis --checkpoint_path runs/my_run/checkpoint-3000 --config small_sum_dit --cache_dir ../cached_datasets/sive --include_modes text,voice --voice_cvae_checkpoint_path ./runs/audio_cvae/.../checkpoint-300000 --voice_cvae_config medium_decoder_only_1d_3x --voice_cvae_latent_channels 128 --vocoder_config hifigan --static_speaker_embedding_path ./logs/speaker_embedding_1.pt --max_samples 100 --bf16
+    python -m src.scripts.eval.world.eval_voice_synthesis --checkpoint_path runs/my_run/checkpoint-3000 --config small_sum_dit --cache_dir ../cached_datasets/sive --include_modes text,voice --voice_smg_checkpoint_path ./runs/smg/.../checkpoint-300000 --voice_smg_config medium_decoder_only_1d_3x --voice_smg_latent_channels 128 --vocoder_config hifigan --static_speaker_embedding_path ./logs/speaker_embedding_1.pt --max_samples 100 --bf16
 """
 
 import argparse
@@ -37,9 +37,9 @@ def parse_args():
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--tie_word_embeddings", action="store_true")
     # Decoders
-    p.add_argument("--voice_cvae_checkpoint_path", type=str, default=None)
-    p.add_argument("--voice_cvae_config", type=str, default="small")
-    p.add_argument("--voice_cvae_latent_channels", type=int, default=None)
+    p.add_argument("--voice_smg_checkpoint_path", type=str, default=None)
+    p.add_argument("--voice_smg_config", type=str, default="small")
+    p.add_argument("--voice_smg_latent_channels", type=int, default=None)
     p.add_argument("--vocoder_config", type=str, default="hifigan")
     p.add_argument("--vocoder_checkpoint_path", type=str, default=None)
     p.add_argument("--static_speaker_embedding_path", type=str, default=None)
@@ -94,14 +94,14 @@ def load_dataset(args, split="val"):
         )
 
 
-def decode_sive_to_mel(cvae_decoder, latent, speaker_embedding):
+def decode_sive_to_mel(smg_decoder, latent, speaker_embedding):
     """Decode SIVE latent (C, T) → mel spectrogram (n_mels, T)."""
-    device = next(cvae_decoder.parameters()).device
-    dtype = next(cvae_decoder.parameters()).dtype
+    device = next(smg_decoder.parameters()).device
+    dtype = next(smg_decoder.parameters()).dtype
     z = latent.to(device=device, dtype=dtype).unsqueeze(0)
     spk = speaker_embedding.to(device=device, dtype=dtype).unsqueeze(0)
     with torch.no_grad():
-        mel = cvae_decoder.decode(z=z, speaker_embedding=spk, features=z)
+        mel = smg_decoder.decode(z=z, speaker_embedding=spk, features=z)
     if isinstance(mel, tuple):
         mel = mel[0]
     if isinstance(mel, dict):
@@ -161,20 +161,20 @@ def main():
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 
-    # Load CVAE decoder
-    cvae_decoder = None
-    if args.voice_cvae_checkpoint_path:
-        from model.audio.vae.vae import AudioCVAEDecoderOnly
-        cvae_overrides = {}
-        if args.voice_cvae_latent_channels is not None:
-            cvae_overrides["latent_channels"] = args.voice_cvae_latent_channels
-        cvae_decoder = model_loading_utils.load_model(
-            AudioCVAEDecoderOnly, args.voice_cvae_config,
-            checkpoint_path=args.voice_cvae_checkpoint_path,
-            strict=False, overrides=cvae_overrides,
+    # Load SMG decoder
+    smg_decoder = None
+    if args.voice_smg_checkpoint_path:
+        from model.smg.smg import SMG
+        smg_overrides = {}
+        if args.voice_smg_latent_channels is not None:
+            smg_overrides["latent_channels"] = args.voice_smg_latent_channels
+        smg_decoder = model_loading_utils.load_model(
+            SMG, args.voice_smg_config,
+            checkpoint_path=args.voice_smg_checkpoint_path,
+            strict=False, overrides=smg_overrides,
         )
-        cvae_decoder.eval()
-        print("Loaded CVAE decoder")
+        smg_decoder.eval()
+        print("Loaded SMG decoder")
 
     # Load vocoder
     vocoder = None
@@ -266,9 +266,9 @@ def main():
         metrics_str = []
 
         # MCD: compare generated vs target mel spectrograms
-        if cvae_decoder is not None:
+        if smg_decoder is not None:
             target_mel = sample.get("voice_mel_spec")  # (n_mels, T)
-            gen_mel = decode_sive_to_mel(cvae_decoder, gen_latent, speaker_emb)
+            gen_mel = decode_sive_to_mel(smg_decoder, gen_latent, speaker_emb)
 
             if target_mel is not None:
                 mcd = compute_mcd(gen_mel, target_mel)

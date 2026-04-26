@@ -8,9 +8,9 @@ from utils.megatransformer_utils import pad_and_mask, trim, print_debug_tensor
 DEBUG_COLLATOR = False  # Set True to debug data loading issues
 
 
-class AudioDataCollator(DataCollator):
+class VoiceDataCollator(DataCollator):
     """
-    Data collator for any audio training.
+    Data collator for any voice training.
 
     Pads features, waveforms, and mel specs to same length within batch and creates masks.
     """

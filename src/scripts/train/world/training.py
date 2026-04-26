@@ -1495,22 +1495,37 @@ def add_cli_args(subparsers):
                             help="Path to image VAE decoder checkpoint (not needed for litevae)")
     sub_parser.add_argument("--image_vae_decoder_config", type=str, default=None,
                             help="Image VAE decoder config. Use 'litevae' for pretrained LiteVAE (auto-downloaded)")
-    sub_parser.add_argument("--voice_cvae_checkpoint_path", type=str, default=None,
-                            help="Path to voice CVAE decoder checkpoint for decoding SIVE latents to mel specs")
-    sub_parser.add_argument("--voice_cvae_config", type=str, default="small",
-                            help="Voice CVAE decoder config name")
-    sub_parser.add_argument("--voice_cvae_latent_channels", type=int, default=None,
-                            help="Override latent_channels for voice CVAE (must match what it was trained with)")
+    sub_parser.add_argument("--voice_smg_checkpoint_path", type=str, default=None,
+                            help="Path to voice SMG decoder checkpoint for decoding SIVE latents to mel specs")
+    sub_parser.add_argument("--voice_smg_config", type=str, default="small",
+                            help="Voice SMG decoder config name")
+    sub_parser.add_argument("--voice_smg_latent_channels", type=int, default=None,
+                            help="Override latent_channels for voice SMG (must match what it was trained with)")
     sub_parser.add_argument("--static_speaker_embedding_path", type=str, default=None,
                             help="Path to a .pt file containing a speaker embedding tensor for static-speaker voice decoding")
     sub_parser.add_argument("--num_eval_samples", type=int, default=4,
                             help="Number of samples per visualization scenario")
 
-    # Audio collator settings
+    # Voice collator settings
+    sub_parser.add_argument("--voice_max_seconds", type=float, default=10.0,
+                            help="Maximum voice clip length in seconds")
+    sub_parser.add_argument("--voice_sample_rate", type=int, default=16000,
+                            help="Voice sample rate")
+    sub_parser.add_argument("--voice_n_fft", type=int, default=1024,
+                            help="FFT size for voice mel spectrograms")
+    sub_parser.add_argument("--voice_n_mels", type=int, default=80,
+                            help="Number of voice mel filterbanks")
+    sub_parser.add_argument("--voice_hop_length", type=int, default=256,
+                            help="Voice hop length")
+    # Audio (general/non-speech) collator settings
     sub_parser.add_argument("--audio_max_seconds", type=float, default=10.0,
-                            help="Maximum audio length in seconds")
+                            help="Maximum audio clip length in seconds")
     sub_parser.add_argument("--audio_sample_rate", type=int, default=16000,
                             help="Audio sample rate")
+    sub_parser.add_argument("--audio_n_fft", type=int, default=1024,
+                            help="FFT size for audio mel spectrograms")
+    sub_parser.add_argument("--audio_n_mels", type=int, default=80,
+                            help="Number of audio mel filterbanks")
     sub_parser.add_argument("--audio_hop_length", type=int, default=256,
                             help="Audio hop length")
     sub_parser.add_argument("--sive_total_stride", type=int, default=4,

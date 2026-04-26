@@ -35,7 +35,7 @@ PYTHONPATH=src python3 -m scripts.eval.world.eval_image_transcription --checkpoi
 Generates voice from text prompts and computes Mel Cepstral Distortion against ground-truth mel spectrograms. Optionally saves generated .wav files.
 
 ```bash
-PYTHONPATH=src python3 -m scripts.eval.world.eval_voice_synthesis --checkpoint_path runs/world/my_run/checkpoint-3000 --config small_sum_dit --include_modes text,voice --cache_dir ./cached_datasets/text_pile_2048 --voice_cache_dir ./cached_datasets/voice_sive_train --split val --bf16 --tie_word_embeddings --log_dir runs/world/my_run --voice_cvae_checkpoint_path ./runs/audio_cvae/my_cvae/checkpoint-300000 --voice_cvae_config medium_decoder_only_1d_3x --voice_cvae_latent_channels 128 --static_speaker_embedding_path ./logs/speaker_embedding_1.pt --save_audio ./eval_audio
+PYTHONPATH=src python3 -m scripts.eval.world.eval_voice_synthesis --checkpoint_path runs/world/my_run/checkpoint-3000 --config small_sum_dit --include_modes text,voice --cache_dir ./cached_datasets/text_pile_2048 --voice_cache_dir ./cached_datasets/voice_sive_train --split val --bf16 --tie_word_embeddings --log_dir runs/world/my_run --voice_smg_checkpoint_path ./runs/smg/my_smg/checkpoint-300000 --voice_smg_config medium_decoder_only_1d_3x --voice_smg_latent_channels 128 --static_speaker_embedding_path ./logs/speaker_embedding_1.pt --save_audio ./eval_audio
 ```
 
 ## Image Synthesis (CLIPScore + FID)
@@ -53,7 +53,7 @@ PYTHONPATH=src python3 -m scripts.eval.world.eval_image_synthesis --checkpoint_p
 Runs the full training visualization callback (same scenarios as during training) against a checkpoint, logging to a separate TensorBoard directory.
 
 ```bash
-PYTHONPATH=src python3 -m scripts.eval.world.visualize --checkpoint_path runs/world/my_run/checkpoint-3000 --config small_sum_dit --cache_dir ./cached_datasets/text_pile_2048 --voice_cache_dir ./cached_datasets/voice_sive_train --image_cache_dir ./cached_datasets/image_vae --include_modes text,voice,image --log_dir runs/eval_viz --step 3000 --bf16 --use_memorization_dataset --max_samples 50 --vocoder_config hifigan --voice_cvae_checkpoint_path ./runs/audio_cvae/my_cvae/checkpoint-300000 --voice_cvae_config medium_decoder_only_1d_3x --voice_cvae_latent_channels 128 --static_speaker_embedding_path ./logs/speaker_embedding_1.pt --image_vae_decoder_config litevae
+PYTHONPATH=src python3 -m scripts.eval.world.visualize --checkpoint_path runs/world/my_run/checkpoint-3000 --config small_sum_dit --cache_dir ./cached_datasets/text_pile_2048 --voice_cache_dir ./cached_datasets/voice_sive_train --image_cache_dir ./cached_datasets/image_vae --include_modes text,voice,image --log_dir runs/eval_viz --step 3000 --bf16 --use_memorization_dataset --max_samples 50 --vocoder_config hifigan --voice_smg_checkpoint_path ./runs/smg/my_smg/checkpoint-300000 --voice_smg_config medium_decoder_only_1d_3x --voice_smg_latent_channels 128 --static_speaker_embedding_path ./logs/speaker_embedding_1.pt --image_vae_decoder_config litevae
 ```
 
 ## TensorBoard Logging

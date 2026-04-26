@@ -4,9 +4,14 @@ import json
 
 from config.common import MegaTransformerBlockConfig
 
+
 @dataclass
-class AudioCodaConfig:
-    """Placeholder: currently reuses the voice SMG-wrapping architecture. Will be replaced with audio-specific architecture (non-SMG decoder) in a future refactor. See VoiceCodaAndSMGConfig for the current behavior."""
+class VoiceCodaAndSMGConfig:
+    """Config for the voice coda that predicts SIVE features.
+
+    The coda projects d_model hidden states back to feature_channels,
+    producing SIVE-shaped outputs (B, feature_channels, T).
+    """
     coda_config: MegaTransformerBlockConfig = dataclasses.field(
         default_factory=MegaTransformerBlockConfig
     )
@@ -34,6 +39,6 @@ class AudioCodaConfig:
         return json.dumps(self.to_dict(), indent=2)
 
 
-AUDIO_CODA_CONFIGS = {
-    "default": AudioCodaConfig(),
+VOICE_CODA_CONFIGS = {
+    "default": VoiceCodaAndSMGConfig(),
 }

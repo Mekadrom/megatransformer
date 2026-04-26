@@ -6,57 +6,8 @@ from typing import Optional
 
 
 @dataclass
-class AudioVAEEncoderConfig:
-    """Configuration for audio VAE model."""
-
-    # architecture parameters
-    encoder_dim: int = 128  # sive feature dim
-    latent_channels: int = 16
-
-    activation: str = "silu"
-
-    intermediate_channels: Optional[list[int]] = None
-    kernel_sizes: Optional[list[int]] = None
-    strides: Optional[list[int]] = None
-    n_residual_blocks: int = 1
-
-    # training parameters
-    dropout: float = 0.1
-    logvar_clamp_max: float = 4.0
-
-
-    def __post_init__(self):
-        # defaults
-        if self.intermediate_channels is None:
-            self.intermediate_channels = [256, 256, 128]
-        if self.kernel_sizes is None:
-            self.kernel_sizes = [5, 5, 3]
-        if self.strides is None:
-            self.strides = [2, 2, 2]  # 8x total downsampling
-            
-    def to_dict(self) -> dict:
-        """Convert config to dictionary (for HuggingFace compatibility)."""
-        return dataclasses.asdict(self)
-
-    def to_json_string(self) -> str:
-        """Convert config to JSON string (for HuggingFace compatibility)."""
-        return json.dumps(self.to_dict(), indent=2)
-
-
-AUDIO_ENCODER_CONFIGS = {
-    "default": AudioVAEEncoderConfig(),
-    "small": AudioVAEEncoderConfig(
-        intermediate_channels=[256],
-        kernel_sizes=[3],
-        strides=[1],  # no downsampling
-        n_residual_blocks=4,
-    ),
-}
-
-
-@dataclass
-class AudioVAEDecoderConfig:
-    """Configuration for audio VAE decoder model."""
+class SMGDecoder2DConfig:
+    """Configuration for 2D SMG (SIVE-Mel Generator) decoder."""
 
     # architecture parameters
     latent_channels: int = 16
@@ -113,9 +64,9 @@ class AudioVAEDecoderConfig:
         return json.dumps(self.to_dict(), indent=2)
 
 
-AUDIO_DECODER_CONFIGS = {
-    "default": AudioVAEDecoderConfig(),
-    "small": AudioVAEDecoderConfig(
+SMG_DECODER_2D_CONFIGS = {
+    "default": SMGDecoder2DConfig(),
+    "small": SMGDecoder2DConfig(
         intermediate_channels_2d=[64, 96, 144],
         kernel_sizes_2d=[(3, 5), (3, 5), (3, 5)],
         scale_factors_2d=[(2, 2), (2, 2), (2, 1)],  # 8x freq, 4x time
@@ -124,8 +75,8 @@ AUDIO_DECODER_CONFIGS = {
 
 
 @dataclass
-class AudioVAEDecoder1DConfig:
-    """Configuration for Conv1D-only audio VAE decoder.
+class SMGDecoder1DConfig:
+    """Configuration for Conv1D-only SMG (SIVE-Mel Generator) decoder.
 
     Treats frequency as channels throughout — no 1D→2D reshape.
     Avoids ring artifacts caused by Conv2D spatial isotropy assumption.
@@ -172,15 +123,15 @@ class AudioVAEDecoder1DConfig:
         return json.dumps(self.to_dict(), indent=2)
 
 
-AUDIO_DECODER_1D_CONFIGS = {
-    "default": AudioVAEDecoder1DConfig(),
-    "small": AudioVAEDecoder1DConfig(
+SMG_DECODER_1D_CONFIGS = {
+    "default": SMGDecoder1DConfig(),
+    "small": SMGDecoder1DConfig(
         initial_channels=512,
         stage_channels=[512, 256, 256],
         stage_kernel_sizes=[5, 5, 5],
         time_upsample_factors=[2, 2, 1],  # 4x total
     ),
-    "medium": AudioVAEDecoder1DConfig(
+    "medium": SMGDecoder1DConfig(
         initial_channels=640,
         stage_channels=[640, 384, 256],
         stage_kernel_sizes=[7, 5, 5],
@@ -189,7 +140,7 @@ AUDIO_DECODER_1D_CONFIGS = {
         pre_upsample_residual_blocks=3,
         pre_upsample_kernel_size=7,
     ),
-    "medium_3x": AudioVAEDecoder1DConfig(
+    "medium_3x": SMGDecoder1DConfig(
         initial_channels=640,
         stage_channels=[640, 384, 256],
         stage_kernel_sizes=[7, 5, 5],
@@ -198,7 +149,7 @@ AUDIO_DECODER_1D_CONFIGS = {
         pre_upsample_residual_blocks=3,
         pre_upsample_kernel_size=7,
     ),
-    "small_snake": AudioVAEDecoder1DConfig(
+    "small_snake": SMGDecoder1DConfig(
         activation="snake",
         initial_channels=512,
         stage_channels=[512, 256, 256],
@@ -264,14 +215,11 @@ F0_CONDITIONING_EMBEDDING_CONFIGS = {
 
 
 @dataclass
-class AudioVAEConfig:
-    encoder_config: AudioVAEEncoderConfig = dataclasses.field(
-        default_factory=AudioVAEEncoderConfig
+class SMGConfig:
+    decoder_config: SMGDecoder2DConfig = dataclasses.field(
+        default_factory=SMGDecoder2DConfig
     )
-    decoder_config: AudioVAEDecoderConfig = dataclasses.field(
-        default_factory=AudioVAEDecoderConfig
-    )
-    decoder_1d_config: Optional[AudioVAEDecoder1DConfig] = None
+    decoder_1d_config: Optional[SMGDecoder1DConfig] = None
     f0_predictor_config: F0PredictorConfig = dataclasses.field(
         default_factory=F0PredictorConfig
     )
@@ -300,58 +248,50 @@ class AudioVAEConfig:
     def to_dict(self) -> dict:
         """Convert config to dictionary (for HuggingFace compatibility)."""
         return dataclasses.asdict(self)
-    
+
     def to_json_string(self) -> str:
         """Convert config to JSON string (for HuggingFace compatibility)."""
         return json.dumps(self.to_dict(), indent=2)
-    
-AUDIO_VAE_CONFIGS = {
-    "default": AudioVAEConfig(),
-    "small": AudioVAEConfig(
-        encoder_config=AUDIO_ENCODER_CONFIGS["small"],
-        decoder_config=AUDIO_DECODER_CONFIGS["small"],
+
+SMG_CONFIGS = {
+    "default": SMGConfig(),
+    "small": SMGConfig(
+        decoder_config=SMG_DECODER_2D_CONFIGS["small"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
-    "small_decoder_only": AudioVAEConfig(
-        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
-        decoder_config=AUDIO_DECODER_CONFIGS["small"],
+    "small_decoder_only": SMGConfig(
+        decoder_config=SMG_DECODER_2D_CONFIGS["small"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
-    "small_1d": AudioVAEConfig(
-        encoder_config=AUDIO_ENCODER_CONFIGS["small"],
-        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["small"],
+    "small_1d": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["small"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
-    "small_decoder_only_1d": AudioVAEConfig(
-        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
-        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["small"],
+    "small_decoder_only_1d": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["small"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
-    "default_decoder_only_1d": AudioVAEConfig(
-        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
-        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["default"],
+    "default_decoder_only_1d": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["default"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
-    "medium_decoder_only_1d": AudioVAEConfig(
-        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
-        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["medium"],
+    "medium_decoder_only_1d": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
-    "medium_decoder_only_1d_3x": AudioVAEConfig(
-        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
-        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["medium_3x"],
+    "medium_decoder_only_1d_3x": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_3x"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
-    "small_decoder_only_1d_snake": AudioVAEConfig(
-        encoder_config=AUDIO_ENCODER_CONFIGS["default"],
-        decoder_1d_config=AUDIO_DECODER_1D_CONFIGS["small_snake"],
+    "small_decoder_only_1d_snake": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["small_snake"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),

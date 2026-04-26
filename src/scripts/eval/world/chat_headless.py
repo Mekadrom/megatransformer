@@ -17,7 +17,7 @@ Imports a few decode/render helpers from `multimodal_chat.py` to avoid code
 duplication.
 
 Usage:
-    PYTHONPATH=src python3 -m scripts.eval.world.chat_headless --checkpoint_path runs/world/my_run/checkpoint-N --config small_sum_dit --include_modes text,voice,image --tie_word_embeddings --bf16 --voice_cvae_checkpoint_path ./runs/audio_cvae/.../checkpoint-300000 --voice_cvae_config medium_decoder_only_1d_3x --voice_cvae_latent_channels 128 --vocoder_config hifigan --image_vae_decoder_config litevae --static_speaker_embedding_path ./logs/speaker_embedding_1.pt --image_latent_channel_scales 0.975,1.027,1.009,1.195,1.259,1.173,1.265,0.932,1.144,0.888,0.522,0.748 --host 127.0.0.1 --port 7861 --session_dir ./runs/headless_sessions --whisper_model base
+    PYTHONPATH=src python3 -m scripts.eval.world.chat_headless --checkpoint_path runs/world/my_run/checkpoint-N --config small_sum_dit --include_modes text,voice,image --tie_word_embeddings --bf16 --voice_smg_checkpoint_path ./runs/smg/.../checkpoint-300000 --voice_smg_config medium_decoder_only_1d_3x --voice_smg_latent_channels 128 --vocoder_config hifigan --image_vae_decoder_config litevae --static_speaker_embedding_path ./logs/speaker_embedding_1.pt --image_latent_channel_scales 0.975,1.027,1.009,1.195,1.259,1.173,1.265,0.932,1.144,0.888,0.522,0.748 --host 127.0.0.1 --port 7861 --session_dir ./runs/headless_sessions --whisper_model base
 
 Client side (curl):
     curl -s -X POST http://127.0.0.1:7861/generate -H 'Content-Type: application/json' -d '{"prompt":"a photo of a red car.","modality_hint":"image","seed":42}' | jq .
@@ -63,7 +63,7 @@ import torch
 import torchaudio
 from torch.amp import autocast
 
-from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
+from model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from model.world.world_model import MegaTransformerWorldModel
 from utils import model_loading_utils
 from utils.audio_utils import SharedWindowBuffer
@@ -94,10 +94,10 @@ def parse_args():
     p.add_argument("--voice_token_budget", type=int, default=209)
     p.add_argument("--audio_token_budget", type=int, default=209)
 
-    # Voice CVAE + vocoder
-    p.add_argument("--voice_cvae_checkpoint_path", type=str, default=None)
-    p.add_argument("--voice_cvae_config", type=str, default="medium_decoder_only_1d_3x")
-    p.add_argument("--voice_cvae_latent_channels", type=int, default=None)
+    # Voice SMG + vocoder
+    p.add_argument("--voice_smg_checkpoint_path", type=str, default=None)
+    p.add_argument("--voice_smg_config", type=str, default="medium_decoder_only_1d_3x")
+    p.add_argument("--voice_smg_latent_channels", type=int, default=None)
     p.add_argument("--vocoder_config", type=str, default="hifigan")
     p.add_argument("--vocoder_checkpoint_path", type=str, default=None)
     p.add_argument("--static_speaker_embedding_path", type=str, default=None)
@@ -178,20 +178,20 @@ class Runner:
             self.litevae = _load_litevae("litevae", device=self.device)
             self.litevae.eval()
 
-        # Voice CVAE decoder
-        self.cvae_decoder = None
-        if args.voice_cvae_checkpoint_path:
-            print(f"[runner] Loading voice CVAE ({args.voice_cvae_config})...")
-            from model.audio.vae.vae import AudioCVAEDecoderOnly
-            cvae_overrides = {}
-            if args.voice_cvae_latent_channels is not None:
-                cvae_overrides["latent_channels"] = args.voice_cvae_latent_channels
-            self.cvae_decoder = model_loading_utils.load_model(
-                AudioCVAEDecoderOnly, args.voice_cvae_config,
-                checkpoint_path=args.voice_cvae_checkpoint_path,
-                device=self.device, strict=False, overrides=cvae_overrides,
+        # Voice SMG decoder
+        self.smg_decoder = None
+        if args.voice_smg_checkpoint_path:
+            print(f"[runner] Loading voice SMG ({args.voice_smg_config})...")
+            from model.smg.smg import SMG
+            smg_overrides = {}
+            if args.voice_smg_latent_channels is not None:
+                smg_overrides["latent_channels"] = args.voice_smg_latent_channels
+            self.smg_decoder = model_loading_utils.load_model(
+                SMG, args.voice_smg_config,
+                checkpoint_path=args.voice_smg_checkpoint_path,
+                device=self.device, strict=False, overrides=smg_overrides,
             )
-            self.cvae_decoder.eval()
+            self.smg_decoder.eval()
 
         # Vocoder
         self.vocoder = None
@@ -317,8 +317,8 @@ class Runner:
         voice_info = []
         voice_lens_out = outputs.get("voice_lengths")
         if real_voice:
-            if self.cvae_decoder is None or self.vocoder is None:
-                voice_info.append({"error": "voice generated but CVAE/vocoder not loaded"})
+            if self.smg_decoder is None or self.vocoder is None:
+                voice_info.append({"error": "voice generated but SMG/vocoder not loaded"})
             elif self.speaker_emb is None:
                 voice_info.append({"error": "voice generated but no --static_speaker_embedding_path"})
             else:
@@ -329,7 +329,7 @@ class Runner:
                         latent = latent[:, :T]
                     try:
                         sr, wav_np = decode_voice_latent(
-                            latent, self.cvae_decoder, self.vocoder,
+                            latent, self.smg_decoder, self.vocoder,
                             self.speaker_emb, self.args.sample_rate,
                         )
                         path = os.path.join(session, f"voice_{k + 1}.wav")

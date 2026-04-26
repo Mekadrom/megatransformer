@@ -12,9 +12,9 @@ from utils.audio_utils import SharedWindowBuffer
 from torch.amp import autocast
 
 
-class AudioCVAEVisualizationCallback(VisualizationCallback):
+class SMGVisualizationCallback(VisualizationCallback):
     """
-    Callback for logging VAE mel spectrogram reconstruction during training.
+    Callback for logging SMG mel spectrogram reconstruction during training.
     Periodically reconstructs test mel specs and logs to TensorBoard.
     Optionally converts mel spectrograms to audio using a vocoder.
     """
@@ -23,11 +23,11 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
         self,
         shared_window_buffer: SharedWindowBuffer,
         step_offset: int = 0,
-        audio_max_seconds: int = 10,
-        audio_sample_rate: int = 16000,
-        audio_n_mels: int = 80,
-        audio_n_fft: int = 1024,
-        audio_hop_length: int = 256,
+        voice_max_seconds: int = 10,
+        voice_sample_rate: int = 16000,
+        voice_n_mels: int = 80,
+        voice_n_fft: int = 1024,
+        voice_hop_length: int = 256,
         vocoder_checkpoint_path: Optional[str] = None,
         vocoder_config: str = "experimental",
         vocoder: Optional[torch.nn.Module] = None,  # Pre-loaded vocoder (shared with trainer)
@@ -39,10 +39,10 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
 
         self.trainer: Optional[Trainer] = None
         self.step_offset = step_offset if step_offset is not None else 0
-        self.audio_sample_rate = audio_sample_rate
-        self.audio_n_mels = audio_n_mels
-        self.audio_n_fft = audio_n_fft
-        self.audio_hop_length = audio_hop_length
+        self.voice_sample_rate = voice_sample_rate
+        self.voice_n_mels = voice_n_mels
+        self.voice_n_fft = voice_n_fft
+        self.voice_hop_length = voice_hop_length
         self.num_eval_samples = num_eval_samples
         self.speaker_encoder_type = speaker_encoder_type
         self.free_bits = free_bits
@@ -90,7 +90,9 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
         # Collect sample data for cross-speaker reconstruction
         eval_samples_data = []  # List of (mel, speaker_embedding, mu, mel_length)
 
-        is_vae = hasattr(model, "encoder") and model.encoder is not None
+        # SMG has no encoder — all is_vae branches below are dead-code paths kept only
+        # to minimize churn; the flag is always False.
+        is_vae = False
 
         with torch.no_grad():
             dtype = torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32
@@ -227,27 +229,27 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
                         recon_mu_only_trimmed = recon_mu_only_cpu[..., :mel_lengths]
 
                     # Log individual mel spectrograms
-                    fig = visualization.render_mel_spectrogram(mel_trimmed, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
-                    metrics.log_figure(f"eval_vae/original/{i}", fig, global_step)
+                    fig = visualization.render_mel_spectrogram(mel_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
+                    metrics.log_figure(f"eval_smg/original/{i}", fig, global_step)
                     plt.close(fig)
 
-                    fig = visualization.render_mel_spectrogram(recon_trimmed, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
-                    metrics.log_figure(f"eval_vae/reconstruction/{i}", fig, global_step)
+                    fig = visualization.render_mel_spectrogram(recon_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
+                    metrics.log_figure(f"eval_smg/reconstruction/{i}", fig, global_step)
                     plt.close(fig)
 
                     if is_vae:
-                        fig = visualization.render_mel_spectrogram(recon_mu_only_trimmed, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
-                        metrics.log_figure(f"eval_vae/reconstruction_mu_only/{i}", fig, global_step)
+                        fig = visualization.render_mel_spectrogram(recon_mu_only_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
+                        metrics.log_figure(f"eval_smg/reconstruction_mu_only/{i}", fig, global_step)
                         plt.close(fig)
 
                     # Log trimmed comparison
                     fig = visualization.render_mel_comparison(recon_trimmed, mel_trimmed)
-                    metrics.log_figure(f"eval_vae/comparison/{i}", fig, global_step)
+                    metrics.log_figure(f"eval_smg/comparison/{i}", fig, global_step)
                     plt.close(fig)
 
                     if is_vae:
                         fig = visualization.render_mel_comparison(recon_mu_only_trimmed, mel_trimmed)
-                        metrics.log_figure(f"eval_vae/comparison_mu_only/{i}", fig, global_step)
+                        metrics.log_figure(f"eval_smg/comparison_mu_only/{i}", fig, global_step)
                         plt.close(fig)
 
                     # Log per-example losses (skip non-scalar values like learned_speaker_embedding)
@@ -258,7 +260,7 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
                             loss_val = loss_val.item()
                         elif not isinstance(loss_val, (int, float)):
                             continue
-                        metrics.log_scalar(f"eval_vae/example_{i}/{loss_name}", loss_val, global_step)
+                        metrics.log_scalar(f"eval_smg/example_{i}/{loss_name}", loss_val, global_step)
 
                     # Log latent channel visualizations for first few samples
                     if is_vae and i < 4:
@@ -267,7 +269,7 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
                         mu_norm = (mu_sample - mu_min) / (mu_max - mu_min + 1e-5)
                         for c in range(min(mu_norm.shape[0], 8)):  # Limit to first 8 channels
                             metrics.log_image(
-                                f"eval_vae/example_{i}/mu_channel_{c}",
+                                f"eval_smg/example_{i}/mu_channel_{c}",
                                 mu_norm[c:c+1, None, :],
                                 global_step
                             )
@@ -291,13 +293,13 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
                         # Log ground truth audio
                         try:
                             waveform = visualization.render_vocoder_audio(self.vocoder, mel_tensor[..., :mel_lengths])
-                            metrics.log_audio(f"eval_vae/original_audio/{i}", waveform, global_step, self.audio_sample_rate)
+                            metrics.log_audio(f"eval_smg/original_audio/{i}", waveform, global_step, self.voice_sample_rate)
                         except Exception as e:
                             print(f"Vocoder failed for original audio {i}: {e}")
                         # Log reconstruction audio
                         try:
                             waveform = visualization.render_vocoder_audio(self.vocoder, recon_mel_tensor[..., :mel_lengths])
-                            metrics.log_audio(f"eval_vae/recon_audio/{i}", waveform, global_step, self.audio_sample_rate)
+                            metrics.log_audio(f"eval_smg/recon_audio/{i}", waveform, global_step, self.voice_sample_rate)
                         except Exception as e:
                             print(f"Vocoder failed for recon audio {i}: {e}")
                         # Log mu-only reconstruction audio (what diffusion will produce)
@@ -305,19 +307,19 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
                             recon_mu_only_mel_tensor = recon_mu_only[0].squeeze(0).float().cpu()
                             try:
                                 waveform = visualization.render_vocoder_audio(self.vocoder, recon_mu_only_mel_tensor[..., :mel_lengths])
-                                metrics.log_audio(f"eval_vae/recon_mu_only_audio/{i}", waveform, global_step, self.audio_sample_rate)
+                                metrics.log_audio(f"eval_smg/recon_mu_only_audio/{i}", waveform, global_step, self.voice_sample_rate)
                             except Exception as e:
                                 print(f"Vocoder failed for mu-only recon audio {i}: {e}")
 
         # Log aggregate statistics
         for loss_name, loss_vals in all_losses.items():
-            metrics.log_scalar(f"eval_vae/mean_{loss_name}", np.mean(loss_vals), global_step)
-            metrics.log_scalar(f"eval_vae/std_{loss_name}", np.std(loss_vals), global_step)
+            metrics.log_scalar(f"eval_smg/mean_{loss_name}", np.mean(loss_vals), global_step)
+            metrics.log_scalar(f"eval_smg/std_{loss_name}", np.std(loss_vals), global_step)
 
         if is_vae:
-            metrics.log_scalar("eval_vae/mean_mu_mean", np.mean(all_mu_means), global_step)
-            metrics.log_scalar("eval_vae/mean_mu_std", np.mean(all_mu_stds), global_step)
-            metrics.log_scalar("eval_vae/mean_logvar_mean", np.mean(all_logvar_means), global_step)
+            metrics.log_scalar("eval_smg/mean_mu_mean", np.mean(all_mu_means), global_step)
+            metrics.log_scalar("eval_smg/mean_mu_std", np.mean(all_mu_stds), global_step)
+            metrics.log_scalar("eval_smg/mean_logvar_mean", np.mean(all_logvar_means), global_step)
 
         # Cross-speaker reconstruction on eval samples
         # Select samples that have speaker embeddings
@@ -387,20 +389,20 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
                         cross_a_trimmed = cross_recon_a_with_b[0].squeeze(0).float().cpu().numpy()[..., :sample_a["mel_length"]]
 
                         metrics.log_text(
-                            f"eval_vae/cross_speaker/pair{pair_idx}",
+                            f"eval_smg/cross_speaker/pair{pair_idx}",
                             f"content{sample_a_idx}_spk{sample_b_idx}",
                             global_step
                         )
-                        fig = visualization.render_mel_spectrogram(mel_a_trimmed, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
-                        metrics.log_figure(f"eval_vae/cross_speaker/pair{pair_idx}/original", fig, global_step)
+                        fig = visualization.render_mel_spectrogram(mel_a_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/original", fig, global_step)
                         plt.close(fig)
 
-                        fig = visualization.render_mel_spectrogram(cross_a_trimmed, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
-                        metrics.log_figure(f"eval_vae/cross_speaker/pair{pair_idx}/reconstruction", fig, global_step)
+                        fig = visualization.render_mel_spectrogram(cross_a_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/reconstruction", fig, global_step)
                         plt.close(fig)
 
                         fig = visualization.render_mel_comparison(cross_a_trimmed, mel_a_trimmed)
-                        metrics.log_figure(f"eval_vae/cross_speaker/pair{pair_idx}/comparison", fig, global_step)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/comparison", fig, global_step)
                         plt.close(fig)
 
                         # Log B with A's speaker
@@ -408,50 +410,50 @@ class AudioCVAEVisualizationCallback(VisualizationCallback):
                         cross_b_trimmed = cross_recon_b_with_a[0].squeeze(0).float().cpu().numpy()[..., :sample_b["mel_length"]]
 
                         metrics.log_text(
-                            f"eval_vae/cross_speaker/pair{pair_idx}",
+                            f"eval_smg/cross_speaker/pair{pair_idx}",
                             f"content{sample_b_idx}_spk{sample_a_idx}",
                             global_step
                         )
-                        fig = visualization.render_mel_spectrogram(mel_b_trimmed, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
-                        metrics.log_figure(f"eval_vae/cross_speaker/pair{pair_idx}/original", fig, global_step)
+                        fig = visualization.render_mel_spectrogram(mel_b_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/original", fig, global_step)
                         plt.close(fig)
 
-                        fig = visualization.render_mel_spectrogram(cross_b_trimmed, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
-                        metrics.log_figure(f"eval_vae/cross_speaker/pair{pair_idx}/reconstruction", fig, global_step)
+                        fig = visualization.render_mel_spectrogram(cross_b_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/reconstruction", fig, global_step)
                         plt.close(fig)
 
                         fig = visualization.render_mel_comparison(cross_b_trimmed, mel_b_trimmed)
-                        metrics.log_figure(f"eval_vae/cross_speaker/pair{pair_idx}/comparison", fig, global_step)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/comparison", fig, global_step)
                         plt.close(fig)
 
                         # Log audio if vocoder available
                         if self.vocoder is not None:
                             try:
                                 waveform = visualization.render_vocoder_audio(self.vocoder, cross_recon_a_with_b[0].squeeze(0).float().cpu()[..., :sample_a["mel_length"]])
-                                metrics.log_audio(f"eval_vae/cross_speaker/pair{pair_idx}_ab/audio", waveform, global_step, self.audio_sample_rate)
+                                metrics.log_audio(f"eval_smg/cross_speaker/pair{pair_idx}_ab/audio", waveform, global_step, self.voice_sample_rate)
 
                                 waveform_mels = audio_utils.extract_mels(
                                     self.shared_window_buffer,
                                     torch.from_numpy(waveform)
                                 ).cpu().numpy()
 
-                                fig = visualization.render_mel_spectrogram(waveform_mels, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
-                                metrics.log_figure(f"eval_vae/cross_speaker/pair{pair_idx}_ab/waveform_mel", fig, global_step)
+                                fig = visualization.render_mel_spectrogram(waveform_mels, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
+                                metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}_ab/waveform_mel", fig, global_step)
                                 plt.close(fig)
                             except Exception as e:
                                 print(f"Vocoder failed for cross-speaker pair {pair_idx} AB: {e}")
 
                             try:
                                 waveform = visualization.render_vocoder_audio(self.vocoder, cross_recon_b_with_a[0].squeeze(0).float().cpu()[..., :sample_b["mel_length"]])
-                                metrics.log_audio(f"eval_vae/cross_speaker/pair{pair_idx}_ba/audio", waveform, global_step, self.audio_sample_rate)
+                                metrics.log_audio(f"eval_smg/cross_speaker/pair{pair_idx}_ba/audio", waveform, global_step, self.voice_sample_rate)
 
                                 waveform_mels = audio_utils.extract_mels(
                                     self.shared_window_buffer,
                                     torch.from_numpy(waveform)
                                 ).cpu().numpy()
 
-                                fig = visualization.render_mel_spectrogram(waveform_mels, hop_length=self.audio_hop_length, sample_rate=self.audio_sample_rate, n_fft=self.audio_n_fft)
-                                metrics.log_figure(f"eval_vae/cross_speaker/pair{pair_idx}_ba/waveform_mel", fig, global_step)
+                                fig = visualization.render_mel_spectrogram(waveform_mels, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
+                                metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}_ba/waveform_mel", fig, global_step)
                                 plt.close(fig)
                             except Exception as e:
                                 print(f"Vocoder failed for cross-speaker pair {pair_idx} BA: {e}")

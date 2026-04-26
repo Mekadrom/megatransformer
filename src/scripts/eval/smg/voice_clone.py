@@ -1,12 +1,12 @@
 """
-Gradio demo for voice cloning using SIVE + CVAE + vocoder.
+Gradio demo for voice cloning using SIVE + SMG + vocoder.
 
 Uploads a content audio and a speaker reference audio, extracts SIVE features
 from the content, ECAPA-TDNN speaker embeddings from the reference, runs the
-CVAE decoder to produce a mel spectrogram, and synthesizes audio via vocoder.
+SMG decoder to produce a mel spectrogram, and synthesizes audio via vocoder.
 
 Usage:
-    python -m src.scripts.eval.audio.cvae.voice_clone --sive_checkpoint_path ./checkpoints/sive/checkpoint-60000 --sive_config tiny_deep --cvae_checkpoint_path ./checkpoints/cvae/checkpoint-50000 --cvae_config small_decoder_only_1d --vocoder_config hifigan
+    python -m src.scripts.eval.smg.voice_clone --sive_checkpoint_path ./checkpoints/sive/checkpoint-60000 --sive_config tiny_deep --smg_checkpoint_path ./checkpoints/smg/checkpoint-50000 --smg_config small_decoder_only_1d --vocoder_config hifigan
 """
 import argparse
 
@@ -15,15 +15,15 @@ import numpy as np
 import torch
 import torchaudio
 
-from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
-from model.audio.vae.vae import AudioVAE, AudioCVAEDecoderOnly
+from model.voice.sive.sive import SpeakerInvariantVoiceEncoder
+from model.smg.smg import SMG
 from utils.audio_utils import SharedWindowBuffer, extract_mels
 from utils.model_loading_utils import load_model, load_vocoder
 from utils.speaker_encoder import get_speaker_encoder
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Voice cloning with SIVE + CVAE")
+    parser = argparse.ArgumentParser(description="Voice cloning with SIVE + SMG")
 
     # SIVE
     parser.add_argument("--sive_checkpoint_path", type=str, required=True, help="Path to SIVE checkpoint directory")
@@ -32,11 +32,9 @@ def parse_args():
     parser.add_argument("--num_speakers", type=int, default=2338, help="Number of speakers for SIVE model (must match checkpoint)")
     parser.add_argument("--speaker_pooling", type=str, default=None, help="SIVE speaker pooling override (e.g. 'attentive_statistics', 'mean')")
 
-    # CVAE
-    parser.add_argument("--cvae_checkpoint_path", type=str, required=True, help="Path to CVAE checkpoint directory")
-    parser.add_argument("--cvae_config", type=str, default="small_decoder_only_1d", help="CVAE config name")
-    parser.add_argument("--decoder_only", action="store_true", default=True, help="Use AudioCVAEDecoderOnly (default: True)")
-    parser.add_argument("--no_decoder_only", action="store_true", help="Use full AudioVAE instead of decoder-only")
+    # SMG
+    parser.add_argument("--smg_checkpoint_path", type=str, required=True, help="Path to SMG checkpoint directory")
+    parser.add_argument("--smg_config", type=str, default="small_decoder_only_1d", help="SMG config name")
 
     # Vocoder
     parser.add_argument("--vocoder_checkpoint_path", type=str, default=None, help="Path to custom vocoder checkpoint (None for pretrained)")
@@ -68,7 +66,6 @@ def load_audio(path, sample_rate):
 
 def main():
     args = parse_args()
-    decoder_only = args.decoder_only and not args.no_decoder_only
     device = args.device
     shared_window_buffer = SharedWindowBuffer()
 
@@ -86,20 +83,19 @@ def main():
     sive.eval()
     print(f"SIVE loaded ({sum(p.numel() for p in sive.parameters()):,} params)")
 
-    # Load CVAE — auto-wire latent_channels from SIVE encoder_dim
+    # Load SMG — auto-wire latent_channels from SIVE encoder_dim
     sive_encoder_dim = sive.config.encoder_dim
-    cvae_cls = AudioCVAEDecoderOnly if decoder_only else AudioVAE
-    print(f"Loading {'AudioCVAEDecoderOnly' if decoder_only else 'AudioVAE'} ({args.cvae_config}) from {args.cvae_checkpoint_path}")
+    print(f"Loading SMG ({args.smg_config}) from {args.smg_checkpoint_path}")
     print(f"  Auto-wiring latent_channels={sive_encoder_dim} from SIVE encoder_dim")
-    cvae = load_model(
-        cvae_cls,
-        args.cvae_config,
-        checkpoint_path=args.cvae_checkpoint_path,
+    smg = load_model(
+        SMG,
+        args.smg_config,
+        checkpoint_path=args.smg_checkpoint_path,
         device=device,
         overrides={"latent_channels": sive_encoder_dim},
     )
-    cvae.eval()
-    print(f"CVAE loaded ({sum(p.numel() for p in cvae.parameters()):,} params)")
+    smg.eval()
+    print(f"SMG loaded ({sum(p.numel() for p in smg.parameters()):,} params)")
 
     # Load speaker encoder
     print("Loading ECAPA-TDNN speaker encoder...")
@@ -142,24 +138,15 @@ def main():
         )
         # sive_features: [1, T', encoder_dim]
 
-        # CVAE expects channel-first: [B, D, T']
+        # SMG expects channel-first: [B, D, T']
         sive_features_cf = sive_features.permute(0, 2, 1)
 
-        # Run CVAE decoder
-        if decoder_only:
-            mel_recon = cvae.decode(
-                z=sive_features_cf,
-                speaker_embedding=speaker_embedding,
-                features=sive_features_cf,
-            )
-        else:
-            # Full VAE: encode to latent, then decode
-            mu, logvar = cvae.encode(sive_features_cf)
-            mel_recon = cvae.decode(
-                z=mu,
-                speaker_embeddings=speaker_embedding,
-                features=sive_features_cf,
-            )
+        # Run SMG decoder
+        mel_recon = smg.decode(
+            z=sive_features_cf,
+            speaker_embedding=speaker_embedding,
+            features=sive_features_cf,
+        )
 
         # Handle 2D decoder output [B, 1, n_mels, T] -> [B, n_mels, T]
         if mel_recon.dim() == 4:
@@ -188,12 +175,12 @@ def main():
             gr.Audio(type="filepath", label="Speaker Reference (whose voice to use)"),
         ],
         outputs=gr.Audio(type="numpy", label="Voice Cloned Output"),
-        title="Voice Cloning with SIVE + CVAE",
+        title="Voice Cloning with SIVE + SMG",
         description=(
             "Upload a content audio file and a speaker reference audio file. "
             "The system extracts linguistic features from the content audio using SIVE "
             "and speaker characteristics from the reference using ECAPA-TDNN, "
-            "then generates speech in the target speaker's voice via the CVAE decoder."
+            "then generates speech in the target speaker's voice via the SMG decoder."
         ),
     )
     demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)

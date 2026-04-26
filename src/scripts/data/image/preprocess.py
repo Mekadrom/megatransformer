@@ -15,7 +15,7 @@ from datasets import load_dataset
 from PIL.Image import Image
 from torchvision import transforms
 
-from scripts.data.preprocessor import BatchProcessor, Preprocessor
+from scripts.data.preprocessor import BatchProcessor, Preprocessor, validate_shard_alignment
 from utils.text_encoder import extract_text_embedding, get_text_encoder
 
 
@@ -60,7 +60,32 @@ def create_image_transforms(
     return transforms.Compose(transform_list)
 
 
-def download_image(url: str, timeout: int = 1) -> Optional[Image]:
+_DOWNLOAD_ERROR_COUNTS: dict[str, int] = {}
+_DOWNLOAD_ERROR_FIRST_SEEN: dict[str, tuple[str, str]] = {}  # kind -> (url, message)
+
+
+def _record_download_error(kind: str, url: str, message: str) -> None:
+    """Accumulate download error stats so the first occurrence of each failure
+    mode is visible without flooding stdout with one line per of 100k+ samples."""
+    if kind not in _DOWNLOAD_ERROR_COUNTS:
+        _DOWNLOAD_ERROR_COUNTS[kind] = 0
+        _DOWNLOAD_ERROR_FIRST_SEEN[kind] = (url, message)
+        print(f"[download_image] First {kind}: url={url!r} msg={message}")
+    _DOWNLOAD_ERROR_COUNTS[kind] += 1
+
+
+def print_download_error_summary() -> None:
+    """Call at end of preprocessing run to see which failure modes dominated."""
+    if not _DOWNLOAD_ERROR_COUNTS:
+        return
+    total = sum(_DOWNLOAD_ERROR_COUNTS.values())
+    print(f"\n[download_image] {total} downloads failed across {len(_DOWNLOAD_ERROR_COUNTS)} error categories:")
+    for kind, count in sorted(_DOWNLOAD_ERROR_COUNTS.items(), key=lambda kv: -kv[1]):
+        url, msg = _DOWNLOAD_ERROR_FIRST_SEEN[kind]
+        print(f"  {count:>8,}  {kind:<30} first: url={url!r} msg={msg}")
+
+
+def download_image(url: str, timeout: int = 10) -> Optional[Image]:
     """
     Download image from URL.
 
@@ -71,6 +96,9 @@ def download_image(url: str, timeout: int = 1) -> Optional[Image]:
     Returns:
         PIL Image or None if download failed
     """
+    if not isinstance(url, str) or not url:
+        _record_download_error("empty_or_nonstring_url", str(url), "url is not a non-empty string")
+        return None
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -81,6 +109,7 @@ def download_image(url: str, timeout: int = 1) -> Optional[Image]:
         # Check content type
         content_type = response.headers.get('content-type', '')
         if not content_type.startswith('image/'):
+            _record_download_error("non_image_content_type", url, f"content-type={content_type!r}")
             return None
 
         # Load image
@@ -91,8 +120,18 @@ def download_image(url: str, timeout: int = 1) -> Optional[Image]:
             img = img.convert('RGB')
 
         return img
-    except Exception:
-        return None
+    except requests.exceptions.Timeout as e:
+        _record_download_error("timeout", url, str(e))
+    except requests.exceptions.SSLError as e:
+        _record_download_error("ssl_error", url, str(e))
+    except requests.exceptions.ConnectionError as e:
+        _record_download_error("connection_error", url, str(e))
+    except requests.exceptions.HTTPError as e:
+        status = getattr(e.response, "status_code", "?")
+        _record_download_error(f"http_{status}", url, str(e))
+    except Exception as e:
+        _record_download_error(f"other_{type(e).__name__}", url, str(e))
+    return None
 
 
 class ConditionsBatchProcessor(BatchProcessor):
@@ -248,7 +287,10 @@ class ImageDatasetPreprocessor(Preprocessor):
         self.device = device
 
         if image_column is not None:
-            print(f"  Total samples in dataset: {len(self.dataset):,}")
+            try:
+                print(f"  Total samples in dataset: {len(self.dataset):,}")
+            except TypeError:
+                print(f"  Total samples in dataset: (streaming, size unknown)")
 
             self.batch_processor = ImageBatchProcessor(
                 image_size=self.args.image_size,
@@ -256,7 +298,10 @@ class ImageDatasetPreprocessor(Preprocessor):
                 device=self.device,
             )
         elif url_column is not None:
-            print(f"  Total samples in dataset: {len(self.dataset):,}")
+            try:
+                print(f"  Total samples in dataset: {len(self.dataset):,}")
+            except TypeError:
+                print(f"  Total samples in dataset: (streaming, size unknown)")
 
             self.batch_processor = URLImageBatchProcessor(
                 image_size=self.args.image_size,
@@ -328,6 +373,9 @@ class ImageDatasetPreprocessor(Preprocessor):
 
             shard_data.update({"conditions": torch.cat(padded_features, dim=0)})
 
+
+        # Catch accumulator-lifecycle bugs before they go to disk.
+        validate_shard_alignment(shard_data, shard_data["num_samples"])
 
         shard_path = os.path.join(self.output_dir, f"shard_{self.shard_fields['shard_idx']:06d}.pt")
         torch.save(shard_data, shard_path)

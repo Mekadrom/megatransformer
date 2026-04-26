@@ -14,7 +14,7 @@ UX:
   appended to the prompt
 
 Usage:
-    python -m src.scripts.eval.world.multimodal_chat --checkpoint_path runs/world/my_run/checkpoint-3000 --config small_sum_dit --include_modes text,voice,image --tie_word_embeddings --bf16 --sive_checkpoint_path ./checkpoints/sive --sive_config tiny_deep --voice_cvae_checkpoint_path ./checkpoints/cvae --voice_cvae_config medium_decoder_only_1d_3x --voice_cvae_latent_channels 128 --vocoder_config hifigan --image_vae_decoder_config litevae --static_speaker_embedding_path ./logs/speaker_embedding_1.pt
+    python -m src.scripts.eval.world.multimodal_chat --checkpoint_path runs/world/my_run/checkpoint-3000 --config small_sum_dit --include_modes text,voice,image --tie_word_embeddings --bf16 --sive_checkpoint_path ./checkpoints/sive --sive_config tiny_deep --voice_smg_checkpoint_path ./checkpoints/smg --voice_smg_config medium_decoder_only_1d_3x --voice_smg_latent_channels 128 --vocoder_config hifigan --image_vae_decoder_config litevae --static_speaker_embedding_path ./logs/speaker_embedding_1.pt
 """
 
 import argparse
@@ -31,7 +31,7 @@ import torchaudio
 from PIL import Image
 from torch.amp import autocast
 
-from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
+from model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from model.world.world_model import MegaTransformerWorldModel
 from utils import model_loading_utils
 from utils.audio_utils import SharedWindowBuffer, extract_mels
@@ -81,10 +81,10 @@ def parse_args():
     p.add_argument("--sive_layer", type=int, default=10)
     p.add_argument("--sive_num_speakers", type=int, default=2338)
 
-    # Voice CVAE + vocoder (for decoding generated voice)
-    p.add_argument("--voice_cvae_checkpoint_path", type=str, default=None)
-    p.add_argument("--voice_cvae_config", type=str, default="medium_decoder_only_1d_3x")
-    p.add_argument("--voice_cvae_latent_channels", type=int, default=None)
+    # Voice SMG + vocoder (for decoding generated voice)
+    p.add_argument("--voice_smg_checkpoint_path", type=str, default=None)
+    p.add_argument("--voice_smg_config", type=str, default="medium_decoder_only_1d_3x")
+    p.add_argument("--voice_smg_latent_channels", type=int, default=None)
     p.add_argument("--vocoder_config", type=str, default="hifigan")
     p.add_argument("--vocoder_checkpoint_path", type=str, default=None)
     p.add_argument("--static_speaker_embedding_path", type=str, default=None,
@@ -315,13 +315,13 @@ def decode_image_latent(litevae, latent: torch.Tensor, device: str) -> tuple[Ima
     return Image.fromarray(arr), stats
 
 
-def decode_voice_latent(latent: torch.Tensor, cvae_decoder, vocoder, speaker_embedding: torch.Tensor, sample_rate: int) -> tuple[int, np.ndarray]:
-    device = next(cvae_decoder.parameters()).device
-    dtype = next(cvae_decoder.parameters()).dtype
+def decode_voice_latent(latent: torch.Tensor, smg_decoder, vocoder, speaker_embedding: torch.Tensor, sample_rate: int) -> tuple[int, np.ndarray]:
+    device = next(smg_decoder.parameters()).device
+    dtype = next(smg_decoder.parameters()).dtype
     z = latent.to(device=device, dtype=dtype).unsqueeze(0)
     spk = speaker_embedding.to(device=device, dtype=dtype).unsqueeze(0)
     with torch.no_grad():
-        mel = cvae_decoder.decode(z=z, speaker_embedding=spk, features=z)
+        mel = smg_decoder.decode(z=z, speaker_embedding=spk, features=z)
     if isinstance(mel, tuple):
         mel = mel[0]
     if isinstance(mel, dict):
@@ -406,19 +406,19 @@ def main():
         litevae = _load_litevae("litevae", device=device)
         litevae.eval()
 
-    cvae_decoder = None
-    if args.voice_cvae_checkpoint_path:
-        print(f"Loading voice CVAE ({args.voice_cvae_config})...")
-        from model.audio.vae.vae import AudioCVAEDecoderOnly
-        cvae_overrides = {}
-        if args.voice_cvae_latent_channels is not None:
-            cvae_overrides["latent_channels"] = args.voice_cvae_latent_channels
-        cvae_decoder = model_loading_utils.load_model(
-            AudioCVAEDecoderOnly, args.voice_cvae_config,
-            checkpoint_path=args.voice_cvae_checkpoint_path,
-            device=device, strict=False, overrides=cvae_overrides,
+    smg_decoder = None
+    if args.voice_smg_checkpoint_path:
+        print(f"Loading voice SMG ({args.voice_smg_config})...")
+        from model.smg.smg import SMG
+        smg_overrides = {}
+        if args.voice_smg_latent_channels is not None:
+            smg_overrides["latent_channels"] = args.voice_smg_latent_channels
+        smg_decoder = model_loading_utils.load_model(
+            SMG, args.voice_smg_config,
+            checkpoint_path=args.voice_smg_checkpoint_path,
+            device=device, strict=False, overrides=smg_overrides,
         )
-        cvae_decoder.eval()
+        smg_decoder.eval()
 
     vocoder = None
     if args.vocoder_config or args.vocoder_checkpoint_path:
@@ -671,8 +671,8 @@ def main():
         voice_lens_out = outputs.get("voice_lengths")
         if voice_preds is not None and voice_counts is not None:
             n_voice = int(voice_counts[0].item())
-            if n_voice and (cvae_decoder is None or vocoder is None):
-                status_lines.append(f"{n_voice} voice block(s) generated but CVAE/vocoder missing — skipping decode")
+            if n_voice and (smg_decoder is None or vocoder is None):
+                status_lines.append(f"{n_voice} voice block(s) generated but SMG/vocoder missing — skipping decode")
             elif n_voice and static_speaker_emb is None:
                 status_lines.append(f"{n_voice} voice block(s) generated but no --static_speaker_embedding_path — skipping decode")
             elif n_voice:
@@ -683,7 +683,7 @@ def main():
                         latent = latent[:, :T]
                     try:
                         sr, wav_np = decode_voice_latent(
-                            latent, cvae_decoder, vocoder, static_speaker_emb, args.sample_rate,
+                            latent, smg_decoder, vocoder, static_speaker_emb, args.sample_rate,
                         )
                         path = os.path.join(wav_tmpdir, f"voice_{int(time.time() * 1000)}_{k}.wav")
                         torchaudio.save(path, torch.from_numpy(wav_np).unsqueeze(0), sr)

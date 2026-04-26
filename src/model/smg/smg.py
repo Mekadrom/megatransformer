@@ -6,138 +6,16 @@ from typing import Optional, Union
 
 from torch.utils.checkpoint import checkpoint
 
-from config.audio.vae.vae import AUDIO_VAE_CONFIGS, AUDIO_DECODER_CONFIGS, AUDIO_DECODER_1D_CONFIGS, AUDIO_ENCODER_CONFIGS, F0_CONDITIONING_EMBEDDING_CONFIGS, F0_PREDICTOR_CONFIGS, AudioVAEConfig, F0ConditioningEmbeddingConfig, F0PredictorConfig
-from config.audio.vae.vae import AudioVAEDecoderConfig, AudioVAEDecoder1DConfig, AudioVAEEncoderConfig
+from config.smg.smg import SMG_CONFIGS, SMG_DECODER_2D_CONFIGS, SMG_DECODER_1D_CONFIGS, F0_CONDITIONING_EMBEDDING_CONFIGS, F0_PREDICTOR_CONFIGS, SMGConfig, F0ConditioningEmbeddingConfig, F0PredictorConfig
+from config.smg.smg import SMGDecoder2DConfig, SMGDecoder1DConfig
 from model import activations
 from model.activations import get_activation_type
-from model.audio.vae.residual_block import ResidualBlock1d, ResidualBlock2d
+from model.smg.residual_block import ResidualBlock1d, ResidualBlock2d
 
 
-class AudioVAEEncoder(nn.Module):
+class SMGDecoder2D(nn.Module):
     """
-    VAE encoder for SIVE features.
-
-    Takes SIVE features [B, T, D] and compresses to latent space.
-    Uses Conv1D for temporal downsampling.
-
-    Architecture:
-    - Input projection: D -> intermediate_channels[0]
-    - Downsampling stages with strided Conv1D
-    - Optional residual blocks per stage
-    - Output: mu, logvar [B, latent_dim, T']
-    """
-    def __init__(self, config: AudioVAEEncoderConfig):
-        super().__init__()
-
-        self.config = config
-
-        self.strides = config.strides
-        channels = [config.encoder_dim] + config.intermediate_channels
-
-        # Get activation type
-        if config.activation == "snake":
-            self.get_activation = lambda c: activations.Snake(c)
-        else:
-            activation_type = get_activation_type(config.activation)
-            if activation_type in [activations.SwiGLU, activations.Snake]:
-                self.get_activation = lambda c: activation_type(c)
-            else:
-                self.get_activation = lambda c: activation_type()
-
-        # Build encoder stages
-        self.stages = nn.ModuleList()
-        for i, (in_c, out_c, kernel_size, stride) in enumerate(
-            zip(channels[:-1], channels[1:], config.kernel_sizes, config.strides)
-        ):
-            stage = nn.ModuleList()
-
-            # Strided conv for downsampling
-            padding = kernel_size // 2
-            stage.append(nn.Conv1d(in_c, out_c, kernel_size, stride=stride, padding=padding))
-            stage.append(nn.GroupNorm(max(1, out_c // 4), out_c))
-            stage.append(self.get_activation(out_c))
-
-            # Residual blocks
-            for _ in range(config.n_residual_blocks):
-                stage.append(ResidualBlock1d(out_c, out_c, kernel_size=kernel_size, activation_fn=config.activation))
-
-            if config.dropout > 0:
-                stage.append(nn.Dropout(config.dropout))
-
-            self.stages.append(stage)
-
-        # Output projections for mu and logvar
-        final_channels = config.intermediate_channels[-1]
-        self.fc_mu = nn.Conv1d(final_channels, config.latent_channels, kernel_size=3, padding=1)
-        self.fc_logvar = nn.Conv1d(final_channels, config.latent_channels, kernel_size=3, padding=1)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv1d) and module not in [self.fc_mu, self.fc_logvar]:
-                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.GroupNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-
-        # Initialize mu/logvar with smaller variance
-        nn.init.normal_(self.fc_mu.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.fc_mu.bias)
-        nn.init.normal_(self.fc_logvar.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.fc_logvar.bias)
-
-    @classmethod
-    def from_config(cls, config: Union[str, AudioVAEEncoderConfig], **overrides) -> "AudioVAEEncoder":
-        """
-        Create model from predefined config with optional overrides.
-
-        Args:
-            config_name: One of predefined configs
-            **overrides: Override any config parameter
-
-        Example:
-            model = AudioVAEEncoder.from_config("small", latent_dim=32)
-        """
-        if isinstance(config, str):
-            if config not in AUDIO_ENCODER_CONFIGS:
-                raise ValueError(f"Unknown config: {config}. Available: {list(AUDIO_ENCODER_CONFIGS.keys())}")
-            config = AUDIO_ENCODER_CONFIGS[config]
-
-        # Apply overrides
-        config_dict = {k: v for k, v in config.__dict__.items()}
-        config_dict.update(overrides)
-        config = AudioVAEEncoderConfig(**config_dict)
-
-        return cls(config)
-
-    def forward(self, x: torch.Tensor) -> tuple:
-        """
-        Args:
-            x: [B, T, D] SIVE features
-
-        Returns:
-            mu: [B, latent_dim, T'] latent mean
-            logvar: [B, latent_dim, T'] latent log variance
-        """
-        # Process through encoder stages
-        for stage in self.stages:
-            for layer in stage:
-                x = layer(x)
-
-        # Get mu and logvar
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x)
-        logvar = torch.clamp(logvar, min=-10.0, max=self.config.logvar_clamp_max)
-
-        return mu, logvar
-
-
-class AudioVAEDecoder(nn.Module):
-    """
-    Audio VAE decoder that transitions from 1D (SIVE features latents) to 2D convolutions (mel specs).
+    SMG (SIVE-Mel Generator) 2D decoder that transitions from 1D (SIVE features latents) to 2D convolutions (mel specs).
 
     Takes 1D latent [B, latent_dim, T'] and produces 2D mel spectrogram [B, 1, n_mels, T].
 
@@ -151,7 +29,7 @@ class AudioVAEDecoder(nn.Module):
     - Process temporal dynamics with 1D convs (efficient, appropriate for latent)
     - Generate mel spectrograms with 2D convs (captures frequency-local patterns like harmonics)
     """
-    def __init__(self, config: AudioVAEDecoderConfig):
+    def __init__(self, config: SMGDecoder2DConfig):
         super().__init__()
 
         self.config = config
@@ -306,7 +184,7 @@ class AudioVAEDecoder(nn.Module):
                         nn.init.zeros_(linear.bias)
 
     @classmethod
-    def from_config(cls, config: Union[str, AudioVAEDecoderConfig], **overrides) -> "AudioVAEDecoder":
+    def from_config(cls, config: Union[str, SMGDecoder2DConfig], **overrides) -> "SMGDecoder2D":
         """
         Create model from predefined config with optional overrides.
 
@@ -315,23 +193,23 @@ class AudioVAEDecoder(nn.Module):
             **overrides: Override any config parameter
 
         Example:
-            model = AudioVAEDecoder.from_config("small", latent_dim=32)
+            model = SMGDecoder2D.from_config("small", latent_dim=32)
         """
         if isinstance(config, str):
-            if config not in AUDIO_DECODER_CONFIGS:
-                raise ValueError(f"Unknown config: {config}. Available: {list(AUDIO_DECODER_CONFIGS.keys())}")
-            config = AUDIO_DECODER_CONFIGS[config]
+            if config not in SMG_DECODER_2D_CONFIGS:
+                raise ValueError(f"Unknown config: {config}. Available: {list(SMG_DECODER_2D_CONFIGS.keys())}")
+            config = SMG_DECODER_2D_CONFIGS[config]
 
         # Apply overrides
         config_dict = {k: v for k, v in config.__dict__.items()}
         config_dict.update(overrides)
-        config = AudioVAEDecoderConfig(**config_dict)
+        config = SMGDecoder2DConfig(**config_dict)
 
         return cls(config)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.gradient_checkpointing = True
-    
+
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing = False
 
@@ -422,7 +300,7 @@ class AudioVAEDecoder(nn.Module):
         f0_2d: torch.Tensor = self.f0_to_2d_projection(f0_embedding)  # [B, C*H, T]
         f0_2d = f0_2d.view(B, self.channels_2d_initial, self.config.initial_freq_bins, T)
         x = x + f0_2d
-    
+
         # === 2D Processing ===
         for i, stage in enumerate(self.stages_2d):
             if self.gradient_checkpointing and self.training and i >= 1:
@@ -457,9 +335,9 @@ class AudioVAEDecoder(nn.Module):
         return x
 
 
-class AudioVAEDecoder1D(nn.Module):
+class SMGDecoder1D(nn.Module):
     """
-    Conv1D-only audio VAE decoder. Treats frequency as channels throughout.
+    Conv1D-only SMG (SIVE-Mel Generator) decoder. Treats frequency as channels throughout.
 
     Avoids ring/circle artifacts caused by Conv2D's spatial isotropy assumption
     on mel spectrograms where frequency and time axes have different semantics.
@@ -474,7 +352,7 @@ class AudioVAEDecoder1D(nn.Module):
     5. Upsample stages: Upsample + Conv1d + ResidualBlock1d + FiLM
     6. Final conv: channels → output_dim (80 mel bins)
     """
-    def __init__(self, config: AudioVAEDecoder1DConfig):
+    def __init__(self, config: SMGDecoder1DConfig):
         super().__init__()
 
         self.config = config
@@ -607,15 +485,15 @@ class AudioVAEDecoder1D(nn.Module):
                         nn.init.zeros_(linear.bias)
 
     @classmethod
-    def from_config(cls, config: Union[str, AudioVAEDecoder1DConfig], **overrides) -> "AudioVAEDecoder1D":
+    def from_config(cls, config: Union[str, SMGDecoder1DConfig], **overrides) -> "SMGDecoder1D":
         if isinstance(config, str):
-            if config not in AUDIO_DECODER_1D_CONFIGS:
-                raise ValueError(f"Unknown config: {config}. Available: {list(AUDIO_DECODER_1D_CONFIGS.keys())}")
-            config = AUDIO_DECODER_1D_CONFIGS[config]
+            if config not in SMG_DECODER_1D_CONFIGS:
+                raise ValueError(f"Unknown config: {config}. Available: {list(SMG_DECODER_1D_CONFIGS.keys())}")
+            config = SMG_DECODER_1D_CONFIGS[config]
 
         config_dict = {k: v for k, v in config.__dict__.items()}
         config_dict.update(overrides)
-        config = AudioVAEDecoder1DConfig(**config_dict)
+        config = SMGDecoder1DConfig(**config_dict)
 
         return cls(config)
 
@@ -944,351 +822,23 @@ class F0ConditioningEmbedding(nn.Module):
         return emb.transpose(1, 2)  # [B, embedding_dim, T]
 
 
-class AudioVAE(nn.Module):
+class SMG(nn.Module):
     """
-    Complete VAE for SIVE features -> Mel Specs.
+    SMG (SIVE-Mel Generator): deterministic decoder for mel spectrogram generation from
+    latent + speaker + F0.
 
-    Compresses speaker-invariant speech features to a lower-dimensional
-    latent space while preserving linguistic/prosodic structure.
-
-    Input: [B, T, D] SIVE features
-    Latent: [B, latent_dim, T'] compressed representation
-    Output: [B, T, D] reconstructed features
-    """
-    def __init__(
-        self,
-        config: AudioVAEConfig,
-        encoder: AudioVAEEncoder,
-        decoder: Union[AudioVAEDecoder, AudioVAEDecoder1D],
-        f0_predictor: F0Predictor,
-        f0_embedding: F0ConditioningEmbedding,
-    ):
-        super().__init__()
-
-        self.config = config
-
-        self.encoder = encoder
-        self.decoder = decoder
-
-        # F0 conditioning modules (optional)
-        self.f0_predictor = f0_predictor
-        self.f0_embedding = f0_embedding
-
-    @classmethod
-    def from_config(cls, config_name: str, **overrides) -> "AudioVAE":
-        """
-        Create model from predefined config with optional overrides.
-
-        Args:
-            config_name: One of predefined configs
-            **overrides: Override any config parameter
-
-        Example:
-            model = AudioVAE.from_config("small", latent_dim=32)
-        """
-        if config_name not in AUDIO_VAE_CONFIGS:
-            raise ValueError(f"Unknown config: {config_name}. Available: {list(AUDIO_VAE_CONFIGS.keys())}")
-
-        config = AUDIO_VAE_CONFIGS[config_name]
-        # Filter overrides to only AudioVAEConfig fields for top-level config
-        vae_fields = set(config.__dict__.keys())
-        config_dict = {k: v for k, v in config.__dict__.items()}
-        config_dict.update({k: v for k, v in overrides.items() if k in vae_fields})
-        config = AudioVAEConfig(**config_dict)
-
-        config_dict = {k: v for k, v in config.encoder_config.__dict__.items()}
-        config_dict.update(overrides)
-        encoder = AudioVAEEncoder.from_config(config.encoder_config, **config_dict)
-
-        # Select decoder type based on config
-        if config.decoder_1d_config is not None:
-            config_dict = {k: v for k, v in config.decoder_1d_config.__dict__.items()}
-            config_dict.update(overrides)
-            decoder = AudioVAEDecoder1D.from_config(config.decoder_1d_config, **config_dict)
-        else:
-            config_dict = {k: v for k, v in config.decoder_config.__dict__.items()}
-            config_dict.update(overrides)
-            decoder = AudioVAEDecoder.from_config(config.decoder_config, **config_dict)
-
-        overrides.pop('latent_channels', None)
-        overrides.pop('activation', None)
-
-        config_dict = {k: v for k, v in config.f0_predictor_config.__dict__.items()}
-        config_dict.update(overrides)
-        f0_predictor = F0Predictor.from_config(config.f0_predictor_config, **config_dict)
-        config_dict = {k: v for k, v in config.f0_conditioning_embedding_config.__dict__.items()}
-        config_dict.update(overrides)
-        f0_embedding = F0ConditioningEmbedding.from_config(config.f0_conditioning_embedding_config, **config_dict)
-
-        return cls(config, encoder, decoder, f0_predictor, f0_embedding)
-
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Reparameterization trick for sampling."""
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        return mu
-
-    def encode(self, x) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode input to latent space.
-
-        Returns:
-            mu: Latent mean
-            logvar: Latent log variance
-            learned_speaker_emb (optional): [B, learned_speaker_dim] if encoder.learn_speaker_embedding=True
-        """
-        return self.encoder(x)
-
-    def decode(self, z, speaker_embeddings=None, f0_embedding=None, features=None, return_film_stats=False) -> torch.Tensor:
-        """
-        Decode latent to mel spectrogram.
-
-        Args:
-            z: Latent tensor
-            speaker_embeddings: Speaker embedding for FiLM conditioning
-            f0_embedding: Pre-computed F0 embedding (optional)
-            features: SIVE features for F0 prediction (optional, used if f0_embedding not provided)
-            return_film_stats: Whether to return FiLM statistics
-
-        If F0 conditioning is enabled and f0_embedding is not provided but features are,
-        F0 will be predicted automatically from speaker_embedding + features.
-        """
-        # Predict F0 if conditioning is enabled but embedding not provided
-        log_f0_pred, voiced_pred = self.f0_predictor(speaker_embeddings, features)
-        f0_embedding = self.f0_embedding(log_f0_pred, voiced_pred)
-        return self.decoder(z, speaker_embedding=speaker_embeddings, f0_embedding=f0_embedding, return_film_stats=return_film_stats)
-
-    def forward(
-        self,
-        features: torch.Tensor,
-        mel_specs: torch.Tensor,
-        mel_spec_masks: torch.Tensor,
-        speaker_embeddings: torch.Tensor,
-        kl_weight_multiplier: float = 1.0,
-        # F0 supervision (optional, for training F0 predictor)
-        target_f0: Optional[torch.Tensor] = None,  # [B, T] ground truth log F0
-        target_voiced: Optional[torch.Tensor] = None,  # [B, T] ground truth voicing (0 or 1)
-        # F0 warmup: use GT F0 instead of predicted F0 for decoder conditioning
-        use_gt_f0: bool = False,  # If True, use target_f0/target_voiced for decoder conditioning
-        return_film_stats: bool = False,
-    ):
-        """
-        Forward pass through VAE.
-
-        Args:
-            features: [B, D, T'] SIVE features (channel-first)
-            mel_specs: [B, n_mels, T] Mel-spectrogram features
-            mel_spec_masks: [B, T] optional mask for valid frames
-            speaker_embeddings: [B, speaker_dim] speaker embedding for FiLM conditioning
-            kl_weight_multiplier: Multiplier for KL loss (for annealing)
-            target_f0: [B, T] ground truth log F0 for F0 prediction loss (optional)
-            target_voiced: [B, T] ground truth voicing mask for VUV loss (optional)
-            f0_vuv_masks: [B, T] mask for valid F0 frames (optional)
-            use_gt_f0: If True, use GT F0 for decoder conditioning instead of predicted F0.
-                       F0 predictor is still run for loss computation, but decoder gets GT signal.
-                       Useful for warmup to let F0 embedding learn with clean signal.
-            return_film_stats: If True, return FiLM layer statistics
-
-        Returns:
-            recon_x: Reconstructed mel spectrogram
-            mu: Latent mean
-            logvar: Latent log variance
-            losses: Dict with loss components
-        """
-        mu, logvar = self.encode(features)
-
-        z = self.reparameterize(mu, logvar)
-
-        # F0 prediction and embedding (if enabled)
-        # Always predict F0 (for loss computation even during GT warmup)
-        log_f0_pred, voiced_pred = self.f0_predictor(speaker_embeddings, features)
-
-        # Determine which F0 to use for decoder conditioning
-        # Determine which F0 to use for decoder conditioning
-        if use_gt_f0 and target_f0 is not None and target_voiced is not None:
-            # GT warmup: use ground truth F0 for decoder conditioning
-            # This lets the F0 embedding learn with clean signal
-            # Downsample GT F0 to match feature resolution if needed
-            gt_f0_for_emb = target_f0
-            gt_voiced_for_emb = target_voiced
-            if gt_f0_for_emb.size(-1) != log_f0_pred.size(-1):
-                gt_f0_for_emb = F.interpolate(
-                    gt_f0_for_emb.unsqueeze(1), size=log_f0_pred.size(-1), mode='linear', align_corners=False
-                ).squeeze(1)
-                gt_voiced_for_emb = F.interpolate(
-                    gt_voiced_for_emb.unsqueeze(1), size=log_f0_pred.size(-1), mode='linear', align_corners=False
-                ).squeeze(1)
-            f0_emb = self.f0_embedding(gt_f0_for_emb, gt_voiced_for_emb)
-        else:
-            # Normal mode: use predicted F0 for decoder conditioning
-            f0_emb = self.f0_embedding(log_f0_pred, voiced_pred)
-
-        film_stats = None
-        decode_result = self.decode(z, speaker_embeddings=speaker_embeddings, f0_embedding=f0_emb, return_film_stats=return_film_stats)
-        if return_film_stats and isinstance(decode_result, tuple):
-            recon_x, film_stats = decode_result
-        else:
-            recon_x = decode_result
-
-        # Handle 2D decoder output: [B, 1, 80, T] -> [B, 80, T]
-        # The 2D decoder returns 4D with channel dim=1, squeeze it for consistency
-        if recon_x.dim() == 4 and recon_x.shape[1] == 1:
-            recon_x = recon_x.squeeze(1)
-
-        # recon_x is mel specs, not a reconstruction
-
-        # Align reconstruction to input size (encoder-decoder stride may cause size mismatch)
-        if recon_x.shape != mel_specs.shape:
-            # Truncate or pad to match input dimensions
-            slices = [slice(None)] * recon_x.dim()
-            for dim in range(2, recon_x.dim()):  # Skip batch and channel dims
-                if recon_x.shape[dim] > mel_specs.shape[dim]:
-                    slices[dim] = slice(0, mel_specs.shape[dim])
-                elif recon_x.shape[dim] < mel_specs.shape[dim]:
-                    # Pad if reconstruction is smaller (shouldn't happen normally)
-                    pad_size = mel_specs.shape[dim] - recon_x.shape[dim]
-                    pad_dims = [0, 0] * (recon_x.dim() - dim - 1) + [0, pad_size]
-                    recon_x = F.pad(recon_x, pad_dims)
-            recon_x = recon_x[tuple(slices)]
-
-        # Compute KL divergence with optional free bits
-        # Per-element KL: [B, C, H, W] for images, [B, C, T] for audio
-        kl_per_element = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-
-        if self.config.free_bits > 0:
-            # Free bits: apply minimum KL per channel to prevent posterior collapse
-            # Sum over spatial dims, mean over batch -> per-channel KL: [C]
-            spatial_dims = list(range(2, mu.dim()))  # [2, 3] for 4D, [2] for 3D
-            kl_per_channel = kl_per_element.sum(dim=spatial_dims).mean(dim=0)  # [C]
-
-            # Clamp each channel's KL to at least free_bits
-            kl_per_channel = torch.clamp(kl_per_channel, min=self.config.free_bits)
-
-            # Sum over channels for total KL
-            kl_divergence = kl_per_channel.sum()
-        else:
-            # Original behavior: sum over all latent dims, mean over batch
-            latent_dims = list(range(1, mu.dim()))  # [1, 2, 3] for 4D, [1, 2] for 3D
-            kl_divergence = kl_per_element.sum(dim=latent_dims).mean()
-
-        # Reconstruction losses (with optional masking)
-        # Expand mask to match input shape: [B, T] -> [B, 1, 1, T] for 4D input
-        # or [B, 1, T] for 3D input
-        if mel_specs.dim() == 4:
-            mask_expanded = mel_spec_masks.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, T]
-        else:
-            mask_expanded = mel_spec_masks.unsqueeze(1)  # [B, 1, T]
-
-        # Masked MSE loss: only compute on valid positions
-        squared_error = (recon_x - mel_specs) ** 2
-        masked_squared_error = squared_error * mask_expanded
-        # Sum over all dims except batch, then divide by number of valid elements per sample
-        valid_elements = mask_expanded.sum(dim=list(range(1, mask_expanded.dim())), keepdim=False) * mel_specs.shape[1]
-        if mel_specs.dim() == 4:
-            valid_elements = valid_elements * mel_specs.shape[2]  # Account for H dimension
-        mse_loss = (masked_squared_error.sum(dim=list(range(1, masked_squared_error.dim()))) / (valid_elements + 1e-5)).mean()
-
-        # Masked L1 loss
-        if self.config.l1_loss_weight > 0:
-            abs_error = torch.abs(recon_x - mel_specs)
-            masked_abs_error = abs_error * mask_expanded
-            l1_loss = (masked_abs_error.sum(dim=list(range(1, masked_abs_error.dim()))) / (valid_elements + 1e-5)).mean()
-        else:
-            l1_loss = torch.tensor(0.0, device=mel_specs.device)
-
-        recon_loss = self.config.mse_loss_weight * mse_loss + self.config.l1_loss_weight * l1_loss
-
-        # Apply KL weight multiplier for KL annealing
-        effective_kl_weight = self.config.kl_divergence_loss_weight * kl_weight_multiplier
-
-        total_loss = (
-            self.config.recon_loss_weight * recon_loss
-            + effective_kl_weight * kl_divergence
-        )
-
-        # F0 prediction losses (if F0 conditioning is enabled and ground truth provided)
-        f0_loss = torch.tensor(0.0, device=mel_specs.device)
-        vuv_loss = torch.tensor(0.0, device=mel_specs.device)
-        if log_f0_pred is not None and target_f0 is not None and target_voiced is not None:
-            # Upsample predictions to match target resolution if needed
-            if log_f0_pred.size(-1) != target_f0.size(-1):
-                log_f0_pred_up: torch.Tensor = F.interpolate(
-                    log_f0_pred.unsqueeze(1), size=target_f0.size(-1), mode='linear', align_corners=False
-                ).squeeze(1)
-                voiced_pred_up: torch.Tensor = F.interpolate(
-                    voiced_pred.unsqueeze(1), size=target_f0.size(-1), mode='linear', align_corners=False
-                ).squeeze(1)
-            else:
-                log_f0_pred_up: torch.Tensor = log_f0_pred
-                voiced_pred_up: torch.Tensor = voiced_pred
-
-            # F0 loss weighted by soft voicing probability (target_voiced is 0-1 periodicity)
-            # This gives more weight to clearly voiced frames and less to ambiguous ones
-            f0_error = torch.abs(log_f0_pred_up - target_f0)
-            weighted_f0_error = f0_error * target_voiced  # Weight by voicing confidence
-            # Normalize by sum of weights to avoid scale issues
-            voicing_sum = target_voiced.sum() + 1e-8
-            f0_loss = weighted_f0_error.sum() / voicing_sum
-
-            # Voicing prediction loss (BCE with soft targets)
-            # target_voiced is now a soft probability (0-1) from periodicity
-            # Use bce_with_logits for numerical stability (avoids NaN from sigmoid + BCE)
-            with torch.autocast(device_type='cuda', enabled=False):
-                voiced_logit = torch.logit(voiced_pred_up.float(), eps=1e-6)
-                vuv_loss = F.binary_cross_entropy_with_logits(
-                    voiced_logit,
-                    target_voiced.clamp(0, 1).float(),
-                    reduction='mean'
-                )
-
-            # Add F0 losses to total
-            total_loss = total_loss + self.config.f0_loss_weight * f0_loss + self.config.vuv_loss_weight * vuv_loss
-
-        losses = {
-            "total_loss": total_loss,
-            "kl_divergence": kl_divergence,
-            "recon_loss": recon_loss,
-            "mse_loss": mse_loss,
-            "l1_loss": l1_loss,
-            "f0_loss": f0_loss,
-            "vuv_loss": vuv_loss,
-            "kl_weight_multiplier": torch.tensor(kl_weight_multiplier, device=mel_specs.device),
-        }
-
-        # Add F0 predictions for external logging/monitoring
-        losses["log_f0_pred"] = log_f0_pred
-        losses["voiced_pred"] = voiced_pred
-
-        # Add FiLM statistics if requested
-        if return_film_stats and film_stats is not None:
-            losses["film_stats"] = film_stats
-
-        return recon_x, mu, logvar, losses
-
-    def get_num_params(self, trainable_only: bool = True) -> int:
-        """Count parameters."""
-        if trainable_only:
-            return sum(p.numel() for p in self.parameters() if p.requires_grad)
-        return sum(p.numel() for p in self.parameters())
-
-
-class AudioCVAEDecoderOnly(nn.Module):
-    """
-    CVAE Decoder-only model for mel spectrogram generation from latent + speaker + F0.
-
-    This model uses only the decoder part of the AudioVAE, allowing it to be
-    used in scenarios where the latent representation is provided externally,
-    such as in a conditional generation setup.
+    This is a decoder-only model — the external caller provides the latent representation
+    (e.g. from a SIVE encoder upstream). Despite the historical name "CVAE", there is no
+    encoder and no reparameterization trick; conditioning on speaker + F0 is what makes
+    this generative.
 
     Input: [B, latent_dim, T'] latent representation
-    Output: [B, n_mels, T] reconstructed mel spectrogram
+    Output: [B, n_mels, T] generated mel spectrogram
     """
     def __init__(
         self,
-        config: AudioVAEConfig,
-        decoder: Union[AudioVAEDecoder, AudioVAEDecoder1D],
+        config: SMGConfig,
+        decoder: Union[SMGDecoder2D, SMGDecoder1D],
         f0_predictor: F0Predictor,
         f0_embedding: F0ConditioningEmbedding,
     ):
@@ -1305,7 +855,7 @@ class AudioCVAEDecoderOnly(nn.Module):
         self.gradient_checkpointing = False
 
     @classmethod
-    def from_config(cls, config: Union[str, AudioVAEConfig], **overrides) -> "AudioCVAEDecoderOnly":
+    def from_config(cls, config: Union[str, SMGConfig], **overrides) -> "SMG":
         """
         Create model from predefined config with optional overrides.
 
@@ -1314,22 +864,22 @@ class AudioCVAEDecoderOnly(nn.Module):
             **overrides: Override any config parameter
 
         Example:
-            model = AudioCVAEDecoderOnly.from_config("small", latent_dim=32)
+            model = SMG.from_config("small", latent_dim=32)
         """
         if isinstance(config, str):
-            if config not in AUDIO_VAE_CONFIGS:
-                raise ValueError(f"Unknown config: {config}. Available: {list(AUDIO_VAE_CONFIGS.keys())}")
-            config = AUDIO_VAE_CONFIGS[config]
+            if config not in SMG_CONFIGS:
+                raise ValueError(f"Unknown config: {config}. Available: {list(SMG_CONFIGS.keys())}")
+            config = SMG_CONFIGS[config]
 
         # Select decoder type based on config
         if config.decoder_1d_config is not None:
             config_dict = {k: v for k, v in config.decoder_1d_config.__dict__.items()}
             config_dict.update(overrides)
-            decoder = AudioVAEDecoder1D.from_config(config.decoder_1d_config, **config_dict)
+            decoder = SMGDecoder1D.from_config(config.decoder_1d_config, **config_dict)
         else:
             config_dict = {k: v for k, v in config.decoder_config.__dict__.items()}
             config_dict.update(overrides)
-            decoder = AudioVAEDecoder.from_config(config.decoder_config, **config_dict)
+            decoder = SMGDecoder2D.from_config(config.decoder_config, **config_dict)
 
         overrides.pop('latent_channels', None)  # F0 and F0 conditioning can't take this
         overrides.pop('activation', None)
@@ -1342,12 +892,12 @@ class AudioCVAEDecoderOnly(nn.Module):
         f0_embedding = F0ConditioningEmbedding.from_config(config.f0_conditioning_embedding_config, **config_dict)
 
         return cls(config, decoder, f0_predictor, f0_embedding)
-    
+
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.gradient_checkpointing = True
         if hasattr(self.decoder, 'gradient_checkpointing_enable'):
             self.decoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
-    
+
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing = False
         if hasattr(self.decoder, 'gradient_checkpointing_disable'):
@@ -1369,7 +919,7 @@ class AudioCVAEDecoderOnly(nn.Module):
             log_f0_pred, voiced_pred = self.f0_predictor(speaker_embedding, features)
             f0_embedding = self.f0_embedding(log_f0_pred, voiced_pred)
         return self.decoder(z, speaker_embedding=speaker_embedding, f0_embedding=f0_embedding, return_film_stats=return_film_stats)
-    
+
     def forward(
         self,
         features: torch.Tensor,
@@ -1384,14 +934,13 @@ class AudioCVAEDecoderOnly(nn.Module):
         return_film_stats: bool = False,
     ):
         """
-        Forward pass through VAE.
+        Forward pass through SMG.
 
         Args:
             features: [B, D, T'] SIVE features (channel-first)
             target: [B, n_mels, T] Mel-spectrogram features
             mask: [B, T] optional mask for valid frames
             speaker_embedding: [B, speaker_dim] speaker embedding for FiLM conditioning
-            kl_weight_multiplier: Multiplier for KL loss (for annealing)
             target_f0: [B, T] ground truth log F0 for F0 prediction loss (optional)
             target_voiced: [B, T] ground truth voicing mask for VUV loss (optional)
             use_gt_f0: If True, use GT F0 for decoder conditioning instead of predicted F0.
@@ -1400,9 +949,7 @@ class AudioCVAEDecoderOnly(nn.Module):
             return_film_stats: If True, return FiLM layer statistics
 
         Returns:
-            recon_x: Reconstructed mel spectrogram
-            mu: Latent mean
-            logvar: Latent log variance
+            recon_x: Generated mel spectrogram
             losses: Dict with loss components
         """
         z = features
@@ -1445,7 +992,7 @@ class AudioCVAEDecoderOnly(nn.Module):
 
         # recon_x is mel specs, not a reconstruction
 
-        # Align reconstruction to input size (encoder-decoder stride may cause size mismatch)
+        # Align reconstruction to input size (decoder stride may cause size mismatch)
         if recon_x.shape != target.shape:
             # Truncate or pad to match input dimensions
             slices = [slice(None)] * recon_x.dim()

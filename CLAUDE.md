@@ -13,8 +13,8 @@ MegaTransformer is a multimodal autoregressive world model combining text, audio
 Training uses subcommands for different model types. All training scripts share common arguments.
 
 ```bash
-# Audio CVAE (speaker-conditioned VAE with FiLM)
-python -m src.scripts.train.train audio-cvae --run_name my_run --config small --cache_dir ../cached_datasets/sive_cvae_f0
+# SMG (SIVE-Mel Generator: speaker-conditioned deterministic decoder with FiLM)
+python -m src.scripts.train.train smg --run_name my_run --config small --cache_dir ../cached_datasets/sive_smg_f0
 
 # Vocoder (mel-to-waveform)
 python -m src.scripts.train.train vocoder --run_name my_vocoder --config tiny --cache_dir ../cached_datasets/audio
@@ -71,8 +71,8 @@ Tests cover data collation logic (BO*/PH/EO* token placement, text target alignm
 ### Inference / Evaluation
 
 ```bash
-# Voice cloning demo (Gradio UI) — combines SIVE + CVAE + vocoder pipeline
-python -m src.scripts.eval.audio.cvae.voice_clone --sive_checkpoint_path ./checkpoints/sive --cvae_checkpoint_path ./checkpoints/cvae --vocoder_checkpoint_path ./checkpoints/vocoder
+# Voice cloning demo (Gradio UI) — combines SIVE + SMG + vocoder pipeline
+python -m src.scripts.eval.smg.voice_clone --sive_checkpoint_path ./checkpoints/sive --smg_checkpoint_path ./checkpoints/smg --vocoder_checkpoint_path ./checkpoints/vocoder
 ```
 
 Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
@@ -103,7 +103,7 @@ Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
   - `train.py`: Main entry point with subcommand routing
   - `trainer.py`: `CommonTrainer` base class extending HuggingFace Trainer
   - `optimizers.py`: `MuonAdamW` custom optimizer
-  - `audio/vae/`, `audio/vocoder/`, `audio/sive/`, `image/vae/`, `world/`: Model-specific trainers
+  - `smg/`, `audio/vocoder/`, `audio/sive/`, `image/vae/`, `world/`: Model-specific trainers
 
 - `src/scripts/data/`: Dataset preprocessing and loading
   - `preprocess_dataset.py`: Main preprocessing entry point with modality-specific `Preprocessor` subclasses
@@ -117,14 +117,14 @@ Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
   - `model_loading_utils.py`: `load_model()` function for loading from config + checkpoint
   - `audio_utils.py`: `SharedWindowBuffer` for efficient STFT/mel computation
   - `speaker_encoder.py`: ECAPA-TDNN and WavLM speaker encoders
-  - `voice_silence_mask.py`: Inference-only silence detection/masking for CVAE-decoded mel spectrograms
+  - `voice_silence_mask.py`: Inference-only silence detection/masking for SMG-decoded mel spectrograms
   - `megatransformer_utils.py`: Weight init helpers (`linear_weight_init`, `apply_depth_scaled_residual_init`, `conv2d_weight_init`)
 
 ### Key Design Patterns
 
 **Config-based model instantiation**: Models use dataclass configs and `from_config()` class methods:
 ```python
-model = load_model(AudioVAE, "small", checkpoint_path=path, overrides={"latent_channels": 32})
+model = load_model(SMG, "small", checkpoint_path=path, overrides={"latent_channels": 32})
 ```
 
 **Sharded datasets**: Training data is preprocessed into `.pt` shards with a `shard_index.json` manifest. Dataset classes (e.g. `AudioShardedDataset`, `MultimodalShardedDataset`) handle lazy loading with LRU caching. `ShardAwareSampler` groups indices by shard to minimize disk I/O.
@@ -133,7 +133,7 @@ model = load_model(AudioVAE, "small", checkpoint_path=path, overrides={"latent_c
 
 **GAN training**: VAE trainers support optional discriminator training with configurable start conditions (`--gan_start_condition_key step/loss`), adaptive weighting, R1 penalty, and instance noise.
 
-**Training module convention**: Each training submodule in `src/scripts/train/` (e.g. `audio/vae/training.py`) must export:
+**Training module convention**: Each training submodule in `src/scripts/train/` (e.g. `smg/training.py`) must export:
 - `add_cli_args(subparsers)`: Registers the subcommand and its args
 - `load_model(args)`: Creates/loads the model from config and optional checkpoint
 
@@ -197,7 +197,7 @@ For TensorBoard, context items are logged as sibling tags (`eval/voice/0/mel`, `
 ### Audio Pipeline
 
 1. **SIVE** (Speaker-Invariant Voice Encoder): Conformer encoder with CTC loss + GRL for speaker disentanglement
-2. **Audio CVAE**: VAE with FiLM-based speaker conditioning, outputs mel spectrograms
+2. **Audio SMG**: SIVE-Mel Generator — deterministic decoder with FiLM-based speaker conditioning, outputs mel spectrograms
 3. **Vocoder**: Mel spectrogram to waveform synthesis (HiFiGAN-based)
 
 ## Configuration
@@ -214,4 +214,4 @@ Runs are logged to `runs/<run_name>/` (metrics + checkpoints). Backend is select
 
 ## Import Convention
 
-All imports use relative-to-`src/` paths (e.g. `from model.audio.vae.vae import AudioVAE`, not `from src.model...`). The project is run as a module from the repo root: `python -m src.scripts.train.train ...`
+All imports use relative-to-`src/` paths (e.g. `from model.smg.smg import SMG`, not `from src.model...`). The project is run as a module from the repo root: `python -m src.scripts.train.train ...`

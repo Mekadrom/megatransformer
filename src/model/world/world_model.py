@@ -7,8 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config.world.world_model import WORLD_MODEL_CONFIGS, MegaTransformerWorldModelConfig
-from model.audio.feature_extractor import AudioVAEPreludeFeatureExtractor
-from model.audio.generator import AudioCodaAndVAEWithLoss
+from model.voice.feature_extractor import VoiceSIVEPreludeFeatureExtractor
+from model.audio.generator import AudioCodaWithLoss
+from model.voice.generator import VoiceCodaAndSMGWithLoss
 from model.image.feature_extractor import ImageVAEPreludeFeatureExtractor
 from model.image.vae.vae import ImageVAEDecoder, ImageVAEEncoder
 from model.sinusoidal_positional_encoding import Sinusoidal2DPositionalEmbedding, SinusoidalPositionalEncoding
@@ -53,11 +54,11 @@ class MegaTransformerWorldModel(nn.Module):
 
         # Modality-specific preludes (only instantiate if included)
         self.audio_feature_extractor = (
-            AudioVAEPreludeFeatureExtractor(config.audio_prelude_config)
+            VoiceSIVEPreludeFeatureExtractor(config.audio_prelude_config)
             if "audio" in self.include_modes else None
         )
         self.voice_feature_extractor = (
-            AudioVAEPreludeFeatureExtractor(config.voice_prelude_config)
+            VoiceSIVEPreludeFeatureExtractor(config.voice_prelude_config)
             if "voice" in self.include_modes else None
         )
         self.image_feature_extractor = (
@@ -76,11 +77,11 @@ class MegaTransformerWorldModel(nn.Module):
         self.text_generator = TextCodaClassifierWithLoss(config.text_coda_config)
 
         self.audio_generator = (
-            AudioCodaAndVAEWithLoss("audio", config.audio_coda_config)
+            AudioCodaWithLoss("audio", config.audio_coda_config)
             if "audio" in self.include_modes else None
         )
         self.voice_generator = (
-            AudioCodaAndVAEWithLoss("voice", config.voice_coda_config)
+            VoiceCodaAndSMGWithLoss("voice", config.voice_coda_config)
             if "voice" in self.include_modes else None
         )
         # Image decoder (optional). Dispatch on the actual config type:

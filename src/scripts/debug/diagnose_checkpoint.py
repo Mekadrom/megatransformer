@@ -261,6 +261,35 @@ def report_activations(model, batch, save_dir):
             if v is not None:
                 print(f"  {key}: {v:.6f}")
 
+    # Per-modality cross-sample recurrent output diff. Answers "do the
+    # recurrent outputs at position type X differ when the inputs to other
+    # modalities differ?" In transcription direction this is how we tell
+    # whether text positions are absorbing voice/image content via the
+    # recurrent block's self-attention.
+    if 'recurrent_output' in probes and 'modality_map' in probes:
+        rec_out = probes['recurrent_output']
+        mmap = probes['modality_map']
+        mod_ids = {'text': 0, 'audio': 1, 'voice': 2, 'image': 3}
+        if rec_out.shape[0] >= 2:
+            print("\n  -- Per-Modality Cross-Sample Recurrent Output Diff --")
+            for mod_name, mod_id in mod_ids.items():
+                per_sample = []
+                for b in range(rec_out.shape[0]):
+                    mask = (mmap[b] == mod_id)
+                    if mask.any():
+                        per_sample.append(rec_out[b][mask])
+                if len(per_sample) >= 2:
+                    # Pairwise across (0,1); match on min length to handle
+                    # variable-length modality runs (e.g. text prompts of
+                    # different lengths).
+                    n = min(s.shape[0] for s in per_sample)
+                    a = per_sample[0][:n].float()
+                    b2 = per_sample[1][:n].float()
+                    diff = (a - b2).abs()
+                    ratio = diff.mean() / a.std().clamp_min(1e-6)
+                    print(f"  recurrent_out[{mod_name}] cross_sample: mean={diff.mean():.6e}, max={diff.max():.6e}, "
+                          f"SNR={ratio.item():.2%} (over {n} matched positions)")
+
     # Coda predictions
     print("\n  -- Coda Predictions --")
     for key in ['image_latent_preds', 'voice_latent_preds', 'audio_latent_preds']:
@@ -546,14 +575,26 @@ def repeated_forward_stats(model, batch, n_repeats):
     collected: dict[str, list[float]] = {}
 
     bridge_probe: dict = {}
+    rec_probe: dict = {}
 
     def _bridge_hook(module, args, output):
         bridge_probe['out'] = output.detach()
         return output
 
+    def _rec_hook(module, args, output):
+        rec_probe['out'] = output[0].detach()
+        return output
+
+    def _interleaver_hook(module, args, output):
+        # output: (interleaved, attn_mask, modality_map)
+        rec_probe['modality_map'] = output[2].detach() if hasattr(output[2], 'detach') else output[2]
+        return output
+
     bridge_handle = None
     if model.image_generator is not None and hasattr(model.image_generator, 'bridge'):
         bridge_handle = model.image_generator.bridge.register_forward_hook(_bridge_hook)
+    rec_handle = model.recurrent_block.register_forward_hook(_rec_hook)
+    interleaver_handle = model.token_interleaver.register_forward_hook(_interleaver_hook)
 
     def _add(name: str, value):
         if not isinstance(value, (int, float)):
@@ -589,6 +630,28 @@ def repeated_forward_stats(model, batch, n_repeats):
                 diff = (v[0] - v[1]).abs()
                 _add(f"{key}/cross_sample_mean", diff.mean())
                 _add(f"{key}/cross_sample_max", diff.max())
+        # Per-modality cross-sample diff on recurrent block output, using
+        # modality_map to slice positions by type. Answers "does the recurrent
+        # block mix signal from other-modality inputs into this-modality
+        # positions?" Low diff = weak mixing.
+        rec_out = rec_probe.get('out')
+        mmap = rec_probe.get('modality_map')
+        if rec_out is not None and mmap is not None and rec_out.shape[0] >= 2:
+            mod_ids = {'text': 0, 'audio': 1, 'voice': 2, 'image': 3}
+            for mod_name, mod_id in mod_ids.items():
+                per_sample = []
+                for b in range(rec_out.shape[0]):
+                    mask = (mmap[b] == mod_id)
+                    if mask.any():
+                        per_sample.append(rec_out[b][mask])
+                if len(per_sample) >= 2:
+                    n = min(s.shape[0] for s in per_sample)
+                    a = per_sample[0][:n].float()
+                    b_t = per_sample[1][:n].float()
+                    diff = (a - b_t).abs()
+                    _add(f"rec_out[{mod_name}]/cross_sample_mean", diff.mean())
+                    _add(f"rec_out[{mod_name}]/cross_sample_max", diff.max())
+                    _add(f"rec_out[{mod_name}]/std", a.std())
         # Bridge output stats (cond_kv) and pooled cond_global. The bridge
         # itself is deterministic given recurrent output, but recurrent output
         # has stochastic iteration count, so re-aggregating per repeat catches
@@ -621,6 +684,8 @@ def repeated_forward_stats(model, batch, n_repeats):
 
     if bridge_handle is not None:
         bridge_handle.remove()
+    rec_handle.remove()
+    interleaver_handle.remove()
     return collected
 
 

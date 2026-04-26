@@ -11,7 +11,7 @@ from rotary_embedding_torch import RotaryEmbedding
 
 from model import activations
 from model.activations import get_activation_type
-from model.audio.sive.conformer import ConformerConvModule
+from model.voice.sive.conformer import ConformerConvModule
 from model.head_dropout import HeadDropout
 
 

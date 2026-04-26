@@ -4,7 +4,7 @@ Loads a checkpoint, runs the full visualization callback (same scenarios as
 during training), and writes results to a TensorBoard log directory.
 
 Usage:
-    python -m src.scripts.eval.world.visualize --checkpoint_path runs/my_run/checkpoint-3000 --config small_sum_dit --log_dir runs/eval_viz --cache_dir ../cached_datasets/sive --include_modes text,voice,image [--vocoder_checkpoint_path ...] [--voice_cvae_checkpoint_path ...] [--image_vae_decoder_config litevae] [--use_memorization_dataset --max_samples 50]
+    python -m src.scripts.eval.world.visualize --checkpoint_path runs/my_run/checkpoint-3000 --config small_sum_dit --log_dir runs/eval_viz --cache_dir ../cached_datasets/sive --include_modes text,voice,image [--vocoder_checkpoint_path ...] [--voice_smg_checkpoint_path ...] [--image_vae_decoder_config litevae] [--use_memorization_dataset --max_samples 50]
 """
 
 import argparse
@@ -66,6 +66,11 @@ def parse_args():
 
     # Collator
     p.add_argument("--max_seq_len", type=int, default=1024)
+    p.add_argument("--voice_max_seconds", type=float, default=10.0)
+    p.add_argument("--voice_sample_rate", type=int, default=16000)
+    p.add_argument("--voice_hop_length", type=int, default=256)
+    p.add_argument("--voice_n_mels", type=int, default=80)
+    p.add_argument("--voice_n_fft", type=int, default=1024)
     p.add_argument("--audio_max_seconds", type=float, default=10.0)
     p.add_argument("--audio_sample_rate", type=int, default=16000)
     p.add_argument("--audio_hop_length", type=int, default=256)
@@ -78,9 +83,9 @@ def parse_args():
     p.add_argument("--vocoder_config", type=str, default="hifigan")
     p.add_argument("--image_vae_decoder_path", type=str, default=None)
     p.add_argument("--image_vae_decoder_config", type=str, default=None)
-    p.add_argument("--voice_cvae_checkpoint_path", type=str, default=None)
-    p.add_argument("--voice_cvae_config", type=str, default="small")
-    p.add_argument("--voice_cvae_latent_channels", type=int, default=None)
+    p.add_argument("--voice_smg_checkpoint_path", type=str, default=None)
+    p.add_argument("--voice_smg_config", type=str, default="small")
+    p.add_argument("--voice_smg_latent_channels", type=int, default=None)
     p.add_argument("--static_speaker_embedding_path", type=str, default=None)
 
     # Model overrides
@@ -207,23 +212,23 @@ def load_decoders(args):
         except Exception as e:
             print(f"Warning: Failed to load image VAE decoder: {e}")
 
-    voice_cvae_decoder = None
-    if args.voice_cvae_checkpoint_path:
+    voice_smg_decoder = None
+    if args.voice_smg_checkpoint_path:
         try:
-            from model.audio.vae.vae import AudioCVAEDecoderOnly
-            cvae_overrides = {}
-            if args.voice_cvae_latent_channels is not None:
-                cvae_overrides["latent_channels"] = args.voice_cvae_latent_channels
-            voice_cvae_decoder = model_loading_utils.load_model(
-                AudioCVAEDecoderOnly,
-                args.voice_cvae_config,
-                checkpoint_path=args.voice_cvae_checkpoint_path,
+            from model.smg.smg import SMG
+            smg_overrides = {}
+            if args.voice_smg_latent_channels is not None:
+                smg_overrides["latent_channels"] = args.voice_smg_latent_channels
+            voice_smg_decoder = model_loading_utils.load_model(
+                SMG,
+                args.voice_smg_config,
+                checkpoint_path=args.voice_smg_checkpoint_path,
                 strict=False,
-                overrides=cvae_overrides,
+                overrides=smg_overrides,
             )
-            voice_cvae_decoder.eval()
+            voice_smg_decoder.eval()
         except Exception as e:
-            print(f"Warning: Failed to load voice CVAE decoder: {e}")
+            print(f"Warning: Failed to load voice SMG decoder: {e}")
 
     static_speaker_embedding = None
     if args.static_speaker_embedding_path:
@@ -235,7 +240,7 @@ def load_decoders(args):
         except Exception as e:
             print(f"Warning: Failed to load static speaker embedding: {e}")
 
-    return vocoder, image_vae_decoder, voice_cvae_decoder, static_speaker_embedding
+    return vocoder, image_vae_decoder, voice_smg_decoder, static_speaker_embedding
 
 
 def main():
@@ -266,30 +271,30 @@ def main():
     print(f"Train: {len(train_dataset)} samples, Eval: {len(eval_dataset)} samples")
 
     # Collator
-    audio_max_frames = int(args.audio_max_seconds * args.audio_sample_rate // args.audio_hop_length)
+    voice_max_frames = int(args.voice_max_seconds * args.voice_sample_rate // args.voice_hop_length)
     collator = MultimodalDataCollator(
         max_seq_len=args.max_seq_len,
-        max_waveforms=int(args.audio_max_seconds * args.audio_sample_rate),
-        max_mel_spec_frames=audio_max_frames,
-        max_sive_feature_frames=math.ceil(audio_max_frames / args.sive_total_stride),
+        max_waveforms=int(args.voice_max_seconds * args.voice_sample_rate),
+        max_mel_spec_frames=voice_max_frames,
+        max_sive_feature_frames=math.ceil(voice_max_frames / args.sive_total_stride),
     )
 
     # Decoders
-    vocoder, image_vae_decoder, voice_cvae_decoder, static_speaker_embedding = load_decoders(args)
+    vocoder, image_vae_decoder, voice_smg_decoder, static_speaker_embedding = load_decoders(args)
 
     # Visualization callback
     callback = WorldModelVisualizationCallback(
         tokenizer=None,
         vocoder=vocoder,
         image_vae_decoder=image_vae_decoder,
-        voice_cvae_decoder=voice_cvae_decoder,
+        voice_smg_decoder=voice_smg_decoder,
         static_speaker_embedding=static_speaker_embedding,
         num_eval_samples=args.num_eval_samples,
         step_offset=0,
-        audio_sample_rate=args.audio_sample_rate,
-        audio_n_mels=args.audio_n_mels,
-        audio_n_fft=args.audio_n_fft,
-        audio_hop_length=args.audio_hop_length,
+        voice_sample_rate=args.voice_sample_rate,
+        voice_n_mels=args.voice_n_mels,
+        voice_n_fft=args.voice_n_fft,
+        voice_hop_length=args.voice_hop_length,
     )
 
     # Wire up the fake trainer

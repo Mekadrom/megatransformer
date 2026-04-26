@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 import argparse
-from functools import partial
 import json
 import os
 import time
 from collections import defaultdict
-from typing import Any, Callable, Union
+from typing import Any
 
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
-from scripts.data.audio.preprocess import AudioDatasetPreprocessor
+from scripts.data.voice.preprocess import VoiceDatasetPreprocessor
 from scripts.data.image.preprocess import ImageDatasetPreprocessor
 from scripts.data.image.vae.preprocess import ImageVAEDatasetPreprocessor
 from scripts.data.text.preprocess import TextDatasetPreprocessor
@@ -19,7 +18,7 @@ from scripts.data.preprocessor import Preprocessor
 
 
 preprocessor_clss: list[type[Preprocessor]] = [
-    AudioDatasetPreprocessor,
+    VoiceDatasetPreprocessor,
     ImageDatasetPreprocessor,
     ImageVAEDatasetPreprocessor,
     TextDatasetPreprocessor,
@@ -140,8 +139,8 @@ def _stat_shards(args):
 
 
 def get_preprocessor(command: str, args, dataset, output_dir, shard_fields, batch_accumulators, stats, device: str) -> Preprocessor:
-    if command == "audio":
-        return AudioDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
+    if command == "voice":
+        return VoiceDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     elif command == "image":
         return ImageDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     elif command == "image-vae":
@@ -149,7 +148,7 @@ def get_preprocessor(command: str, args, dataset, output_dir, shard_fields, batc
     elif command == "text":
         return TextDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     else:
-        raise ValueError(f"Unknown command: {command}. Available: audio, image, image-vae, text")
+        raise ValueError(f"Unknown command: {command}. Available: voice, image, image-vae, text")
 
 
 def main():
@@ -169,6 +168,12 @@ def main():
                             help="HuggingFace dataset name")
         sub_parser.add_argument("--dataset_config", type=str,
                             help="Dataset configuration")
+        sub_parser.add_argument("--data_dir", type=str, default=None,
+                            help="Optional subdirectory within the dataset to load from. "
+                                 "Use for datasets that organize content as language/category "
+                                 "subdirectories without proper HF configs (e.g. "
+                                 "bigcode/starcoderdata --data_dir python). When set, only "
+                                 "files under that subdirectory are loaded.")
         sub_parser.add_argument("--split", type=str,
                             help="Dataset split")
         # Multi-GPU
@@ -202,7 +207,7 @@ def main():
     else:
         output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     print(f"GPU {args.gpu_id}/{args.total_gpus}")
     print(f"Processing every {args.total_gpus}th sample starting at offset {args.gpu_id}")
@@ -210,14 +215,19 @@ def main():
 
     # Load dataset
     streaming = getattr(args, 'streaming', False)
-    print(f"Loading dataset {args.dataset_name}/{args.dataset_config} split {args.split} (streaming={streaming})...")
-    dataset = load_dataset(
-        args.dataset_name,
-        args.dataset_config,
+    data_dir = getattr(args, 'data_dir', None)
+    print(f"Loading dataset {args.dataset_name}/{args.dataset_config} split {args.split} "
+          f"(streaming={streaming}, data_dir={data_dir})...")
+    load_kwargs = dict(
+        path=args.dataset_name,
+        name=args.dataset_config,
         split=args.split,
         trust_remote_code=True,
         streaming=streaming,
     )
+    if data_dir:
+        load_kwargs["data_dir"] = data_dir
+    dataset = load_dataset(**load_kwargs)
 
     # Shard accumulators
     shard_fields = {
@@ -227,12 +237,25 @@ def main():
     # Batch accumulators
     batch_accumulators: dict[Any, Any] = {}
 
-    # Stats - use defaultdict for skipped reasons so preprocessors can add their own
+    # Stats - use defaultdict for skipped reasons so preprocessors can add their own.
+    # `tokens_saved` is maintained by the text preprocessor; `seconds_saved` by
+    # the voice preprocessor. Both let the main loop enforce size budgets
+    # (--max_tokens / --max_hours). For subcommands that don't emit tokens or
+    # audio, the counters stay at 0 and the corresponding checks are no-ops.
     stats = {
         "processed": 0,
         "saved": 0,
+        "tokens_saved": 0,
+        "seconds_saved": 0.0,
         "skipped": defaultdict(int),
     }
+
+    # Corpus-size caps. Only one is meaningful per subcommand (text → tokens,
+    # voice → hours). For subcommands that don't track the relevant counter,
+    # the budget resolves to None and the check is a no-op.
+    max_tokens_budget = getattr(args, "max_tokens", None)
+    max_hours_budget = getattr(args, "max_hours", None)
+    max_seconds_budget = max_hours_budget * 3600 if max_hours_budget else None
 
     preprocessor: Preprocessor = get_preprocessor(args.command, args, dataset, output_dir, shard_fields, batch_accumulators, stats, device)
 
@@ -255,6 +278,10 @@ def main():
             if idx % args.total_gpus != args.gpu_id:
                 continue
             if args.max_samples and stats["saved"] >= args.max_samples:
+                break
+            if max_tokens_budget and stats["tokens_saved"] >= max_tokens_budget:
+                break
+            if max_seconds_budget and stats["seconds_saved"] >= max_seconds_budget:
                 break
             try:
                 if preprocessor.preprocess_example(example):
@@ -280,6 +307,10 @@ def main():
             if idx % args.total_gpus != args.gpu_id:
                 continue
             if args.max_samples and stats["saved"] >= args.max_samples:
+                break
+            if max_tokens_budget and stats["tokens_saved"] >= max_tokens_budget:
+                break
+            if max_seconds_budget and stats["seconds_saved"] >= max_seconds_budget:
                 break
             try:
                 example = dataset[idx]
@@ -321,12 +352,36 @@ def main():
     print(f"GPU {args.gpu_id} complete!")
     print(f"  Processed: {stats['processed']:,}")
     print(f"  Saved: {stats['saved']:,}")
+    if stats.get("tokens_saved", 0) > 0:
+        print(f"  Tokens saved: {stats['tokens_saved']:,}")
+    if stats.get("seconds_saved", 0) > 0:
+        print(f"  Audio saved: {stats['seconds_saved']:,.1f} s ({stats['seconds_saved'] / 3600:.2f} h)")
     for reason in stats['skipped']:
         print(f"  Skipped ({reason}): {stats['skipped'][reason]:,}")
     print(f"  Time: {elapsed/60:.1f} minutes")
     print(f"  Speed: {stats['saved']/elapsed:.1f} samples/sec")
+
+    # Image preprocessing: surface the download failure breakdown so 100%-fail
+    # runs don't look like a mystery ("all 420k skipped as download_failed").
+    try:
+        from scripts.data.image.preprocess import print_download_error_summary
+        print_download_error_summary()
+    except ImportError:
+        pass
     print(f"  Shards: {shard_fields['shard_idx']}")
     print(f"  Output: {output_dir}")
+
+    # Streaming mode leaves background prefetch threads alive inside the HF
+    # datasets library. Their HTTP retries race with Python interpreter
+    # teardown and trigger "Bad file descriptor" / "PyGILState_Release"
+    # crashes (SIGABRT) AFTER preprocessing has already succeeded. All shards
+    # and config.json have been flushed by this point, so bypassing Python
+    # finalizers via os._exit is safe — it skips the teardown race entirely.
+    if streaming:
+        import sys as _sys
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

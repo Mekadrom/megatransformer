@@ -40,7 +40,7 @@
 ## Scaling to 1B
 
 - [ ] Design 1B config: scale recurrent block (larger d_model or more blocks), keep codas relatively thin
-- [ ] Expand voice data: add GigaSpeech or LibriLight (requires SIVE + CVAE retraining on new distribution)
+- [ ] Expand voice data: add GigaSpeech or LibriLight (requires SIVE + SMG retraining on new distribution)
 - [ ] Expand text data: more Pile, or switch to FineWeb/RedPajama
 - [ ] Image data is sufficient at 800k for 1B
 - [ ] Target hardware: 4×4090 (2-4 weeks) or 8×H100-NVLink rental (~1 week, ~$2600)

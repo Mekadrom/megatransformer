@@ -4,8 +4,9 @@ import json
 from dataclasses import dataclass
 from typing import Optional, List, Union
 
-from config.audio.feature_extractor import AudioVAEPreludeFeatureExtractorConfig
-from config.audio.generator import AudioCodaAndVAEConfig
+from config.voice.feature_extractor import VoiceSIVEPreludeFeatureExtractorConfig
+from config.audio.generator import AudioCodaConfig
+from config.voice.generator import VoiceCodaAndSMGConfig
 from config.common import MegaTransformerBlockConfig
 from config.image.decoder import (
     DiffusionBridgeImageDecoderConfig,
@@ -109,11 +110,11 @@ class MegaTransformerWorldModelConfig:
     text_prelude_config: TextPreludeFeatureExtractorConfig = dataclasses.field(
         default_factory=TextPreludeFeatureExtractorConfig
     )
-    audio_prelude_config: AudioVAEPreludeFeatureExtractorConfig = dataclasses.field(
-        default_factory=AudioVAEPreludeFeatureExtractorConfig
+    audio_prelude_config: VoiceSIVEPreludeFeatureExtractorConfig = dataclasses.field(
+        default_factory=VoiceSIVEPreludeFeatureExtractorConfig
     )
-    voice_prelude_config: AudioVAEPreludeFeatureExtractorConfig = dataclasses.field(
-        default_factory=AudioVAEPreludeFeatureExtractorConfig
+    voice_prelude_config: VoiceSIVEPreludeFeatureExtractorConfig = dataclasses.field(
+        default_factory=VoiceSIVEPreludeFeatureExtractorConfig
     )
     image_prelude_config: ImageVAEPreludeFeatureExtractorConfig = dataclasses.field(
         default_factory=ImageVAEPreludeFeatureExtractorConfig
@@ -130,11 +131,11 @@ class MegaTransformerWorldModelConfig:
     text_coda_config: TextCodaClassifierConfig = dataclasses.field(
         default_factory=TextCodaClassifierConfig
     )
-    audio_coda_config: AudioCodaAndVAEConfig = dataclasses.field(
-        default_factory=AudioCodaAndVAEConfig
+    audio_coda_config: AudioCodaConfig = dataclasses.field(
+        default_factory=AudioCodaConfig
     )
-    voice_coda_config: AudioCodaAndVAEConfig = dataclasses.field(
-        default_factory=AudioCodaAndVAEConfig
+    voice_coda_config: VoiceCodaAndSMGConfig = dataclasses.field(
+        default_factory=VoiceCodaAndSMGConfig
     )
     # Image decoder (optional). Two acceptable types:
     #   - `ImageDecoderConfig` for direct latent prediction (mode="direct" or
@@ -261,11 +262,11 @@ WORLD_MODEL_CONFIGS = {
                 causal=True,
             ),
         ),
-        audio_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
+        audio_prelude_config=VoiceSIVEPreludeFeatureExtractorConfig(
             n_layers=2,
             prelude_config=_mha_block(d_model=768, causal=False),
         ),
-        voice_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
+        voice_prelude_config=VoiceSIVEPreludeFeatureExtractorConfig(
             n_layers=2,
             prelude_config=_mha_block(d_model=768, causal=True),
         ),
@@ -298,12 +299,12 @@ WORLD_MODEL_CONFIGS = {
             n_layers=2,
             coda_config=_mha_block(d_model=768),
         ),
-        audio_coda_config=AudioCodaAndVAEConfig(
+        audio_coda_config=AudioCodaConfig(
             n_layers=2,
             coda_config=_mha_block(d_model=768),
             output_mode="conv_refine",
         ),
-        voice_coda_config=AudioCodaAndVAEConfig(
+        voice_coda_config=VoiceCodaAndSMGConfig(
             n_layers=2,
             coda_config=_mha_block(d_model=768),
             output_mode="framewise_refine",
@@ -348,11 +349,11 @@ WORLD_MODEL_CONFIGS = {
                 causal=True,
             ),
         ),
-        audio_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
+        audio_prelude_config=VoiceSIVEPreludeFeatureExtractorConfig(
             n_layers=2,
             prelude_config=_mha_block(d_model=768, causal=False),
         ),
-        voice_prelude_config=AudioVAEPreludeFeatureExtractorConfig(
+        voice_prelude_config=VoiceSIVEPreludeFeatureExtractorConfig(
             n_layers=2,
             prelude_config=_mha_block(d_model=768, causal=True),
         ),
@@ -384,12 +385,12 @@ WORLD_MODEL_CONFIGS = {
             n_layers=2,
             coda_config=_mha_block(d_model=768),
         ),
-        audio_coda_config=AudioCodaAndVAEConfig(
+        audio_coda_config=AudioCodaConfig(
             n_layers=2,
             coda_config=_mha_block(d_model=768),
             output_mode="conv_refine",
         ),
-        voice_coda_config=AudioCodaAndVAEConfig(
+        voice_coda_config=VoiceCodaAndSMGConfig(
             n_layers=2,
             coda_config=_mha_block(d_model=768),
             output_mode="framewise_refine",

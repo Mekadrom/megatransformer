@@ -4,7 +4,7 @@ import torch.nn as nn
 
 class ConvNeXtBlock(nn.Module):
     """
-    ConvNeXt-style block - efficient and effective for audio.
+    ConvNeXt-style block - efficient and effective for voice audio.
     Depthwise conv -> pointwise expand -> pointwise contract
     """
     def __init__(self, dim, ovr_out_dim=None, kernel_size=7, expansion=4):
