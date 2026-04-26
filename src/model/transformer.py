@@ -12,7 +12,7 @@ from model import activations
 from model.activations import get_activation_type
 from model.norms import create_norm
 from model.world.kv_cache import KVCache
-from utils.megatransformer_utils import transformer_weight_init
+from utils.megatransformer_utils import linear_weight_init
 
 
 def create_alibi_bias(n_heads, maxlen):
@@ -191,6 +191,9 @@ class MegaTransformerAttention(nn.Module):
         attention_scores = attention_scores / math.sqrt(self.d_queries)
         if bool(self.use_grok_scaled_attn):
             attention_scores = 30.0 * torch.tanh(attention_scores / 30.0)
+        elif self.config.attn_logit_cap is not None:
+            cap = self.config.attn_logit_cap
+            attention_scores = cap * torch.tanh(attention_scores / cap)
 
         # Causal masking (skip for bidirectional attention and cross-attention)
         if self.is_causal and not is_cross_attention:
@@ -199,14 +202,22 @@ class MegaTransformerAttention(nn.Module):
             # Use T-based offset so the mask always matches the actual key dimension.
             eff_offset = max(T - t, 0)  # query positions relative to key positions
             required_size = max(eff_offset + t, T)
-            if required_size > min(self.causal_mask.shape[-1], self.causal_mask.shape[-2]):
-                self.causal_mask = torch.tril(
-                    torch.ones(required_size, required_size, device=hidden_states.device)
-                ).view(1, 1, required_size, required_size)
+            if required_size > self.causal_mask.shape[-1]:
+                # At training time the buffer is sized for max_position_embeddings and
+                # shouldn't need expansion. Expanding in-place (rebinding the buffer)
+                # breaks gradient checkpointing with use_reentrant=False because the
+                # saved-tensor metadata check can't match the rebound buffer on
+                # recompute. Raise so that the caller either increases
+                # max_position_embeddings or switches to reentrant checkpointing.
+                raise RuntimeError(
+                    f"Causal mask buffer too small: required_size={required_size} > "
+                    f"self.causal_mask.shape[-1]={self.causal_mask.shape[-1]}. "
+                    f"Increase MegaTransformerBlockConfig.max_position_embeddings to "
+                    f"at least {required_size}."
+                )
 
-            # Slice causal mask for current query/key positions
+            # Slice causal mask for current query/key positions.
             causal_mask_slice = self.causal_mask[:, :, eff_offset:eff_offset + t, :T]
-            causal_mask_slice = causal_mask_slice.to(attention_scores.device)
             attention_scores = attention_scores.masked_fill(causal_mask_slice == 0, float("-inf"))
 
         # Apply attention mask (use encoder_attention_mask for cross-attention)
@@ -312,6 +323,10 @@ class MegaTransformerAxial2DAttention(nn.Module):
         attention_scores = torch.matmul(queries, keys.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.d_queries)
 
+        if self.config.attn_logit_cap is not None:
+            cap = self.config.attn_logit_cap
+            attention_scores = cap * torch.tanh(attention_scores / cap)
+
         # Optional causal masking (off by default for images)
         if self.causal:
             causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=hidden_states.device))
@@ -378,7 +393,10 @@ class MegaTransformerEncoderBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(transformer_weight_init())
+        # Per-block default: standard Xavier (gain=1.0). Parent stacks should
+        # call `apply_depth_scaled_residual_init` after constructing all blocks
+        # to depth-scale the residual-output layers (o_proj, condense).
+        self.apply(linear_weight_init(gain=1.0))
 
     def forward(
         self,
@@ -468,7 +486,10 @@ class MegaTransformerAxial2DEncoderBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(transformer_weight_init())
+        # Per-block default: standard Xavier (gain=1.0). Parent stacks should
+        # call `apply_depth_scaled_residual_init` after constructing all blocks
+        # to depth-scale the residual-output layers (o_proj, condense).
+        self.apply(linear_weight_init(gain=1.0))
 
     def forward(
         self,
@@ -536,7 +557,10 @@ class MegaTransformerDecoderBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(transformer_weight_init())
+        # Per-block default: standard Xavier (gain=1.0). Parent stacks should
+        # call `apply_depth_scaled_residual_init` after constructing all blocks
+        # to depth-scale the residual-output layers (o_proj, condense).
+        self.apply(linear_weight_init(gain=1.0))
 
     def forward(
         self,

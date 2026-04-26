@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from scripts.data.preprocessor import BatchProcessor, Preprocessor
+from scripts.data.preprocessor import BatchProcessor, Preprocessor, validate_shard_alignment
 
 
 def download_image(
@@ -408,7 +408,10 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
 
         self.image_size = (args.image_size, args.image_size)
         print(f"  Image size: {self.image_size}")
-        print(f"  Total samples in dataset: {len(self.dataset):,}")
+        try:
+            print(f"  Total samples in dataset: {len(self.dataset):,}")
+        except TypeError:
+            print(f"  Total samples in dataset: (streaming, size unknown)")
 
         # Initialize batch processor
         if self._encode_fn is not None:
@@ -494,7 +497,7 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
                                 help="Tokenize text into token IDs (for world model text input)")
         sub_parser.add_argument("--tokenizer_name", type=str, default="mistralai/Mistral-7B-v0.1",
                                 help="HuggingFace tokenizer for --tokenize_text")
-        sub_parser.add_argument("--max_seq_len", type=int, default=128,
+        sub_parser.add_argument("--max_seq_len", type=int, default=256,
                                 help="Maximum token sequence length for --tokenize_text")
         
         return sub_parser
@@ -563,6 +566,9 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
                     padded.append(tokens)
                 shard_data["token_ids"] = torch.stack(padded, dim=0)
                 shard_data["text_lengths"] = torch.stack(self.shard_fields['shard_text_lengths'], dim=0)
+
+        # Catch accumulator-lifecycle bugs before they go to disk.
+        validate_shard_alignment(shard_data, shard_data["num_samples"])
 
         shard_path = os.path.join(self.output_dir, f"shard_{self.shard_fields['shard_idx']:06d}.pt")
         torch.save(shard_data, shard_path)

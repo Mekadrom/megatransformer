@@ -44,6 +44,11 @@ def set_seed_everywhere(seed: int):
 
 
 def embedding_weight_init(hidden_size):
+    """Embedding init: N(0, 1/sqrt(hidden_size)).
+
+    This keeps embedding output magnitude ~1 regardless of d_model, so the
+    downstream transformer doesn't see embeddings that scale wildly with width.
+    """
     def init_weights(module):
         if isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=hidden_size ** -0.5)
@@ -52,22 +57,110 @@ def embedding_weight_init(hidden_size):
     return init_weights
 
 
-def transformer_weight_init():
+def linear_weight_init(gain: float = 1.0):
+    """Standard Xavier-normal init for `nn.Linear` layers.
+
+    This is the principled default for q/k/v projections, FFN expand layers,
+    and any other linear layer that should preserve activation variance. Uses
+    `xavier_normal_(gain=gain)` which gives `std = gain * sqrt(2/(fan_in+fan_out))`.
+
+    For residual-output layers (attention `o_proj`, FFN `condense`) you should
+    additionally call `apply_depth_scaled_residual_init` after constructing the
+    full stack so the residual stream variance does not grow with depth.
+    """
     def init_weights(module):
         if isinstance(module, nn.Linear):
-            nn.init.xavier_normal_(module.weight, gain=0.02)
+            nn.init.xavier_normal_(module.weight, gain=gain)
             if hasattr(module, 'bias') and module.bias is not None:
                 module.bias.data.zero_()
     return init_weights
 
 
+# Backwards-compat alias. Old call sites that used `transformer_weight_init()`
+# meant "init all linear layers" — now uses the principled gain=1.0 default
+# instead of the previous gain=0.02 which was effectively zero.
+def transformer_weight_init(gain: float = 1.0):
+    return linear_weight_init(gain=gain)
+
+
 def conv2d_weight_init():
+    """Kaiming-normal init for `nn.Conv2d` (and `nn.Conv1d`) layers.
+
+    Uses `fan_out` mode and `relu` nonlinearity, which is the principled choice
+    for conv layers feeding into ReLU/GELU activations.
+    """
     def init_weights(module):
-        if isinstance(module, nn.Conv2d):
+        if isinstance(module, (nn.Conv1d, nn.Conv2d)):
             nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
             if hasattr(module, 'bias') and module.bias is not None:
                 module.bias.data.zero_()
     return init_weights
+
+
+def _depth_scaled_residual_init_(linear: nn.Linear, n_residual_layers: int):
+    """In-place depth-scaled init for a single residual-output Linear.
+
+    Uses `std = sqrt(1 / (n_residual_layers * fan_in))`, derived from Kaiming
+    `sqrt(2/fan_in)` divided by `sqrt(2*n_residual_layers)` (the GPT-2/Megatron
+    pattern). Keeps the variance of the residual stream stable as depth grows.
+    """
+    if not isinstance(linear, nn.Linear):
+        return
+    fan_in = linear.weight.shape[1]
+    std = (1.0 / max(n_residual_layers, 1) / fan_in) ** 0.5
+    nn.init.normal_(linear.weight, mean=0.0, std=std)
+    if linear.bias is not None:
+        nn.init.zeros_(linear.bias)
+
+
+def apply_depth_scaled_residual_init(blocks, n_residual_layers: Optional[int] = None):
+    """Re-initialize residual-output layers of every block in a stack.
+
+    Targets per block:
+      - `block.self_attn.o_proj`
+      - `block.cross_attn.o_proj` (if present)
+      - `block.ffn.condense` (if present)
+
+    `n_residual_layers` defaults to `len(blocks)` — the depth of this residual
+    stack. Pass an explicit value to handle cases like the recurrent block where
+    the effective depth is the number of iterations, not the number of blocks.
+
+    Call this AFTER constructing all blocks (and after their per-block default
+    init has run). It overwrites the residual-output layers with depth-scaled
+    init while leaving q/k/v/expand and other layers alone.
+    """
+    if n_residual_layers is None:
+        try:
+            n_residual_layers = len(blocks)
+        except TypeError:
+            n_residual_layers = 1
+    if n_residual_layers <= 0:
+        return
+    for block in blocks:
+        if hasattr(block, 'self_attn') and hasattr(block.self_attn, 'o_proj'):
+            _depth_scaled_residual_init_(block.self_attn.o_proj, n_residual_layers)
+        if hasattr(block, 'cross_attn') and hasattr(block.cross_attn, 'o_proj'):
+            _depth_scaled_residual_init_(block.cross_attn.o_proj, n_residual_layers)
+        if hasattr(block, 'ffn') and hasattr(block.ffn, 'condense'):
+            _depth_scaled_residual_init_(block.ffn.condense, n_residual_layers)
+
+
+def init_transformer_stack(blocks, n_residual_layers: Optional[int] = None, gain: float = 1.0):
+    """One-shot principled init for a stack of transformer blocks.
+
+    1. Applies standard Xavier (`linear_weight_init(gain)`) to every Linear in
+       every block — overwriting any per-block default init so the whole stack
+       is consistent.
+    2. Then re-initializes the residual-output layers (o_proj / condense) with
+       depth-scaled init so the residual stream variance is preserved.
+
+    This is the recommended init for any encoder/decoder stack inside a parent
+    module (preludes, codas, cross-attention decoders).
+    """
+    init_linear = linear_weight_init(gain=gain)
+    for block in blocks:
+        block.apply(init_linear)
+    apply_depth_scaled_residual_init(blocks, n_residual_layers=n_residual_layers)
 
 
 def print_debug_tensor(pre: str, tensor: torch.Tensor):

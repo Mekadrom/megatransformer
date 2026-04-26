@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from model.audio.vocoder.vocoder import Vocoder
+from model.voice.vocoder.vocoder import Vocoder
 from model.ema import EMAModel
 from utils.audio_utils import SharedWindowBuffer
 

@@ -6,8 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Sampler
 from transformers.trainer import Trainer
-from model.audio.sive.ctc_vocab import CTCVocab
-from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
+from model.voice.sive.ctc_vocab import CTCVocab
+from model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from utils import metrics, model_loading_utils
 from utils.megatransformer_utils import print_debug_tensor
 
@@ -153,9 +153,11 @@ class SIVETrainer(Trainer):
         global_step = self.state.global_step + self.step_offset
 
         # Log CLI and git hash on first call (logs at resumed step if resuming)
-        if not self.has_logged_cli:
+        if not self.has_logged_cli and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
             metrics.log_text("training/command_line", self.cmdline, global_step)
             metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            metrics.log_text("training/model_architecture", str(model), global_step)
+            metrics.log_text("training/model_param_count", f"{sum(p.numel() for p in model.parameters()):,}", global_step)
             self.has_logged_cli = True
 
         mel_specs = inputs["mel_specs"]
@@ -280,6 +282,12 @@ class SIVETrainer(Trainer):
             print(f"SpecAugment: ENABLED")
             print(f"  time_mask_param: {args.spec_time_mask_param}, freq_mask_param: {args.spec_freq_mask_param}")
             print(f"  num_time_masks: {args.spec_num_time_masks}, num_freq_masks: {args.spec_num_freq_masks}")
+        if args.use_mel_noise:
+            print(f"Mel noise: ENABLED")
+            print(f"  SNR range: [{args.mel_noise_snr_min_db}, {args.mel_noise_snr_max_db}] dB, prob={args.mel_noise_prob}")
+        if args.use_mel_freq_response:
+            print(f"Mel freq-response modulation: ENABLED")
+            print(f"  strength={args.mel_freq_response_strength}, prob={args.mel_freq_response_prob}, smoothing={args.mel_freq_response_smoothing}")
         if args.drop_path_rate > 0:
             print(f"Stochastic Depth: ENABLED (max drop_path_rate={args.drop_path_rate})")
         if args.activation != "gelu":
@@ -289,7 +297,7 @@ class SIVETrainer(Trainer):
         if args.vocoder_checkpoint_path:
             print(f"Vocoder (for audio visualization): {args.vocoder_config}")
             print(f"  checkpoint: {args.vocoder_checkpoint_path}")
-            print(f"  sample_rate: {args.audio_sample_rate}, n_fft: {args.audio_n_fft}, hop_length: {args.audio_hop_length}")
+            print(f"  sample_rate: {args.voice_sample_rate}, n_fft: {args.voice_n_fft}, hop_length: {args.voice_hop_length}")
             print(f"  num_audio_samples: {args.num_audio_samples}")
         print(f"CTC decoding: beam_width={args.beam_width}")
         if args.kenlm_model_path:
@@ -331,7 +339,7 @@ class SIVETrainer(Trainer):
 def load_model(args):
     return model_loading_utils.load_model(SpeakerInvariantVoiceEncoder, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
         'num_speakers': args.num_speakers,
-        'audio_n_mels': args.audio_n_mels,
+        'voice_n_mels': args.voice_n_mels,
         # CTC upsampling (relaxes CTC length constraint)
         'ctc_upsample_factor': args.ctc_upsample_factor,
         # Dropout regularization
@@ -351,6 +359,15 @@ def load_model(args):
         'spec_freq_mask_param': args.spec_freq_mask_param,
         'spec_num_time_masks': args.spec_num_time_masks,
         'spec_num_freq_masks': args.spec_num_freq_masks,
+        # Mel-space noise / EQ augmentation
+        'use_mel_noise': args.use_mel_noise,
+        'mel_noise_snr_min_db': args.mel_noise_snr_min_db,
+        'mel_noise_snr_max_db': args.mel_noise_snr_max_db,
+        'mel_noise_prob': args.mel_noise_prob,
+        'use_mel_freq_response': args.use_mel_freq_response,
+        'mel_freq_response_strength': args.mel_freq_response_strength,
+        'mel_freq_response_prob': args.mel_freq_response_prob,
+        'mel_freq_response_smoothing': args.mel_freq_response_smoothing,
         # Stochastic Depth
         'drop_path_rate': args.drop_path_rate,
     })
@@ -393,17 +410,17 @@ def create_trainer(
 def add_cli_args(subparsers):
     sub_parser = subparsers.add_parser("audio-sive", help="Train a Speaker-Invariant Voice Encoder (SIVE) model with CTC + GRL losses")
 
-    # Audio settings
-    sub_parser.add_argument("--audio_max_seconds", type=float, default=10.0,
-                            help="Maximum audio length in seconds")
-    sub_parser.add_argument("--audio_n_mels", type=int, default=80,
+    # Voice settings
+    sub_parser.add_argument("--voice_max_seconds", type=float, default=10.0,
+                            help="Maximum voice clip length in seconds")
+    sub_parser.add_argument("--voice_n_mels", type=int, default=80,
                             help="Number of mel filterbanks")
-    sub_parser.add_argument("--audio_sample_rate", type=int, default=16000,
-                            help="Audio sample rate")
-    sub_parser.add_argument("--audio_n_fft", type=int, default=16000,
-                            help="FFT size for audio processing")
-    sub_parser.add_argument("--audio_hop_length", type=int, default=256,
-                            help="Hop length for audio processing")
+    sub_parser.add_argument("--voice_sample_rate", type=int, default=16000,
+                            help="Voice sample rate")
+    sub_parser.add_argument("--voice_n_fft", type=int, default=1024,
+                            help="FFT size for voice processing")
+    sub_parser.add_argument("--voice_hop_length", type=int, default=256,
+                            help="Hop length for voice processing")
     sub_parser.add_argument("--sive_total_stride", type=int, default=4,
                             help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
 
@@ -458,6 +475,26 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--spec_num_freq_masks", type=int, default=2,
                             help="Number of frequency masks for SpecAugment")
 
+    # Mel-space Gaussian noise injection (waveform-free noise augmentation).
+    sub_parser.add_argument("--use_mel_noise", action="store_true",
+                            help="Add Gaussian noise to mel at a random SNR (training-only)")
+    sub_parser.add_argument("--mel_noise_snr_min_db", type=float, default=5.0,
+                            help="Lower bound on sampled target SNR in dB")
+    sub_parser.add_argument("--mel_noise_snr_max_db", type=float, default=20.0,
+                            help="Upper bound on sampled target SNR in dB")
+    sub_parser.add_argument("--mel_noise_prob", type=float, default=0.5,
+                            help="Per-utterance probability of applying mel noise")
+
+    # Mel-space frequency-response modulation (simulates mic/channel EQ).
+    sub_parser.add_argument("--use_mel_freq_response", action="store_true",
+                            help="Apply random smooth per-band gain to simulate mic/channel EQ")
+    sub_parser.add_argument("--mel_freq_response_strength", type=float, default=0.3,
+                            help="Std of pre-smoothing per-band gain noise (0.3 = ~±30% swings)")
+    sub_parser.add_argument("--mel_freq_response_prob", type=float, default=0.5,
+                            help="Per-utterance probability of applying EQ modulation")
+    sub_parser.add_argument("--mel_freq_response_smoothing", type=int, default=7,
+                            help="Smoothing kernel width across mel bands (odd int; larger = smoother EQ)")
+
     # Stochastic Depth (drop entire residual paths for regularization)
     sub_parser.add_argument("--drop_path_rate", type=float, default=0.0,
                             help="Max drop path rate for stochastic depth (linearly scaled per layer, 0=disabled)")
@@ -484,6 +521,10 @@ def add_cli_args(subparsers):
                             help="Number of speakers for speaker embedding classifier")
 
     sub_parser.add_argument("--cache_dir", type=str, default="../cached_datasets/audio_sive",
-                           help="Directory for cached datasets")
+                           help="Base dir for cached shards (code appends _train/_val)")
+    sub_parser.add_argument("--train_cache_dir", type=str, default=None,
+                           help="Explicit train shard dir (overrides --cache_dir)")
+    sub_parser.add_argument("--val_cache_dir", type=str, default=None,
+                           help="Explicit val shard dir (overrides --cache_dir)")
 
     return sub_parser

@@ -29,6 +29,12 @@ class MegaTransformerBlockConfig:
     activation_function: str = "gelu"
     causal: bool = True  # If False, no causal mask (bidirectional attention)
 
+    # Soft logit capping on attention scores (Gemma 2-style). Applied after
+    # scaling by 1/sqrt(d_queries): scores = cap * tanh(scores / cap).
+    # Prevents attention entropy collapse without hard clipping.
+    # None = disabled (default). Typical values: 30.0–50.0.
+    attn_logit_cap: Optional[float] = None
+
     norm_type: str = "layernorm"
     norm_eps: float = 1e-5
     pre_attn_norm: bool = True
@@ -64,5 +70,5 @@ class ImageConfig:
     image_size: int = 256
     latent_channels: int = 12
     latent_compression_factor: int = 8
-    latent_patch_size: int = 2
+    latent_patch_size: int = 4
 

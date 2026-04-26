@@ -1,12 +1,16 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from config.text.generator import TextCodaClassifierConfig
 from model.norms import create_norm
 from model.transformer import MegaTransformerEncoderBlock
-from utils.megatransformer_utils import transformer_weight_init
+from utils.megatransformer_utils import (
+    apply_depth_scaled_residual_init,
+    linear_weight_init,
+)
 
 
 class TextCodaClassifierWithLoss(nn.Module):
@@ -38,33 +42,74 @@ class TextCodaClassifierWithLoss(nn.Module):
         self.lm_head = nn.Linear(coda_config.d_model, config.vocab_size)
         self.loss_fn = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
 
+        self.gradient_checkpointing = False
         self._init_weights()
 
     def _init_weights(self):
-        self.apply(transformer_weight_init())
+        # Standard Xavier on every Linear (coda blocks + lm_head), then
+        # depth-scaled init for the coda blocks' residual outputs.
+        self.apply(linear_weight_init(gain=1.0))
+        apply_depth_scaled_residual_init(self.coda)
 
-    def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        kv_caches: Optional[List] = None,
+        position_offset: int = 0,
+        use_cache: bool = False,
+    ) -> dict[str, torch.Tensor]:
         """
         Takes inputs in the shape (batch_size, seq_length, d_model) and processes them through the Coda and classification head.
-        It goes: Coda -> classification head -> logits over vocabulary.
+
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_length, d_model).
-            targets (torch.Tensor, optional): Target token IDs for computing classification loss.
+            x: Input tensor of shape (batch_size, seq_length, d_model).
+            targets: Target token IDs for computing classification loss.
+            kv_caches: Optional list of KVCache objects, one per coda layer.
+                When provided, the coda's self-attention attends to cached
+                representations from previous positions (inference only).
+            position_offset: RoPE position offset for cached generation.
+            use_cache: If True, return updated KV caches in the output dict.
+
         Returns:
-            dict[str, torch.Tensor]: A dictionary containing the logits and classification loss if targets are provided.
+            dict with "logits" and optionally "text_classification_loss" and "kv_caches".
         """
 
         if hasattr(self, 'input_norm'):
             x = self.input_norm(x)
 
+        # MegaTransformerEncoderBlock.forward already adds residuals internally,
+        # so the loop just chains layers without re-adding the input.
         h = x
-        for block in self.coda:
-            hidden, _ = block(h)
-            h = h + hidden
+        new_kv_caches = []
+        for i, block in enumerate(self.coda):
+            block_cache = kv_caches[i] if kv_caches is not None else None
+            if self.gradient_checkpointing and self.training and not use_cache:
+                h, new_cache = torch_checkpoint(
+                    block, h, None, None, block_cache, position_offset, use_cache,
+                    use_reentrant=False,
+                )
+            else:
+                h, new_cache = block(
+                    h,
+                    kv_cache=block_cache,
+                    position_offset=position_offset,
+                    use_cache=use_cache,
+                )
+            if use_cache:
+                new_kv_caches.append(new_cache)
 
         logits: torch.Tensor = self.lm_head(h)
 
+        # Soft logit capping (Gemma 2-style): bounds logits within [-cap, cap]
+        # to prevent overconfident predictions. Pairs with label smoothing.
+        cap = getattr(self.config, 'lm_head_logit_cap', None)
+        if cap is not None:
+            logits = cap * torch.tanh(logits / cap)
+
         output = {"logits": logits}
+        if use_cache:
+            output["kv_caches"] = new_kv_caches
 
         if targets is not None:
             batch_size, seq_length, vocab_size = logits.size()

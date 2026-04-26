@@ -99,9 +99,11 @@ class ImageVAEGANTrainer(CommonTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
 
-        if not self.has_logged_cli:
+        if not self.has_logged_cli and torch.distributed.get_rank() == 0:
             metrics.log_text("training/command_line", self.cmdline, global_step)
             metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
+            metrics.log_text("training/model_architecture", str(model), global_step)
+            metrics.log_text("training/model_param_count", f"{sum(p.numel() for p in model.parameters()):,}", global_step)
             self.has_logged_cli = True
 
         image = inputs["image"]
@@ -488,6 +490,10 @@ def add_cli_args(subparsers):
 
     # Dataset caching directory
     sub_parser.add_argument("--cache_dir", type=str, default=None,
-                           help="Directory to cache datasets")
-    
+                           help="Base dir for cached shards (code appends _train/_val)")
+    sub_parser.add_argument("--train_cache_dir", type=str, default=None,
+                           help="Explicit train shard dir (overrides --cache_dir)")
+    sub_parser.add_argument("--val_cache_dir", type=str, default=None,
+                           help="Explicit val shard dir (overrides --cache_dir)")
+
     return sub_parser

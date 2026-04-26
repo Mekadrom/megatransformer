@@ -47,6 +47,7 @@
   arrow/.style={-{Stealth[length=5pt, width=4pt]}, line width=0.7pt, color=darkgray},
   thickarrow/.style={-{Stealth[length=6pt, width=5pt]}, line width=1.0pt, color=#1},
   dasharrow/.style={-{Stealth[length=5pt, width=4pt]}, line width=0.7pt, color=darkgray, dashed},
+  thickdasharrow/.style={-{Stealth[length=6pt, width=5pt]}, line width=1.0pt, color=#1, dashed},
   seclabel/.style={font=\footnotesize\sffamily\bfseries, text=#1},
 }
 
@@ -66,7 +67,7 @@
 % ════════════════════════════════════════════════════════════════════
 \node[iolabel] (voice_in) at (\voiceX, 0) {SIVE Features\\$(B, C, T)$};
 \node[iolabel] (text_in)  at (\textX, 0)  {Token IDs\\$(B, T)$};
-\node[iolabel] (image_in) at (\imageX, 0) {VAE Latents\\$(B, C, H, W)$};
+\node[iolabel] (image_in) at (\imageX, 0) {Image Latents\\$(B, C, H, W)$};
 
 % ════════════════════════════════════════════════════════════════════
 % FEATURE EXTRACTORS / PRELUDES
@@ -76,19 +77,19 @@
 \node[modbox=voicegreen] (voice_proj)    at (\voiceX, 1.5) {Linear $C \to d$};
 \node[modbox=voicegreen] (voice_pos)     at (\voiceX, 3.0) {Sinusoidal Pos Enc};
 \node[modbox=voicegreen] (voice_prelude) at (\voiceX, 4.5) {Prelude Blocks $\times N$};
-\node[attnlabel=voicegreen, anchor=east] at ([xshift=-5pt]voice_prelude.west) {CAUSAL};
+\node[attnlabel=voicegreen, anchor=east] at ([xshift=-5pt]voice_prelude.west) {CAUSAL, RoPE};
 
 % -- Text (center) --
 \node[modbox=textblue] (text_embed)   at (\textX, 1.5) {Embedding $V \to d$};
 \node[modbox=textblue] (text_pos)     at (\textX, 3.0) {Sinusoidal Pos Enc};
 \node[modbox=textblue] (text_prelude) at (\textX, 4.5) {Prelude Blocks $\times N$};
-\node[attnlabel=textblue, anchor=west] at ([xshift=5pt]text_prelude.east) {CAUSAL};
+\node[attnlabel=textblue, anchor=west] at ([xshift=5pt]text_prelude.east) {CAUSAL, RoPE};
 
 % -- Image (right) --
 \node[modbox=imagered] (image_patch)   at (\imageX, 1.5) {Patch Embed Conv2d};
 \node[modbox=imagered] (image_pos)     at (\imageX, 3.0) {2D Positional Enc};
 \node[modbox=imagered] (image_prelude) at (\imageX, 4.5) {Prelude Blocks $\times N$};
-\node[attnlabel=imagered, anchor=west] at ([xshift=5pt]image_prelude.east) {BIDIR};
+\node[attnlabel=imagered, anchor=west] at ([xshift=5pt]image_prelude.east) {BIDIR, Axial RoPE};
 
 % Prelude arrows
 \draw[arrow] (voice_in) -- (voice_proj);
@@ -108,26 +109,26 @@
 
 % Voice synthesis (between voice and text)
 \node[annobox=voicegreen] (voice_genq) at (\voiceCondX, 6.5) {Gen Queries\\$\times 3.0$ + SinPE};
-\node[modbox=voicegreen, minimum width=2.6cm] (voice_textcond) at (\voiceCondX, 8.0) {Text Cond.\\Cross-Attn};
-\node[attnlabel=voicegreen, anchor=east] at ([xshift=-4pt]voice_textcond.west) {BIDIR};
+\node[annobox=voicegreen, minimum width=2.6cm] (voice_textcond) at (\voiceCondX, 8.0) {Text Cond.\\Cross-Attn};
+\node[attnlabel=voicegreen, anchor=east] at ([xshift=-16pt]voice_textcond.west) {BIDIR, RoPE};
 \node[font=\tiny\sffamily\itshape, text=voicegreen!70!black, anchor=south]
-  at ([yshift=3pt]voice_genq.north) {synthesis only};
+  at ([xshift=-20pt,yshift=3pt]voice_genq.north) {synthesis only};
 
 % Image synthesis (between text and image)
 \node[annobox=imagered] (image_genq) at (\imageCondX, 6.5) {Gen Queries\\$\times 3.0$ + 2D PE};
-\node[modbox=imagered, minimum width=2.6cm] (image_textcond) at (\imageCondX, 8.0) {Text Cond.\\Cross-Attn};
-\node[attnlabel=imagered, anchor=west] at ([xshift=4pt]image_textcond.east) {BIDIR};
+\node[annobox=imagered, minimum width=2.6cm] (image_textcond) at (\imageCondX, 8.0) {Text Cond.\\Cross-Attn};
+\node[attnlabel=imagered, anchor=west] at ([xshift=16pt]image_textcond.east) {BIDIR, RoPE};
 \node[font=\tiny\sffamily\itshape, text=imagered!70!black, anchor=south]
-  at ([yshift=3pt]image_genq.north) {synthesis only};
+  at ([xshift=20pt,yshift=3pt]image_genq.north) {synthesis only};
 
 % Arrows for synthesis path
 \draw[dasharrow] (voice_genq) -- (voice_textcond);
 \draw[dasharrow] (image_genq) -- (image_textcond);
 
 % Text feeds outward into both conditioning blocks (clean fan-out)
-\draw[dasharrow] (text_prelude) -- ++(0, 1.5) -| (voice_textcond)
+\draw[dasharrow] (text_prelude) -- ++(0, 1) -| (voice_genq)
   node[pos=0.15, above, font=\tiny\sffamily\itshape, text=darkgray] {text hidden states};
-\draw[dasharrow] (text_prelude) -- ++(0, 1.5) -| (image_textcond);
+\draw[dasharrow] (text_prelude) -- ++(0, 1) -| (image_genq);
 
 % ════════════════════════════════════════════════════════════════════
 % TOKEN INTERLEAVER
@@ -140,11 +141,11 @@
 \node[annobox=interleaveamber] (scale) at (\centerX, 11.2) {$\times \sqrt{d_{model}}$};
 
 % Arrows into interleaver — from preludes and from text conditioning
-\draw[arrow] (voice_prelude) -- ++(0, 2.0) -| ([xshift=-4.5cm]interleaver.south);
-\draw[arrow] (voice_textcond) -- ++(0, 0.8) -| ([xshift=-3cm]interleaver.south);
-\draw[arrow] (text_prelude) -- ++(0, 1.5) -| ([xshift=0cm]interleaver.south);
-\draw[arrow] (image_prelude) -- ++(0, 2.0) -| ([xshift=4.5cm]interleaver.south);
-\draw[arrow] (image_textcond) -- ++(0, 0.8) -| ([xshift=3cm]interleaver.south);
+\draw[thickarrow=voicegreen] (voice_prelude) -- ++(0, 2.0) -| ([xshift=-4.5cm]interleaver.south);
+\draw[thickdasharrow=voicegreen] (voice_textcond) -- ++(0, 0.8) -| ([xshift=-2.8cm]interleaver.south);
+\draw[thickarrow=textblue] (text_prelude) -- ++(0, 1.5) -| ([xshift=0cm]interleaver.south);
+\draw[thickarrow=imagered] (image_prelude) -- ++(0, 2.0) -| ([xshift=4.5cm]interleaver.south);
+\draw[thickdasharrow=imagered] (image_textcond) -- ++(0, 0.8) -| ([xshift=2.8cm]interleaver.south);
 
 \draw[arrow] (interleaver) -- (scale);
 
@@ -168,7 +169,7 @@
 
 \node[modbox=recurrentpurple, minimum width=5.5cm] (recblocks) at (\centerX, 15.9)
   {Transformer Blocks $\times 4$\\(shared or independent weights)};
-\node[attnlabel=recurrentpurple, anchor=west] at ([xshift=5pt]recblocks.east) {CAUSAL};
+\node[attnlabel=recurrentpurple, anchor=west] at ([xshift=5pt]recblocks.east) {CAUSAL, RoPE};
 
 \node[modbox=recurrentpurple, minimum width=4.0cm] (projection) at (\centerX, 17.5)
   {Linear $2d \to d$};
@@ -181,7 +182,7 @@
 \coordinate (rec_left_pad) at ([xshift=-3.0cm]recblocks.west);
 \begin{scope}[on background layer]
   \node[groupbg=recurrentpurple, inner sep=16pt,
-    fit=(scale)(postnorm)(rec_right_pad)(rec_left_pad)] (recbg) {};
+    fit=(scale)(postnorm)(rec_right_pad)(rec_left_pad), yshift=10pt] (recbg) {};
 \end{scope}
 
 \node[seclabel=recurrentpurple, anchor=north west] at (recbg.north west)
@@ -223,15 +224,15 @@
 % Voice coda (left, matching input column)
 \node[modbox=voicegreen] (voice_coda) at (\voiceX, 23.0) {Voice Coda $\times N$};
 \node[modbox=voicegreen] (voice_proj_out) at (\voiceX, 24.5) {Linear $d \to C$\\+ Conv Refine};
-\node[attnlabel=voicegreen, anchor=east] at ([xshift=-5pt]voice_coda.west) {CAUSAL};
+\node[attnlabel=voicegreen, anchor=east] at ([xshift=-5pt]voice_coda.west) {CAUSAL, RoPE};
 
 % Text coda (center, matching input column)
 \node[modbox=textblue] (text_coda) at (\textX, 23.0) {Text Coda $\times N$};
 \node[modbox=textblue] (text_lmhead) at (\textX, 24.5) {LM Head $d \to V$};
-\node[attnlabel=textblue, anchor=west] at ([xshift=5pt]text_coda.east) {CAUSAL};
+\node[attnlabel=textblue, anchor=west] at ([xshift=5pt]text_coda.east) {CAUSAL, RoPE};
 
 % Image coda (right, matching input column — cross-attention architecture)
-\node[modbox=imagered] (image_norm) at (\imageX, 22.8) {LayerNorm};
+\node[modbox=imagered] (image_norm) at (\imageX, 23.0) {LayerNorm};
 \node[modbox=imagered] (image_enc) at (\imageX, 24.0) {Encoder $\times 4$};
 \node[attnlabel=imagered, anchor=west] at ([xshift=5pt]image_enc.east) {BIDIR};
 \node[modbox=imagered] (image_dec) at (\imageX, 25.2) {Decoder $\times 6$};
@@ -256,7 +257,7 @@
 % OUTPUTS
 % ════════════════════════════════════════════════════════════════════
 
-\node[iolabel, above=0.6cm of voice_proj_out] (voice_out) {Voice Latents $(B, C, T)$};
+\node[iolabel, above=0.6cm of voice_proj_out] (voice_out) {SIVE Features $(B, C, T)$};
 \node[iolabel, above=0.6cm of text_lmhead]    (text_out)  {Logits $(B, T, V)$};
 \node[iolabel, above=0.6cm of image_unpatch]  (image_out) {Image Latents $(B, C, H, W)$};
 

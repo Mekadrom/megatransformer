@@ -8,8 +8,8 @@ from typing import Optional
 
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from model.audio.sive.ctc_vocab import CTCVocab
-from model.audio.vocoder.vocoder import Vocoder
+from model.voice.sive.ctc_vocab import CTCVocab
+from model.voice.vocoder.vocoder import Vocoder
 from scripts.train.visualization_callback import VisualizationCallback
 from transformers.trainer import Trainer
 
@@ -69,11 +69,11 @@ class SIVEVisualizationCallback(VisualizationCallback):
         num_tsne_samples: int = 150,
         num_transcription_samples: int = 8,
         max_speakers_for_tsne: int = 15,
-        # Audio settings
-        audio_sample_rate: int = 16000,
-        audio_max_length: int = 10,
-        audio_n_fft: int = 1024,
-        audio_hop_length: int = 256,
+        # Voice settings
+        voice_sample_rate: int = 16000,
+        voice_max_length: int = 10,
+        voice_n_fft: int = 1024,
+        voice_hop_length: int = 256,
         num_audio_samples: int = 4,
         sive_downsampling_factor: int = 4,
         # LM decoder settings (beam search with optional language model)
@@ -90,12 +90,12 @@ class SIVEVisualizationCallback(VisualizationCallback):
         self.max_speakers_for_tsne = max_speakers_for_tsne
         self.trainer: Optional[Trainer] = None
 
-        # Audio settings
-        self.audio_sample_rate = audio_sample_rate
-        self.audio_n_fft = audio_n_fft
-        self.audio_hop_length = audio_hop_length
+        # Voice settings
+        self.voice_sample_rate = voice_sample_rate
+        self.voice_n_fft = voice_n_fft
+        self.voice_hop_length = voice_hop_length
         self.num_audio_samples = num_audio_samples
-        self.max_mel_frames = (audio_sample_rate * audio_max_length) // audio_hop_length
+        self.max_mel_frames = (voice_sample_rate * voice_max_length) // voice_hop_length
         self.max_feature_frames = (self.max_mel_frames + sive_downsampling_factor - 1) // sive_downsampling_factor
 
         # LM decoder settings
@@ -658,7 +658,7 @@ class SIVEVisualizationCallback(VisualizationCallback):
             # Generate audio from mel spectrogram
             try:
                 waveform = visualization.render_vocoder_audio(self.vocoder, mel_cropped)
-                metrics.log_audio(f"audio_samples/sample_{i}", waveform, step, self.audio_sample_rate)
+                metrics.log_audio(f"audio_samples/sample_{i}", waveform, step, self.voice_sample_rate)
             except Exception as e:
                 print(f"Failed to generate audio with vocoder: {e}")
 

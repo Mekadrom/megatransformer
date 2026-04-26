@@ -31,8 +31,8 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 from tqdm import tqdm
 
-from model.audio.sive.sive import SpeakerInvariantVoiceEncoder
-from scripts.data.audio.dataset import AudioShardedDataset
+from model.voice.sive.sive import SpeakerInvariantVoiceEncoder
+from scripts.data.voice.dataset import VoiceShardedDataset
 from utils.model_loading_utils import load_model
 
 
@@ -78,7 +78,7 @@ def load_sample(cache_dir: str, sample_index: int) -> tuple[torch.Tensor, int]:
         mel_spec: [n_mels, T] tensor
         mel_length: int
     """
-    dataset = AudioShardedDataset(cache_dir, columns=["mel_specs"])
+    dataset = VoiceShardedDataset(cache_dir, columns=["mel_specs"])
     sample = dataset[sample_index]
     return sample["mel_spec"], sample["mel_length"]
 

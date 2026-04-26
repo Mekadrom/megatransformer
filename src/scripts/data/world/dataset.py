@@ -1,6 +1,8 @@
 import json
 import os
 import bisect
+from typing import Optional
+
 import torch
 
 from torch.utils.data import Dataset
@@ -74,8 +76,13 @@ class MultimodalShardedDataset(Dataset):
         if self.voice_columns is None and "voice" in self.modalities:
             self.voice_columns = _default_audio_columns
 
-        # Total length = max across modalities; shorter ones wrap via modulo
-        self.total_samples = max(m["total_samples"] for m in self.modalities.values())
+        # Total length = max across modalities × number of task types, so one
+        # "epoch" covers every sample in the largest modality across all tasks
+        # (synthesis + transcription). Shorter modalities wrap via modulo.
+        # Without the ×n_tasks factor, __getitem__'s `within_task_idx = idx // n_tasks`
+        # caps at total_samples // n_tasks, leaving most samples unreachable.
+        n_tasks = len(self.task_types)
+        self.total_samples = max(m["total_samples"] for m in self.modalities.values()) * n_tasks
 
         # Cap dataset length for overfitting experiments
         if max_samples is not None and max_samples > 0:
@@ -114,7 +121,7 @@ class MultimodalShardedDataset(Dataset):
             for shard_file in tqdm(shard_files):
                 shard_offsets.append(total_samples)
                 shard_path = os.path.join(shard_dir, shard_file)
-                shard = torch.load(shard_path, map_location="cpu", weights_only=True)
+                shard = torch.load(shard_path, map_location="cpu", weights_only=True, mmap=True)
                 total_samples += shard["num_samples"]
 
             index_data = {
@@ -153,7 +160,7 @@ class MultimodalShardedDataset(Dataset):
             return cache[shard_idx]
 
         shard_path = os.path.join(modality["shard_dir"], modality["shard_files"][shard_idx])
-        shard = torch.load(shard_path, map_location="cpu", weights_only=True)
+        shard = torch.load(shard_path, map_location="cpu", weights_only=True, mmap=True)
 
         if len(cache) >= self.cache_size:
             oldest = cache_order.pop(0)
@@ -365,7 +372,8 @@ class MultimodalShardedDataset(Dataset):
         return sample
 
     def get_sampler(self, shuffle: bool = True, seed: int = 42,
-                    batch_size: int = 1, world_size: int = 1):
+                    batch_size: int = 1, world_size: int = 1,
+                    shard_aware: bool = True):
         """
         Get a task-grouped sampler that yields indices such that each
         batch contains only one task type (e.g., all voice_synthesis or
@@ -375,7 +383,20 @@ class MultimodalShardedDataset(Dataset):
         each task are strided. This sampler groups them into chunks
         aligned to (world_size × batch_size) so all DDP/DeepSpeed ranks
         receive the same task type at each step.
+
+        When shard_aware=True, within-modality shuffling groups samples
+        by shard before permuting, so consecutive samples in an epoch
+        hit the same shard-cache entry — dramatically reducing LRU
+        cache misses vs. the prior uniform-random shuffle. Changes the
+        sampling order, so pass False to preserve legacy ordering when
+        resuming a checkpoint from a pre-shard-aware run.
         """
+        shard_info = None
+        if shard_aware:
+            shard_info = []
+            for task_name, modality_name, direction in self.task_types:
+                mod = self.modalities[modality_name]
+                shard_info.append((mod["shard_offsets"], mod["total_samples"]))
         return ModalityGroupedSampler(
             total_samples=self.total_samples,
             n_modalities=len(self.task_types),
@@ -383,6 +404,7 @@ class MultimodalShardedDataset(Dataset):
             seed=seed,
             batch_size=batch_size,
             world_size=world_size,
+            shard_info=shard_info,
         )
 
 
@@ -401,16 +423,24 @@ class ModalityGroupedSampler(torch.utils.data.Sampler):
         seed: Random seed for reproducibility across ranks.
         batch_size: Per-device batch size (for alignment).
         world_size: Number of distributed processes (for alignment).
+        shard_info: Optional list parallel to tasks (length n_modalities).
+            Each entry is (shard_offsets, modality_total_samples) for the
+            modality that task belongs to. When provided together with
+            shuffle=True, within-modality permutation groups samples by
+            shard and shuffles shard order, minimizing LRU cache misses.
+            When None (default), falls back to uniform random shuffle.
     """
 
     def __init__(self, total_samples: int, n_modalities: int, shuffle: bool = True,
-                 seed: int = 42, batch_size: int = 1, world_size: int = 1):
+                 seed: int = 42, batch_size: int = 1, world_size: int = 1,
+                 shard_info: Optional[list] = None):
         self.total_samples = total_samples
         self.n_modalities = n_modalities
         self.shuffle = shuffle
         self.seed = seed
         self.batch_size = batch_size
         self.world_size = world_size
+        self.shard_info = shard_info
         self.epoch = 0
 
     def set_epoch(self, epoch: int):
@@ -429,8 +459,32 @@ class ModalityGroupedSampler(torch.utils.data.Sampler):
             mod = idx % self.n_modalities
             modality_indices[mod].append(idx)
 
-        # Shuffle within each modality group
-        if self.shuffle:
+        # Order within each modality group
+        if self.shard_info is not None and self.shuffle:
+            # Shard-aware shuffle: group indices by their owning shard,
+            # shuffle within each shard, then shuffle shard order. Samples
+            # from the same shard arrive in a contiguous run, so the per-
+            # modality LRU cache only misses at shard boundaries rather
+            # than probabilistically within every batch.
+            for i in range(len(modality_indices)):
+                shard_offsets, mod_total = self.shard_info[i]
+                shard_groups: dict[int, list[int]] = {}
+                for global_idx in modality_indices[i]:
+                    within_task_idx = global_idx // self.n_modalities
+                    wrapped = within_task_idx % mod_total
+                    shard_idx = bisect.bisect_right(shard_offsets, wrapped) - 1
+                    shard_groups.setdefault(shard_idx, []).append(global_idx)
+                shard_keys = list(shard_groups.keys())
+                for sk in shard_keys:
+                    group = shard_groups[sk]
+                    perm = torch.randperm(len(group), generator=g).tolist()
+                    shard_groups[sk] = [group[p] for p in perm]
+                sperm = torch.randperm(len(shard_keys), generator=g).tolist()
+                shard_keys = [shard_keys[p] for p in sperm]
+                modality_indices[i] = [idx for sk in shard_keys for idx in shard_groups[sk]]
+        elif self.shuffle:
+            # Legacy path: uniform random shuffle within each modality.
+            # Preserved byte-identically for resume compatibility.
             for i in range(len(modality_indices)):
                 perm = torch.randperm(len(modality_indices[i]), generator=g).tolist()
                 modality_indices[i] = [modality_indices[i][p] for p in perm]

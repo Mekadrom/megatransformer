@@ -4,14 +4,17 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from dataclasses import dataclass
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from config.world.world_model import MegaTransformerRecurrentConfig
 from model import recurrent_criteria
+from model.norms import RMSNorm
 from model.transformer import MegaTransformerEncoderBlock
 from model.world.kv_cache import RecurrentKVCache
-from utils.megatransformer_utils import transformer_weight_init
+from utils.megatransformer_utils import (
+    apply_depth_scaled_residual_init,
+    linear_weight_init,
+)
 
 
 class MegatransformerRecurrentBlock(nn.Module):
@@ -28,6 +31,7 @@ class MegatransformerRecurrentBlock(nn.Module):
 
         self.lockstep_n = self.config.lockstep_n
         self.lockstep_k = self.config.lockstep_k
+        self.gradient_checkpointing = False
 
         self.n_recurrent_blocks = config.n_recurrent_blocks
         self.injection_type = config.injection_type
@@ -58,10 +62,8 @@ class MegatransformerRecurrentBlock(nn.Module):
         self.pre_projection_norm = None
         self.post_projection_norm = None
         if self.iteration_norm == "pre_projection":
-            from model.norms import RMSNorm
             self.pre_projection_norm = RMSNorm(config.block_config.d_model)
         elif self.iteration_norm == "post_projection":
-            from model.norms import RMSNorm
             out_dim = config.block_config.d_model // 2 if self.injection_type == "concat" else config.block_config.d_model
             self.post_projection_norm = RMSNorm(out_dim)
         
@@ -120,13 +122,19 @@ class MegatransformerRecurrentBlock(nn.Module):
 
             mask = _extend_mask_fn(attention_mask, iter_cache) if _extend_mask_fn else attention_mask
 
-            h, updated_cache = block(
-                h,
-                attention_mask=mask,
-                kv_cache=iter_cache,
-                position_offset=position_offset,
-                use_cache=use_cache,
-            )
+            if self.gradient_checkpointing and self.training and not use_cache:
+                h, updated_cache = torch_checkpoint(
+                    block, h, mask, None, iter_cache, position_offset, use_cache,
+                    use_reentrant=False,
+                )
+            else:
+                h, updated_cache = block(
+                    h,
+                    attention_mask=mask,
+                    kv_cache=iter_cache,
+                    position_offset=position_offset,
+                    use_cache=use_cache,
+                )
 
             if use_cache and updated_cache is not None and kv_cache is not None:
                 layer_idx = 0 if share_kv_cache else block_idx
@@ -137,28 +145,28 @@ class MegatransformerRecurrentBlock(nn.Module):
         return self._extract_thought(h)
 
     def _init_weights(self):
-        self.apply(transformer_weight_init())
-        # Re-init recurrent blocks with configurable gain (default 0.02 = same as transformer_weight_init)
-        if self.config.block_init_gain != 0.02:
-            gain = self.config.block_init_gain
-            for block in self.recurrent_blocks:
-                for module in block.modules():
-                    if isinstance(module, nn.Linear):
-                        nn.init.xavier_normal_(module.weight, gain=gain)
-                        if module.bias is not None:
-                            nn.init.zeros_(module.bias)
-        # Optionally re-init projection with explicit gain (default 1.0 = no override,
-        # keeps the gain=0.02 from transformer_weight_init)
+        # 1. Standard Xavier (gain=1.0) on every Linear in the recurrent block.
+        #    Overrides any per-block default init for consistency.
+        self.apply(linear_weight_init(gain=self.config.block_init_gain))
+
+        # 2. Optionally re-init the (concat-mode) projection with an explicit
+        #    Xavier uniform gain. Defaults to 1.0 which is what step 1 already
+        #    produced via xavier_normal — this branch only runs if the user
+        #    asked for a specific override.
         if self.projection is not None and self.config.projection_init_gain != 1.0:
             nn.init.xavier_uniform_(self.projection.weight, gain=self.config.projection_init_gain)
             if self.projection.bias is not None:
                 nn.init.zeros_(self.projection.bias)
+
         if not self.config.depth_scaled_init:
             return
-        # Depth-scaled init for output projections (Huginn-inspired).
-        # Each block appears mean_thinking_steps times (not n_blocks * mean_steps),
-        # so per-block effective depth = mean_thinking_steps.
-        # Use base d_model (half of concat d_model) to avoid over-shrinking.
+
+        # 3. Depth-scaled init for residual outputs (Huginn-inspired).
+        #    Each block appears `mean_thinking_steps` times in a forward pass,
+        #    so the effective depth is mean_thinking_steps (not n_blocks * mean_steps).
+        #    The factor-of-5 safety margin comes from Huginn and gives extra
+        #    stability for the recurrent computation. Uses base d_model (half
+        #    of concat width) to avoid over-shrinking under concat injection.
         d_model = self.config.block_config.d_model
         if self.injection_type == "concat":
             d_model = d_model // 2  # use base width, not concat width
@@ -167,8 +175,12 @@ class MegatransformerRecurrentBlock(nn.Module):
         for block in self.recurrent_blocks:
             if hasattr(block, 'self_attn') and hasattr(block.self_attn, 'o_proj'):
                 nn.init.normal_(block.self_attn.o_proj.weight, std=out_std)
+                if block.self_attn.o_proj.bias is not None:
+                    nn.init.zeros_(block.self_attn.o_proj.bias)
             if hasattr(block, 'ffn') and hasattr(block.ffn, 'condense'):
                 nn.init.normal_(block.ffn.condense.weight, std=out_std)
+                if block.ffn.condense.bias is not None:
+                    nn.init.zeros_(block.ffn.condense.bias)
 
     def initialize_thinking_state(self, input_embeds):
         """
@@ -260,6 +272,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         position_offset: int = 0,
         use_cache: bool = False,
         share_kv_cache: bool = False,
+        max_iterations_override: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache], int, List[float]]:
         """
         Forward pass through recurrent block with optional KV caching.
@@ -287,7 +300,14 @@ class MegatransformerRecurrentBlock(nn.Module):
             kl_per_iteration: Per-iteration KL divergence between consecutive
                 thought states (mean over batch and sequence). Empty during training.
         """
-        n_steps_no_grad, k_steps_grad = self.n_k_steps(self.mean_thinking_steps, self.backprop_depth)
+        # max_iterations_override only applies in eval (training uses stochastic
+        # Poisson-log-normal sampling + backprop_depth). During eval the sampler
+        # deterministically returns (mean_thinking_steps, 0), so swapping in the
+        # override as the no_grad step count is equivalent to a per-call cap.
+        effective_mean_steps = self.mean_thinking_steps
+        if max_iterations_override is not None and not self.training:
+            effective_mean_steps = max_iterations_override
+        n_steps_no_grad, k_steps_grad = self.n_k_steps(effective_mean_steps, self.backprop_depth)
 
         last_thought_state = self.initialize_thinking_state(x_0)  # (batch_size, seq_len, d_model)
         track_kl = not self.training

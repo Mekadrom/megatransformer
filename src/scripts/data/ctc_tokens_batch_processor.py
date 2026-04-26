@@ -2,9 +2,8 @@ import torch
 import torch.nn.functional as F
 
 
-from model.audio.sive.ctc_vocab import CTCVocab
+from model.voice.sive.ctc_vocab import CTCVocab
 from scripts.data.preprocessor import BatchProcessor
-from utils.text_encoder import TextEncoderType, get_text_encoder
 
 
 class TextCTCTokensBatchProcessor(BatchProcessor):

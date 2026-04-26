@@ -7,7 +7,11 @@ from config.image.generator import IMAGE_CODA_CONFIGS, ImageCodaAndVAEConfig
 from model.image.vae.vae import ImageVAEDecoder
 from model.norms import create_norm
 from model.transformer import MegaTransformerEncoderBlock
-from utils.megatransformer_utils import conv2d_weight_init, transformer_weight_init
+from utils.megatransformer_utils import (
+    apply_depth_scaled_residual_init,
+    conv2d_weight_init,
+    linear_weight_init,
+)
 
 
 class Unpatchify(nn.Module):
@@ -153,9 +157,13 @@ class ImageCodaAndVAEWithLoss(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Only init coda and projection; VAE decoder has its own init
+        # Only init coda and unpatchify; VAE decoder has its own init.
+        # Standard Xavier on linears, then depth-scaled init for the residual
+        # outputs of each coda block.
+        init_linear = linear_weight_init(gain=1.0)
         for block in self.coda:
-            block.apply(transformer_weight_init())
+            block.apply(init_linear)
+        apply_depth_scaled_residual_init(self.coda)
         self.unpatchify.apply(conv2d_weight_init())
 
     @classmethod
@@ -207,10 +215,11 @@ class ImageCodaAndVAEWithLoss(nn.Module):
             - "latent_l1_loss", "latent_mse_loss": Latent space losses (if latent_labels provided)
             - "image_l1_loss", "image_mse_loss", "image_perceptual_loss": Image losses (if decode_to_image and image_labels provided)
         """
+        # MegaTransformerEncoderBlock.forward already adds residuals internally,
+        # so the loop just chains layers without re-adding the input.
         h = x
         for block in self.coda:
-            hidden, _ = block(h)
-            h = h + hidden
+            h, _ = block(h)
         coda_output: torch.Tensor = h
 
         # seq_length should be 256 for a 256x256 image. this is because the vae latent space is 32x32 and we patchify into 2x2 patches
