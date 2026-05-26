@@ -9,6 +9,7 @@ from config.voice.sive.sive import CONFIGS as SIVE_CONFIGS
 from utils.megatransformer_utils import print_debug_tensor
 
 from config.voice.sive.sive import SpeakerInvariantVoiceEncoderConfig
+from model.norms import RMSNorm
 from model.voice.sive.conv_subsampling import Conv2dSubsampling, ConvSubsampling
 from model.voice.sive.grl import GradientReversalFunction, SpeakerClassifier
 from model.voice.sive.mel_augment import MelFrequencyResponse, MelGaussianNoise
@@ -101,8 +102,20 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             for i in range(config.num_layers)
         ])
 
-        # Final layer norm
-        self.final_norm = nn.LayerNorm(config.encoder_dim)
+        # Final norm on encoder output. LN does mean-subtraction across the dim
+        # axis which creates inter-dim competition (a few high-magnitude dims
+        # can suppress others); RMSNorm avoids this. Identity disables entirely.
+        if config.final_norm_type == "layernorm":
+            self.final_norm = nn.LayerNorm(config.encoder_dim)
+        elif config.final_norm_type == "rmsnorm":
+            self.final_norm = RMSNorm(config.encoder_dim)
+        elif config.final_norm_type == "none":
+            self.final_norm = nn.Identity()
+        else:
+            raise ValueError(
+                f"Unknown final_norm_type: {config.final_norm_type}. "
+                f"Expected one of 'layernorm', 'rmsnorm', 'none'."
+            )
 
         # Feature dropout (applied before heads)
         self.feature_dropout = nn.Dropout(config.feature_dropout) if config.feature_dropout > 0 else nn.Identity()
@@ -279,6 +292,51 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 self.config.temporal_smoothness_weight * smoothness_loss
             )
 
+        # Std hinge + covariance regularization (independently togglable; both
+        # disabled by default). Computed in float32 over padding-masked frames
+        # so padded positions don't deflate the variance estimate. Training-
+        # only — at eval the losses are zero.
+        std_hinge_loss = torch.zeros((), device=mel_spec.device)
+        cov_loss = torch.zeros((), device=mel_spec.device)
+        run_feature_reg = self.training and (
+            self.config.use_std_hinge or self.config.use_covariance_reg
+        )
+        if run_feature_reg:
+            if padding_mask is not None:
+                valid_positions = ~padding_mask  # [B, T'] True for valid
+                flat_feat = features[valid_positions]  # [N_valid, D]
+            else:
+                flat_feat = features.reshape(-1, features.size(-1))
+            flat_feat_fp32 = flat_feat.float()
+
+            if flat_feat_fp32.size(0) >= 2:
+                if self.config.use_std_hinge:
+                    dim_std = flat_feat_fp32.std(dim=0)  # [D]
+                    std_hinge_loss = self.config.dim_std_weight * F.relu(
+                        self.config.dim_std_min - dim_std
+                    ).mean()
+
+                    if self.config.temporal_std_weight > 0 and features.size(1) > 1:
+                        diffs = features[:, 1:, :] - features[:, :-1, :]  # [B, T-1, D]
+                        if padding_mask is not None:
+                            diff_valid = (~padding_mask[:, 1:]) & (~padding_mask[:, :-1])
+                            flat_diffs = diffs[diff_valid]
+                        else:
+                            flat_diffs = diffs.reshape(-1, diffs.size(-1))
+                        if flat_diffs.size(0) >= 2:
+                            temporal_std = flat_diffs.float().std(dim=0)
+                            std_hinge_loss = std_hinge_loss + self.config.temporal_std_weight * F.relu(
+                                self.config.temporal_std_min - temporal_std
+                            ).mean()
+
+                if self.config.use_covariance_reg:
+                    centered = flat_feat_fp32 - flat_feat_fp32.mean(dim=0, keepdim=True)
+                    n_valid = centered.size(0)
+                    d = centered.size(1)
+                    cov = (centered.t() @ centered) / max(n_valid - 1, 1)  # [D, D]
+                    off_diag_sq = cov.pow(2).sum() - cov.diag().pow(2).sum()
+                    cov_loss = self.config.cov_weight * off_diag_sq / d
+
         # Apply feature dropout before heads
         features_for_heads = self.feature_dropout(features)
 
@@ -320,6 +378,8 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             "ctc_lengths": ctc_lengths,  # CTC lengths (potentially upsampled, for CTC loss)
             "variance_loss": variance_loss,
             "temporal_smoothness": temporal_smoothness if self.config.use_variance_reg and self.training else None,
+            "std_hinge_loss": std_hinge_loss,
+            "cov_loss": cov_loss,
         }
 
         if return_all_hiddens:

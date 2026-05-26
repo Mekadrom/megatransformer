@@ -89,7 +89,9 @@ Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
 
 - `src/model/`: Neural network modules
   - `world/`: Core world model (`MegaTransformerWorldModel`, recurrent transformer, KV cache, token interleaving)
-  - `audio/`: Audio models (VAE, SIVE conformer, vocoder, prelude feature extractor, coda generator)
+  - `voice/`: Voice/speech models — prelude feature extractor, coda generator, plus `sive/` (Speaker-Invariant Voice Encoder) and `vocoder/` (HiFiGAN-based mel-to-wave) subpackages
+  - `audio/`: Non-speech audio prelude/coda (`feature_extractor.py`, `generator.py`)
+  - `smg/`: SIVE-Mel Generator (speaker-conditioned deterministic decoder with FiLM) — `smg.py`, `discriminator.py`, `criteria.py`, `residual_block.py`
   - `image/`: Image models (VAE, prelude feature extractor, `decoder.py` direct decoder, `diffusion_decoder.py` flow-matching DiT)
   - `text/`: Text feature extractor (prelude with causal transformer) and generator (coda classifier)
   - `transformer.py`: `MegaTransformerBlock` with GQA, rotary embeddings, ALiBi

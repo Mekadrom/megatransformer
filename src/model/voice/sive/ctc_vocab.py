@@ -58,24 +58,37 @@ class CTCVocab:
 
         return ''.join(chars)
 
-    def ctc_decode_greedy(self, logits: torch.Tensor) -> list:
+    def ctc_decode_greedy(
+        self,
+        logits: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> list:
         """
         Greedy CTC decoding.
 
         Args:
             logits: [T, vocab_size] or [B, T, vocab_size]
+            lengths: optional [B] (or scalar for unbatched) of valid frame
+                counts per sample. Frames beyond `lengths[i]` are dropped
+                before argmax — without this, garbage in padded regions
+                leaks into the decoded string.
 
         Returns:
             List of decoded strings
         """
         if logits.dim() == 2:
             logits = logits.unsqueeze(0)
+            if lengths is not None and lengths.dim() == 0:
+                lengths = lengths.unsqueeze(0)
 
         # Greedy: take argmax at each timestep
         predictions = logits.argmax(dim=-1)  # [B, T]
 
         decoded = []
-        for pred in predictions:
+        for i, pred in enumerate(predictions):
+            if lengths is not None:
+                valid_len = int(lengths[i].item())
+                pred = pred[:valid_len]
             text = self.decode(pred.tolist())
             decoded.append(text)
 

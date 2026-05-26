@@ -56,7 +56,9 @@ class SpeakerInvariantVoiceEncoderConfig:
     # Stochastic Depth (drop entire residual paths)
     drop_path_rate: float = 0.0  # Max drop rate (linearly scaled per layer, 0=disabled)
 
-    # Variance regularization (for VAE-friendly features)
+    # Variance regularization (for VAE-friendly features) — legacy var-hinge.
+    # Currently unused by the trainer (no consumer of result["variance_loss"]).
+    # Kept for backwards compat. New runs should prefer use_std_hinge below.
     use_variance_reg: bool = False
     temporal_var_weight: float = 0.01
     temporal_var_min: float = 0.1
@@ -65,12 +67,34 @@ class SpeakerInvariantVoiceEncoderConfig:
     temporal_smoothness_weight: float = 0.1
     temporal_smoothness_max: float = 0.95
 
+    # Std-based hinge on per-dim std (disabled by default). Replaces the
+    # var-hinge with constant gradient pressure as a dim approaches zero std.
+    # Independently togglable from covariance reg below.
+    use_std_hinge: bool = False
+    dim_std_min: float = 0.5      # target minimum per-dim std
+    dim_std_weight: float = 1.0   # weight on dim-std hinge loss
+    # Temporal std hinge: penalizes too-flat frame-to-frame deltas. Set
+    # temporal_std_weight > 0 to enable (orthogonal axis from dim hinge).
+    temporal_std_min: float = 0.1
+    temporal_std_weight: float = 0.0
+
+    # VICReg-style covariance / decorrelation regularization (disabled by
+    # default). Penalizes off-diagonal of the feature covariance matrix.
+    use_covariance_reg: bool = False
+    cov_weight: float = 0.04      # VICReg paper default
+
     # CTC upsampling (relaxes CTC length constraint without increasing transformer cost)
     # Upsamples features before CTC head using linear interpolation
     # factor=1: no upsampling (default), factor=2: 2x more CTC frames, etc.
     ctc_upsample_factor: int = 1
 
     downsample_norm_type: Optional[str] = None  # "batchnorm", "layernorm", or None (default)
+
+    # Final normalization on encoder features (the user-facing SIVE output).
+    # "layernorm" (default, matches prior behavior), "rmsnorm" (no mean-subtraction
+    # → less dim-axis competition; can help when a few dims appear blown out and
+    # invariant), or "none" (skip — let consumers normalize).
+    final_norm_type: str = "layernorm"
 
     speaker_classifier_hidden_dim: Optional[int] = None
 
@@ -174,6 +198,19 @@ CONFIGS = {
         downsample_norm_type="batchnorm",
         speaker_pooling="attentive_statistics",
     ),
+    "tiny_deep_3xdownsample_conv2d_layernorm_attentive": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=128,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        use_conv2d_frontend=True,
+        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
+        conv_strides=[(2, 3), (2, 1), (1, 1)],
+        ctc_upsample_factor=2,
+        downsample_norm_type="layernorm",
+        speaker_pooling="attentive_statistics",
+    ),
     "tiny_deep_2xdownsample": SpeakerInvariantVoiceEncoderConfig(
         encoder_dim=128,
         num_layers=12,
@@ -190,6 +227,31 @@ CONFIGS = {
         ff_dim=512,
         dropout=0.1,
         ctc_upsample_factor=4,
+    ),
+    "small_deep_3xdownsample_conv2d_batchnorm": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=256,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        use_conv2d_frontend=True,
+        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
+        conv_strides=[(2, 3), (2, 1), (1, 1)],
+        ctc_upsample_factor=2,
+        downsample_norm_type="layernorm",
+    ),
+    "small_deep_3xdownsample_conv2d_layernorm_attentive": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=256,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        use_conv2d_frontend=True,
+        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
+        conv_strides=[(2, 3), (2, 1), (1, 1)],
+        ctc_upsample_factor=2,
+        downsample_norm_type="layernorm",
+        speaker_pooling="attentive_statistics",
     ),
     # ~9.6M params w/ macaron and swiglu, ~3.7M w/o
     "small": SpeakerInvariantVoiceEncoderConfig(

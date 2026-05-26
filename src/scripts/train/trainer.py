@@ -3,14 +3,48 @@ import math
 import os
 
 import torch
+import torch.nn as nn
 
 
 from typing import Any, Mapping, Optional, Union
 
+from model.norms import RMSNorm
 from transformers.trainer import Trainer
 
 
+# Norm module types HF Trainer's get_decay_parameter_names misses by default.
+# HF only excludes nn.LayerNorm (the sole entry in ALL_LAYERNORM_LAYERS) plus
+# names containing 'bias'/'layernorm'/'rmsnorm'. Anything else — BatchNorm,
+# InstanceNorm, GroupNorm, or this project's custom RMSNorm (which is named
+# '*_norm' across the codebase, not '*rmsnorm', so HF's substring filter
+# misses it) — has its gain weight slip through and get WD'd.
+#
+# This base class extends the filter via isinstance, so any subclass that
+# doesn't override create_optimizer (SMG, vocoder, image-vae, world) gets
+# the corrected behavior automatically. Add new norm types here as they're
+# introduced rather than scattering filters across trainers.
+_NON_LAYERNORM_NORM_TYPES = (
+    nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+    nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d,
+    nn.GroupNorm,
+    RMSNorm,
+)
+
+
 class CommonTrainer(abc.ABC, Trainer):
+    def get_decay_parameter_names(self, model) -> list:
+        """Override HF default to also exclude BatchNorm/InstanceNorm/GroupNorm
+        gains from weight decay. Required for any model with non-LayerNorm
+        norms (SIVE conv frontend, SMG GroupNorm stack, image VAE GroupNorm).
+        """
+        decay = set(super().get_decay_parameter_names(model))
+        for module_name, module in model.named_modules():
+            if isinstance(module, _NON_LAYERNORM_NORM_TYPES):
+                for param_name, _ in module.named_parameters(recurse=False):
+                    full_name = f"{module_name}.{param_name}" if module_name else param_name
+                    decay.discard(full_name)
+        return list(decay)
+
     def _save(self, output_dir=None, state_dict=None):
         """Save with torch.save instead of safetensors to support tied weights."""
         output_dir = output_dir if output_dir is not None else self.args.output_dir

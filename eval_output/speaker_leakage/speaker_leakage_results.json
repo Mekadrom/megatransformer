@@ -1,0 +1,230 @@
+{
+  "config": "tiny_deep_3xdownsample_conv2d_batchnorm",
+  "checkpoint_path": "./runs/sive/tiny_deep_3xdownsample_conv2d_batchnorm_grl_pretrain_grl_weight_0.1_0_0/checkpoint-250000/",
+  "num_samples": 10016,
+  "num_unique_speakers": 509,
+  "num_probe_classes": 509,
+  "layers": [
+    {
+      "layer_idx": 0,
+      "layer_name": "conv_subsample",
+      "probe": {
+        "train_acc": 0.8972790837287903,
+        "test_acc": 0.6991018056869507,
+        "test_top5_acc": 0.9141716361045837
+      },
+      "silhouette": -0.43789589405059814,
+      "cka_speaker": 0.04071633145213127,
+      "cka_ctc": 0.0225930605083704,
+      "cosine": {
+        "intra_cos": 0.75090092420578,
+        "inter_cos": 0.7312310934066772,
+        "ratio": 1.0268996094072866
+      }
+    },
+    {
+      "layer_idx": 1,
+      "layer_name": "encoder_block_1",
+      "probe": {
+        "train_acc": 0.9487019777297974,
+        "test_acc": 0.7355289459228516,
+        "test_top5_acc": 0.9186626672744751
+      },
+      "silhouette": -0.391830176115036,
+      "cka_speaker": 0.03831200674176216,
+      "cka_ctc": 0.02234586328268051,
+      "cosine": {
+        "intra_cos": 0.7645643949508667,
+        "inter_cos": 0.7371290922164917,
+        "ratio": 1.0372191289477928
+      }
+    },
+    {
+      "layer_idx": 2,
+      "layer_name": "encoder_block_2",
+      "probe": {
+        "train_acc": 0.9586869478225708,
+        "test_acc": 0.7340319156646729,
+        "test_top5_acc": 0.9036926031112671
+      },
+      "silhouette": -0.34708884358406067,
+      "cka_speaker": 0.04972274973988533,
+      "cka_ctc": 0.043021224439144135,
+      "cosine": {
+        "intra_cos": 0.8179030418395996,
+        "inter_cos": 0.7958786487579346,
+        "ratio": 1.027673054323089
+      }
+    },
+    {
+      "layer_idx": 3,
+      "layer_name": "encoder_block_3",
+      "probe": {
+        "train_acc": 0.9555666446685791,
+        "test_acc": 0.7000998258590698,
+        "test_top5_acc": 0.8832335472106934
+      },
+      "silhouette": -0.3755299150943756,
+      "cka_speaker": 0.053728945553302765,
+      "cka_ctc": 0.04744787514209747,
+      "cosine": {
+        "intra_cos": 0.8297827243804932,
+        "inter_cos": 0.8063116669654846,
+        "ratio": 1.02910916259384
+      }
+    },
+    {
+      "layer_idx": 4,
+      "layer_name": "encoder_block_4",
+      "probe": {
+        "train_acc": 0.9417124390602112,
+        "test_acc": 0.6257485151290894,
+        "test_top5_acc": 0.8483033776283264
+      },
+      "silhouette": -0.44954511523246765,
+      "cka_speaker": 0.0535598061978817,
+      "cka_ctc": 0.038692109286785126,
+      "cosine": {
+        "intra_cos": 0.8325796723365784,
+        "inter_cos": 0.8098553419113159,
+        "ratio": 1.0280597401156006
+      }
+    },
+    {
+      "layer_idx": 5,
+      "layer_name": "encoder_block_5",
+      "probe": {
+        "train_acc": 0.8693210482597351,
+        "test_acc": 0.5254490971565247,
+        "test_top5_acc": 0.7909181714057922
+      },
+      "silhouette": -0.5713697671890259,
+      "cka_speaker": 0.04290534928441048,
+      "cka_ctc": 0.03251221776008606,
+      "cosine": {
+        "intra_cos": 0.8192652463912964,
+        "inter_cos": 0.7996931672096252,
+        "ratio": 1.0244744859456085
+      }
+    },
+    {
+      "layer_idx": 6,
+      "layer_name": "encoder_block_6",
+      "probe": {
+        "train_acc": 0.754118800163269,
+        "test_acc": 0.45009979605674744,
+        "test_top5_acc": 0.6941117644309998
+      },
+      "silhouette": -0.652370274066925,
+      "cka_speaker": 0.0314352810382843,
+      "cka_ctc": 0.024779662489891052,
+      "cosine": {
+        "intra_cos": 0.8159188032150269,
+        "inter_cos": 0.8030997514724731,
+        "ratio": 1.0159619670147453
+      }
+    },
+    {
+      "layer_idx": 7,
+      "layer_name": "encoder_block_7",
+      "probe": {
+        "train_acc": 0.7121817469596863,
+        "test_acc": 0.3897205591201782,
+        "test_top5_acc": 0.6167664527893066
+      },
+      "silhouette": -0.4820941388607025,
+      "cka_speaker": 0.05156901851296425,
+      "cka_ctc": 0.07228299975395203,
+      "cosine": {
+        "intra_cos": 0.8743704557418823,
+        "inter_cos": 0.8560073971748352,
+        "ratio": 1.0214519858445763
+      }
+    },
+    {
+      "layer_idx": 8,
+      "layer_name": "encoder_block_8",
+      "probe": {
+        "train_acc": 0.7085621356964111,
+        "test_acc": 0.36227545142173767,
+        "test_top5_acc": 0.5758482813835144
+      },
+      "silhouette": -0.466302752494812,
+      "cka_speaker": 0.054335083812475204,
+      "cka_ctc": 0.07799308001995087,
+      "cosine": {
+        "intra_cos": 0.87717205286026,
+        "inter_cos": 0.8577613234519958,
+        "ratio": 1.0226295227793054
+      }
+    },
+    {
+      "layer_idx": 9,
+      "layer_name": "encoder_block_9",
+      "probe": {
+        "train_acc": 0.68659508228302,
+        "test_acc": 0.3183632791042328,
+        "test_top5_acc": 0.523952066898346
+      },
+      "silhouette": -0.4663486182689667,
+      "cka_speaker": 0.048094093799591064,
+      "cka_ctc": 0.07769595086574554,
+      "cosine": {
+        "intra_cos": 0.8748334646224976,
+        "inter_cos": 0.8535897731781006,
+        "ratio": 1.0248874718417749
+      }
+    },
+    {
+      "layer_idx": 10,
+      "layer_name": "encoder_block_10",
+      "probe": {
+        "train_acc": 0.6162006855010986,
+        "test_acc": 0.321856290102005,
+        "test_top5_acc": 0.4985029995441437
+      },
+      "silhouette": -0.5044686794281006,
+      "cka_speaker": 0.03660910576581955,
+      "cka_ctc": 0.06850429624319077,
+      "cosine": {
+        "intra_cos": 0.9032235145568848,
+        "inter_cos": 0.8858095407485962,
+        "ratio": 1.0196588239426412
+      }
+    },
+    {
+      "layer_idx": 11,
+      "layer_name": "encoder_block_11",
+      "probe": {
+        "train_acc": 0.4586869776248932,
+        "test_acc": 0.23053891956806183,
+        "test_top5_acc": 0.44261476397514343
+      },
+      "silhouette": -0.573773980140686,
+      "cka_speaker": 0.014178573153913021,
+      "cka_ctc": 0.03566720709204674,
+      "cosine": {
+        "intra_cos": 0.9799439311027527,
+        "inter_cos": 0.9767027497291565,
+        "ratio": 1.0033184931387722
+      }
+    },
+    {
+      "layer_idx": 12,
+      "layer_name": "encoder_block_12",
+      "probe": {
+        "train_acc": 0.4242386519908905,
+        "test_acc": 0.24750499427318573,
+        "test_top5_acc": 0.43512973189353943
+      },
+      "silhouette": -0.7323819994926453,
+      "cka_speaker": 0.004772881977260113,
+      "cka_ctc": 0.012812785804271698,
+      "cosine": {
+        "intra_cos": 0.9752908945083618,
+        "inter_cos": 0.9690956473350525,
+        "ratio": 1.0063928129182562
+      }
+    }
+  ]
+}

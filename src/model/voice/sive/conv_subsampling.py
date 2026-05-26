@@ -3,6 +3,24 @@ import torch
 import torch.nn as nn
 
 
+class SpatialLayerNorm2d(nn.Module):
+    """LayerNorm across the channel dim at each (F, T) position.
+
+    Pad-invariant by construction: each spatial position normalizes only its
+    own C channels, so pad-region values cannot influence valid-region
+    statistics. Matches the per-position LayerNorm used in wav2vec2 / HuBERT
+    conv stacks.
+    """
+
+    def __init__(self, num_channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, F, T] -> [B, F, T, C] -> norm -> [B, C, F, T]
+        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
+
+
 class ConvSubsampling(nn.Module):
     """
     Convolutional subsampling frontend (similar to Conformer/wav2vec2).
@@ -64,7 +82,7 @@ class Conv2dSubsampling(nn.Module):
         kernel_sizes: list = [(5, 5), (5, 3), (5, 3)],
         strides: list = [(2, 2), (2, 2), (1, 1)],
         dropout: float = 0.05,
-        norm_type: Literal['batchnorm', 'instancenorm', 'groupnorm'] = 'instancenorm',
+        norm_type: Literal['batchnorm', 'instancenorm', 'groupnorm', 'layernorm'] = 'instancenorm',
     ):
         super().__init__()
 
@@ -79,6 +97,12 @@ class Conv2dSubsampling(nn.Module):
                 norm = nn.InstanceNorm2d(channels[i + 1], affine=True)
             elif norm_type == 'groupnorm':
                 norm = nn.GroupNorm(8, channels[i + 1])  # 8 groups is a common choice
+            elif norm_type == 'layernorm':
+                # Per-position LayerNorm across the channel dim. Pad-invariant
+                # (wav2vec2 / HuBERT style). Strictly cleaner than InstanceNorm
+                # for variable-length voice — pad regions cannot pollute the
+                # statistics used at valid-region positions.
+                norm = SpatialLayerNorm2d(channels[i + 1])
             layers.extend([
                 nn.Conv2d(channels[i], channels[i + 1], kernel_size=k, stride=s, padding=(k[0] // 2, k[1] // 2)),
                 norm if norm is not None else nn.Identity(),

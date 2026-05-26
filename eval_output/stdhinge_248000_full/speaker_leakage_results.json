@@ -1,0 +1,451 @@
+{
+  "config": "small_deep_3xdownsample_conv2d_layernorm_attentive",
+  "checkpoint_path": "runs/sive/stdhinge_3x_down_256dim_12L_2d_layernorm_attentive_muon_all_weight_decay_0.01_0_0/checkpoint-248000",
+  "num_samples": 2000,
+  "num_unique_speakers": 417,
+  "num_probe_classes": 417,
+  "gender_balance": {
+    "train": {
+      "male": 839,
+      "female": 761,
+      "unknown": 0
+    },
+    "test": {
+      "male": 196,
+      "female": 204,
+      "unknown": 0
+    }
+  },
+  "layers": [
+    {
+      "layer_idx": 0,
+      "layer_name": "conv_subsample",
+      "probe": {
+        "train_acc": 0.9950000047683716,
+        "test_acc": 0.6074999570846558,
+        "test_top5_acc": 0.7524999976158142,
+        "test_top10_acc": 0.7949999570846558
+      },
+      "gender_probe": {
+        "train_acc": 0.9449999928474426,
+        "test_acc": 0.9474999904632568,
+        "test_top5_acc": 0.9474999904632568,
+        "test_top10_acc": 0.9474999904632568,
+        "test_balanced_acc": 0.9475290116046419,
+        "test_recall_male": 0.9489795918367347,
+        "test_recall_female": 0.946078431372549,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.26174256205558777,
+      "cka_speaker": 0.06561889499425888,
+      "cka_ctc": 0.04396817833185196,
+      "cosine": {
+        "intra_cos": 0.8052180409431458,
+        "inter_cos": 0.7848297953605652,
+        "ratio": 1.0259779199300325
+      }
+    },
+    {
+      "layer_idx": 1,
+      "layer_name": "encoder_block_1",
+      "probe": {
+        "train_acc": 0.9887499809265137,
+        "test_acc": 0.6024999618530273,
+        "test_top5_acc": 0.7400000095367432,
+        "test_top10_acc": 0.7649999856948853
+      },
+      "gender_probe": {
+        "train_acc": 0.953125,
+        "test_acc": 0.9524999856948853,
+        "test_top5_acc": 0.9524999856948853,
+        "test_top10_acc": 0.9524999856948853,
+        "test_balanced_acc": 0.9527310924369747,
+        "test_recall_male": 0.9642857142857143,
+        "test_recall_female": 0.9411764705882353,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.3144237995147705,
+      "cka_speaker": 0.06198175251483917,
+      "cka_ctc": 0.03886900842189789,
+      "cosine": {
+        "intra_cos": 0.8842055201530457,
+        "inter_cos": 0.8744682669639587,
+        "ratio": 1.0111350560757264
+      }
+    },
+    {
+      "layer_idx": 2,
+      "layer_name": "encoder_block_2",
+      "probe": {
+        "train_acc": 0.9962499737739563,
+        "test_acc": 0.612500011920929,
+        "test_top5_acc": 0.7549999952316284,
+        "test_top10_acc": 0.7924999594688416
+      },
+      "gender_probe": {
+        "train_acc": 0.9518749713897705,
+        "test_acc": 0.9624999761581421,
+        "test_top5_acc": 0.9624999761581421,
+        "test_top10_acc": 0.9624999761581421,
+        "test_balanced_acc": 0.9621348539415766,
+        "test_recall_male": 0.9438775510204082,
+        "test_recall_female": 0.9803921568627451,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.32103461027145386,
+      "cka_speaker": 0.0668220967054367,
+      "cka_ctc": 0.034377265721559525,
+      "cosine": {
+        "intra_cos": 0.9110861420631409,
+        "inter_cos": 0.8974473476409912,
+        "ratio": 1.0151973198851167
+      }
+    },
+    {
+      "layer_idx": 3,
+      "layer_name": "encoder_block_3",
+      "probe": {
+        "train_acc": 0.9874999523162842,
+        "test_acc": 0.5999999642372131,
+        "test_top5_acc": 0.7549999952316284,
+        "test_top10_acc": 0.7724999785423279
+      },
+      "gender_probe": {
+        "train_acc": 0.9399999976158142,
+        "test_acc": 0.9274999499320984,
+        "test_top5_acc": 0.9274999499320984,
+        "test_top10_acc": 0.9274999499320984,
+        "test_balanced_acc": 0.9262204881952781,
+        "test_recall_male": 0.8622448979591837,
+        "test_recall_female": 0.9901960784313726,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.30565929412841797,
+      "cka_speaker": 0.06411349773406982,
+      "cka_ctc": 0.027859196066856384,
+      "cosine": {
+        "intra_cos": 0.9098462462425232,
+        "inter_cos": 0.889070451259613,
+        "ratio": 1.0233679962633733
+      }
+    },
+    {
+      "layer_idx": 4,
+      "layer_name": "encoder_block_4",
+      "probe": {
+        "train_acc": 0.9824999570846558,
+        "test_acc": 0.5999999642372131,
+        "test_top5_acc": 0.75,
+        "test_top10_acc": 0.7874999642372131
+      },
+      "gender_probe": {
+        "train_acc": 0.9356249570846558,
+        "test_acc": 0.9249999523162842,
+        "test_top5_acc": 0.9249999523162842,
+        "test_top10_acc": 0.9249999523162842,
+        "test_balanced_acc": 0.9235694277711084,
+        "test_recall_male": 0.8520408163265306,
+        "test_recall_female": 0.9950980392156863,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.29853320121765137,
+      "cka_speaker": 0.0715232864022255,
+      "cka_ctc": 0.0318143405020237,
+      "cosine": {
+        "intra_cos": 0.9127426743507385,
+        "inter_cos": 0.8892790079116821,
+        "ratio": 1.02638504477257
+      }
+    },
+    {
+      "layer_idx": 5,
+      "layer_name": "encoder_block_5",
+      "probe": {
+        "train_acc": 0.9981249570846558,
+        "test_acc": 0.5849999785423279,
+        "test_top5_acc": 0.7475000023841858,
+        "test_top10_acc": 0.7874999642372131
+      },
+      "gender_probe": {
+        "train_acc": 0.9412499666213989,
+        "test_acc": 0.9300000071525574,
+        "test_top5_acc": 0.9300000071525574,
+        "test_top10_acc": 0.9300000071525574,
+        "test_balanced_acc": 0.9310724289715886,
+        "test_recall_male": 0.9846938775510204,
+        "test_recall_female": 0.8774509803921569,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.3099071979522705,
+      "cka_speaker": 0.0843350738286972,
+      "cka_ctc": 0.03925679251551628,
+      "cosine": {
+        "intra_cos": 0.9148349165916443,
+        "inter_cos": 0.8952105641365051,
+        "ratio": 1.0219214933796814
+      }
+    },
+    {
+      "layer_idx": 6,
+      "layer_name": "encoder_block_6",
+      "probe": {
+        "train_acc": 0.9818750023841858,
+        "test_acc": 0.5475000143051147,
+        "test_top5_acc": 0.7199999690055847,
+        "test_top10_acc": 0.7774999737739563
+      },
+      "gender_probe": {
+        "train_acc": 0.9649999737739563,
+        "test_acc": 0.9749999642372131,
+        "test_top5_acc": 0.9749999642372131,
+        "test_top10_acc": 0.9749999642372131,
+        "test_balanced_acc": 0.9748899559823929,
+        "test_recall_male": 0.9693877551020408,
+        "test_recall_female": 0.9803921568627451,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.34758201241493225,
+      "cka_speaker": 0.08984235674142838,
+      "cka_ctc": 0.04321040213108063,
+      "cosine": {
+        "intra_cos": 0.907656729221344,
+        "inter_cos": 0.8905712962150574,
+        "ratio": 1.0191848009012867
+      }
+    },
+    {
+      "layer_idx": 7,
+      "layer_name": "encoder_block_7",
+      "probe": {
+        "train_acc": 0.9806249737739563,
+        "test_acc": 0.4749999940395355,
+        "test_top5_acc": 0.7024999856948853,
+        "test_top10_acc": 0.7524999976158142
+      },
+      "gender_probe": {
+        "train_acc": 0.9643749594688416,
+        "test_acc": 0.9624999761581421,
+        "test_top5_acc": 0.9624999761581421,
+        "test_top10_acc": 0.9624999761581421,
+        "test_balanced_acc": 0.9624349739895959,
+        "test_recall_male": 0.9591836734693877,
+        "test_recall_female": 0.9656862745098039,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.3931337594985962,
+      "cka_speaker": 0.08834422379732132,
+      "cka_ctc": 0.04493984952569008,
+      "cosine": {
+        "intra_cos": 0.8881264925003052,
+        "inter_cos": 0.8705690503120422,
+        "ratio": 1.0201677766766113
+      }
+    },
+    {
+      "layer_idx": 8,
+      "layer_name": "encoder_block_8",
+      "probe": {
+        "train_acc": 0.95374995470047,
+        "test_acc": 0.429999977350235,
+        "test_top5_acc": 0.6150000095367432,
+        "test_top10_acc": 0.6649999618530273
+      },
+      "gender_probe": {
+        "train_acc": 0.953125,
+        "test_acc": 0.9375,
+        "test_top5_acc": 0.9375,
+        "test_top10_acc": 0.9375,
+        "test_balanced_acc": 0.9372248899559823,
+        "test_recall_male": 0.923469387755102,
+        "test_recall_female": 0.9509803921568627,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.4457255005836487,
+      "cka_speaker": 0.08724900335073471,
+      "cka_ctc": 0.044345423579216,
+      "cosine": {
+        "intra_cos": 0.8489164113998413,
+        "inter_cos": 0.8256503343582153,
+        "ratio": 1.0281790923753586
+      }
+    },
+    {
+      "layer_idx": 9,
+      "layer_name": "encoder_block_9",
+      "probe": {
+        "train_acc": 0.9556249976158142,
+        "test_acc": 0.38499999046325684,
+        "test_top5_acc": 0.5924999713897705,
+        "test_top10_acc": 0.6674999594688416
+      },
+      "gender_probe": {
+        "train_acc": 0.8968749642372131,
+        "test_acc": 0.8774999976158142,
+        "test_top5_acc": 0.8774999976158142,
+        "test_top10_acc": 0.8774999976158142,
+        "test_balanced_acc": 0.8769007603041217,
+        "test_recall_male": 0.8469387755102041,
+        "test_recall_female": 0.9068627450980392,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.4603957235813141,
+      "cka_speaker": 0.104421466588974,
+      "cka_ctc": 0.04953990876674652,
+      "cosine": {
+        "intra_cos": 0.7951701879501343,
+        "inter_cos": 0.7451335191726685,
+        "ratio": 1.0671512789184712
+      }
+    },
+    {
+      "layer_idx": 10,
+      "layer_name": "encoder_block_10",
+      "probe": {
+        "train_acc": 0.9606249928474426,
+        "test_acc": 0.32749998569488525,
+        "test_top5_acc": 0.5099999904632568,
+        "test_top10_acc": 0.6100000143051147
+      },
+      "gender_probe": {
+        "train_acc": 0.9131249785423279,
+        "test_acc": 0.8999999761581421,
+        "test_top5_acc": 0.8999999761581421,
+        "test_top10_acc": 0.8999999761581421,
+        "test_balanced_acc": 0.9013605442176871,
+        "test_recall_male": 0.9693877551020408,
+        "test_recall_female": 0.8333333333333334,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.4770423173904419,
+      "cka_speaker": 0.11770250648260117,
+      "cka_ctc": 0.05286841467022896,
+      "cosine": {
+        "intra_cos": 0.7254717350006104,
+        "inter_cos": 0.6324347853660583,
+        "ratio": 1.147109159374751
+      }
+    },
+    {
+      "layer_idx": 11,
+      "layer_name": "encoder_block_11",
+      "probe": {
+        "train_acc": 0.8824999928474426,
+        "test_acc": 0.25,
+        "test_top5_acc": 0.42249998450279236,
+        "test_top10_acc": 0.4899999797344208
+      },
+      "gender_probe": {
+        "train_acc": 0.9006249904632568,
+        "test_acc": 0.8774999976158142,
+        "test_top5_acc": 0.8774999976158142,
+        "test_top10_acc": 0.8774999976158142,
+        "test_balanced_acc": 0.8789015606242497,
+        "test_recall_male": 0.9489795918367347,
+        "test_recall_female": 0.8088235294117647,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.5278657674789429,
+      "cka_speaker": 0.1151270717382431,
+      "cka_ctc": 0.05488918721675873,
+      "cosine": {
+        "intra_cos": 0.6801172494888306,
+        "inter_cos": 0.5848409533500671,
+        "ratio": 1.1629097545118974
+      }
+    },
+    {
+      "layer_idx": 12,
+      "layer_name": "encoder_block_12",
+      "probe": {
+        "train_acc": 0.8949999809265137,
+        "test_acc": 0.1525000035762787,
+        "test_top5_acc": 0.27250000834465027,
+        "test_top10_acc": 0.35749998688697815
+      },
+      "gender_probe": {
+        "train_acc": 0.8050000071525574,
+        "test_acc": 0.7849999666213989,
+        "test_top5_acc": 0.7849999666213989,
+        "test_top10_acc": 0.7849999666213989,
+        "test_balanced_acc": 0.788015206082433,
+        "test_recall_male": 0.9387755102040817,
+        "test_recall_female": 0.6372549019607843,
+        "train_count_male": 839,
+        "train_count_female": 761,
+        "test_count_male": 196,
+        "test_count_female": 204
+      },
+      "silhouette": -0.5655785202980042,
+      "cka_speaker": 0.1010446846485138,
+      "cka_ctc": 0.06474748998880386,
+      "cosine": {
+        "intra_cos": 0.5726844072341919,
+        "inter_cos": 0.5115523338317871,
+        "ratio": 1.1195030681308684
+      }
+    }
+  ],
+  "mlp_probe": {
+    "layer_idx": 10,
+    "layer_name": "encoder_block_10",
+    "feature_dim": 512,
+    "hidden_dim": 512,
+    "num_layers": 4,
+    "dropout": 0.1,
+    "speaker": {
+      "train_acc": 0.9249999523162842,
+      "test_acc": 0.25,
+      "test_top5_acc": 0.44999998807907104,
+      "test_top10_acc": 0.5774999856948853
+    },
+    "gender": {
+      "train_acc": 0.9556249976158142,
+      "test_acc": 0.9424999952316284,
+      "test_top5_acc": 0.9424999952316284,
+      "test_top10_acc": 0.9424999952316284,
+      "test_balanced_acc": 0.9431272509003601,
+      "test_recall_male": 0.9744897959183674,
+      "test_recall_female": 0.9117647058823529,
+      "train_count_male": 839,
+      "train_count_female": 761,
+      "test_count_male": 196,
+      "test_count_female": 204
+    }
+  }
+}

@@ -1,0 +1,269 @@
+{
+  "config": "small_deep_3xdownsample_conv2d_layernorm_attentive",
+  "checkpoint_path": "runs/sive/3x_down_256dim_12L_2d_layernorm_attentive_muon_all_weight_decay_0.01_0_0/checkpoint-258500",
+  "num_samples": 2000,
+  "num_unique_speakers": 414,
+  "num_probe_classes": 414,
+  "gender_balance": {
+    "train": {
+      "male": 0,
+      "female": 0,
+      "unknown": 1600
+    },
+    "test": {
+      "male": 0,
+      "female": 0,
+      "unknown": 400
+    }
+  },
+  "layers": [
+    {
+      "layer_idx": 0,
+      "layer_name": "conv_subsample",
+      "probe": {
+        "train_acc": 0.9975000023841858,
+        "test_acc": 0.6800000071525574,
+        "test_top5_acc": 0.7874999642372131,
+        "test_top10_acc": 0.8199999928474426
+      },
+      "gender_probe": null,
+      "silhouette": -0.03929278627038002,
+      "cka_speaker": 0.08780284225940704,
+      "cka_ctc": 0.059972554445266724,
+      "cosine": {
+        "intra_cos": 0.9663592576980591,
+        "inter_cos": 0.9481710195541382,
+        "ratio": 1.0191824446949176
+      }
+    },
+    {
+      "layer_idx": 1,
+      "layer_name": "encoder_block_1",
+      "probe": {
+        "train_acc": 0.9993749856948853,
+        "test_acc": 0.6850000023841858,
+        "test_top5_acc": 0.8025000095367432,
+        "test_top10_acc": 0.824999988079071
+      },
+      "gender_probe": null,
+      "silhouette": -0.09037113189697266,
+      "cka_speaker": 0.07502233237028122,
+      "cka_ctc": 0.05049452185630798,
+      "cosine": {
+        "intra_cos": 0.9776706695556641,
+        "inter_cos": 0.9666298031806946,
+        "ratio": 1.0114220214798255
+      }
+    },
+    {
+      "layer_idx": 2,
+      "layer_name": "encoder_block_2",
+      "probe": {
+        "train_acc": 1.0,
+        "test_acc": 0.6699999570846558,
+        "test_top5_acc": 0.7949999570846558,
+        "test_top10_acc": 0.8299999833106995
+      },
+      "gender_probe": null,
+      "silhouette": -0.07758680731058121,
+      "cka_speaker": 0.0899025946855545,
+      "cka_ctc": 0.05982814356684685,
+      "cosine": {
+        "intra_cos": 0.9790083765983582,
+        "inter_cos": 0.968849241733551,
+        "ratio": 1.01048577469765
+      }
+    },
+    {
+      "layer_idx": 3,
+      "layer_name": "encoder_block_3",
+      "probe": {
+        "train_acc": 1.0,
+        "test_acc": 0.6574999690055847,
+        "test_top5_acc": 0.7874999642372131,
+        "test_top10_acc": 0.824999988079071
+      },
+      "gender_probe": null,
+      "silhouette": -0.09472957998514175,
+      "cka_speaker": 0.09312411397695541,
+      "cka_ctc": 0.06345280259847641,
+      "cosine": {
+        "intra_cos": 0.9818938374519348,
+        "inter_cos": 0.9736151099205017,
+        "ratio": 1.008503080372396
+      }
+    },
+    {
+      "layer_idx": 4,
+      "layer_name": "encoder_block_4",
+      "probe": {
+        "train_acc": 1.0,
+        "test_acc": 0.5974999666213989,
+        "test_top5_acc": 0.7749999761581421,
+        "test_top10_acc": 0.8100000023841858
+      },
+      "gender_probe": null,
+      "silhouette": -0.14363764226436615,
+      "cka_speaker": 0.08833024650812149,
+      "cka_ctc": 0.06692909449338913,
+      "cosine": {
+        "intra_cos": 0.9800536632537842,
+        "inter_cos": 0.9720673561096191,
+        "ratio": 1.0082157960494915
+      }
+    },
+    {
+      "layer_idx": 5,
+      "layer_name": "encoder_block_5",
+      "probe": {
+        "train_acc": 1.0,
+        "test_acc": 0.5174999833106995,
+        "test_top5_acc": 0.6850000023841858,
+        "test_top10_acc": 0.7425000071525574
+      },
+      "gender_probe": null,
+      "silhouette": -0.2841968238353729,
+      "cka_speaker": 0.07345111668109894,
+      "cka_ctc": 0.06251755356788635,
+      "cosine": {
+        "intra_cos": 0.9741833209991455,
+        "inter_cos": 0.9609001874923706,
+        "ratio": 1.0138236350452168
+      }
+    },
+    {
+      "layer_idx": 6,
+      "layer_name": "encoder_block_6",
+      "probe": {
+        "train_acc": 1.0,
+        "test_acc": 0.44999998807907104,
+        "test_top5_acc": 0.6225000023841858,
+        "test_top10_acc": 0.6875
+      },
+      "gender_probe": null,
+      "silhouette": -0.43074554204940796,
+      "cka_speaker": 0.05052119866013527,
+      "cka_ctc": 0.04829205945134163,
+      "cosine": {
+        "intra_cos": 0.9633663296699524,
+        "inter_cos": 0.9403045773506165,
+        "ratio": 1.024525832240777
+      }
+    },
+    {
+      "layer_idx": 7,
+      "layer_name": "encoder_block_7",
+      "probe": {
+        "train_acc": 0.9981249570846558,
+        "test_acc": 0.4099999964237213,
+        "test_top5_acc": 0.5774999856948853,
+        "test_top10_acc": 0.6349999904632568
+      },
+      "gender_probe": null,
+      "silhouette": -0.5044897794723511,
+      "cka_speaker": 0.04000365361571312,
+      "cka_ctc": 0.04220625013113022,
+      "cosine": {
+        "intra_cos": 0.9507718086242676,
+        "inter_cos": 0.9177325963973999,
+        "ratio": 1.0360009139443935
+      }
+    },
+    {
+      "layer_idx": 8,
+      "layer_name": "encoder_block_8",
+      "probe": {
+        "train_acc": 1.0,
+        "test_acc": 0.35999998450279236,
+        "test_top5_acc": 0.5324999690055847,
+        "test_top10_acc": 0.6100000143051147
+      },
+      "gender_probe": null,
+      "silhouette": -0.43211930990219116,
+      "cka_speaker": 0.05107274651527405,
+      "cka_ctc": 0.056604743003845215,
+      "cosine": {
+        "intra_cos": 0.9442163109779358,
+        "inter_cos": 0.9105355143547058,
+        "ratio": 1.0369900965884888
+      }
+    },
+    {
+      "layer_idx": 9,
+      "layer_name": "encoder_block_9",
+      "probe": {
+        "train_acc": 1.0,
+        "test_acc": 0.32999998331069946,
+        "test_top5_acc": 0.48749998211860657,
+        "test_top10_acc": 0.5600000023841858
+      },
+      "gender_probe": null,
+      "silhouette": -0.34492728114128113,
+      "cka_speaker": 0.07034913450479507,
+      "cka_ctc": 0.09293480962514877,
+      "cosine": {
+        "intra_cos": 0.9425107836723328,
+        "inter_cos": 0.9104548692703247,
+        "ratio": 1.0352086802805491
+      }
+    },
+    {
+      "layer_idx": 10,
+      "layer_name": "encoder_block_10",
+      "probe": {
+        "train_acc": 1.0,
+        "test_acc": 0.2449999898672104,
+        "test_top5_acc": 0.42249998450279236,
+        "test_top10_acc": 0.4949999749660492
+      },
+      "gender_probe": null,
+      "silhouette": -0.35199475288391113,
+      "cka_speaker": 0.05774173140525818,
+      "cka_ctc": 0.10242380946874619,
+      "cosine": {
+        "intra_cos": 0.928196370601654,
+        "inter_cos": 0.8885038495063782,
+        "ratio": 1.0446734373940278
+      }
+    },
+    {
+      "layer_idx": 11,
+      "layer_name": "encoder_block_11",
+      "probe": {
+        "train_acc": 0.965624988079071,
+        "test_acc": 0.19999998807907104,
+        "test_top5_acc": 0.3149999976158142,
+        "test_top10_acc": 0.3700000047683716
+      },
+      "gender_probe": null,
+      "silhouette": -0.42025020718574524,
+      "cka_speaker": 0.04929563030600548,
+      "cka_ctc": 0.08267902582883835,
+      "cosine": {
+        "intra_cos": 0.8827124238014221,
+        "inter_cos": 0.8124161958694458,
+        "ratio": 1.0865273591164015
+      }
+    },
+    {
+      "layer_idx": 12,
+      "layer_name": "encoder_block_12",
+      "probe": {
+        "train_acc": 0.8806250095367432,
+        "test_acc": 0.12999999523162842,
+        "test_top5_acc": 0.26999998092651367,
+        "test_top10_acc": 0.32749998569488525
+      },
+      "gender_probe": null,
+      "silhouette": -0.55739426612854,
+      "cka_speaker": 0.030527407303452492,
+      "cka_ctc": 0.037448056042194366,
+      "cosine": {
+        "intra_cos": 0.9450229406356812,
+        "inter_cos": 0.905299961566925,
+        "ratio": 1.0438782511378903
+      }
+    }
+  ],
+  "mlp_probe": null
+}

@@ -14,7 +14,8 @@ def load_model(
     checkpoint_path: Optional[str] = None,
     device: str = "cuda",
     overrides: dict = {},
-    strict: bool = False
+    strict: bool = False,
+    allow_size_mismatch: bool = False,
 ):
     """
     Load a model from a checkpoint.
@@ -23,6 +24,9 @@ def load_model(
         checkpoint_path: Path to checkpoint directory (containing model.safetensors or pytorch_model.bin)
         config_name: Config name from the model class (e.g., "small", "medium")
         device: Device to load the model on
+        allow_size_mismatch: If True, drop checkpoint keys whose tensor shape
+            doesn't match the current model. Use when an unused head's output
+            dim differs (e.g. SIVE speaker_classifier across train/eval splits).
 
     Returns:
         model in eval mode
@@ -40,10 +44,14 @@ def load_model(
     if os.path.exists(safetensors_path):
         from safetensors.torch import load_file
         state_dict = load_file(safetensors_path)
+        if allow_size_mismatch:
+            state_dict = _filter_size_mismatched(state_dict, model)
         model.load_state_dict(state_dict, strict=strict)
         print(f"Loaded model from {safetensors_path}")
     elif os.path.exists(pytorch_path):
         state_dict = torch.load(pytorch_path, map_location=device, weights_only=True)
+        if allow_size_mismatch:
+            state_dict = _filter_size_mismatched(state_dict, model)
         model.load_state_dict(state_dict, strict=strict)
         print(f"Loaded model from {pytorch_path}")
     else:
@@ -53,6 +61,20 @@ def load_model(
         )
 
     return model
+
+
+def _filter_size_mismatched(state_dict: dict, model: torch.nn.Module) -> dict:
+    """Drop checkpoint entries whose tensor shape disagrees with the model's
+    parameter at the same key. Prints a one-line warning per dropped key."""
+    model_shapes = {n: p.shape for n, p in model.state_dict().items()}
+    filtered = {}
+    for k, v in state_dict.items():
+        target = model_shapes.get(k)
+        if target is not None and tuple(target) != tuple(v.shape):
+            print(f"  Skipping size-mismatched key {k}: ckpt {tuple(v.shape)} vs model {tuple(target)}")
+            continue
+        filtered[k] = v
+    return filtered
 
 
 class PretrainedVocoderWrapper(torch.nn.Module):

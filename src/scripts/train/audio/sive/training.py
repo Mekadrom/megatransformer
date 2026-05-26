@@ -8,6 +8,7 @@ from torch.utils.data import Sampler
 from transformers.trainer import Trainer
 from model.voice.sive.ctc_vocab import CTCVocab
 from model.voice.sive.sive import SpeakerInvariantVoiceEncoder
+from scripts.train.trainer import CommonTrainer
 from utils import metrics, model_loading_utils
 from utils.megatransformer_utils import print_debug_tensor
 
@@ -46,7 +47,7 @@ class GRLAlphaScheduler:
         return float(alpha * self.max_alpha)
 
 
-class SIVETrainer(Trainer):
+class SIVETrainer(CommonTrainer):
     """
     Custom trainer for SIVE with CTC + GRL losses.
 
@@ -64,6 +65,7 @@ class SIVETrainer(Trainer):
         grl_weight: float = 0.1,
         grl_start_step: int = 0,  # Step at which GRL kicks in (before this, classifier trains freely)
         grl_lr: float = None,  # Separate LR for speaker classifier (None = use base LR)
+        pad_blank_weight: float = 0.05,  # Auxiliary CE pushing pad-region asr_logits toward blank
         cmdline: str = "",
         git_commit_hash: str = "",
         step_offset: int = 0,
@@ -76,6 +78,7 @@ class SIVETrainer(Trainer):
         self.grl_weight = grl_weight
         self.grl_start_step = grl_start_step
         self.grl_lr = grl_lr
+        self.pad_blank_weight = pad_blank_weight
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
         self.step_offset = step_offset if step_offset is not None else 0
@@ -96,8 +99,17 @@ class SIVETrainer(Trainer):
 
     def create_optimizer(self):
         """
-        Override to create separate parameter groups with different learning rates.
-        Speaker classifier gets grl_lr (or base_lr if None).
+        Build optimizer with two-axis parameter grouping:
+          axis 1: speaker_classifier (gets grl_lr) vs everything else (gets base_lr)
+          axis 2: decay (linear/conv weights) vs no_decay (norms, biases)
+
+        Yields up to 4 param groups so weight_decay isn't applied to LayerNorm
+        gain/bias or other 1D parameters — those would otherwise be slowly
+        pulled toward zero, hurting convergence on transformer-shaped models.
+
+        Uses HF Trainer's `get_decay_parameter_names` to determine which params
+        belong in the decay set (matches the convention HF's default optimizer
+        and DeepSpeed both expect).
         """
         if self.optimizer is not None:
             return self.optimizer
@@ -106,38 +118,46 @@ class SIVETrainer(Trainer):
         base_lr = self.args.learning_rate
         speaker_lr = self.grl_lr if self.grl_lr is not None else base_lr
 
-        # Separate speaker classifier parameters
-        speaker_classifier_params = []
-        other_params = []
+        # CommonTrainer.get_decay_parameter_names already excludes nn.LayerNorm
+        # plus BatchNorm/InstanceNorm/GroupNorm gains. No extra filter needed.
+        decay_names = set(self.get_decay_parameter_names(model))
+
+        groups = {
+            "main_decay":     {"params": [], "lr": base_lr,    "weight_decay": self.args.weight_decay},
+            "main_no_decay":  {"params": [], "lr": base_lr,    "weight_decay": 0.0},
+            "spk_decay":      {"params": [], "lr": speaker_lr, "weight_decay": self.args.weight_decay},
+            "spk_no_decay":   {"params": [], "lr": speaker_lr, "weight_decay": 0.0},
+        }
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'speaker_classifier' in name:
-                speaker_classifier_params.append(param)
-            else:
-                other_params.append(param)
+            in_speaker = 'speaker_classifier' in name
+            in_decay = name in decay_names
+            key = (
+                "spk_decay"     if in_speaker and in_decay else
+                "spk_no_decay"  if in_speaker else
+                "main_decay"    if in_decay else
+                "main_no_decay"
+            )
+            groups[key]["params"].append(param)
 
-        # Create parameter groups
-        optimizer_grouped_parameters = [
-            {
-                "params": other_params,
-                "lr": base_lr,
-                "weight_decay": self.args.weight_decay,
-            },
-            {
-                "params": speaker_classifier_params,
-                "lr": speaker_lr,
-                "weight_decay": self.args.weight_decay,
-            },
-        ]
+        optimizer_grouped_parameters = [g for g in groups.values() if g["params"]]
 
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args, model)
-
-        # Remove lr from kwargs since we set it per-group
-        optimizer_kwargs.pop("lr", None)
+        optimizer_kwargs.pop("lr", None)  # per-group lr takes precedence
 
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+        if self.args.local_rank in (-1, 0):
+            counts = {k: sum(p.numel() for p in g["params"]) for k, g in groups.items()}
+            print(
+                "[SIVE create_optimizer] param group counts:\n"
+                f"  main_decay     ({counts['main_decay']:>10,}) wd={self.args.weight_decay} lr={base_lr}\n"
+                f"  main_no_decay  ({counts['main_no_decay']:>10,}) wd=0.0 lr={base_lr}\n"
+                f"  spk_decay      ({counts['spk_decay']:>10,}) wd={self.args.weight_decay} lr={speaker_lr}\n"
+                f"  spk_no_decay   ({counts['spk_no_decay']:>10,}) wd=0.0 lr={speaker_lr}"
+            )
 
         return self.optimizer
 
@@ -192,6 +212,27 @@ class SIVETrainer(Trainer):
 
         ctc_loss = self.ctc_criterion(log_probs, ctc_tokens, output_ctc_lengths, ctc_lengths)
 
+        # Pad-blank pressure: CTC loss is masked beyond output_ctc_lengths, so
+        # asr_logits at padded frames receive no gradient and drift to arbitrary
+        # classes — leaking nonsense into greedy decode and downstream consumers
+        # that read the full feature tensor. This auxiliary CE pushes pad-region
+        # asr_logits toward the blank class so the encoder learns "silent past
+        # audio." Set pad_blank_weight=0 to disable.
+        pad_blank_loss = torch.zeros((), device=asr_logits.device)
+        if self.pad_blank_weight > 0 and output_ctc_lengths is not None:
+            B, T_ctc, V = asr_logits.shape
+            frame_idx = torch.arange(T_ctc, device=asr_logits.device).unsqueeze(0)  # [1, T]
+            pad_mask = frame_idx >= output_ctc_lengths.unsqueeze(1)  # [B, T] True where padded
+            if pad_mask.any():
+                pad_logits = asr_logits[pad_mask]  # [N_pad, V]
+                blank_targets = torch.full(
+                    (pad_logits.size(0),),
+                    self.vocab.blank_idx,
+                    device=asr_logits.device,
+                    dtype=torch.long,
+                )
+                pad_blank_loss = F.cross_entropy(pad_logits, blank_targets)
+
         # GRL speaker classification loss
         # We want the classifier to FAIL (be at chance level)
         # But we train it normally - GRL reverses gradients to encoder
@@ -202,6 +243,10 @@ class SIVETrainer(Trainer):
             speaker_preds = speaker_logits.argmax(dim=-1)
             speaker_acc = (speaker_preds == speaker_ids).float().mean().item()
 
+            # Top-5 accuracy: true speaker among top-5 logits
+            top5_preds = speaker_logits.topk(min(5, speaker_logits.size(-1)), dim=-1).indices
+            speaker_acc_top5 = (top5_preds == speaker_ids.unsqueeze(-1)).any(dim=-1).float().mean().item()
+
             # Diagnostic: check for mode collapse
             pred_probs = F.softmax(speaker_logits, dim=-1)
             pred_entropy = -(pred_probs * torch.log(pred_probs + 1e-8)).sum(dim=-1).mean().item()
@@ -210,16 +255,30 @@ class SIVETrainer(Trainer):
             # Max probability (confidence) - high values with low accuracy = overconfident
             max_prob = pred_probs.max(dim=-1).values.mean().item()
 
+        # Feature-space regularization losses (zero unless --use_std_hinge or
+        # --use_covariance_reg are set; weights are baked into the model-side
+        # computation, so no further multiplier is applied here).
+        std_hinge_loss = result.get("std_hinge_loss", torch.zeros((), device=ctc_loss.device))
+        cov_loss = result.get("cov_loss", torch.zeros((), device=ctc_loss.device))
+
         # Combined loss
         # During pre-training phase, speaker loss still contributes but doesn't affect encoder
         # (because grl_alpha=0 means no gradient reversal, but classifier still learns)
-        total_loss = self.ctc_weight * ctc_loss + self.grl_weight * speaker_loss
+        total_loss = (
+            self.ctc_weight * ctc_loss
+            + self.grl_weight * speaker_loss
+            + self.pad_blank_weight * pad_blank_loss
+            + std_hinge_loss
+            + cov_loss
+        )
 
         # Log to TensorBoard
         if global_step % self.args.logging_steps == 0:
             metrics.log_scalar("train/ctc_loss", ctc_loss, global_step)
+            metrics.log_scalar("train/pad_blank_loss", pad_blank_loss, global_step)
             metrics.log_scalar("train/speaker_loss", speaker_loss, global_step)
             metrics.log_scalar("train/speaker_accuracy", speaker_acc, global_step)
+            metrics.log_scalar("train/speaker_accuracy_top5", speaker_acc_top5, global_step)
             metrics.log_scalar("train/grl_alpha", grl_alpha, global_step)
             metrics.log_scalar("train/total_loss", total_loss, global_step)
             metrics.log_scalar("train/grl_pretraining", float(in_pretraining), global_step)
@@ -228,9 +287,72 @@ class SIVETrainer(Trainer):
             metrics.log_scalar("train/speaker_unique_preds", unique_preds, global_step)
             metrics.log_scalar("train/speaker_max_prob", max_prob, global_step)
 
+            # Feature regularization losses (zero when respective flags are off).
+            metrics.log_scalar("train/std_hinge_loss", std_hinge_loss, global_step)
+            metrics.log_scalar("train/cov_loss", cov_loss, global_step)
+
+            # Per-dim std diagnostics for spotting dead/blown-out feature dims.
+            # Compares post-LN ("features") vs pre-LN ("features_unnorm"): if a
+            # dim is dead in post-LN but healthy in pre-LN, the final norm's γ
+            # (or LN's dim-axis mean/std) is the culprit.
+            self._log_feature_dim_stats(
+                result["features"],
+                result["features_unnorm"],
+                result["feature_lengths"],
+                global_step,
+            )
+
         if return_outputs:
             return total_loss, result
         return total_loss
+
+    @torch.no_grad()
+    def _log_feature_dim_stats(
+        self,
+        features: torch.Tensor,
+        features_unnorm: torch.Tensor,
+        feature_lengths: Optional[torch.Tensor],
+        global_step: int,
+        dead_std_threshold: float = 0.05,
+    ) -> None:
+        """
+        Log per-dim std of SIVE output features (post-LN) and pre-LN features.
+        Padded positions are masked out using feature_lengths so they don't
+        artificially deflate the variance estimate.
+        """
+        B, T, D = features.shape
+        if feature_lengths is not None:
+            valid_mask = (
+                torch.arange(T, device=features.device).unsqueeze(0)
+                < feature_lengths.unsqueeze(1)
+            )  # [B, T]
+            flat_mask = valid_mask.reshape(-1)
+            feat_flat = features.reshape(-1, D)[flat_mask].float()
+            feat_un_flat = features_unnorm.reshape(-1, D)[flat_mask].float()
+        else:
+            feat_flat = features.reshape(-1, D).float()
+            feat_un_flat = features_unnorm.reshape(-1, D).float()
+
+        if feat_flat.size(0) < 2:
+            return
+
+        for tag, flat in (("features", feat_flat), ("features_unnorm", feat_un_flat)):
+            dim_std = flat.std(dim=0)  # [D]
+            dim_mean = flat.mean(dim=0)  # [D]
+            dim_absmean = dim_mean.abs()
+            dead_count = (dim_std < dead_std_threshold).sum().item()
+
+            metrics.log_scalar(f"feat_dim_std/{tag}/min", dim_std.min().item(), global_step)
+            metrics.log_scalar(f"feat_dim_std/{tag}/max", dim_std.max().item(), global_step)
+            metrics.log_scalar(f"feat_dim_std/{tag}/mean", dim_std.mean().item(), global_step)
+            metrics.log_scalar(f"feat_dim_std/{tag}/median", dim_std.median().item(), global_step)
+            metrics.log_scalar(f"feat_dim_std/{tag}/dead_count", dead_count, global_step)
+            # Per-dim absolute mean — a "blown out" dead dim shows large |mean|
+            # alongside small std (constant high-magnitude output).
+            metrics.log_scalar(f"feat_dim_absmean/{tag}/max", dim_absmean.max().item(), global_step)
+            metrics.log_scalar(f"feat_dim_absmean/{tag}/mean", dim_absmean.mean().item(), global_step)
+            metrics.log_histogram(f"feat_dim_std/{tag}/hist", dim_std.detach().cpu(), global_step)
+            metrics.log_histogram(f"feat_dim_absmean/{tag}/hist", dim_absmean.detach().cpu(), global_step)
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         """Override to handle SIVE inputs correctly during evaluation."""
@@ -248,12 +370,13 @@ class SIVETrainer(Trainer):
 
             asr_logits = result["asr_logits"]
             speaker_logits = result["speaker_logits"]
-            # Use ctc_lengths for CTC loss (accounts for upsampling if enabled)
-            ctc_lengths = result.get("ctc_lengths", result["feature_lengths"])
+            # Input frame lengths after CTC upsampling (accounts for upsampling if enabled).
+            # NOTE: do not shadow ctc_lengths — that's the target token length from inputs.
+            output_ctc_lengths = result.get("ctc_lengths", result["feature_lengths"])
 
             # CTC loss
             log_probs = F.log_softmax(asr_logits, dim=-1).permute(1, 0, 2)
-            ctc_loss = self.ctc_criterion(log_probs, ctc_tokens, ctc_lengths, ctc_lengths)
+            ctc_loss = self.ctc_criterion(log_probs, ctc_tokens, output_ctc_lengths, ctc_lengths)
 
             # Speaker loss
             speaker_loss = self.speaker_criterion(speaker_logits, speaker_ids)
@@ -370,6 +493,17 @@ def load_model(args):
         'mel_freq_response_smoothing': args.mel_freq_response_smoothing,
         # Stochastic Depth
         'drop_path_rate': args.drop_path_rate,
+        # Final normalization on encoder output
+        'final_norm_type': args.final_norm_type,
+        # Std hinge regularization (disabled unless --use_std_hinge)
+        'use_std_hinge': args.use_std_hinge,
+        'dim_std_min': args.dim_std_min,
+        'dim_std_weight': args.dim_std_weight,
+        'temporal_std_min': args.temporal_std_min,
+        'temporal_std_weight': args.temporal_std_weight,
+        # Covariance/decorrelation regularization (disabled unless --use_covariance_reg)
+        'use_covariance_reg': args.use_covariance_reg,
+        'cov_weight': args.cov_weight,
     })
 
 
@@ -401,6 +535,7 @@ def create_trainer(
         grl_weight=args.grl_weight,
         grl_start_step=args.grl_start_step,
         grl_lr=args.grl_lr,
+        pad_blank_weight=args.pad_blank_weight,
         cmdline=args.cmdline,
         git_commit_hash=args.commit_hash or "",
         step_offset=args.start_step,
@@ -434,7 +569,14 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--grl_start_step", type=int, default=0,
                             help="Pre-training phase before GRL kicks in")
     sub_parser.add_argument("--grl_lr", type=float, default=None,
-                            help="Separate learning rate for speaker classifier (default: use base LR)")
+                            help="Separate learning rate for speaker classifier (default: use base LR). "
+                                 "When --use_muon is set, controls the AdamW LR for speaker_classifier "
+                                 "(biases, norms, and matmul params kept on AdamW via --muon_last_layer_names).")
+    sub_parser.add_argument("--grl_lr_muon", type=float, default=None,
+                            help="Separate Muon LR for speaker_classifier matmul params (default: use --lr_muon). "
+                                 "Only takes effect when --use_muon is set AND speaker_classifier matmul "
+                                 "params are routed to Muon (i.e. 'speaker_classifier' is NOT in "
+                                 "--muon_last_layer_names).")
     
     sub_parser.add_argument("--speaker_pooling", type=str, default="attentive_statistics",
                             help="Pooling strategy for speaker classifier (e.g., 'attentive_statistics')")
@@ -442,6 +584,9 @@ def add_cli_args(subparsers):
     # CTC-specific settings
     sub_parser.add_argument("--ctc_weight", type=float, default=1.0,
                             help="Weight for CTC loss in total loss")
+    sub_parser.add_argument("--pad_blank_weight", type=float, default=0.05,
+                            help="Auxiliary CE loss pushing pad-region asr_logits toward blank "
+                                 "(keeps SIVE features clean past audio end). 0 disables.")
 
     # Dropout settings for regularization (helps prevent memorization)
     sub_parser.add_argument("--conv_dropout", type=float, default=0.05,
@@ -498,6 +643,32 @@ def add_cli_args(subparsers):
     # Stochastic Depth (drop entire residual paths for regularization)
     sub_parser.add_argument("--drop_path_rate", type=float, default=0.0,
                             help="Max drop path rate for stochastic depth (linearly scaled per layer, 0=disabled)")
+
+    # Final normalization on SIVE output features
+    sub_parser.add_argument("--final_norm_type", type=str, default="layernorm",
+                            choices=["layernorm", "rmsnorm", "none"],
+                            help="Final normalization on encoder output features. "
+                                 "'rmsnorm' avoids LN's dim-axis competition; 'none' skips entirely.")
+
+    # Std-based hinge on per-dim feature std (disabled by default)
+    sub_parser.add_argument("--use_std_hinge", action="store_true",
+                            help="Enable std-hinge regularization on encoder output features. "
+                                 "Penalizes per-dim std falling below --dim_std_min with constant gradient.")
+    sub_parser.add_argument("--dim_std_min", type=float, default=0.5,
+                            help="Target minimum per-dim std for std hinge (default: 0.5)")
+    sub_parser.add_argument("--dim_std_weight", type=float, default=1.0,
+                            help="Weight on dim-std hinge loss (default: 1.0)")
+    sub_parser.add_argument("--temporal_std_min", type=float, default=0.1,
+                            help="Target minimum frame-to-frame std (only used if --temporal_std_weight > 0)")
+    sub_parser.add_argument("--temporal_std_weight", type=float, default=0.0,
+                            help="Weight on temporal-std hinge loss (default: 0.0 = disabled even if --use_std_hinge)")
+
+    # Covariance / decorrelation regularization (VICReg-style, disabled by default)
+    sub_parser.add_argument("--use_covariance_reg", action="store_true",
+                            help="Enable VICReg-style covariance regularization on encoder features. "
+                                 "Penalizes the squared off-diagonal of the per-batch feature covariance matrix.")
+    sub_parser.add_argument("--cov_weight", type=float, default=0.04,
+                            help="Weight on covariance loss (default: 0.04, VICReg paper)")
 
     # Vocoder settings (for audio generation in TensorBoard)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,

@@ -160,11 +160,20 @@ class SIVEVisualizationCallback(VisualizationCallback):
         model.eval()
         device = next(model.parameters()).device
 
+        # Pick a single index set so transcriptions, alignments, and audio
+        # samples all reference the same underlying utterances.
+        n_total = len(self.trainer.eval_dataset)
+        n_pick = min(
+            max(self.num_transcription_samples, self.num_audio_samples),
+            n_total,
+        )
+        sample_indices = np.random.choice(n_total, n_pick, replace=False)
+
         try:
             self._log_tsne(model, state.global_step, device)
-            self._log_transcriptions_with_alignment(model, state.global_step, device)
+            self._log_transcriptions_with_alignment(model, state.global_step, device, sample_indices)
             self._log_feature_health(model, state.global_step, device)
-            self._log_audio_samples(model, state.global_step, device)
+            self._log_audio_samples(model, state.global_step, device, sample_indices)
         except Exception as e:
             print(f"Visualization error at step {state.global_step}: {e}")
             import traceback
@@ -248,17 +257,13 @@ class SIVEVisualizationCallback(VisualizationCallback):
         plt.close(fig)
 
     @torch.no_grad()
-    def _log_transcriptions_with_alignment(self, model, step, device):
+    def _log_transcriptions_with_alignment(self, model, step, device, sample_indices):
         """Log sample transcriptions with CER/WER and CTC alignment visualization."""
         transcriptions = []
         total_cer = 0
         total_wer = 0
 
-        indices = np.random.choice(
-            len(self.trainer.eval_dataset),
-            min(self.num_transcription_samples, len(self.trainer.eval_dataset)),
-            replace=False,
-        )
+        indices = sample_indices[:min(self.num_transcription_samples, len(sample_indices))]
 
         for i, idx in enumerate(indices):
             sample = self.trainer.eval_dataset[idx]
@@ -270,12 +275,20 @@ class SIVEVisualizationCallback(VisualizationCallback):
             ctc_length = sample["ctc_length"].item()
 
             result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
-            asr_logits = result["asr_logits"]  # [1, T, vocab]
-            features = result["features"]  # [1, T, D]
-            feature_length = result["feature_lengths"][0].item() if result["feature_lengths"] is not None else asr_logits.size(1)
+            asr_logits = result["asr_logits"]  # [1, T_ctc, vocab]
+            features = result["features"]  # [1, T_feat, D]
+            feature_length = result["feature_lengths"][0].item() if result["feature_lengths"] is not None else features.size(1)
+            # asr_logits is on the CTC time axis (potentially upsampled).
+            # Use ctc_lengths to slice it, NOT feature_lengths — otherwise we
+            # truncate to T/upsample_factor when ctc_upsample_factor > 1.
+            ctc_length_logits = (
+                result["ctc_lengths"][0].item()
+                if result.get("ctc_lengths") is not None
+                else asr_logits.size(1)
+            )
 
             # Get probabilities
-            asr_probs = F.softmax(asr_logits[0, :feature_length], dim=-1).cpu().numpy()  # [T, vocab]
+            asr_probs = F.softmax(asr_logits[0, :ctc_length_logits], dim=-1).cpu().numpy()  # [T, vocab]
 
             # Get ground truth
             target_text = self.vocab.decode(
@@ -285,7 +298,10 @@ class SIVEVisualizationCallback(VisualizationCallback):
             )
 
             # Always compute greedy decode for base metrics (maintains consistency with previous runs)
-            pred_text_greedy = self.vocab.ctc_decode_greedy(asr_logits)[0]
+            pred_text_greedy = self.vocab.ctc_decode_greedy(
+                asr_logits,
+                lengths=torch.tensor([ctc_length_logits], device=asr_logits.device),
+            )[0]
             wer_greedy, cer_greedy = compute_wer_cer(pred_text_greedy, target_text)
             length_ratio_greedy = len(pred_text_greedy) / max(len(target_text), 1)
             total_wer += wer_greedy
@@ -295,7 +311,7 @@ class SIVEVisualizationCallback(VisualizationCallback):
             if self.ctc_decoder is not None:
                 try:
                     pred_text_lm = self.vocab.ctc_decode_beam(
-                        asr_logits[0, :feature_length],
+                        asr_logits[0, :ctc_length_logits],
                         decoder=self.ctc_decoder,
                         beam_width=self.beam_width,
                     )[0]
@@ -371,7 +387,7 @@ class SIVEVisualizationCallback(VisualizationCallback):
                 blank_probs = asr_probs[:, self.vocab.blank_idx]  # [T]
                 axes[3].plot(blank_probs, color='blue', linewidth=1)
                 axes[3].fill_between(range(len(blank_probs)), blank_probs, alpha=0.3)
-                axes[3].set_xlim(0, feature_length)
+                axes[3].set_xlim(0, ctc_length_logits)
                 axes[3].set_ylim(0, 1)
                 axes[3].set_ylabel("P(blank)")
                 axes[3].set_xlabel("Frame")
@@ -630,15 +646,16 @@ class SIVEVisualizationCallback(VisualizationCallback):
               f"effective_dim={effective_dim:.1f}")
 
     @torch.no_grad()
-    def _log_audio_samples(self, model, step, device):
+    def _log_audio_samples(self, model, step, device, sample_indices):
         """Log audio samples with vocoder output aligned with transcription."""
         if self.vocoder is None:
             return
 
-        num_samples = min(self.num_audio_samples, len(self.trainer.eval_dataset))
+        num_samples = min(self.num_audio_samples, len(sample_indices))
 
         for i in range(num_samples):
-            sample = self.trainer.eval_dataset[i]
+            idx = int(sample_indices[i])
+            sample = self.trainer.eval_dataset[idx]
 
             mel_spec = sample["mel_spec"]  # [n_mels, T]
             mel_length = sample["mel_length"].item()

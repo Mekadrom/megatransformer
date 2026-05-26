@@ -17,7 +17,8 @@ Usage:
     )
 """
 
-from typing import Optional, Iterable, Tuple, List, Set, Callable
+from collections import OrderedDict
+from typing import Optional, Iterable, Tuple, List, Set, Callable, Dict
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer, AdamW
@@ -251,8 +252,20 @@ class MuonAdamW(Optimizer):
         first_layer_names: Optional[List[str]] = None,
         last_layer_names: Optional[List[str]] = None,
         adamw_override_names: Optional[List[str]] = None,
+        param_groupers: Optional[List[Tuple[str, str, Dict[str, float]]]] = None,
         verbose: bool = False,
     ):
+        """
+        ``param_groupers`` is an ordered list of ``(group_name, name_pattern,
+        overrides)`` tuples. Any parameter whose name contains ``name_pattern``
+        is routed to its own sub-group (within both the Muon and AdamW sub-
+        optimizers as applicable) with the supplied LR / weight_decay overrides.
+        First-match wins. Useful for adversarial heads (e.g. SIVE's GRL speaker
+        classifier) that need their own LR distinct from the base.
+
+        Supported override keys: ``lr_muon``, ``lr_adamw``,
+        ``weight_decay_muon``, ``weight_decay_adamw``, ``momentum_muon``.
+        """
         self.lr_muon = lr_muon
         self.lr_adamw = lr_adamw
         self.momentum_muon = momentum_muon
@@ -268,6 +281,7 @@ class MuonAdamW(Optimizer):
         self.first_layer_names = set(first_layer_names or [])
         self.last_layer_names = set(last_layer_names or [])
         self.adamw_override_names = set(adamw_override_names or [])
+        self.param_groupers = list(param_groupers or [])
 
         # Patterns that always go to AdamW (norms, biases, embeddings)
         self.adamw_patterns = {
@@ -278,42 +292,130 @@ class MuonAdamW(Optimizer):
             ".norm.", "_norm.", "final_norm",
         }
 
-        # Collect and route parameters
-        muon_params = []
-        adamw_params = []
-
+        # Collect and route parameters into buckets keyed by
+        # (route, override_group_name). The override_group_name is None for
+        # params that don't match any param_groupers pattern; otherwise it is
+        # the matched group_name (first match wins). Each bucket holds two
+        # lists for the AdamW side: decay vs no_decay. The Muon side ignores
+        # the decay distinction.
         named_params_list = list(named_params)
+
+        def _match_group(name: str) -> Optional[str]:
+            for group_name, pattern, _ in self.param_groupers:
+                if pattern in name:
+                    return group_name
+            return None
+
+        # Use OrderedDict so param-group iteration order is deterministic
+        # (None group always first since it's the first inserted in practice).
+        buckets: "OrderedDict[Tuple[str, Optional[str]], Dict[str, list]]" = OrderedDict()
+
+        def _bucket(key):
+            if key not in buckets:
+                buckets[key] = {"decay": [], "no_decay": []}
+            return buckets[key]
 
         for name, param in named_params_list:
             if not param.requires_grad:
                 continue
 
             route = self._route_parameter(name, param)
+            group_key = _match_group(name)
+            tag = "" if group_key is None else f":{group_key}"
 
             if route == "muon":
-                muon_params.append(param)
+                _bucket((route, group_key))["decay"].append(param)
                 if verbose:
-                    print(f"[Muon]  {name}: {tuple(param.shape)}")
+                    print(f"[Muon{tag}]              {name}: {tuple(param.shape)}")
             else:
-                adamw_params.append(param)
+                # On the AdamW side, further split into decay vs no-decay so
+                # weight_decay_adamw doesn't apply to norm gains, biases, etc.
+                # 1D params are always no-decay; 2D+ params on AdamW (first/last
+                # layer overrides, embeddings, etc.) get decay unless their name
+                # matches a norm/bias/embedding pattern.
+                is_no_decay = (
+                    param.ndim < 2
+                    or any(pat in name for pat in self._no_decay_name_patterns())
+                )
+                decay_key = "no_decay" if is_no_decay else "decay"
+                _bucket((route, group_key))[decay_key].append(param)
                 if verbose:
-                    print(f"[AdamW] {name}: {tuple(param.shape)}")
+                    print(f"[AdamW{tag} {decay_key}]    {name}: {tuple(param.shape)}")
+
+        def _get_overrides(group_name: Optional[str]) -> Dict[str, float]:
+            if group_name is None:
+                return {}
+            for n, _p, o in self.param_groupers:
+                if n == group_name:
+                    return o
+            return {}
+
+        # Build per-(route, group) param groups, preserving backward-compat
+        # flat lists for callers that read .muon_params/.adamw_params.
+        muon_param_groups: List[dict] = []
+        adamw_param_groups: List[dict] = []
+        muon_params: List[torch.nn.Parameter] = []
+        adamw_decay_params: List[torch.nn.Parameter] = []
+        adamw_no_decay_params: List[torch.nn.Parameter] = []
+
+        for (route, group_key), inner in buckets.items():
+            overrides = _get_overrides(group_key)
+            if route == "muon":
+                params = inner["decay"] + inner["no_decay"]
+                if not params:
+                    continue
+                muon_param_groups.append({
+                    "params": params,
+                    "lr": overrides.get("lr_muon", lr_muon),
+                    "momentum": overrides.get("momentum_muon", momentum_muon),
+                    "nesterov": nesterov,
+                    "ns_steps": ns_steps,
+                    "weight_decay": overrides.get("weight_decay_muon", weight_decay_muon),
+                })
+                muon_params.extend(params)
+            else:
+                lr = overrides.get("lr_adamw", lr_adamw)
+                wd_decay = overrides.get("weight_decay_adamw", weight_decay_adamw)
+                if inner["decay"]:
+                    adamw_param_groups.append({
+                        "params": inner["decay"],
+                        "lr": lr,
+                        "weight_decay": wd_decay,
+                    })
+                    adamw_decay_params.extend(inner["decay"])
+                if inner["no_decay"]:
+                    adamw_param_groups.append({
+                        "params": inner["no_decay"],
+                        "lr": lr,
+                        "weight_decay": 0.0,
+                    })
+                    adamw_no_decay_params.extend(inner["no_decay"])
+
+        adamw_params = adamw_decay_params + adamw_no_decay_params
 
         if verbose:
             muon_count = sum(p.numel() for p in muon_params)
-            adamw_count = sum(p.numel() for p in adamw_params)
-            print(f"\nMuon params: {len(muon_params)} tensors, {muon_count:,} parameters")
-            print(f"AdamW params: {len(adamw_params)} tensors, {adamw_count:,} parameters")
+            adamw_decay_count = sum(p.numel() for p in adamw_decay_params)
+            adamw_no_decay_count = sum(p.numel() for p in adamw_no_decay_params)
+            print(f"\nMuon params:           {len(muon_params)} tensors, {muon_count:,} parameters across {len(muon_param_groups)} group(s)")
+            print(f"AdamW decay params:    {len(adamw_decay_params)} tensors, {adamw_decay_count:,} parameters")
+            print(f"AdamW no_decay params: {len(adamw_no_decay_params)} tensors, {adamw_no_decay_count:,} parameters")
+            for group_name, pattern, overrides in self.param_groupers:
+                print(f"  Override group '{group_name}' (pattern '{pattern}'): {overrides}")
 
         # Store param lists for the optimizers
         self.muon_params = muon_params
-        self.adamw_params = adamw_params
+        self.adamw_params = adamw_params  # combined, kept for backward compat
+        self.adamw_decay_params = adamw_decay_params
+        self.adamw_no_decay_params = adamw_no_decay_params
 
-        # Create sub-optimizers
+        # Create sub-optimizers from the per-group dicts. PyTorch's Optimizer
+        # base class accepts either a flat iterable of params or a list of
+        # group dicts; group-level keys override the optimizer-level defaults.
         self.muon_optimizer = None
-        if muon_params:
+        if muon_param_groups:
             self.muon_optimizer = Muon(
-                muon_params,
+                muon_param_groups,
                 lr=lr_muon,
                 momentum=momentum_muon,
                 nesterov=nesterov,
@@ -322,13 +424,13 @@ class MuonAdamW(Optimizer):
             )
 
         self.adamw_optimizer = None
-        if adamw_params:
+        if adamw_param_groups:
             self.adamw_optimizer = AdamW(
-                adamw_params,
+                adamw_param_groups,
                 lr=lr_adamw,
                 betas=betas_adamw,
                 eps=eps_adamw,
-                weight_decay=weight_decay_adamw,
+                weight_decay=weight_decay_adamw,  # default for any group missing it
             )
 
         # Initialize parent with all params (for compatibility)
@@ -345,6 +447,24 @@ class MuonAdamW(Optimizer):
         if self.adamw_optimizer is not None:
             combined.extend(self.adamw_optimizer.param_groups)
         self.param_groups = combined
+
+    def _no_decay_name_patterns(self) -> Set[str]:
+        """Substrings in parameter names that indicate WD should NOT apply.
+
+        Covers norm gains/biases (LayerNorm, BatchNorm, GroupNorm, InstanceNorm,
+        and any module attribute literally named *norm*) and explicit biases.
+        Note: this is name-based and won't catch every case — for HF-style
+        models, prefer Trainer.get_decay_parameter_names. For SIVE/MuonAdamW
+        boundaries this name set is a sufficient practical filter.
+        """
+        return {
+            "bias",
+            "LayerNorm", "layernorm", "layer_norm",
+            "GroupNorm", "groupnorm", "group_norm",
+            "BatchNorm", "batchnorm", "batch_norm",
+            "InstanceNorm", "instancenorm", "instance_norm",
+            ".norm.", "_norm.", "final_norm", "rmsnorm",
+        }
 
     def _route_parameter(self, name: str, param: torch.nn.Parameter) -> str:
         """
@@ -447,6 +567,7 @@ def create_muon_adamw_optimizer(
     ns_steps: int = 5,
     first_layer_names: Optional[List[str]] = None,
     last_layer_names: Optional[List[str]] = None,
+    param_groupers: Optional[List[Tuple[str, str, Dict[str, float]]]] = None,
     verbose: bool = False,
 ) -> MuonAdamW:
     """
@@ -477,5 +598,6 @@ def create_muon_adamw_optimizer(
         ns_steps=ns_steps,
         first_layer_names=first_layer_names,
         last_layer_names=last_layer_names,
+        param_groupers=param_groupers,
         verbose=verbose,
     )

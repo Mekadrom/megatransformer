@@ -1,0 +1,55 @@
+{
+  "config": "small_deep_3xdownsample_conv2d_layernorm_attentive",
+  "checkpoint_path": "runs/sive/3x_down_256dim_12L_2d_layernorm_attentive_muon_all_weight_decay_0.01_0_0/checkpoint-258500",
+  "num_samples": 2000,
+  "num_unique_speakers": 871,
+  "num_probe_classes": 871,
+  "gender_balance": {
+    "train": {
+      "male": 0,
+      "female": 0,
+      "unknown": 1600
+    },
+    "test": {
+      "male": 0,
+      "female": 0,
+      "unknown": 400
+    }
+  },
+  "layers": [
+    {
+      "layer_idx": 10,
+      "layer_name": "encoder_block_10",
+      "probe": {
+        "train_acc": 0.9568749666213989,
+        "test_acc": 0.2874999940395355,
+        "test_top5_acc": 0.38999998569488525,
+        "test_top10_acc": 0.42499998211860657
+      },
+      "gender_probe": null,
+      "silhouette": -0.2566281259059906,
+      "cka_speaker": 0.05754617974162102,
+      "cka_ctc": 0.7076478004455566,
+      "cosine": {
+        "intra_cos": 0.9579187631607056,
+        "inter_cos": 0.8475035429000854,
+        "ratio": 1.130282901098901
+      }
+    }
+  ],
+  "mlp_probe": {
+    "layer_idx": 10,
+    "layer_name": "encoder_block_10",
+    "feature_dim": 512,
+    "hidden_dim": 512,
+    "num_layers": 4,
+    "dropout": 0.1,
+    "speaker": {
+      "train_acc": 0.9912499785423279,
+      "test_acc": 0.3149999976158142,
+      "test_top5_acc": 0.38749998807907104,
+      "test_top10_acc": 0.4274999797344208
+    },
+    "gender": null
+  }
+}

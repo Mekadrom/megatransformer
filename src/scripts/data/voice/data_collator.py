@@ -40,6 +40,7 @@ class VoiceDataCollator(DataCollator):
         all_mel_specs = []
         all_speaker_embeddings = []
         all_speaker_ids = []
+        all_gender_ids = []
         all_mel_lengths = []
         all_f0 = []
         all_vuv = []
@@ -56,6 +57,7 @@ class VoiceDataCollator(DataCollator):
             all_mel_lengths.append(ex.get("mel_length", None))
             all_speaker_embeddings.append(ex.get("speaker_embedding", None))
             all_speaker_ids.append(ex.get("speaker_id", None))
+            all_gender_ids.append(ex.get("gender_id", None))
             all_f0.append(trim(ex.get("f0", None), self.max_mel_spec_frames, dim=-1))
             all_vuv.append(trim(ex.get("vuv", None), self.max_mel_spec_frames, dim=-1))
             all_ctc_tokens.append(ex.get("ctc_tokens", None))
@@ -105,6 +107,9 @@ class VoiceDataCollator(DataCollator):
         if all_speaker_embeddings[0] is not None:
             batch["speaker_embeddings"] = torch.stack(all_speaker_embeddings)  # [B, speaker_embedding_dim]
             batch["speaker_ids"] = torch.stack(all_speaker_ids)  # [B]
+
+        if all_gender_ids[0] is not None:
+            batch["gender_ids"] = torch.stack(all_gender_ids)  # [B]
 
         if padded_f0 is not None:
             batch["f0"] = torch.stack(padded_f0)  # [B, T]

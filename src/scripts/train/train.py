@@ -19,7 +19,7 @@ import scripts.train.image.vae.training as image_vae_training
 import scripts.train.world.training as world_training
 
 
-from typing import Optional, List
+from typing import Dict, Optional, List
 
 from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
@@ -517,6 +517,21 @@ def get_optimizer(args, model: nn.Module) -> Optional[MuonAdamW]:
     first_layer_names = [s.strip() for s in args.muon_first_layer_names.split(',') if s.strip()]
     last_layer_names = [s.strip() for s in args.muon_last_layer_names.split(',') if s.strip()]
 
+    # Trainer-specific param-group overrides. Currently used by SIVE so that
+    # --grl_lr / --grl_lr_muon route the speaker_classifier (the GRL branch)
+    # to its own LRs distinct from the encoder's lr_muon / lr_adamw.
+    param_groupers = None
+    if args.command in ('audio-sive', 'sive'):
+        spk_overrides: Dict[str, float] = {}
+        grl_lr = getattr(args, 'grl_lr', None)
+        grl_lr_muon = getattr(args, 'grl_lr_muon', None)
+        if grl_lr is not None:
+            spk_overrides['lr_adamw'] = grl_lr
+        if grl_lr_muon is not None:
+            spk_overrides['lr_muon'] = grl_lr_muon
+        if spk_overrides:
+            param_groupers = [('spk', 'speaker_classifier', spk_overrides)]
+
     optimizer = create_muon_adamw_optimizer(
         model=model,
         lr_muon=args.lr_muon,
@@ -527,6 +542,7 @@ def get_optimizer(args, model: nn.Module) -> Optional[MuonAdamW]:
         ns_steps=args.ns_steps,
         first_layer_names=first_layer_names if first_layer_names else None,
         last_layer_names=last_layer_names if last_layer_names else None,
+        param_groupers=param_groupers,
         verbose=args.muon_verbose,
     )
 
@@ -538,6 +554,9 @@ def get_optimizer(args, model: nn.Module) -> Optional[MuonAdamW]:
             print(f"  First layer patterns (AdamW): {first_layer_names}")
         if last_layer_names:
             print(f"  Last layer patterns (AdamW): {last_layer_names}")
+        if param_groupers:
+            for group_name, pattern, overrides in param_groupers:
+                print(f"  Param group override '{group_name}' (pattern '{pattern}'): {overrides}")
 
     return optimizer
 

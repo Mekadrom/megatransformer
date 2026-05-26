@@ -53,6 +53,7 @@ class VoiceShardedDataset(Dataset):
                 "mel_specs",  # pre-extracted mel spectrograms as tensors
                 "speaker_embeddings",  # unnormalized speaker embeddings
                 "speaker_ids",  # speaker IDs normalized to the total number of unique speakers in the entire dataset
+                "gender_ids",  # integer gender labels (0=male, 1=female, -1=unknown), present only when --gender_column was set during preprocessing
                 "waveforms",  # original waveforms
                 "f0",  # f0 baselines as extracted by a pretrained model
                 "vuv",  # vuv booleans as extracted by a pretrained model
@@ -178,6 +179,9 @@ class VoiceShardedDataset(Dataset):
 
         if "speaker_ids" in shard and "speaker_ids" in self.columns:
             sample["speaker_id"] = shard["speaker_ids"][local_idx]
+
+        if "gender_ids" in shard and "gender_ids" in self.columns:
+            sample["gender_id"] = shard["gender_ids"][local_idx]
 
         # Add F0 data if available
         if "f0" in shard and "f0" in self.columns:

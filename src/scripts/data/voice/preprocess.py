@@ -25,6 +25,76 @@ from utils.speaker_encoder import SpeakerEncoderType, get_speaker_embedding_dim,
 from utils.text_encoder import TextEncoderType
 
 
+# Canonical gender label mapping. Datasets use varied conventions (Common
+# Voice: "male"/"female"/"other"/""; LibriTTS, VCTK: "M"/"F"); we collapse to
+# integer codes downstream consumers can rely on. Values not in this map
+# (including missing, "other", and non-binary labels) become -1 ("unknown")
+# so models can mask them out rather than infer a wrong binary class.
+_GENDER_MAP: Dict[str, int] = {
+    "male": 0, "m": 0, "0": 0,
+    "female": 1, "f": 1, "1": 1,
+}
+
+
+def _normalize_gender(value: Any) -> int:
+    if value is None:
+        return -1
+    s = str(value).strip().lower()
+    if not s:
+        return -1
+    return _GENDER_MAP.get(s, -1)
+
+
+def _gender_from_speaker_id_prefix(speaker_id: Any) -> int:
+    """
+    Extract gender (0=male, 1=female, -1=unknown) from the first character of
+    a speaker_id string. Used by AMI, which formats speaker IDs as
+    ``[F|M]EE<number>`` (e.g. ``FEE068`` = female, ``MEE055`` = male).
+
+    Only matches alphabetic ``M``/``F`` prefixes — does NOT pass through
+    ``_normalize_gender`` because that maps the digit ``"1"`` to female, which
+    would mis-label numeric speaker IDs like ``"1234"`` if we naively took
+    their first character.
+    """
+    if speaker_id is None:
+        return -1
+    s = str(speaker_id).strip()
+    if not s:
+        return -1
+    first = s[0].lower()
+    if first == "m":
+        return 0
+    if first == "f":
+        return 1
+    return -1
+
+
+def _parse_speakers_txt(path: str) -> Dict[str, int]:
+    """
+    Parse a LibriSpeech-style SPEAKERS.TXT (or any pipe-delimited file with
+    speaker_id in column 0 and gender in column 1) into a {speaker_id: gender_int}
+    map. Lines beginning with ';' are treated as comments and skipped.
+
+    Format example (LibriSpeech / OpenSLR):
+        ;ID  |SEX| SUBSET           |MINUTES| NAME
+        14   | F | train-clean-360  | 25.03 | Kristin LeMoine
+    """
+    lookup: Dict[str, int] = {}
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith(";"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 2:
+                continue
+            speaker_id_str, sex = parts[0], parts[1]
+            gender_int = _normalize_gender(sex)
+            if gender_int != -1:
+                lookup[speaker_id_str] = gender_int
+    return lookup
+
+
 def normalize_transcript(text: str) -> str:
     """Normalize audio transcript to consistent casing and punctuation.
 
@@ -483,6 +553,25 @@ class VoiceDatasetPreprocessor(Preprocessor):
                 'shard_speaker_ids': [],
             })
 
+        # Gender extraction is enabled if either a per-utterance dataset column
+        # is configured OR a speaker_id→gender lookup file is provided. The
+        # column takes precedence per utterance; the lookup is the fallback for
+        # rows where the column is missing or maps to "unknown".
+        self.gender_lookup: Optional[Dict[str, int]] = None
+        if args.gender_lookup_path is not None:
+            self.gender_lookup = _parse_speakers_txt(args.gender_lookup_path)
+            print(f"Loaded gender lookup from {args.gender_lookup_path}: "
+                  f"{len(self.gender_lookup)} speakers")
+        self.gender_enabled = (
+            args.gender_column is not None
+            or self.gender_lookup is not None
+            or getattr(args, "gender_from_speaker_id_prefix", False)
+        )
+        if self.gender_enabled:
+            shard_fields.update({
+                'shard_gender_ids': [],
+            })
+
         print(f"  Extract F0: {self.args.extract_f0}")
         if args.extract_f0:
             print(f"  F0 range: {self.args.f0_fmin}-{self.args.f0_fmax} Hz")
@@ -616,6 +705,25 @@ class VoiceDatasetPreprocessor(Preprocessor):
                             help="Pooling type for SIVE speaker classifier")
         sub_parser.add_argument("--speaker_id_column", type=str, default="speaker_id",
                             help="Name of the speaker ID column in the dataset")
+        sub_parser.add_argument("--gender_column", type=str, default=None,
+                            help="Name of the gender column in the dataset (e.g. 'gender'). "
+                                 "If provided, gender is extracted and saved as integer labels "
+                                 "(0=male, 1=female, -1=unknown/other/missing). Disabled by default.")
+        sub_parser.add_argument("--gender_lookup_path", type=str, default=None,
+                            help="Path to a pipe-delimited speaker_id→gender lookup file (e.g. "
+                                 "LibriSpeech's SPEAKERS.TXT). Used for datasets without a per-"
+                                 "utterance gender column (LibriSpeech, MLS, etc.). Format: "
+                                 "comment lines start with ';', data rows are 'id | F|M | ...'. "
+                                 "When --gender_column is also set, the column wins per utterance "
+                                 "and this lookup is the fallback for unknowns.")
+        sub_parser.add_argument("--gender_from_speaker_id_prefix", action="store_true",
+                            help="Extract gender from the FIRST CHARACTER of the speaker_id "
+                                 "(case-insensitive: 'M'/'m'→male, 'F'/'f'→female, anything else"
+                                 "→unknown). Used by AMI, whose speaker IDs are formatted as "
+                                 "'[F|M]EE<number>'. Precedence: gender_column > "
+                                 "gender_from_speaker_id_prefix > gender_lookup_path. "
+                                 "Digit prefixes are NOT treated as gender to avoid mis-labeling "
+                                 "numeric speaker IDs like '1234'.")
         
         sub_parser.add_argument("--save_waveforms", action="store_true", default=False,
                                 help="Enable saving waveforms.")
@@ -736,6 +844,12 @@ class VoiceDatasetPreprocessor(Preprocessor):
                 shard_data["speaker_ids"] = native_ids
             self.shard_fields['shard_speaker_embeddings'] = []
             self.shard_fields['shard_speaker_ids'] = []
+
+        if self.gender_enabled:
+            shard_data["gender_ids"] = torch.tensor(
+                self.shard_fields['shard_gender_ids'], dtype=torch.long
+            )
+            self.shard_fields['shard_gender_ids'] = []
 
         if self.args.extract_f0:
             shard_data["f0"] = torch.cat(self.shard_fields['shard_f0'], dim=0)
@@ -882,6 +996,9 @@ class VoiceDatasetPreprocessor(Preprocessor):
                 self.shard_fields['shard_speaker_embeddings'].append(speaker_features_result["speaker_embeddings"])
                 self.shard_fields['shard_speaker_ids'].extend(self.batch_accumulators['batch_speaker_ids'])
 
+            if self.gender_enabled:
+                self.shard_fields['shard_gender_ids'].extend(self.batch_accumulators['batch_gender_ids'])
+
             if self.args.extract_f0:
                 self.shard_fields['shard_f0'].append(f0_vuv_result["f0"])
                 self.shard_fields['shard_vuv'].append(f0_vuv_result["vuv"])
@@ -929,6 +1046,8 @@ class VoiceDatasetPreprocessor(Preprocessor):
         self.batch_accumulators['batch_waveforms'] = []
         if self.args.compute_speaker_embeddings:
             self.batch_accumulators['batch_speaker_ids'] = []
+        if self.gender_enabled:
+            self.batch_accumulators['batch_gender_ids'] = []
         if self.args.extract_conditions or self.args.tokenize_text or self.args.extract_ctc_tokens:
             self.batch_accumulators['batch_conditions'] = []
     
@@ -985,6 +1104,8 @@ class VoiceDatasetPreprocessor(Preprocessor):
             self.batch_accumulators['batch_waveforms'] = []
         if 'batch_speaker_ids' not in self.batch_accumulators and self.args.compute_speaker_embeddings:
             self.batch_accumulators['batch_speaker_ids'] = []
+        if 'batch_gender_ids' not in self.batch_accumulators and self.gender_enabled:
+            self.batch_accumulators['batch_gender_ids'] = []
         if 'batch_conditions' not in self.batch_accumulators and (
             self.args.extract_conditions or self.args.tokenize_text or self.args.extract_ctc_tokens
         ):
@@ -995,6 +1116,19 @@ class VoiceDatasetPreprocessor(Preprocessor):
         if self.args.compute_speaker_embeddings:
             speaker_id = example.get(self.args.speaker_id_column, "unknown")
             self.batch_accumulators['batch_speaker_ids'].append(speaker_id)
+        if self.gender_enabled:
+            gender_id = -1
+            if self.args.gender_column is not None:
+                gender_id = _normalize_gender(example.get(self.args.gender_column, None))
+            if gender_id == -1 and self.args.gender_from_speaker_id_prefix:
+                gender_id = _gender_from_speaker_id_prefix(
+                    example.get(self.args.speaker_id_column, None)
+                )
+            if gender_id == -1 and self.gender_lookup is not None:
+                speaker_value = example.get(self.args.speaker_id_column, None)
+                if speaker_value is not None:
+                    gender_id = self.gender_lookup.get(str(speaker_value), -1)
+            self.batch_accumulators['batch_gender_ids'].append(gender_id)
         if self.args.extract_conditions or self.args.tokenize_text or self.args.extract_ctc_tokens:
             conditions = example[self.args.text_conditions_column]
             if isinstance(conditions, str):
@@ -1024,6 +1158,10 @@ class VoiceDatasetPreprocessor(Preprocessor):
             "compute_speaker_embeddings": self.args.compute_speaker_embeddings,
             "speaker_encoder_type": self.args.speaker_encoder_type,
             "speaker_embedding_dim": self.speaker_feature_batch_processor.speaker_embedding_dim if self.speaker_feature_batch_processor is not None else 0,
+            "gender_column": self.args.gender_column,
+            "gender_lookup_path": self.args.gender_lookup_path,
+            "gender_lookup_size": len(self.gender_lookup) if self.gender_lookup is not None else 0,
+            "gender_from_speaker_id_prefix": getattr(self.args, "gender_from_speaker_id_prefix", False),
             "remove_mains_hum": self.args.remove_mains_hum,
             "shard_size": self.args.shard_size,
             # Feature extraction settings
