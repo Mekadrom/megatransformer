@@ -53,6 +53,14 @@ class SpeakerInvariantVoiceEncoderConfig:
     mel_freq_response_prob: float = 0.5      # per-utterance application probability
     mel_freq_response_smoothing: int = 7     # smoothing kernel width (odd; larger = smoother EQ)
 
+    # Post-hoc VTLP (Vocal Tract Length Perturbation). Piecewise-linear warp of
+    # the mel-bin axis. Approximate vs filter-bank-level VTLP, but cheap and a
+    # useful regularizer alongside waveform-level pitch shift.
+    use_mel_vtlp: bool = False
+    mel_vtlp_strength: float = 0.1       # alpha drawn from [1-strength, 1+strength]
+    mel_vtlp_prob: float = 0.5           # per-utterance application probability
+    mel_vtlp_boundary_frac: float = 0.7  # fraction of mel-bin axis under linear region
+
     # Stochastic Depth (drop entire residual paths)
     drop_path_rate: float = 0.0  # Max drop rate (linearly scaled per layer, 0=disabled)
 

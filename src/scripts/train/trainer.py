@@ -52,6 +52,31 @@ class CommonTrainer(abc.ABC, Trainer):
         if state_dict is None:
             state_dict = self.model.state_dict()
         torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+
+    def log(self, logs, *args, **kwargs):
+        """Apply step_offset to TensorBoard / log_history so eval & train metrics
+        plot at the resumed global step under --fresh_schedule. HF Trainer's
+        log() reads self.state.global_step (and passes the state into callbacks
+        like TensorBoardCallback), so we temporarily inject the offset value for
+        the duration of the call.
+
+        Subclasses (SIVE, SMG, world) set self.step_offset = args.start_step in
+        their __init__. Falls back to 0 if absent so this is safe to call from
+        any CommonTrainer subclass.
+        """
+        offset = getattr(self, "step_offset", 0) or 0
+        if offset == 0:
+            return super().log(logs, *args, **kwargs)
+
+        real_step = self.state.global_step
+        self.state.global_step = real_step + offset
+        try:
+            return super().log(logs, *args, **kwargs)
+        finally:
+            # Restore so the scheduler / save logic / training loop math keeps
+            # using the real HF-internal step. Only the *log-side* sees the
+            # offset value.
+            self.state.global_step = real_step
         
     def _get_train_sampler(self, dataset=None) -> Optional[torch.utils.data.Sampler]:
         """

@@ -8,8 +8,10 @@ from torch.utils.data import Sampler
 from transformers.trainer import Trainer
 from model.voice.sive.ctc_vocab import CTCVocab
 from model.voice.sive.sive import SpeakerInvariantVoiceEncoder
+from model.voice.sive.waveform_augment import WaveformAugment
 from scripts.train.trainer import CommonTrainer
 from utils import metrics, model_loading_utils
+from utils.audio_utils import SharedWindowBuffer, extract_mels
 from utils.megatransformer_utils import print_debug_tensor
 
 
@@ -69,6 +71,13 @@ class SIVETrainer(CommonTrainer):
         cmdline: str = "",
         git_commit_hash: str = "",
         step_offset: int = 0,
+        waveform_augment: Optional[WaveformAugment] = None,
+        shared_window_buffer: Optional[SharedWindowBuffer] = None,
+        mel_sample_rate: int = 16000,
+        mel_n_mels: int = 80,
+        mel_n_fft: int = 1024,
+        mel_hop_length: int = 256,
+        max_mel_frames: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -83,6 +92,17 @@ class SIVETrainer(CommonTrainer):
         self.git_commit_hash = git_commit_hash
         self.step_offset = step_offset if step_offset is not None else 0
         self.has_logged_cli = False
+
+        # Waveform-level augmentation + on-GPU mel extraction. When a dataset
+        # surfaces raw waveforms (no precomputed mels), or when waveform aug is
+        # requested, mel specs are derived per step in _prepare_mel_inputs.
+        self.waveform_augment = waveform_augment
+        self.shared_window_buffer = shared_window_buffer or SharedWindowBuffer()
+        self.mel_sample_rate = mel_sample_rate
+        self.mel_n_mels = mel_n_mels
+        self.mel_n_fft = mel_n_fft
+        self.mel_hop_length = mel_hop_length
+        self.max_mel_frames = max_mel_frames
 
         # CTC loss
         self.ctc_criterion = nn.CTCLoss(blank=vocab.blank_idx, reduction="mean", zero_infinity=True)
@@ -169,6 +189,72 @@ class SIVETrainer(CommonTrainer):
             return self._shard_sampler
         return super()._get_train_sampler(dataset)
 
+    def _waveform_to_mel(self, waveforms: torch.Tensor, wav_lengths: torch.Tensor):
+        """Batched on-GPU waveform -> log-mel, returning (mel, mel_lengths).
+
+        Mirrors the offline preprocessing convention: STFT frame count is
+        ``1 + L // hop_length``, and mel lengths are clamped to the configured
+        frame budget so a slowed-down (longer) clip can't overrun the rest of
+        the pipeline.
+        """
+        mel = extract_mels(
+            self.shared_window_buffer,
+            waveforms,  # [B, T] -> [B, n_mels, T']
+            sr=self.mel_sample_rate,
+            n_mels=self.mel_n_mels,
+            n_fft=self.mel_n_fft,
+            hop_length=self.mel_hop_length,
+        )
+        # extract_mels squeezes a leading dim of size 1, so a batch of 1 comes
+        # back as [n_mels, T']; restore the batch dim.
+        if mel.dim() == 2:
+            mel = mel.unsqueeze(0)
+
+        mel_lengths = 1 + wav_lengths // self.mel_hop_length
+
+        if self.max_mel_frames is not None and mel.size(-1) > self.max_mel_frames:
+            mel = mel[..., : self.max_mel_frames]
+        mel_lengths = mel_lengths.clamp(max=mel.size(-1))
+
+        # Precomputed mels arrive already cast to the model dtype by the
+        # Trainer; mirror that here (e.g. bf16 under DeepSpeed).
+        mel = mel.to(dtype=next(self.model.parameters()).dtype)
+        return mel, mel_lengths
+
+    def _prepare_mel_inputs(self, inputs: dict, augment: bool):
+        """Resolve (mel_specs, mel_lengths) for a batch.
+
+        Priority:
+          1. augment requested + WaveformAugment enabled + waveforms present:
+             augment waveforms, extract mel on GPU. Pitch/F0 shift is a
+             waveform-domain op, so this wins even if mels are also present.
+          2. precomputed mel_specs present: use them (original path).
+          3. waveforms present: extract mel on GPU, no augmentation.
+          4. otherwise: error.
+        """
+        waveforms = inputs.get("waveforms", None)
+        do_aug = (
+            augment
+            and self.waveform_augment is not None
+            and self.waveform_augment.enabled
+            and waveforms is not None
+        )
+
+        if do_aug:
+            # External module: model.train()/eval() doesn't toggle it, so force
+            # train mode here (the `augment` flag is the real on/off switch).
+            self.waveform_augment.train()
+            waveforms, wav_lengths = self.waveform_augment(waveforms, inputs["waveform_lengths"])
+            return self._waveform_to_mel(waveforms, wav_lengths)
+
+        if inputs.get("mel_specs", None) is not None:
+            return inputs["mel_specs"], inputs["mel_lengths"]
+
+        if waveforms is not None:
+            return self._waveform_to_mel(waveforms, inputs["waveform_lengths"])
+
+        raise KeyError("SIVE batch has neither 'mel_specs' nor 'waveforms'")
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         global_step = self.state.global_step + self.step_offset
 
@@ -180,8 +266,7 @@ class SIVETrainer(CommonTrainer):
             metrics.log_text("training/model_param_count", f"{sum(p.numel() for p in model.parameters()):,}", global_step)
             self.has_logged_cli = True
 
-        mel_specs = inputs["mel_specs"]
-        mel_lengths = inputs["mel_lengths"]
+        mel_specs, mel_lengths = self._prepare_mel_inputs(inputs, augment=True)
         ctc_tokens = inputs["ctc_tokens"]
         ctc_lengths = inputs["ctc_lengths"]
         speaker_ids = inputs["speaker_ids"]
@@ -205,6 +290,18 @@ class SIVETrainer(CommonTrainer):
         speaker_logits = result["speaker_logits"]  # [B, num_speakers]
         # Use ctc_lengths for CTC loss (accounts for upsampling if enabled)
         output_ctc_lengths = result.get("ctc_lengths", result["feature_lengths"])  # [B]
+
+        # CTC underflow tracking. nn.CTCLoss(zero_infinity=True) silently zeros
+        # the loss for samples where input_length < target_length, so a too-
+        # aggressive speed perturb (or just tight transcripts) will quietly
+        # drop samples from the gradient instead of erroring. Count them so we
+        # know whether --wav_speed_perturb needs to come down or
+        # --ctc_upsample_factor needs to go up.
+        with torch.no_grad():
+            margin = output_ctc_lengths - ctc_lengths  # [B]; negative => infeasible
+            ctc_underflow_count = (margin < 0).sum().item()
+            ctc_underflow_frac = ctc_underflow_count / margin.numel()
+            ctc_margin_min = margin.min().item()
 
         # CTC loss
         # CTC expects [T, B, vocab] and log probabilities
@@ -275,6 +372,9 @@ class SIVETrainer(CommonTrainer):
         # Log to TensorBoard
         if global_step % self.args.logging_steps == 0:
             metrics.log_scalar("train/ctc_loss", ctc_loss, global_step)
+            metrics.log_scalar("train/ctc_underflow_count", ctc_underflow_count, global_step)
+            metrics.log_scalar("train/ctc_underflow_frac", ctc_underflow_frac, global_step)
+            metrics.log_scalar("train/ctc_margin_min", ctc_margin_min, global_step)
             metrics.log_scalar("train/pad_blank_loss", pad_blank_loss, global_step)
             metrics.log_scalar("train/speaker_loss", speaker_loss, global_step)
             metrics.log_scalar("train/speaker_accuracy", speaker_acc, global_step)
@@ -359,8 +459,9 @@ class SIVETrainer(CommonTrainer):
         model.eval()
 
         with torch.no_grad():
-            mel_specs = inputs["mel_specs"]
-            mel_lengths = inputs["mel_lengths"]
+            # No augmentation during eval; falls back to precomputed mels when
+            # present, else extracts mel from waveforms.
+            mel_specs, mel_lengths = self._prepare_mel_inputs(inputs, augment=False)
             ctc_tokens = inputs["ctc_tokens"]
             ctc_lengths = inputs["ctc_lengths"]
             speaker_ids = inputs["speaker_ids"]
@@ -411,6 +512,13 @@ class SIVETrainer(CommonTrainer):
         if args.use_mel_freq_response:
             print(f"Mel freq-response modulation: ENABLED")
             print(f"  strength={args.mel_freq_response_strength}, prob={args.mel_freq_response_prob}, smoothing={args.mel_freq_response_smoothing}")
+        if args.use_mel_vtlp:
+            print(f"Post-hoc VTLP: ENABLED")
+            print(f"  strength={args.mel_vtlp_strength} (alpha in 1 +/- {args.mel_vtlp_strength}), prob={args.mel_vtlp_prob}, boundary_frac={args.mel_vtlp_boundary_frac}")
+        if getattr(args, "use_waveform_aug", False):
+            print(f"Waveform augmentation: ENABLED (mel recomputed on GPU per step)")
+            print(f"  pitch_shift: +/-{args.wav_pitch_shift_semitones} semitones, prob={args.wav_pitch_shift_prob}, quantize_step={args.wav_pitch_quantize_step}")
+            print(f"  speed_perturb: 1 +/-{args.wav_speed_perturb}, prob={args.wav_speed_perturb_prob}, quantize_step={args.wav_speed_quantize_step}")
         if args.drop_path_rate > 0:
             print(f"Stochastic Depth: ENABLED (max drop_path_rate={args.drop_path_rate})")
         if args.activation != "gelu":
@@ -491,6 +599,11 @@ def load_model(args):
         'mel_freq_response_strength': args.mel_freq_response_strength,
         'mel_freq_response_prob': args.mel_freq_response_prob,
         'mel_freq_response_smoothing': args.mel_freq_response_smoothing,
+        # Post-hoc VTLP
+        'use_mel_vtlp': args.use_mel_vtlp,
+        'mel_vtlp_strength': args.mel_vtlp_strength,
+        'mel_vtlp_prob': args.mel_vtlp_prob,
+        'mel_vtlp_boundary_frac': args.mel_vtlp_boundary_frac,
         # Stochastic Depth
         'drop_path_rate': args.drop_path_rate,
         # Final normalization on encoder output
@@ -515,12 +628,27 @@ def create_trainer(
     data_collator,
     train_dataset,
     eval_dataset,
+    shared_window_buffer=None,
 ):
     # Create GRL scheduler
     grl_scheduler = GRLAlphaScheduler(
         warmup_steps=args.grl_warmup_steps,
         max_alpha=args.grl_max_alpha,
     )
+
+    waveform_augment = None
+    if getattr(args, "use_waveform_aug", False):
+        waveform_augment = WaveformAugment(
+            sample_rate=args.voice_sample_rate,
+            pitch_shift_semitones=args.wav_pitch_shift_semitones,
+            pitch_shift_prob=args.wav_pitch_shift_prob,
+            speed_perturb=args.wav_speed_perturb,
+            speed_perturb_prob=args.wav_speed_perturb_prob,
+            pitch_quantize_step=args.wav_pitch_quantize_step,
+            speed_quantize_step=args.wav_speed_quantize_step,
+        )
+
+    max_mel_frames = int(args.voice_max_seconds * args.voice_sample_rate // args.voice_hop_length)
 
     return SIVETrainer(
         model=model,
@@ -539,6 +667,13 @@ def create_trainer(
         cmdline=args.cmdline,
         git_commit_hash=args.commit_hash or "",
         step_offset=args.start_step,
+        waveform_augment=waveform_augment,
+        shared_window_buffer=shared_window_buffer,
+        mel_sample_rate=args.voice_sample_rate,
+        mel_n_mels=args.voice_n_mels,
+        mel_n_fft=args.voice_n_fft,
+        mel_hop_length=args.voice_hop_length,
+        max_mel_frames=max_mel_frames,
     )
 
 
@@ -630,6 +765,17 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--mel_noise_prob", type=float, default=0.5,
                             help="Per-utterance probability of applying mel noise")
 
+    # Post-hoc VTLP (mel-bin axis warp; cheaper but approximate vs
+    # filter-bank-level VTLP). Disabled by default.
+    sub_parser.add_argument("--use_mel_vtlp", action="store_true",
+                            help="Enable post-hoc VTLP on log-mel (piecewise-linear warp of the mel-bin axis)")
+    sub_parser.add_argument("--mel_vtlp_strength", type=float, default=0.1,
+                            help="Half-width of warp factor range (alpha drawn from 1 +/- this; ~0.1 is conventional)")
+    sub_parser.add_argument("--mel_vtlp_prob", type=float, default=0.5,
+                            help="Per-utterance probability of applying VTLP")
+    sub_parser.add_argument("--mel_vtlp_boundary_frac", type=float, default=0.7,
+                            help="Fraction of the mel-bin axis under the linear-with-slope-1/alpha region")
+
     # Mel-space frequency-response modulation (simulates mic/channel EQ).
     sub_parser.add_argument("--use_mel_freq_response", action="store_true",
                             help="Apply random smooth per-band gain to simulate mic/channel EQ")
@@ -639,6 +785,30 @@ def add_cli_args(subparsers):
                             help="Per-utterance probability of applying EQ modulation")
     sub_parser.add_argument("--mel_freq_response_smoothing", type=int, default=7,
                             help="Smoothing kernel width across mel bands (odd int; larger = smoother EQ)")
+
+    # Waveform-level augmentation (pitch / speed). Only usable on datasets that
+    # surface raw waveforms; the perturbed waveform is converted to a mel on the
+    # GPU each step, so the same example is augmented differently per epoch.
+    sub_parser.add_argument("--use_waveform_aug", action="store_true",
+                            help="Enable waveform-level augmentation (pitch shift + speed perturb). "
+                                 "Requires a dataset with raw waveforms; mel is recomputed on GPU per step.")
+    sub_parser.add_argument("--wav_pitch_shift_semitones", type=float, default=4.0,
+                            help="Half-width of uniform pitch-shift range in semitones (per-sample draw in +/- this)")
+    sub_parser.add_argument("--wav_pitch_shift_prob", type=float, default=0.5,
+                            help="Per-sample probability of applying pitch shift")
+    sub_parser.add_argument("--wav_speed_perturb", type=float, default=0.1,
+                            help="Half-width of uniform speed range (per-sample factor in 1 +/- this; >1 = faster). 0 disables.")
+    sub_parser.add_argument("--wav_speed_perturb_prob", type=float, default=0.5,
+                            help="Per-sample probability of applying speed perturbation")
+    sub_parser.add_argument("--wav_pitch_quantize_step", type=float, default=1.0,
+                            help="Quantize per-sample n_steps to multiples of this (semitones). "
+                                 "Samples sharing a quantized value share a single batched "
+                                 "AF.pitch_shift call. 0 disables quantization (per-sample calls). "
+                                 "Default 1.0 = Kaldi-style integer semitones.")
+    sub_parser.add_argument("--wav_speed_quantize_step", type=float, default=0.05,
+                            help="Quantize per-sample speed factor to multiples of this. "
+                                 "Same grouping semantics as --wav_pitch_quantize_step. "
+                                 "0 disables. Default 0.05.")
 
     # Stochastic Depth (drop entire residual paths for regularization)
     sub_parser.add_argument("--drop_path_rate", type=float, default=0.0,

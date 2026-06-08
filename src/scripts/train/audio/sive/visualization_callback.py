@@ -14,6 +14,7 @@ from scripts.train.visualization_callback import VisualizationCallback
 from transformers.trainer import Trainer
 
 from utils import metrics, visualization
+from utils.audio_utils import SharedWindowBuffer, extract_mels
 
 
 def levenshtein_distance(s1, s2) -> int:
@@ -72,6 +73,7 @@ class SIVEVisualizationCallback(VisualizationCallback):
         # Voice settings
         voice_sample_rate: int = 16000,
         voice_max_length: int = 10,
+        voice_n_mels: int = 80,
         voice_n_fft: int = 1024,
         voice_hop_length: int = 256,
         num_audio_samples: int = 4,
@@ -92,11 +94,18 @@ class SIVEVisualizationCallback(VisualizationCallback):
 
         # Voice settings
         self.voice_sample_rate = voice_sample_rate
+        self.voice_n_mels = voice_n_mels
         self.voice_n_fft = voice_n_fft
         self.voice_hop_length = voice_hop_length
         self.num_audio_samples = num_audio_samples
         self.max_mel_frames = (voice_sample_rate * voice_max_length) // voice_hop_length
         self.max_feature_frames = (self.max_mel_frames + sive_downsampling_factor - 1) // sive_downsampling_factor
+
+        # Used to extract mels on-the-fly from sample["waveform"] when the
+        # dataset shard doesn't carry precomputed mels (waveform-only shards).
+        # Trainer-side mel extraction has its own buffer; viz keeps its own to
+        # stay self-contained.
+        self._shared_window_buffer = SharedWindowBuffer()
 
         # LM decoder settings
         self.kenlm_model_path = kenlm_model_path
@@ -181,6 +190,31 @@ class SIVEVisualizationCallback(VisualizationCallback):
 
         model.train()
 
+    def _get_mel_from_sample(self, sample: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (mel_spec [n_mels, T], mel_length scalar tensor) for one sample.
+
+        Falls back to on-the-fly extraction from sample["waveform"] when the
+        shard didn't store precomputed mels (waveform-only datasets — the same
+        case the trainer's _prepare_mel_inputs handles on the GPU side).
+        Uses the same params as preprocessing so frame counts match.
+        """
+        if "mel_spec" in sample:
+            return sample["mel_spec"], sample["mel_length"]
+        if "waveform" in sample:
+            wav_len = int(sample["waveform_length"])
+            valid = sample["waveform"][:wav_len].to(torch.float32)
+            mel = extract_mels(
+                self._shared_window_buffer,
+                valid,
+                sr=self.voice_sample_rate,
+                n_mels=self.voice_n_mels,
+                n_fft=self.voice_n_fft,
+                hop_length=self.voice_hop_length,
+            )  # [n_mels, T]
+            mel_length = torch.tensor(mel.size(-1), dtype=torch.long)
+            return mel, mel_length
+        raise KeyError("Sample has neither 'mel_spec' nor 'waveform'")
+
     @torch.no_grad()
     def _log_tsne(self, model, step, device):
         """Log PCA and t-SNE visualization of features colored by speaker."""
@@ -204,8 +238,9 @@ class SIVEVisualizationCallback(VisualizationCallback):
             if len(speaker_counts) >= self.max_speakers_for_tsne and speaker_id not in speaker_counts:
                 continue
 
-            mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
-            mel_length = sample["mel_length"].unsqueeze(0)
+            mel_spec_cpu, mel_len_cpu = self._get_mel_from_sample(sample)
+            mel_spec = mel_spec_cpu.unsqueeze(0).to(device)
+            mel_length = mel_len_cpu.unsqueeze(0)
 
             result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
             feat = result["features"]
@@ -268,9 +303,10 @@ class SIVEVisualizationCallback(VisualizationCallback):
         for i, idx in enumerate(indices):
             sample = self.trainer.eval_dataset[idx]
 
-            mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
-            mel_length = sample["mel_length"].unsqueeze(0)
-            actual_mel_len = sample["mel_length"].item()
+            mel_spec_cpu, mel_len_cpu = self._get_mel_from_sample(sample)
+            mel_spec = mel_spec_cpu.unsqueeze(0).to(device)
+            mel_length = mel_len_cpu.unsqueeze(0)
+            actual_mel_len = int(mel_len_cpu.item())
             ctc_tokens = sample["ctc_tokens"]
             ctc_length = sample["ctc_length"].item()
 
@@ -341,8 +377,9 @@ class SIVEVisualizationCallback(VisualizationCallback):
             if i < 4:  # Only visualize first 4
                 fig, axes = plt.subplots(4, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [2, 2, 1.5, 0.8]})
 
-                # 1. Mel spectrogram
-                mel_np = sample["mel_spec"][:, :actual_mel_len].numpy()
+                # 1. Mel spectrogram (reuse the mel we already resolved above —
+                # works for both precomputed-mel and waveform-only shards).
+                mel_np = mel_spec_cpu[:, :actual_mel_len].numpy()
                 im0 = axes[0].imshow(mel_np, aspect="auto", origin="lower", cmap="viridis")
                 axes[0].set_title(f"Mel Spectrogram (T={actual_mel_len})")
                 axes[0].set_ylabel("Mel Bin")
@@ -499,8 +536,9 @@ class SIVEVisualizationCallback(VisualizationCallback):
 
         for idx in indices:
             sample = self.trainer.eval_dataset[idx]
-            mel_spec = sample["mel_spec"].unsqueeze(0).to(device)
-            mel_length = sample["mel_length"].unsqueeze(0)
+            mel_spec_cpu, mel_len_cpu = self._get_mel_from_sample(sample)
+            mel_spec = mel_spec_cpu.unsqueeze(0).to(device)
+            mel_length = mel_len_cpu.unsqueeze(0)
 
             result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
             features_norm = result["features"][0].cpu()  # [T, D]
@@ -657,8 +695,8 @@ class SIVEVisualizationCallback(VisualizationCallback):
             idx = int(sample_indices[i])
             sample = self.trainer.eval_dataset[idx]
 
-            mel_spec = sample["mel_spec"]  # [n_mels, T]
-            mel_length = sample["mel_length"].item()
+            mel_spec, mel_len_cpu = self._get_mel_from_sample(sample)  # [n_mels, T]
+            mel_length = int(mel_len_cpu.item())
             ctc_tokens = sample["ctc_tokens"]
             ctc_length = sample["ctc_length"].item()
 

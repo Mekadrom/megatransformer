@@ -438,6 +438,12 @@ class VoiceDatasetPreprocessor(Preprocessor):
         self.stats_accumulator = stats_accumulator
         self.device = device
 
+        # Examples accumulated into the current shard. Tracked independently of
+        # any shard_fields storage layout so the flush check works whether an
+        # output type appends a batched tensor ([B, ...]) or extends with one
+        # 1-D tensor per example (e.g. waveforms). Reset in flush_shard.
+        self._samples_in_shard = 0
+
         assert args.save_waveforms or args.save_mel_specs or args.sive_checkpoint_path is not None, \
             "At least one of --save_waveforms, --save_mel_specs, or --sive_checkpoint_path must be specified."
 
@@ -912,6 +918,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
         print(f"  Saved shard {self.shard_fields['shard_idx']} ({shard_data['num_samples']} samples)")
 
         self.shard_fields['shard_idx'] += self.args.total_gpus
+        self._samples_in_shard = 0
     
     def encode_to_mels(self, waveforms: list[torch.Tensor]) -> tuple:
         mel_specs = []
@@ -974,23 +981,22 @@ class VoiceDatasetPreprocessor(Preprocessor):
             if self.args.extract_ctc_tokens:
                 ctc_result = self.ctc_tokens_processor.process_batch(conditions)
 
-            # Add to shard
-            # count_key tracks which field to use for shard size checking (doesn't matter which one, just needs to be one of them)
-            count_key = ""
+            # Add to shard. Shard-fullness is tracked via self._samples_in_shard
+            # below — don't try to infer example count from shard_fields here,
+            # since some outputs (waveforms) are stored as one 1-D tensor per
+            # example and others (features, mel_specs) as batched [B, ...]
+            # tensors.
             if self.args.sive_checkpoint_path is not None:
                 self.shard_fields['shard_features'].append(features_result["features"])
                 self.shard_fields['shard_feature_lengths'].append(features_result["feature_lengths"])
-                count_key = "shard_features"
-            
+
             if self.args.save_waveforms:
                 self.shard_fields['shard_waveforms'].extend(waveforms)
                 self.shard_fields['shard_waveform_lengths'].append(waveform_lengths)
-                count_key = "shard_waveforms"
-            
+
             if self.args.save_mel_specs:
                 self.shard_fields['shard_mel_specs'].append(mel_specs)
                 self.shard_fields['shard_mel_lengths'].append(mel_spec_lengths)
-                count_key = "shard_mel_specs"
             
             if self.args.compute_speaker_embeddings:
                 self.shard_fields['shard_speaker_embeddings'].append(speaker_features_result["speaker_embeddings"])
@@ -1028,11 +1034,12 @@ class VoiceDatasetPreprocessor(Preprocessor):
                         self.shard_fields['shard_token_ids'].append(torch.tensor(input_ids, dtype=torch.long))
                         self.shard_fields['shard_text_lengths'].append(torch.tensor(len(input_ids), dtype=torch.long))
 
-            self.stats_accumulator["saved"] += len(self.batch_accumulators['batch_waveforms'])
+            batch_examples = len(self.batch_accumulators['batch_waveforms'])
+            self.stats_accumulator["saved"] += batch_examples
+            self._samples_in_shard += batch_examples
 
             # Flush shard if full
-            current_size = sum(f.shape[0] for f in self.shard_fields[count_key])
-            if current_size >= self.args.shard_size:
+            if self._samples_in_shard >= self.args.shard_size:
                 self.flush_shard()
         except Exception as e:
             print(f"Batch processing error: {e}")

@@ -12,7 +12,7 @@ from config.voice.sive.sive import SpeakerInvariantVoiceEncoderConfig
 from model.norms import RMSNorm
 from model.voice.sive.conv_subsampling import Conv2dSubsampling, ConvSubsampling
 from model.voice.sive.grl import GradientReversalFunction, SpeakerClassifier
-from model.voice.sive.mel_augment import MelFrequencyResponse, MelGaussianNoise
+from model.voice.sive.mel_augment import MelFrequencyResponse, MelGaussianNoise, MelVTLP
 from model.voice.sive.sive_block import SpeakerInvariantVoiceEncoderBlock
 from model.voice.sive.spec_augment import SpecAugment
 
@@ -43,6 +43,19 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             )
         else:
             self.spec_augment = None
+
+        # Post-hoc VTLP — piecewise-linear warp of the mel-bin axis.
+        # Applied first so subsequent EQ/noise/masking act on the warped mel,
+        # matching the physical order (vocal-tract geometry → channel EQ →
+        # ambient noise → training-only masks).
+        if config.use_mel_vtlp:
+            self.mel_vtlp = MelVTLP(
+                strength=config.mel_vtlp_strength,
+                prob=config.mel_vtlp_prob,
+                boundary_frac=config.mel_vtlp_boundary_frac,
+            )
+        else:
+            self.mel_vtlp = None
 
         # Mel-space frequency-response modulation (simulates channel/mic EQ).
         if config.use_mel_freq_response:
@@ -209,10 +222,11 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 - all_hiddens: list of [B, T', D] if return_all_hiddens=True
         """
         # Mel-space augmentations (training-only; all no-op in eval mode).
-        # Order: EQ-like gain first, then additive noise, then SpecAugment masks.
-        # This matches the physical intuition of channel coloration applied to
-        # the clean signal, ambient noise added on top, and finally training-
-        # only masking applied to the noisy-colored mel.
+        # Order: VTLP (formant warp / vocal-tract geometry), then EQ-like gain
+        # (channel coloration), then additive noise (ambient), then SpecAugment
+        # masks (training-only). Roughly matches the physical signal path.
+        if self.mel_vtlp is not None:
+            mel_spec = self.mel_vtlp(mel_spec)
         if self.mel_freq_response is not None:
             mel_spec = self.mel_freq_response(mel_spec)
         if self.mel_noise is not None:

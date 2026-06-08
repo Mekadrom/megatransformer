@@ -148,7 +148,7 @@ def get_dataset(command: str, args, split: str):
     if command in ["smg"]:
         dataset = VoiceShardedDataset(
             shard_dir=shard_dir,
-            cache_size=32,
+            cache_size=args.shard_cache_size,
             columns=[
                 "features",  # includes lengths
                 "mel_specs",  # includes lengths
@@ -173,10 +173,11 @@ def get_dataset(command: str, args, split: str):
     elif command in ['audio-sive', 'sive']:
         dataset = VoiceShardedDataset(
             shard_dir=shard_dir,
-            cache_size=32,
+            cache_size=args.shard_cache_size,
             columns=[
                 "features",  # includes lengths
                 "mel_specs",  # includes lengths
+                "waveforms",  # includes lengths; used for waveform-level aug / GPU mel extraction when present
                 "speaker_embeddings",
                 "f0",
                 "vuv",
@@ -273,6 +274,7 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             vocoder=vocoder,
             vocab=CTCVocab(),
             voice_sample_rate=args.voice_sample_rate,
+            voice_n_mels=args.voice_n_mels,
             voice_n_fft=args.voice_n_fft,
             voice_hop_length=args.voice_hop_length,
             num_audio_samples=args.num_audio_samples,
@@ -428,6 +430,7 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, optimizer: Option
             data_collator,
             train_dataset,
             eval_dataset,
+            shared_window_buffer=shared_window_buffer,
         )
     elif command in ["vocoder"]:
         trainer: Trainer = audio_vocoder_training.create_trainer(
@@ -586,6 +589,10 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--cpu', action='store_true', help='Use CPU for training')
         sub_parser.add_argument('--log_level', type=str, default='warning', help='Logging level: debug, info, warning, error, critical')
         sub_parser.add_argument('--resume_from_checkpoint', type=str, help='Resume from checkpoint at this path')
+        sub_parser.add_argument('--fresh_schedule', action='store_true',
+            help='Warm restart: load model weights from --resume_from_checkpoint but build a fresh '
+                 'optimizer + scheduler + step counter. Use with a new --learning_rate, --warmup_steps, '
+                 'and --max_steps. Pair with --start_step <orig_total> for log continuity.')
         sub_parser.add_argument('--start_step', type=int, default=None, help='Start step for training')
         sub_parser.add_argument('--lr_scheduler_type', type=str, default='cosine', help='Learning rate scheduler type')
         sub_parser.add_argument('--lr_scheduler_kwargs', type=str, default=None, help='Additional kwargs for LR scheduler as a JSON stringified dict')
@@ -717,7 +724,7 @@ if __name__ == "__main__":
     if module is None:
         raise ValueError(f"Unknown command: {args.command}. Available: smg, image-vae")
 
-    if module in [smg_training, audio_vocoder_training, world_training]:
+    if module in [smg_training, audio_vocoder_training, world_training, audio_sive_training]:
         shared_window_buffer = SharedWindowBuffer()
     else:
         shared_window_buffer = None
@@ -770,4 +777,12 @@ if __name__ == "__main__":
         print(f"Rank {trainer.args.local_rank} Checkpoint contents: {os.listdir(checkpoint_path) if os.path.exists(checkpoint_path) else 'N/A'}")
 
     print(f"Starting training with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters")
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    # --fresh_schedule: model weights still came from the checkpoint via load_model
+    # earlier; passing None here makes HF Trainer build a fresh optimizer + scheduler
+    # against the new --learning_rate / --warmup_steps / --max_steps instead of
+    # restoring the saved (near-zero, end-of-cosine) LR. Adam moments are reset too.
+    resume_path = None if args.fresh_schedule else args.resume_from_checkpoint
+    if args.fresh_schedule:
+        print("--fresh_schedule: HF Trainer optimizer/scheduler/global_step will start fresh; "
+              "model weights loaded from --resume_from_checkpoint via load_model.")
+    trainer.train(resume_from_checkpoint=resume_path)
