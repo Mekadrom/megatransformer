@@ -139,3 +139,5 @@ checkpoints/
 logs/
 
 pretrained_models/
+
+eval_output/
