@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "megatransformer"
+version = "0.1.0"
+description = "Multimodal transformer research models (SIVE, SMG, vocoder, world model)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+# Import-time dependencies, intentionally UNPINNED so an editable install does
+# not clobber a host environment's existing build (e.g. ComfyUI's CUDA torch).
+# torch / torchaudio are deliberately omitted: they are expected to be provided
+# by the runtime environment. requirements.txt still holds the full, pinned
+# training environment for reproducing experiments.
+dependencies = [
+    "numpy",
+    "einops",
+    "safetensors",
+    "transformers",
+    "rotary-embedding-torch",
+    "positional-encodings",
+]
+
+[project.urls]
+Repository = "https://github.com/Mekadrom/megatransformer"
+
+# src-layout: the importable package `megatransformer` lives under src/.
+# `pip install -e .` then makes `import megatransformer.model.smg.smg` work,
+# replacing the old implicit "put src/ on PYTHONPATH" convention.
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["megatransformer*"]

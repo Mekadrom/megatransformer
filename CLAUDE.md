@@ -14,19 +14,19 @@ Training uses subcommands for different model types. All training scripts share 
 
 ```bash
 # SMG (SIVE-Mel Generator: speaker-conditioned deterministic decoder with FiLM)
-python -m src.scripts.train.train smg --run_name my_run --config small --cache_dir ../cached_datasets/sive_smg_f0
+python -m megatransformer.scripts.train.train smg --run_name my_run --config small --cache_dir ../cached_datasets/sive_smg_f0
 
 # Vocoder (mel-to-waveform)
-python -m src.scripts.train.train vocoder --run_name my_vocoder --config tiny --cache_dir ../cached_datasets/audio
+python -m megatransformer.scripts.train.train vocoder --run_name my_vocoder --config tiny --cache_dir ../cached_datasets/audio
 
 # SIVE (Speaker-Invariant Voice Encoder with CTC + GRL)
-python -m src.scripts.train.train audio-sive --run_name my_sive --config small --cache_dir ../cached_datasets/audio_sive
+python -m megatransformer.scripts.train.train audio-sive --run_name my_sive --config small --cache_dir ../cached_datasets/audio_sive
 
 # Image VAE
-python -m src.scripts.train.train image-vae --run_name my_image_vae --config small --cache_dir ../cached_datasets/image
+python -m megatransformer.scripts.train.train image-vae --run_name my_image_vae --config small --cache_dir ../cached_datasets/image
 
 # World Model (multimodal)
-python -m src.scripts.train.train world --run_name my_world --config small --include_modes text,audio,image
+python -m megatransformer.scripts.train.train world --run_name my_world --config small --include_modes text,audio,image
 ```
 
 Common training arguments:
@@ -44,7 +44,7 @@ Common training arguments:
 
 ```bash
 # Audio preprocessing (extracts SIVE features, speaker embeddings, F0, mel specs)
-python -m src.scripts.data.preprocess_dataset audio \
+python -m megatransformer.scripts.data.preprocess_dataset audio \
     --dataset_name mozilla-foundation/common_voice_17_0 \
     --dataset_config en --split train \
     --output_dir ../cached_datasets/audio_train \
@@ -52,10 +52,10 @@ python -m src.scripts.data.preprocess_dataset audio \
     --compute_speaker_embeddings --extract_f0 --save_mel_specs
 
 # Build shard index after preprocessing
-python -m src.scripts.data.preprocess_dataset stat-shards --output_dir ../cached_datasets/audio_train
+python -m megatransformer.scripts.data.preprocess_dataset stat-shards --output_dir ../cached_datasets/audio_train
 
 # Multi-GPU preprocessing (run on each GPU)
-python -m src.scripts.data.preprocess_dataset audio --gpu_id 0 --total_gpus 4 ...
+python -m megatransformer.scripts.data.preprocess_dataset audio --gpu_id 0 --total_gpus 4 ...
 ```
 
 ### Testing
@@ -72,10 +72,10 @@ Tests cover data collation logic (BO*/PH/EO* token placement, text target alignm
 
 ```bash
 # Voice cloning demo (Gradio UI) — combines SIVE + SMG + vocoder pipeline
-python -m src.scripts.eval.smg.voice_clone --sive_checkpoint_path ./checkpoints/sive --smg_checkpoint_path ./checkpoints/smg --vocoder_checkpoint_path ./checkpoints/vocoder
+python -m megatransformer.scripts.eval.smg.voice_clone --sive_checkpoint_path ./checkpoints/sive --smg_checkpoint_path ./checkpoints/smg --vocoder_checkpoint_path ./checkpoints/vocoder
 ```
 
-Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
+Eval scripts live in `src/megatransformer/scripts/eval/` with subdirectories per modality.
 
 ### TensorBoard
 
@@ -87,7 +87,7 @@ Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
 
 ### Directory Structure
 
-- `src/model/`: Neural network modules
+- `src/megatransformer/model/`: Neural network modules
   - `world/`: Core world model (`MegaTransformerWorldModel`, recurrent transformer, KV cache, token interleaving)
   - `voice/`: Voice/speech models — prelude feature extractor, coda generator, plus `sive/` (Speaker-Invariant Voice Encoder) and `vocoder/` (HiFiGAN-based mel-to-wave) subpackages
   - `audio/`: Non-speech audio prelude/coda (`feature_extractor.py`, `generator.py`)
@@ -96,22 +96,22 @@ Eval scripts live in `src/scripts/eval/` with subdirectories per modality.
   - `text/`: Text feature extractor (prelude with causal transformer) and generator (coda classifier)
   - `transformer.py`: `MegaTransformerBlock` with GQA, rotary embeddings, ALiBi
 
-- `src/config/`: Dataclass configs with predefined configurations (small, medium, large)
+- `src/megatransformer/config/`: Dataclass configs with predefined configurations (small, medium, large)
   - Each model has `*_CONFIGS` dicts mapping config names to dataclass instances
   - `common.py`: `MegaTransformerBlockConfig` shared across models
   - `image/decoder.py`: `ImageDecoderConfig` (direct) and `DiffusionBridgeImageDecoderConfig` (flow-matching DiT)
 
-- `src/scripts/train/`: Training scripts
+- `src/megatransformer/scripts/train/`: Training scripts
   - `train.py`: Main entry point with subcommand routing
   - `trainer.py`: `CommonTrainer` base class extending HuggingFace Trainer
   - `optimizers.py`: `MuonAdamW` custom optimizer
   - `smg/`, `audio/vocoder/`, `audio/sive/`, `image/vae/`, `world/`: Model-specific trainers
 
-- `src/scripts/data/`: Dataset preprocessing and loading
+- `src/megatransformer/scripts/data/`: Dataset preprocessing and loading
   - `preprocess_dataset.py`: Main preprocessing entry point with modality-specific `Preprocessor` subclasses
   - `audio/`, `image/`, `text/`, `world/`: Per-modality dataset, collator, and preprocessor implementations
 
-- `src/utils/`: Shared utilities
+- `src/megatransformer/utils/`: Shared utilities
   - `metrics.py`: Central metrics logging module (backend-agnostic singleton)
   - `metrics_backend.py`: `MetricsBackend` protocol, `TensorBoardBackend`, `NoOpBackend`
   - `wandb_backend.py`: `WandBBackend` with context-aware media grouping
@@ -135,13 +135,13 @@ model = load_model(SMG, "small", checkpoint_path=path, overrides={"latent_channe
 
 **GAN training**: VAE trainers support optional discriminator training with configurable start conditions (`--gan_start_condition_key step/loss`), adaptive weighting, R1 penalty, and instance noise.
 
-**Training module convention**: Each training submodule in `src/scripts/train/` (e.g. `smg/training.py`) must export:
+**Training module convention**: Each training submodule in `src/megatransformer/scripts/train/` (e.g. `smg/training.py`) must export:
 - `add_cli_args(subparsers)`: Registers the subcommand and its args
 - `load_model(args)`: Creates/loads the model from config and optional checkpoint
 
 ### Metrics Logging
 
-All metrics logging goes through the centralized `src/utils/metrics.py` module — trainers and visualization callbacks never interact with TensorBoard/W&B directly.
+All metrics logging goes through the centralized `src/megatransformer/utils/metrics.py` module — trainers and visualization callbacks never interact with TensorBoard/W&B directly.
 
 **Architecture** (3 layers):
 - `metrics.py`: `MetricsLogger` class + module-level convenience functions (`log_scalar`, `log_image`, `log_audio`, `log_figure`, `log_text`, `log_histogram`, `flush`). Initialized once via `metrics.init_metrics(backend)` in `train.py`.
@@ -211,9 +211,13 @@ Runs are logged to `runs/<run_name>/` (metrics + checkpoints). Backend is select
 ## Environment
 
 - Python 3.10, CUDA 12.4
-- Dependencies: `pip install -r requirements.txt`
+- Editable install: `pip install -e .` (makes the `megatransformer` package importable)
+- Full pinned training environment: `pip install -r requirements.txt`
 - venv: `source venv/bin/activate`
 
 ## Import Convention
 
-All imports use relative-to-`src/` paths (e.g. `from model.smg.smg import SMG`, not `from src.model...`). The project is run as a module from the repo root: `python -m src.scripts.train.train ...`
+The codebase is a `src`-layout package named `megatransformer` (see `pyproject.toml`).
+All imports are absolute under that namespace, e.g. `from megatransformer.model.smg.smg import SMG`.
+After `pip install -e .` the package is importable from anywhere — no `PYTHONPATH=src` needed.
+Run modules via the package path: `python -m megatransformer.scripts.train.train ...`

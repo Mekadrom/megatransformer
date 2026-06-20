@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import torch
 import pytest
 
-from utils.constants import (
+from megatransformer.utils.constants import (
     BOA_TOKEN_ID, EOA_TOKEN_ID,
     BOV_TOKEN_ID, EOV_TOKEN_ID,
     BOI_TOKEN_ID, EOI_TOKEN_ID,

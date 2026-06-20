@@ -86,7 +86,7 @@ def _make_preprocessor(monkeypatch, tmp_path, **arg_overrides):
         "from_pretrained",
         staticmethod(lambda name: FakeTokenizer()),
     )
-    from scripts.data.text.preprocess import TextDatasetPreprocessor
+    from megatransformer.scripts.data.text.preprocess import TextDatasetPreprocessor
 
     args = _make_args(**arg_overrides)
     shard_fields = {"shard_idx": 0}
