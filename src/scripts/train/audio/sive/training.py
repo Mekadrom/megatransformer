@@ -493,9 +493,12 @@ class SIVETrainer(CommonTrainer):
         print(f"Config: {args.config}")
         print(f"Run dir: {args.run_dir}")
         print(f"Data cache: {args.cache_dir}")
-        if args.ctc_upsample_factor > 1:
+        # Read from the loaded model rather than args — CLI no longer overrides
+        # this; the config value is the source of truth.
+        ctc_upsample_factor = self.model.config.ctc_upsample_factor
+        if ctc_upsample_factor > 1:
             print(f"CTC upsampling: ENABLED")
-            print(f"  ctc_upsample_factor: {args.ctc_upsample_factor} ({args.ctc_upsample_factor}x more CTC frames)")
+            print(f"  ctc_upsample_factor: {ctc_upsample_factor} ({ctc_upsample_factor}x more CTC frames)")
         if args.conv_dropout > 0 or args.feature_dropout > 0 or args.head_dropout > 0 or args.attention_head_drop > 0:
             print(f"Dropout regularization: ENABLED")
             print(f"  conv_dropout: {args.conv_dropout} (Dropout1d in conv frontend)")
@@ -571,8 +574,10 @@ def load_model(args):
     return model_loading_utils.load_model(SpeakerInvariantVoiceEncoder, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
         'num_speakers': args.num_speakers,
         'voice_n_mels': args.voice_n_mels,
-        # CTC upsampling (relaxes CTC length constraint)
-        'ctc_upsample_factor': args.ctc_upsample_factor,
+        # ctc_upsample_factor is intentionally NOT overridden here: the CLI
+        # default would silently clobber whatever the config specifies. The
+        # config is the source of truth; change it there if you want a
+        # different value.
         # Dropout regularization
         'dropout': args.dropout,
         'conv_dropout': args.conv_dropout,
@@ -741,7 +746,9 @@ def add_cli_args(subparsers):
 
     # CTC upsampling (relaxes CTC length constraint without increasing transformer cost)
     sub_parser.add_argument("--ctc_upsample_factor", type=int, default=1,
-                            help="CTC upsampling factor (e.g., 2 = double CTC frames)")
+                            help="DEPRECATED / IGNORED: CTC upsampling factor is sourced from the "
+                                 "model config. Edit src/config/voice/sive/sive.py to change it. "
+                                 "Kept here only so existing scripts that pass this flag don't error.")
 
     # SpecAugment (data augmentation)
     sub_parser.add_argument("--use_spec_augment", action="store_true",

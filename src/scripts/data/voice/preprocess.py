@@ -1087,10 +1087,16 @@ class VoiceDatasetPreprocessor(Preprocessor):
         if self.args.remove_mains_hum:
             waveform = audio_utils.remove_mains_hum(waveform.unsqueeze(0), self.args.sample_rate).squeeze(0)
 
-        # Truncate if too long
+        # Skip if too long. Truncating waveform without truncating the
+        # transcript leaves the transcript referring to audio we discarded —
+        # CTC then can't find enough input frames for the targets and
+        # nn.CTCLoss(zero_infinity=True) silently zeros those samples'
+        # gradient. Better to drop them at preprocessing time so the lost
+        # examples show up explicitly in stats["skipped"]["too_long"].
         max_samples = self.args.voice_max_seconds * self.args.sample_rate
         if len(waveform) > max_samples:
-            waveform = waveform[:max_samples]
+            self.stats_accumulator["skipped"]["too_long"] += 1
+            return False
 
         # Compute effective stored duration (post-truncation) for --max_hours
         # budget tracking. Prefer the dataset's duration column when available,
