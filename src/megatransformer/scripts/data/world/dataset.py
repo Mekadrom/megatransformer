@@ -29,6 +29,7 @@ class MultimodalShardedDataset(Dataset):
         audio_shard_dir: str = None,
         voice_shard_dir: str = None,
         image_shard_dir: str = None,
+        voice_synthesis_shard_dir: str = None,
         text_columns: list[str] = None,
         audio_columns: list[str] = None,
         voice_columns: list[str] = None,
@@ -39,8 +40,16 @@ class MultimodalShardedDataset(Dataset):
         Args:
             text_shard_dir: Path to preprocessed text shards (token_ids, text_lengths, text)
             audio_shard_dir: Path to preprocessed audio shards (features, mel_specs, etc.)
-            voice_shard_dir: Path to preprocessed voice shards (same format as audio)
+            voice_shard_dir: Path to preprocessed voice shards (same format as audio).
+                This is the canonical voice corpus: it anchors the dataset length
+                and is the default source for BOTH voice directions.
             image_shard_dir: Path to preprocessed image shards (images)
+            voice_synthesis_shard_dir: Optional override corpus used ONLY by the voice
+                synthesis (text→voice) direction. When set, synthesis draws from here while
+                transcription (voice→text) keeps drawing from voice_shard_dir. Intended use:
+                a clean subset for synthesis vs. the clean+noisy superset (voice_shard_dir)
+                for transcription. Requires voice_shard_dir to also be set. When None,
+                synthesis and transcription share voice_shard_dir (legacy behavior).
             text_columns: Columns to load from text shards. If None, loads all.
             audio_columns: Columns to load from audio shards. If None, loads all.
             voice_columns: Columns to load from voice shards. If None, mirrors audio_columns.
@@ -62,6 +71,23 @@ class MultimodalShardedDataset(Dataset):
         if not self.modalities:
             raise ValueError("At least one shard directory must be provided")
 
+        # Optional per-(modality, direction) source overrides. By default a task
+        # draws from its modality's single corpus (self.modalities[mod]); an entry
+        # here gives one direction its own independently-indexed corpus. A "source"
+        # dict is structurally identical to a modality dict, so _load_shard /
+        # _find_shard_for_idx operate on it unchanged.
+        self._direction_sources = {}
+        if voice_synthesis_shard_dir is not None:
+            if "voice" not in self.modalities:
+                raise ValueError(
+                    "voice_synthesis_shard_dir was provided but voice_shard_dir was not. "
+                    "The base voice corpus is required — it anchors dataset length and is "
+                    "the transcription source."
+                )
+            self._direction_sources[("voice", "synthesis")] = self._init_modality(
+                voice_synthesis_shard_dir, "voice:synthesis"
+            )
+
         self.text_columns = text_columns
         self.audio_columns = audio_columns
         self.voice_columns = voice_columns
@@ -82,7 +108,8 @@ class MultimodalShardedDataset(Dataset):
         # Without the ×n_tasks factor, __getitem__'s `within_task_idx = idx // n_tasks`
         # caps at total_samples // n_tasks, leaving most samples unreachable.
         n_tasks = len(self.task_types)
-        self.total_samples = max(m["total_samples"] for m in self.modalities.values()) * n_tasks
+        all_sources = list(self.modalities.values()) + list(self._direction_sources.values())
+        self.total_samples = max(s["total_samples"] for s in all_sources) * n_tasks
 
         # Cap dataset length for overfitting experiments
         if max_samples is not None and max_samples > 0:
@@ -176,8 +203,17 @@ class MultimodalShardedDataset(Dataset):
         local_idx = idx - modality["shard_offsets"][shard_idx]
         return shard_idx, local_idx
 
-    def _get_text_sample(self, idx: int) -> dict:
-        mod = self.modalities["text"]
+    def _source_for_task(self, modality_name: str, direction: Optional[str]) -> dict:
+        """Resolve the shard source a (modality, direction) task draws from.
+
+        Defaults to the modality's canonical corpus; returns a per-direction
+        override source when one was registered (e.g. a clean voice subset for
+        the synthesis direction).
+        """
+        return self._direction_sources.get((modality_name, direction), self.modalities[modality_name])
+
+    def _get_text_sample(self, idx: int, source: dict = None) -> dict:
+        mod = source if source is not None else self.modalities["text"]
         wrapped_idx = idx % mod["total_samples"]
         shard_idx, local_idx = self._find_shard_for_idx(mod, wrapped_idx)
         shard = self._load_shard(mod, shard_idx)
@@ -193,8 +229,8 @@ class MultimodalShardedDataset(Dataset):
 
         return sample
 
-    def _get_audio_sample(self, idx: int) -> dict:
-        mod = self.modalities["audio"]
+    def _get_audio_sample(self, idx: int, source: dict = None) -> dict:
+        mod = source if source is not None else self.modalities["audio"]
         wrapped_idx = idx % mod["total_samples"]
         shard_idx, local_idx = self._find_shard_for_idx(mod, wrapped_idx)
         shard = self._load_shard(mod, shard_idx)
@@ -235,8 +271,8 @@ class MultimodalShardedDataset(Dataset):
 
         return sample
 
-    def _get_voice_sample(self, idx: int) -> dict:
-        mod = self.modalities["voice"]
+    def _get_voice_sample(self, idx: int, source: dict = None) -> dict:
+        mod = source if source is not None else self.modalities["voice"]
         wrapped_idx = idx % mod["total_samples"]
         shard_idx, local_idx = self._find_shard_for_idx(mod, wrapped_idx)
         shard = self._load_shard(mod, shard_idx)
@@ -282,8 +318,8 @@ class MultimodalShardedDataset(Dataset):
 
         return sample
 
-    def _get_image_sample(self, idx: int) -> dict:
-        mod = self.modalities["image"]
+    def _get_image_sample(self, idx: int, source: dict = None) -> dict:
+        mod = source if source is not None else self.modalities["image"]
         wrapped_idx = idx % mod["total_samples"]
         shard_idx, local_idx = self._find_shard_for_idx(mod, wrapped_idx)
         shard = self._load_shard(mod, shard_idx)
@@ -339,20 +375,21 @@ class MultimodalShardedDataset(Dataset):
         within_task_idx = idx // n_tasks
 
         sample = {"_modality": modality_name, "_task": task_name, "_direction": direction}
+        source = self._source_for_task(modality_name, direction)
 
         if modality_name == "text":
-            text_sample = self._get_text_sample(within_task_idx)
+            text_sample = self._get_text_sample(within_task_idx, source)
             sample.update({f"text_{k}": v for k, v in text_sample.items()})
 
         elif modality_name == "audio":
-            audio_sample = self._get_audio_sample(within_task_idx)
+            audio_sample = self._get_audio_sample(within_task_idx, source)
             sample.update({f"audio_{k}": v for k, v in audio_sample.items()})
             if "token_ids" in audio_sample:
                 sample["text_token_ids"] = audio_sample["token_ids"]
                 sample["text_text_length"] = audio_sample["text_length"]
 
         elif modality_name == "voice":
-            voice_sample = self._get_voice_sample(within_task_idx)
+            voice_sample = self._get_voice_sample(within_task_idx, source)
             sample.update({f"voice_{k}": v for k, v in voice_sample.items()})
             if "token_ids" in voice_sample:
                 sample["text_token_ids"] = voice_sample["token_ids"]
@@ -361,7 +398,7 @@ class MultimodalShardedDataset(Dataset):
                 sample["text_text"] = voice_sample["voice_text"]
 
         elif modality_name == "image":
-            image_sample = self._get_image_sample(within_task_idx)
+            image_sample = self._get_image_sample(within_task_idx, source)
             sample.update({f"image_{k}": v for k, v in image_sample.items()})
             if "token_ids" in image_sample:
                 sample["text_token_ids"] = image_sample["token_ids"]
@@ -395,8 +432,8 @@ class MultimodalShardedDataset(Dataset):
         if shard_aware:
             shard_info = []
             for task_name, modality_name, direction in self.task_types:
-                mod = self.modalities[modality_name]
-                shard_info.append((mod["shard_offsets"], mod["total_samples"]))
+                src = self._source_for_task(modality_name, direction)
+                shard_info.append((src["shard_offsets"], src["total_samples"]))
         return ModalityGroupedSampler(
             total_samples=self.total_samples,
             n_modalities=len(self.task_types),

@@ -224,11 +224,35 @@ def get_dataset(command: str, args, split: str):
                 )
             return candidate
 
+        def _resolve_optional_dir(modality, direction, split):
+            """Resolve an optional per-direction override shard dir. Mirrors
+            _resolve_shard_dir's explicit-split > base+split precedence, but
+            returns None when no direction-specific arg is set so the dataset
+            falls back to the modality's canonical corpus. Hard-fails only when
+            an override IS requested but its directory is missing."""
+            explicit = getattr(args, f"{modality}_{direction}_{split}_cache_dir", None)
+            base = getattr(args, f"{modality}_{direction}_cache_dir", None)
+            if explicit is not None:
+                candidate = explicit
+                source = f"--{modality}_{direction}_{split}_cache_dir={explicit}"
+            elif base is not None:
+                candidate = base + "_" + split
+                source = f"--{modality}_{direction}_cache_dir={base}, split={split}"
+            else:
+                return None
+            if not os.path.isdir(candidate):
+                raise FileNotFoundError(
+                    f"Override shard dir for modality '{modality}' direction "
+                    f"'{direction}' not found: {candidate} (from {source})."
+                )
+            return candidate
+
         include_modes = [m.strip() for m in args.include_modes.split(",")]
         text_dir = _resolve_shard_dir("text", split) if "text" in include_modes else None
         audio_dir = _resolve_shard_dir("audio", split) if "audio" in include_modes else None
         voice_dir = _resolve_shard_dir("voice", split) if "voice" in include_modes else None
         image_dir = _resolve_shard_dir("image", split) if "image" in include_modes else None
+        voice_synthesis_dir = _resolve_optional_dir("voice", "synthesis", split) if "voice" in include_modes else None
         max_samples = getattr(args, 'max_samples', None)
         use_memorization = getattr(args, 'use_memorization_dataset', False)
 
@@ -246,6 +270,7 @@ def get_dataset(command: str, args, split: str):
                 audio_shard_dir=audio_dir,
                 voice_shard_dir=voice_dir,
                 image_shard_dir=image_dir,
+                voice_synthesis_shard_dir=voice_synthesis_dir,
                 cache_size=args.shard_cache_size,
                 max_samples=max_samples,
             )

@@ -1340,6 +1340,15 @@ def add_cli_args(subparsers):
                             help="Explicit voice train shard dir (overrides --voice_cache_dir)")
     sub_parser.add_argument("--voice_val_cache_dir", type=str, default=None,
                             help="Explicit voice val shard dir (overrides --voice_cache_dir)")
+    sub_parser.add_argument("--voice_synthesis_cache_dir", type=str, default=None,
+                            help="Optional override corpus for the voice SYNTHESIS (text->voice) "
+                                 "direction only (code appends _train/_val). Unset -> synthesis "
+                                 "shares --voice_cache_dir. Point this at a clean subset while "
+                                 "--voice_cache_dir holds the clean+noisy transcription superset.")
+    sub_parser.add_argument("--voice_synthesis_train_cache_dir", type=str, default=None,
+                            help="Explicit voice synthesis train shard dir (overrides --voice_synthesis_cache_dir)")
+    sub_parser.add_argument("--voice_synthesis_val_cache_dir", type=str, default=None,
+                            help="Explicit voice synthesis val shard dir (overrides --voice_synthesis_cache_dir)")
     sub_parser.add_argument("--image_cache_dir", type=str, default=None,
                             help="Base dir for image shards (code appends _train/_val)")
     sub_parser.add_argument("--image_train_cache_dir", type=str, default=None,
