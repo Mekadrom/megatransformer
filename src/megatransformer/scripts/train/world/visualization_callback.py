@@ -119,7 +119,22 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                           requires_audio=False, requires_voice=False, requires_image=False,
                           requires_text_only=False):
         """Get n random samples from eval dataset that match modality requirements."""
-        indices = torch.randperm(len(eval_dataset))
+        # Early-out: if a required modality isn't present in the dataset at all,
+        # no index can satisfy the filter and the loop below would walk the
+        # entire eval set — every eval, for every absent-modality scenario — for
+        # nothing. (e.g. running --include_modes text,voice still calls the
+        # text_to_image / image_to_text scenarios.)
+        mods = getattr(eval_dataset, "modalities", None)
+        if mods is not None:
+            if (requires_audio and "audio" not in mods) or \
+               (requires_voice and "voice" not in mods) or \
+               (requires_image and "image" not in mods):
+                return []
+        # Bound the scan so a sparse-but-present modality can't degrade into a
+        # full-eval sweep. Visit at most `budget` indices, in shard (sorted)
+        # order so the dataset's LRU shard cache loads each shard at most once.
+        budget = min(len(eval_dataset), max(n * 50, 1000))
+        indices = torch.randperm(len(eval_dataset))[:budget].sort().values
         samples = []
         for idx in indices:
             sample = eval_dataset[idx.item()]
@@ -709,12 +724,21 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
         # Select fixed per-modality indices (computed once, cached)
         if not hasattr(self, '_train_gen_voice_indices') or not hasattr(self, '_train_gen_image_indices'):
-            # Find indices for each modality type by inspecting actual samples
+            # Find indices for each modality type by inspecting actual samples.
+            # Only hunt for a modality that's actually present, and bound the
+            # scan — otherwise an absent/sparse modality turns this into a full
+            # sweep of the (large) train set looking for samples that can't or
+            # rarely exist. Quotas for absent modalities are 0 so the break
+            # below fires without scanning further.
+            mods = getattr(train_dataset, "modalities", None)
+            want_voice = n if (mods is None or "voice" in mods) else 0
+            want_image = n if (mods is None or "image" in mods) else 0
+            budget = min(len(train_dataset), max(n * 50, 2000))
             voice_indices = []
             image_indices = []
             seen_image_hashes = set()
             seen_voice_hashes = set()
-            for idx in range(len(train_dataset)):
+            for idx in range(budget):
                 try:
                     sample = train_dataset[idx]
                 except Exception:
@@ -737,7 +761,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     if h not in seen_image_hashes:
                         seen_image_hashes.add(h)
                         image_indices.append(idx)
-                if len(voice_indices) >= n and len(image_indices) >= n:
+                if len(voice_indices) >= want_voice and len(image_indices) >= want_image:
                     break
             self._train_gen_voice_indices = voice_indices
             self._train_gen_image_indices = image_indices

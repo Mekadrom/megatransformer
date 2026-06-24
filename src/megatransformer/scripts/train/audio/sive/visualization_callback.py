@@ -222,17 +222,30 @@ class SIVEVisualizationCallback(VisualizationCallback):
         speakers_list = []
         speaker_counts = {}
 
-        indices = list(range(len(self.trainer.eval_dataset)))
-        np.random.shuffle(indices)
+        n_total = len(self.trainer.eval_dataset)
+        # Bound the scan. The per-speaker quota (≤ max_speakers_for_tsne
+        # speakers, ≤ num_tsne_samples // max_speakers_for_tsne clips each) is
+        # frequently unfillable: eval sets with many low-utterance speakers
+        # cannot supply that many speakers each with that many clips. The old
+        # loop's ONLY exit was reaching num_tsne_samples, so when the quota
+        # couldn't be met it walked the entire eval set — reloading
+        # multi-hundred-MB shards under a thrashed LRU cache for hours (the
+        # eval hang). Cap the candidate pool so termination is guaranteed, then
+        # visit in shard (ascending-index) order so the dataset's LRU cache
+        # loads each shard at most once instead of thrashing on shuffled access.
+        budget = min(n_total, max(self.num_tsne_samples * 20, 2000))
+        candidates = np.random.choice(n_total, size=budget, replace=False)
+        candidates.sort()
 
-        for idx in indices:
+        per_speaker_cap = max(1, self.num_tsne_samples // self.max_speakers_for_tsne)
+        for idx in candidates:
             if len(features_list) >= self.num_tsne_samples:
                 break
 
-            sample = self.trainer.eval_dataset[idx]
+            sample = self.trainer.eval_dataset[int(idx)]
             speaker_id = sample["speaker_id"].item()
 
-            if speaker_counts.get(speaker_id, 0) >= self.num_tsne_samples // self.max_speakers_for_tsne:
+            if speaker_counts.get(speaker_id, 0) >= per_speaker_cap:
                 continue
 
             if len(speaker_counts) >= self.max_speakers_for_tsne and speaker_id not in speaker_counts:
