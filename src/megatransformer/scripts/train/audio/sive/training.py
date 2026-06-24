@@ -271,6 +271,23 @@ class SIVETrainer(CommonTrainer):
         ctc_lengths = inputs["ctc_lengths"]
         speaker_ids = inputs["speaker_ids"]
 
+        # Guard against speaker-count drift (e.g. a forgotten --num_speakers
+        # leaving the stale config default against a larger dataset). Checked
+        # once: an out-of-range label would otherwise feed the speaker CE and
+        # trip an opaque device-side assert, or silently weaken the adversary.
+        if not getattr(self, "_speaker_id_range_checked", False):
+            n_spk = self.model.config.num_speakers
+            mx = int(speaker_ids.max().item())
+            mn = int(speaker_ids.min().item())
+            if mx >= n_spk or mn < 0:
+                raise ValueError(
+                    f"Speaker id out of range for the speaker classifier: saw "
+                    f"[{mn}, {mx}] but num_speakers={n_spk}. The dataset has more "
+                    f"speakers than the model's head — pass --num_speakers >= {mx + 1} "
+                    f"(it defaults to a stale value if omitted)."
+                )
+            self._speaker_id_range_checked = True
+
         # GRL pre-training phase:
         # Before grl_start_step, classifier trains freely (no gradient reversal)
         # After grl_start_step, GRL kicks in with alpha ramping from that point
