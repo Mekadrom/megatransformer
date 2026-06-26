@@ -16,10 +16,16 @@ leakage = good disentanglement.
 - Default datasets: train `./cached_datasets/voice_sive_gender_train_merged/`,
   val `./cached_datasets/voice_sive_gender_val_merged/`. The val set is ~24.7k
   utterances / ~699 speakers (heavily imbalanced — one speaker ~3.5k utts).
-- Config for the current 12-layer runs: `small_deep_3xdownsample_conv2d_layernorm_attentive`
-  (encoder_dim=256). **Always pass `--num_speakers 3610`** — the config default
-  is stale and the encoder load needs the right head size (the encoder features
-  load fine regardless, but be explicit).
+- Pass the `--config` that MATCHES the checkpoint: `small_deep_3xdownsample_conv2d_layernorm_attentive`
+  (256-dim) for the standard runs, `tiny_deep_3xdownsample_conv2d_layernorm_attentive`
+  (128-dim) for the 128-dim ablation. **Always pass `--num_speakers 3610`** — the
+  config default is stale.
+- **Norm-variant checkpoints:** the config preset defaults `final_norm_type` to
+  `layernorm`. If the run was trained with `--final_norm_type rmsnorm` (or `none`),
+  the eval model MUST be built the same way or the final norm loads wrong and ALL
+  features (hence every number) are silently garbage. Both `per_speaker_leakage.py`
+  and `synthesis_usability.py` take **`--final_norm_type rmsnorm|none`** — pass it
+  to match the checkpoint (omit for standard layernorm runs).
 - Checkpoints are HF Trainer dirs: `runs/sive/<run_name>/checkpoint-<step>/` with
   `pytorch_model.bin`.
 
@@ -41,6 +47,35 @@ PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python3 -m megatransformer.scripts.eval.au
 Outputs land in `--output_dir`: `per_speaker_leakage_report.md` (read this),
 `per_speaker_leakage_results.json`, and per-run `per_speaker_recall_*.png` +
 `hot_speakers_*.png`.
+
+Bonus from the cached npz (no GPU): a binary **gender probe** (speaker-disjoint
+split, balanced accuracy vs 0.5 chance) and **effective dimensionality** are both
+computable directly from `_features_*.npz`. Gender leaks ~0.91 balanced acc in
+every run measured so far (nothing targets it — there's no gender GRL); low
+effective_dim flags feature collapse (covreg-style or a bunk run).
+
+## Synthesis-usability (tiny-SMG) — does the feature decode back to speech?
+
+`scripts/eval/audio/sive/synthesis_usability.py` — the metric that actually
+predicts SMG usability (CTC is blind to prosody/reconstructability). Trains a
+small SMG-shaped FiLM-conditioned conv decoder (fixed budget, comparable across
+checkpoints, NOT to convergence) to reconstruct mel from the frozen feature + the
+stored ECAPA embedding, and reports:
+- recon L1 with the **true** embedding = content sufficiency (lower better);
+- disentanglement Δ = L1(shuffled emb) − L1(true) (higher better);
+- **gender-stratified** recon + **cross-gender re-pitch** (F0 via torchcrepe) +
+  per-run mel-comparison figures, vocoded `target`/`recon_true`/`recon_wrong_<g>`
+  WAVs, and `f0_contours.png`.
+
+```
+PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python3 -m megatransformer.scripts.eval.audio.sive.synthesis_usability --config small_deep_3xdownsample_conv2d_layernorm_attentive --num_speakers 3610 --val_cache_dir ./cached_datasets/voice_sive_gender_val_merged/ --output_dir ./eval_output/synthesis_usability --device cuda --subset_size 1024 --probe_steps 5000 --dec_width 256 --dec_blocks 6 --num_render 8 --checkpoint name=runs/sive/<run>/checkpoint-300000
+```
+
+For a quick bunk-check, add `--no_f0 --num_render 2 --probe_steps 3000` (skips the
+slow vocoder/F0 pass). A bunk run shows a much higher recon L1 than a healthy one
+plus collapsed effective_dim. Validated finding: this metric ranks runs in line
+with human listening where CTC/L1-magnitude alone can mislead (e.g. covreg had
+best CTC but worst, mushiest reconstruction).
 
 ## Secondary tool — per-layer sweep
 
