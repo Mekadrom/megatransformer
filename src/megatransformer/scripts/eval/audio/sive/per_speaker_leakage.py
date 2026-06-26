@@ -141,7 +141,9 @@ def cached_features(args, name, ckpt_path):
 
     model = load_model(
         SpeakerInvariantVoiceEncoder, args.config, checkpoint_path=ckpt_path,
-        device=args.device, overrides={"num_speakers": args.num_speakers},
+        device=args.device,
+        overrides={"num_speakers": args.num_speakers,
+                   **({"final_norm_type": args.final_norm_type} if args.final_norm_type else {})},
         strict=False, allow_size_mismatch=True,
     )
     dataset = VoiceShardedDataset(
@@ -595,6 +597,11 @@ def main():
                     help="Checkpoint to evaluate as name=path. Repeatable. Pass a no-GRL run as contrast.")
     ap.add_argument("--config", required=True)
     ap.add_argument("--num_speakers", type=int, default=3610)
+    ap.add_argument("--final_norm_type", default=None,
+                    help="Override the model's final_norm_type to MATCH a norm-variant checkpoint "
+                         "(layernorm/rmsnorm/none). REQUIRED for rmsnorm/none runs — without it the "
+                         "eval model builds a LayerNorm final and the features load wrong (garbage). "
+                         "Default: use the config preset's value (layernorm).")
     ap.add_argument("--val_cache_dir", required=True)
     ap.add_argument("--output_dir", default="./eval_output/per_speaker_leakage")
     ap.add_argument("--device", default="cuda")
