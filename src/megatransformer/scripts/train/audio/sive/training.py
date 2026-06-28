@@ -314,11 +314,19 @@ class SIVETrainer(CommonTrainer):
         # drop samples from the gradient instead of erroring. Count them so we
         # know whether --wav_speed_perturb needs to come down or
         # --ctc_upsample_factor needs to go up.
-        with torch.no_grad():
-            margin = output_ctc_lengths - ctc_lengths  # [B]; negative => infeasible
-            ctc_underflow_count = (margin < 0).sum().item()
-            ctc_underflow_frac = ctc_underflow_count / margin.numel()
-            ctc_margin_min = margin.min().item()
+        #
+        # These counters call .item(), each a GPU->CPU sync, and are only read in
+        # the logging block below — so compute them only on logging steps to
+        # avoid stalling the pipeline every step. should_log gates the speaker
+        # diagnostics and the TensorBoard block too.
+        should_log = (global_step % self.args.logging_steps == 0)
+        ctc_underflow_count = ctc_underflow_frac = ctc_margin_min = None
+        if should_log:
+            with torch.no_grad():
+                margin = output_ctc_lengths - ctc_lengths  # [B]; negative => infeasible
+                ctc_underflow_count = (margin < 0).sum().item()
+                ctc_underflow_frac = ctc_underflow_count / margin.numel()
+                ctc_margin_min = margin.min().item()
 
         # CTC loss
         # CTC expects [T, B, vocab] and log probabilities
@@ -352,22 +360,25 @@ class SIVETrainer(CommonTrainer):
         # But we train it normally - GRL reverses gradients to encoder
         speaker_loss = self.speaker_criterion(speaker_logits, speaker_ids)
 
-        # Speaker accuracy and diagnostics (for logging)
-        with torch.no_grad():
-            speaker_preds = speaker_logits.argmax(dim=-1)
-            speaker_acc = (speaker_preds == speaker_ids).float().mean().item()
+        # Speaker accuracy and diagnostics (logging only). Every line here ends
+        # in .item()/.numel() — each a GPU->CPU sync — so gate on logging steps.
+        speaker_acc = speaker_acc_top5 = pred_entropy = unique_preds = max_prob = None
+        if should_log:
+            with torch.no_grad():
+                speaker_preds = speaker_logits.argmax(dim=-1)
+                speaker_acc = (speaker_preds == speaker_ids).float().mean().item()
 
-            # Top-5 accuracy: true speaker among top-5 logits
-            top5_preds = speaker_logits.topk(min(5, speaker_logits.size(-1)), dim=-1).indices
-            speaker_acc_top5 = (top5_preds == speaker_ids.unsqueeze(-1)).any(dim=-1).float().mean().item()
+                # Top-5 accuracy: true speaker among top-5 logits
+                top5_preds = speaker_logits.topk(min(5, speaker_logits.size(-1)), dim=-1).indices
+                speaker_acc_top5 = (top5_preds == speaker_ids.unsqueeze(-1)).any(dim=-1).float().mean().item()
 
-            # Diagnostic: check for mode collapse
-            pred_probs = F.softmax(speaker_logits, dim=-1)
-            pred_entropy = -(pred_probs * torch.log(pred_probs + 1e-8)).sum(dim=-1).mean().item()
-            unique_preds = speaker_preds.unique().numel()
+                # Diagnostic: check for mode collapse
+                pred_probs = F.softmax(speaker_logits, dim=-1)
+                pred_entropy = -(pred_probs * torch.log(pred_probs + 1e-8)).sum(dim=-1).mean().item()
+                unique_preds = speaker_preds.unique().numel()
 
-            # Max probability (confidence) - high values with low accuracy = overconfident
-            max_prob = pred_probs.max(dim=-1).values.mean().item()
+                # Max probability (confidence) - high values with low accuracy = overconfident
+                max_prob = pred_probs.max(dim=-1).values.mean().item()
 
         # Feature-space regularization losses (zero unless --use_std_hinge or
         # --use_covariance_reg are set; weights are baked into the model-side
@@ -387,7 +398,7 @@ class SIVETrainer(CommonTrainer):
         )
 
         # Log to TensorBoard
-        if global_step % self.args.logging_steps == 0:
+        if should_log:
             metrics.log_scalar("train/ctc_loss", ctc_loss, global_step)
             metrics.log_scalar("train/ctc_underflow_count", ctc_underflow_count, global_step)
             metrics.log_scalar("train/ctc_underflow_frac", ctc_underflow_frac, global_step)
