@@ -144,23 +144,23 @@ class SpeakerInvariantVoiceEncoderBlock(nn.Module):
         q = self.rotary_embedding.rotate_queries_or_keys(q)
         k = self.rotary_embedding.rotate_queries_or_keys(k)
 
-        # Scaled dot-product attention
-        scale = math.sqrt(self.head_dim)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / scale  # [B, H, T, T]
-
-        # Apply key padding mask
+        # Scaled dot-product attention via the fused SDPA kernel (FlashAttention /
+        # mem-efficient). Mathematically equivalent to the explicit
+        # softmax(QK^T / sqrt(d)) V it replaces, but never materializes the
+        # [B, H, T, T] score matrix — faster and far lower activation memory.
+        # SDPA applies its own 1/sqrt(head_dim) scaling, so we do not pre-scale.
+        attn_mask = None
         if key_padding_mask is not None:
-            # key_padding_mask: [B, T] True for padded positions
-            attn_weights = attn_weights.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2),  # [B, 1, 1, T]
-                float('-inf')
-            )
+            # key_padding_mask: [B, T] True for padded positions. SDPA's boolean
+            # attn_mask uses True = "attend", so invert; broadcasts over query
+            # and head dims as [B, 1, 1, T] (mask padded keys for every query).
+            attn_mask = (~key_padding_mask).view(B, 1, 1, T)
 
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        # Apply attention to values
-        out = torch.matmul(attn_weights, v)  # [B, H, T, D_h]
+        # SDPA applies attention dropout internally; pass p only while training.
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p
+        )  # [B, H, T, D_h]
         out = out.transpose(1, 2).contiguous().view(B, T, D)  # [B, T, D]
 
         return self.o_proj(out)
