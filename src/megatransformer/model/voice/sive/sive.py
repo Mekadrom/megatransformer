@@ -1,6 +1,7 @@
 from typing import Optional, Tuple
 
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -194,6 +195,28 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         """Calculate output sequence length given input mel spectrogram length."""
         return self.conv_subsample.get_output_length(input_length)
 
+    @torch._dynamo.disable
+    def _apply_mel_augmentations(self, mel_spec: torch.Tensor) -> torch.Tensor:
+        """Training-only mel-space augmentations (all no-op in eval mode).
+
+        Excluded from torch.compile via @torch._dynamo.disable: SpecAugment uses
+        data-dependent random mask shapes (.item() on per-sample widths) that
+        force dynamo graph breaks, and these are cheap augmentation not worth
+        compiling — dynamo runs this region eagerly and resumes compiling the
+        encoder after it. Order: VTLP (formant warp / vocal-tract geometry), then
+        EQ-like gain (channel coloration), then additive noise (ambient), then
+        SpecAugment masks. Roughly matches the physical signal path.
+        """
+        if self.mel_vtlp is not None:
+            mel_spec = self.mel_vtlp(mel_spec)
+        if self.mel_freq_response is not None:
+            mel_spec = self.mel_freq_response(mel_spec)
+        if self.mel_noise is not None:
+            mel_spec = self.mel_noise(mel_spec)
+        if self.spec_augment is not None:
+            mel_spec = self.spec_augment(mel_spec)
+        return mel_spec
+
     def forward(
         self,
         mel_spec: torch.Tensor,
@@ -221,18 +244,10 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 - temporal_smoothness: scalar metric (if variance_reg enabled and training)
                 - all_hiddens: list of [B, T', D] if return_all_hiddens=True
         """
-        # Mel-space augmentations (training-only; all no-op in eval mode).
-        # Order: VTLP (formant warp / vocal-tract geometry), then EQ-like gain
-        # (channel coloration), then additive noise (ambient), then SpecAugment
-        # masks (training-only). Roughly matches the physical signal path.
-        if self.mel_vtlp is not None:
-            mel_spec = self.mel_vtlp(mel_spec)
-        if self.mel_freq_response is not None:
-            mel_spec = self.mel_freq_response(mel_spec)
-        if self.mel_noise is not None:
-            mel_spec = self.mel_noise(mel_spec)
-        if self.spec_augment is not None:
-            mel_spec = self.spec_augment(mel_spec)
+        # Mel-space augmentations (training-only; no-op in eval). Isolated in a
+        # @torch._dynamo.disable method so --compile_model doesn't graph-break on
+        # SpecAugment's data-dependent random mask shapes (.item() per sample).
+        mel_spec = self._apply_mel_augmentations(mel_spec)
 
         # Convolutional frontend
         x: torch.Tensor = self.conv_subsample(mel_spec)  # [B, encoder_dim, T']
@@ -247,10 +262,13 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         feature_lengths = None
         padding_mask = None
         if lengths is not None:
-            feature_lengths = torch.tensor(
-                [self.get_output_length(l.item()) for l in lengths],
-                device=mel_spec.device,
-                dtype=torch.long,
+            # Vectorized: was a per-sample `.item()` list comprehension, which
+            # forced a torch.compile graph break. get_output_length is pure
+            # integer arithmetic ((L + s - 1) // s), so it broadcasts over the
+            # lengths tensor directly — also faster (no Python loop / per-element
+            # host sync) even without compile.
+            feature_lengths = self.get_output_length(lengths).to(
+                device=mel_spec.device, dtype=torch.long
             )
             # Create padding mask [B, T'] - True for padded positions
             max_len = x.size(1)
