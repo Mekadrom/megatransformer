@@ -425,12 +425,18 @@ class MuonAdamW(Optimizer):
 
         self.adamw_optimizer = None
         if adamw_param_groups:
+            # fused=True runs the entire AdamW update in a single CUDA kernel
+            # (vs the default per-tensor foreach path) — strictly faster, no
+            # change to the math. Requires every AdamW param on CUDA, so guard
+            # on that; falls back to foreach on CPU or mixed placement.
+            use_fused = torch.cuda.is_available() and all(p.is_cuda for p in adamw_params)
             self.adamw_optimizer = AdamW(
                 adamw_param_groups,
                 lr=lr_adamw,
                 betas=betas_adamw,
                 eps=eps_adamw,
                 weight_decay=weight_decay_adamw,  # default for any group missing it
+                fused=use_fused,
             )
 
         # Initialize parent with all params (for compatibility)

@@ -758,6 +758,27 @@ if __name__ == "__main__":
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
 
+    # TF32 for fp32 matmuls/convs (Muon's fp32 Newton-Schulz orthogonalization and
+    # any autocast-fp32-kept matmuls): tensor-core fp32 at ~10-bit mantissa, much
+    # faster than IEEE fp32, negligible training-quality impact, and it does NOT
+    # touch bf16 paths. Free; never slows anything. cuDNN benchmark is left OFF on
+    # purpose — it re-autotunes per unique input shape, which is a net loss for our
+    # highly variable (unbucketed) audio lengths.
+    torch.set_float32_matmul_precision("high")
+
+    # torch.compile on variable-length audio: HF's Trainer performs the actual
+    # compile (--compile_model -> TrainingArguments.torch_compile) and saves the
+    # UNCOMPILED self.model, so checkpoints keep clean keys (a hand-rolled
+    # torch.compile(model) would prefix state_dict keys with "_orig_mod." and break
+    # every eval/diagnostic loader). We only tune dynamo so it behaves: let it mark
+    # the varying time dim dynamic (default) and raise the recompile cache well
+    # above the default 8 so early specialization across distinct lengths doesn't
+    # overflow to eager.
+    if args.compile_model and not args.use_deepspeed:
+        import torch._dynamo
+        torch._dynamo.config.automatic_dynamic_shapes = True
+        torch._dynamo.config.cache_size_limit = 64
+
     model.to(device)
 
     # Create optimizer if using Muon (not passed to trainer yet)
