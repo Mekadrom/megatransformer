@@ -248,6 +248,10 @@ def get_dataset(command: str, args, split: str):
             return candidate
 
         include_modes = [m.strip() for m in args.include_modes.split(",")]
+        include_tasks = (
+            [t.strip() for t in args.include_tasks.split(",") if t.strip()]
+            if getattr(args, "include_tasks", None) else None
+        )
         text_dir = _resolve_shard_dir("text", split) if "text" in include_modes else None
         audio_dir = _resolve_shard_dir("audio", split) if "audio" in include_modes else None
         voice_dir = _resolve_shard_dir("voice", split) if "voice" in include_modes else None
@@ -257,6 +261,8 @@ def get_dataset(command: str, args, split: str):
         use_memorization = getattr(args, 'use_memorization_dataset', False)
 
         if use_memorization and max_samples is not None:
+            if include_tasks is not None:
+                print("WARNING: --include_tasks is ignored by the memorization dataset")
             dataset = MultimodalMemorizationDataset(
                 text_shard_dir=text_dir,
                 audio_shard_dir=audio_dir,
@@ -273,6 +279,7 @@ def get_dataset(command: str, args, split: str):
                 voice_synthesis_shard_dir=voice_synthesis_dir,
                 cache_size=args.shard_cache_size,
                 max_samples=max_samples,
+                include_tasks=include_tasks,
             )
     return dataset
 
@@ -609,6 +616,7 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--logging_base_dir', type=str, default=os.path.join('runs', 'causal'), help='Base directory for logging')
         sub_parser.add_argument('--run_name', type=str, help='Name of the run', required=True)
         sub_parser.add_argument('--include_modes', type=str, default='text,audio,image', help='Comma-separated list of modes to include (e.g., text,audio,image or audio,image), order agnostic')
+        sub_parser.add_argument('--include_tasks', type=str, default=None, help='Comma-separated allowlist of world task types to train/eval (default: all tasks for the included modes). Subset of: text_continuation, voice_synthesis, voice_transcription, image_synthesis, image_transcription. Filtered against --include_modes (naming a task whose modality is not included errors). World model only.')
         sub_parser.add_argument('--dataset_cache_dir', type=str, default='cached_datasets', help='Path to the dataset cache directory')
         sub_parser.add_argument('--config', type=str, default="small", help='Model configuration.')
         sub_parser.add_argument('--cpu', action='store_true', help='Use CPU for training')

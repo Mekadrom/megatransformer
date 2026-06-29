@@ -35,6 +35,7 @@ class MultimodalShardedDataset(Dataset):
         voice_columns: list[str] = None,
         cache_size: int = 3,
         max_samples: int = None,
+        include_tasks: list[str] = None,
     ):
         """
         Args:
@@ -55,6 +56,10 @@ class MultimodalShardedDataset(Dataset):
             voice_columns: Columns to load from voice shards. If None, mirrors audio_columns.
             cache_size: Number of shards to keep cached per modality
             max_samples: If set, cap the effective dataset length (for overfitting experiments)
+            include_tasks: Optional allowlist of task names to keep (e.g.
+                ["text_continuation", "voice_synthesis"]). None = all tasks for the
+                configured modalities. Filters self.task_types; keyed on task name,
+                so the directionless "text_continuation" needs no special handling.
         """
         self.cache_size = cache_size
         self.modalities = {}
@@ -101,6 +106,20 @@ class MultimodalShardedDataset(Dataset):
             self.audio_columns = _default_audio_columns
         if self.voice_columns is None and "voice" in self.modalities:
             self.voice_columns = _default_audio_columns
+
+        # Optional task allowlist (None = all tasks for the configured modalities).
+        # Filters self.task_types — the single source of truth for the round-robin,
+        # length, sampler, and eval grouping — keyed on task NAME, so the
+        # directionless "text_continuation" needs no special handling.
+        self._include_tasks = set(include_tasks) if include_tasks else None
+        if self._include_tasks is not None:
+            available = [t[0] for t in self._all_task_types()]
+            unknown = self._include_tasks - set(available)
+            if unknown:
+                raise ValueError(
+                    f"include_tasks contains unknown/unavailable task(s) {sorted(unknown)}. "
+                    f"Available for the configured modalities ({list(self.modalities)}): {available}."
+                )
 
         # Total length = max across modalities × number of task types, so one
         # "epoch" covers every sample in the largest modality across all tasks
@@ -343,12 +362,11 @@ class MultimodalShardedDataset(Dataset):
     def __len__(self):
         return self.total_samples
 
-    @property
-    def task_types(self) -> list:
-        """List of task types based on configured modalities.
+    def _all_task_types(self) -> list:
+        """Unfiltered (task_name, modality, direction) list for configured modalities.
 
-        Each media modality produces two tasks (synthesis + transcription).
-        Text-only is always included. Returns list of (task_name, modality, direction).
+        Each media modality produces two tasks (synthesis + transcription); text-only
+        (text_continuation) is always present.
         """
         tasks = [("text_continuation", "text", None)]
         for mod in self.modalities:
@@ -356,6 +374,19 @@ class MultimodalShardedDataset(Dataset):
                 continue
             tasks.append((f"{mod}_synthesis", mod, "synthesis"))
             tasks.append((f"{mod}_transcription", mod, "transcription"))
+        return tasks
+
+    @property
+    def task_types(self) -> list:
+        """Active task types, filtered by include_tasks (None = all).
+
+        Single source of truth for the round-robin (__getitem__), dataset length,
+        sampler grouping, and eval task grouping — filtering here propagates to all.
+        Returns list of (task_name, modality, direction).
+        """
+        tasks = self._all_task_types()
+        if self._include_tasks is not None:
+            tasks = [t for t in tasks if t[0] in self._include_tasks]
         return tasks
 
     def __getitem__(self, idx: int) -> dict:
