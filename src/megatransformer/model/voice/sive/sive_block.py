@@ -11,6 +11,7 @@ from rotary_embedding_torch import RotaryEmbedding
 
 from megatransformer.model import activations
 from megatransformer.model.activations import get_activation_type
+from megatransformer.model.norms import build_seq_norm
 from megatransformer.model.voice.sive.conformer import ConformerConvModule
 from megatransformer.model.head_dropout import HeadDropout
 
@@ -62,6 +63,8 @@ class SpeakerInvariantVoiceEncoderBlock(nn.Module):
         # Architectural options
         conformer_kernel_size: int = 31,
         activation: str = "gelu",
+        norm_type: str = "layernorm",
+        conv_norm_type: str = "instancenorm",
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -90,6 +93,8 @@ class SpeakerInvariantVoiceEncoderBlock(nn.Module):
             d_model=d_model,
             kernel_size=conformer_kernel_size,
             dropout=dropout,
+            norm_type=norm_type,
+            conv_norm_type=conv_norm_type,
         )
 
         # Helper to build FFN
@@ -115,11 +120,10 @@ class SpeakerInvariantVoiceEncoderBlock(nn.Module):
         # Macaron-style: two half-step FFNs (each scaled by 0.5)
         self.ff1 = build_ffn()  # First half-step FFN
         self.ff2 = build_ffn()  # Second half-step FFN
-        self.norm_ff1 = nn.LayerNorm(d_model)
-        self.norm_ff2 = nn.LayerNorm(d_model)
+        self.norm_ff1 = build_seq_norm(norm_type, d_model)
+        self.norm_ff2 = build_seq_norm(norm_type, d_model)
 
-        self.norm1 = nn.LayerNorm(d_model)  # For attention
-        self.norm_conv = nn.LayerNorm(d_model)
+        self.norm1 = build_seq_norm(norm_type, d_model)  # For attention
         self.dropout = nn.Dropout(dropout)
 
     def _rope_attention(

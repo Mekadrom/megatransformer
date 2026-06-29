@@ -18,6 +18,23 @@ class RMSNorm(nn.Module):
         return new_x
 
 
+def build_seq_norm(norm_type, dim, eps=1e-5):
+    """Build a norm over the feature (last) dim of a [B, T, D] sequence tensor.
+
+    Used for transformer pre-norms. Supports "layernorm", "rmsnorm", and "none".
+    """
+    if norm_type == "layernorm":
+        return nn.LayerNorm(dim, eps=eps)
+    if norm_type == "rmsnorm":
+        return RMSNorm(dim, eps=eps)
+    if norm_type in ("none", None):
+        return nn.Identity()
+    raise ValueError(
+        f"Unknown sequence norm_type: {norm_type!r}. "
+        f"Expected one of 'layernorm', 'rmsnorm', 'none'."
+    )
+
+
 def create_norm(hidden_size, norm_type, norm_eps):
     if norm_type == "layernorm":
         return nn.LayerNorm(hidden_size, eps=norm_eps)

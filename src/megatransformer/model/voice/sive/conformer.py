@@ -2,12 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatransformer.model.norms import build_seq_norm
+from megatransformer.model.voice.sive.conv_subsampling import _build_norm_1d
+
 
 class ConformerConvModule(nn.Module):
     """
     Conformer-style convolution module for speech processing.
 
-    Architecture: LayerNorm -> Pointwise Conv -> GLU -> Depthwise Conv -> InstanceNorm -> Swish -> Pointwise Conv -> Dropout
+    Architecture: norm (pre-norm) -> Pointwise Conv -> GLU -> Depthwise Conv ->
+    conv-norm -> Swish -> Pointwise Conv -> Dropout
+
+    The pre-norm (norm_type, lever 3) and the depthwise-conv norm (conv_norm_type,
+    lever 4) are independently configurable. Defaults (layernorm / instancenorm)
+    match prior behavior.
 
     The depthwise separable convolution captures local acoustic patterns that
     self-attention alone may miss, making it particularly effective for speech.
@@ -21,11 +29,13 @@ class ConformerConvModule(nn.Module):
         kernel_size: int = 31,
         expansion_factor: int = 2,
         dropout: float = 0.1,
+        norm_type: str = "layernorm",
+        conv_norm_type: str = "instancenorm",
     ):
         super().__init__()
         inner_dim = d_model * expansion_factor
 
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = build_seq_norm(norm_type, d_model)
 
         # Pointwise expansion with GLU (doubles channels, GLU halves them)
         self.pointwise_conv1 = nn.Conv1d(d_model, inner_dim * 2, kernel_size=1)
@@ -39,7 +49,9 @@ class ConformerConvModule(nn.Module):
             groups=inner_dim,  # Depthwise: each channel has its own filter
         )
 
-        self.instance_norm = nn.InstanceNorm1d(inner_dim, affine=True)
+        # Norm on the depthwise-conv output [B, inner_dim, T]. Attribute name kept
+        # as `instance_norm` for checkpoint-key compatibility regardless of type.
+        self.instance_norm = _build_norm_1d(conv_norm_type, inner_dim)
         self.activation = nn.SiLU()  # Swish
 
         # Pointwise projection back to d_model

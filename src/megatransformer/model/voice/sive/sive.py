@@ -86,6 +86,7 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 kernel_sizes=config.conv_kernel_sizes,
                 strides=config.conv_strides,
                 dropout=config.conv_dropout if config.conv_dropout > 0 else config.dropout,
+                norm_type=config.downsample_norm_type,
             )
         else:
             self.conv_subsample = ConvSubsampling(
@@ -94,6 +95,7 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 kernel_sizes=config.conv_kernel_sizes,
                 strides=config.conv_strides,
                 dropout=config.conv_dropout if config.conv_dropout > 0 else config.dropout,
+                norm_type=config.downsample_norm_type,
             )
 
         # Transformer encoder blocks with architectural options
@@ -112,6 +114,8 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 drop_path_prob=drop_path_rates[i],
                 conformer_kernel_size=config.conformer_kernel_size,
                 activation=config.activation,
+                norm_type=config.block_norm_type,
+                conv_norm_type=config.conv_norm_type,
             )
             for i in range(config.num_layers)
         ])

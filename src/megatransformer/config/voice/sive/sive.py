@@ -96,7 +96,22 @@ class SpeakerInvariantVoiceEncoderConfig:
     # factor=1: no upsampling (default), factor=2: 2x more CTC frames, etc.
     ctc_upsample_factor: int = 1
 
-    downsample_norm_type: Optional[str] = None  # "batchnorm", "layernorm", or None (default)
+    # Norm applied inside the conv subsampling frontend (per conv layer). LIVE:
+    # passed through to Conv2dSubsampling/ConvSubsampling. One of "batchnorm",
+    # "instancenorm", "groupnorm", "layernorm", "rmsnorm", "none", or None
+    # (-> instancenorm). Distinct from final_norm_type (post-encoder output norm).
+    downsample_norm_type: Optional[str] = None
+
+    # SIVE has four independent norm levers. (1) downsample_norm_type = conv
+    # frontend; (2) final_norm_type = post-encoder output; plus the two below.
+    # block_norm_type (lever 3) = the transformer encoder pre-norms (macaron
+    # FFNs, attention, and the conformer module's input pre-norm), over the
+    # feature dim of [B, T, D]. One of "layernorm" (default), "rmsnorm", "none".
+    block_norm_type: str = "layernorm"
+    # conv_norm_type (lever 4) = the norm on the conformer depthwise-conv output
+    # [B, C, T]. One of "instancenorm" (default, matches prior behavior),
+    # "batchnorm", "groupnorm", "layernorm", "rmsnorm", "none".
+    conv_norm_type: str = "instancenorm"
 
     # Final normalization on encoder features (the user-facing SIVE output).
     # "layernorm" (default, matches prior behavior), "rmsnorm" (no mean-subtraction
@@ -179,7 +194,7 @@ CONFIGS = {
         conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
         conv_strides=[(2, 2), (2, 2), (1, 1)],
         ctc_upsample_factor=2,
-        downsample_norm_type="batchnorm",
+        downsample_norm_type="instancenorm",  # pinned: ran as instancenorm while the field was a no-op
     ),
     "tiny_deep_3xdownsample_conv2d_batchnorm": SpeakerInvariantVoiceEncoderConfig(
         encoder_dim=128,
@@ -191,7 +206,7 @@ CONFIGS = {
         conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
         conv_strides=[(2, 3), (2, 1), (1, 1)],
         ctc_upsample_factor=2,
-        downsample_norm_type="batchnorm",
+        downsample_norm_type="instancenorm",  # pinned: ran as instancenorm while the field was a no-op
     ),
     "tiny_deep_3xdownsample_conv2d_batchnorm_attentive": SpeakerInvariantVoiceEncoderConfig(
         encoder_dim=128,
@@ -203,7 +218,7 @@ CONFIGS = {
         conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
         conv_strides=[(2, 3), (2, 1), (1, 1)],
         ctc_upsample_factor=2,
-        downsample_norm_type="batchnorm",
+        downsample_norm_type="instancenorm",  # pinned: ran as instancenorm while the field was a no-op
         speaker_pooling="attentive_statistics",
     ),
     "tiny_deep_3xdownsample_conv2d_layernorm_attentive": SpeakerInvariantVoiceEncoderConfig(
@@ -216,7 +231,7 @@ CONFIGS = {
         conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
         conv_strides=[(2, 3), (2, 1), (1, 1)],
         ctc_upsample_factor=2,
-        downsample_norm_type="layernorm",
+        downsample_norm_type="instancenorm",  # pinned: ran as instancenorm while the field was a no-op
         speaker_pooling="attentive_statistics",
     ),
     "tiny_deep_2xdownsample": SpeakerInvariantVoiceEncoderConfig(
@@ -246,8 +261,15 @@ CONFIGS = {
         conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
         conv_strides=[(2, 3), (2, 1), (1, 1)],
         ctc_upsample_factor=2,
-        downsample_norm_type="layernorm",
+        downsample_norm_type="instancenorm",  # pinned: ran as instancenorm while the field was a no-op
     ),
+    # stdhinge11 base. NOTE: downsample_norm_type is "instancenorm" (the conv2d
+    # frontend norm this run was actually trained with — back when the field was
+    # a no-op, the frontend defaulted to instancenorm). The "layernorm" in the
+    # NAME refers to the FINAL norm (final_norm_type defaults to layernorm), not
+    # the frontend. Now that downsample_norm_type is live, this MUST stay
+    # "instancenorm" or every existing checkpoint / diagnostic for this recipe
+    # loads the wrong frontend module.
     "small_deep_3xdownsample_conv2d_layernorm_attentive": SpeakerInvariantVoiceEncoderConfig(
         encoder_dim=256,
         num_layers=12,
@@ -258,7 +280,40 @@ CONFIGS = {
         conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
         conv_strides=[(2, 3), (2, 1), (1, 1)],
         ctc_upsample_factor=2,
-        downsample_norm_type="layernorm",
+        downsample_norm_type="instancenorm",
+        speaker_pooling="attentive_statistics",
+    ),
+    # Final-norm ablations vs stdhinge11. ONLY final_norm_type differs from
+    # small_deep_3xdownsample_conv2d_layernorm_attentive — frontend stays
+    # instancenorm for a clean single-variable comparison against the existing
+    # stdhinge11 baseline. The named-here "rmsnorm"/"nonorm" refers to the FINAL
+    # norm; the frontend-norm ablation is a separate axis.
+    "small_deep_3xdownsample_conv2d_rmsnorm_attentive": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=256,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        use_conv2d_frontend=True,
+        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
+        conv_strides=[(2, 3), (2, 1), (1, 1)],
+        ctc_upsample_factor=2,
+        downsample_norm_type="instancenorm",
+        final_norm_type="rmsnorm",
+        speaker_pooling="attentive_statistics",
+    ),
+    "small_deep_3xdownsample_conv2d_nonorm_attentive": SpeakerInvariantVoiceEncoderConfig(
+        encoder_dim=256,
+        num_layers=12,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        use_conv2d_frontend=True,
+        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
+        conv_strides=[(2, 3), (2, 1), (1, 1)],
+        ctc_upsample_factor=2,
+        downsample_norm_type="instancenorm",
+        final_norm_type="none",
         speaker_pooling="attentive_statistics",
     ),
     # ~9.6M params w/ macaron and swiglu, ~3.7M w/o

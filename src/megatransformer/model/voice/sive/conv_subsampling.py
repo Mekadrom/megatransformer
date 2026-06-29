@@ -2,6 +2,8 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
+from megatransformer.model.norms import RMSNorm
+
 
 class SpatialLayerNorm2d(nn.Module):
     """LayerNorm across the channel dim at each (F, T) position.
@@ -21,6 +23,92 @@ class SpatialLayerNorm2d(nn.Module):
         return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
 
 
+class SpatialLayerNorm1d(nn.Module):
+    """LayerNorm across the channel dim at each time position (1d analogue of
+    SpatialLayerNorm2d). Pad-invariant: each position normalizes only its own
+    C channels."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, T] -> [B, T, C] -> norm -> [B, C, T]
+        return self.norm(x.permute(0, 2, 1)).permute(0, 2, 1).contiguous()
+
+
+class SpatialRMSNorm2d(nn.Module):
+    """RMSNorm across the channel dim at each (F, T) position — SpatialLayerNorm2d
+    without mean-subtraction (no inter-channel competition from centering).
+    Pad-invariant: each spatial position normalizes only its own C channels."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.norm = RMSNorm(num_channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, F, T] -> [B, F, T, C] -> norm (over last dim) -> [B, C, F, T]
+        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
+
+
+class SpatialRMSNorm1d(nn.Module):
+    """RMSNorm across the channel dim at each time position (1d analogue of
+    SpatialRMSNorm2d)."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.norm = RMSNorm(num_channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, T] -> [B, T, C] -> norm (over last dim) -> [B, C, T]
+        return self.norm(x.permute(0, 2, 1)).permute(0, 2, 1).contiguous()
+
+
+NormType = Literal['batchnorm', 'instancenorm', 'groupnorm', 'layernorm', 'rmsnorm', 'none']
+
+
+def _build_norm_1d(norm_type: NormType, num_channels: int) -> nn.Module:
+    if norm_type == 'batchnorm':
+        return nn.BatchNorm1d(num_channels)
+    if norm_type == 'instancenorm':
+        return nn.InstanceNorm1d(num_channels, affine=True)
+    if norm_type == 'groupnorm':
+        return nn.GroupNorm(8, num_channels)
+    if norm_type == 'layernorm':
+        return SpatialLayerNorm1d(num_channels)
+    if norm_type == 'rmsnorm':
+        return SpatialRMSNorm1d(num_channels)
+    if norm_type in ('none', None):
+        return nn.Identity()
+    raise ValueError(
+        f"Unknown downsample norm_type: {norm_type!r}. Expected one of "
+        f"'batchnorm', 'instancenorm', 'groupnorm', 'layernorm', 'rmsnorm', 'none'."
+    )
+
+
+def _build_norm_2d(norm_type: NormType, num_channels: int) -> nn.Module:
+    if norm_type == 'batchnorm':
+        return nn.BatchNorm2d(num_channels)
+    if norm_type == 'instancenorm':
+        return nn.InstanceNorm2d(num_channels, affine=True)
+    if norm_type == 'groupnorm':
+        return nn.GroupNorm(8, num_channels)  # 8 groups is a common choice
+    if norm_type == 'layernorm':
+        # Per-position LayerNorm across the channel dim. Pad-invariant
+        # (wav2vec2 / HuBERT style). Strictly cleaner than InstanceNorm for
+        # variable-length voice — pad regions cannot pollute the statistics
+        # used at valid-region positions.
+        return SpatialLayerNorm2d(num_channels)
+    if norm_type == 'rmsnorm':
+        return SpatialRMSNorm2d(num_channels)
+    if norm_type in ('none', None):
+        return nn.Identity()
+    raise ValueError(
+        f"Unknown downsample norm_type: {norm_type!r}. Expected one of "
+        f"'batchnorm', 'instancenorm', 'groupnorm', 'layernorm', 'rmsnorm', 'none'."
+    )
+
+
 class ConvSubsampling(nn.Module):
     """
     Convolutional subsampling frontend (similar to Conformer/wav2vec2).
@@ -34,6 +122,7 @@ class ConvSubsampling(nn.Module):
         kernel_sizes: list = [5, 3, 3],
         strides: list = [2, 2, 1],
         dropout: float = 0.05,
+        norm_type: NormType = 'instancenorm',
     ):
         super().__init__()
 
@@ -43,7 +132,7 @@ class ConvSubsampling(nn.Module):
         for i, (k, s) in enumerate(zip(kernel_sizes, strides)):
             layers.extend([
                 nn.Conv1d(channels[i], channels[i + 1], kernel_size=k, stride=s, padding=k // 2),
-                nn.InstanceNorm1d(channels[i + 1], affine=True),
+                _build_norm_1d(norm_type, channels[i + 1]),
                 nn.GELU(),
                 nn.Dropout1d(dropout),
             ])
@@ -82,7 +171,7 @@ class Conv2dSubsampling(nn.Module):
         kernel_sizes: list = [(5, 5), (5, 3), (5, 3)],
         strides: list = [(2, 2), (2, 2), (1, 1)],
         dropout: float = 0.05,
-        norm_type: Literal['batchnorm', 'instancenorm', 'groupnorm', 'layernorm'] = 'instancenorm',
+        norm_type: NormType = 'instancenorm',
     ):
         super().__init__()
 
@@ -90,22 +179,9 @@ class Conv2dSubsampling(nn.Module):
         channels = [1] + [out_channels] * len(kernel_sizes)
 
         for i, (k, s) in enumerate(zip(kernel_sizes, strides)):
-            norm = None
-            if norm_type == 'batchnorm':
-                norm = nn.BatchNorm2d(channels[i + 1])
-            elif norm_type == 'instancenorm':
-                norm = nn.InstanceNorm2d(channels[i + 1], affine=True)
-            elif norm_type == 'groupnorm':
-                norm = nn.GroupNorm(8, channels[i + 1])  # 8 groups is a common choice
-            elif norm_type == 'layernorm':
-                # Per-position LayerNorm across the channel dim. Pad-invariant
-                # (wav2vec2 / HuBERT style). Strictly cleaner than InstanceNorm
-                # for variable-length voice — pad regions cannot pollute the
-                # statistics used at valid-region positions.
-                norm = SpatialLayerNorm2d(channels[i + 1])
             layers.extend([
                 nn.Conv2d(channels[i], channels[i + 1], kernel_size=k, stride=s, padding=(k[0] // 2, k[1] // 2)),
-                norm if norm is not None else nn.Identity(),
+                _build_norm_2d(norm_type, channels[i + 1]),
                 nn.GELU(),
                 nn.Dropout2d(dropout),
             ])
