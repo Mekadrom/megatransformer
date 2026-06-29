@@ -97,7 +97,9 @@ sample's per-layer features evolve across checkpoints. Qualitative only.
    and can invent false stories (e.g. a phantom "nonlinear residual" when the
    linear probe simply hadn't converged). Check `plateaued=True` for every probe
    in the report; if any say False, bump `--probe_max_epochs` / `--probe_patience`
-   and re-run (cheap — features are cached). 600 / 40 is usually enough.
+   and re-run (cheap — features are cached). 600 / 40 is usually enough, but
+   slow-converging features (no-GRL, covreg, late checkpoints) can need 1500 / 60
+   — when in doubt, use the higher numbers.
 2. **Macro is the honest metric, not micro.** The val set is wildly
    utterance-imbalanced, so micro@1 is dominated by a few high-count speakers.
    Judge leakage on **macro@1 ×chance** (typical speaker); use the micro-vs-macro
@@ -108,11 +110,34 @@ sample's per-layer features evolve across checkpoints. Qualitative only.
    hop_length=256 (the script defaults). Wrong params → garbage features.
 5. The split depends only on `speaker_ids` + `--seed`, so it's identical across
    checkpoints — a clean GRL-vs-no-GRL contrast.
+6. **A recon-L1 outlier or NaN is a diverged probe, not a feature verdict.** The
+   synthesis decoder has no grad-clip / NaN-guard, so a bad seed can produce a
+   garbage recon-L1 (e.g. ~2.4 vs the normal ~1.0–1.1) plus NaN F0/centroid and
+   absurd Δ that *mimics* a real regression. Re-run with a different `--seed`
+   before trusting; if it normalizes, the first was divergence (this happened —
+   it nearly read as a "2× worse" run).
+7. **For a perceptual A/B, render both checkpoints at the SAME `--seed`.** The
+   seed fixes the eval subset *and* decoder init, so cross-seed audio compares
+   different utterances entirely. Compare matched `recon_true.wav` pairs only
+   (same `sampleN_spkID`). The user's ear is the tiebreaker — but only on matched
+   audio.
+8. **eff-dim does NOT compare across final-norm types.** It's the entropy of
+   per-dim variance, which the final norm's affine/centering directly shapes —
+   rmsnorm vs layernorm eff-dim can even disagree in *sign*. Also the offline
+   (mean-pooled, from the leakage cache) eff-dim ≠ the TB
+   `feature_health/dim_utilization_ratio` (computed over all frames). Use eff-dim
+   only within the same norm type + same pooling.
+9. **Judge disentanglement at the 300k endpoint, not mid-training.** The slow GRL
+   purge does the real work in the back half; mid-training snapshots mislead —
+   a 166k snapshot ranked rmsnorm-final a "keeper" that the 300k endpoint flatly
+   reversed.
 
 ## Notes
 
 - Gender GRL is NOT implemented in the SIVE model/trainer (only a speaker GRL
   head exists); `gender_ids` are consumed only by these offline probes.
-- Findings as of the 224k checkpoints live in memory `project_sive_speaker_leakage`.
+- Current experiment state, best base, ruled-out runs, and next levers live in
+  memory `project_sive_experiment_status` (the entry point); detailed findings in
+  `project_sive_speaker_leakage` + `project_sive_synthesis_usability`.
 - The SIVE eval-time t-SNE viz callback had an unbounded-scan hang; see memory
   `project_sive_eval_hang`.
