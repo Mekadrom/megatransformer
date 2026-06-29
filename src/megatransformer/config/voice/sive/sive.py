@@ -143,134 +143,17 @@ class SpeakerInvariantVoiceEncoderConfig:
 
 
 CONFIGS = {
-    "default": SpeakerInvariantVoiceEncoderConfig(),
-    # ~1.3M params - very fast, good for experimentation
-    "tiny": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=128,
-        num_layers=3,
-        num_heads=4,
-        ff_dim=512,
-        dropout=0.1,
-    ),
-    # ~7M params w/ macaron and swiglu, ~2.5M w/o
-    # This is the current best model with the run name "tiny_deep_0_4" - checkpoint-60000 was best performance, least overfit.
-    "tiny_deep": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=128,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        ctc_upsample_factor=2,
-    ),
-    "tiny_deep": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=128,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        use_conv2d_frontend=True,
-        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
-        conv_strides=[(2, 2), (1, 1), (1, 1)],  # 4x downsampling
-        ctc_upsample_factor=2,
-    ),
-    "tiny_deep_4xdownsample_conv2d": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=128,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        use_conv2d_frontend=True,
-        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
-        conv_strides=[(2, 2), (2, 2), (1, 1)],
-        ctc_upsample_factor=2,
-    ),
-    "tiny_deep_4xdownsample_conv2d_batchnorm": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=128,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        use_conv2d_frontend=True,
-        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
-        conv_strides=[(2, 2), (2, 2), (1, 1)],
-        ctc_upsample_factor=2,
-        downsample_norm_type="instancenorm",  # pinned: ran as instancenorm while the field was a no-op
-    ),
-    "tiny_deep_3xdownsample_conv2d_batchnorm": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=128,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        use_conv2d_frontend=True,
-        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
-        conv_strides=[(2, 3), (2, 1), (1, 1)],
-        ctc_upsample_factor=2,
-        downsample_norm_type="instancenorm",  # pinned: ran as instancenorm while the field was a no-op
-    ),
-    "tiny_deep_3xdownsample_conv2d_batchnorm_attentive": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=128,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        use_conv2d_frontend=True,
-        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
-        conv_strides=[(2, 3), (2, 1), (1, 1)],
-        ctc_upsample_factor=2,
-        downsample_norm_type="instancenorm",  # pinned: ran as instancenorm while the field was a no-op
-        speaker_pooling="attentive_statistics",
-    ),
-    "tiny_deep_3xdownsample_conv2d_layernorm_attentive": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=128,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        use_conv2d_frontend=True,
-        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
-        conv_strides=[(2, 3), (2, 1), (1, 1)],
-        ctc_upsample_factor=2,
-        downsample_norm_type="instancenorm",  # pinned: ran as instancenorm while the field was a no-op
-        speaker_pooling="attentive_statistics",
-    ),
-    "tiny_deep_2xdownsample": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=128,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        conv_strides=[2, 1, 1],  # 2x downsampling instead of 4x (more CTC frames, higher transformer cost)
-        ctc_upsample_factor=1,
-    ),
-    "tiny_deep_4xupsample": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=128,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        ctc_upsample_factor=4,
-    ),
-    "small_deep_3xdownsample_conv2d_batchnorm": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=256,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        use_conv2d_frontend=True,
-        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
-        conv_strides=[(2, 3), (2, 1), (1, 1)],
-        ctc_upsample_factor=2,
-        downsample_norm_type="instancenorm",  # pinned: ran as instancenorm while the field was a no-op
-    ),
-    # stdhinge11 base. NOTE: downsample_norm_type is "instancenorm" (the conv2d
-    # frontend norm this run was actually trained with — back when the field was
-    # a no-op, the frontend defaulted to instancenorm). The "layernorm" in the
-    # NAME refers to the FINAL norm (final_norm_type defaults to layernorm), not
-    # the frontend. Now that downsample_norm_type is live, this MUST stay
-    # "instancenorm" or every existing checkpoint / diagnostic for this recipe
-    # loads the wrong frontend module.
-    "small_deep_3xdownsample_conv2d_layernorm_attentive": SpeakerInvariantVoiceEncoderConfig(
+    # The single SIVE base: 256-dim, 12L, conv2d 3x-downsample, attentive pooling.
+    # All four norm levers sit at their defaults and are overridable per-run from
+    # the CLI (--downsample_norm_type / --block_norm_type / --conv_norm_type /
+    # --final_norm_type), so norm ablations need no separate presets:
+    #   frontend (downsample) = instancenorm  (explicit below; the name has no norm token)
+    #   block pre-norms       = layernorm     (dataclass default)
+    #   conformer conv        = instancenorm  (dataclass default)
+    #   final output norm     = layernorm     (dataclass default)
+    # Older size/norm presets were pruned 2026-06-29; recover any from git history
+    # or a run's tagged commit if a structural variant (e.g. 128-dim) is needed.
+    "small_deep_3xdownsample_conv2d_attentive": SpeakerInvariantVoiceEncoderConfig(
         encoder_dim=256,
         num_layers=12,
         num_heads=8,
@@ -282,86 +165,5 @@ CONFIGS = {
         ctc_upsample_factor=2,
         downsample_norm_type="instancenorm",
         speaker_pooling="attentive_statistics",
-    ),
-    # Final-norm ablations vs stdhinge11. ONLY final_norm_type differs from
-    # small_deep_3xdownsample_conv2d_layernorm_attentive — frontend stays
-    # instancenorm for a clean single-variable comparison against the existing
-    # stdhinge11 baseline. The named-here "rmsnorm"/"nonorm" refers to the FINAL
-    # norm; the frontend-norm ablation is a separate axis.
-    "small_deep_3xdownsample_conv2d_rmsnorm_attentive": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=256,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        use_conv2d_frontend=True,
-        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
-        conv_strides=[(2, 3), (2, 1), (1, 1)],
-        ctc_upsample_factor=2,
-        downsample_norm_type="instancenorm",
-        final_norm_type="rmsnorm",
-        speaker_pooling="attentive_statistics",
-    ),
-    "small_deep_3xdownsample_conv2d_nonorm_attentive": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=256,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=512,
-        dropout=0.1,
-        use_conv2d_frontend=True,
-        conv_kernel_sizes=[(5, 7), (5, 3), (5, 3)],
-        conv_strides=[(2, 3), (2, 1), (1, 1)],
-        ctc_upsample_factor=2,
-        downsample_norm_type="instancenorm",
-        final_norm_type="none",
-        speaker_pooling="attentive_statistics",
-    ),
-    # ~9.6M params w/ macaron and swiglu, ~3.7M w/o
-    "small": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=256,
-        num_layers=4,
-        num_heads=4,
-        ff_dim=1024,
-        dropout=0.1,
-    ),
-    # ~30M params w/ macaron and swiglu, ~11M w/o
-    "small_deep": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=256,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=1024,
-        dropout=0.1,
-    ),
-    # ~32M params w/ macaron and swiglu, ~11M w/o
-    "medium": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=384,
-        num_layers=6,
-        num_heads=6,
-        ff_dim=1536,
-        dropout=0.1,
-    ),
-    # ~61M params w/ macaron and swiglu, ~23M w/o
-    "medium_deep": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=384,
-        num_layers=12,
-        num_heads=6,
-        ff_dim=1536,
-        dropout=0.1,
-    ),
-    # ~74M params w/ macaron and swiglu, ~27M w/o
-    "large": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=512,
-        num_layers=8,
-        num_heads=8,
-        ff_dim=2048,
-        dropout=0.1,
-    ),
-    # 110M params w/ macaron and swiglu, ~40M w/o
-    "large_deep": SpeakerInvariantVoiceEncoderConfig(
-        encoder_dim=512,
-        num_layers=12,
-        num_heads=8,
-        ff_dim=2048,
-        dropout=0.1,
     ),
 }

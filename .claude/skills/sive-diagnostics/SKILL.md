@@ -16,16 +16,22 @@ leakage = good disentanglement.
 - Default datasets: train `./cached_datasets/voice_sive_gender_train_merged/`,
   val `./cached_datasets/voice_sive_gender_val_merged/`. The val set is ~24.7k
   utterances / ~699 speakers (heavily imbalanced — one speaker ~3.5k utts).
-- Pass the `--config` that MATCHES the checkpoint: `small_deep_3xdownsample_conv2d_layernorm_attentive`
-  (256-dim) for the standard runs, `tiny_deep_3xdownsample_conv2d_layernorm_attentive`
-  (128-dim) for the 128-dim ablation. **Always pass `--num_speakers 3610`** — the
-  config default is stale.
-- **Norm-variant checkpoints:** the config preset defaults `final_norm_type` to
-  `layernorm`. If the run was trained with `--final_norm_type rmsnorm` (or `none`),
-  the eval model MUST be built the same way or the final norm loads wrong and ALL
-  features (hence every number) are silently garbage. Both `per_speaker_leakage.py`
-  and `synthesis_usability.py` take **`--final_norm_type rmsnorm|none`** — pass it
-  to match the checkpoint (omit for standard layernorm runs).
+- Pass the `--config` that MATCHES the checkpoint: there is now a single SIVE
+  preset, `small_deep_3xdownsample_conv2d_attentive` (256-dim). Older size/norm
+  presets (incl. the 128-dim `tiny_deep_*` ablation) were pruned 2026-06-29 —
+  recover one from the run's tagged commit if you need to eval a structural
+  variant. **Always pass `--num_speakers 3610`** — the config default is stale.
+- **Norm-variant checkpoints:** the four norm levers (frontend / block pre-norm /
+  conformer conv / final) are now CLI-overridable at TRAIN time and default to the
+  config's values (instancenorm / layernorm / instancenorm / layernorm). If a run
+  was trained with a non-default norm, the eval model MUST be built the same way
+  or features (hence every number) are silently garbage. `per_speaker_leakage.py`
+  and `synthesis_usability.py` currently only expose **`--final_norm_type
+  rmsnorm|none`** — pass it to match the checkpoint (omit for layernorm-final
+  runs). NOTE: these eval scripts do NOT yet expose `--downsample_norm_type /
+  --block_norm_type / --conv_norm_type`, so a checkpoint trained with a non-default
+  frontend/block/conv norm cannot be matched here yet — add those flags before
+  diagnosing such a run.
 - Checkpoints are HF Trainer dirs: `runs/sive/<run_name>/checkpoint-<step>/` with
   `pytorch_model.bin`.
 
@@ -41,7 +47,7 @@ cross-checkpoint table. Repeat `--checkpoint name=path` for a multi-run contrast
 to npz, so re-running only the probes is instant.
 
 ```
-PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python3 -m megatransformer.scripts.eval.audio.sive.per_speaker_leakage --config small_deep_3xdownsample_conv2d_layernorm_attentive --num_speakers 3610 --val_cache_dir ./cached_datasets/voice_sive_gender_val_merged/ --output_dir ./eval_output/per_speaker_leakage --device cuda --max_samples 0 --min_utts 5 --test_split 0.3 --probe_max_epochs 600 --probe_patience 40 --checkpoint nogrl=runs/sive/<nogrl_run>/checkpoint-224000 --checkpoint grl=runs/sive/<grl_run>/checkpoint-224000
+PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python3 -m megatransformer.scripts.eval.audio.sive.per_speaker_leakage --config small_deep_3xdownsample_conv2d_attentive --num_speakers 3610 --val_cache_dir ./cached_datasets/voice_sive_gender_val_merged/ --output_dir ./eval_output/per_speaker_leakage --device cuda --max_samples 0 --min_utts 5 --test_split 0.3 --probe_max_epochs 600 --probe_patience 40 --checkpoint nogrl=runs/sive/<nogrl_run>/checkpoint-224000 --checkpoint grl=runs/sive/<grl_run>/checkpoint-224000
 ```
 
 Outputs land in `--output_dir`: `per_speaker_leakage_report.md` (read this),
@@ -68,7 +74,7 @@ stored ECAPA embedding, and reports:
   WAVs, and `f0_contours.png`.
 
 ```
-PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python3 -m megatransformer.scripts.eval.audio.sive.synthesis_usability --config small_deep_3xdownsample_conv2d_layernorm_attentive --num_speakers 3610 --val_cache_dir ./cached_datasets/voice_sive_gender_val_merged/ --output_dir ./eval_output/synthesis_usability --device cuda --subset_size 1024 --probe_steps 5000 --dec_width 256 --dec_blocks 6 --num_render 8 --checkpoint name=runs/sive/<run>/checkpoint-300000
+PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python3 -m megatransformer.scripts.eval.audio.sive.synthesis_usability --config small_deep_3xdownsample_conv2d_attentive --num_speakers 3610 --val_cache_dir ./cached_datasets/voice_sive_gender_val_merged/ --output_dir ./eval_output/synthesis_usability --device cuda --subset_size 1024 --probe_steps 5000 --dec_width 256 --dec_blocks 6 --num_render 8 --checkpoint name=runs/sive/<run>/checkpoint-300000
 ```
 
 For a quick bunk-check, add `--no_f0 --num_render 2 --probe_steps 3000` (skips the
@@ -129,8 +135,14 @@ sample's per-layer features evolve across checkpoints. Qualitative only.
    only within the same norm type + same pooling.
 9. **Judge disentanglement at the 300k endpoint, not mid-training.** The slow GRL
    purge does the real work in the back half; mid-training snapshots mislead —
-   a 166k snapshot ranked rmsnorm-final a "keeper" that the 300k endpoint flatly
-   reversed.
+   e.g. grlwup30k's 80k content/eff-dim edge over stdhinge11 fully washed out by
+   the 300k endpoint (tied leakage + recon), reversing the mid-training read.
+10. **Verify config-identity before trusting any A/B.** Diff the *resolved* config
+   (not the run name) — a run renamed without actually changing the variable is a
+   pure noise generator. A "rmsnorm-final" run that never set `final_norm_type`
+   was config-identical to the baseline yet showed 184x-vs-139x macro leakage at
+   300k: that gap was run-to-run trajectory noise, which also sets a sobering
+   floor — treat sub-~1.3x single-run leakage gaps as possibly noise, not signal.
 
 ## Notes
 

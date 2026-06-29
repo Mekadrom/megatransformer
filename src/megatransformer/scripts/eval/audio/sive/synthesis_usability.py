@@ -23,7 +23,7 @@ high retention (low true-L1) + low leakage.
 
 Usage:
     python -m megatransformer.scripts.eval.audio.sive.synthesis_usability \
-        --config small_deep_3xdownsample_conv2d_layernorm_attentive --num_speakers 3610 \
+        --config small_deep_3xdownsample_conv2d_attentive --num_speakers 3610 \
         --val_cache_dir ./cached_datasets/voice_sive_gender_val_merged/ \
         --output_dir ./eval_output/synthesis_usability --vocoder_config hifigan \
         --checkpoint stdhinge11=runs/sive/stdhinge_..._1_1/checkpoint-224000

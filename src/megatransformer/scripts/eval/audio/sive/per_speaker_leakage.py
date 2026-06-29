@@ -29,7 +29,7 @@ intermediate-layer sweep.
 
 Usage:
     python -m megatransformer.scripts.eval.audio.sive.per_speaker_leakage \
-        --config small_deep_3xdownsample_conv2d_layernorm_attentive \
+        --config small_deep_3xdownsample_conv2d_attentive \
         --num_speakers 3610 \
         --val_cache_dir ./cached_datasets/voice_sive_gender_val_merged/ \
         --output_dir ./eval_output/per_speaker_leakage \

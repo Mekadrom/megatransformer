@@ -599,7 +599,7 @@ class SIVETrainer(CommonTrainer):
 
 
 def load_model(args):
-    return model_loading_utils.load_model(SpeakerInvariantVoiceEncoder, args.config,  checkpoint_path=args.resume_from_checkpoint, overrides={
+    overrides = {
         'num_speakers': args.num_speakers,
         'voice_n_mels': args.voice_n_mels,
         # ctc_upsample_factor is intentionally NOT overridden here: the CLI
@@ -639,8 +639,6 @@ def load_model(args):
         'mel_vtlp_boundary_frac': args.mel_vtlp_boundary_frac,
         # Stochastic Depth
         'drop_path_rate': args.drop_path_rate,
-        # Final normalization on encoder output
-        'final_norm_type': args.final_norm_type,
         # Std hinge regularization (disabled unless --use_std_hinge)
         'use_std_hinge': args.use_std_hinge,
         'dim_std_min': args.dim_std_min,
@@ -650,7 +648,23 @@ def load_model(args):
         # Covariance/decorrelation regularization (disabled unless --use_covariance_reg)
         'use_covariance_reg': args.use_covariance_reg,
         'cov_weight': args.cov_weight,
-    })
+    }
+    # Norm levers (frontend / block pre-norm / conformer conv / final norm).
+    # Override the config ONLY when a value is explicitly passed (CLI default is
+    # None), so the config stays the source of truth and a CLI default can't
+    # silently clobber it (the ctc_upsample_factor footgun noted above — which
+    # final_norm_type previously had).
+    _norm_overrides = {
+        'downsample_norm_type': args.downsample_norm_type,
+        'block_norm_type': args.block_norm_type,
+        'conv_norm_type': args.conv_norm_type,
+        'final_norm_type': args.final_norm_type,
+    }
+    overrides.update({k: v for k, v in _norm_overrides.items() if v is not None})
+    return model_loading_utils.load_model(
+        SpeakerInvariantVoiceEncoder, args.config,
+        checkpoint_path=args.resume_from_checkpoint, overrides=overrides,
+    )
 
 
 def create_trainer(
@@ -849,10 +863,22 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--drop_path_rate", type=float, default=0.0,
                             help="Max drop path rate for stochastic depth (linearly scaled per layer, 0=disabled)")
 
-    # Final normalization on SIVE output features
-    sub_parser.add_argument("--final_norm_type", type=str, default="layernorm",
+    # Norm levers. All default to None = use the config's value (override only
+    # when explicitly passed, so a CLI default can't silently clobber the config).
+    # The four SIVE norm sites: frontend conv subsampling, transformer block
+    # pre-norms, conformer depthwise-conv, and the final output norm.
+    sub_parser.add_argument("--downsample_norm_type", type=str, default=None,
+                            choices=["batchnorm", "instancenorm", "groupnorm", "layernorm", "rmsnorm", "none"],
+                            help="Frontend conv-subsampling norm (config default: instancenorm).")
+    sub_parser.add_argument("--block_norm_type", type=str, default=None,
                             choices=["layernorm", "rmsnorm", "none"],
-                            help="Final normalization on encoder output features. "
+                            help="Transformer encoder pre-norms incl. conformer input norm (config default: layernorm).")
+    sub_parser.add_argument("--conv_norm_type", type=str, default=None,
+                            choices=["batchnorm", "instancenorm", "groupnorm", "layernorm", "rmsnorm", "none"],
+                            help="Conformer depthwise-conv norm (config default: instancenorm).")
+    sub_parser.add_argument("--final_norm_type", type=str, default=None,
+                            choices=["layernorm", "rmsnorm", "none"],
+                            help="Final norm on encoder output features (config default: layernorm). "
                                  "'rmsnorm' avoids LN's dim-axis competition; 'none' skips entirely.")
 
     # Std-based hinge on per-dim feature std (disabled by default)
