@@ -115,6 +115,14 @@ def extract_subset(model, dataset, indices, device, batch_size,
 class FiLMConvDecoder(nn.Module):
     def __init__(self, feat_dim=256, emb_dim=192, width=192, n_blocks=4, kernel=5, n_mels=80):
         super().__init__()
+        # Input-norm: per-frame LayerNorm over the feature dim makes the decoder
+        # scale-robust so it can consume ANY final_norm_type (incl. "none", whose
+        # unnormalized scale otherwise diverges this fixed-LR probe). Near-identity
+        # for already-unit-scale (layernorm) features, so it keeps those numbers
+        # essentially unchanged while making no-final-norm readable. Mirrors the
+        # input normalization a real SMG applies to its conditioning, so it
+        # measures content/structure, not the (downstream-irrelevant) raw scale.
+        self.in_norm = nn.LayerNorm(feat_dim)
         self.stem = nn.Conv1d(feat_dim, width, 1)
         self.blocks = nn.ModuleList([
             nn.Conv1d(width, width, kernel, padding=kernel // 2) for _ in range(n_blocks)
@@ -127,6 +135,7 @@ class FiLMConvDecoder(nn.Module):
 
     def forward(self, feat_up, emb):
         # feat_up [B, feat_dim, T], emb [B, emb_dim]
+        feat_up = self.in_norm(feat_up.transpose(1, 2)).transpose(1, 2)  # per-frame LN over feat_dim
         h = self.stem(feat_up)
         film = self.film(emb).view(emb.size(0), self.n_blocks, 2, self.width)
         for i, conv in enumerate(self.blocks):
@@ -156,24 +165,47 @@ def _masked_l1(pred, tgt, mask):
     return (F.l1_loss(pred, tgt, reduction="none") * mask).sum() / (mask.sum() * n_mels + 1e-8)
 
 
-def train_decoder(feats, mels, embs, train_idx, args, device):
-    torch.manual_seed(args.seed)
+def _train_decoder_once(feats, mels, embs, train_idx, args, device, seed):
+    torch.manual_seed(seed)
     dec = FiLMConvDecoder(feat_dim=feats[0].shape[0], emb_dim=embs.shape[1],
                           width=args.dec_width, n_blocks=args.dec_blocks,
                           kernel=args.dec_kernel, n_mels=mels[0].shape[0]).to(device)
-    nparams = sum(p.numel() for p in dec.parameters())
     opt = optim.Adam(dec.parameters(), lr=args.probe_lr)
-    g = torch.Generator().manual_seed(args.seed)
+    g = torch.Generator().manual_seed(seed)
     dec.train()
+    diverged = False
     for step in range(args.probe_steps):
         sel = [train_idx[i] for i in torch.randint(0, len(train_idx), (args.probe_batch,), generator=g).tolist()]
         fb, mb, mask = _collate(feats, mels, sel, device)
         eb = embs[sel].to(device)
         opt.zero_grad()
         loss = _masked_l1(dec(fb, eb), mb, mask)
+        if not torch.isfinite(loss):
+            diverged = True
+            break
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(dec.parameters(), 1.0)  # guard vs gradient blow-up
         opt.step()
-    return dec, nparams
+    return dec, diverged
+
+
+def train_decoder(feats, mels, embs, train_idx, args, device, max_retries=2):
+    # Input-norm + grad-clip should prevent divergence; the NaN-retry (with a
+    # bumped seed) is a last-resort guard so a single bad init can't masquerade as
+    # a feature verdict. Only the decoder init / data order shift on retry — the
+    # eval subset and rendered utterances stay seeded by args.seed, so matched
+    # cross-run A/B audio is preserved.
+    dec = None
+    for attempt in range(max_retries + 1):
+        seed = args.seed + attempt
+        dec, diverged = _train_decoder_once(feats, mels, embs, train_idx, args, device, seed)
+        if not diverged:
+            if attempt:
+                print(f"  [train_decoder] recovered on retry {attempt} (seed {seed})")
+            return dec, sum(p.numel() for p in dec.parameters())
+        print(f"  [train_decoder] non-finite loss at seed {seed}; retrying ({attempt + 1}/{max_retries})")
+    print("  [train_decoder] WARNING: non-finite loss persisted across retries")
+    return dec, sum(p.numel() for p in dec.parameters())
 
 
 @torch.no_grad()

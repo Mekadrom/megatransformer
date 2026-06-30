@@ -9,6 +9,22 @@ Measure how much speaker / gender identity leaks into the frozen SIVE feature
 (the "speaker-invariant" representation SMG and the world model consume). Low
 leakage = good disentanglement.
 
+## ALWAYS run BOTH probes — leakage AND synthesis
+
+A complete SIVE diagnosis is **never just the leakage classifier**. Always run
+**both**:
+1. `per_speaker_leakage.py` — how much identity survives (the classifier view).
+2. `synthesis_usability.py` — does the feature decode back to intelligible
+   speech, **with vocoded WAVs to LISTEN to** (recon-L1, disentangle Δ, F0).
+
+The **human ear on the rendered audio is one of the most crucial metrics** — it
+has repeatedly caught things the leakage classifier *and* mel-L1 both miss
+(pitch/texture collapse, cross-gender conversion quality, "mushy" reconstruction
+that scores fine numerically). Never report a leakage number without running the
+synthesis probe and surfacing its audio alongside. When comparing runs, render
+all checkpoints at the **same fixed `--seed`** (e.g. 7; 42 has diverged before)
+so the WAVs are matched and comparable, then have the user listen.
+
 ## Environment
 
 - Run from the repo root with `PYTHONPATH=src` (the `-m` module path needs it).
@@ -117,11 +133,15 @@ sample's per-layer features evolve across checkpoints. Qualitative only.
 5. The split depends only on `speaker_ids` + `--seed`, so it's identical across
    checkpoints — a clean GRL-vs-no-GRL contrast.
 6. **A recon-L1 outlier or NaN is a diverged probe, not a feature verdict.** The
-   synthesis decoder has no grad-clip / NaN-guard, so a bad seed can produce a
-   garbage recon-L1 (e.g. ~2.4 vs the normal ~1.0–1.1) plus NaN F0/centroid and
-   absurd Δ that *mimics* a real regression. Re-run with a different `--seed`
-   before trusting; if it normalizes, the first was divergence (this happened —
-   it nearly read as a "2× worse" run).
+   decoder is now hardened (2026-06-30): a learnable per-frame **input-norm** makes
+   it scale-robust (so `final_norm_type=none`'s unnormalized features decode fine —
+   previously they diverged to ~3.1 across *every* seed), plus **grad-clip** and a
+   **NaN-retry** (bumped seed) guard. This measures content/structure, not raw
+   scale — faithful to what a real SMG does — and is uniform across all final-norm
+   types, so the numbers stay comparable. Divergence should now be rare; if a
+   recon-L1 outlier (≫ the ~1.0–1.1 norm) or NaN still appears, re-run with a
+   different `--seed` before trusting it. (Historical: an un-hardened bad seed once
+   nearly read as a "2× worse" run.)
 7. **For a perceptual A/B, render both checkpoints at the SAME `--seed`.** The
    seed fixes the eval subset *and* decoder init, so cross-seed audio compares
    different utterances entirely. Compare matched `recon_true.wav` pairs only
