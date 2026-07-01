@@ -264,13 +264,21 @@ def render_samples(dec, feats, mels, embs, spks, gens, eval_idx, vocoder, args, 
             j = next((o for o in eval_idx if spks[o] != spks[i]), i)
         pred_shuf = dec(f, embs[j:j + 1].to(device))[0].cpu()
         gj = gmap[int(gens[j])]
+        spk_j = int(spks[j])
 
         fig = visualization.render_mel_comparison(pred_true.numpy(), tgt.numpy())
         fig.savefig(os.path.join(out, f"sample{k}_spk{int(spks[i])}_{gmap[gi]}_mel.png"), dpi=100)
         plt.close(fig)
 
         if vocoder is not None:
-            for tag, mel in [("target", tgt), ("recon_true", pred_true), (f"recon_wrong_{gj}", pred_shuf)]:
+            # xref = the ACTUAL target speaker the cross/wrong embedding came from
+            # (GT mel of utterance j, vocoded). A reference so the cross-conversion
+            # (recon_wrong) can be judged against the real target voice rather than
+            # just a male/female label.
+            renders = [("target", tgt), ("recon_true", pred_true),
+                       (f"recon_wrong_{gj}", pred_shuf),
+                       (f"xref_spk{spk_j}_{gj}", mels[j])]
+            for tag, mel in renders:
                 try:
                     wav = visualization.render_vocoder_audio(vocoder, mel.to(torch.float32))
                     wav = np.clip(np.asarray(wav), -1, 1)

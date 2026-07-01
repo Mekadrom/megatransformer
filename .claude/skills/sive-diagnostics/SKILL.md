@@ -88,6 +88,11 @@ stored ECAPA embedding, and reports:
 - **gender-stratified** recon + **cross-gender re-pitch** (F0 via torchcrepe) +
   per-run mel-comparison figures, vocoded `target`/`recon_true`/`recon_wrong_<g>`
   WAVs, and `f0_contours.png`.
+- **`xref_spk<j>_<g>` WAV** = the ACTUAL target speaker `j` the cross/wrong
+  embedding came from (vocoded GT mel). The listening A/B is `recon_wrong_<g>` vs
+  `xref_spk<j>_<g>`: did the cross-conversion land on *that* speaker, not just a
+  gender? Same `j` is used across all runs at a given sample index (seed-fixed
+  subset), so one shared reference lines up against every run's conversion.
 
 ```
 PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python3 -m megatransformer.scripts.eval.audio.sive.synthesis_usability --config small_deep_3xdownsample_conv2d_attentive --num_speakers 3610 --val_cache_dir ./cached_datasets/voice_sive_gender_val_merged/ --output_dir ./eval_output/synthesis_usability --device cuda --subset_size 1024 --probe_steps 5000 --dec_width 256 --dec_blocks 6 --num_render 8 --checkpoint name=runs/sive/<run>/checkpoint-300000
