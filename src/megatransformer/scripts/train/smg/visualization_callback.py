@@ -389,20 +389,20 @@ class SMGVisualizationCallback(VisualizationCallback):
                         cross_a_trimmed = cross_recon_a_with_b[0].squeeze(0).float().cpu().numpy()[..., :sample_a["mel_length"]]
 
                         metrics.log_text(
-                            f"eval_smg/cross_speaker/pair{pair_idx}",
+                            f"eval_smg/cross_speaker/pair{pair_idx}_ab",
                             f"content{sample_a_idx}_spk{sample_b_idx}",
                             global_step
                         )
                         fig = visualization.render_mel_spectrogram(mel_a_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
-                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/original", fig, global_step)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}_ab/original", fig, global_step)
                         plt.close(fig)
 
                         fig = visualization.render_mel_spectrogram(cross_a_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
-                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/reconstruction", fig, global_step)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}_ab/reconstruction", fig, global_step)
                         plt.close(fig)
 
                         fig = visualization.render_mel_comparison(cross_a_trimmed, mel_a_trimmed)
-                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/comparison", fig, global_step)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}_ab/comparison", fig, global_step)
                         plt.close(fig)
 
                         # Log B with A's speaker
@@ -410,20 +410,20 @@ class SMGVisualizationCallback(VisualizationCallback):
                         cross_b_trimmed = cross_recon_b_with_a[0].squeeze(0).float().cpu().numpy()[..., :sample_b["mel_length"]]
 
                         metrics.log_text(
-                            f"eval_smg/cross_speaker/pair{pair_idx}",
+                            f"eval_smg/cross_speaker/pair{pair_idx}_ba",
                             f"content{sample_b_idx}_spk{sample_a_idx}",
                             global_step
                         )
                         fig = visualization.render_mel_spectrogram(mel_b_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
-                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/original", fig, global_step)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}_ba/original", fig, global_step)
                         plt.close(fig)
 
                         fig = visualization.render_mel_spectrogram(cross_b_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
-                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/reconstruction", fig, global_step)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}_ba/reconstruction", fig, global_step)
                         plt.close(fig)
 
                         fig = visualization.render_mel_comparison(cross_b_trimmed, mel_b_trimmed)
-                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}/comparison", fig, global_step)
+                        metrics.log_figure(f"eval_smg/cross_speaker/pair{pair_idx}_ba/comparison", fig, global_step)
                         plt.close(fig)
 
                         # Log audio if vocoder available
