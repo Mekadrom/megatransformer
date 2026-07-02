@@ -123,9 +123,16 @@ def _load_pretrained_hifigan():
     huggingface_hub.hf_hub_download = _patched_hf_download
 
     try:
+        # Pass an explicit, parseable device string. SpeechBrain otherwise
+        # auto-detects the bare string "cuda", fails to split it into
+        # (type, index), and prints "Could not parse CUDA device string 'cuda'
+        # ... Falling back to device 0". The fallback lands on the right GPU
+        # anyway (CUDA_VISIBLE_DEVICES remaps it to index 0), so this is purely
+        # cosmetic — it just silences the warning.
         hifi_gan = HIFIGAN.from_hparams(
             source="speechbrain/tts-hifigan-libritts-16kHz",
             savedir="pretrained_models/tts-hifigan-libritts-16kHz",
+            run_opts={"device": "cuda:0" if torch.cuda.is_available() else "cpu"},
         )
     finally:
         huggingface_hub.hf_hub_download = _original_hf_download
