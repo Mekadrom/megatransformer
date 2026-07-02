@@ -239,7 +239,8 @@ class SMGTrainer(CommonTrainer):
         global_step = self.state.global_step + self.step_offset
 
         # gets reset any time training is resumed; it can be assumed that the cli changed, so log at the step value it was resumed from
-        if not self.has_logged_cli and torch.distributed.get_rank() == 0:
+        is_main_process = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        if not self.has_logged_cli and is_main_process:
             metrics.log_text("training/command_line", self.cmdline, global_step)
             metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
             metrics.log_text("training/model_architecture", str(model), global_step)
@@ -1013,7 +1014,7 @@ class SMGTrainer(CommonTrainer):
         print(f"  N FFT: {args.voice_n_fft}")
         print(f"  Hop length: {args.voice_hop_length}")
         print(f"  Max voice: {args.voice_max_seconds} seconds")
-        print(f"  Latent channels: {args.latent_channels}")
+        print(f"  SIVE encoder dim: {args.sive_encoder_dim}")
         print(f"  Speaker encoder type: {args.speaker_encoder_type}")
         print(f"  Speaker embedding dim: {args.speaker_embedding_dim}")
         print(f"  Speaker embedding proj dim: {args.speaker_embedding_proj_dim} (0=no projection)")
@@ -1080,7 +1081,7 @@ class SMGTrainer(CommonTrainer):
 
 def load_model(args):
     return model_loading_utils.load_model(SMG, args.config, checkpoint_path=args.resume_from_checkpoint, overrides={
-        "latent_channels": args.latent_channels,
+        "sive_encoder_dim": args.sive_encoder_dim,
     })
 
 
@@ -1317,8 +1318,8 @@ def add_cli_args(subparsers):
                             help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
 
     # SMG settings
-    sub_parser.add_argument("--latent_channels", type=int, default=32,
-                           help="Number of latent channels in the SMG input (from SIVE upstream)")
+    sub_parser.add_argument("--sive_encoder_dim", type=int, default=256,
+                           help="Channel width of the SIVE encoder features fed into the SMG (SMG decoder input dim). Must match the upstream SIVE encoder_dim (currently 256)")
     # Speaker encoder type determines embedding dimension
     sub_parser.add_argument("--speaker_encoder_type", type=str, default="ecapa_tdnn",
                            help="Type of pretrained speaker encoder to use (ecapa_tdnn or wavlm)")
@@ -1394,8 +1395,8 @@ def add_cli_args(subparsers):
                            help="Weight for SIVE perceptual loss (0 = disabled)")
     sub_parser.add_argument("--sive_perceptual_checkpoint_path", type=str, default=None,
                            help="Path to frozen SIVE checkpoint for perceptual loss")
-    sub_parser.add_argument("--sive_perceptual_config", type=str, default="tiny_deep_3xdownsample_conv2d_batchnorm_attentive",
-                           help="SIVE config name for perceptual loss model")
+    sub_parser.add_argument("--sive_perceptual_config", type=str, default="small_deep_3xdownsample_conv2d_attentive",
+                           help="SIVE config name for perceptual loss model (must be a live SIVE preset and match the perceptual checkpoint's norm settings)")
     sub_parser.add_argument("--sive_perceptual_layer", type=int, default=-1,
                            help="SIVE layer to extract features from (-1 = final, e.g. 10 for layer 10)")
     sub_parser.add_argument("--sive_perceptual_loss_start_step", type=int, default=0,

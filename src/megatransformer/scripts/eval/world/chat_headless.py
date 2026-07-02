@@ -17,7 +17,7 @@ Imports a few decode/render helpers from `multimodal_chat.py` to avoid code
 duplication.
 
 Usage:
-    python -m megatransformer.scripts.eval.world.chat_headless --checkpoint_path runs/world/my_run/checkpoint-N --config small_sum_dit --include_modes text,voice,image --tie_word_embeddings --bf16 --voice_smg_checkpoint_path ./runs/smg/.../checkpoint-300000 --voice_smg_config medium_decoder_only_1d_3x --voice_smg_latent_channels 128 --vocoder_config hifigan --image_vae_decoder_config litevae --static_speaker_embedding_path ./logs/speaker_embedding_1.pt --image_latent_channel_scales 0.975,1.027,1.009,1.195,1.259,1.173,1.265,0.932,1.144,0.888,0.522,0.748 --host 127.0.0.1 --port 7861 --session_dir ./runs/headless_sessions --whisper_model base
+    python -m megatransformer.scripts.eval.world.chat_headless --checkpoint_path runs/world/my_run/checkpoint-N --config small_sum_dit --include_modes text,voice,image --tie_word_embeddings --bf16 --voice_smg_checkpoint_path ./runs/smg/.../checkpoint-300000 --voice_smg_config medium_decoder_only_1d_3x --voice_smg_sive_encoder_dim 256 --vocoder_config hifigan --image_vae_decoder_config litevae --static_speaker_embedding_path ./logs/speaker_embedding_1.pt --image_latent_channel_scales 0.975,1.027,1.009,1.195,1.259,1.173,1.265,0.932,1.144,0.888,0.522,0.748 --host 127.0.0.1 --port 7861 --session_dir ./runs/headless_sessions --whisper_model base
 
 Client side (curl):
     curl -s -X POST http://127.0.0.1:7861/generate -H 'Content-Type: application/json' -d '{"prompt":"a photo of a red car.","modality_hint":"image","seed":42}' | jq .
@@ -97,7 +97,7 @@ def parse_args():
     # Voice SMG + vocoder
     p.add_argument("--voice_smg_checkpoint_path", type=str, default=None)
     p.add_argument("--voice_smg_config", type=str, default="medium_decoder_only_1d_3x")
-    p.add_argument("--voice_smg_latent_channels", type=int, default=None)
+    p.add_argument("--voice_smg_sive_encoder_dim", type=int, default=None)
     p.add_argument("--vocoder_config", type=str, default="hifigan")
     p.add_argument("--vocoder_checkpoint_path", type=str, default=None)
     p.add_argument("--static_speaker_embedding_path", type=str, default=None)
@@ -184,8 +184,8 @@ class Runner:
             print(f"[runner] Loading voice SMG ({args.voice_smg_config})...")
             from megatransformer.model.smg.smg import SMG
             smg_overrides = {}
-            if args.voice_smg_latent_channels is not None:
-                smg_overrides["latent_channels"] = args.voice_smg_latent_channels
+            if args.voice_smg_sive_encoder_dim is not None:
+                smg_overrides["sive_encoder_dim"] = args.voice_smg_sive_encoder_dim
             self.smg_decoder = model_loading_utils.load_model(
                 SMG, args.voice_smg_config,
                 checkpoint_path=args.voice_smg_checkpoint_path,

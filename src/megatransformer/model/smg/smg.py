@@ -38,8 +38,8 @@ class SMGDecoder2D(nn.Module):
         # Effective speaker dim for FiLM
         self.film_speaker_dim = config.speaker_embedding_proj_dim if config.speaker_embedding_proj_dim > 0 else config.speaker_embedding_dim
 
-        # Input dim is just latent (F0 is injected after 1D→2D transition)
-        decoder_input_dim = config.latent_channels
+        # Input dim is the SIVE encoder feature width (F0 is injected after 1D→2D transition)
+        decoder_input_dim = config.sive_encoder_dim
 
         self.scale_factors_2d = config.scale_factors_2d
 
@@ -380,7 +380,7 @@ class SMGDecoder1D(nn.Module):
             )
 
         # Initial projection from latent to working channels
-        self.initial_conv = nn.Conv1d(config.latent_channels, config.initial_channels, kernel_size=3, padding=1)
+        self.initial_conv = nn.Conv1d(config.sive_encoder_dim, config.initial_channels, kernel_size=3, padding=1)
         self.initial_norm = nn.GroupNorm(max(1, config.initial_channels // 4), config.initial_channels)
         self.initial_act = self.get_activation(config.initial_channels)
 
@@ -827,10 +827,9 @@ class SMG(nn.Module):
     SMG (SIVE-Mel Generator): deterministic decoder for mel spectrogram generation from
     latent + speaker + F0.
 
-    This is a decoder-only model — the external caller provides the latent representation
-    (e.g. from a SIVE encoder upstream). Despite the historical name "CVAE", there is no
-    encoder and no reparameterization trick; conditioning on speaker + F0 is what makes
-    this generative.
+    This is a decoder-only model — the external caller provides the SIVE encoder features
+    (e.g. from a frozen SIVE encoder upstream). There is no encoder and no reparameterization
+    trick; conditioning on speaker + F0 is what makes this generative.
 
     Input: [B, latent_dim, T'] latent representation
     Output: [B, n_mels, T] generated mel spectrogram
@@ -881,11 +880,17 @@ class SMG(nn.Module):
             config_dict.update(overrides)
             decoder = SMGDecoder2D.from_config(config.decoder_config, **config_dict)
 
-        overrides.pop('latent_channels', None)  # F0 and F0 conditioning can't take this
+        # The F0 predictor consumes the SAME SIVE features as the decoder (via its
+        # sive_proj), so its encoder_dim must track sive_encoder_dim — not
+        # F0PredictorConfig's own default. Capture the effective value (CLI override
+        # if given, else the decoder config's) before popping.
+        active_decoder_cfg = config.decoder_1d_config if config.decoder_1d_config is not None else config.decoder_config
+        sive_encoder_dim = overrides.pop('sive_encoder_dim', active_decoder_cfg.sive_encoder_dim)
         overrides.pop('activation', None)
 
         config_dict = {k: v for k, v in config.f0_predictor_config.__dict__.items()}
         config_dict.update(overrides)
+        config_dict['encoder_dim'] = sive_encoder_dim  # F0 predictor reads SIVE features too
         f0_predictor = F0Predictor.from_config(config.f0_predictor_config, **config_dict)
         config_dict = {k: v for k, v in config.f0_conditioning_embedding_config.__dict__.items()}
         config_dict.update(overrides)

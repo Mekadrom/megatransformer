@@ -10,7 +10,9 @@ class SMGDecoder2DConfig:
     """Configuration for 2D SMG (SIVE-Mel Generator) decoder."""
 
     # architecture parameters
-    latent_channels: int = 16
+    # Channel width of the SIVE encoder features fed into the decoder (the
+    # decoder input dim). Defaults to the current SIVE encoder_dim (256).
+    sive_encoder_dim: int = 256
 
     activation: str = "silu"
 
@@ -82,7 +84,9 @@ class SMGDecoder1DConfig:
     Avoids ring artifacts caused by Conv2D spatial isotropy assumption.
     """
 
-    latent_channels: int = 16
+    # Channel width of the SIVE encoder features fed into the decoder (the
+    # decoder input dim). Defaults to the current SIVE encoder_dim (256).
+    sive_encoder_dim: int = 256
     activation: str = "silu"
 
     # Speaker conditioning (FiLM)
@@ -162,7 +166,9 @@ SMG_DECODER_1D_CONFIGS = {
 @dataclass
 class F0PredictorConfig:
     speaker_embedding_dim: int = 192
-    encoder_dim: int = 128
+    # Width of the SIVE encoder features consumed by the F0 predictor's sive_proj.
+    # SMG.from_config wires this from sive_encoder_dim; default tracks current SIVE (256).
+    encoder_dim: int = 256
     hidden_dim: int = 256
     n_layers: int = 3
     kernel_size: int = 5

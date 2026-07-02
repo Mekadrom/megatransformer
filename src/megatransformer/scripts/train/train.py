@@ -373,8 +373,8 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             try:
                 from megatransformer.model.smg.smg import SMG
                 smg_overrides = {}
-                if getattr(args, 'voice_smg_latent_channels', None) is not None:
-                    smg_overrides["latent_channels"] = args.voice_smg_latent_channels
+                if getattr(args, 'voice_smg_sive_encoder_dim', None) is not None:
+                    smg_overrides["sive_encoder_dim"] = args.voice_smg_sive_encoder_dim
                 voice_smg_decoder = model_loading_utils.load_model(
                     SMG,
                     getattr(args, 'voice_smg_config', 'small'),

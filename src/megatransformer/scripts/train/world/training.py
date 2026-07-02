@@ -1508,8 +1508,8 @@ def add_cli_args(subparsers):
                             help="Path to voice SMG decoder checkpoint for decoding SIVE latents to mel specs")
     sub_parser.add_argument("--voice_smg_config", type=str, default="small",
                             help="Voice SMG decoder config name")
-    sub_parser.add_argument("--voice_smg_latent_channels", type=int, default=None,
-                            help="Override latent_channels for voice SMG (must match what it was trained with)")
+    sub_parser.add_argument("--voice_smg_sive_encoder_dim", type=int, default=None,
+                            help="Override sive_encoder_dim for voice SMG (must match what it was trained with)")
     sub_parser.add_argument("--static_speaker_embedding_path", type=str, default=None,
                             help="Path to a .pt file containing a speaker embedding tensor for static-speaker voice decoding")
     sub_parser.add_argument("--num_eval_samples", type=int, default=4,

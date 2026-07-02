@@ -14,7 +14,7 @@ UX:
   appended to the prompt
 
 Usage:
-    python -m megatransformer.scripts.eval.world.multimodal_chat --checkpoint_path runs/world/my_run/checkpoint-3000 --config small_sum_dit --include_modes text,voice,image --tie_word_embeddings --bf16 --sive_checkpoint_path ./checkpoints/sive --sive_config tiny_deep --voice_smg_checkpoint_path ./checkpoints/smg --voice_smg_config medium_decoder_only_1d_3x --voice_smg_latent_channels 128 --vocoder_config hifigan --image_vae_decoder_config litevae --static_speaker_embedding_path ./logs/speaker_embedding_1.pt
+    python -m megatransformer.scripts.eval.world.multimodal_chat --checkpoint_path runs/world/my_run/checkpoint-3000 --config small_sum_dit --include_modes text,voice,image --tie_word_embeddings --bf16 --sive_checkpoint_path ./checkpoints/sive --sive_config tiny_deep --voice_smg_checkpoint_path ./checkpoints/smg --voice_smg_config medium_decoder_only_1d_3x --voice_smg_sive_encoder_dim 256 --vocoder_config hifigan --image_vae_decoder_config litevae --static_speaker_embedding_path ./logs/speaker_embedding_1.pt
 """
 
 import argparse
@@ -84,7 +84,7 @@ def parse_args():
     # Voice SMG + vocoder (for decoding generated voice)
     p.add_argument("--voice_smg_checkpoint_path", type=str, default=None)
     p.add_argument("--voice_smg_config", type=str, default="medium_decoder_only_1d_3x")
-    p.add_argument("--voice_smg_latent_channels", type=int, default=None)
+    p.add_argument("--voice_smg_sive_encoder_dim", type=int, default=None)
     p.add_argument("--vocoder_config", type=str, default="hifigan")
     p.add_argument("--vocoder_checkpoint_path", type=str, default=None)
     p.add_argument("--static_speaker_embedding_path", type=str, default=None,
@@ -411,8 +411,8 @@ def main():
         print(f"Loading voice SMG ({args.voice_smg_config})...")
         from megatransformer.model.smg.smg import SMG
         smg_overrides = {}
-        if args.voice_smg_latent_channels is not None:
-            smg_overrides["latent_channels"] = args.voice_smg_latent_channels
+        if args.voice_smg_sive_encoder_dim is not None:
+            smg_overrides["sive_encoder_dim"] = args.voice_smg_sive_encoder_dim
         smg_decoder = model_loading_utils.load_model(
             SMG, args.voice_smg_config,
             checkpoint_path=args.voice_smg_checkpoint_path,

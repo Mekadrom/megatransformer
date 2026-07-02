@@ -83,16 +83,16 @@ def main():
     sive.eval()
     print(f"SIVE loaded ({sum(p.numel() for p in sive.parameters()):,} params)")
 
-    # Load SMG — auto-wire latent_channels from SIVE encoder_dim
+    # Load SMG — auto-wire sive_encoder_dim from SIVE encoder_dim
     sive_encoder_dim = sive.config.encoder_dim
     print(f"Loading SMG ({args.smg_config}) from {args.smg_checkpoint_path}")
-    print(f"  Auto-wiring latent_channels={sive_encoder_dim} from SIVE encoder_dim")
+    print(f"  Auto-wiring sive_encoder_dim={sive_encoder_dim} from SIVE encoder_dim")
     smg = load_model(
         SMG,
         args.smg_config,
         checkpoint_path=args.smg_checkpoint_path,
         device=device,
-        overrides={"latent_channels": sive_encoder_dim},
+        overrides={"sive_encoder_dim": sive_encoder_dim},
     )
     smg.eval()
     print(f"SMG loaded ({sum(p.numel() for p in smg.parameters()):,} params)")

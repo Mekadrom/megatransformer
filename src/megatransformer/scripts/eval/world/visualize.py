@@ -85,7 +85,7 @@ def parse_args():
     p.add_argument("--image_vae_decoder_config", type=str, default=None)
     p.add_argument("--voice_smg_checkpoint_path", type=str, default=None)
     p.add_argument("--voice_smg_config", type=str, default="small")
-    p.add_argument("--voice_smg_latent_channels", type=int, default=None)
+    p.add_argument("--voice_smg_sive_encoder_dim", type=int, default=None)
     p.add_argument("--static_speaker_embedding_path", type=str, default=None)
 
     # Model overrides
@@ -217,8 +217,8 @@ def load_decoders(args):
         try:
             from megatransformer.model.smg.smg import SMG
             smg_overrides = {}
-            if args.voice_smg_latent_channels is not None:
-                smg_overrides["latent_channels"] = args.voice_smg_latent_channels
+            if args.voice_smg_sive_encoder_dim is not None:
+                smg_overrides["sive_encoder_dim"] = args.voice_smg_sive_encoder_dim
             voice_smg_decoder = model_loading_utils.load_model(
                 SMG,
                 args.voice_smg_config,
