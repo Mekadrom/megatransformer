@@ -471,7 +471,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
 
         self.sive_batch_processor = None
         if args.sive_checkpoint_path is not None:
-            model_config_overrides = {}
+            model_config_overrides = {'num_speakers': args.num_speakers}
             if args.speaker_classifier_hidden_dim:
                 model_config_overrides['speaker_classifier_hidden_dim'] = args.speaker_classifier_hidden_dim
             if args.speaker_pooling:
@@ -655,8 +655,11 @@ class VoiceDatasetPreprocessor(Preprocessor):
         # SIVE model
         sub_parser.add_argument("--sive_checkpoint_path", type=str,
                             help="Path to SIVE checkpoint directory. If not specified, features are not saved.")
-        sub_parser.add_argument("--sive_config", type=str, default="small",
-                            help="SIVE config name (tiny, small, medium, large)")
+        sub_parser.add_argument("--sive_config", type=str, default="small_deep_3xdownsample_conv2d_attentive",
+                            help="SIVE config name (must be a live preset; collapsed to a single preset in the 2026-06 prune)")
+        sub_parser.add_argument("--num_speakers", type=int, default=3610,
+                            help="num_speakers the SIVE checkpoint was trained with; sizes the speaker-classifier head, "
+                                 "so it must match the checkpoint or the load fails on a shape mismatch. Current runs use 3610.")
         
         # Feature extraction options
         sub_parser.add_argument("--normalize", action="store_true", default=False,
