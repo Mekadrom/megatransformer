@@ -58,6 +58,29 @@ from megatransformer.utils import visualization
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def _load_speaker_ids(dataset):
+    """Map global sample index -> speaker_id by concatenating each shard's
+    speaker_ids column in shard order (matches VoiceShardedDataset indexing).
+    Cached to a .npy in the shard dir so repeat runs skip the scan."""
+    cache = os.path.join(dataset.shard_dir, "_speaker_ids_index.npy")
+    if os.path.exists(cache):
+        arr = np.load(cache)
+        if len(arr) == dataset.total_samples:
+            return arr
+    ids = []
+    for sf in tqdm(dataset.shard_files, desc="Indexing speaker_ids"):
+        d = torch.load(os.path.join(dataset.shard_dir, sf), map_location="cpu", weights_only=False)
+        s = d["speaker_ids"]
+        ids.extend(s.tolist() if isinstance(s, torch.Tensor) else list(s))
+    arr = np.asarray(ids, dtype=np.int64)
+    try:
+        np.save(cache, arr)
+    except Exception:
+        pass
+    return arr
+
+
+@torch.no_grad()
 def extract_subset(model, dataset, indices, device, batch_size,
                    sr, n_mels, n_fft, hop_length):
     """For each chosen utterance, return (feat_up [256,T], mel [n_mels,T], emb [E],
@@ -545,6 +568,12 @@ def main():
     ap.add_argument("--shard_cache_size", type=int, default=8)
     # subset / split
     ap.add_argument("--subset_size", type=int, default=1024)
+    ap.add_argument("--max_speaker_id", type=int, default=None,
+                    help="Restrict the eval subset to utterances whose speaker_id < this value. "
+                         "In the merged val set LibriSpeech occupies the first 2338 IDs, so "
+                         "--max_speaker_id 2338 restricts the whole diagnostic to clean LibriSpeech "
+                         "speakers (matches the SMG's clean-audio use case; also excludes the "
+                         "3485-utt VoxPopuli speaker 3605 that otherwise swamps the random subset).")
     ap.add_argument("--eval_frac", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
     # decoder + probe budget
@@ -577,7 +606,16 @@ def main():
         columns=["waveforms", "mel_specs", "speaker_embeddings", "speaker_ids", "gender_ids"])
     n_total = len(dataset)
     rng = np.random.RandomState(args.seed)
-    subset_indices = sorted(rng.choice(n_total, size=min(args.subset_size, n_total), replace=False).tolist())
+    if args.max_speaker_id is not None:
+        spk_ids = _load_speaker_ids(dataset)
+        pool = np.where(spk_ids < args.max_speaker_id)[0]
+        print(f"[max_speaker_id={args.max_speaker_id}] {len(pool)}/{n_total} utts eligible "
+              f"(speaker_id < {args.max_speaker_id})")
+        if len(pool) == 0:
+            ap.error(f"no utterances with speaker_id < {args.max_speaker_id}")
+    else:
+        pool = np.arange(n_total)
+    subset_indices = sorted(rng.choice(pool, size=min(args.subset_size, len(pool)), replace=False).tolist())
 
     vocoder = None
     if not args.no_audio:

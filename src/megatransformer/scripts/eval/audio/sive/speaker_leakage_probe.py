@@ -68,11 +68,24 @@ from tqdm import tqdm
 from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
 from megatransformer.utils.model_loading_utils import load_model
+from megatransformer.utils.audio_utils import SharedWindowBuffer, extract_mels
 
 
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
+
+
+def _sample_to_mel(sample, buf, sr, n_mels, n_fft, hop_length):
+    """Return (mel [n_mels, T], length). Uses a precomputed mel when present,
+    otherwise extracts it from the waveform with the exact training mel params
+    (the merged voice_sive_gender_*_merged shards store waveforms only)."""
+    if "mel_spec" in sample:
+        return sample["mel_spec"], int(sample["mel_length"])
+    wav_len = int(sample["waveform_length"])
+    wav = sample["waveform"][:wav_len].to(torch.float32)
+    mel = extract_mels(buf, wav, sr=sr, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length)  # [n_mels, T]
+    return mel, mel.shape[-1]
 
 @torch.no_grad()
 def extract_all_layer_features(
@@ -82,6 +95,10 @@ def extract_all_layer_features(
     device: str,
     batch_size: int = 32,
     mlp_probe_layer: int = 10,
+    sr: int = 16000,
+    n_mels: int = 80,
+    n_fft: int = 1024,
+    hop_length: int = 256,
 ) -> tuple[list[np.ndarray], np.ndarray, list[np.ndarray], np.ndarray, Optional[np.ndarray]]:
     """
     Run the SIVE encoder over the dataset and collect:
@@ -103,6 +120,7 @@ def extract_all_layer_features(
     """
     model.eval()
     num_samples = min(len(dataset), max_samples)
+    buf = SharedWindowBuffer()  # for on-the-fly mel extraction from waveform-only shards
 
     # Accumulate per-layer lists
     layer_accum: list[list[np.ndarray]] | None = None
@@ -120,8 +138,9 @@ def extract_all_layer_features(
         lengths = []
         for i in range(idx, end):
             sample = dataset[i]
-            mel_specs.append(sample["mel_spec"])        # [n_mels, T]
-            lengths.append(sample["mel_length"])
+            mel, mel_len = _sample_to_mel(sample, buf, sr, n_mels, n_fft, hop_length)
+            mel_specs.append(mel)                        # [n_mels, T]
+            lengths.append(mel_len)
             speaker_ids_list.append(sample["speaker_id"])
             ctc_len = sample["ctc_length"]
             ctc_tokens_list.append(
@@ -757,6 +776,12 @@ def main():
                         help="Training epochs for the MLP probe (default: same as linear)")
     parser.add_argument("--mlp_probe_lr", type=float, default=1e-3,
                         help="Learning rate for MLP probe (default: 1e-3, lower than linear)")
+
+    # Mel params for on-the-fly extraction from waveform-only shards (must match training)
+    parser.add_argument("--voice_sample_rate", type=int, default=16000)
+    parser.add_argument("--voice_n_mels", type=int, default=80)
+    parser.add_argument("--voice_n_fft", type=int, default=1024)
+    parser.add_argument("--voice_hop_length", type=int, default=256)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -783,7 +808,7 @@ def main():
     print(f"Loading dataset from {args.cache_dir}...")
     dataset = VoiceShardedDataset(
         args.cache_dir,
-        columns=["mel_specs", "speaker_ids", "ctc_tokens", "gender_ids"],
+        columns=["waveforms", "mel_specs", "speaker_ids", "ctc_tokens", "gender_ids"],
     )
 
     # ---- 3. Extract features ----
@@ -792,6 +817,8 @@ def main():
         model, dataset, args.max_samples, args.device,
         batch_size=args.extraction_batch_size,
         mlp_probe_layer=args.mlp_probe_layer,
+        sr=args.voice_sample_rate, n_mels=args.voice_n_mels,
+        n_fft=args.voice_n_fft, hop_length=args.voice_hop_length,
     )
     num_total_layers = len(layer_features)
     all_layer_names = get_layer_names(num_total_layers - 1)
