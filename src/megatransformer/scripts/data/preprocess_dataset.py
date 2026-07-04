@@ -111,6 +111,20 @@ def _stat_shards(args):
         print("No shard files found in any directory.")
         exit(1)
 
+    # Fail fast on a speaker_id_column typo: if a column was requested but no IDs
+    # were collected from any shard, stat-shards would otherwise silently write an
+    # un-remapped index with no num_speakers (e.g. passing 'speaker_id' when the
+    # shards actually store 'speaker_ids').
+    if col is not None and not all_speaker_ids:
+        first_dir = next(iter(dir_info))
+        first_shard = dir_info[first_dir][0][0]
+        sh = torch.load(os.path.join(first_dir, first_shard), map_location="cpu", weights_only=False)
+        avail = sorted(k for k in sh.keys() if k != "num_samples")
+        raise SystemExit(
+            f"--speaker_id_column '{col}' not found in any shard (0 IDs collected); "
+            f"no remap performed. Available shard columns: {avail}"
+        )
+
     # Build global dense mapping
     num_speakers = 0
     if col is not None and all_speaker_ids:
