@@ -185,6 +185,16 @@ sample's per-layer features evolve across checkpoints. Qualitative only.
    median over a voiced minority — the typical cross recon had NO extractable pitch
    (an empty red line in `f0_contours.png`), which is exactly how covreg @100k read
    192. Low `cross voiced%` ⇒ treat the cross-emb F0 as noise and trust the ear.
+12. **Only compare runs at the SAME step count.** SIVE features drift continuously
+   over training (the GRL purge does most of its work in the back half — see caveat
+   #9), so a run @100k vs another @300k is a training-stage confound, not a
+   variant/regularizer contrast — even leakage direction can flip between stages.
+   Always pick a checkpoint step that BOTH runs have on disk (`ls
+   runs/sive/<run>/ | grep checkpoint`; note HF prunes to the last N unless
+   `save_total_limit` is unset, so the overlap may be a mid-training step, not the
+   latest of either) and pass that same `checkpoint-<step>` for every `--checkpoint`
+   arg. If one run hasn't reached the other's latest yet, compare at the lower run's
+   latest, don't compare mismatched steps.
 
 ## Notes
 
