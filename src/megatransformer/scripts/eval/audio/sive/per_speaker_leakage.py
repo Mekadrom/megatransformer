@@ -143,7 +143,10 @@ def cached_features(args, name, ckpt_path):
         SpeakerInvariantVoiceEncoder, args.config, checkpoint_path=ckpt_path,
         device=args.device,
         overrides={"num_speakers": args.num_speakers,
-                   **({"final_norm_type": args.final_norm_type} if args.final_norm_type else {})},
+                   **{k: v for k, v in {"final_norm_type": args.final_norm_type,
+                                        "downsample_norm_type": args.downsample_norm_type,
+                                        "block_norm_type": args.block_norm_type,
+                                        "conv_norm_type": args.conv_norm_type}.items() if v is not None}},
         strict=False, allow_size_mismatch=True,
     )
     dataset = VoiceShardedDataset(
@@ -602,6 +605,14 @@ def main():
                          "(layernorm/rmsnorm/none). REQUIRED for rmsnorm/none runs — without it the "
                          "eval model builds a LayerNorm final and the features load wrong (garbage). "
                          "Default: use the config preset's value (layernorm).")
+    ap.add_argument("--downsample_norm_type", default=None,
+                    help="Override the frontend conv-subsampling norm to MATCH a checkpoint "
+                         "(e.g. groupnorm for a groupnormfrontend run). Default: config value.")
+    ap.add_argument("--block_norm_type", default=None,
+                    help="Override the transformer/conformer block pre-norms to MATCH a checkpoint "
+                         "(e.g. rmsnorm for a rmsnormblock run). Default: config value.")
+    ap.add_argument("--conv_norm_type", default=None,
+                    help="Override the conformer depthwise-conv norm to MATCH a checkpoint. Default: config value.")
     ap.add_argument("--val_cache_dir", required=True)
     ap.add_argument("--output_dir", default="./eval_output/per_speaker_leakage")
     ap.add_argument("--device", default="cuda")
