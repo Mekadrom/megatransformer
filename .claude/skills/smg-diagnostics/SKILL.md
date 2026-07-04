@@ -60,6 +60,10 @@ val subset (TRUE embedding) and reports, on valid frames:
   53 ≈ 3.3 kHz). HF detail is smoothed first, so this is usually lower than `gv_ratio`.
 - `hf_mean_gap` = mean(recon HF band) − mean(GT HF band), mel units. Negative ⇒ recon is
   duller/muffled in the high band.
+- `--wrong_emb` → also computes `gv_ratio_wrong` on each utt decoded with a DIFFERENT
+  speaker's embedding (the CONVERSION regime). `gv_ratio_wrong` below `gv_ratio` ⇒ the
+  extrapolative conversion over-smooths *more* than same-speaker recon = GAN's target. On a
+  collapsed model it ≈ `gv_ratio` (converted == source; verified 50k baseline 0.957 vs 0.963).
 
 All from mels (no vocoder) — cheap, isolates the SMG.
 
@@ -89,15 +93,62 @@ already cached in `~/.cache/torch/hub`). Reports:
 - `mos_gt_voc` — UTMOS of the GT mel vocoded = the **vocoder ceiling** (~3.82 for HiFi-GAN
   here; checkpoint-independent — to beat it you need a better *vocoder*, not a better SMG).
 - `mos_gap` = ceiling − recon = the SMG's own naturalness cost.
+- `--wrong_emb` → also decodes each utt with a DIFFERENT speaker's embedding, vocodes+scores
+  it, reports `mos_wrong` + `conv_gap = mos_recon − mos_wrong`. The CONVERSION (extrapolative)
+  regime — where an L1/MSE decoder is most prone to over-smooth = the **GAN decision point that
+  same-speaker recon can't see.** Collapsed model ⇒ `mos_wrong ≈ mos_recon`, `conv_gap ≈ 0`
+  (verified 50k baseline −0.002); once conversion is real (post-contrastive) a positive
+  `conv_gap` is GAN's target.
 
-Validated 2026-07-04: `mos_recon` 1.71 @5k (robotic) → 3.43 @15k (smooth) — clean and
-monotonic, unlike GV. At 15k the baseline sits ~0.39 MOS below the ceiling, so **GAN's
-naturalness headroom is small** (it can't exceed the vocoder ceiling). Heavier than GV
-(needs a vocoding pass + the UTMOS model); use `--n 200`.
+⚠️ **UTMOS is a 16 kHz model.** Its `forward(wave, sr)` resamples the input to 16 kHz before
+scoring (`model.py:32`), so it is BLIND to anything above 8 kHz. We pass `16000` because the
+HiFi-GAN is 16 kHz (no-op). Consequence: UTMOS **cannot see a 24 kHz upgrade's 8–12 kHz gain**
+— a 24 kHz pipeline would score ~flat/slightly-lower on UTMOS despite sounding crisper. Use
+the ear or a wideband metric (NISQA wideband / Audiobox-Aesthetics) to measure a 24 kHz move.
+
+Validated 2026-07-04: `mos_recon` 1.71 @5k (robotic) → 3.43 @15k → 3.73 @50k; `mos_gap`
+0.39 → 0.19 → **0.097 @50k** (near the ceiling). GV `gv_ratio` 0.963 @50k, `hf_mean_gap` +0.023
+(not muffled). So the recon-only baseline is essentially at the vocoder ceiling ⇒ **GAN's
+same-speaker headroom is ~nil**; its real (untested) value is on CONVERTED outputs (`--wrong_emb`,
+post-contrastive). Heavier than GV (vocoding pass + UTMOS model); use `--n 200`.
 
 ```
 CUDA_VISIBLE_DEVICES=N PYTHONPATH=src python3 -m megatransformer.scripts.eval.smg.mos \
   --checkpoint runs/smg/<run>/checkpoint-<step> --n 200
+```
+
+## Structural tool — conditioning-path weight health (`conditioning_health.py`)
+
+`scripts/eval/smg/conditioning_health.py` — asks **what, structurally, is dying** in the
+collapse: it splits the model's parameters into the **speaker/FiLM path**
+(`speaker_embedding_projection`, `early_film_projection`, `speaker_projections_2d`), the
+**F0 path**, and the **backbone**, and reports each group's weight RMS against both the rest
+of the model and a **freshly-initialized model of the same config** (`trained/init` ratio),
+plus a per-tensor breakdown. No forward pass / data — pure weights, runs on **CPU** (`--device
+cpu`), so it never touches the training GPUs.
+
+- FiLM output layers init at `std=0.02` (`smg.py _init_film_projection`), so `trained/init ≈ 1`
+  on those ⇒ the FiLM never learned to condition; `≫ 1` ⇒ it did.
+- The script prints a **data-driven verdict**: `speaker_film grew x_ vs backbone x_`.
+
+**KEY FINDING (50k baseline, 2026-07-04): the conditioning path is NOT dead — it's the most-
+trained part of the model.** FiLM output layer `early_film_projection.2.weight` = **1.55× init**,
+speaker_film group **1.40×** vs backbone **1.03×**. So the cross-speaker collapse is
+**FUNCTIONAL, not structural**: the FiLM is heavily trained and *does* modulate the output
+(`output_diff`/`rel_influence` ≈ 0.36), but that modulation carries **non-identity** attributes
+(prosody/energy) — because the leaky SIVE features supply identity for free, there was never
+gradient pressure for FiLM to encode identity. Two consequences: (1) the fix is NOT "revive a
+dead path" — the weights are already grown; it's redirecting an active path toward identity, or
+removing identity from the features (SIVE-side). (2) **A pure `output_diff` contrastive loss is
+suspect** — the FiLM already produces large `output_diff`, so pushing it risks amplifying the
+existing non-identity modulation rather than creating identity control. Prefer an identity-
+targeting contrastive loss (speaker-encoder on the converted output → target embedding) or the
+features-side levers (GRL-at-layer-10 / ECAPA-regression adversary).
+
+```
+PYTHONPATH=src python3 -m megatransformer.scripts.eval.smg.conditioning_health \
+  --checkpoint runs/smg/<run>/checkpoint-<step> \
+  --config medium_decoder_only_1d_3x --sive_encoder_dim 256 --device cpu
 ```
 
 ## Reading the results — caveats
@@ -109,13 +160,20 @@ CUDA_VISIBLE_DEVICES=N PYTHONPATH=src python3 -m megatransformer.scripts.eval.sm
    garbage. Baseline runs use `medium_decoder_only_1d_3x` + 256.
 3. **It's light** — a few hundred small conv decodes, fits next to a training run;
    run on whichever GPU has headroom (`nvidia-smi`). Uses `@torch.no_grad()`.
-4. **Reference points (recon-only baseline, ~epoch 20 / step 10k):** `l1_true ≈ 0.44`,
-   `disentangle ≈ +0.035`, `rel_influence ≈ 0.35` = weak, non-controlling embedding
-   (collapse). Track these rising when the FiLM contrastive loss is on; that's the
-   sign conversion is being restored.
-5. **The fix is SMG-side, not SIVE-side.** SIVE leakage floors at ~140× across every
-   variant tried (covreg tied, grllr3x worse), so you can't swap to a lower-leakage
-   SIVE — the contrastive loss is the lever.
+4. **Reference points (recon-only baseline).** @10k: `l1_true ≈ 0.44`, `disentangle ≈ +0.035`,
+   `rel_influence ≈ 0.35`. @50k (final, recon AT the vocoder ceiling): `l1_true 0.356`,
+   `disentangle +0.025`, `rel_influence 0.360`, `gv_ratio 0.963`, `mos_recon 3.73` (gap 0.097).
+   disentangle PLATEAUED at ~+0.025 by ~26k — the collapse forms early then sits. **+0.025 /
+   0.36 is the floor the contrastive arm must move; judge success by `disentangle` rising, NOT
+   `output_diff`/`rel_influence`** (those can rise cosmetically — the FiLM already modulates
+   non-identity attributes, see conditioning_health).
+5. **The fix is SMG-side OR SIVE-side — both are live.** SIVE leakage floors ~140–200× among
+   *stable* variants, so you can't just swap to an existing lower-leakage SIVE. Features-side
+   lever = new SIVE work: GRL-at-layer-10 (align the adversary to the SMG's layer-10 tap) +
+   ECAPA-regression / MHASP adversary (both implemented). SMG-side lever = an *identity-
+   targeting* contrastive loss — the naive `output_diff` hinge is suspect (conditioning_health
+   shows FiLM already produces large output_diff without carrying identity). Both compound.
+   Tapping SIVE layer 12 was ruled out (~24% worse recon on clean data).
 
 ## Notes / future extensions
 
