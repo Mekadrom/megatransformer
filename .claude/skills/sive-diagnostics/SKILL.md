@@ -168,6 +168,17 @@ sample's per-layer features evolve across checkpoints. Qualitative only.
    was config-identical to the baseline yet showed 184x-vs-139x macro leakage at
    300k: that gap was run-to-run trajectory noise, which also sets a sobering
    floor — treat sub-~1.3x single-run leakage gaps as possibly noise, not signal.
+11. **Don't call a "falsetto" from the synthesis F0 scalar without the ear.** The
+   per-gender F0 (`F0 male true-emb=...`) is torchcrepe's median-over-voiced-frames,
+   median-over-`--f0_samples` (default 30) utts — robust to single outliers, but
+   torchcrepe can systematically **latch onto a harmonic** of a run's spectral
+   structure and report an *elevated* pitch (e.g. a 132Hz male read as 192Hz) even
+   when the *perceived fundamental* is fine. This happened for covreg @100k (F0 said
+   falsetto; the user's ear said as-good-or-better, esp. cross-speaker) — it was a
+   spectral difference mis-mapped to pitch, not a real falsetto. So a high true-emb
+   F0 is a FLAG to LISTEN, not a verdict; confirm on the rendered WAVs, and if you
+   must quantify, bump `--f0_samples 100` and eyeball `f0_contours.png`. (Real
+   falsetto — rmsnorm-final, grllr3x — was confirmed by ear; the metric alone isn't.)
 
 ## Notes
 
