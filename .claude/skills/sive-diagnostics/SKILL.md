@@ -179,6 +179,12 @@ sample's per-layer features evolve across checkpoints. Qualitative only.
    F0 is a FLAG to LISTEN, not a verdict; confirm on the rendered WAVs, and if you
    must quantify, bump `--f0_samples 100` and eyeball `f0_contours.png`. (Real
    falsetto — rmsnorm-final, grllr3x — was confirmed by ear; the metric alone isn't.)
+   The `cross-emb` F0 is worse: NaN utts (torchcrepe found no confident-voiced frame)
+   are **dropped before the median**, so a low **`cross voiced%`** column (new; also
+   in the console line as `voiced N% of M`) means that F0 is a survivorship-biased
+   median over a voiced minority — the typical cross recon had NO extractable pitch
+   (an empty red line in `f0_contours.png`), which is exactly how covreg @100k read
+   192. Low `cross voiced%` ⇒ treat the cross-emb F0 as noise and trust the ear.
 
 ## Notes
 

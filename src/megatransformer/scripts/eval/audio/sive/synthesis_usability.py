@@ -381,7 +381,7 @@ def spectral_gender_analysis(dec, feats, mels, embs, gens, eval_idx, vocoder, ar
         cross_pool = [int(o) for o in eval_idx if int(gens[o]) == (1 - gid)]
         if not src or not cross_pool:
             continue
-        f0_t, f0_r, f0_c, c_t, c_r, contours, vr = [], [], [], [], [], [], 0
+        f0_t, f0_r, f0_c, c_t, c_r, contours, vr, vc = [], [], [], [], [], [], 0, 0
         for n, i in enumerate(src):
             tgt = mels[i]
             rt = dec(feats[i].unsqueeze(0).to(device), embs[i:i + 1].to(device))[0].cpu()
@@ -395,7 +395,7 @@ def spectral_gender_analysis(dec, feats, mels, embs, gens, eval_idx, vocoder, ar
                 mc, cc_ = _f0(rc)
                 if not np.isnan(mt): f0_t.append(mt)
                 if not np.isnan(mr): f0_r.append(mr); vr += 1
-                if not np.isnan(mc): f0_c.append(mc)
+                if not np.isnan(mc): f0_c.append(mc); vc += 1
                 if len(contours) < 1:
                     contours.append((ct_, cr_, cc_))
             except Exception:
@@ -406,6 +406,7 @@ def spectral_gender_analysis(dec, feats, mels, embs, gens, eval_idx, vocoder, ar
             "f0_recon": float(np.median(f0_r)) if f0_r else float("nan"),
             "f0_recon_cross": float(np.median(f0_c)) if f0_c else float("nan"),
             "f0_voiced_frac_recon": vr / max(len(src), 1),
+            "f0_voiced_frac_cross": vc / max(len(src), 1),
             "centroid_target": float(np.median(c_t)) if c_t else float("nan"),
             "centroid_recon": float(np.median(c_r)) if c_r else float("nan"),
             "_contours": contours,
@@ -490,7 +491,8 @@ def analyze_checkpoint(args, name, ckpt_path, vocoder, dataset, subset_indices, 
             other = "female" if gname == "male" else "male"
             rp = s.get("repitch", float("nan"))
             print(f"[{name}]   F0 {gname}: target={s['f0_target']:.0f}Hz true-emb={s['f0_recon']:.0f}Hz "
-                  f"→{other}-emb={s['f0_recon_cross']:.0f}Hz (re-pitch={rp:+.2f}) | "
+                  f"→{other}-emb={s['f0_recon_cross']:.0f}Hz (re-pitch={rp:+.2f}, "
+                  f"voiced {s.get('f0_voiced_frac_cross', float('nan')):.0%} of {s['n']}) | "
                   f"centroid t={s['centroid_target']:.1f} r={s['centroid_recon']:.1f}")
     return {"name": name, "params_M": nparams / 1e6, "l1_true": l1_true,
             "l1_shuffled": l1_shuf, "delta": delta, "n_eval": len(eval_idx),
@@ -536,15 +538,20 @@ def write_report(args, results):
                   "other gender's median (1.0 = fully re-pitched, 0 = stayed at source, <0 = "
                   "moved further away). Low/negative re-pitch = cross-gender cloning fails to "
                   "move the pitch (the 'masculine female' effect). Per-run `f0_contours.png` "
-                  "shows the trajectories.", "",
-                  "| run | source gender | F0 target | true-emb | cross-emb | re-pitch | centroid t→r |",
-                  "|---|---|---|---|---|---|---|"]
+                  "shows the trajectories. `cross voiced%` = fraction of cross-emb utterances "
+                  "where torchcrepe found ANY confident-voiced frame (the rest are NaN-dropped "
+                  "before the median). A LOW value means the `cross-emb` F0 is a survivorship-"
+                  "biased median over a small voiced minority — treat that F0 as noise, not a "
+                  "pitch measurement, and trust the ear.", "",
+                  "| run | source gender | F0 target | true-emb | cross-emb | cross voiced% | re-pitch | centroid t→r |",
+                  "|---|---|---|---|---|---|---|---|"]
         for r in results:
             for gname in ("female", "male"):
                 s = r.get("spectral", {}).get(gname)
                 if s:
                     lines.append(f"| {r['name']} | {gname} | {s['f0_target']:.0f} | {s['f0_recon']:.0f} | "
-                                 f"{s['f0_recon_cross']:.0f} | {s.get('repitch', float('nan')):+.2f} | "
+                                 f"{s['f0_recon_cross']:.0f} | {s.get('f0_voiced_frac_cross', float('nan')):.0%} | "
+                                 f"{s.get('repitch', float('nan')):+.2f} | "
                                  f"{s['centroid_target']:.1f}→{s['centroid_recon']:.1f} |")
     lines += ["", "Per-run mel figures + target/recon_true/recon_wrong_<g> WAVs (filenames tagged "
               "with source gender m/f) are under `<output_dir>/<run>/`."]
