@@ -870,6 +870,20 @@ class SMG(nn.Module):
                 raise ValueError(f"Unknown config: {config}. Available: {list(SMG_CONFIGS.keys())}")
             config = SMG_CONFIGS[config]
 
+        # Peel off overrides that target TOP-LEVEL SMGConfig scalar fields (e.g. the
+        # loss weights, which SMG.forward reads via self.config.*) and apply them to
+        # a COPY of the config here. The sub-config constructors below only accept
+        # decoder/F0 fields, so leaving these in `overrides` would TypeError; and
+        # dataclasses.replace avoids mutating the shared SMG_CONFIGS singleton.
+        import dataclasses as _dc
+        _top_scalar_fields = {
+            f.name for f in _dc.fields(config)
+            if not _dc.is_dataclass(getattr(config, f.name, None))
+        }
+        _top_overrides = {k: overrides.pop(k) for k in list(overrides) if k in _top_scalar_fields}
+        if _top_overrides:
+            config = _dc.replace(config, **_top_overrides)
+
         # Select decoder type based on config
         if config.decoder_1d_config is not None:
             config_dict = {k: v for k, v in config.decoder_1d_config.__dict__.items()}

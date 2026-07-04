@@ -1080,9 +1080,19 @@ class SMGTrainer(CommonTrainer):
 
 
 def load_model(args):
-    return model_loading_utils.load_model(SMG, args.config, checkpoint_path=args.resume_from_checkpoint, overrides={
-        "sive_encoder_dim": args.sive_encoder_dim,
-    })
+    overrides = {"sive_encoder_dim": args.sive_encoder_dim}
+    # Model-internal loss weights (read by SMG.forward via self.config.*). Override
+    # the config ONLY when explicitly passed (CLI default None) so the preset's
+    # values stay the source of truth and a CLI default can't silently clobber them.
+    _loss_overrides = {
+        "recon_loss_weight": args.recon_loss_weight,
+        "mse_loss_weight": args.mse_loss_weight,
+        "l1_loss_weight": args.l1_loss_weight,
+        "f0_loss_weight": args.f0_loss_weight,
+        "vuv_loss_weight": args.vuv_loss_weight,
+    }
+    overrides.update({k: v for k, v in _loss_overrides.items() if v is not None})
+    return model_loading_utils.load_model(SMG, args.config, checkpoint_path=args.resume_from_checkpoint, overrides=overrides)
 
 
 def create_trainer(
@@ -1364,12 +1374,12 @@ def add_cli_args(subparsers):
                            help="Number of steps to ramp up FiLM contrastive margin")
 
     # SMG loss weights
-    sub_parser.add_argument("--recon_loss_weight", type=float, default=1.0,
-                           help="Weight for reconstruction loss")
-    sub_parser.add_argument("--mse_loss_weight", type=float, default=1.0,
-                           help="Weight for MSE loss")
-    sub_parser.add_argument("--l1_loss_weight", type=float, default=1.0,
-                           help="Weight for L1 loss")
+    sub_parser.add_argument("--recon_loss_weight", type=float, default=None,
+                           help="Weight for reconstruction loss (None = use config value, currently 1.0)")
+    sub_parser.add_argument("--mse_loss_weight", type=float, default=None,
+                           help="Weight for MSE loss (None = use config value, currently 1.0)")
+    sub_parser.add_argument("--l1_loss_weight", type=float, default=None,
+                           help="Weight for L1 loss (None = use config value, currently 1.0)")
     sub_parser.add_argument("--kl_divergence_loss_weight", type=float, default=1e-6,
                            help="Weight for KL divergence loss")
     
@@ -1507,10 +1517,10 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--mu_only_recon_weight", type=float, default=0.0,
                            help="Weight for mu-only reconstruction loss (0 = disabled)")
 
-    sub_parser.add_argument("--f0_loss_weight", type=float, default=0.1,
-                           help="Weight for F0 prediction loss")
-    sub_parser.add_argument("--vuv_loss_weight", type=float, default=0.1,
-                           help="Weight for V/UV prediction loss")
+    sub_parser.add_argument("--f0_loss_weight", type=float, default=None,
+                           help="Weight for F0 prediction loss (None = use config value, currently 5.0)")
+    sub_parser.add_argument("--vuv_loss_weight", type=float, default=None,
+                           help="Weight for V/UV prediction loss (None = use config value, currently 2.0)")
 
     sub_parser.add_argument("--cache_dir", type=str, default="../cached_datasets/sive_smg_f0",
                            help="Base dir for cached shards (code appends _train/_val)")
