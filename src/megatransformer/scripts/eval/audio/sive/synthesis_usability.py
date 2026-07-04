@@ -82,7 +82,7 @@ def _load_speaker_ids(dataset):
 
 @torch.no_grad()
 def extract_subset(model, dataset, indices, device, batch_size,
-                   sr, n_mels, n_fft, hop_length):
+                   sr, n_mels, n_fft, hop_length, extract_layer=-1):
     """For each chosen utterance, return (feat_up [256,T], mel [n_mels,T], emb [E],
     speaker_id). Features are linear-interpolated to the mel frame rate so the
     decoder sees frame-aligned inputs (the SMG upsamples too)."""
@@ -112,9 +112,14 @@ def extract_subset(model, dataset, indices, device, batch_size,
         mel_batch = mel_batch.to(device)
         len_batch = torch.tensor(lengths, dtype=torch.long, device=device)
 
-        result = model(mel_batch, lengths=len_batch, grl_alpha=0.0)
-        feat = result["features"]            # [B, T', D]
-        feat_len = result["feature_lengths"]  # [B]
+        if extract_layer >= 0:
+            # Tap a specific encoder layer (all_hiddens[L]) — matches how the SMG's
+            # preprocessing extracts its features (extract_features(layer=L)).
+            feat, feat_len = model.extract_features(mel_batch, lengths=len_batch, layer=extract_layer)
+        else:
+            result = model(mel_batch, lengths=len_batch, grl_alpha=0.0)
+            feat = result["features"]            # [B, T', D]  (final, post-norm)
+            feat_len = result["feature_lengths"]  # [B]
 
         for j in range(feat.shape[0]):
             tprime = max(int(feat_len[j].item()), 1)
@@ -443,7 +448,8 @@ def analyze_checkpoint(args, name, ckpt_path, vocoder, dataset, subset_indices, 
                        strict=False, allow_size_mismatch=True)
     feats, mels, embs, spks, gens = extract_subset(
         model, dataset, subset_indices, device, args.batch_size,
-        args.voice_sample_rate, args.voice_n_mels, args.voice_n_fft, args.voice_hop_length)
+        args.voice_sample_rate, args.voice_n_mels, args.voice_n_fft, args.voice_hop_length,
+        extract_layer=args.extract_layer)
     del model
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
@@ -579,6 +585,11 @@ def main():
                          "(e.g. rmsnorm for a rmsnormblock run). Default: config value.")
     ap.add_argument("--conv_norm_type", default=None,
                     help="Override the conformer depthwise-conv norm to MATCH a checkpoint. Default: config value.")
+    ap.add_argument("--extract_layer", type=int, default=-1,
+                    help="Which encoder layer to extract features from (-1 = final, the GRL/CTC layer; "
+                         "0=conv_subsample, 1..N=blocks). The SMG trains on layer 10, but the final layer "
+                         "(12) is where GRL acts directly, so it disentangles best. Use this to A/B whether "
+                         "a less-leaky layer still reconstructs well enough for the SMG.")
     ap.add_argument("--val_cache_dir", required=True)
     ap.add_argument("--output_dir", default="./eval_output/synthesis_usability")
     ap.add_argument("--device", default="cuda")
