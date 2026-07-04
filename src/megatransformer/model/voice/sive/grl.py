@@ -30,7 +30,15 @@ class SpeakerClassifier(nn.Module):
     - "statistics": Mean + std concatenation (2x input dim)
     - "attention": Learnable attention weights
     - "attentive_statistics": ASP from ECAPA-TDNN (attention-weighted mean + std)
-    - "multi_head_attention": Multi-head self-attention pooling
+    - "multi_head_attention": Multi-head self-attention pooling (query-based mean)
+    - "mhasp": Multi-head attentive statistics pooling (H heads, weighted mean+std)
+
+    Adversary target (``adversary_target``):
+    - "speaker_id": classify the training speaker (cross-entropy).
+    - "ecapa_embedding": regress the ECAPA speaker embedding (head outputs a
+      D_emb vector; the trainer applies a cosine loss). Richer, generalizes to
+      unseen speakers, and enforces features that carry nothing predicting the
+      speaker vector the SMG conditions on.
     """
 
     def __init__(
@@ -41,15 +49,23 @@ class SpeakerClassifier(nn.Module):
         pooling: str = "attentive_statistics",
         dropout: float = 0.1,
         num_attention_heads: int = 4,
+        adversary_target: str = "speaker_id",
+        embedding_dim: int = 192,
     ):
         super().__init__()
 
         hidden_dim = hidden_dim or d_model * 2
         self.pooling = pooling
         self.d_model = d_model
+        self.num_attention_heads = num_attention_heads
+        # Adversary output target: classify the speaker id, or regress the ECAPA
+        # embedding. Embedding mode sizes the head to embedding_dim; the encoder is
+        # then pushed (via GRL) to make features un-predictive of that vector.
+        self.adversary_target = adversary_target
+        out_dim = num_speakers if adversary_target == "speaker_id" else embedding_dim
 
         # Determine pooled dimension based on pooling type
-        if pooling in ("statistics", "attentive_statistics"):
+        if pooling in ("statistics", "attentive_statistics", "mhasp"):
             pooled_dim = d_model * 2  # mean + std
         else:
             pooled_dim = d_model
@@ -82,7 +98,20 @@ class SpeakerClassifier(nn.Module):
             )
             self.mha_norm = nn.LayerNorm(d_model)
 
-        # Classifier MLP
+        elif pooling == "mhasp":
+            # Multi-Head Attentive Statistics Pooling: `num_attention_heads`
+            # independent time-attentions, each producing an attention-weighted
+            # mean+std over the full feature; heads are concatenated and projected
+            # back to 2*D. Richer and more collapse-resistant than single-head ASP
+            # (the encoder must fool every head at once to hide speaker).
+            self.mhasp_attn = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.Tanh(),
+                nn.Linear(d_model, num_attention_heads),  # H attention logits per frame
+            )
+            self.mhasp_proj = nn.Linear(num_attention_heads * 2 * d_model, d_model * 2)
+
+        # Classifier / regressor MLP (final dim = num_speakers or embedding_dim)
         self.classifier = nn.Sequential(
             nn.Linear(pooled_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
@@ -92,7 +121,7 @@ class SpeakerClassifier(nn.Module):
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_speakers),
+            nn.Linear(hidden_dim, out_dim),
         )
 
     def _statistics_pooling(
@@ -157,7 +186,8 @@ class SpeakerClassifier(nn.Module):
             x: [B, T, D] features
             mask: [B, T] True for valid positions
         Returns:
-            [B, num_speakers] speaker logits
+            [B, num_speakers] speaker logits (adversary_target="speaker_id"), or
+            [B, embedding_dim] predicted embedding (adversary_target="ecapa_embedding")
         """
         if self.pooling == "mean":
             if mask is not None:
@@ -193,6 +223,18 @@ class SpeakerClassifier(nn.Module):
 
             pooled, _ = self.mha_pool(query, x, x, key_padding_mask=key_padding_mask)
             pooled = self.mha_norm(pooled.squeeze(1))  # [B, D]
+
+        elif self.pooling == "mhasp":
+            B = x.size(0)
+            logits = self.mhasp_attn(x)                         # [B, T, H]
+            if mask is not None:
+                logits = logits.masked_fill(~mask.unsqueeze(-1), float("-inf"))
+            w = F.softmax(logits, dim=1)                         # [B, T, H] over time
+            mean = torch.einsum("bth,btd->bhd", w, x)            # [B, H, D]
+            ex2 = torch.einsum("bth,btd->bhd", w, x * x)         # [B, H, D]
+            std = (ex2 - mean * mean).clamp(min=1e-6).sqrt()     # [B, H, D]
+            pooled = torch.cat([mean, std], dim=-1).reshape(B, -1)  # [B, H*2D]
+            pooled = self.mhasp_proj(pooled)                     # [B, 2D]
 
         else:
             raise ValueError(f"Unknown pooling type: {self.pooling}")

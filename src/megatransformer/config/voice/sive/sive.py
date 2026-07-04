@@ -121,6 +121,15 @@ class SpeakerInvariantVoiceEncoderConfig:
 
     speaker_classifier_hidden_dim: Optional[int] = None
 
+    # GRL speaker-adversary target: "speaker_id" (cross-entropy over training
+    # speakers) or "ecapa_embedding" (cosine-regress the ECAPA embedding — richer,
+    # generalizes to unseen speakers, and enforces features orthogonal to the
+    # SMG's speaker vector). Embedding mode sizes the head to speaker_embedding_dim.
+    speaker_adversary_target: str = "speaker_id"
+    speaker_embedding_dim: int = 192
+    # Heads for the multi-head poolings ("mhasp", "multi_head_attention").
+    speaker_classifier_num_heads: int = 4
+
     def __post_init__(self):
         # defaults
         if self.conv_kernel_sizes is None:

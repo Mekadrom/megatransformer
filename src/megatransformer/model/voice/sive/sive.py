@@ -152,6 +152,9 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             hidden_dim=config.speaker_classifier_hidden_dim,
             pooling=config.speaker_pooling,
             dropout=config.dropout,
+            num_attention_heads=getattr(config, "speaker_classifier_num_heads", 4),
+            adversary_target=getattr(config, "speaker_adversary_target", "speaker_id"),
+            embedding_dim=getattr(config, "speaker_embedding_dim", 192),
         )
 
         # Initialize weights

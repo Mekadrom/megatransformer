@@ -78,6 +78,7 @@ class SIVETrainer(CommonTrainer):
         mel_n_fft: int = 1024,
         mel_hop_length: int = 256,
         max_mel_frames: Optional[int] = None,
+        speaker_adversary_target: str = "speaker_id",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -103,6 +104,7 @@ class SIVETrainer(CommonTrainer):
         self.mel_n_fft = mel_n_fft
         self.mel_hop_length = mel_hop_length
         self.max_mel_frames = max_mel_frames
+        self.speaker_adversary_target = speaker_adversary_target
 
         # CTC loss
         self.ctc_criterion = nn.CTCLoss(blank=vocab.blank_idx, reduction="mean", zero_infinity=True)
@@ -255,6 +257,19 @@ class SIVETrainer(CommonTrainer):
 
         raise KeyError("SIVE batch has neither 'mel_specs' nor 'waveforms'")
 
+    def _speaker_adversary_loss(self, speaker_out, inputs, speaker_ids):
+        """Adversary loss to be gradient-reversed into the encoder.
+
+        speaker_id mode: cross-entropy on speaker logits.
+        ecapa_embedding mode: cosine loss regressing the stored ECAPA embedding
+        (1 - cos, so minimizing it => predicting speaker well => reversal pushes
+        the encoder to make features un-predictive of the embedding).
+        """
+        if self.speaker_adversary_target == "ecapa_embedding":
+            target_emb = inputs["speaker_embeddings"].to(speaker_out.dtype)
+            return (1.0 - F.cosine_similarity(speaker_out, target_emb, dim=-1)).mean()
+        return self.speaker_criterion(speaker_out, speaker_ids)
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         global_step = self.state.global_step + self.step_offset
 
@@ -355,15 +370,16 @@ class SIVETrainer(CommonTrainer):
                 )
                 pad_blank_loss = F.cross_entropy(pad_logits, blank_targets)
 
-        # GRL speaker classification loss
-        # We want the classifier to FAIL (be at chance level)
-        # But we train it normally - GRL reverses gradients to encoder
-        speaker_loss = self.speaker_criterion(speaker_logits, speaker_ids)
+        # GRL speaker-adversary loss. We train the adversary to succeed; the GRL
+        # reverses gradients so the encoder is pushed to make it FAIL. Target is
+        # the speaker id (CE) or the ECAPA embedding (cosine regression).
+        speaker_loss = self._speaker_adversary_loss(speaker_logits, inputs, speaker_ids)
 
         # Speaker accuracy and diagnostics (logging only). Every line here ends
         # in .item()/.numel() — each a GPU->CPU sync — so gate on logging steps.
         speaker_acc = speaker_acc_top5 = pred_entropy = unique_preds = max_prob = None
-        if should_log:
+        speaker_cos = None
+        if should_log and self.speaker_adversary_target == "speaker_id":
             with torch.no_grad():
                 speaker_preds = speaker_logits.argmax(dim=-1)
                 speaker_acc = (speaker_preds == speaker_ids).float().mean().item()
@@ -379,6 +395,13 @@ class SIVETrainer(CommonTrainer):
 
                 # Max probability (confidence) - high values with low accuracy = overconfident
                 max_prob = pred_probs.max(dim=-1).values.mean().item()
+        elif should_log:
+            # Embedding-regression adversary: cosine sim to the ECAPA target is the
+            # adversary-strength readout (higher => features still predict speaker,
+            # so the GRL has more to remove).
+            with torch.no_grad():
+                target_emb = inputs["speaker_embeddings"].to(speaker_logits.dtype)
+                speaker_cos = F.cosine_similarity(speaker_logits, target_emb, dim=-1).mean().item()
 
         # Feature-space regularization losses (zero unless --use_std_hinge or
         # --use_covariance_reg are set; weights are baked into the model-side
@@ -405,15 +428,19 @@ class SIVETrainer(CommonTrainer):
             metrics.log_scalar("train/ctc_margin_min", ctc_margin_min, global_step)
             metrics.log_scalar("train/pad_blank_loss", pad_blank_loss, global_step)
             metrics.log_scalar("train/speaker_loss", speaker_loss, global_step)
-            metrics.log_scalar("train/speaker_accuracy", speaker_acc, global_step)
-            metrics.log_scalar("train/speaker_accuracy_top5", speaker_acc_top5, global_step)
             metrics.log_scalar("train/grl_alpha", grl_alpha, global_step)
             metrics.log_scalar("train/total_loss", total_loss, global_step)
             metrics.log_scalar("train/grl_pretraining", float(in_pretraining), global_step)
-            # Diagnostics for speaker classifier behavior
-            metrics.log_scalar("train/speaker_pred_entropy", pred_entropy, global_step)
-            metrics.log_scalar("train/speaker_unique_preds", unique_preds, global_step)
-            metrics.log_scalar("train/speaker_max_prob", max_prob, global_step)
+            # Adversary diagnostics — id-mode logs classifier accuracy/collapse;
+            # embedding-mode logs cosine sim to the ECAPA target.
+            if self.speaker_adversary_target == "speaker_id":
+                metrics.log_scalar("train/speaker_accuracy", speaker_acc, global_step)
+                metrics.log_scalar("train/speaker_accuracy_top5", speaker_acc_top5, global_step)
+                metrics.log_scalar("train/speaker_pred_entropy", pred_entropy, global_step)
+                metrics.log_scalar("train/speaker_unique_preds", unique_preds, global_step)
+                metrics.log_scalar("train/speaker_max_prob", max_prob, global_step)
+            elif speaker_cos is not None:
+                metrics.log_scalar("train/speaker_emb_cosine", speaker_cos, global_step)
 
             # Feature regularization losses (zero when respective flags are off).
             metrics.log_scalar("train/std_hinge_loss", std_hinge_loss, global_step)
@@ -507,8 +534,8 @@ class SIVETrainer(CommonTrainer):
             log_probs = F.log_softmax(asr_logits, dim=-1).permute(1, 0, 2)
             ctc_loss = self.ctc_criterion(log_probs, ctc_tokens, output_ctc_lengths, ctc_lengths)
 
-            # Speaker loss
-            speaker_loss = self.speaker_criterion(speaker_logits, speaker_ids)
+            # Speaker loss (id CE or ECAPA-embedding cosine, matching training)
+            speaker_loss = self._speaker_adversary_loss(speaker_logits, inputs, speaker_ids)
 
             # Combined loss
             total_loss = self.ctc_weight * ctc_loss + self.grl_weight * speaker_loss
@@ -615,8 +642,11 @@ def load_model(args):
         # Architectural options
         'conformer_kernel_size': args.conformer_kernel_size,
         'activation': args.activation,
-        # Speaker classifier pooling strategy
+        # Speaker classifier pooling strategy + adversary target
         'speaker_pooling': args.speaker_pooling,
+        'speaker_adversary_target': args.speaker_adversary_target,
+        'speaker_embedding_dim': args.speaker_embedding_dim,
+        'speaker_classifier_num_heads': args.speaker_classifier_num_heads,
         # SpecAugment
         'use_spec_augment': args.use_spec_augment,
         'spec_time_mask_param': args.spec_time_mask_param,
@@ -711,6 +741,7 @@ def create_trainer(
         grl_start_step=args.grl_start_step,
         grl_lr=args.grl_lr,
         pad_blank_weight=args.pad_blank_weight,
+        speaker_adversary_target=args.speaker_adversary_target,
         cmdline=args.cmdline,
         git_commit_hash=args.commit_hash or "",
         step_offset=args.start_step,
@@ -761,7 +792,19 @@ def add_cli_args(subparsers):
                                  "--muon_last_layer_names).")
     
     sub_parser.add_argument("--speaker_pooling", type=str, default="attentive_statistics",
-                            help="Pooling strategy for speaker classifier (e.g., 'attentive_statistics')")
+                            help="Pooling strategy for speaker classifier: mean | max | statistics | "
+                                 "attention | attentive_statistics | multi_head_attention | mhasp "
+                                 "(mhasp = multi-head attentive statistics pooling)")
+    sub_parser.add_argument("--speaker_adversary_target", type=str, default="speaker_id",
+                            choices=["speaker_id", "ecapa_embedding"],
+                            help="GRL adversary target: 'speaker_id' (classify id, cross-entropy) or "
+                                 "'ecapa_embedding' (cosine-regress the stored ECAPA embedding — richer, "
+                                 "generalizes to unseen speakers, enforces features orthogonal to the SMG's "
+                                 "speaker vector). Requires speaker_embeddings in the shards (SIVE has them).")
+    sub_parser.add_argument("--speaker_embedding_dim", type=int, default=192,
+                            help="ECAPA embedding dim; the adversary head output size in ecapa_embedding mode.")
+    sub_parser.add_argument("--speaker_classifier_num_heads", type=int, default=4,
+                            help="Attention heads for multi-head poolings ('mhasp', 'multi_head_attention').")
 
     # CTC-specific settings
     sub_parser.add_argument("--ctc_weight", type=float, default=1.0,
