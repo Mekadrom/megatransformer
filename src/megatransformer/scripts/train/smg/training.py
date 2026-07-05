@@ -133,6 +133,7 @@ class SMGTrainer(CommonTrainer):
         identity_loss_weight: float = 0.0,  # ECAPA identity loss weight (0 = disabled)
         identity_loss_start_step: int = 0,  # Step to start the identity loss
         identity_loss_rampup_steps: int = 5000,  # Steps to ramp the identity weight 0 -> max
+        identity_loss_max_frames: int = 0,  # Cap mel frames fed to ECAPA (0 = no cap); bounds ECAPA activation memory
         # Mu-only reconstruction loss (for diffusion compatibility)
         mu_only_recon_weight: float = 0.0,  # Weight for mu-only reconstruction loss (0 = disabled)
         learned_speaker_classifier: Optional[torch.nn.Module] = None,
@@ -216,6 +217,7 @@ class SMGTrainer(CommonTrainer):
         self.identity_loss_weight = identity_loss_weight
         self.identity_loss_start_step = identity_loss_start_step
         self.identity_loss_rampup_steps = identity_loss_rampup_steps
+        self.identity_loss_max_frames = identity_loss_max_frames
         self.identity_speaker_encoder = None  # lazy-built frozen ECAPA (built on first use, on the model device)
 
         # Mu-only reconstruction loss (for diffusion compatibility)
@@ -779,8 +781,13 @@ class SMGTrainer(CommonTrainer):
             # Differentiable ECAPA embedding of the recon (call _forward_ecapa_tdnn to bypass the
             # @torch.no_grad() outer forward(); frozen weights => grad flows only into the recon).
             recon_mel = recon[..., :mel_specs.shape[-1]]
-            pred_emb = self.identity_speaker_encoder._forward_ecapa_tdnn(
-                recon_mel, lengths=mel_lengths.clamp(max=recon_mel.size(-1)))
+            id_lengths = mel_lengths.clamp(max=recon_mel.size(-1))
+            # Cap the frames fed to ECAPA to bound its (backprop) activation memory — speaker
+            # identity is determined by a few seconds, so the full utterance isn't needed.
+            if self.identity_loss_max_frames > 0 and recon_mel.size(-1) > self.identity_loss_max_frames:
+                recon_mel = recon_mel[..., :self.identity_loss_max_frames]
+                id_lengths = id_lengths.clamp(max=self.identity_loss_max_frames)
+            pred_emb = self.identity_speaker_encoder._forward_ecapa_tdnn(recon_mel, lengths=id_lengths)
             tgt_emb = decode_speaker_embedding
             if tgt_emb.dim() == 3:
                 tgt_emb = tgt_emb.squeeze(1)
@@ -1344,6 +1351,7 @@ def create_trainer(
         identity_loss_weight=args.identity_loss_weight,
         identity_loss_start_step=args.identity_loss_start_step,
         identity_loss_rampup_steps=args.identity_loss_rampup_steps,
+        identity_loss_max_frames=args.identity_loss_max_frames,
         mu_only_recon_weight=args.mu_only_recon_weight,
         learned_speaker_classifier=learned_speaker_classifier,
         learned_speaker_classifier_optimizer=learned_speaker_classifier_optimizer,
@@ -1431,6 +1439,10 @@ def add_cli_args(subparsers):
                            help="Step to start the identity loss (set = resume step so the ramp begins at resume).")
     sub_parser.add_argument("--identity_loss_rampup_steps", type=int, default=5000,
                            help="Steps to ramp the identity-loss weight from 0 to max.")
+    sub_parser.add_argument("--identity_loss_max_frames", type=int, default=0,
+                           help="Cap the mel frames fed to ECAPA for the identity loss (0 = no cap). "
+                                "Bounds ECAPA's backprop activation memory (the OOM source); ~300-400 "
+                                "frames is plenty for speaker identity and lets you keep a larger batch.")
 
     # SMG loss weights
     sub_parser.add_argument("--recon_loss_weight", type=float, default=None,
