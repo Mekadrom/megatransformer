@@ -104,6 +104,41 @@ plus collapsed effective_dim. Validated finding: this metric ranks runs in line
 with human listening where CTC/L1-magnitude alone can mislead (e.g. covreg had
 best CTC but worst, mushiest reconstruction).
 
+## Speaker-similarity (ECAPA) — the IDENTITY axis the other metrics are blind to
+
+**This is the metric that actually ranks the SIVE base.** Leakage / recon-L1 /
+disentangle / UTMOS all measure *content* or *naturalness* — none of them see speaker
+**identity/gender preservation**, which is exactly where the base decision lives (a
+natural-sounding but wrong-gender output — e.g. the speaker-1420 male→feminine flip —
+scores fine on every one of them). ECAPA cosine catches it:
+- **identity** = `cos(ECAPA(recon_true), ECAPA(target))` — did the recon keep the SOURCE
+  speaker (low on a same-speaker recon ⇒ wrong person even WITH the correct embedding).
+- **convert** = `cos(ECAPA(recon_wrong_<g>), ECAPA(xref_spk<j>_<g>))` — did the conversion
+  land on the intended TARGET (vs a plausible-but-wrong voice).
+
+Two ways to run it:
+1. **`synthesis_usability.py --speaker_sim`** — piggybacks the render vocoding, prints
+   `identity`/`convert` means. **Bump `--num_render` (e.g. 60) to grow the sample** — the
+   default 8 is too few. Needs a probe run (the tiny decoder is NOT checkpointed, so there's
+   no way to score a full subset without re-training).
+2. **`speaker_sim_wavs.py`** — scores ECAPA cosine on an ALREADY-rendered WAV dir (no
+   re-train), for when the renders already exist: `--dir name=<render_dir>` (repeatable).
+
+```
+PYTHONPATH=src python3 -m megatransformer.scripts.eval.audio.sive.speaker_sim_wavs --device cpu \
+  --dir stdhinge11=<render_dir> --dir groupnormfrontend=<render_dir> --dir covreg=<render_dir>
+```
+
+Reading it (non-negotiable caveats):
+- **Absolute cosines are LOW (~0.07–0.30)** because tiny-probe audio is degraded — the ECAPA
+  embedding of mushy audio is noisy. **RELATIVE across variants is the only signal** (same
+  decoder/vocoder, so differences are the features). Never quote an absolute.
+- **The `identity` half is the trustworthy one** (direct same-speaker comparison, confirmed the
+  ear on 1420: groupnormfrontend 0.189 > stdhinge11 0.130 > covreg 0.071). The **`convert` half
+  is weaker** (compares two degraded signals) — treat a low convert as a flag for a targeted
+  `recon_wrong`-vs-`xref` EAR check, not a verdict.
+- Still confirm on the WAVs — this quantifies the ear's identity call, it doesn't replace it.
+
 ## Secondary tool — per-layer sweep
 
 `scripts/eval/audio/sive/speaker_leakage_probe.py` — linear+MLP probe across ALL
