@@ -782,11 +782,18 @@ class SMGTrainer(CommonTrainer):
             # @torch.no_grad() outer forward(); frozen weights => grad flows only into the recon).
             recon_mel = recon[..., :mel_specs.shape[-1]]
             id_lengths = mel_lengths.clamp(max=recon_mel.size(-1))
-            # Cap the frames fed to ECAPA to bound its (backprop) activation memory — speaker
-            # identity is determined by a few seconds, so the full utterance isn't needed.
+            # Cap the frames fed to ECAPA to bound its (backprop) activation memory. Take a RANDOM
+            # window (not always the onset — the least-voiced part) so the identity gradient spreads
+            # over the utterance across training. Start is bounded by the SHORTEST valid length so
+            # every sample has real speech in the window; the per-sample id_lengths passed below let
+            # ECAPA's attentive pooling MASK any remaining padding out of the statistics.
             if self.identity_loss_max_frames > 0 and recon_mel.size(-1) > self.identity_loss_max_frames:
-                recon_mel = recon_mel[..., :self.identity_loss_max_frames]
-                id_lengths = id_lengths.clamp(max=self.identity_loss_max_frames)
+                win = self.identity_loss_max_frames
+                min_valid = int(id_lengths.min().item())
+                start = int(torch.randint(0, max(0, min_valid - win) + 1, (1,)).item())
+                recon_mel = recon_mel[..., start:start + win]
+                # Valid frames of each sample *within this window* (>=1; masks trailing padding).
+                id_lengths = (id_lengths - start).clamp(min=1, max=win)
             pred_emb = self.identity_speaker_encoder._forward_ecapa_tdnn(recon_mel, lengths=id_lengths)
             tgt_emb = decode_speaker_embedding
             if tgt_emb.dim() == 3:
