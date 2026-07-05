@@ -376,9 +376,13 @@ def spectral_gender_analysis(dec, feats, mels, embs, gens, eval_idx, vocoder, ar
             batch_size=512, device=device, pad=True)
         voiced = period[0] > 0.5
         med = float(pitch[0][voiced].median().item()) if voiced.any() else float("nan")
+        # Expressiveness: std of the voiced F0 contour in SEMITONES (register-invariant
+        # intonation dynamics). Low => flat/monotone delivery ("less acting").
+        vp = pitch[0][voiced]
+        sd = float((12.0 * torch.log2(vp.clamp(min=1e-3))).std().item()) if int(voiced.sum()) > 1 else float("nan")
         contour = pitch[0].cpu().numpy().copy()
         contour[~voiced.cpu().numpy()] = np.nan
-        return med, contour
+        return med, contour, sd
 
     by_gender = {}
     for gid, gname in [(0, "male"), (1, "female")]:
@@ -387,6 +391,7 @@ def spectral_gender_analysis(dec, feats, mels, embs, gens, eval_idx, vocoder, ar
         if not src or not cross_pool:
             continue
         f0_t, f0_r, f0_c, c_t, c_r, contours, vr, vc = [], [], [], [], [], [], 0, 0
+        sd_t, sd_r = [], []
         for n, i in enumerate(src):
             tgt = mels[i]
             rt = dec(feats[i].unsqueeze(0).to(device), embs[i:i + 1].to(device))[0].cpu()
@@ -395,12 +400,15 @@ def spectral_gender_analysis(dec, feats, mels, embs, gens, eval_idx, vocoder, ar
             c_t.append(_mel_centroid(tgt.numpy()))
             c_r.append(_mel_centroid(rt.numpy()))
             try:
-                mt, ct_ = _f0(tgt)
-                mr, cr_ = _f0(rt)
-                mc, cc_ = _f0(rc)
+                mt, ct_, sdt = _f0(tgt)
+                mr, cr_, sdr = _f0(rt)
+                mc, cc_, _ = _f0(rc)
                 if not np.isnan(mt): f0_t.append(mt)
                 if not np.isnan(mr): f0_r.append(mr); vr += 1
                 if not np.isnan(mc): f0_c.append(mc); vc += 1
+                # Paired intonation-std (both voiced) so the recon/target ratio is per-utt clean.
+                if not (np.isnan(sdt) or np.isnan(sdr)):
+                    sd_t.append(sdt); sd_r.append(sdr)
                 if len(contours) < 1:
                     contours.append((ct_, cr_, cc_))
             except Exception:
@@ -414,6 +422,9 @@ def spectral_gender_analysis(dec, feats, mels, embs, gens, eval_idx, vocoder, ar
             "f0_voiced_frac_cross": vc / max(len(src), 1),
             "centroid_target": float(np.median(c_t)) if c_t else float("nan"),
             "centroid_recon": float(np.median(c_r)) if c_r else float("nan"),
+            "f0_dyn_target": float(np.median(sd_t)) if sd_t else float("nan"),
+            "f0_dyn_recon": float(np.median(sd_r)) if sd_r else float("nan"),
+            "f0_dyn_ratio": float(np.median(sd_r) / np.median(sd_t)) if (sd_t and sd_r and np.median(sd_t) > 0) else float("nan"),
             "_contours": contours,
         }
 
@@ -517,7 +528,9 @@ def analyze_checkpoint(args, name, ckpt_path, vocoder, dataset, subset_indices, 
             print(f"[{name}]   F0 {gname}: target={s['f0_target']:.0f}Hz true-emb={s['f0_recon']:.0f}Hz "
                   f"→{other}-emb={s['f0_recon_cross']:.0f}Hz (re-pitch={rp:+.2f}, "
                   f"voiced {s.get('f0_voiced_frac_cross', float('nan')):.0%} of {s['n']}) | "
-                  f"centroid t={s['centroid_target']:.1f} r={s['centroid_recon']:.1f}")
+                  f"centroid t={s['centroid_target']:.1f} r={s['centroid_recon']:.1f} | "
+                  f"intonation(semitone-std) t={s.get('f0_dyn_target', float('nan')):.2f} "
+                  f"r={s.get('f0_dyn_recon', float('nan')):.2f} ratio={s.get('f0_dyn_ratio', float('nan')):.2f} (<1=flatter)")
     return {"name": name, "speaker_sim": spk_sim, "params_M": nparams / 1e6, "l1_true": l1_true,
             "l1_shuffled": l1_shuf, "delta": delta, "n_eval": len(eval_idx),
             "l1_true_male": l1_true_m, "l1_true_female": l1_true_f,
@@ -566,9 +579,12 @@ def write_report(args, results):
                   "where torchcrepe found ANY confident-voiced frame (the rest are NaN-dropped "
                   "before the median). A LOW value means the `cross-emb` F0 is a survivorship-"
                   "biased median over a small voiced minority — treat that F0 as noise, not a "
-                  "pitch measurement, and trust the ear.", "",
-                  "| run | source gender | F0 target | true-emb | cross-emb | cross voiced% | re-pitch | centroid t→r |",
-                  "|---|---|---|---|---|---|---|---|"]
+                  "pitch measurement, and trust the ear. `intonation` = semitone-std of the voiced "
+                  "F0 contour (register-invariant prosodic dynamics); `ratio` = recon/target intonation "
+                  "on the SAME utts — **<1 = the recon FLATTENS delivery** (monotone / 'less acting'), "
+                  "controlling for content the way GV does for texture.", "",
+                  "| run | source gender | F0 target | true-emb | cross-emb | cross voiced% | re-pitch | centroid t→r | intonation t→r (ratio) |",
+                  "|---|---|---|---|---|---|---|---|---|"]
         for r in results:
             for gname in ("female", "male"):
                 s = r.get("spectral", {}).get(gname)
@@ -576,7 +592,9 @@ def write_report(args, results):
                     lines.append(f"| {r['name']} | {gname} | {s['f0_target']:.0f} | {s['f0_recon']:.0f} | "
                                  f"{s['f0_recon_cross']:.0f} | {s.get('f0_voiced_frac_cross', float('nan')):.0%} | "
                                  f"{s.get('repitch', float('nan')):+.2f} | "
-                                 f"{s['centroid_target']:.1f}→{s['centroid_recon']:.1f} |")
+                                 f"{s['centroid_target']:.1f}→{s['centroid_recon']:.1f} | "
+                                 f"{s.get('f0_dyn_target', float('nan')):.2f}→{s.get('f0_dyn_recon', float('nan')):.2f} "
+                                 f"({s.get('f0_dyn_ratio', float('nan')):.2f}) |")
     lines += ["", "Per-run mel figures + target/recon_true/recon_wrong_<g> WAVs (filenames tagged "
               "with source gender m/f) are under `<output_dir>/<run>/`."]
     path = os.path.join(args.output_dir, "synthesis_usability_report.md")
