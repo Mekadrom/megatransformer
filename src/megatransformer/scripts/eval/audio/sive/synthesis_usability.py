@@ -466,6 +466,24 @@ def analyze_checkpoint(args, name, ckpt_path, vocoder, dataset, subset_indices, 
     spectral = (spectral_gender_analysis(dec, feats, mels, embs, gens, eval_idx, vocoder, args, name, device)
                 if (vocoder is not None and not args.no_f0) else {})
 
+    # Objective speaker-similarity (ECAPA cosine) on the rendered set — the identity axis
+    # that recon-L1 / leakage / disentangle are all blind to (e.g. the 1420 male->feminine
+    # flip). Reuses score_dir on render_samples' output; bump --num_render to grow the sample.
+    # Opt-in (loads the ECAPA encoder). Absolute cosines are low (degraded probe audio) —
+    # relative across variants is the signal.
+    spk_sim = {}
+    if getattr(args, "speaker_sim", False):
+        from megatransformer.scripts.eval.audio.sive.speaker_sim_wavs import score_dir
+        from megatransformer.utils.speaker_encoder import SpeakerEncoderWrapper
+        enc = SpeakerEncoderWrapper(encoder_type="ecapa_tdnn", device=device)
+        rows = score_dir(enc, SharedWindowBuffer(), os.path.join(args.output_dir, name), device)
+        idents = [r[3] for r in rows if r[3] == r[3]]
+        convs = [r[4] for r in rows if r[4] == r[4]]
+        spk_sim = {"identity": float(np.mean(idents)) if idents else float("nan"),
+                   "convert": float(np.mean(convs)) if convs else float("nan"), "n": len(idents)}
+        print(f"[{name}]   speaker-sim ECAPA (n={spk_sim['n']}): identity={spk_sim['identity']:.3f} "
+              f"convert={spk_sim['convert']:.3f}  (identity=kept source, convert=landed on target; relative-only)")
+
     l1_true, l1_shuf = float(l1t.mean()), float(l1s.mean())
     delta = l1_shuf - l1_true
 
@@ -500,7 +518,7 @@ def analyze_checkpoint(args, name, ckpt_path, vocoder, dataset, subset_indices, 
                   f"→{other}-emb={s['f0_recon_cross']:.0f}Hz (re-pitch={rp:+.2f}, "
                   f"voiced {s.get('f0_voiced_frac_cross', float('nan')):.0%} of {s['n']}) | "
                   f"centroid t={s['centroid_target']:.1f} r={s['centroid_recon']:.1f}")
-    return {"name": name, "params_M": nparams / 1e6, "l1_true": l1_true,
+    return {"name": name, "speaker_sim": spk_sim, "params_M": nparams / 1e6, "l1_true": l1_true,
             "l1_shuffled": l1_shuf, "delta": delta, "n_eval": len(eval_idx),
             "l1_true_male": l1_true_m, "l1_true_female": l1_true_f,
             "delta_same": d_same, "delta_cross": d_cross,
@@ -585,6 +603,12 @@ def main():
                          "(e.g. rmsnorm for a rmsnormblock run). Default: config value.")
     ap.add_argument("--conv_norm_type", default=None,
                     help="Override the conformer depthwise-conv norm to MATCH a checkpoint. Default: config value.")
+    ap.add_argument("--speaker_sim", action="store_true",
+                    help="Also score ECAPA speaker-similarity on the rendered set: identity "
+                         "(recon_true vs GT — did it keep the source speaker) + conversion "
+                         "(recon_wrong vs the target — did it land on the right speaker). The "
+                         "identity axis that L1/leakage/disentangle miss (e.g. the 1420 flip). "
+                         "Bump --num_render to grow the sample; relative-across-variants only.")
     ap.add_argument("--extract_layer", type=int, default=-1,
                     help="Which encoder layer to extract features from (-1 = final, the GRL/CTC layer; "
                          "0=conv_subsample, 1..N=blocks). The SMG trains on layer 10, but the final layer "
