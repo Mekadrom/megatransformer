@@ -130,6 +130,9 @@ class SMGTrainer(CommonTrainer):
         film_contrastive_loss_start_step: int = 0,  # Step to start FiLM contrastive loss
         film_contrastive_margin_max: float = 0.1,  # Max margin value for hinge loss
         film_contrastive_margin_rampup_steps: int = 5000,  # Steps to ramp margin from 0 to max
+        identity_loss_weight: float = 0.0,  # ECAPA identity loss weight (0 = disabled)
+        identity_loss_start_step: int = 0,  # Step to start the identity loss
+        identity_loss_rampup_steps: int = 5000,  # Steps to ramp the identity weight 0 -> max
         # Mu-only reconstruction loss (for diffusion compatibility)
         mu_only_recon_weight: float = 0.0,  # Weight for mu-only reconstruction loss (0 = disabled)
         learned_speaker_classifier: Optional[torch.nn.Module] = None,
@@ -210,6 +213,10 @@ class SMGTrainer(CommonTrainer):
         self.film_contrastive_loss_start_step = film_contrastive_loss_start_step
         self.film_contrastive_margin_max = film_contrastive_margin_max
         self.film_contrastive_margin_rampup_steps = film_contrastive_margin_rampup_steps
+        self.identity_loss_weight = identity_loss_weight
+        self.identity_loss_start_step = identity_loss_start_step
+        self.identity_loss_rampup_steps = identity_loss_rampup_steps
+        self.identity_speaker_encoder = None  # lazy-built frozen ECAPA (built on first use, on the model device)
 
         # Mu-only reconstruction loss (for diffusion compatibility)
         self.mu_only_recon_weight = mu_only_recon_weight
@@ -747,6 +754,45 @@ class SMGTrainer(CommonTrainer):
                 metrics.log_scalar(f"{prefix}film_contrastive/margin_alpha", film_contrastive_margin_alpha, global_step, skip_zero=False)
                 metrics.log_scalar(f"{prefix}film_contrastive/weighted_loss",
                                self.film_contrastive_loss_weight * film_contrastive_loss, global_step, skip_zero=False)
+
+        # Identity loss: push the ECAPA embedding of the DECODED mel toward the target embedding
+        # the decoder was conditioned on (1 - cos). Optimizes "become the RIGHT speaker" directly
+        # — the axis the output-diff FiLM contrastive hinge failed to move. ECAPA takes mel, so no
+        # vocoder in the loop; its weights are frozen (grad flows only through the recon). Ramped so
+        # a resumed model isn't shocked. Off by default (weight 0). Judge by embedding_control's
+        # disentangle rising, not this loss value.
+        identity_loss = torch.tensor(0.0, device=mel_specs.device)
+        identity_enabled = (
+            self.identity_loss_weight > 0
+            and global_step >= self.identity_loss_start_step
+            and decode_speaker_embedding is not None
+        )
+        if identity_enabled:
+            if self.identity_speaker_encoder is None:
+                from megatransformer.utils.speaker_encoder import SpeakerEncoderWrapper
+                enc = SpeakerEncoderWrapper(encoder_type="ecapa_tdnn", device=str(mel_specs.device))
+                enc.eval()
+                for p in enc.parameters():
+                    p.requires_grad_(False)
+                self.identity_speaker_encoder = enc
+            identity_alpha = min(1.0, (global_step - self.identity_loss_start_step) / max(1, self.identity_loss_rampup_steps))
+            # Differentiable ECAPA embedding of the recon (call _forward_ecapa_tdnn to bypass the
+            # @torch.no_grad() outer forward(); frozen weights => grad flows only into the recon).
+            recon_mel = recon[..., :mel_specs.shape[-1]]
+            pred_emb = self.identity_speaker_encoder._forward_ecapa_tdnn(
+                recon_mel, lengths=mel_lengths.clamp(max=recon_mel.size(-1)))
+            tgt_emb = decode_speaker_embedding
+            if tgt_emb.dim() == 3:
+                tgt_emb = tgt_emb.squeeze(1)
+            identity_loss = (1.0 - F.cosine_similarity(pred_emb, tgt_emb.to(pred_emb.dtype), dim=-1)).mean()
+            total_loss = total_loss + self.identity_loss_weight * identity_alpha * identity_loss
+            if global_step % self.args.logging_steps == 0:
+                prefix = "train/" if model.training else "eval/"
+                metrics.log_scalar(f"{prefix}identity/loss", identity_loss, global_step, skip_zero=False)
+                metrics.log_scalar(f"{prefix}identity/cos_to_target", 1.0 - identity_loss.item(), global_step, skip_zero=False)
+                metrics.log_scalar(f"{prefix}identity/alpha", identity_alpha, global_step, skip_zero=False)
+                metrics.log_scalar(f"{prefix}identity/weighted_loss",
+                                   self.identity_loss_weight * identity_alpha * identity_loss, global_step, skip_zero=False)
 
         # Log losses (skip non-loss values like learned_speaker_embedding)
         if global_step % self.args.logging_steps == 0:
@@ -1295,6 +1341,9 @@ def create_trainer(
         film_contrastive_loss_start_step=args.film_contrastive_loss_start_step,
         film_contrastive_margin_max=args.film_contrastive_margin_max,
         film_contrastive_margin_rampup_steps=args.film_contrastive_margin_rampup_steps,
+        identity_loss_weight=args.identity_loss_weight,
+        identity_loss_start_step=args.identity_loss_start_step,
+        identity_loss_rampup_steps=args.identity_loss_rampup_steps,
         mu_only_recon_weight=args.mu_only_recon_weight,
         learned_speaker_classifier=learned_speaker_classifier,
         learned_speaker_classifier_optimizer=learned_speaker_classifier_optimizer,
@@ -1372,6 +1421,16 @@ def add_cli_args(subparsers):
                            help="Maximum margin for FiLM contrastive loss")
     sub_parser.add_argument("--film_contrastive_margin_rampup_steps", type=int, default=5000,
                            help="Number of steps to ramp up FiLM contrastive margin")
+    # ECAPA identity loss — push ECAPA(decoded_mel) toward the target embedding (1 - cos).
+    # Optimizes "become the right speaker" directly (the axis the output-diff hinge missed).
+    sub_parser.add_argument("--identity_loss_weight", type=float, default=0.0,
+                           help="Weight for the ECAPA identity loss (0 = disabled). ECAPA on the decoded "
+                                "mel is pushed toward the conditioning embedding; no vocoder in the loop, "
+                                "frozen ECAPA. Judge success by embedding_control's disentangle, not this loss.")
+    sub_parser.add_argument("--identity_loss_start_step", type=int, default=0,
+                           help="Step to start the identity loss (set = resume step so the ramp begins at resume).")
+    sub_parser.add_argument("--identity_loss_rampup_steps", type=int, default=5000,
+                           help="Steps to ramp the identity-loss weight from 0 to max.")
 
     # SMG loss weights
     sub_parser.add_argument("--recon_loss_weight", type=float, default=None,
