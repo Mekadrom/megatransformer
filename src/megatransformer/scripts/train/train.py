@@ -182,6 +182,7 @@ def get_dataset(command: str, args, split: str):
                 "f0",
                 "vuv",
                 "speaker_ids",
+                "gender_ids",  # 0=male, 1=female, -1=unknown; consumed by the gender GRL adversary (no-op if the shards lack it)
                 "ctc_tokens",  # includes lengths
                 "text",
             ]

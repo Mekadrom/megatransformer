@@ -129,6 +129,27 @@ class SpeakerInvariantVoiceEncoderConfig:
     speaker_embedding_dim: int = 192
     # Heads for the multi-head poolings ("mhasp", "multi_head_attention").
     speaker_classifier_num_heads: int = 4
+    # Encoder layer the GRL speaker adversary attaches to. -1 = final layer (default,
+    # current behavior: GRL + CTC both on the output). >=0 reverses into all_hiddens[grl_layer]
+    # (0 = conv frontend, 1..N = blocks) while CTC stays on the final layer — aligns the
+    # clean-point with the SMG's tap (layer 10) so the layer the SMG consumes is the scrubbed one.
+    grl_layer: int = -1
+
+    # Gender GRL adversary — a binary (male/female) pooled head reversed into its
+    # OWN tap (gender_grl_layer, default 10), independent of the speaker adversary's
+    # grl_layer. Off by default. Targets the gender direction the speaker GRL leaves
+    # largely intact — gender leaks ~0.91 balanced-acc in every run measured because
+    # nothing removes it today. gender_ids come from the shards (0=male, 1=female,
+    # -1=unknown → ignored by the CE). The loss weight is a trainer arg
+    # (--gender_grl_weight), mirroring how grl_weight lives there.
+    use_gender_grl: bool = False
+    num_genders: int = 2
+    gender_pooling: Optional[str] = None  # None -> mirror speaker_pooling
+    # Encoder layer the gender adversary reverses into — independent of the speaker
+    # adversary's grl_layer. Default 10 = the SMG's tap point (scrub gender where the
+    # SMG reads). -1 = final layer; 0 = conv frontend; 1..N = block outputs. Only
+    # validated / used when use_gender_grl is set.
+    gender_grl_layer: int = 10
 
     def __post_init__(self):
         # defaults
@@ -141,6 +162,19 @@ class SpeakerInvariantVoiceEncoderConfig:
 
         if self.speaker_classifier_hidden_dim is None:
             self.speaker_classifier_hidden_dim = self.encoder_dim * 2
+
+        if self.gender_pooling is None:
+            self.gender_pooling = self.speaker_pooling
+
+        if self.grl_layer != -1 and not (0 <= self.grl_layer <= self.num_layers):
+            raise ValueError(f"grl_layer={self.grl_layer} out of range: use -1 (final) or 0..{self.num_layers}")
+
+        # Only validate the gender tap when the head is active — the default (10)
+        # would otherwise trip a small-config default construction (num_layers=4).
+        if self.use_gender_grl and self.gender_grl_layer != -1 and not (0 <= self.gender_grl_layer <= self.num_layers):
+            raise ValueError(
+                f"gender_grl_layer={self.gender_grl_layer} out of range: use -1 (final) or 0..{self.num_layers}"
+            )
 
     def to_dict(self) -> dict:
         """Convert config to dictionary (for HuggingFace compatibility)."""

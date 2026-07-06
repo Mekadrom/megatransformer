@@ -79,6 +79,7 @@ class SIVETrainer(CommonTrainer):
         mel_hop_length: int = 256,
         max_mel_frames: Optional[int] = None,
         speaker_adversary_target: str = "speaker_id",
+        gender_grl_weight: float = 0.1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -105,10 +106,13 @@ class SIVETrainer(CommonTrainer):
         self.mel_hop_length = mel_hop_length
         self.max_mel_frames = max_mel_frames
         self.speaker_adversary_target = speaker_adversary_target
+        self.gender_grl_weight = gender_grl_weight
 
         # CTC loss
         self.ctc_criterion = nn.CTCLoss(blank=vocab.blank_idx, reduction="mean", zero_infinity=True)
         self.speaker_criterion = nn.CrossEntropyLoss()
+        # Gender adversary CE — ignore_index=-1 skips unknown-gender utterances.
+        self.gender_criterion = nn.CrossEntropyLoss(ignore_index=-1)
 
         # Metrics tracking
         self._step_metrics = {}
@@ -154,11 +158,14 @@ class SIVETrainer(CommonTrainer):
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            in_speaker = 'speaker_classifier' in name
+            # Both adversary heads (speaker + gender) get grl_lr — same adversarial
+            # role, same LR treatment. (Under --use_muon, add 'gender_classifier' to
+            # --muon_last_layer_names too so its matmuls route like speaker_classifier.)
+            in_adversary = ('speaker_classifier' in name) or ('gender_classifier' in name)
             in_decay = name in decay_names
             key = (
-                "spk_decay"     if in_speaker and in_decay else
-                "spk_no_decay"  if in_speaker else
+                "spk_decay"     if in_adversary and in_decay else
+                "spk_no_decay"  if in_adversary else
                 "main_decay"    if in_decay else
                 "main_no_decay"
             )
@@ -375,6 +382,24 @@ class SIVETrainer(CommonTrainer):
         # the speaker id (CE) or the ECAPA embedding (cosine regression).
         speaker_loss = self._speaker_adversary_loss(speaker_logits, inputs, speaker_ids)
 
+        # Gender adversary (parallel GRL head): trains to predict gender; the shared
+        # GRL reversal pushes the encoder to make features gender-un-predictive.
+        # -1 (unknown) is skipped by the CE; an all-unknown batch would give NaN, so
+        # guard on there being at least one labelled sample.
+        gender_logits = result.get("gender_logits")
+        gender_ids = inputs.get("gender_ids")
+        gender_loss = torch.zeros((), device=ctc_loss.device)
+        if gender_logits is not None:
+            if gender_ids is None:
+                raise KeyError(
+                    "use_gender_grl is set but the batch has no 'gender_ids'. The SIVE "
+                    "shards were preprocessed without --gender_column (or the dataset "
+                    "column list omits 'gender_ids'). Re-preprocess with gender labels "
+                    "or drop --use_gender_grl."
+                )
+            if (gender_ids != -1).any():
+                gender_loss = self.gender_criterion(gender_logits, gender_ids.long())
+
         # Speaker accuracy and diagnostics (logging only). Every line here ends
         # in .item()/.numel() — each a GPU->CPU sync — so gate on logging steps.
         speaker_acc = speaker_acc_top5 = pred_entropy = unique_preds = max_prob = None
@@ -415,6 +440,7 @@ class SIVETrainer(CommonTrainer):
         total_loss = (
             self.ctc_weight * ctc_loss
             + self.grl_weight * speaker_loss
+            + self.gender_grl_weight * gender_loss
             + self.pad_blank_weight * pad_blank_loss
             + std_hinge_loss
             + cov_loss
@@ -441,6 +467,18 @@ class SIVETrainer(CommonTrainer):
                 metrics.log_scalar("train/speaker_max_prob", max_prob, global_step)
             elif speaker_cos is not None:
                 metrics.log_scalar("train/speaker_emb_cosine", speaker_cos, global_step)
+
+            # Gender adversary diagnostics (only when the head is active). Accuracy
+            # is the leakage readout — HIGH gender accuracy => features still carry
+            # gender for the GRL to remove; it should fall as the adversary bites.
+            if gender_logits is not None:
+                metrics.log_scalar("train/gender_loss", gender_loss, global_step)
+                with torch.no_grad():
+                    valid_g = gender_ids != -1
+                    if valid_g.any():
+                        gender_preds = gender_logits.argmax(dim=-1)
+                        gender_acc = (gender_preds[valid_g] == gender_ids[valid_g]).float().mean().item()
+                        metrics.log_scalar("train/gender_accuracy", gender_acc, global_step)
 
             # Feature regularization losses (zero when respective flags are off).
             metrics.log_scalar("train/std_hinge_loss", std_hinge_loss, global_step)
@@ -537,8 +575,19 @@ class SIVETrainer(CommonTrainer):
             # Speaker loss (id CE or ECAPA-embedding cosine, matching training)
             speaker_loss = self._speaker_adversary_loss(speaker_logits, inputs, speaker_ids)
 
+            # Gender adversary loss (matches training; skips unknown -1 labels).
+            gender_logits = result.get("gender_logits")
+            gender_ids = inputs.get("gender_ids")
+            gender_loss = torch.zeros((), device=ctc_loss.device)
+            if gender_logits is not None and gender_ids is not None and (gender_ids != -1).any():
+                gender_loss = self.gender_criterion(gender_logits, gender_ids.long())
+
             # Combined loss
-            total_loss = self.ctc_weight * ctc_loss + self.grl_weight * speaker_loss
+            total_loss = (
+                self.ctc_weight * ctc_loss
+                + self.grl_weight * speaker_loss
+                + self.gender_grl_weight * gender_loss
+            )
 
         return (total_loss, None, None)
 
@@ -647,6 +696,9 @@ def load_model(args):
         'speaker_adversary_target': args.speaker_adversary_target,
         'speaker_embedding_dim': args.speaker_embedding_dim,
         'speaker_classifier_num_heads': args.speaker_classifier_num_heads,
+        # Gender GRL adversary (off by default; num_genders always safe to pass).
+        'use_gender_grl': args.use_gender_grl,
+        'num_genders': args.num_genders,
         # SpecAugment
         'use_spec_augment': args.use_spec_augment,
         'spec_time_mask_param': args.spec_time_mask_param,
@@ -689,6 +741,12 @@ def load_model(args):
         'block_norm_type': args.block_norm_type,
         'conv_norm_type': args.conv_norm_type,
         'final_norm_type': args.final_norm_type,
+        # GRL attachment layer — same safe-override discipline (None = keep config).
+        'grl_layer': args.grl_layer,
+        # Gender adversary pooling — None keeps the config (which mirrors speaker_pooling).
+        'gender_pooling': args.gender_pooling,
+        # Gender adversary tap layer — None keeps the config (default 10 = SMG tap).
+        'gender_grl_layer': args.gender_grl_layer,
     }
     overrides.update({k: v for k, v in _norm_overrides.items() if v is not None})
     return model_loading_utils.load_model(
@@ -742,6 +800,7 @@ def create_trainer(
         grl_lr=args.grl_lr,
         pad_blank_weight=args.pad_blank_weight,
         speaker_adversary_target=args.speaker_adversary_target,
+        gender_grl_weight=args.gender_grl_weight,
         cmdline=args.cmdline,
         git_commit_hash=args.commit_hash or "",
         step_offset=args.start_step,
@@ -790,6 +849,11 @@ def add_cli_args(subparsers):
                                  "Only takes effect when --use_muon is set AND speaker_classifier matmul "
                                  "params are routed to Muon (i.e. 'speaker_classifier' is NOT in "
                                  "--muon_last_layer_names).")
+    sub_parser.add_argument("--grl_layer", type=int, default=None,
+                            help="Encoder layer the GRL speaker adversary attaches to. Default (None) = "
+                                 "config value (-1 = final layer, current behavior). Set e.g. 10 to align "
+                                 "the adversary with the SMG's layer-10 tap (0 = conv frontend, 1..N = "
+                                 "blocks); CTC stays on the final layer regardless.")
     
     sub_parser.add_argument("--speaker_pooling", type=str, default="attentive_statistics",
                             help="Pooling strategy for speaker classifier: mean | max | statistics | "
@@ -805,6 +869,26 @@ def add_cli_args(subparsers):
                             help="ECAPA embedding dim; the adversary head output size in ecapa_embedding mode.")
     sub_parser.add_argument("--speaker_classifier_num_heads", type=int, default=4,
                             help="Attention heads for multi-head poolings ('mhasp', 'multi_head_attention').")
+
+    # Gender GRL adversary (parallel to the speaker adversary). Off by default.
+    sub_parser.add_argument("--use_gender_grl", action="store_true",
+                            help="Enable a gender adversary (GRL) alongside the speaker adversary. A binary "
+                                 "male/female pooled head is gradient-reversed into its own tap "
+                                 "(--gender_grl_layer, default layer 10 = the SMG tap), scrubbing the gender "
+                                 "direction the speaker GRL leaves largely intact (gender otherwise leaks ~0.91 "
+                                 "balanced acc). Shares the speaker GRL alpha ramp / start step. Requires "
+                                 "gender_ids in the shards.")
+    sub_parser.add_argument("--num_genders", type=int, default=2,
+                            help="Gender classes for the gender adversary (default 2: 0=male, 1=female; -1=unknown ignored).")
+    sub_parser.add_argument("--gender_pooling", type=str, default=None,
+                            help="Pooling for the gender adversary head (default: mirror --speaker_pooling).")
+    sub_parser.add_argument("--gender_grl_layer", type=int, default=None,
+                            help="Encoder layer the gender adversary attaches to (like --grl_layer, but "
+                                 "independent). Default (None) = config value (10 = the SMG's layer-10 tap). "
+                                 "-1 = final layer; 0 = conv frontend; 1..N = block outputs.")
+    sub_parser.add_argument("--gender_grl_weight", type=float, default=0.1,
+                            help="Weight on the gender adversary loss in the total (default 0.1, matching --grl_weight). "
+                                 "Only active with --use_gender_grl.")
 
     # CTC-specific settings
     sub_parser.add_argument("--ctc_weight", type=float, default=1.0,

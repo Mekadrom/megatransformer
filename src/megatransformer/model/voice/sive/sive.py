@@ -159,6 +159,22 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             embedding_dim=getattr(config, "speaker_embedding_dim", 192),
         )
 
+        # Optional gender adversary (GRL), parallel to the speaker adversary. A
+        # binary pooled head reversed into its own tap (gender_grl_layer, default 10;
+        # see forward), independent of the speaker adversary's layer. Reuses
+        # SpeakerClassifier in id-mode with num_speakers=num_genders (CE, not ECAPA).
+        self.gender_classifier = None
+        if getattr(config, "use_gender_grl", False):
+            self.gender_classifier = SpeakerClassifier(
+                d_model=config.encoder_dim,
+                num_speakers=getattr(config, "num_genders", 2),
+                hidden_dim=config.speaker_classifier_hidden_dim,
+                pooling=getattr(config, "gender_pooling", None) or config.speaker_pooling,
+                dropout=config.dropout,
+                num_attention_heads=getattr(config, "speaker_classifier_num_heads", 4),
+                adversary_target="speaker_id",
+            )
+
         # Initialize weights
         self._init_weights()
 
@@ -285,11 +301,26 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
 
         # Transformer encoder
         all_hiddens = [x] if return_all_hiddens else None
+        # GRL attachment layer: capture the hidden the speaker adversary reverses into.
+        # all_hiddens index convention: 0 = conv frontend output, k = output after block k-1.
+        # -1 (default) => attach to the final features (below); >=0 => attach here so the
+        # adversarial speaker-scrub lands where the SMG taps (e.g. layer 10).
+        grl_layer = getattr(self.config, "grl_layer", -1)
+        # The gender adversary can tap a DIFFERENT layer (default 10). Only capture
+        # its hidden when the gender head exists.
+        gender_grl_layer = getattr(self.config, "gender_grl_layer", 10)
+        capture_gender = self.gender_classifier is not None
+        grl_hidden = x if grl_layer == 0 else None
+        gender_grl_hidden = x if (capture_gender and gender_grl_layer == 0) else None
         for i, block in enumerate(self.encoder_blocks):
             x = block(x, key_padding_mask=padding_mask)
 
             if return_all_hiddens:
                 all_hiddens.append(x)
+            if grl_layer == i + 1:   # all_hiddens[i+1] = output after block i
+                grl_hidden = x
+            if capture_gender and gender_grl_layer == i + 1:
+                gender_grl_hidden = x
 
         # Store pre-LayerNorm features
         features_unnorm = x  # [B, T, encoder_dim]
@@ -408,17 +439,37 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         # ASR head (operates on potentially upsampled features)
         asr_logits = self.asr_head(features_for_asr)
 
-        # Speaker classifier with gradient reversal (operates on original resolution)
-        # Use ~padding_mask to get valid positions mask
+        # Speaker classifier with gradient reversal (operates on original resolution).
+        # By default the adversary reverses into the FINAL features; with grl_layer>=0 it
+        # reverses into that intermediate layer instead, so the speaker-scrub lands where the
+        # SMG taps. CTC still trains the final layer, whose gradient flows back through the
+        # scrubbed layer, so blocks above grl_layer keep refining content on cleaned features.
         valid_mask = ~padding_mask if padding_mask is not None else None
-        reversed_features = GradientReversalFunction.apply(features_for_heads, grl_alpha)
+        grl_input = self.feature_dropout(grl_hidden) if grl_hidden is not None else features_for_heads
+        reversed_features = GradientReversalFunction.apply(grl_input, grl_alpha)
         speaker_logits = self.speaker_classifier(reversed_features, mask=valid_mask)
+
+        # Gender adversary reverses into its OWN tap (gender_grl_layer, default 10),
+        # independent of the speaker adversary's layer. When both taps coincide, the
+        # speaker adversary's already-reversed hidden is reused.
+        gender_logits = None
+        if self.gender_classifier is not None:
+            if gender_grl_layer == grl_layer:
+                reversed_gender = reversed_features
+            else:
+                gender_grl_input = (
+                    self.feature_dropout(gender_grl_hidden)
+                    if gender_grl_hidden is not None else features_for_heads
+                )
+                reversed_gender = GradientReversalFunction.apply(gender_grl_input, grl_alpha)
+            gender_logits = self.gender_classifier(reversed_gender, mask=valid_mask)
 
         result = {
             "features": features,  # Normalized features (preferred for VAE)
             "features_unnorm": features_unnorm,  # Pre-LayerNorm (for comparison)
             "asr_logits": asr_logits,
             "speaker_logits": speaker_logits,
+            "gender_logits": gender_logits,  # [B, num_genders] for GRL gender adversary (None if disabled)
             "feature_lengths": feature_lengths,  # Original feature lengths (for feature extraction)
             "ctc_lengths": ctc_lengths,  # CTC lengths (potentially upsampled, for CTC loss)
             "variance_loss": variance_loss,
