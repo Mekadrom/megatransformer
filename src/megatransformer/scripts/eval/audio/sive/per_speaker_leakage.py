@@ -343,6 +343,89 @@ def gender_structured_confusion(top1, yte, class_gender):
 
 
 # ---------------------------------------------------------------------------
+# Direct gender-leakage probe (speaker-disjoint)
+# ---------------------------------------------------------------------------
+
+def balanced_accuracy(y_true, y_pred, num_classes=2):
+    """Mean of per-class recall — robust to the male/female count imbalance
+    (chance = 0.5 for 2 balanced-by-construction classes)."""
+    recalls = []
+    for c in range(num_classes):
+        m = y_true == c
+        if m.sum() == 0:
+            continue
+        recalls.append(float((y_pred[m] == c).mean()))
+    return float(np.mean(recalls)) if recalls else 0.0
+
+
+def gender_speaker_disjoint_split(spk, gen, test_frac, seed):
+    """Speaker-DISJOINT gender split. Partition SPEAKERS (not utterances) into
+    train/test so the gender probe must generalize across UNSEEN speakers — a
+    speaker-mixed split lets it decode gender by memorizing per-speaker identity,
+    which measures speaker leakage, not gender leakage. Stratified by per-speaker
+    majority gender so both genders land on both sides. Utts inherit their
+    speaker's side and their own per-utt gender label; unknown (-1) utts dropped.
+
+    Returns (train_idx, test_idx, n_train_speakers, n_test_speakers)."""
+    rng = np.random.RandomState(seed)
+    spk_gender = {}
+    for s in np.unique(spk):
+        g = gen[(spk == s) & (gen >= 0)]
+        if len(g) > 0:
+            spk_gender[s] = int(np.round(g.mean()))
+    train_spk, test_spk = set(), set()
+    for cls in (0, 1):
+        members = [s for s, gg in spk_gender.items() if gg == cls]
+        members = list(rng.permutation(members)) if members else []
+        if not members:
+            continue
+        n_test = max(1, int(round(len(members) * test_frac)))
+        n_test = min(n_test, len(members) - 1) if len(members) > 1 else 0
+        test_spk.update(members[:n_test])
+        train_spk.update(members[n_test:])
+    known = gen >= 0
+    train_idx = np.where(known & np.isin(spk, list(train_spk)))[0]
+    test_idx = np.where(known & np.isin(spk, list(test_spk)))[0]
+    return train_idx, test_idx, len(train_spk), len(test_spk)
+
+
+def gender_probe(args, feats, spk, gen):
+    """Train a linear + MLP probe to predict gender from the mean-pooled feature
+    on a speaker-disjoint split; report BALANCED accuracy (0.5 = no gender info,
+    1.0 = fully decodable). A working gender GRL should push this toward 0.5.
+    Returns None when gender labels are absent / too few speakers to split."""
+    train_idx, test_idx, n_tr_spk, n_te_spk = gender_speaker_disjoint_split(
+        spk, gen, args.gender_test_frac, args.seed)
+    if len(train_idx) < 4 or len(test_idx) < 4 or n_te_spk < 2 or n_tr_spk < 2:
+        print(f"[gender probe] too few labelled speakers to split "
+              f"(train_spk={n_tr_spk}, test_spk={n_te_spk}); skipping")
+        return None
+
+    Xtr, Xte = feats[train_idx], feats[test_idx]
+    ytr, yte = gen[train_idx].astype(np.int64), gen[test_idx].astype(np.int64)
+    in_dim = feats.shape[1]
+    out = {"n_train": int(len(ytr)), "n_test": int(len(yte)),
+           "n_train_speakers": int(n_tr_spk), "n_test_speakers": int(n_te_spk),
+           "test_class_counts": [int((yte == 0).sum()), int((yte == 1).sum())]}
+    for pname, probe in [
+        ("linear", LinearProbe(in_dim, 2)),
+        ("mlp", MLPProbe(in_dim, 2, hidden_dim=args.mlp_hidden_dim,
+                         num_layers=args.mlp_num_layers, dropout=args.mlp_dropout)),
+    ]:
+        tr = train_probe(probe, Xtr, ytr, Xte, yte, 2,
+                         args.probe_max_epochs, args.probe_patience,
+                         args.probe_lr, args.probe_batch_size, args.device)
+        pred1 = tr["top5_preds"][:, 0]
+        out[pname] = {
+            "balanced_acc": balanced_accuracy(yte, pred1, 2),
+            "raw_acc": float((pred1 == yte).mean()),
+            "plateaued": tr["plateaued"], "best_epoch": tr["best_epoch"],
+            "epochs_run": tr["epochs_run"],
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Per-checkpoint analysis
 # ---------------------------------------------------------------------------
 
@@ -404,6 +487,18 @@ def analyze_checkpoint(args, name, ckpt_path):
               f"({m['ratio_micro_top1']:.1f}x chance)  macro@1={m['macro_top1']:.4f}  "
               f"Gini={m['gini_recall1']:.3f}  top{args.top_k_hot}-share={conc:.2f}  "
               f"plateaued={tr['plateaued']}")
+
+    # Direct gender-leakage probe (speaker-disjoint; balanced acc vs 0.5 chance).
+    # Independent of the speaker probe above — measures how much GENDER survives
+    # in the feature, which the new gender GRL targets directly.
+    if not args.no_gender_probe:
+        gp = gender_probe(args, feats, spk, gen)
+        results["gender_probe"] = gp
+        if gp is not None:
+            print(f"[{name}]   gender probe (speaker-disjoint): balanced_acc "
+                  f"lin={gp['linear']['balanced_acc']:.3f} mlp={gp['mlp']['balanced_acc']:.3f} "
+                  f"(chance 0.5; {gp['n_test_speakers']} test speakers, "
+                  f"plateaued lin={gp['linear']['plateaued']})")
 
     # Linear-vs-MLP per-speaker delta
     lin, mlp = results["linear"]["per_speaker"], results["mlp"]["per_speaker"]
@@ -537,6 +632,33 @@ def write_report(args, all_results):
             f"{l['concentration_topk_share']*100:.0f}% | {gcr} | {l['plateaued']} |")
     lines.append("")
 
+    # Gender leakage (speaker-disjoint probe). Δ is vs the FIRST run listed —
+    # pass the no-gender-GRL run first to read the gender-GRL run's Δ directly.
+    gender_runs = [(n, r) for n, r in all_results.items() if r.get("gender_probe") is not None]
+    if gender_runs:
+        base_name, base_res = gender_runs[0]
+        base_lin = base_res["gender_probe"]["linear"]["balanced_acc"]
+        base_mlp = base_res["gender_probe"]["mlp"]["balanced_acc"]
+        lines.append("## Gender leakage (speaker-disjoint gender probe)")
+        lines.append("")
+        lines.append("Balanced accuracy predicting gender from the mean-pooled feature across "
+                     "**unseen** speakers (0.5 = no gender info; a working gender GRL pushes this "
+                     f"toward 0.5). **Δ vs baseline `{base_name}`** (negative = less gender leakage = better).")
+        lines.append("")
+        lines.append("| run | bal-acc (lin) | Δ lin | bal-acc (mlp) | Δ mlp | raw-acc (lin) | test spk (m/f) | plateaued (lin/mlp) |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for name, res in gender_runs:
+            gp = res["gender_probe"]
+            gl, gm = gp["linear"], gp["mlp"]
+            dl = gl["balanced_acc"] - base_lin
+            dm = gm["balanced_acc"] - base_mlp
+            mc, fc = gp["test_class_counts"]
+            lines.append(
+                f"| {name} | {gl['balanced_acc']:.3f} | {dl:+.3f} | {gm['balanced_acc']:.3f} | "
+                f"{dm:+.3f} | {gl['raw_acc']:.3f} | {gp['n_test_speakers']} ({mc}/{fc}) | "
+                f"{gl['plateaued']}/{gm['plateaued']} |")
+        lines.append("")
+
     lines.append("## MLP (non-linear) contrast")
     lines.append("")
     lines.append("| run | micro@1 ×chance (lin → mlp) | macro@1 (lin → mlp) | speakers where MLP pulls ahead (id:Δrecall) |")
@@ -579,7 +701,8 @@ def write_report(args, all_results):
     slim = {}
     for name, res in all_results.items():
         slim[name] = {"_meta": res["_meta"],
-                      "mlp_minus_linear_top": res["mlp_minus_linear_top"]}
+                      "mlp_minus_linear_top": res["mlp_minus_linear_top"],
+                      "gender_probe": res.get("gender_probe")}
         for pname in ("linear", "mlp"):
             p = dict(res[pname])
             p.pop("per_speaker", None)
@@ -634,6 +757,12 @@ def main():
     # reporting
     ap.add_argument("--top_k_hot", type=int, default=10)
     ap.add_argument("--confusion_n", type=int, default=30)
+    # gender probe (speaker-disjoint; balanced acc vs 0.5). The Δ column in the
+    # report is vs the FIRST --checkpoint listed, so pass the no-gender-GRL run first.
+    ap.add_argument("--no_gender_probe", action="store_true",
+                    help="Skip the direct speaker-disjoint gender-leakage probe.")
+    ap.add_argument("--gender_test_frac", type=float, default=0.3,
+                    help="Fraction of SPEAKERS held out for the gender probe test set (speaker-disjoint).")
     # mel params (must match training; defaults are the SIVE training defaults)
     ap.add_argument("--voice_sample_rate", type=int, default=16000)
     ap.add_argument("--voice_n_mels", type=int, default=80)
