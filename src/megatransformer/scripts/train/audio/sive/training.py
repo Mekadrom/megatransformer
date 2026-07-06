@@ -920,7 +920,7 @@ def add_cli_args(subparsers):
                             choices=["batchnorm", "instancenorm", "groupnorm", "layernorm", "rmsnorm", "none"],
                             help="Conformer depthwise-conv norm (config default: instancenorm).")
     sub_parser.add_argument("--final_norm_type", type=str, default=None,
-                            choices=["layernorm", "rmsnorm", "none"],
+                            choices=["layernorm", "rmsnorm", "batchnorm", "none"],
                             help="Final norm on encoder output features (config default: layernorm). "
                                  "'rmsnorm' avoids LN's dim-axis competition; 'none' skips entirely.")
 

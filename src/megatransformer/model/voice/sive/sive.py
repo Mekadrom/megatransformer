@@ -127,12 +127,14 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             self.final_norm = nn.LayerNorm(config.encoder_dim)
         elif config.final_norm_type == "rmsnorm":
             self.final_norm = RMSNorm(config.encoder_dim)
+        elif config.final_norm_type == "batchnorm":
+            self.final_norm = nn.BatchNorm1d(config.encoder_dim)
         elif config.final_norm_type == "none":
             self.final_norm = nn.Identity()
         else:
             raise ValueError(
                 f"Unknown final_norm_type: {config.final_norm_type}. "
-                f"Expected one of 'layernorm', 'rmsnorm', 'none'."
+                f"Expected one of 'layernorm', 'rmsnorm', 'batchnorm', 'none'."
             )
 
         # Feature dropout (applied before heads)
@@ -290,10 +292,14 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 all_hiddens.append(x)
 
         # Store pre-LayerNorm features
-        features_unnorm = x
+        features_unnorm = x  # [B, T, encoder_dim]
 
         # Final normalization
-        features = self.final_norm(x)
+        if isinstance(self.final_norm, nn.BatchNorm1d):
+            # BatchNorm1d expects input of shape [B, C, T], so permute
+            features = self.final_norm(x.permute(0, 2, 1)).permute(0, 2, 1)
+        else:
+            features = self.final_norm(x)
 
         # Compute variance regularization loss (for VAE-friendly features)
         variance_loss = torch.tensor(0.0, device=mel_spec.device)
