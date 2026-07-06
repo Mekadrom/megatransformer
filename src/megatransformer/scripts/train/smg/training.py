@@ -134,6 +134,7 @@ class SMGTrainer(CommonTrainer):
         identity_loss_start_step: int = 0,  # Step to start the identity loss
         identity_loss_rampup_steps: int = 5000,  # Steps to ramp the identity weight 0 -> max
         identity_loss_max_frames: int = 0,  # Cap mel frames fed to ECAPA (0 = no cap); bounds ECAPA activation memory
+        identity_loss_every_n_steps: int = 1,  # Apply the identity loss every N steps (1 = every step); amortizes cost
         # Mu-only reconstruction loss (for diffusion compatibility)
         mu_only_recon_weight: float = 0.0,  # Weight for mu-only reconstruction loss (0 = disabled)
         learned_speaker_classifier: Optional[torch.nn.Module] = None,
@@ -218,6 +219,7 @@ class SMGTrainer(CommonTrainer):
         self.identity_loss_start_step = identity_loss_start_step
         self.identity_loss_rampup_steps = identity_loss_rampup_steps
         self.identity_loss_max_frames = identity_loss_max_frames
+        self.identity_loss_every_n_steps = max(1, identity_loss_every_n_steps)
         self.identity_speaker_encoder = None  # lazy-built frozen ECAPA (built on first use, on the model device)
 
         # Mu-only reconstruction loss (for diffusion compatibility)
@@ -759,21 +761,25 @@ class SMGTrainer(CommonTrainer):
 
         # Identity loss: push the ECAPA embedding of the DECODED mel toward the target embedding the
         # decoder was conditioned on (1 - cos). Optimizes "become the RIGHT speaker" directly — the
-        # axis the output-diff FiLM contrastive hinge failed to move. Two halves, ONE ECAPA pass:
-        #   same-speaker: decode(features, own_emb) -> should read as OWN speaker (identity-faithful
-        #     recon; catches the "correct-emb but wrong-person" failure mel-L1 is blind to). Reuses
-        #     the main forward's `recon` — no extra decode.
-        #   swapped:      decode(features, OTHER_emb) -> should read as the OTHER speaker. THIS is the
-        #     collapse-breaker: the features encode the source, so the only way to make the content
-        #     read as the swapped speaker is to actually USE the embedding. One extra decode.
-        # Both outputs are aligned to their OWN conditioning embedding, so they share a single ECAPA
-        # forward over the stacked [same ; swapped] batch. ECAPA takes mel (no vocoder in the loop),
-        # frozen weights (grad flows only into the recons). Ramped; off by default (weight 0). Judge
-        # by embedding_control's disentangle + the identity/cos_swap curve, not the same-speaker cos.
+        # axis the output-diff FiLM contrastive hinge failed to move. THE trained half is the SWAP:
+        #   swapped: decode(features, OTHER_emb) -> should read as the OTHER speaker. The collapse-
+        #     breaker — the features encode the source, so the only way to make the content read as
+        #     the swapped speaker is to actually USE the embedding. One extra decode, backpropped.
+        # The same-speaker cos is kept only as a DIAGNOSTIC (no_grad, on logging steps): the main
+        # mel-L1 already enforces identity-faithful same-speaker recon, so its ECAPA gradient was
+        # near-redundant and doubled the expensive ECAPA backward — dropping it halves that cost.
+        # Perf levers: ECAPA fwd runs under bf16 autocast (cosine is robust to it); the whole loss
+        # fires only every --identity_loss_every_n_steps to amortize the extra decode + ECAPA.
+        # ECAPA takes mel (no vocoder in the loop), frozen weights. Ramped; off by default (weight 0).
+        # Judge by embedding_control's disentangle + the identity/cos_swap curve, not cos_same.
         identity_loss = torch.tensor(0.0, device=mel_specs.device)
+        # Fire every N steps (offset from start). global_step is constant across a grad-accum group,
+        # so a whole optimizer step either fires on all its micro-batches or none — no partial group.
+        identity_fires = ((global_step - self.identity_loss_start_step) % self.identity_loss_every_n_steps == 0)
         identity_enabled = (
             self.identity_loss_weight > 0
             and global_step >= self.identity_loss_start_step
+            and identity_fires
             and decode_speaker_embedding is not None
             and decode_speaker_embedding.shape[0] > 1  # need >=2 for the swap
         )
@@ -786,6 +792,10 @@ class SMGTrainer(CommonTrainer):
                     p.requires_grad_(False)
                 self.identity_speaker_encoder = enc
             identity_alpha = min(1.0, (global_step - self.identity_loss_start_step) / max(1, self.identity_loss_rampup_steps))
+            # bf16 autocast for ECAPA (frozen fp32 params, bf16 activations). ECAPA fwd+bwd is the
+            # bulk of the cost and a speaker-cosine tolerates bf16; the loss is upcast to fp32 below.
+            id_dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
+            id_amp = self.args.bf16 or self.args.fp16
 
             emb_own = decode_speaker_embedding.squeeze(1) if decode_speaker_embedding.dim() == 3 else decode_speaker_embedding
             B = emb_own.shape[0]
@@ -795,38 +805,45 @@ class SMGTrainer(CommonTrainer):
             perm[self_map] = (perm[self_map] + 1) % B
             emb_swapped = emb_own[perm]
 
-            # Same-speaker recon = the main forward's `recon` (reuse). Swapped = one extra decode.
-            recon_same = recon[..., :mel_specs.shape[-1]]
-            if recon_same.dim() == 4 and recon_same.shape[1] == 1:
-                recon_same = recon_same.squeeze(1)
+            # Swapped output = one extra decode (the only backpropped half).
             recon_swap = model.decode(features, speaker_embedding=emb_swapped, features=features)[..., :mel_specs.shape[-1]]
             if recon_swap.dim() == 4 and recon_swap.shape[1] == 1:
                 recon_swap = recon_swap.squeeze(1)
 
-            # One RANDOM padding-masked window applied to BOTH (same content/lengths) — no onset bias,
-            # start bounded by the shortest valid length, per-sample id_lengths mask trailing padding.
-            id_lengths = mel_lengths.clamp(max=recon_same.size(-1))
-            if self.identity_loss_max_frames > 0 and recon_same.size(-1) > self.identity_loss_max_frames:
+            # One RANDOM padding-masked window (no onset bias; start bounded by the shortest valid
+            # length; per-sample id_lengths mask trailing padding). Same window reused for the
+            # same-speaker diagnostic below so both score the identical region.
+            id_lengths = mel_lengths.clamp(max=recon_swap.size(-1))
+            start = 0
+            if self.identity_loss_max_frames > 0 and recon_swap.size(-1) > self.identity_loss_max_frames:
                 win = self.identity_loss_max_frames
                 min_valid = int(id_lengths.min().item())
                 start = int(torch.randint(0, max(0, min_valid - win) + 1, (1,)).item())
-                recon_same = recon_same[..., start:start + win]
                 recon_swap = recon_swap[..., start:start + win]
                 id_lengths = (id_lengths - start).clamp(min=1, max=win)
 
-            # ONE ECAPA pass over [same ; swapped]; align each output to its own conditioning emb.
-            pred = self.identity_speaker_encoder._forward_ecapa_tdnn(
-                torch.cat([recon_same, recon_swap], dim=0),
-                lengths=torch.cat([id_lengths, id_lengths], dim=0))
-            targets = torch.cat([emb_own, emb_swapped], dim=0).to(pred.dtype)
-            cos = F.cosine_similarity(pred, targets, dim=-1)  # [2B]: first B = same, last B = swapped
-            identity_loss = (1.0 - cos).mean()
+            with autocast(mel_specs.device.type, dtype=id_dtype, enabled=id_amp):
+                pred_swap = self.identity_speaker_encoder._forward_ecapa_tdnn(recon_swap, lengths=id_lengths)
+            cos_swap = F.cosine_similarity(pred_swap.float(), emb_swapped.float(), dim=-1)  # [B]
+            identity_loss = (1.0 - cos_swap).mean()
             total_loss = total_loss + self.identity_loss_weight * identity_alpha * identity_loss
+
             if global_step % self.args.logging_steps == 0:
                 prefix = "train/" if model.training else "eval/"
+                # Same-speaker cos = no_grad diagnostic; reuses the main forward's `recon` (no extra
+                # decode), windowed identically to the swap. Not part of the loss.
+                with torch.no_grad():
+                    recon_same = recon[..., :mel_specs.shape[-1]]
+                    if recon_same.dim() == 4 and recon_same.shape[1] == 1:
+                        recon_same = recon_same.squeeze(1)
+                    if self.identity_loss_max_frames > 0 and recon_same.size(-1) > self.identity_loss_max_frames:
+                        recon_same = recon_same[..., start:start + self.identity_loss_max_frames]
+                    with autocast(mel_specs.device.type, dtype=id_dtype, enabled=id_amp):
+                        pred_same = self.identity_speaker_encoder._forward_ecapa_tdnn(recon_same, lengths=id_lengths)
+                    cos_same = F.cosine_similarity(pred_same.float(), emb_own.float(), dim=-1).mean()
                 metrics.log_scalar(f"{prefix}identity/loss", identity_loss, global_step, skip_zero=False)
-                metrics.log_scalar(f"{prefix}identity/cos_same", cos[:B].mean(), global_step, skip_zero=False)
-                metrics.log_scalar(f"{prefix}identity/cos_swap", cos[B:].mean(), global_step, skip_zero=False)  # THE conversion signal
+                metrics.log_scalar(f"{prefix}identity/cos_same", cos_same, global_step, skip_zero=False)
+                metrics.log_scalar(f"{prefix}identity/cos_swap", cos_swap.mean(), global_step, skip_zero=False)  # THE conversion signal
                 metrics.log_scalar(f"{prefix}identity/alpha", identity_alpha, global_step, skip_zero=False)
                 metrics.log_scalar(f"{prefix}identity/weighted_loss",
                                    self.identity_loss_weight * identity_alpha * identity_loss, global_step, skip_zero=False)
@@ -1382,6 +1399,7 @@ def create_trainer(
         identity_loss_start_step=args.identity_loss_start_step,
         identity_loss_rampup_steps=args.identity_loss_rampup_steps,
         identity_loss_max_frames=args.identity_loss_max_frames,
+        identity_loss_every_n_steps=args.identity_loss_every_n_steps,
         mu_only_recon_weight=args.mu_only_recon_weight,
         learned_speaker_classifier=learned_speaker_classifier,
         learned_speaker_classifier_optimizer=learned_speaker_classifier_optimizer,
@@ -1473,6 +1491,12 @@ def add_cli_args(subparsers):
                            help="Cap the mel frames fed to ECAPA for the identity loss (0 = no cap). "
                                 "Bounds ECAPA's backprop activation memory (the OOM source); ~300-400 "
                                 "frames is plenty for speaker identity and lets you keep a larger batch.")
+    sub_parser.add_argument("--identity_loss_every_n_steps", type=int, default=1,
+                           help="Apply the identity loss every N steps (1 = every step). Amortizes its "
+                                "cost (the extra swap decode + ECAPA fwd/bwd, the bulk of the per-iter "
+                                "slowdown); 2-3 is a good tradeoff for a slow-moving conversion objective. "
+                                "Note: firing every N steps reduces the AVERAGE pressure ~Nx — bump "
+                                "--identity_loss_weight if you want to hold the effective weight constant.")
 
     # SMG loss weights
     sub_parser.add_argument("--recon_loss_weight", type=float, default=None,
