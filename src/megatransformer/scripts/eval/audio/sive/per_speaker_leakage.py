@@ -82,7 +82,7 @@ def _sample_to_mel(sample, buf, sr, n_mels, n_fft, hop_length):
 
 @torch.no_grad()
 def extract_final_features(model, dataset, max_samples, device, batch_size,
-                           sr, n_mels, n_fft, hop_length):
+                           sr, n_mels, n_fft, hop_length, layer=-1):
     """Mean-pool the FINAL SIVE feature over valid frames, one vector / utterance.
 
     Returns (features [N, D] float32, speaker_ids [N] int64, gender_ids [N] int64
@@ -113,8 +113,11 @@ def extract_final_features(model, dataset, max_samples, device, batch_size,
         mel_batch = mel_batch.to(device)
         len_batch = torch.tensor(lengths, dtype=torch.long, device=device)
 
-        result = model(mel_batch, lengths=len_batch, grl_alpha=0.0)
-        features = result["features"]            # [B, T', D]
+        result = model(mel_batch, lengths=len_batch, grl_alpha=0.0,
+                       return_all_hiddens=(layer != -1))
+        # layer -1 = final post-norm features (result["features"]); >=0 = all_hiddens[L]
+        # (0 = conv frontend, k = output of encoder layer k) — e.g. 10 = the SMG's tap.
+        features = result["features"] if layer == -1 else result["all_hiddens"][layer]
         feat_lengths = result["feature_lengths"]  # [B]
         for b in range(features.shape[0]):
             vlen = int(feat_lengths[b].item())
@@ -132,7 +135,7 @@ def extract_final_features(model, dataset, max_samples, device, batch_size,
 
 def cached_features(args, name, ckpt_path):
     """Extract (or load cached) per-utterance features for one checkpoint."""
-    key = hashlib.md5(f"{ckpt_path}|{args.max_samples}|{args.config}".encode()).hexdigest()[:10]
+    key = hashlib.md5(f"{ckpt_path}|{args.max_samples}|{args.config}|L{args.extract_layer}".encode()).hexdigest()[:10]
     cache_path = os.path.join(args.output_dir, f"_features_{name}_{key}.npz")
     if os.path.exists(cache_path) and not args.no_feature_cache:
         d = np.load(cache_path)
@@ -156,6 +159,7 @@ def cached_features(args, name, ckpt_path):
     feats, spk, gen = extract_final_features(
         model, dataset, args.max_samples, args.device, args.batch_size,
         args.voice_sample_rate, args.voice_n_mels, args.voice_n_fft, args.voice_hop_length,
+        layer=args.extract_layer,
     )
     del model
     if args.device.startswith("cuda"):
@@ -769,6 +773,11 @@ def main():
     ap.add_argument("--voice_n_fft", type=int, default=1024)
     ap.add_argument("--voice_hop_length", type=int, default=256)
     ap.add_argument("--no_feature_cache", action="store_true")
+    ap.add_argument("--extract_layer", type=int, default=-1,
+                    help="Encoder layer to probe: -1 = final POST-norm features (result['features'], "
+                         "the GRL/CTC layer); >=0 = all_hiddens[L] (0 = conv frontend, k = output of "
+                         "encoder layer k). Use 10 to probe the SMG's actual tap. Matches "
+                         "synthesis_usability's --extract_layer. Cache key includes the layer.")
     args = ap.parse_args()
 
     if not args.checkpoint:
