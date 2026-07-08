@@ -80,6 +80,13 @@ class SMGDecoder2D(nn.Module):
                 self.get_activation_1d = lambda _: activation_type()
                 self.get_activation_2d = lambda _: activation_type()
 
+        # Optional InstanceNorm on the RAW input features (strips per-channel
+        # utterance moments = speaker envelope before any learned mixing). Off by default.
+        self.input_instance_norm = (
+            nn.InstanceNorm1d(decoder_input_dim, affine=False)
+            if getattr(config, "input_instance_norm", False) else None
+        )
+
         # Initial 1D projection
         self.conv1d_initial = nn.Conv1d(decoder_input_dim, config.conv1d_channels, kernel_size=3, padding=1)
         self.conv1d_initial_norm = nn.GroupNorm(max(1, config.conv1d_channels // 4), config.conv1d_channels)
@@ -255,6 +262,10 @@ class SMGDecoder2D(nn.Module):
                 speaker_embedding = self.speaker_embedding_projection(speaker_embedding)
 
         # === 1D Processing ===
+        # Optional input InstanceNorm — strip the speaker envelope from the raw
+        # SIVE features before any learned mixing (see __init__).
+        if self.input_instance_norm is not None:
+            z = self.input_instance_norm(z)
         x: torch.Tensor = self.conv1d_initial(z)
         x = self.conv1d_initial_norm(x)
         x = self.conv1d_initial_act(x)
@@ -378,6 +389,15 @@ class SMGDecoder1D(nn.Module):
                 nn.Linear(config.speaker_embedding_dim, config.speaker_embedding_proj_dim),
                 nn.SiLU(),
             )
+
+        # Optional InstanceNorm on the RAW input features (before the initial conv):
+        # strips per-channel utterance moments (speaker's global spectral envelope)
+        # so the SMG must source that detail from the embedding. affine=False =
+        # genuinely lossy (no learnable restore). Off by default.
+        self.input_instance_norm = (
+            nn.InstanceNorm1d(config.sive_encoder_dim, affine=False)
+            if getattr(config, "input_instance_norm", False) else None
+        )
 
         # Initial projection from latent to working channels
         self.initial_conv = nn.Conv1d(config.sive_encoder_dim, config.initial_channels, kernel_size=3, padding=1)
@@ -556,6 +576,11 @@ class SMGDecoder1D(nn.Module):
                 speaker_embedding = F.normalize(speaker_embedding, p=2, dim=-1)
             if self.speaker_embedding_projection is not None:
                 speaker_embedding = self.speaker_embedding_projection(speaker_embedding)
+
+        # Optional input InstanceNorm — strip the speaker envelope from the raw
+        # SIVE features before any learned mixing (see __init__).
+        if self.input_instance_norm is not None:
+            z = self.input_instance_norm(z)
 
         # Initial projection
         x: torch.Tensor = self.initial_conv(z)
@@ -901,6 +926,9 @@ class SMG(nn.Module):
         active_decoder_cfg = config.decoder_1d_config if config.decoder_1d_config is not None else config.decoder_config
         sive_encoder_dim = overrides.pop('sive_encoder_dim', active_decoder_cfg.sive_encoder_dim)
         overrides.pop('activation', None)
+        # Decoder-only override: the F0 predictor / conditioning sub-configs don't
+        # have this field, so drop it before splatting overrides into them.
+        overrides.pop('input_instance_norm', None)
 
         config_dict = {k: v for k, v in config.f0_predictor_config.__dict__.items()}
         config_dict.update(overrides)

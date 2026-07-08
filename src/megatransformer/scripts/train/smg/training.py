@@ -1181,6 +1181,11 @@ class SMGTrainer(CommonTrainer):
 
 def load_model(args):
     overrides = {"sive_encoder_dim": args.sive_encoder_dim}
+    # Architectural input InstanceNorm on the raw SIVE features (strips the speaker
+    # envelope at the SMG input). Only override when the flag is passed, so a preset
+    # that enables it isn't clobbered by the CLI default.
+    if getattr(args, "input_instance_norm", None):
+        overrides["input_instance_norm"] = True
     # Model-internal loss weights (read by SMG.forward via self.config.*). Override
     # the config ONLY when explicitly passed (CLI default None) so the preset's
     # values stay the source of truth and a CLI default can't silently clobber them.
@@ -1435,6 +1440,11 @@ def add_cli_args(subparsers):
     # SMG settings
     sub_parser.add_argument("--sive_encoder_dim", type=int, default=256,
                            help="Channel width of the SIVE encoder features fed into the SMG (SMG decoder input dim). Must match the upstream SIVE encoder_dim (currently 256)")
+    sub_parser.add_argument("--input_instance_norm", action="store_true",
+                           help="Architecturally InstanceNorm the raw SIVE features (per-channel over time, affine-free) "
+                                "before the SMG's initial conv — strips the per-channel utterance moments (speaker's global "
+                                "spectral envelope), forcing that detail to come from the embedding. Not baked into the cache, "
+                                "so the same features are reusable without it. Off by default.")
     # Speaker encoder type determines embedding dimension
     sub_parser.add_argument("--speaker_encoder_type", type=str, default="ecapa_tdnn",
                            help="Type of pretrained speaker encoder to use (ecapa_tdnn or wavlm)")

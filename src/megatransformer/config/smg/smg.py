@@ -13,6 +13,11 @@ class SMGDecoder2DConfig:
     # Channel width of the SIVE encoder features fed into the decoder (the
     # decoder input dim). Defaults to the current SIVE encoder_dim (256).
     sive_encoder_dim: int = 256
+    # InstanceNorm the RAW SIVE features (per-channel over time) before the initial
+    # conv — strips per-channel utterance moments (speaker envelope) at the input,
+    # forcing that detail to come from the embedding (AutoVC/IN-VC style).
+    # Architectural, affine-free, off by default.
+    input_instance_norm: bool = False
 
     activation: str = "silu"
 
@@ -87,6 +92,12 @@ class SMGDecoder1DConfig:
     # Channel width of the SIVE encoder features fed into the decoder (the
     # decoder input dim). Defaults to the current SIVE encoder_dim (256).
     sive_encoder_dim: int = 256
+    # InstanceNorm the RAW SIVE features (per-channel over time) before the initial
+    # conv — strips the per-channel utterance moments (a speaker slice: global
+    # spectral envelope) at the SMG's input, forcing that detail to come from the
+    # embedding instead (AutoVC/IN-VC style). Architectural (not baked into the
+    # cache), affine-free, off by default; toggling it reuses the same features.
+    input_instance_norm: bool = False
     activation: str = "silu"
 
     # Speaker conditioning (FiLM)
