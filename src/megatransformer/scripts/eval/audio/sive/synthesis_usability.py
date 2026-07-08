@@ -298,6 +298,19 @@ def render_samples(dec, feats, mels, embs, spks, gens, eval_idx, vocoder, args, 
         fig.savefig(os.path.join(out, f"sample{k}_spk{int(spks[i])}_{gmap[gi]}_mel.png"), dpi=100)
         plt.close(fig)
 
+        # Optionally persist the PRE-vocoder mels so a mel-domain speaker-sim can
+        # feed them straight to ECAPA (no HiFiGAN round-trip) — isolates whether the
+        # vocoder OOD step, not the features, drags a run's ECAPA cosine down.
+        if getattr(args, "save_render_mels", False):
+            mel_out = os.path.join(out, "mels")
+            os.makedirs(mel_out, exist_ok=True)
+            base = f"sample{k}_spk{int(spks[i])}_{gmap[gi]}"
+            torch.save({
+                "target": tgt.cpu(), "recon_true": pred_true.cpu(),
+                "recon_wrong": pred_shuf.cpu(), "xref": mels[j].cpu(),
+                "spk": int(spks[i]), "g": gmap[gi], "spk_wrong": spk_j, "g_wrong": gj,
+            }, os.path.join(mel_out, f"{base}.mels.pt"))
+
         if vocoder is not None:
             # xref = the ACTUAL target speaker the cross/wrong embedding came from
             # (GT mel of utterance j, vocoded). A reference so the cross-conversion
@@ -656,6 +669,9 @@ def main():
     ap.add_argument("--probe_batch", type=int, default=16)
     # rendering / vocoder
     ap.add_argument("--num_render", type=int, default=6)
+    ap.add_argument("--save_render_mels", action="store_true",
+                    help="Also dump the PRE-vocoder mels of each rendered sample to <out>/mels/*.mels.pt "
+                         "for the mel-domain speaker-sim (ECAPA on the mel directly, skipping HiFiGAN).")
     ap.add_argument("--f0_samples", type=int, default=30, help="utts per gender for F0/centroid analysis")
     ap.add_argument("--no_f0", action="store_true", help="skip the F0/centroid gender analysis")
     ap.add_argument("--vocoder_config", default="hifigan")
