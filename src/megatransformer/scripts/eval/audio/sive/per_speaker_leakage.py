@@ -133,14 +133,46 @@ def extract_final_features(model, dataset, max_samples, device, batch_size,
             np.array(gen_list, dtype=np.int64))
 
 
+def extract_contentvec_features(dataset, model_id, layer, max_samples, device):
+    """Mean-pooled ContentVec features per utterance (parallels extract_final_features
+    but off the raw waveform via an off-the-shelf HuBERT)."""
+    from megatransformer.utils.contentvec_features import load_contentvec, contentvec_hidden
+    m = load_contentvec(model_id, device)
+    n = len(dataset) if max_samples <= 0 else min(len(dataset), max_samples)
+    feats_list, spk_list, gen_list = [], [], []
+    for i in tqdm(range(n), desc="Extracting ContentVec"):
+        s = dataset[i]
+        wav = s["waveform"][:int(s["waveform_length"])].to(torch.float32).to(device)
+        h = contentvec_hidden(m, wav, layer=layer)  # [T', D]
+        feats_list.append(h.mean(dim=0).float().cpu().numpy())
+        spk_list.append(int(s["speaker_id"]))
+        g = s.get("gender_id", None)
+        gen_list.append(-1 if g is None else int(g if not isinstance(g, torch.Tensor) else g.item()))
+    return (np.stack(feats_list).astype(np.float32),
+            np.array(spk_list, dtype=np.int64), np.array(gen_list, dtype=np.int64))
+
+
 def cached_features(args, name, ckpt_path):
     """Extract (or load cached) per-utterance features for one checkpoint."""
-    key = hashlib.md5(f"{ckpt_path}|{args.max_samples}|{args.config}|L{args.extract_layer}".encode()).hexdigest()[:10]
+    enc = getattr(args, "content_encoder", "sive")
+    key = hashlib.md5(f"{enc}|{ckpt_path}|{args.max_samples}|{args.config}|L{args.extract_layer}|{getattr(args, 'contentvec_model', '')}".encode()).hexdigest()[:10]
     cache_path = os.path.join(args.output_dir, f"_features_{name}_{key}.npz")
     if os.path.exists(cache_path) and not args.no_feature_cache:
         d = np.load(cache_path)
         print(f"[{name}] loaded cached features from {cache_path}")
         return d["features"], d["speaker_ids"], d["gender_ids"]
+
+    # ContentVec: off-the-shelf HuBERT on the raw waveform (no SIVE checkpoint).
+    if enc == "contentvec":
+        dataset = VoiceShardedDataset(
+            shard_dir=args.val_cache_dir, cache_size=args.shard_cache_size,
+            columns=["waveforms", "mel_specs", "speaker_ids", "gender_ids"],
+        )
+        feats, spk, gen = extract_contentvec_features(
+            dataset, args.contentvec_model, args.extract_layer, args.max_samples, args.device)
+        if not args.no_feature_cache:
+            np.savez(cache_path, features=feats, speaker_ids=spk, gender_ids=gen)
+        return feats, spk, gen
 
     model = load_model(
         SpeakerInvariantVoiceEncoder, args.config, checkpoint_path=ckpt_path,
@@ -727,6 +759,10 @@ def main():
                     help="Checkpoint to evaluate as name=path. Repeatable. Pass a no-GRL run as contrast.")
     ap.add_argument("--config", required=True)
     ap.add_argument("--num_speakers", type=int, default=3610)
+    ap.add_argument("--content_encoder", default="sive", choices=["sive", "contentvec"],
+                    help="Feature source: 'sive' (checkpoint) or 'contentvec' (off-the-shelf HuBERT on the raw waveform, for an apples-to-apples leakage comparison). --config is ignored for contentvec.")
+    ap.add_argument("--contentvec_model", default="lengyue233/content-vec-best",
+                    help="HF model id for ContentVec (transformers.HubertModel), used when --content_encoder contentvec. --extract_layer <0 = last_hidden_state (768).")
     ap.add_argument("--final_norm_type", default=None,
                     help="Override the model's final_norm_type to MATCH a norm-variant checkpoint "
                          "(layernorm/rmsnorm/none). REQUIRED for rmsnorm/none runs — without it the "

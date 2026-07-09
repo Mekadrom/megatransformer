@@ -136,6 +136,33 @@ def extract_subset(model, dataset, indices, device, batch_size,
             torch.tensor(spks, dtype=torch.long), torch.tensor(gens, dtype=torch.long))
 
 
+def extract_contentvec_subset(dataset, indices, model_id, layer, device,
+                              sr, n_mels, n_fft, hop_length):
+    """ContentVec analog of extract_subset: off-the-shelf HuBERT on the raw waveform,
+    features linear-interpolated to the mel frame rate (same as the SIVE path, so the
+    tiny decoder sees frame-aligned inputs regardless of the encoder's native rate)."""
+    from megatransformer.utils.contentvec_features import load_contentvec, contentvec_hidden
+    m = load_contentvec(model_id, device)
+    buf = SharedWindowBuffer()
+    feats, mels, embs, spks, gens = [], [], [], [], []
+    for i in tqdm(indices, desc="Extracting ContentVec subset"):
+        s = dataset[int(i)]
+        wav = s["waveform"][:int(s["waveform_length"])].to(torch.float32)
+        mel = extract_mels(buf, wav, sr=sr, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length)  # [n_mels, T]
+        tmel = mel.shape[-1]
+        h = contentvec_hidden(m, wav.to(device), layer=layer)          # [T', D]
+        f = h.transpose(0, 1).unsqueeze(0).float()                     # [1, D, T']
+        f_up = F.interpolate(f, size=tmel, mode="linear", align_corners=False)[0].cpu()  # [D, T]
+        feats.append(f_up)
+        mels.append(mel)
+        embs.append(s["speaker_embedding"].float().reshape(-1))
+        spks.append(int(s["speaker_id"]))
+        gg = s.get("gender_id", None)
+        gens.append(-1 if gg is None else int(gg if not isinstance(gg, torch.Tensor) else gg.item()))
+    return (feats, mels, torch.stack(embs),
+            torch.tensor(spks, dtype=torch.long), torch.tensor(gens, dtype=torch.long))
+
+
 # ---------------------------------------------------------------------------
 # Decoder: SMG-shaped — FiLM-conditioned 1D conv (frame-parallel, ~0.5-1.5M params)
 # ---------------------------------------------------------------------------
@@ -462,21 +489,27 @@ def spectral_gender_analysis(dec, feats, mels, embs, gens, eval_idx, vocoder, ar
 
 def analyze_checkpoint(args, name, ckpt_path, vocoder, dataset, subset_indices, device):
     print(f"\n{'='*70}\n[{name}] {ckpt_path}\n{'='*70}")
-    model = load_model(SpeakerInvariantVoiceEncoder, args.config, checkpoint_path=ckpt_path,
-                       device=device,
-                       overrides={"num_speakers": args.num_speakers,
-                                  **{k: v for k, v in {"final_norm_type": args.final_norm_type,
-                                                       "downsample_norm_type": args.downsample_norm_type,
-                                                       "block_norm_type": args.block_norm_type,
-                                                       "conv_norm_type": args.conv_norm_type}.items() if v is not None}},
-                       strict=False, allow_size_mismatch=True)
-    feats, mels, embs, spks, gens = extract_subset(
-        model, dataset, subset_indices, device, args.batch_size,
-        args.voice_sample_rate, args.voice_n_mels, args.voice_n_fft, args.voice_hop_length,
-        extract_layer=args.extract_layer)
-    del model
-    if device.startswith("cuda"):
-        torch.cuda.empty_cache()
+    if getattr(args, "content_encoder", "sive") == "contentvec":
+        # Off-the-shelf HuBERT on the raw waveform; no SIVE checkpoint.
+        feats, mels, embs, spks, gens = extract_contentvec_subset(
+            dataset, subset_indices, args.contentvec_model, args.extract_layer, device,
+            args.voice_sample_rate, args.voice_n_mels, args.voice_n_fft, args.voice_hop_length)
+    else:
+        model = load_model(SpeakerInvariantVoiceEncoder, args.config, checkpoint_path=ckpt_path,
+                           device=device,
+                           overrides={"num_speakers": args.num_speakers,
+                                      **{k: v for k, v in {"final_norm_type": args.final_norm_type,
+                                                           "downsample_norm_type": args.downsample_norm_type,
+                                                           "block_norm_type": args.block_norm_type,
+                                                           "conv_norm_type": args.conv_norm_type}.items() if v is not None}},
+                           strict=False, allow_size_mismatch=True)
+        feats, mels, embs, spks, gens = extract_subset(
+            model, dataset, subset_indices, device, args.batch_size,
+            args.voice_sample_rate, args.voice_n_mels, args.voice_n_fft, args.voice_hop_length,
+            extract_layer=args.extract_layer)
+        del model
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
     n = len(feats)
     rng = np.random.RandomState(args.seed)
@@ -621,6 +654,10 @@ def main():
     ap.add_argument("--checkpoint", action="append", default=[], metavar="name=path", help="Repeatable.")
     ap.add_argument("--config", required=True)
     ap.add_argument("--num_speakers", type=int, default=3610)
+    ap.add_argument("--content_encoder", default="sive", choices=["sive", "contentvec"],
+                    help="Feature source: 'sive' (checkpoint) or 'contentvec' (off-the-shelf HuBERT on the raw waveform). --config/--checkpoint path are ignored for contentvec (pass a dummy name=x).")
+    ap.add_argument("--contentvec_model", default="lengyue233/content-vec-best",
+                    help="HF model id for ContentVec, used when --content_encoder contentvec. --extract_layer <0 = last_hidden_state (768).")
     ap.add_argument("--final_norm_type", default=None,
                     help="Override the model's final_norm_type to MATCH a norm-variant checkpoint "
                          "(layernorm/rmsnorm/none). REQUIRED for rmsnorm/none runs — without it the "
