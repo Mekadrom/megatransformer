@@ -658,6 +658,12 @@ class MegaTransformerWorldModel(nn.Module):
         # Token budgets for media generation (fixed-length, like image patches)
         audio_token_budget: int = 209,
         voice_token_budget: int = 209,
+        # Stochastic voice sampling (only active if the voice coda emits a
+        # log-variance). 0.0 => deterministic (mean only, == old behaviour);
+        # ~0.5-0.7 => moderate. variance_floor clamps the per-frame std before
+        # sampling (anti-collapse mitigation).
+        voice_temperature: float = 0.0,
+        voice_variance_floor: float = 0.0,
         # Pre-encoded media for transcription / cross-modal tasks
         audio_inputs: Optional[torch.Tensor] = None,
         audio_lengths: Optional[torch.Tensor] = None,
@@ -1093,7 +1099,18 @@ class MegaTransformerWorldModel(nn.Module):
                         )
                         voice_coda_kv_caches[b] = coda_out.get("kv_caches")
                         voice_coda_position_offsets[b] += 1
-                        frame_pred = coda_out["voice_latent_preds"]  # (1, C, 1)
+                        frame_pred = coda_out["voice_latent_preds"]  # (1, C, 1) = Gaussian mean
+                        # Heteroscedastic sampling: if the coda emitted a log-variance
+                        # and temperature > 0, draw the frame from N(mu, (temp*std)^2).
+                        # The sampled frame is BOTH emitted and fed back to the prelude
+                        # at the next step (so downstream context sees the sample, not
+                        # the mean). temperature 0 or a deterministic coda => mean.
+                        voice_logvar = coda_out.get("voice_latent_logvar")
+                        if voice_logvar is not None and voice_temperature > 0.0:
+                            std = torch.exp(0.5 * voice_logvar)  # (1, C, 1)
+                            if voice_variance_floor > 0.0:
+                                std = std.clamp_min(voice_variance_floor)
+                            frame_pred = frame_pred + voice_temperature * std * torch.randn_like(frame_pred)
                         voice_sequences[b].append(frame_pred.squeeze(0))  # (C, 1)
                         last_voice_pred[b] = frame_pred.squeeze(0)  # (C, 1)
                         # Check stop probability

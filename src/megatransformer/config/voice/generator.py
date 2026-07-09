@@ -26,6 +26,20 @@ class VoiceCodaAndSMGConfig:
     input_norm_type: str = "layernorm"
     output_norm_type: str = "layernorm"
 
+    # Stochastic output head. When True, the coda additionally predicts a
+    # per-frame, per-dim log-variance (a parallel linear head off the coda
+    # hidden state) so the SIVE-feature output is a heteroscedastic diagonal
+    # Gaussian rather than a point estimate. Training uses (beta-)NLL; inference
+    # samples mu + temperature*std*eps. Default False = original deterministic
+    # behaviour (byte-identical: the extra head is simply not built).
+    stochastic_output: bool = False
+    logvar_clamp_min: float = -8.0
+    logvar_clamp_max: float = 4.0
+    # Initial (homoscedastic) log-variance: the log-variance head's weight inits
+    # to zero and its bias to this, so the model starts by predicting a constant
+    # variance everywhere and learns position-conditional variance from there.
+    logvar_init: float = 0.0
+
 
     def __post_init__(self):
         pass

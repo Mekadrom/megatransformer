@@ -104,6 +104,19 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
 
         self.feature_projection = nn.Linear(coda_config.d_model, config.feature_channels)
 
+        # Stochastic (heteroscedastic Gaussian) output: a parallel head predicting
+        # per-frame log-variance off the coda hidden state. The mean path (feature
+        # _projection -> denorm -> refine) is untouched; log-variance bypasses the
+        # denorm/refine (which are calibrated for the point estimate) and is read
+        # straight off the hidden state. Only built when enabled, so a deterministic
+        # config is unchanged.
+        self.stochastic_output = getattr(config, "stochastic_output", False)
+        if self.stochastic_output:
+            self.logvar_clamp_min = config.logvar_clamp_min
+            self.logvar_clamp_max = config.logvar_clamp_max
+            self.logvar_init = config.logvar_init
+            self.logvar_projection = nn.Linear(coda_config.d_model, config.feature_channels)
+
         # Optional refinement after linear projection
         output_mode = getattr(config, 'output_mode', 'linear')
         if output_mode == "conv_refine":
@@ -138,6 +151,12 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
             block.apply(init_linear)
         apply_depth_scaled_residual_init(self.coda)
         self.feature_projection.apply(init_linear)
+        # Log-variance head starts homoscedastic: zero weight => log_var == bias
+        # everywhere (= logvar_init), so the model begins with a constant predicted
+        # variance and learns position-conditional variance from there.
+        if getattr(self, "stochastic_output", False):
+            nn.init.zeros_(self.logvar_projection.weight)
+            nn.init.constant_(self.logvar_projection.bias, self.logvar_init)
         # Bias the stop head toward "continue" at init so an untrained model
         # generates full sequences instead of stopping immediately.
         nn.init.zeros_(self.stop_head.weight)
@@ -236,6 +255,14 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
             f"{self.prefix}_latent_preds": feature_preds,
             f"{self.prefix}_stop_logits": stop_logits,
         }
+
+        # Heteroscedastic log-variance (parallel head, off the coda hidden state).
+        # feature_preds above is the Gaussian MEAN; this is per-frame log-variance
+        # in the same (batch, feature_channels, timesteps) layout.
+        if self.stochastic_output:
+            log_var = self.logvar_projection(h)  # (batch, seq_length, feature_channels)
+            log_var = log_var.clamp(min=self.logvar_clamp_min, max=self.logvar_clamp_max)
+            outputs[f"{self.prefix}_latent_logvar"] = log_var.permute(0, 2, 1)  # (B, C, T)
         if use_cache:
             outputs["kv_caches"] = new_kv_caches
 

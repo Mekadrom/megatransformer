@@ -56,6 +56,9 @@ class WorldModelTrainer(CommonTrainer):
         # Whitened by log(2) (BCE baseline) so 1.0 = equal weight to other losses.
         audio_stop_loss_weight: float = 1.0,
         voice_stop_loss_weight: float = 1.0,
+        # beta for the voice heteroscedastic beta-NLL (only used when the voice
+        # coda is stochastic, i.e. emits a log-variance). 0.5 = Seitzer default.
+        voice_beta_nll: float = 0.5,
         # Modality flags
         include_text: bool = True,
         include_audio: bool = True,
@@ -107,6 +110,7 @@ class WorldModelTrainer(CommonTrainer):
 
         self.audio_stop_loss_weight = audio_stop_loss_weight
         self.voice_stop_loss_weight = voice_stop_loss_weight
+        self.voice_beta_nll = voice_beta_nll
 
         self.include_text = include_text
         self.include_audio = include_audio
@@ -192,6 +196,8 @@ class WorldModelTrainer(CommonTrainer):
         var_loss_weight: float,
         var_barrier_weight: float = 0.0,
         lengths: Optional[torch.Tensor] = None,
+        logvar: Optional[torch.Tensor] = None,
+        beta_nll: float = 0.5,
     ):
         """Whitened L1+MSE reconstruction loss + variance-matching auxiliary loss.
 
@@ -256,6 +262,41 @@ class WorldModelTrainer(CommonTrainer):
             preds_masked = preds
             labels_masked = labels
             n_real = preds.numel()
+
+        # Heteroscedastic Gaussian (beta-)NLL branch. When the coda emits a
+        # per-frame log-variance, `preds` is the Gaussian MEAN and this replaces
+        # the whitened recon + variance-matching terms entirely (the NLL already
+        # trades mean accuracy against variance calibration). beta-NLL (Seitzer
+        # et al. 2022) reweights each term by var**beta (stop-grad) so the mean's
+        # gradient isn't down-weighted by 1/var and left to underfit; beta=0.5 is
+        # the recommended middle ground (beta=0 => plain NLL, beta=1 => ~MSE).
+        if logvar is not None:
+            lv = logvar
+            inv_var = torch.exp(-lv)
+            sq = (labels - preds) ** 2
+            nll = 0.5 * (lv + sq * inv_var)  # drop the 0.5*log(2pi) constant
+            if beta_nll and beta_nll > 0.0:
+                nll = nll * torch.exp(lv * beta_nll).detach()
+            if lengths is not None:
+                nll_loss = (nll * mask).sum() / n_real
+                l1_raw = ((labels - preds).abs() * mask).sum() / n_real
+            else:
+                nll_loss = nll.mean()
+                l1_raw = (labels - preds).abs().mean()
+            with torch.no_grad():
+                if lengths is not None:
+                    sel = mask.expand_as(lv)
+                    lv_v = lv[sel]
+                else:
+                    lv_v = lv.flatten()
+                pred_std_mean = torch.exp(0.5 * lv_v).mean()
+            return nll_loss, {
+                f"{name}_nll_loss": nll_loss.detach(),
+                f"{name}_l1_loss_raw": l1_raw.detach(),
+                f"{name}_logvar_mean": lv_v.mean().detach(),
+                f"{name}_logvar_std": lv_v.std().detach(),
+                f"{name}_pred_std_mean": pred_std_mean.detach(),
+            }
 
         # Per-batch label statistics on real positions only, detached so they
         # can't backprop (fixed normalizers, not optimization targets).
@@ -593,6 +634,8 @@ class WorldModelTrainer(CommonTrainer):
                 self.voice_var_loss_weight,
                 self.voice_var_barrier_weight,
                 lengths=voice_loss_lengths,
+                logvar=outputs.get("voice_latent_logvar"),
+                beta_nll=self.voice_beta_nll,
             )
             total_loss = total_loss + self.voice_latent_loss_weight * voice_modality_loss
             loss_components.update(voice_components)
@@ -1158,7 +1201,8 @@ def load_model(args, device='cuda'):
     # Pre-construction overrides for nested configs
     needs_override = (getattr(args, 'iteration_norm', None) is not None or
                       getattr(args, 'share_block_weights', False) or
-                      getattr(args, 'max_seq_len', None) is not None)
+                      getattr(args, 'max_seq_len', None) is not None or
+                      getattr(args, 'voice_stochastic_output', False))
     if needs_override:
         import copy
         from megatransformer.config.world.world_model import WORLD_MODEL_CONFIGS
@@ -1168,6 +1212,14 @@ def load_model(args, device='cuda'):
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if getattr(args, 'share_block_weights', False):
             config.recurrent_block_config.share_block_weights = True
+        if getattr(args, 'voice_stochastic_output', False):
+            config.voice_coda_config.stochastic_output = True
+            if getattr(args, 'voice_logvar_init', None) is not None:
+                config.voice_coda_config.logvar_init = args.voice_logvar_init
+            if getattr(args, 'voice_logvar_clamp_min', None) is not None:
+                config.voice_coda_config.logvar_clamp_min = args.voice_logvar_clamp_min
+            if getattr(args, 'voice_logvar_clamp_max', None) is not None:
+                config.voice_coda_config.logvar_clamp_max = args.voice_logvar_clamp_max
         if getattr(args, 'max_seq_len', None) is not None:
             # Size causal masks for the full interleaved sequence length:
             # text max_seq_len + worst-case media tokens (voice ~210, image ~64)
@@ -1299,6 +1351,7 @@ def create_trainer(
         image_var_barrier_weight=getattr(args, 'image_var_barrier_weight', 0.0),
         audio_stop_loss_weight=getattr(args, 'audio_stop_loss_weight', 1.0),
         voice_stop_loss_weight=getattr(args, 'voice_stop_loss_weight', 1.0),
+        voice_beta_nll=getattr(args, 'voice_beta_nll', 0.5),
         include_text="text" in include_modes,
         include_audio="audio" in include_modes,
         include_voice="voice" in include_modes,
@@ -1397,6 +1450,21 @@ def add_cli_args(subparsers):
                             help="Weight for the audio stop prediction loss")
     sub_parser.add_argument("--voice_stop_loss_weight", type=float, default=1.0,
                             help="Weight for the voice stop prediction loss")
+
+    # Stochastic (heteroscedastic Gaussian) voice coda. When enabled the voice
+    # coda predicts (mu, log_var) per SIVE frame and trains with beta-NLL instead
+    # of the whitened recon + variance-matching terms; inference samples from the
+    # predicted Gaussian with a temperature (deterministic at temperature 0).
+    sub_parser.add_argument("--voice_stochastic_output", action="store_true",
+                            help="Voice coda predicts a per-frame diagonal Gaussian (mu, log_var) and trains with beta-NLL")
+    sub_parser.add_argument("--voice_beta_nll", type=float, default=0.5,
+                            help="beta for the voice beta-NLL (0=plain NLL, 1=~MSE; Seitzer default 0.5)")
+    sub_parser.add_argument("--voice_logvar_init", type=float, default=0.0,
+                            help="Initial (homoscedastic) log-variance the log-var head's bias inits to")
+    sub_parser.add_argument("--voice_logvar_clamp_min", type=float, default=-8.0,
+                            help="Lower clamp on predicted voice log-variance")
+    sub_parser.add_argument("--voice_logvar_clamp_max", type=float, default=4.0,
+                            help="Upper clamp on predicted voice log-variance")
 
     # Diffusion bridge image decoder: latent scaling (only used in diffusion mode).
     # Either pass --image_latent_scale (global SD1.x-style scalar) OR
