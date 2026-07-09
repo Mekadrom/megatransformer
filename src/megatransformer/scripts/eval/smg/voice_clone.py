@@ -1,12 +1,17 @@
 """
-Gradio demo for voice cloning using SIVE + SMG + vocoder.
+Gradio demo for voice cloning using a content encoder + SMG + vocoder.
 
-Uploads a content audio and a speaker reference audio, extracts SIVE features
-from the content, ECAPA-TDNN speaker embeddings from the reference, runs the
-SMG decoder to produce a mel spectrogram, and synthesizes audio via vocoder.
+Uploads a content audio and a speaker reference audio, extracts content features
+(SIVE from the mel, or off-the-shelf ContentVec from the waveform), ECAPA-TDNN
+speaker embeddings from the reference, runs the SMG decoder to produce a mel
+spectrogram, and synthesizes audio via vocoder. If the SMG mel hop differs from
+the vocoder's (e.g. a 50 Hz ContentVec SMG @hop320 vs a 62.5 Hz @hop256 vocoder),
+the mel is resampled to the vocoder's rate before synthesis.
 
-Usage:
-    python -m megatransformer.scripts.eval.smg.voice_clone --sive_checkpoint_path ./checkpoints/sive/checkpoint-60000 --sive_config tiny_deep --smg_checkpoint_path ./checkpoints/smg/checkpoint-50000 --smg_config small_decoder_only_1d --vocoder_config hifigan
+Usage (SIVE):
+    python -m megatransformer.scripts.eval.smg.voice_clone --content_encoder sive --sive_checkpoint_path ./checkpoints/sive/checkpoint-60000 --sive_config tiny_deep --smg_checkpoint_path ./checkpoints/smg/checkpoint-50000 --smg_config small_decoder_only_1d --vocoder_config hifigan
+Usage (ContentVec, 50 Hz):
+    python -m megatransformer.scripts.eval.smg.voice_clone --content_encoder contentvec --hop_length 320 --smg_checkpoint_path ./checkpoints/smg_contentvec/checkpoint-50000 --smg_config medium_decoder_only_1d_1x --vocoder_config hifigan
 """
 import argparse
 
@@ -25,8 +30,14 @@ from megatransformer.utils.speaker_encoder import get_speaker_encoder
 def parse_args():
     parser = argparse.ArgumentParser(description="Voice cloning with SIVE + SMG")
 
-    # SIVE
-    parser.add_argument("--sive_checkpoint_path", type=str, required=True, help="Path to SIVE checkpoint directory")
+    # Content encoder — must match how the SMG was trained
+    parser.add_argument("--content_encoder", type=str, default="sive", choices=["sive", "contentvec"],
+                        help="Content features source: 'sive' (custom checkpoint) or 'contentvec' (off-the-shelf HuBERT, on the raw waveform).")
+    parser.add_argument("--contentvec_model", type=str, default="lengyue233/content-vec-best",
+                        help="HF model id for ContentVec (transformers.HubertModel), used when --content_encoder contentvec.")
+
+    # SIVE (used when --content_encoder sive)
+    parser.add_argument("--sive_checkpoint_path", type=str, default=None, help="Path to SIVE checkpoint directory (required for --content_encoder sive)")
     parser.add_argument("--sive_config", type=str, default="tiny_deep", help="SIVE config name")
     parser.add_argument("--sive_layer", type=int, default=10, help="SIVE all_hiddens index to extract from (0=subsampling frontend, 1-12=encoder layers 1-12). Default 10 = encoder layer 10 = -3 from the end of 12 encoder layers.")
     parser.add_argument("--num_speakers", type=int, default=2338, help="Number of speakers for SIVE model (must match checkpoint)")
@@ -71,28 +82,38 @@ def main():
 
     print("Loading models...")
 
-    # Load SIVE
-    print(f"Loading SIVE ({args.sive_config}) from {args.sive_checkpoint_path}")
-    sive = load_model(
-        SpeakerInvariantVoiceEncoder,
-        args.sive_config,
-        checkpoint_path=args.sive_checkpoint_path,
-        device=device,
-        overrides={k: v for k, v in {"num_speakers": args.num_speakers, "speaker_pooling": args.speaker_pooling}.items() if v is not None},
-    )
-    sive.eval()
-    print(f"SIVE loaded ({sum(p.numel() for p in sive.parameters()):,} params)")
+    # Load the content encoder — SIVE (custom) or ContentVec (off-the-shelf HuBERT).
+    sive = None
+    contentvec = None
+    if args.content_encoder == "sive":
+        assert args.sive_checkpoint_path, "--sive_checkpoint_path is required for --content_encoder sive"
+        print(f"Loading SIVE ({args.sive_config}) from {args.sive_checkpoint_path}")
+        sive = load_model(
+            SpeakerInvariantVoiceEncoder,
+            args.sive_config,
+            checkpoint_path=args.sive_checkpoint_path,
+            device=device,
+            overrides={k: v for k, v in {"num_speakers": args.num_speakers, "speaker_pooling": args.speaker_pooling}.items() if v is not None},
+        ).eval()
+        content_dim = sive.config.encoder_dim
+        print(f"SIVE loaded ({sum(p.numel() for p in sive.parameters()):,} params)")
+    else:
+        from transformers import HubertModel
+        print(f"Loading ContentVec: {args.contentvec_model}")
+        contentvec = HubertModel.from_pretrained(args.contentvec_model).eval().to(device)
+        content_dim = contentvec.config.hidden_size
+        print(f"ContentVec loaded ({sum(p.numel() for p in contentvec.parameters()):,} params), dim={content_dim}")
 
-    # Load SMG — auto-wire sive_encoder_dim from SIVE encoder_dim
-    sive_encoder_dim = sive.config.encoder_dim
+    # Load SMG — wire sive_encoder_dim from the content encoder's dim, and hop_length
+    # so the F0-embedding phase matches the mel rate (e.g. 320 for a 50 Hz ContentVec SMG).
     print(f"Loading SMG ({args.smg_config}) from {args.smg_checkpoint_path}")
-    print(f"  Auto-wiring sive_encoder_dim={sive_encoder_dim} from SIVE encoder_dim")
+    print(f"  Wiring sive_encoder_dim={content_dim}, hop_length={args.hop_length}")
     smg = load_model(
         SMG,
         args.smg_config,
         checkpoint_path=args.smg_checkpoint_path,
         device=device,
-        overrides={"sive_encoder_dim": sive_encoder_dim},
+        overrides={"sive_encoder_dim": content_dim, "hop_length": args.hop_length},
     )
     smg.eval()
     print(f"SMG loaded ({sum(p.numel() for p in smg.parameters()):,} params)")
@@ -120,37 +141,43 @@ def main():
         content_waveform = load_audio(content_audio_path, args.sample_rate).to(device)
         speaker_waveform = load_audio(speaker_audio_path, args.sample_rate).to(device)
 
-        # Extract mel spectrograms
-        content_mel = extract_mels(shared_window_buffer, content_waveform, sr=args.sample_rate, n_mels=args.n_mels, n_fft=args.n_fft, hop_length=args.hop_length)
+        # Speaker embedding from the reference (ECAPA-TDNN takes the mel).
         speaker_mel = extract_mels(shared_window_buffer, speaker_waveform, sr=args.sample_rate, n_mels=args.n_mels, n_fft=args.n_fft, hop_length=args.hop_length)
-        # content_mel: [n_mels, T], speaker_mel: [n_mels, T]
-
-        # Extract speaker embedding from reference audio
-        # ECAPA-TDNN expects [B, n_mels, T]
         speaker_embedding = speaker_encoder(mel_spec=speaker_mel.unsqueeze(0))  # [1, 192]
 
-        # Extract SIVE features from content audio
-        # SIVE expects [B, n_mels, T]
-        sive_features, feature_lengths = sive.extract_features(
-            content_mel.unsqueeze(0),
-            lengths=torch.tensor([content_mel.shape[-1]], device=device),
-            layer=args.sive_layer,
-        )
-        # sive_features: [1, T', encoder_dim]
-
-        # SMG expects channel-first: [B, D, T']
-        sive_features_cf = sive_features.permute(0, 2, 1)
+        # Content features from the content audio -> [1, D, T'] (channel-first for the SMG).
+        if sive is not None:
+            # SIVE takes the mel; extract a specific encoder layer.
+            content_mel = extract_mels(shared_window_buffer, content_waveform, sr=args.sample_rate, n_mels=args.n_mels, n_fft=args.n_fft, hop_length=args.hop_length)
+            feats, _ = sive.extract_features(
+                content_mel.unsqueeze(0),
+                lengths=torch.tensor([content_mel.shape[-1]], device=device),
+                layer=args.sive_layer,
+            )  # [1, T', D]
+            content_features = feats.permute(0, 2, 1)
+        else:
+            # ContentVec takes the raw waveform -> [1, T@50Hz, D] -> [1, D, T].
+            hidden = contentvec(content_waveform.unsqueeze(0)).last_hidden_state
+            content_features = hidden.permute(0, 2, 1)
 
         # Run SMG decoder
         mel_recon = smg.decode(
-            z=sive_features_cf,
+            z=content_features,
             speaker_embedding=speaker_embedding,
-            features=sive_features_cf,
+            features=content_features,
         )
 
         # Handle 2D decoder output [B, 1, n_mels, T] -> [B, n_mels, T]
         if mel_recon.dim() == 4:
             mel_recon = mel_recon.squeeze(1)
+
+        # Resample the mel to the vocoder's frame rate if the SMG mel hop differs
+        # (e.g. a 50 Hz ContentVec mel @hop320 -> a 62.5 Hz @hop256 vocoder). No-op
+        # when they match, so SIVE runs at the vocoder's hop are unaffected.
+        voc_hop = getattr(getattr(vocoder, "config", None), "hop_length", args.hop_length)
+        if args.hop_length != voc_hop:
+            new_T = max(1, round(mel_recon.shape[-1] * args.hop_length / voc_hop))
+            mel_recon = torch.nn.functional.interpolate(mel_recon.float(), size=new_T, mode="linear", align_corners=False)
 
         # Vocoder: mel -> waveform
         result = vocoder(mel_recon)
@@ -175,12 +202,12 @@ def main():
             gr.Audio(type="filepath", label="Speaker Reference (whose voice to use)"),
         ],
         outputs=gr.Audio(type="numpy", label="Voice Cloned Output"),
-        title="Voice Cloning with SIVE + SMG",
+        title=f"Voice Cloning — {args.content_encoder} + SMG",
         description=(
-            "Upload a content audio file and a speaker reference audio file. "
-            "The system extracts linguistic features from the content audio using SIVE "
-            "and speaker characteristics from the reference using ECAPA-TDNN, "
-            "then generates speech in the target speaker's voice via the SMG decoder."
+            "Upload a content audio file and a speaker reference audio file. Content features "
+            f"come from {'SIVE' if args.content_encoder == 'sive' else 'ContentVec'}, speaker "
+            "identity from ECAPA-TDNN, and the SMG decoder + vocoder synthesize the content in "
+            "the target speaker's voice."
         ),
     )
     demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)

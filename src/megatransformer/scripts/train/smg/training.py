@@ -1181,6 +1181,11 @@ class SMGTrainer(CommonTrainer):
 
 def load_model(args):
     overrides = {"sive_encoder_dim": args.sive_encoder_dim}
+    # Keep the F0 conditioning embedding's harmonic-phase step (hop/sample_rate) in
+    # sync with the mel/F0 frame rate. Routed to the F0-embedding sub-config only
+    # (from_config pops it before the F0-predictor build). e.g. 320 for a 50 Hz
+    # ContentVec run; 256 (the default) matches existing runs = no change.
+    overrides["hop_length"] = args.voice_hop_length
     # Architectural input InstanceNorm on the raw SIVE features (strips the speaker
     # envelope at the SMG input). Only override when the flag is passed, so a preset
     # that enables it isn't clobbered by the CLI default.

@@ -167,18 +167,33 @@ def render_attention_weights(
 def render_vocoder_audio(
     vocoder: torch.nn.Module,
     mel_spec: torch.Tensor,
+    mel_hop_length: Optional[int] = None,
+    vocoder_hop_length: Optional[int] = None,
 ) -> np.ndarray:
     """Run vocoder inference and return normalized waveform.
 
     Args:
         vocoder: Vocoder model.
         mel_spec: Mel spectrogram, shape (n_mels, T) or (B, n_mels, T).
+        mel_hop_length: hop the incoming mel was computed at (e.g. 320 = 50 Hz).
+        vocoder_hop_length: hop the vocoder was trained at (e.g. 256 = 62.5 Hz).
+            If both are given and differ, the mel is resampled along the TIME axis to
+            the vocoder's frame rate before synthesis (new_T = T * mel_hop/voc_hop) —
+            lets a 50 Hz SMG mel drive the existing 62.5 Hz vocoder without a retrain.
+            The frequency params (n_mels/fmin/fmax/log-scale) must still match. Both
+            None (default) = no resample, so existing callers are unaffected.
 
     Returns:
         Waveform as 1D numpy float32 array, normalized to [-1, 1].
     """
     if mel_spec.dim() == 2:
         mel_spec = mel_spec.unsqueeze(0)
+
+    if (mel_hop_length is not None and vocoder_hop_length is not None
+            and mel_hop_length != vocoder_hop_length):
+        new_T = max(1, int(round(mel_spec.shape[-1] * mel_hop_length / vocoder_hop_length)))
+        mel_spec = torch.nn.functional.interpolate(
+            mel_spec.float(), size=new_T, mode="linear", align_corners=False)
 
     vocoder_dtype = next(vocoder.parameters()).dtype
     vocoder_device = next(vocoder.parameters()).device

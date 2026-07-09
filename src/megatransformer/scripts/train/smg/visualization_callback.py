@@ -53,6 +53,16 @@ class SMGVisualizationCallback(VisualizationCallback):
         self.vocoder = vocoder  # May be pre-loaded (shared with trainer for waveform losses)
         self._vocoder_load_attempted = vocoder is not None  # Skip lazy loading if already provided
 
+    def _vocode(self, mel):
+        """Vocode a mel, resampling its time axis to the vocoder's frame rate when the
+        SMG mel hop (voice_hop_length) differs from the vocoder's — e.g. a 50 Hz
+        ContentVec mel @hop320 driving a 62.5 Hz @hop256 vocoder. No-op when equal."""
+        return visualization.render_vocoder_audio(
+            self.vocoder, mel,
+            mel_hop_length=self.voice_hop_length,
+            vocoder_hop_length=getattr(getattr(self.vocoder, "config", None), "hop_length", self.voice_hop_length),
+        )
+
     def on_evaluate(self, args, state, control, model=None, **kwargs):
         """Generate and log reconstructions during evaluation from eval dataset."""
         global_step = state.global_step + self.step_offset
@@ -292,13 +302,13 @@ class SMGVisualizationCallback(VisualizationCallback):
 
                         # Log ground truth audio
                         try:
-                            waveform = visualization.render_vocoder_audio(self.vocoder, mel_tensor[..., :mel_lengths])
+                            waveform = self._vocode(mel_tensor[..., :mel_lengths])
                             metrics.log_audio(f"eval_smg/original_audio/{i}", waveform, global_step, self.voice_sample_rate)
                         except Exception as e:
                             print(f"Vocoder failed for original audio {i}: {e}")
                         # Log reconstruction audio
                         try:
-                            waveform = visualization.render_vocoder_audio(self.vocoder, recon_mel_tensor[..., :mel_lengths])
+                            waveform = self._vocode(recon_mel_tensor[..., :mel_lengths])
                             metrics.log_audio(f"eval_smg/recon_audio/{i}", waveform, global_step, self.voice_sample_rate)
                         except Exception as e:
                             print(f"Vocoder failed for recon audio {i}: {e}")
@@ -306,7 +316,7 @@ class SMGVisualizationCallback(VisualizationCallback):
                         if is_vae:
                             recon_mu_only_mel_tensor = recon_mu_only[0].squeeze(0).float().cpu()
                             try:
-                                waveform = visualization.render_vocoder_audio(self.vocoder, recon_mu_only_mel_tensor[..., :mel_lengths])
+                                waveform = self._vocode(recon_mu_only_mel_tensor[..., :mel_lengths])
                                 metrics.log_audio(f"eval_smg/recon_mu_only_audio/{i}", waveform, global_step, self.voice_sample_rate)
                             except Exception as e:
                                 print(f"Vocoder failed for mu-only recon audio {i}: {e}")
@@ -429,7 +439,7 @@ class SMGVisualizationCallback(VisualizationCallback):
                         # Log audio if vocoder available
                         if self.vocoder is not None:
                             try:
-                                waveform = visualization.render_vocoder_audio(self.vocoder, cross_recon_a_with_b[0].squeeze(0).float().cpu()[..., :sample_a["mel_length"]])
+                                waveform = self._vocode(cross_recon_a_with_b[0].squeeze(0).float().cpu()[..., :sample_a["mel_length"]])
                                 metrics.log_audio(f"eval_smg/cross_speaker/pair{pair_idx}_ab/audio", waveform, global_step, self.voice_sample_rate)
 
                                 waveform_mels = audio_utils.extract_mels(
@@ -444,7 +454,7 @@ class SMGVisualizationCallback(VisualizationCallback):
                                 print(f"Vocoder failed for cross-speaker pair {pair_idx} AB: {e}")
 
                             try:
-                                waveform = visualization.render_vocoder_audio(self.vocoder, cross_recon_b_with_a[0].squeeze(0).float().cpu()[..., :sample_b["mel_length"]])
+                                waveform = self._vocode(cross_recon_b_with_a[0].squeeze(0).float().cpu()[..., :sample_b["mel_length"]])
                                 metrics.log_audio(f"eval_smg/cross_speaker/pair{pair_idx}_ba/audio", waveform, global_step, self.voice_sample_rate)
 
                                 waveform_mels = audio_utils.extract_mels(

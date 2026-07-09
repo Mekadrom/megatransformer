@@ -31,6 +31,10 @@ def main():
     ap.add_argument("--sive_encoder_dim", type=int, default=256)
     ap.add_argument("--cache_dir", default="./cached_datasets/smg_libritts_r_clean_stdhinge11-300k_val")
     ap.add_argument("--vocoder_config", default="hifigan")
+    ap.add_argument("--mel_hop_length", type=int, default=256,
+                    help="Hop the cache's mels were computed at (e.g. 320 for a 50 Hz ContentVec cache). "
+                         "If it differs from the vocoder's hop, the mel is time-resampled to the vocoder's "
+                         "rate before synthesis. Default 256 (matches the vocoder = no-op).")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=7)
@@ -56,8 +60,12 @@ def main():
     embs = [s["speaker_embedding"].float() for s in samples]
     rng = np.random.RandomState(args.seed)
 
+    _voc_hop = getattr(getattr(vocoder, "config", None), "hop_length", args.mel_hop_length)
+
     def _mos(mel_1c):  # mel [1, 80, T] -> UTMOS scalar (vocode then score)
-        wav = torch.from_numpy(visualization.render_vocoder_audio(vocoder, mel_1c)).float().unsqueeze(0).to(dev)
+        wav = torch.from_numpy(visualization.render_vocoder_audio(
+            vocoder, mel_1c, mel_hop_length=args.mel_hop_length, vocoder_hop_length=_voc_hop,
+        )).float().unsqueeze(0).to(dev)
         return float(utmos(wav, 16000).reshape(-1)[0])
 
     mos_r, mos_g, mos_w = [], [], []

@@ -146,11 +146,11 @@ SMG_DECODER_1D_CONFIGS = {
         stage_kernel_sizes=[5, 5, 5],
         time_upsample_factors=[2, 2, 1],  # 4x total
     ),
-    "medium": SMGDecoder1DConfig(
+    "medium_1x": SMGDecoder1DConfig(
         initial_channels=640,
         stage_channels=[640, 384, 256],
         stage_kernel_sizes=[7, 5, 5],
-        time_upsample_factors=[2, 2, 1],  # 4x total
+        time_upsample_factors=[1, 1, 1],  # 1x total (ContentVec@50 = mel@50, no time upsampling)
         n_residual_blocks_per_stage=3,
         pre_upsample_residual_blocks=3,
         pre_upsample_kernel_size=7,
@@ -160,6 +160,15 @@ SMG_DECODER_1D_CONFIGS = {
         stage_channels=[640, 384, 256],
         stage_kernel_sizes=[7, 5, 5],
         time_upsample_factors=[3, 1, 1],  # 3x total
+        n_residual_blocks_per_stage=3,
+        pre_upsample_residual_blocks=3,
+        pre_upsample_kernel_size=7,
+    ),
+    "medium_4x": SMGDecoder1DConfig(
+        initial_channels=640,
+        stage_channels=[640, 384, 256],
+        stage_kernel_sizes=[7, 5, 5],
+        time_upsample_factors=[2, 2, 1],  # 4x total
         n_residual_blocks_per_stage=3,
         pre_upsample_residual_blocks=3,
         pre_upsample_kernel_size=7,
@@ -297,13 +306,18 @@ SMG_CONFIGS = {
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
-    "medium_decoder_only_1d": SMGConfig(
-        decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium"],
+    "medium_decoder_only_1d_1x": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_1x"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
     "medium_decoder_only_1d_3x": SMGConfig(
         decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_3x"],
+        f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+    ),
+    "medium_decoder_only_1d_4x": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_4x"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),

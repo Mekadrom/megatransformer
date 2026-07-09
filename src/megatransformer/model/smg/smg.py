@@ -909,6 +909,13 @@ class SMG(nn.Module):
         if _top_overrides:
             config = _dc.replace(config, **_top_overrides)
 
+        # hop_length is ONLY a field of the F0 conditioning embedding (it sets the
+        # harmonic phase step = hop/sample_rate). Pop it up front so it doesn't reach
+        # the decoder or F0-predictor sub-configs (which have no such field), and
+        # re-add to the conditioning config below. Driven from --voice_hop_length so
+        # the F0-embedding phase tracks the mel/F0 rate (e.g. 320 for 50 Hz ContentVec).
+        _f0emb_hop = overrides.pop('hop_length', None)
+
         # Select decoder type based on config
         if config.decoder_1d_config is not None:
             config_dict = {k: v for k, v in config.decoder_1d_config.__dict__.items()}
@@ -936,6 +943,8 @@ class SMG(nn.Module):
         f0_predictor = F0Predictor.from_config(config.f0_predictor_config, **config_dict)
         config_dict = {k: v for k, v in config.f0_conditioning_embedding_config.__dict__.items()}
         config_dict.update(overrides)
+        if _f0emb_hop is not None:
+            config_dict['hop_length'] = _f0emb_hop
         f0_embedding = F0ConditioningEmbedding.from_config(config.f0_conditioning_embedding_config, **config_dict)
 
         return cls(config, decoder, f0_predictor, f0_embedding)
