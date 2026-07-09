@@ -58,12 +58,27 @@ same step). Reference reads and full caveats are in the per-tool sections below.
   `gv_ratio_wrong` (the extrapolative regime; a real converter drops here = the GAN target).
 - `mos.py --wrong_emb` (`--n 200`) — perceptual UTMOS `mos_recon` + converted `mos_wrong` +
   `conv_gap` (the naturalness cost of real conversion = the GAN decision point).
+- `content_preservation.py` (`--n 300`, needs `--sive_checkpoint … --sive_layer 10`) — **run
+  this whenever a conversion/identity loss is active.** It DECONFOUNDS `disentangle`, which
+  rises for BOTH real conversion AND content-breakage. Reports two independent axes: SPEAKER
+  `conversion margin = convert(→target) − residual(→source)` (want > 0) and CONTENT
+  `content_drift = content_wrong − content_true` (frozen SIVE on the decoded mel vs source
+  features; want ≈ 0). High margin + high `content_drift` = "right speaker, wrong words"
+  (the content-blind-identity-loss failure; identity run @16k = margin +0.42, drift +5.71).
+  The fix is `--identity_content_loss_weight` (SIVE-perceptual on the swap); success = drift
+  falls toward `content_true` while margin stays positive.
 
 **5. Interpretation frame.** On a COLLAPSED model, `mos_wrong ≈ mos_recon` and
 `gv_ratio_wrong ≈ gv_ratio` are ARTIFACTS (converted == source), not good conversion — read
 them together with `disentangle`. A big `disentangle` jump + a big `conv_gap`/`gv_ratio_wrong`
 drop = collapse broken, quality cost moved onto converted output = hand off to the GAN arm
 (`--use_gan`). Present a matched table (baseline | run @ same step) and end with a verdict.
+⚠️ **`disentangle` alone is CONFOUNDED once a conversion loss is on:** `l1_wrong` rises for
+real speaker conversion AND for content-breakage, so a rising `disentangle` is NOT proof of
+clean conversion — always pair it with `content_preservation.py` to split the two (a content-
+blind identity loss can show a great `disentangle` while garbling words). After a content fix,
+EXPECT `disentangle` to DROP (its content-drift inflation is removed); judge by margin +
+`content_drift` + the ear, not `disentangle`.
 
 Example (fills the parent dir + logs; adapt run names / step / config):
 ```
