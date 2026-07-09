@@ -270,6 +270,69 @@ class SIVEFeatureBatchProcessor(BatchProcessor):
         }
 
 
+class ContentVecBatchProcessor(BatchProcessor):
+    """Off-the-shelf ContentVec content features — a speaker-disentangled drop-in for SIVE.
+
+    Runs ContentVec (a HuBERT variant trained to remove speaker) on the 16 kHz
+    waveforms and emits per-frame content-only features at its native ~50 Hz. Each
+    utterance's features are interpolated to its mel-frame count so features and mel
+    share one grid (the SMG then uses a 1x-upsample decoder, no downsample gap like
+    SIVE). Output shape matches SIVEFeatureBatchProcessor ([B, encoder_dim, T'] +
+    feature_lengths) so the rest of the pipeline is unchanged. encoder_dim is read
+    from the model (768 for the default lengyue233/content-vec-best); set the SMG's
+    --sive_encoder_dim to match. Pair with --hop_length 320 so mel is 50 Hz too.
+    """
+
+    def __init__(self, model_name: str, voice_max_frames: int, device: str = "cuda"):
+        from transformers import HubertModel
+        self.model = HubertModel.from_pretrained(model_name).eval().to(device)
+        self.encoder_dim = self.model.config.hidden_size
+        self.voice_max_frames = voice_max_frames
+        self.device = device
+        self.num_layers = 1
+
+    def _cv_lengths(self, wav_lengths) -> torch.Tensor:
+        """ContentVec frame count per waveform sample count (HuBERT conv strides)."""
+        return self.model._get_feat_extract_output_lengths(
+            torch.as_tensor(wav_lengths, dtype=torch.long)
+        ).long()
+
+    @torch.no_grad()
+    def process_batch(
+        self,
+        waveforms: list[torch.Tensor],
+        waveform_lengths: torch.Tensor,
+        mel_spec_lengths: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        max_len = max(int(len(w)) for w in waveforms)
+        wav_batch = torch.stack(
+            [F.pad(w.float(), (0, max_len - int(len(w)))) for w in waveforms]
+        ).to(self.device)
+        attn = (
+            torch.arange(max_len, device=self.device)[None, :]
+            < waveform_lengths.to(self.device)[:, None]
+        ).long()
+        hidden = self.model(wav_batch, attention_mask=attn).last_hidden_state  # [B, T_cv, D]
+        B, T_cv, D = hidden.shape
+        cv_lengths = self._cv_lengths(waveform_lengths).clamp(max=T_cv)
+
+        feats = torch.zeros(B, D, self.voice_max_frames)
+        feat_lengths = torch.zeros(B, dtype=torch.long)
+        for i in range(B):
+            cv_len = int(cv_lengths[i].item())
+            mel_len = min(int(mel_spec_lengths[i].item()), self.voice_max_frames)
+            if cv_len < 1 or mel_len < 1:
+                feat_lengths[i] = max(mel_len, 1)
+                continue
+            valid = hidden[i, :cv_len].transpose(0, 1).unsqueeze(0)  # [1, D, cv_len]
+            # ContentVec@50Hz and mel@50Hz are the same rate, so this interp is
+            # ~identity — it just snaps to the exact mel-frame count for a clean 1:1.
+            aligned = F.interpolate(valid.float(), size=mel_len, mode="linear", align_corners=False)
+            feats[i, :, :mel_len] = aligned.squeeze(0).cpu()
+            feat_lengths[i] = mel_len
+        return {"features": feats, "feature_lengths": feat_lengths}
+
+
 class SpeakerEmbeddingBatchProcessor(BatchProcessor):
     """Batched GPU processing for extracting speaker embeddings."""
 
@@ -444,8 +507,10 @@ class VoiceDatasetPreprocessor(Preprocessor):
         # 1-D tensor per example (e.g. waveforms). Reset in flush_shard.
         self._samples_in_shard = 0
 
-        assert args.save_waveforms or args.save_mel_specs or args.sive_checkpoint_path is not None, \
-            "At least one of --save_waveforms, --save_mel_specs, or --sive_checkpoint_path must be specified."
+        assert args.save_waveforms or args.save_mel_specs or args.sive_checkpoint_path is not None \
+            or args.content_encoder == "contentvec", \
+            "At least one of --save_waveforms, --save_mel_specs, --sive_checkpoint_path, or " \
+            "--content_encoder contentvec must be specified."
 
         self.voice_max_frames = (args.voice_max_seconds * args.sample_rate) // args.hop_length
 
@@ -504,6 +569,25 @@ class VoiceDatasetPreprocessor(Preprocessor):
                 device=self.device,
             )
             print(f"  Output feature dimension: {self.sive_batch_processor.encoder_dim}")
+            shard_fields.update({
+                'shard_features': [],
+                'shard_feature_lengths': [],
+            })
+
+        # ContentVec content encoder (off-the-shelf SIVE replacement). Emits the same
+        # 'features' field; the SMG doesn't know or care where the features came from.
+        self.contentvec_batch_processor = None
+        if args.content_encoder == "contentvec":
+            print(f"Loading ContentVec: {args.contentvec_model} ...")
+            self.contentvec_batch_processor = ContentVecBatchProcessor(
+                model_name=args.contentvec_model,
+                voice_max_frames=self.voice_max_frames,
+                device=self.device,
+            )
+            print(f"  ContentVec feature dimension: {self.contentvec_batch_processor.encoder_dim} "
+                  f"(set SMG --sive_encoder_dim to this)")
+            print(f"  hop_length={args.hop_length} -> mel {args.sample_rate / args.hop_length:.1f} Hz "
+                  f"(use 320 for 50 Hz to match ContentVec)")
             shard_fields.update({
                 'shard_features': [],
                 'shard_feature_lengths': [],
@@ -653,6 +737,16 @@ class VoiceDatasetPreprocessor(Preprocessor):
         sub_parser = subparsers.add_parser("voice", help="Preprocess voice dataset through SIVE for VAE training")
     
         # SIVE model
+        sub_parser.add_argument("--content_encoder", type=str, default="sive",
+                            choices=["sive", "contentvec"],
+                            help="Which content encoder to store as the 'features' field. 'sive' (default) = the "
+                                 "custom SIVE checkpoint (--sive_checkpoint_path). 'contentvec' = off-the-shelf "
+                                 "ContentVec (speaker-disentangled HuBERT) on the waveforms, ~50 Hz — pair with "
+                                 "--hop_length 320 so mel matches, and set the SMG's --sive_encoder_dim to the "
+                                 "ContentVec dim (768 for the default model) + a 1x-upsample SMG decoder.")
+        sub_parser.add_argument("--contentvec_model", type=str, default="lengyue233/content-vec-best",
+                            help="HF model id for ContentVec (loaded via transformers.HubertModel). "
+                                 "Default lengyue233/content-vec-best (768-dim).")
         sub_parser.add_argument("--sive_checkpoint_path", type=str,
                             help="Path to SIVE checkpoint directory. If not specified, features are not saved.")
         sub_parser.add_argument("--sive_config", type=str, default="small_deep_3xdownsample_conv2d_attentive",
@@ -967,9 +1061,12 @@ class VoiceDatasetPreprocessor(Preprocessor):
 
             mel_specs, mel_spec_lengths, waveform_lengths = self.encode_to_mels(waveforms)
 
+            features_result = None
             if self.sive_batch_processor is not None:
                 features_result = self.sive_batch_processor.process_batch(mel_specs.to(self.sive_batch_processor.device), mel_spec_lengths.to(self.sive_batch_processor.device))
-            
+            elif self.contentvec_batch_processor is not None:
+                features_result = self.contentvec_batch_processor.process_batch(waveforms, waveform_lengths, mel_spec_lengths)
+
             if self.args.compute_speaker_embeddings:
                 speaker_features_result = self.speaker_feature_batch_processor.process_batch(waveforms, waveform_lengths, mel_specs, mel_spec_lengths)
 
@@ -989,7 +1086,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
             # since some outputs (waveforms) are stored as one 1-D tensor per
             # example and others (features, mel_specs) as batched [B, ...]
             # tensors.
-            if self.args.sive_checkpoint_path is not None:
+            if features_result is not None:
                 self.shard_fields['shard_features'].append(features_result["features"])
                 self.shard_fields['shard_feature_lengths'].append(features_result["feature_lengths"])
 
