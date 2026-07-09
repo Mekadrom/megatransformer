@@ -20,6 +20,62 @@ reliance on the feature shortcut). The intended fix is the **FiLM contrastive lo
 (`--film_contrastive_loss_weight`, ramped), which forces different-embedding →
 different-output. This metric is how you watch it recover.
 
+## Standard run procedure — DO THIS EVERY TIME "run smg-diagnostics" is invoked
+
+This is the canonical sweep (reproduces the baseline-vs-identity @11k run). Follow it
+verbatim unless the user narrows the scope.
+
+**0. Same-step rule (HARD).** When comparing two runs, evaluate BOTH at the *same*
+checkpoint step — pick a step both have on disk (HF prunes to last N). Never mix steps.
+
+**1. Match config + dim to the checkpoint from the run name.** `..._1d3x_...` →
+`--config medium_decoder_only_1d_3x`; a `stdhinge11`/SIVE-256 base → `--sive_encoder_dim
+256`; a 50 Hz ContentVec SMG (`..._1d_1x`, dim 768) → `--config medium_decoder_only_1d_1x
+--sive_encoder_dim 768`. Wrong config/dim = garbage load. Val cache defaults to
+`./cached_datasets/smg_libritts_r_clean_stdhinge11-300k_val` (ContentVec SMGs →
+`..._clean_contentvec_val`).
+
+**2. GPU discipline.** The user runs training on these GPUs. Do NOT infer "free" from one
+`nvidia-smi` util reading. Run GPU jobs **one at a time**, low-profile, pinned with
+`CUDA_VISIBLE_DEVICES=` to whichever GPU has headroom (or the one the user designates).
+`conditioning_health` is CPU (`--device cpu`) — run it freely alongside a GPU job.
+
+**3. Output convention.** One parent dir per comparison:
+`eval_outputs/<task>_<step>_<idx>/` (e.g. `eval_outputs/baseline-identity_step11000_0/`).
+These scripts print to stdout (no `--output_dir`), so **`tee` each into that folder** as
+`<tool>_<runtag>.log`, and write a `SUMMARY.md` with a matched-step comparison table + a
+verdict at the end. Keep this structure going forward.
+
+**4. The four-tool sweep** (run all four; on a two-run comparison, run each on BOTH at the
+same step). Reference reads and full caveats are in the per-tool sections below.
+- `embedding_control.py` (`--n 400`) — **the headline collapse metric.** Judge success by
+  `disentangle` rising (baseline collapse floor ≈ +0.03 / rel_influence ≈ 0.36–0.40;
+  healthy conversion +0.2–0.4 / rel_influence >0.5). This is the one that decides "did the
+  embedding take control."
+- `conditioning_health.py` (`--device cpu`) — is the FiLM path structurally alive/redirected
+  (trained/init, RMS-vs-backbone). CPU, safe next to training.
+- `oversmoothing.py --wrong_emb` (`--n 400`) — same-spk `gv_ratio` + conversion
+  `gv_ratio_wrong` (the extrapolative regime; a real converter drops here = the GAN target).
+- `mos.py --wrong_emb` (`--n 200`) — perceptual UTMOS `mos_recon` + converted `mos_wrong` +
+  `conv_gap` (the naturalness cost of real conversion = the GAN decision point).
+
+**5. Interpretation frame.** On a COLLAPSED model, `mos_wrong ≈ mos_recon` and
+`gv_ratio_wrong ≈ gv_ratio` are ARTIFACTS (converted == source), not good conversion — read
+them together with `disentangle`. A big `disentangle` jump + a big `conv_gap`/`gv_ratio_wrong`
+drop = collapse broken, quality cost moved onto converted output = hand off to the GAN arm
+(`--use_gan`). Present a matched table (baseline | run @ same step) and end with a verdict.
+
+Example (fills the parent dir + logs; adapt run names / step / config):
+```
+mkdir -p eval_outputs/<task>_step<STEP>_0 && OUT=eval_outputs/<task>_step<STEP>_0
+# CPU, both runs:
+PYTHONPATH=src python3 -m megatransformer.scripts.eval.smg.conditioning_health --checkpoint runs/smg/<run>/checkpoint-<STEP> --config <cfg> --sive_encoder_dim <dim> --device cpu 2>&1 | tee $OUT/conditioning_health_<tag>.log
+# GPU, one at a time (pin CUDA_VISIBLE_DEVICES):
+CUDA_VISIBLE_DEVICES=<G> PYTHONPATH=src python3 -m megatransformer.scripts.eval.smg.embedding_control --checkpoint runs/smg/<run>/checkpoint-<STEP> --config <cfg> --sive_encoder_dim <dim> --cache_dir <val> --n 400 --device cuda 2>&1 | tee $OUT/embedding_control_<tag>.log
+CUDA_VISIBLE_DEVICES=<G> PYTHONPATH=src python3 -m megatransformer.scripts.eval.smg.oversmoothing --checkpoint runs/smg/<run>/checkpoint-<STEP> --config <cfg> --sive_encoder_dim <dim> --cache_dir <val> --n 400 --wrong_emb --device cuda 2>&1 | tee $OUT/oversmoothing_<tag>.log
+CUDA_VISIBLE_DEVICES=<G> PYTHONPATH=src python3 -m megatransformer.scripts.eval.smg.mos --checkpoint runs/smg/<run>/checkpoint-<STEP> --config <cfg> --sive_encoder_dim <dim> --cache_dir <val> --n 200 --wrong_emb --device cuda 2>&1 | tee $OUT/mos_<tag>.log
+```
+
 ## Primary tool — embedding-control metric
 
 `scripts/eval/smg/embedding_control.py` — decodes a val subset twice per utterance
