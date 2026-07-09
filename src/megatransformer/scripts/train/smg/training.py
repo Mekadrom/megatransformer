@@ -135,6 +135,7 @@ class SMGTrainer(CommonTrainer):
         identity_loss_rampup_steps: int = 5000,  # Steps to ramp the identity weight 0 -> max
         identity_loss_max_frames: int = 0,  # Cap mel frames fed to ECAPA (0 = no cap); bounds ECAPA activation memory
         identity_loss_every_n_steps: int = 1,  # Apply the identity loss every N steps (1 = every step); amortizes cost
+        identity_content_loss_weight: float = 0.0,  # SIVE-perceptual content loss on the SWAPPED output (0 = off; needs sive_perceptual_model)
         # Mu-only reconstruction loss (for diffusion compatibility)
         mu_only_recon_weight: float = 0.0,  # Weight for mu-only reconstruction loss (0 = disabled)
         learned_speaker_classifier: Optional[torch.nn.Module] = None,
@@ -220,6 +221,7 @@ class SMGTrainer(CommonTrainer):
         self.identity_loss_rampup_steps = identity_loss_rampup_steps
         self.identity_loss_max_frames = identity_loss_max_frames
         self.identity_loss_every_n_steps = max(1, identity_loss_every_n_steps)
+        self.identity_content_loss_weight = identity_content_loss_weight
         self.identity_speaker_encoder = None  # lazy-built frozen ECAPA (built on first use, on the model device)
 
         # Mu-only reconstruction loss (for diffusion compatibility)
@@ -810,6 +812,35 @@ class SMGTrainer(CommonTrainer):
             if recon_swap.dim() == 4 and recon_swap.shape[1] == 1:
                 recon_swap = recon_swap.squeeze(1)
 
+            # Content preservation on the SWAP. The ECAPA loss below is speaker-only and
+            # CONTENT-BLIND, so on hard conversions the decoder can match the target speaker
+            # while garbling the words. Anchor content by running the frozen SIVE on the full
+            # swapped mel and L1-ing it against the SOURCE's own SIVE features (speaker-clean
+            # content target — SIVE leaks only ~1% speaker energy at the tap, dominated by the
+            # ECAPA pull toward the target). Computed on the FULL swapped mel, before the ECAPA
+            # window below. Ramped with identity_alpha (paired content+speaker constraint).
+            identity_content_loss = torch.tensor(0.0, device=mel_specs.device)
+            if self.sive_perceptual_model is not None and self.identity_content_loss_weight > 0:
+                swap_target = features.permute(0, 2, 1)  # [B, T', C] source content
+                swap_pred_result = self.sive_perceptual_model(
+                    recon_swap, lengths=mel_lengths,
+                    return_all_hiddens=(self.sive_perceptual_layer != -1),
+                )
+                if self.sive_perceptual_layer == -1:
+                    swap_pred = swap_pred_result["features"]
+                else:
+                    swap_pred = swap_pred_result["all_hiddens"][self.sive_perceptual_layer]
+                swap_feat_lengths = swap_pred_result["feature_lengths"]
+                min_t = min(swap_pred.shape[1], swap_target.shape[1])
+                swap_pred, swap_target = swap_pred[:, :min_t], swap_target[:, :min_t]
+                if swap_feat_lengths is not None:
+                    swap_mask = (torch.arange(min_t, device=swap_pred.device).unsqueeze(0) < swap_feat_lengths.unsqueeze(1)).unsqueeze(-1)
+                    swap_diff = (swap_pred - swap_target).abs() * swap_mask
+                    identity_content_loss = swap_diff.sum() / (swap_mask.sum() * swap_pred.shape[-1]).clamp(min=1)
+                else:
+                    identity_content_loss = F.l1_loss(swap_pred, swap_target)
+                total_loss = total_loss + self.identity_content_loss_weight * identity_alpha * identity_content_loss
+
             # One RANDOM padding-masked window (no onset bias; start bounded by the shortest valid
             # length; per-sample id_lengths mask trailing padding). Same window reused for the
             # same-speaker diagnostic below so both score the identical region.
@@ -844,6 +875,9 @@ class SMGTrainer(CommonTrainer):
                 metrics.log_scalar(f"{prefix}identity/loss", identity_loss, global_step, skip_zero=False)
                 metrics.log_scalar(f"{prefix}identity/cos_same", cos_same, global_step, skip_zero=False)
                 metrics.log_scalar(f"{prefix}identity/cos_swap", cos_swap.mean(), global_step, skip_zero=False)  # THE conversion signal
+                metrics.log_scalar(f"{prefix}identity/content_loss", identity_content_loss, global_step, skip_zero=False)  # content preservation on the swap
+                metrics.log_scalar(f"{prefix}identity/content_weighted",
+                                   self.identity_content_loss_weight * identity_alpha * identity_content_loss, global_step, skip_zero=False)
                 metrics.log_scalar(f"{prefix}identity/alpha", identity_alpha, global_step, skip_zero=False)
                 metrics.log_scalar(f"{prefix}identity/weighted_loss",
                                    self.identity_loss_weight * identity_alpha * identity_loss, global_step, skip_zero=False)
@@ -1219,13 +1253,15 @@ def create_trainer(
 ):
     # Load frozen SIVE encoder for perceptual loss if requested
     sive_perceptual_model = None
-    if args.sive_perceptual_loss_weight > 0 and args.sive_perceptual_checkpoint_path is not None:
+    _need_sive = args.sive_perceptual_loss_weight > 0 or getattr(args, 'identity_content_loss_weight', 0.0) > 0
+    if _need_sive and args.sive_perceptual_checkpoint_path is not None:
         from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
         sive_perceptual_model = model_loading_utils.load_model(
             SpeakerInvariantVoiceEncoder,
             args.sive_perceptual_config,
             checkpoint_path=args.sive_perceptual_checkpoint_path,
             device=str(device),
+            overrides={"num_speakers": args.sive_perceptual_num_speakers},
         )
         for param in sive_perceptual_model.parameters():
             param.requires_grad = False
@@ -1233,8 +1269,8 @@ def create_trainer(
         print(f"Loaded frozen SIVE for perceptual loss: config={args.sive_perceptual_config}, "
               f"layer={args.sive_perceptual_layer}, weight={args.sive_perceptual_loss_weight}, "
               f"params={sum(p.numel() for p in sive_perceptual_model.parameters()):,}")
-    elif args.sive_perceptual_loss_weight > 0:
-        print("WARNING: sive_perceptual_loss_weight > 0 but no --sive_perceptual_checkpoint_path provided. SIVE perceptual loss disabled.")
+    elif _need_sive:
+        print("WARNING: sive_perceptual/identity_content loss requested but no --sive_perceptual_checkpoint_path provided. SIVE perceptual + swap-content loss disabled.")
 
     # Create waveform-domain loss criteria if enabled
     waveform_stft_loss = None
@@ -1406,6 +1442,7 @@ def create_trainer(
         film_contrastive_margin_max=args.film_contrastive_margin_max,
         film_contrastive_margin_rampup_steps=args.film_contrastive_margin_rampup_steps,
         identity_loss_weight=args.identity_loss_weight,
+        identity_content_loss_weight=getattr(args, 'identity_content_loss_weight', 0.0),
         identity_loss_start_step=args.identity_loss_start_step,
         identity_loss_rampup_steps=args.identity_loss_rampup_steps,
         identity_loss_max_frames=args.identity_loss_max_frames,
@@ -1506,6 +1543,8 @@ def add_cli_args(subparsers):
                            help="Cap the mel frames fed to ECAPA for the identity loss (0 = no cap). "
                                 "Bounds ECAPA's backprop activation memory (the OOM source); ~300-400 "
                                 "frames is plenty for speaker identity and lets you keep a larger batch.")
+    sub_parser.add_argument("--identity_content_loss_weight", type=float, default=0.0,
+                            help="SIVE-perceptual content loss on the SWAPPED (converted) output: anchors source content while ECAPA converts speaker. Needs --sive_perceptual_checkpoint_path. Ramped with the identity loss. 0 = off.")
     sub_parser.add_argument("--identity_loss_every_n_steps", type=int, default=1,
                            help="Apply the identity loss every N steps (1 = every step). Amortizes its "
                                 "cost (the extra swap decode + ECAPA fwd/bwd, the bulk of the per-iter "
@@ -1545,6 +1584,8 @@ def add_cli_args(subparsers):
                            help="Weight for SIVE perceptual loss (0 = disabled)")
     sub_parser.add_argument("--sive_perceptual_checkpoint_path", type=str, default=None,
                            help="Path to frozen SIVE checkpoint for perceptual loss")
+    sub_parser.add_argument("--sive_perceptual_num_speakers", type=int, default=3610,
+                            help="Speaker-head size the frozen SIVE checkpoint was trained with (must match to load; stdhinge11-300k = 3610)")
     sub_parser.add_argument("--sive_perceptual_config", type=str, default="small_deep_3xdownsample_conv2d_attentive",
                            help="SIVE config name for perceptual loss model (must be a live SIVE preset and match the perceptual checkpoint's norm settings)")
     sub_parser.add_argument("--sive_perceptual_layer", type=int, default=-1,
