@@ -283,10 +283,13 @@ class ContentVecBatchProcessor(BatchProcessor):
     --sive_encoder_dim to match. Pair with --hop_length 320 so mel is 50 Hz too.
     """
 
-    def __init__(self, model_name: str, voice_max_frames: int, device: str = "cuda"):
-        from transformers import HubertModel
-        self.model = HubertModel.from_pretrained(model_name).eval().to(device)
-        self.encoder_dim = self.model.config.hidden_size
+    def __init__(self, model_name: str, voice_max_frames: int, device: str = "cuda", dim: int = 768):
+        from megatransformer.utils.contentvec_features import load_contentvec
+        self.model = load_contentvec(model_name, device, dim=dim)
+        # dim=256 uses the final_proj head (ContentVec's disentangled contrastive
+        # space, matches SIVE's width); 768 = last_hidden_state.
+        self.use_final_proj = (dim == 256)
+        self.encoder_dim = self.model.final_proj.out_features if self.use_final_proj else self.model.config.hidden_size
         self.voice_max_frames = voice_max_frames
         self.device = device
         self.num_layers = 1
@@ -312,7 +315,9 @@ class ContentVecBatchProcessor(BatchProcessor):
             torch.arange(max_len, device=self.device)[None, :]
             < waveform_lengths.to(self.device)[:, None]
         ).long()
-        hidden = self.model(wav_batch, attention_mask=attn).last_hidden_state  # [B, T_cv, D]
+        hidden = self.model(wav_batch, attention_mask=attn).last_hidden_state  # [B, T_cv, 768]
+        if self.use_final_proj:
+            hidden = self.model.final_proj(hidden)  # [B, T_cv, 256]
         B, T_cv, D = hidden.shape
         cv_lengths = self._cv_lengths(waveform_lengths).clamp(max=T_cv)
 
@@ -583,6 +588,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
                 model_name=args.contentvec_model,
                 voice_max_frames=self.voice_max_frames,
                 device=self.device,
+                dim=args.contentvec_dim,
             )
             print(f"  ContentVec feature dimension: {self.contentvec_batch_processor.encoder_dim} "
                   f"(set SMG --sive_encoder_dim to this)")
@@ -744,6 +750,9 @@ class VoiceDatasetPreprocessor(Preprocessor):
                                  "ContentVec (speaker-disentangled HuBERT) on the waveforms, ~50 Hz — pair with "
                                  "--hop_length 320 so mel matches, and set the SMG's --sive_encoder_dim to the "
                                  "ContentVec dim (768 for the default model) + a 1x-upsample SMG decoder.")
+        sub_parser.add_argument("--contentvec_dim", type=int, default=768, choices=[256, 768],
+                            help="ContentVec feature width: 768 (last_hidden_state) or 256 (final_proj — same 95M "
+                                 "model, matches SIVE's width; pair with the SMG's --sive_encoder_dim).")
         sub_parser.add_argument("--contentvec_model", type=str, default="lengyue233/content-vec-best",
                             help="HF model id for ContentVec (loaded via transformers.HubertModel). "
                                  "Default lengyue233/content-vec-best (768-dim).")
