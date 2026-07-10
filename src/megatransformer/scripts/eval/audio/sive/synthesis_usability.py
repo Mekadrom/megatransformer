@@ -137,20 +137,21 @@ def extract_subset(model, dataset, indices, device, batch_size,
 
 
 def extract_contentvec_subset(dataset, indices, model_id, layer, device,
-                              sr, n_mels, n_fft, hop_length):
+                              sr, n_mels, n_fft, hop_length, dim=768):
     """ContentVec analog of extract_subset: off-the-shelf HuBERT on the raw waveform,
     features linear-interpolated to the mel frame rate (same as the SIVE path, so the
-    tiny decoder sees frame-aligned inputs regardless of the encoder's native rate)."""
+    tiny decoder sees frame-aligned inputs regardless of the encoder's native rate).
+    dim=256 uses final_proj (matches SIVE's width)."""
     from megatransformer.utils.contentvec_features import load_contentvec, contentvec_hidden
-    m = load_contentvec(model_id, device)
+    m = load_contentvec(model_id, device, dim=dim)
     buf = SharedWindowBuffer()
     feats, mels, embs, spks, gens = [], [], [], [], []
-    for i in tqdm(indices, desc="Extracting ContentVec subset"):
+    for i in tqdm(indices, desc=f"Extracting ContentVec-{dim} subset"):
         s = dataset[int(i)]
         wav = s["waveform"][:int(s["waveform_length"])].to(torch.float32)
         mel = extract_mels(buf, wav, sr=sr, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length)  # [n_mels, T]
         tmel = mel.shape[-1]
-        h = contentvec_hidden(m, wav.to(device), layer=layer)          # [T', D]
+        h = contentvec_hidden(m, wav.to(device), layer=layer, final_proj=(dim == 256))          # [T', D]
         f = h.transpose(0, 1).unsqueeze(0).float()                     # [1, D, T']
         f_up = F.interpolate(f, size=tmel, mode="linear", align_corners=False)[0].cpu()  # [D, T]
         feats.append(f_up)
@@ -493,7 +494,8 @@ def analyze_checkpoint(args, name, ckpt_path, vocoder, dataset, subset_indices, 
         # Off-the-shelf HuBERT on the raw waveform; no SIVE checkpoint.
         feats, mels, embs, spks, gens = extract_contentvec_subset(
             dataset, subset_indices, args.contentvec_model, args.extract_layer, device,
-            args.voice_sample_rate, args.voice_n_mels, args.voice_n_fft, args.voice_hop_length)
+            args.voice_sample_rate, args.voice_n_mels, args.voice_n_fft, args.voice_hop_length,
+            dim=getattr(args, "contentvec_dim", 768))
     else:
         model = load_model(SpeakerInvariantVoiceEncoder, args.config, checkpoint_path=ckpt_path,
                            device=device,
@@ -657,7 +659,9 @@ def main():
     ap.add_argument("--content_encoder", default="sive", choices=["sive", "contentvec"],
                     help="Feature source: 'sive' (checkpoint) or 'contentvec' (off-the-shelf HuBERT on the raw waveform). --config/--checkpoint path are ignored for contentvec (pass a dummy name=x).")
     ap.add_argument("--contentvec_model", default="lengyue233/content-vec-best",
-                    help="HF model id for ContentVec, used when --content_encoder contentvec. --extract_layer <0 = last_hidden_state (768).")
+                    help="HF model id for ContentVec, used when --content_encoder contentvec. --extract_layer <0 = last_hidden_state.")
+    ap.add_argument("--contentvec_dim", type=int, default=768, choices=[256, 768],
+                    help="ContentVec feature width: 768 (last_hidden_state) or 256 (final_proj — same 95M model, matches SIVE's width).")
     ap.add_argument("--final_norm_type", default=None,
                     help="Override the model's final_norm_type to MATCH a norm-variant checkpoint "
                          "(layernorm/rmsnorm/none). REQUIRED for rmsnorm/none runs — without it the "

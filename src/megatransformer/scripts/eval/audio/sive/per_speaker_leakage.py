@@ -133,17 +133,17 @@ def extract_final_features(model, dataset, max_samples, device, batch_size,
             np.array(gen_list, dtype=np.int64))
 
 
-def extract_contentvec_features(dataset, model_id, layer, max_samples, device):
+def extract_contentvec_features(dataset, model_id, layer, max_samples, device, dim=768):
     """Mean-pooled ContentVec features per utterance (parallels extract_final_features
-    but off the raw waveform via an off-the-shelf HuBERT)."""
+    but off the raw waveform via an off-the-shelf HuBERT). dim=256 uses final_proj."""
     from megatransformer.utils.contentvec_features import load_contentvec, contentvec_hidden
-    m = load_contentvec(model_id, device)
+    m = load_contentvec(model_id, device, dim=dim)
     n = len(dataset) if max_samples <= 0 else min(len(dataset), max_samples)
     feats_list, spk_list, gen_list = [], [], []
-    for i in tqdm(range(n), desc="Extracting ContentVec"):
+    for i in tqdm(range(n), desc=f"Extracting ContentVec-{dim}"):
         s = dataset[i]
         wav = s["waveform"][:int(s["waveform_length"])].to(torch.float32).to(device)
-        h = contentvec_hidden(m, wav, layer=layer)  # [T', D]
+        h = contentvec_hidden(m, wav, layer=layer, final_proj=(dim == 256))  # [T', D]
         feats_list.append(h.mean(dim=0).float().cpu().numpy())
         spk_list.append(int(s["speaker_id"]))
         g = s.get("gender_id", None)
@@ -155,7 +155,7 @@ def extract_contentvec_features(dataset, model_id, layer, max_samples, device):
 def cached_features(args, name, ckpt_path):
     """Extract (or load cached) per-utterance features for one checkpoint."""
     enc = getattr(args, "content_encoder", "sive")
-    key = hashlib.md5(f"{enc}|{ckpt_path}|{args.max_samples}|{args.config}|L{args.extract_layer}|{getattr(args, 'contentvec_model', '')}".encode()).hexdigest()[:10]
+    key = hashlib.md5(f"{enc}|{ckpt_path}|{args.max_samples}|{args.config}|L{args.extract_layer}|{getattr(args, 'contentvec_model', '')}|D{getattr(args, 'contentvec_dim', 768)}".encode()).hexdigest()[:10]
     cache_path = os.path.join(args.output_dir, f"_features_{name}_{key}.npz")
     if os.path.exists(cache_path) and not args.no_feature_cache:
         d = np.load(cache_path)
@@ -169,7 +169,8 @@ def cached_features(args, name, ckpt_path):
             columns=["waveforms", "mel_specs", "speaker_ids", "gender_ids"],
         )
         feats, spk, gen = extract_contentvec_features(
-            dataset, args.contentvec_model, args.extract_layer, args.max_samples, args.device)
+            dataset, args.contentvec_model, args.extract_layer, args.max_samples, args.device,
+            dim=getattr(args, "contentvec_dim", 768))
         if not args.no_feature_cache:
             np.savez(cache_path, features=feats, speaker_ids=spk, gender_ids=gen)
         return feats, spk, gen
@@ -762,7 +763,9 @@ def main():
     ap.add_argument("--content_encoder", default="sive", choices=["sive", "contentvec"],
                     help="Feature source: 'sive' (checkpoint) or 'contentvec' (off-the-shelf HuBERT on the raw waveform, for an apples-to-apples leakage comparison). --config is ignored for contentvec.")
     ap.add_argument("--contentvec_model", default="lengyue233/content-vec-best",
-                    help="HF model id for ContentVec (transformers.HubertModel), used when --content_encoder contentvec. --extract_layer <0 = last_hidden_state (768).")
+                    help="HF model id for ContentVec (transformers.HubertModel), used when --content_encoder contentvec. --extract_layer <0 = last_hidden_state.")
+    ap.add_argument("--contentvec_dim", type=int, default=768, choices=[256, 768],
+                    help="ContentVec feature width: 768 (last_hidden_state) or 256 (final_proj — same 95M model, matches SIVE's width).")
     ap.add_argument("--final_norm_type", default=None,
                     help="Override the model's final_norm_type to MATCH a norm-variant checkpoint "
                          "(layernorm/rmsnorm/none). REQUIRED for rmsnorm/none runs — without it the "
