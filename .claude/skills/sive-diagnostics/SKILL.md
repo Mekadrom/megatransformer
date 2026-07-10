@@ -148,6 +148,27 @@ the waveform-only `voice_sive_gender_*_merged` shards** — only run it on shard
 that stored precomputed mels, or extend it to extract mels from waveforms the
 way per_speaker_leakage.py does.
 
+## Comparing against ContentVec (off-the-shelf, invariance-disentangled)
+
+Both `per_speaker_leakage.py` and `synthesis_usability.py` take **`--content_encoder
+contentvec --contentvec_dim {256,768}`** (default `sive`) to swap the feature source to
+an off-the-shelf HuBERT ContentVec (`utils/contentvec_features.py`) on the SAME val set +
+speaker-stratified split + probe protocol — an apples-to-apples encoder comparison. Pass a
+dummy `--checkpoint name=na` (the SIVE ckpt/config are ignored for contentvec). `768` =
+last_hidden_state; `256` = final_proj (ContentVec's disentangled space, matches SIVE width —
+the dimensionality-fair comparison). Run SIVE and ContentVec as SEPARATE invocations (the
+norm/encoder flags are global), then tabulate; the split is seed+speaker_id-determined so
+it's identical across runs. Findings (2026-07-09, [[project_contentvec_pivot]]): dim-matched,
+ContentVec ≈ SIVE-final on speaker-ID and FAR cleaner on **gender** (the conversion-critical
+axis), and it fixes the **female→male F0 flip** SIVE fails. **CAVEAT: the raw speaker-ID
+leakage is DIM-CONFOUNDED** (768-d probes more separable than 256) — trust the gender probe
+(binary, dim-robust) + synthesis F0-conversion, or dim-match with `--contentvec_dim 256`.
+**CAVEAT: variance-share / eff-dim / raw-leakage comparisons ACROSS final-norm types
+(batchnorm-final vs layernorm-final) are norm-confounded** — batchnorm-final is a fixed
+per-dim renorm at eval (not batch-dependent), but it reweights dims in any variance-ratio;
+per-dim z-score both feature sets before comparing energy-share, and lean on gender +
+synthesis over raw leakage when the two runs differ in final norm.
+
 ## Tertiary — feature timelapse
 
 `scripts/eval/audio/sive/timelapse_sive_encoder_features.py` — MP4 of how a
