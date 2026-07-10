@@ -875,13 +875,19 @@ class VoiceDatasetPreprocessor(Preprocessor):
         return sub_parser
 
     def flush_shard(self):
+        # Nothing buffered (e.g. the orchestrator's final flush after the last full
+        # shard already flushed) — skip, or the max() over empty buffers below throws.
+        if self._samples_in_shard == 0:
+            return
         # Find max feature length in this shard for padding
         shard_data = {}
-        
+
         num_samples = 0
 
-        if self.args.sive_checkpoint_path is not None:
-            # Pad features to same length
+        if self.args.sive_checkpoint_path is not None or self.args.content_encoder == "contentvec":
+            # Pad features to same length. Written for BOTH the SIVE path
+            # (sive_checkpoint_path) and the ContentVec path (--content_encoder
+            # contentvec), which both buffer into shard_features.
             # Shape depends on multi-layer mode:
             # - Single layer: [N, encoder_dim, T']
             # - Multi-layer:  [N, num_layers, encoder_dim, T']
@@ -1258,8 +1264,13 @@ class VoiceDatasetPreprocessor(Preprocessor):
         return {
             "sive_checkpoint": self.args.sive_checkpoint_path,
             "sive_config": self.args.sive_config,
-            "encoder_dim": self.sive_batch_processor.sive_model.config.encoder_dim if self.sive_batch_processor is not None else 0,
-            "total_stride": self.sive_batch_processor.sive_model.conv_subsample.total_stride if self.sive_batch_processor is not None else 0,
+            "content_encoder": self.args.content_encoder,
+            "contentvec_model": self.args.contentvec_model if self.contentvec_batch_processor is not None else None,
+            "encoder_dim": (self.sive_batch_processor.sive_model.config.encoder_dim if self.sive_batch_processor is not None
+                            else self.contentvec_batch_processor.encoder_dim if self.contentvec_batch_processor is not None else 0),
+            # ContentVec features are interpolated to the mel-frame count, so 1:1 with mel (stride 1).
+            "total_stride": (self.sive_batch_processor.sive_model.conv_subsample.total_stride if self.sive_batch_processor is not None
+                             else 1 if self.contentvec_batch_processor is not None else 0),
             "dataset_name": self.args.dataset_name,
             "dataset_config": self.args.dataset_config,
             "split": self.args.split,
@@ -1280,7 +1291,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
             # Feature extraction settings
             "normalize": self.args.normalize,
             "layers": self.args.layers,  # None for single layer (default), list for multi-layer
-            "num_layers": self.sive_batch_processor.num_layers if self.sive_batch_processor is not None else 0,  # 1 for single layer, >1 for multi-layer
+            "num_layers": self.sive_batch_processor.num_layers if self.sive_batch_processor is not None else (1 if self.contentvec_batch_processor is not None else 0),  # 1 for single layer, >1 for multi-layer
             # F0 extraction settings
             "extract_f0": self.args.extract_f0,
             "f0_fmin": self.args.f0_fmin,
