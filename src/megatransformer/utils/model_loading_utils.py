@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -83,10 +84,19 @@ class PretrainedVocoderWrapper(torch.nn.Module):
     Expected interface: vocoder(mel_spec) -> {"pred_waveform": waveform}
     where mel_spec is [B, n_mels, T] and waveform is [B, T] or [T].
     """
-    def __init__(self, vocoder: torch.nn.Module, name: str = "pretrained"):
+    def __init__(self, vocoder: torch.nn.Module, name: str = "pretrained",
+                 hop_length: int = 256, sample_rate: int = 16000):
         super().__init__()
         self.vocoder = vocoder
         self.name = name
+        # Advertise the frame rate this vocoder was TRAINED at so callers can
+        # resample a mismatched-hop mel before synthesis (e.g. a 50 Hz ContentVec
+        # SMG mel @hop320 driving this 62.5 Hz @hop256 HiFi-GAN). Every vocoding
+        # call site reads `getattr(vocoder, "config", None).hop_length`; without
+        # this the pretrained wrapper had no `.config`, callers fell back to the
+        # MEL hop, saw "no mismatch", skipped the resample, and the 50 Hz mel
+        # played 62.5/50 = 1.25x too fast (correct pitch, faster speech).
+        self.config = SimpleNamespace(hop_length=hop_length, sample_rate=sample_rate)
 
     def forward(self, mel_spec: torch.Tensor) -> dict[str, torch.Tensor]:
         waveform = self.vocoder(mel_spec)
@@ -152,7 +162,9 @@ def _load_pretrained_hifigan():
             return self.generator.inference(mel_spec).squeeze(1)  # [B, 1, T] -> [B, T]
 
     inner = HiFiGANInner(generator)
-    return PretrainedVocoderWrapper(inner, name="hifigan-libritts-16khz")
+    # SpeechBrain LibriTTS HiFi-GAN: 16 kHz, 256 hop_length (62.5 Hz mel frames).
+    return PretrainedVocoderWrapper(inner, name="hifigan-libritts-16khz",
+                                    hop_length=256, sample_rate=16000)
 
 
 PRETRAINED_VOCODERS = {
