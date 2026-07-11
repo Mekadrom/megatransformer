@@ -1613,8 +1613,10 @@ def add_cli_args(subparsers):
                             help="Weight for feature matching loss component")
     sub_parser.add_argument("--discriminator_update_frequency", type=int, default=1,
                             help="Number of discriminator updates per generator update")
-    sub_parser.add_argument("--discriminator_config", type=str, default="mini_multi_scale",
-                            help="Discriminator configuration name")
+    sub_parser.add_argument("--discriminator_config", type=str, default="default",
+                            help="Discriminator configuration name (MEL_COMBINED_DISCRIMINATOR_CONFIGS: "
+                                 "'default' = multi-scale+multi-period ~13M, best for harmonics; "
+                                 "'mini_multi_scale' = lighter multi-scale-only)")
 
     # Discriminator regularization settings
     sub_parser.add_argument("--instance_noise_std", type=float, default=0.0,

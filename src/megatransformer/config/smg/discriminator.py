@@ -78,5 +78,15 @@ class MelDomainCombinedDiscriminatorConfig:
 
 
 MEL_COMBINED_DISCRIMINATOR_CONFIGS = {
+    # Full combined disc: multi-scale (temporal resolutions) + multi-period (harmonic
+    # periodicities). The multi-period sub-discs are what target harmonic structure, so
+    # this is the right choice for de-robotifying the SMG. ~13M params.
     "default": MelDomainCombinedDiscriminatorConfig(),
+    # Cheaper multi-scale-ONLY disc (no periods). Faster/lighter but weaker on harmonics.
+    "mini_multi_scale": MelDomainCombinedDiscriminatorConfig(
+        multi_scale_config=MelDomainMultiScaleDiscriminatorConfig(
+            base_channels=32, n_layers=3, n_scales=3,
+        ),
+        multi_period_config=None,
+    ),
 }
