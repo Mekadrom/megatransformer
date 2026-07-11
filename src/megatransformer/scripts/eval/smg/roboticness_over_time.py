@@ -168,8 +168,10 @@ def main():
                 rvu = (mel_t[:, um].var(1) / (gt[:, um].var(1) + 1e-8)).clamp(0, 3)
                 gvu.append(float(rvu.mean())); hfu.append(float(rvu[args.hf_bin:].mean()))
                 l1u.append(float((mel_t[:, um] - gt[:, um]).abs().mean()))
-        row = dict(step=step, label=label, gv_ratio=np.mean(gv), hf_gv_ratio=np.mean(hfgv),
-                   gv_ratio_wrong=np.mean(gvw), mos_recon=np.mean(mr), mos_wrong=np.mean(mw),
+        mos_se = float(np.std(mr) / max(1, len(mr)) ** 0.5)
+        gv_se = float(np.std(gv) / max(1, len(gv)) ** 0.5)
+        row = dict(step=step, label=label, gv_ratio=np.mean(gv), gv_se=gv_se, hf_gv_ratio=np.mean(hfgv),
+                   gv_ratio_wrong=np.mean(gvw), mos_recon=np.mean(mr), mos_se=mos_se, mos_wrong=np.mean(mw),
                    mos_gt_voc=mos_gt_voc, mos_gap=mos_gt_voc - np.mean(mr), conv_gap=np.mean(mr) - np.mean(mw),
                    gv_voiced=np.mean(gvv), gv_unvoiced=np.mean(gvu),
                    hf_gv_voiced=np.mean(hfv), hf_gv_unvoiced=np.mean(hfu),
@@ -177,7 +179,8 @@ def main():
                    l1_voiced=np.mean(l1v), l1_unvoiced=np.mean(l1u))
         rows.append(row)
         del model; torch.cuda.empty_cache()
-        print(f"  step {step:>7}{' ('+label+')' if label else '':9} mos_recon={row['mos_recon']:.3f} | "
+        print(f"  step {step:>7}{' ('+label+')' if label else '':9} "
+              f"mos_recon={row['mos_recon']:.3f}±{mos_se:.3f} gv={row['gv_ratio']:.3f}±{gv_se:.3f} | "
               f"VOICED hf={row['hf_gv_voiced']:.3f} corr={row['corr_voiced']:.3f}  "
               f"UNVOICED hf={row['hf_gv_unvoiced']:.3f} corr={row['corr_unvoiced']:.3f}")
 
