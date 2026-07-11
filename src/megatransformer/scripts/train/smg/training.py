@@ -104,6 +104,7 @@ class SMGTrainer(CommonTrainer):
         discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
         gan_loss_weight: float = 0.5,
         feature_matching_weight: float = 0.0,
+        gan_wrong_emb_weight: float = 0.0,  # Adversarial weight on WRONG-speaker (converted) output
         discriminator_update_frequency: int = 1,
         gan_start_condition_key: Optional[str] = None,
         gan_start_condition_value: Optional[Any] = None,
@@ -169,6 +170,7 @@ class SMGTrainer(CommonTrainer):
         self.discriminator_optimizer = discriminator_optimizer
         self.gan_loss_weight = gan_loss_weight
         self.feature_matching_weight = feature_matching_weight
+        self.gan_wrong_emb_weight = gan_wrong_emb_weight
         self.discriminator_update_frequency = discriminator_update_frequency
         self.gan_start_condition_key = gan_start_condition_key
         self.gan_start_condition_value = gan_start_condition_value
@@ -389,6 +391,25 @@ class SMGTrainer(CommonTrainer):
                 gan_rel_step = global_step - (self.gan_start_step if self.gan_start_step is not None else 0)
                 noise_std = self.noise_scheduler.get_std(gan_rel_step)
 
+            # WRONG-SPEAKER (converted) output for the GAN. Only the same-speaker recon enters
+            # the GAN below, so the conversion regime gets ZERO adversarial pressure and stays
+            # over-smoothed (audible on swaps). Decode content with a shuffled batch embedding
+            # and feed it as an extra fake (D) + weighted adversarial (G). There is no GT target
+            # for a converted output, so it's adversarial-only — the unconditional D just judges
+            # "is this realistic speech?". Computed once (with grad) so D uses .detach() and G
+            # backprops the adversarial term into the generator.
+            recon_wrong = None
+            if (self.gan_wrong_emb_weight > 0 and decode_speaker_embedding is not None
+                    and decode_speaker_embedding.shape[0] > 1):
+                _dt = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
+                with autocast(mel_specs.device.type, dtype=_dt, enabled=self.args.fp16 or self.args.bf16):
+                    perm = torch.roll(torch.arange(decode_speaker_embedding.shape[0],
+                                                   device=decode_speaker_embedding.device), shifts=1)
+                    rw = model.decode(features, speaker_embedding=decode_speaker_embedding[perm], features=features)
+                    if rw.dim() == 4 and rw.shape[1] == 1:
+                        rw = rw.squeeze(1)
+                    recon_wrong = rw[..., :recon.shape[-1]]
+
             # Discriminator Update
             if global_step % self.discriminator_update_frequency == 0:
                 self.discriminator.train()
@@ -412,9 +433,12 @@ class SMGTrainer(CommonTrainer):
                         if old_state["state"]:
                             self.discriminator_optimizer.load_state_dict(old_state)
 
-                # Apply instance noise to both real and fake mel spectrograms
+                # Apply instance noise to both real and fake mel spectrograms. The fake set
+                # includes the wrong-speaker (converted) output when enabled, so D learns that
+                # converted outputs must also look like real speech.
                 real_for_disc = add_mel_instance_noise(mel_specs, noise_std) if noise_std > 0 else mel_specs
-                fake_for_disc = add_mel_instance_noise(recon.detach(), noise_std) if noise_std > 0 else recon.detach()
+                fake_base = recon.detach() if recon_wrong is None else torch.cat([recon.detach(), recon_wrong.detach()], dim=0)
+                fake_for_disc = add_mel_instance_noise(fake_base, noise_std) if noise_std > 0 else fake_base
 
                 # Compute discriminator loss in fp32 to avoid gradient underflow
                 # Mixed precision can cause discriminator gradients to vanish
@@ -488,6 +512,17 @@ class SMGTrainer(CommonTrainer):
                     fake_mels=recon_for_gen,
                     feature_matching_weight=self.feature_matching_weight,
                 )
+                # Adversarial-only realism pressure on the converted output (no GT → no FM).
+                if recon_wrong is not None:
+                    rw_for_gen = recon_wrong.unsqueeze(1) if recon_wrong.dim() == 3 else recon_wrong
+                    g_wrong, _ = compute_mel_generator_gan_loss(
+                        self.discriminator,
+                        real_mels=mel_spec_for_gen,
+                        fake_mels=rw_for_gen,
+                        feature_matching_weight=0.0,
+                    )
+                    g_gan_loss = g_gan_loss + self.gan_wrong_emb_weight * g_wrong
+                    g_loss_dict["g_adv_wrong"] = g_wrong
 
             if global_step % self.args.logging_steps == 0:
                 for key, val in g_loss_dict.items():
@@ -1427,6 +1462,7 @@ def create_trainer(
         discriminator_optimizer=discriminator_optimizer,
         gan_loss_weight=args.gan_loss_weight,
         feature_matching_weight=args.feature_matching_weight,
+        gan_wrong_emb_weight=args.gan_wrong_emb_weight,
         discriminator_update_frequency=args.discriminator_update_frequency,
         gan_start_condition_key=args.gan_start_condition_key,
         gan_start_condition_value=args.gan_start_condition_value,
@@ -1616,6 +1652,11 @@ def add_cli_args(subparsers):
                             help="Weight for GAN loss component")
     sub_parser.add_argument("--feature_matching_weight", type=float, default=0.0,
                             help="Weight for feature matching loss component")
+    sub_parser.add_argument("--gan_wrong_emb_weight", type=float, default=0.0,
+                            help="Adversarial weight on the WRONG-speaker (converted) output. 0 = off "
+                                 "(GAN only sees same-speaker recon → swaps stay robotic). >0 feeds the "
+                                 "converted output as an extra discriminator fake + weighted generator "
+                                 "adversarial (no FM; there is no GT target for a conversion). Try ~0.5-1.0.")
     sub_parser.add_argument("--discriminator_update_frequency", type=int, default=1,
                             help="Number of discriminator updates per generator update")
     sub_parser.add_argument("--discriminator_config", type=str, default="default",
