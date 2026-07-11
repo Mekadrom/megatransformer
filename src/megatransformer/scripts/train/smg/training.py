@@ -379,10 +379,15 @@ class SMGTrainer(CommonTrainer):
                 steps_since_gan_start = global_step - self.gan_start_step
                 gan_warmup_factor = min(1.0, steps_since_gan_start / self.gan_warmup_steps)
 
-            # Get current instance noise std (decays over training)
+            # Get current instance noise std (decays over training). Use the GAN-RELATIVE
+            # step (like the warmup factor and R1 interval) so --instance_noise_decay_steps
+            # means "decay over N steps from GAN start" regardless of --start_step. Keying on
+            # absolute global_step made the offset (e.g. 50000) exceed decay_steps immediately,
+            # silently pinning noise at final_std=0.
             noise_std = 0.0
             if self.noise_scheduler is not None:
-                noise_std = self.noise_scheduler.get_std(global_step)
+                gan_rel_step = global_step - (self.gan_start_step if self.gan_start_step is not None else 0)
+                noise_std = self.noise_scheduler.get_std(gan_rel_step)
 
             # Discriminator Update
             if global_step % self.discriminator_update_frequency == 0:
