@@ -56,6 +56,8 @@ def parse_args():
     parser.add_argument("--vocoder_config", type=str, default="hifigan", help="Vocoder config name (use 'hifigan' for pretrained HiFi-GAN)")
 
     # Audio
+    parser.add_argument("--speaker_embedding_dim", type=int, default=192,
+                        help="ECAPA speaker embedding width (must match the SMG's training).")
     parser.add_argument("--sample_rate", type=int, default=16000)
     parser.add_argument("--n_mels", type=int, default=80)
     parser.add_argument("--n_fft", type=int, default=1024)
@@ -77,6 +79,28 @@ def load_audio(path, sample_rate):
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     return waveform.squeeze(0)  # [T]
+
+
+def load_embedding_file(path, dim):
+    """Load an ECAPA speaker embedding from a .pt file for speaker-space probing.
+
+    Accepts a [dim] or [1, dim] tensor (or a dict holding one under a common key).
+    Returns a [1, dim] float CPU tensor. Raises gr.Error on a shape/format mismatch."""
+    try:
+        obj = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, dict):
+        for k in ("speaker_embedding", "speaker_embeddings", "embedding", "emb", "ecapa"):
+            if k in obj:
+                obj = obj[k]
+                break
+        else:
+            raise gr.Error(f".pt is a dict with no embedding key (keys: {list(obj)[:6]})")
+    t = torch.as_tensor(obj).float().reshape(-1)
+    if t.numel() != dim:
+        raise gr.Error(f"embedding has {t.numel()} values, expected {dim} (ECAPA)")
+    return t.reshape(1, dim)
 
 
 def main():
@@ -138,18 +162,60 @@ def main():
 
     print("All models loaded.\n")
 
+    import os
+    import tempfile
+    emb_dim = args.speaker_embedding_dim
+
     @torch.no_grad()
-    def voice_clone(content_audio_path, speaker_audio_path):
-        if content_audio_path is None or speaker_audio_path is None:
-            return None
+    def voice_clone(content_audio_path, speaker_audio_path, speaker_source,
+                    emb_pt_file, blend_alpha, scale, noise_std, noise_seed, l2_normalize):
+        if content_audio_path is None:
+            raise gr.Error("Content audio is required.")
 
-        # Load audio files
+        # --- Resolve the base speaker embedding: from reference audio, an uploaded
+        #     .pt, or a blend — so the embedding space can be probed directly. ---
+        emb_audio = emb_pt = None
+        if speaker_audio_path is not None:
+            speaker_waveform = load_audio(speaker_audio_path, args.sample_rate).to(device)
+            speaker_mel = extract_mels(shared_window_buffer, speaker_waveform, sr=args.sample_rate, n_mels=args.n_mels, n_fft=args.n_fft, hop_length=args.hop_length)
+            emb_audio = speaker_encoder(mel_spec=speaker_mel.unsqueeze(0)).reshape(1, emb_dim).to(device)
+        if emb_pt_file is not None:
+            emb_pt = load_embedding_file(emb_pt_file, emb_dim).to(device)
+
+        if speaker_source == "uploaded .pt":
+            if emb_pt is None:
+                raise gr.Error("Upload a speaker embedding .pt (or switch source).")
+            base_emb = emb_pt
+        elif speaker_source == "blend":
+            if emb_audio is None or emb_pt is None:
+                raise gr.Error("Blend needs BOTH a speaker reference audio and a .pt.")
+            a = float(blend_alpha)
+            base_emb = (1.0 - a) * emb_audio + a * emb_pt
+        else:  # "reference audio"
+            if emb_audio is None:
+                raise gr.Error("Provide a speaker reference audio (or switch source).")
+            base_emb = emb_audio
+
+        # --- Deterministic probe modifiers ---
+        emb = base_emb.clone()
+        if float(scale) != 1.0:
+            emb = emb * float(scale)
+        if float(noise_std) > 0:
+            g = torch.Generator(device="cpu").manual_seed(int(noise_seed))
+            emb = emb + float(noise_std) * torch.randn(emb.shape, generator=g).to(emb.device)
+        if l2_normalize:
+            emb = emb / (emb.norm(dim=-1, keepdim=True) + 1e-8)
+        speaker_embedding = emb  # [1, emb_dim]
+
+        # --- Export the EXACT embedding used, as [emb_dim], for download+re-upload ---
+        fd, emb_out_path = tempfile.mkstemp(suffix="_ecapa.pt"); os.close(fd)
+        torch.save(speaker_embedding.squeeze(0).cpu().clone(), emb_out_path)
+        stats = (f"source={speaker_source} | scale={float(scale):g} "
+                 f"noise={float(noise_std):g}(seed {int(noise_seed)}) l2norm={bool(l2_normalize)} | "
+                 f"norm={speaker_embedding.norm().item():.3f} mean={speaker_embedding.mean().item():+.4f} "
+                 f"min={speaker_embedding.min().item():+.3f} max={speaker_embedding.max().item():+.3f}")
+
         content_waveform = load_audio(content_audio_path, args.sample_rate).to(device)
-        speaker_waveform = load_audio(speaker_audio_path, args.sample_rate).to(device)
-
-        # Speaker embedding from the reference (ECAPA-TDNN takes the mel).
-        speaker_mel = extract_mels(shared_window_buffer, speaker_waveform, sr=args.sample_rate, n_mels=args.n_mels, n_fft=args.n_fft, hop_length=args.hop_length)
-        speaker_embedding = speaker_encoder(mel_spec=speaker_mel.unsqueeze(0))  # [1, 192]
 
         # Content features from the content audio -> [1, D, T'] (channel-first for the SMG).
         if sive is not None:
@@ -202,21 +268,36 @@ def main():
             pred_waveform = pred_waveform / peak
 
         waveform_np = pred_waveform.cpu().float().numpy()
-        return (args.sample_rate, waveform_np)
+        return (args.sample_rate, waveform_np), emb_out_path, stats
 
     demo = gr.Interface(
         fn=voice_clone,
         inputs=[
             gr.Audio(type="filepath", label="Content Audio (what to say)"),
-            gr.Audio(type="filepath", label="Speaker Reference (whose voice to use)"),
+            gr.Audio(type="filepath", label="Speaker Reference (optional if using a .pt)"),
+            gr.Radio(["reference audio", "uploaded .pt", "blend"], value="reference audio",
+                     label="Speaker source"),
+            gr.File(type="filepath", file_types=[".pt"],
+                    label=f"Speaker embedding .pt  ([{emb_dim}] or [1,{emb_dim}])"),
+            gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Blend alpha (0=audio → 1=.pt)"),
+            gr.Number(value=1.0, label="Scale (× embedding)"),
+            gr.Slider(0.0, 0.5, value=0.0, step=0.01, label="Add Gaussian noise (std)"),
+            gr.Number(value=0, precision=0, label="Noise seed"),
+            gr.Checkbox(value=False, label="L2-normalize embedding"),
         ],
-        outputs=gr.Audio(type="numpy", label="Voice Cloned Output"),
-        title=f"Voice Cloning — {args.content_encoder} + SMG",
+        outputs=[
+            gr.Audio(type="numpy", label="Voice Cloned Output"),
+            gr.File(label=f"Embedding used (.pt, [{emb_dim}]) — download, modify, re-upload"),
+            gr.Textbox(label="Embedding stats"),
+        ],
+        title=f"Voice Cloning / speaker-space probe — {args.content_encoder} + SMG",
         description=(
-            "Upload a content audio file and a speaker reference audio file. Content features "
-            f"come from {'SIVE' if args.content_encoder == 'sive' else 'ContentVec'}, speaker "
-            "identity from ECAPA-TDNN, and the SMG decoder + vocoder synthesize the content in "
-            "the target speaker's voice."
+            "Content features come from "
+            f"{'SIVE' if args.content_encoder == 'sive' else 'ContentVec'}; speaker identity from a "
+            f"[{emb_dim}]-dim ECAPA embedding. Speaker source = a reference audio, an uploaded .pt "
+            "embedding, or a blend; then probe the space with scale / additive noise / L2-normalize. "
+            "The exact embedding used is exported as a .pt so you can download it, edit it, and "
+            "re-upload — closing the loop for embedding-space exploration."
         ),
     )
     demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)
