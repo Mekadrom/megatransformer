@@ -202,7 +202,13 @@ def main():
             emb = emb * float(scale)
         if float(noise_std) > 0:
             g = torch.Generator(device="cpu").manual_seed(int(noise_seed))
-            emb = emb + float(noise_std) * torch.randn(emb.shape, generator=g).to(emb.device)
+            d = torch.randn(emb.shape, generator=g).to(emb.device)
+            d = d / (d.norm(dim=-1, keepdim=True) + 1e-8)  # unit direction
+            # Scale to a FRACTION of the embedding's own norm. ECAPA here is ||e||~286 and
+            # the SMG L2-normalizes internally, so only the ANGLE matters: fraction f rotates
+            # the embedding by ~arctan(f) (f=1 -> ~45 deg; different speakers sit ~76 deg apart).
+            # A raw std (old behavior) was ~2% of ||e|| at the slider max => inaudible.
+            emb = emb + (float(noise_std) * base_emb.norm(dim=-1, keepdim=True)) * d
         if l2_normalize:
             emb = emb / (emb.norm(dim=-1, keepdim=True) + 1e-8)
         speaker_embedding = emb  # [1, emb_dim]
@@ -280,10 +286,11 @@ def main():
             gr.File(type="filepath", file_types=[".pt"],
                     label=f"Speaker embedding .pt  ([{emb_dim}] or [1,{emb_dim}])"),
             gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Blend alpha (0=audio → 1=.pt)"),
-            gr.Number(value=1.0, label="Scale (× embedding)"),
-            gr.Slider(0.0, 0.5, value=0.0, step=0.01, label="Add Gaussian noise (std)"),
+            gr.Number(value=1.0, label="Scale (× embedding) — NO-OP if the model L2-normalizes"),
+            gr.Slider(0.0, 1.0, value=0.0, step=0.02,
+                      label="Add noise (fraction of ‖emb‖, random dir; f≈angle: 1→~45°, speakers ~76° apart)"),
             gr.Number(value=0, precision=0, label="Noise seed"),
-            gr.Checkbox(value=False, label="L2-normalize embedding"),
+            gr.Checkbox(value=False, label="L2-normalize embedding — NO-OP if the model normalizes internally"),
         ],
         outputs=[
             gr.Audio(type="numpy", label="Voice Cloned Output"),
@@ -296,8 +303,11 @@ def main():
             f"{'SIVE' if args.content_encoder == 'sive' else 'ContentVec'}; speaker identity from a "
             f"[{emb_dim}]-dim ECAPA embedding. Speaker source = a reference audio, an uploaded .pt "
             "embedding, or a blend; then probe the space with scale / additive noise / L2-normalize. "
-            "The exact embedding used is exported as a .pt so you can download it, edit it, and "
-            "re-upload — closing the loop for embedding-space exploration."
+            "NOTE: if the SMG L2-normalizes the embedding internally (this run does), only the "
+            "DIRECTION matters — scale and L2-normalize are no-ops, and noise is scaled as a fraction "
+            "of ‖emb‖ so it maps to a real rotation angle. Meaningful moves = large angles: blend "
+            "toward another speaker's .pt, or noise fraction ≳0.3. The exact embedding used is exported "
+            "as a .pt so you can download it, edit it, and re-upload."
         ),
     )
     demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)
