@@ -33,22 +33,41 @@ import numpy as np
 import torch
 
 
-def gather(cache_dirs, dim, max_per_cache, seed):
+def gather(cache_dirs, dim, max_per_cache, seed, need_f0=False):
     from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
-    E, S = [], []
+    E, S, F0 = [], [], []
+    cols = ["speaker_embeddings", "speaker_ids"] + (["f0"] if need_f0 else [])
     for cd in cache_dirs:
-        ds = VoiceShardedDataset(cd, columns=["speaker_embeddings", "speaker_ids"])
-        idx = range(len(ds))
-        if max_per_cache and max_per_cache < len(ds):
-            idx = np.random.RandomState(seed).choice(len(ds), max_per_cache, replace=False)
-        for i in idx:
+        ds = VoiceShardedDataset(cd, columns=cols)
+        # Strided SEQUENTIAL read (not random indices) — random access thrashes shards on a
+        # big cache; a small stride stays within a shard while covering the whole dataset.
+        step = max(1, len(ds) // max_per_cache) if max_per_cache else 1
+        idx = range(0, len(ds), step)
+        for n, i in enumerate(idx):
+            if n % 4000 == 0:
+                print(f"  gather {cd}: {n}/{len(idx)}", flush=True)
             s = ds[int(i)]
             e = s["speaker_embedding"].float().reshape(-1)
             if e.numel() == dim:
                 E.append(e); S.append(int(s["speaker_id"]))
+                if need_f0:
+                    f0 = torch.as_tensor(s["f0"]).float().reshape(-1); v = f0[f0 > 0]
+                    F0.append(float(torch.exp(v).median()) if v.numel() else float("nan"))
     if not E:
-        return None, None
-    return torch.stack(E), np.array(S)
+        return None, None, None
+    return torch.stack(E), np.array(S), (np.array(F0) if need_f0 else None)
+
+
+def speaker_gender(S, F0, male_max, female_min):
+    """Per-speaker gender from median voiced F0 (Hz). Returns dict sid -> 'male'|'female'|'?'."""
+    out = {}
+    for sid in sorted(set(S.tolist())):
+        vals = F0[(S == sid) & ~np.isnan(F0)]
+        if not len(vals):
+            out[sid] = "?"; continue
+        f = float(np.median(vals))
+        out[sid] = "male" if f < male_max else "female" if f > female_min else "?"
+    return out
 
 
 def per_speaker_means(E, S):
@@ -70,6 +89,11 @@ def main():
     ap.add_argument("--basis_dims", default="", help="Comma dim indices for unit basis vectors e_i (empty = none).")
     ap.add_argument("--match_norm", action="store_true",
                     help="Rescale synthetic points (zeros excepted) to the mean real norm.")
+    ap.add_argument("--gender", choices=["all", "male", "female"], default="all",
+                    help="Restrict data-derived points (mean/PCA/real_spk) to speakers of this gender, "
+                         "classified by median voiced F0 (no gender labels in the cache).")
+    ap.add_argument("--male_max_f0", type=float, default=155.0, help="Median F0 < this = male (Hz)")
+    ap.add_argument("--female_min_f0", type=float, default=165.0, help="Median F0 > this = female (Hz)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -86,7 +110,16 @@ def main():
         manifest[name] = {"norm": round(float(vec.norm()), 3), "mean": round(float(vec.mean()), 4)}
 
     # ---- data-derived stats ----
-    E, S = gather(caches, dim, args.max_per_cache, args.seed)
+    E, S, F0 = gather(caches, dim, args.max_per_cache, args.seed, need_f0=(args.gender != "all"))
+    if args.gender != "all" and E is not None:
+        gmap = speaker_gender(S, F0, args.male_max_f0, args.female_min_f0)
+        keep = {sid for sid, g in gmap.items() if g == args.gender}
+        mask = np.array([s in keep for s in S])
+        n_all = len(set(S.tolist()))
+        E, S, F0 = E[torch.from_numpy(mask)], S[mask], F0[mask]
+        print(f"gender={args.gender}: kept {len(keep)}/{n_all} speakers ({mask.sum()} utts). "
+              f"F0 split: {sum(1 for g in gmap.values() if g=='male')}M / "
+              f"{sum(1 for g in gmap.values() if g=='female')}F / {sum(1 for g in gmap.values() if g=='?')}?")
     real_norm = float(E.norm(dim=1).mean()) if E is not None else 1.0
     unit = (lambda v: v)  # identity; scaling handled per-point below
 
