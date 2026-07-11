@@ -49,12 +49,18 @@ def _resolve_files(path, file_substr, merge):
         return files
     if merge:
         return files
-    # default: newest process only (all files sharing the max <unixtime> in the name)
+    # default: newest PROCESS only. A process writes >1 file (HF's + the custom backend's)
+    # whose <unixtime> can differ by ~1s, so group by PID, not timestamp: find the newest
+    # file, take all files sharing its PID. Filename: events.out.tfevents.<ts>.<host>.<pid>.<n>
     def ts(f):
         m = _TS.search(os.path.basename(f))
         return int(m.group(1)) if m else 0
-    newest = max(ts(f) for f in files)
-    return [f for f in files if ts(f) == newest]
+
+    def pid(f):
+        parts = os.path.basename(f).split(".")
+        return parts[-2] if len(parts) >= 2 else ""
+    newest_pid = pid(max(files, key=ts))
+    return [f for f in files if pid(f) == newest_pid]
 
 
 def _load(files):
