@@ -10,8 +10,8 @@ the mel is resampled to the vocoder's rate before synthesis.
 
 Usage (SIVE):
     python -m megatransformer.scripts.eval.smg.voice_clone --content_encoder sive --sive_checkpoint_path ./checkpoints/sive/checkpoint-60000 --sive_config tiny_deep --smg_checkpoint_path ./checkpoints/smg/checkpoint-50000 --smg_config small_decoder_only_1d --vocoder_config hifigan
-Usage (ContentVec, 50 Hz):
-    python -m megatransformer.scripts.eval.smg.voice_clone --content_encoder contentvec --hop_length 320 --smg_checkpoint_path ./checkpoints/smg_contentvec/checkpoint-50000 --smg_config medium_decoder_only_1d_1x --vocoder_config hifigan
+Usage (ContentVec vec256, 50 Hz — matches the smg_..._1d1x_contentvec run):
+    python -m megatransformer.scripts.eval.smg.voice_clone --content_encoder contentvec --contentvec_dim 256 --hop_length 320 --smg_checkpoint_path runs/smg/smg_libritts_r_1d1x_contentvec_baseline_nogan_0/checkpoint-27000 --smg_config medium_decoder_only_1d_1x --vocoder_config hifigan
 """
 import argparse
 
@@ -35,6 +35,10 @@ def parse_args():
                         help="Content features source: 'sive' (custom checkpoint) or 'contentvec' (off-the-shelf HuBERT, on the raw waveform).")
     parser.add_argument("--contentvec_model", type=str, default="lengyue233/content-vec-best",
                         help="HF model id for ContentVec (transformers.HubertModel), used when --content_encoder contentvec.")
+    parser.add_argument("--contentvec_dim", type=int, default=768, choices=[256, 768],
+                        help="ContentVec feature width — MUST match how the SMG was trained. 768 = "
+                             "last_hidden_state; 256 = final_proj head (vec256). Matches the preprocessor's "
+                             "--contentvec_dim and the SMG's --sive_encoder_dim.")
 
     # SIVE (used when --content_encoder sive)
     parser.add_argument("--sive_checkpoint_path", type=str, default=None, help="Path to SIVE checkpoint directory (required for --content_encoder sive)")
@@ -98,10 +102,12 @@ def main():
         content_dim = sive.config.encoder_dim
         print(f"SIVE loaded ({sum(p.numel() for p in sive.parameters()):,} params)")
     else:
-        from transformers import HubertModel
-        print(f"Loading ContentVec: {args.contentvec_model}")
-        contentvec = HubertModel.from_pretrained(args.contentvec_model).eval().to(device)
-        content_dim = contentvec.config.hidden_size
+        # Match the preprocessor EXACTLY: load via load_contentvec (adds the final_proj
+        # head for dim=256) and extract last_hidden_state (-> final_proj if 256).
+        from megatransformer.utils.contentvec_features import load_contentvec
+        print(f"Loading ContentVec: {args.contentvec_model} (dim={args.contentvec_dim})")
+        contentvec = load_contentvec(args.contentvec_model, device, dim=args.contentvec_dim)
+        content_dim = args.contentvec_dim
         print(f"ContentVec loaded ({sum(p.numel() for p in contentvec.parameters()):,} params), dim={content_dim}")
 
     # Load SMG — wire sive_encoder_dim from the content encoder's dim, and hop_length
@@ -156,9 +162,12 @@ def main():
             )  # [1, T', D]
             content_features = feats.permute(0, 2, 1)
         else:
-            # ContentVec takes the raw waveform -> [1, T@50Hz, D] -> [1, D, T].
-            hidden = contentvec(content_waveform.unsqueeze(0)).last_hidden_state
-            content_features = hidden.permute(0, 2, 1)
+            # ContentVec takes the raw waveform -> [T@50Hz, D] -> [1, D, T]. Match the
+            # preprocessor: last_hidden_state (layer=-1), + final_proj when dim=256.
+            from megatransformer.utils.contentvec_features import contentvec_hidden
+            hidden = contentvec_hidden(contentvec, content_waveform, layer=-1,
+                                       final_proj=(args.contentvec_dim == 256))  # [T', D]
+            content_features = hidden.permute(1, 0).unsqueeze(0)  # [1, D, T']
 
         # Run SMG decoder
         mel_recon = smg.decode(
