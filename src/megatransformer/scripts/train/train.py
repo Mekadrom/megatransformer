@@ -409,6 +409,8 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             voice_n_mels=getattr(args, 'voice_n_mels', 80),
             voice_n_fft=getattr(args, 'voice_n_fft', 1024),
             voice_hop_length=getattr(args, 'voice_hop_length', 256),
+            voice_temperature=getattr(args, 'viz_voice_temperature', 0.6),
+            voice_variance_floor=getattr(args, 'viz_voice_variance_floor', 0.0),
         )
     return callback
 

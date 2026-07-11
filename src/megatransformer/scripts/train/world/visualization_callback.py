@@ -49,6 +49,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         voice_n_mels: int = 80,
         voice_n_fft: int = 1024,
         voice_hop_length: int = 256,
+        voice_temperature: float = 0.6,
+        voice_variance_floor: float = 0.0,
     ):
         self.tokenizer = tokenizer
         self.vocoder = vocoder
@@ -57,6 +59,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         self.static_speaker_embedding = static_speaker_embedding
         self.num_eval_samples = num_eval_samples
         self.step_offset = step_offset if step_offset is not None else 0
+        # Voice sampling for TB eval renders. Only bites when the model was trained with
+        # --voice_stochastic_output (heteroscedastic coda) — else logvar is None and generate()
+        # ignores it (deterministic mu). 0 = deterministic; ~0.5-0.7 = moderate stochasticity.
+        self.voice_temperature = voice_temperature
+        self.voice_variance_floor = voice_variance_floor
         self.voice_sample_rate = voice_sample_rate
         self.voice_n_mels = voice_n_mels
         self.voice_n_fft = voice_n_fft
@@ -691,6 +698,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     text_input_ids=prompt,
                     max_new_tokens=max_new,
                     temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
                     top_p=0.9,
                 )
 
@@ -799,6 +808,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
                 outputs = model.generate(
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
+                    voice_temperature=self.voice_temperature, voice_variance_floor=self.voice_variance_floor,
                 )
 
                 # Log the generated text alongside the media so memorization
@@ -861,6 +871,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
                 outputs = model.generate(
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
+                    voice_temperature=self.voice_temperature, voice_variance_floor=self.voice_variance_floor,
                 )
 
                 # Log the generated text alongside the media.
@@ -950,6 +961,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     text_input_ids=prompt,
                     max_new_tokens=256,
                     temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
                     voice_inputs=voice_input,
                     voice_lengths=voice_len,
                     precomputed_latents=True,
@@ -998,6 +1011,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     text_input_ids=prompt,
                     max_new_tokens=256,
                     temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
                     image_inputs=image_input,
                     precomputed_latents=True,
                 )
@@ -1075,6 +1090,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     text_input_ids=prompt,
                     max_new_tokens=512,
                     temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
                     voice_inputs=voice_input,
                     voice_lengths=voice_len,
                     precomputed_latents=True,
@@ -1133,6 +1150,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     text_input_ids=prompt,
                     max_new_tokens=512,
                     temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
                     image_inputs=image_input,
                     precomputed_latents=True,
                 )
@@ -1201,6 +1220,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 text_input_ids=prompt,
                 max_new_tokens=max_new,
                 temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
                 top_p=0.9,
             )
 
@@ -1246,6 +1267,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 text_input_ids=prompt,
                 max_new_tokens=max_new,
                 temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
             )
 
             # Log generated voice if available
@@ -1383,6 +1406,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 text_input_ids=prompt,
                 max_new_tokens=256,
                 temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
                 top_p=0.9,
                 voice_inputs=voice_inputs,
                 voice_lengths=voice_lengths,
@@ -1431,6 +1456,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 text_input_ids=prompt,
                 max_new_tokens=max_new,
                 temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
             )
 
             image_preds = outputs.get("image_latent_preds")
@@ -1503,6 +1530,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 text_input_ids=prompt,
                 max_new_tokens=256,
                 temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
                 top_p=0.9,
                 image_inputs=image_inputs,
             )
@@ -1550,6 +1579,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 text_input_ids=prompt,
                 max_new_tokens=512,
                 temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
                 voice_inputs=voice_inputs,
                 voice_lengths=voice_lengths,
             )
@@ -1599,6 +1630,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 text_input_ids=prompt,
                 max_new_tokens=512,
                 temperature=0.8,
+                voice_temperature=self.voice_temperature,
+                voice_variance_floor=self.voice_variance_floor,
                 image_inputs=image_inputs,
             )
 

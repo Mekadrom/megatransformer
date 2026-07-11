@@ -1578,6 +1578,12 @@ def add_cli_args(subparsers):
                             help="Voice SMG decoder config name")
     sub_parser.add_argument("--voice_smg_sive_encoder_dim", type=int, default=None,
                             help="Override sive_encoder_dim for voice SMG (must match what it was trained with)")
+    sub_parser.add_argument("--viz_voice_temperature", type=float, default=0.6,
+                            help="Sampling temperature for voice latents in TB eval renders (0=deterministic mu; "
+                                 "~0.5-0.7=moderate). Only active if the model was trained with "
+                                 "--voice_stochastic_output (else generate() ignores it).")
+    sub_parser.add_argument("--viz_voice_variance_floor", type=float, default=0.0,
+                            help="Clamp the per-frame std floor when sampling voice latents in TB renders (0=off).")
     sub_parser.add_argument("--static_speaker_embedding_path", type=str, default=None,
                             help="Path to a .pt file containing a speaker embedding tensor for static-speaker voice decoding")
     sub_parser.add_argument("--num_eval_samples", type=int, default=4,
