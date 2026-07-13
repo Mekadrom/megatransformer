@@ -260,13 +260,24 @@ class SMGTrainer(CommonTrainer):
 
     def _build_swap_bank(self, device):
         """Per-speaker ECAPA centroid bank: emb [K, D] + UNIQUE speaker ids [K].
-        Built once (cached) from --identity_swap_bank_path or a strided pass over the train cache."""
+
+        Build-once / reuse-forever: loads a persisted bank if present, else builds it from a
+        strided pass over the train cache and SAVES it so later runs skip the scan. The bank
+        path is --identity_swap_bank_path if given, else <train_cache>/identity_swap_bank.pt.
+        NB the saved ids are dataset-specific — a bank is only exact on the cache it was built from."""
         if self._swap_bank_emb is not None:
             return self._swap_bank_emb, self._swap_bank_sid
-        if self.identity_swap_bank_path:
-            d = torch.load(self.identity_swap_bank_path, map_location="cpu", weights_only=False)
+
+        save_path = self.identity_swap_bank_path
+        if not save_path:
+            shard_dir = getattr(self.train_dataset, "shard_dir", None)
+            save_path = os.path.join(shard_dir, "identity_swap_bank.pt") if shard_dir else None
+
+        if save_path and os.path.exists(save_path):
+            d = torch.load(save_path, map_location="cpu", weights_only=False)
             emb = torch.as_tensor(d["embeddings"]).float()
             sid = torch.as_tensor(d["speaker_ids"]).long()
+            print(f"[identity_swap_bank] loaded {emb.shape[0]} speaker centroids from {save_path}")
         else:
             ds = self.train_dataset
             n = len(ds)
@@ -284,9 +295,21 @@ class SMGTrainer(CommonTrainer):
             sids = sorted(sums.keys())
             emb = torch.stack([sums[k] / counts[k] for k in sids])
             sid = torch.tensor(sids, dtype=torch.long)
+            print(f"[identity_swap_bank] built {emb.shape[0]} speaker centroids (dim {emb.shape[1]}) from {n} utts (stride {stride})")
+            # Persist for reuse. The build is deterministic (fixed stride, no RNG), so every rank
+            # already holds an identical in-memory copy — only rank 0 writes, no barrier needed.
+            # Atomic tmp+rename so a concurrent reader never sees a partial file.
+            if save_path and getattr(self, "is_world_process_zero", True):
+                try:
+                    tmp = f"{save_path}.tmp"
+                    torch.save({"embeddings": emb, "speaker_ids": sid}, tmp)
+                    os.replace(tmp, save_path)
+                    print(f"[identity_swap_bank] saved -> {save_path} (reused automatically on future runs)")
+                except Exception as ex:
+                    print(f"[identity_swap_bank] WARN could not persist bank to {save_path}: {ex}")
+
         self._swap_bank_emb = emb.to(device)
         self._swap_bank_sid = sid.to(device)
-        print(f"[identity_swap_bank] {emb.shape[0]} speaker centroids (dim {emb.shape[1]})")
         return self._swap_bank_emb, self._swap_bank_sid
 
     def _sample_swap_targets(self, src_speaker_ids, device, dtype):
@@ -1653,8 +1676,10 @@ def add_cli_args(subparsers):
                                 "(shard-local batches hold only ~12-25 speakers) and GUARANTEES the swap "
                                 "target is a different speaker than the source.")
     sub_parser.add_argument("--identity_swap_bank_path", type=str, default=None,
-                           help="Optional .pt with {'embeddings':[K,D],'speaker_ids':[K]} for the swap bank. "
-                                "If omitted, it is built once from the train cache at first use.")
+                           help="Path for the swap-bank .pt ({'embeddings':[K,D],'speaker_ids':[K]}). Loaded if it "
+                                "exists, else BUILT from the train cache and SAVED here for reuse. If omitted, "
+                                "defaults to <train_cache>/identity_swap_bank.pt (build once, reuse forever). "
+                                "NB ids are dataset-specific — a saved bank is only exact on the cache it was built from.")
     sub_parser.add_argument("--identity_loss_max_frames", type=int, default=0,
                            help="Cap the mel frames fed to ECAPA for the identity loss (0 = no cap). "
                                 "Bounds ECAPA's backprop activation memory (the OOM source); ~300-400 "
