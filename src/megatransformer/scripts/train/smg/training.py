@@ -152,6 +152,7 @@ class SMGTrainer(CommonTrainer):
         sive_perceptual_model: Optional[torch.nn.Module] = None,
         sive_perceptual_loss_weight: float = 0.0,
         sive_perceptual_loss_start_step: int = 0,
+        sive_perceptual_loss_rampup_steps: int = 5000,  # Ramp SIVE-perceptual weight 0 -> max over this many steps after start_step (0 = hard on)
         sive_perceptual_layer: int = -1,  # Which SIVE layer to extract (-1 = final)
         **kwargs
     ):
@@ -246,6 +247,7 @@ class SMGTrainer(CommonTrainer):
         self.sive_perceptual_model = sive_perceptual_model
         self.sive_perceptual_loss_weight = sive_perceptual_loss_weight
         self.sive_perceptual_loss_start_step = sive_perceptual_loss_start_step
+        self.sive_perceptual_loss_rampup_steps = sive_perceptual_loss_rampup_steps
         self.sive_perceptual_layer = sive_perceptual_layer
 
         self.has_logged_cli = False
@@ -576,12 +578,16 @@ class SMGTrainer(CommonTrainer):
         # compare against the ground truth SIVE features from the dataset.
         # Encourages content preservation — speaker-invariant by design.
         sive_perceptual_loss_value = torch.tensor(0.0, device=mel_specs.device)
+        sive_alpha = 0.0
         sive_perceptual_enabled = (
             self.sive_perceptual_model is not None
             and self.sive_perceptual_loss_weight > 0
             and global_step >= self.sive_perceptual_loss_start_step
         )
         if sive_perceptual_enabled:
+            # Ramp weight 0 -> max over rampup_steps so the perceptual signal doesn't shock
+            # the decoder before L1/MSE have settled (mirrors identity_alpha).
+            sive_alpha = min(1.0, (global_step - self.sive_perceptual_loss_start_step) / max(1, self.sive_perceptual_loss_rampup_steps))
             # Target: ground truth SIVE features from the dataset [B, C, T']
             # Permute to [B, T', C] to match SIVE model output format
             target_sive_features = features.permute(0, 2, 1)  # [B, T', C]
@@ -616,7 +622,7 @@ class SMGTrainer(CommonTrainer):
                 sive_perceptual_loss_value = F.l1_loss(
                     pred_sive_features[:, :min_t], target_sive_features[:, :min_t]
                 )
-            total_loss = total_loss + self.sive_perceptual_loss_weight * sive_perceptual_loss_value
+            total_loss = total_loss + self.sive_perceptual_loss_weight * sive_alpha * sive_perceptual_loss_value
 
         # Learned speaker embedding classification loss
         # Uses direct gradients (no reversal) to train the speaker head to be discriminative
@@ -972,7 +978,8 @@ class SMGTrainer(CommonTrainer):
             # Log SIVE perceptual loss
             if sive_perceptual_enabled:
                 metrics.log_scalar(f"{prefix}sive_perceptual_loss", sive_perceptual_loss_value, global_step)
-                metrics.log_scalar(f"{prefix}sive_perceptual_weighted", self.sive_perceptual_loss_weight * sive_perceptual_loss_value, global_step)
+                metrics.log_scalar(f"{prefix}sive_perceptual_weighted", self.sive_perceptual_loss_weight * sive_alpha * sive_perceptual_loss_value, global_step)
+                metrics.log_scalar(f"{prefix}sive_perceptual_alpha", sive_alpha, global_step)
 
             # Log speaker embedding statistics (learned or pretrained, whichever is used for decoding)
             if decode_speaker_embedding is not None:
@@ -1250,6 +1257,7 @@ class SMGTrainer(CommonTrainer):
             print(f"  Weight: {self.sive_perceptual_loss_weight}")
             print(f"  Layer: {self.sive_perceptual_layer} (-1 = final)")
             print(f"  Start step: {self.sive_perceptual_loss_start_step}")
+            print(f"  Rampup steps: {self.sive_perceptual_loss_rampup_steps}")
             print(f"  SIVE params: {sum(p.numel() for p in self.sive_perceptual_model.parameters()):,} (frozen)")
 
 
@@ -1500,6 +1508,7 @@ def create_trainer(
         sive_perceptual_model=sive_perceptual_model,
         sive_perceptual_loss_weight=args.sive_perceptual_loss_weight,
         sive_perceptual_loss_start_step=args.sive_perceptual_loss_start_step,
+        sive_perceptual_loss_rampup_steps=args.sive_perceptual_loss_rampup_steps,
         sive_perceptual_layer=args.sive_perceptual_layer,
     )
 
@@ -1633,6 +1642,9 @@ def add_cli_args(subparsers):
                            help="SIVE layer to extract features from (-1 = final, e.g. 10 for layer 10)")
     sub_parser.add_argument("--sive_perceptual_loss_start_step", type=int, default=0,
                            help="Step to start applying SIVE perceptual loss (0 = from start)")
+    sub_parser.add_argument("--sive_perceptual_loss_rampup_steps", type=int, default=5000,
+                           help="Ramp the SIVE perceptual weight 0 -> max over this many steps after the start step "
+                                "(mirrors --identity_loss_rampup_steps; 0 = hard on at full weight)")
 
     # Vocoder settings (optional - for audio generation during visualization AND waveform losses)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,
