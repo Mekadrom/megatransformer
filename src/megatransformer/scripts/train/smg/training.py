@@ -137,6 +137,8 @@ class SMGTrainer(CommonTrainer):
         identity_loss_max_frames: int = 0,  # Cap mel frames fed to ECAPA (0 = no cap); bounds ECAPA activation memory
         identity_loss_every_n_steps: int = 1,  # Apply the identity loss every N steps (1 = every step); amortizes cost
         identity_content_loss_weight: float = 0.0,  # SIVE-perceptual content loss on the SWAPPED output (0 = off; needs sive_perceptual_model)
+        identity_swap_bank: bool = False,  # Draw swap targets from a full-dataset speaker-centroid bank (decouples swap diversity from the shard-local batch)
+        identity_swap_bank_path: Optional[str] = None,  # Optional .pt {"embeddings":[K,D], "speaker_ids":[K]}; if None, built from the train cache
         # Mu-only reconstruction loss (for diffusion compatibility)
         mu_only_recon_weight: float = 0.0,  # Weight for mu-only reconstruction loss (0 = disabled)
         learned_speaker_classifier: Optional[torch.nn.Module] = None,
@@ -225,6 +227,10 @@ class SMGTrainer(CommonTrainer):
         self.identity_loss_max_frames = identity_loss_max_frames
         self.identity_loss_every_n_steps = max(1, identity_loss_every_n_steps)
         self.identity_content_loss_weight = identity_content_loss_weight
+        self.identity_swap_bank = identity_swap_bank
+        self.identity_swap_bank_path = identity_swap_bank_path
+        self._swap_bank_emb = None
+        self._swap_bank_sid = None
         self.identity_speaker_encoder = None  # lazy-built frozen ECAPA (built on first use, on the model device)
 
         # Mu-only reconstruction loss (for diffusion compatibility)
@@ -251,6 +257,48 @@ class SMGTrainer(CommonTrainer):
         self.sive_perceptual_layer = sive_perceptual_layer
 
         self.has_logged_cli = False
+
+    def _build_swap_bank(self, device):
+        """Per-speaker ECAPA centroid bank: emb [K, D] + UNIQUE speaker ids [K].
+        Built once (cached) from --identity_swap_bank_path or a strided pass over the train cache."""
+        if self._swap_bank_emb is not None:
+            return self._swap_bank_emb, self._swap_bank_sid
+        if self.identity_swap_bank_path:
+            d = torch.load(self.identity_swap_bank_path, map_location="cpu", weights_only=False)
+            emb = torch.as_tensor(d["embeddings"]).float()
+            sid = torch.as_tensor(d["speaker_ids"]).long()
+        else:
+            ds = self.train_dataset
+            n = len(ds)
+            stride = max(1, n // 20000)  # ~20k utts covers every speaker (each has ~80-168) for stable centroids
+            sums, counts = {}, {}
+            for i in range(0, n, stride):
+                s = ds[i]
+                if "speaker_embedding" not in s or "speaker_id" not in s:
+                    raise KeyError("identity_swap_bank needs 'speaker_embedding' + 'speaker_id' in the train cache")
+                e = s["speaker_embedding"].float().reshape(-1)
+                sp = int(s["speaker_id"])
+                if sp not in sums:
+                    sums[sp] = torch.zeros_like(e); counts[sp] = 0
+                sums[sp] += e; counts[sp] += 1
+            sids = sorted(sums.keys())
+            emb = torch.stack([sums[k] / counts[k] for k in sids])
+            sid = torch.tensor(sids, dtype=torch.long)
+        self._swap_bank_emb = emb.to(device)
+        self._swap_bank_sid = sid.to(device)
+        print(f"[identity_swap_bank] {emb.shape[0]} speaker centroids (dim {emb.shape[1]})")
+        return self._swap_bank_emb, self._swap_bank_sid
+
+    def _sample_swap_targets(self, src_speaker_ids, device, dtype):
+        """One target embedding per source, GUARANTEED a different speaker. The bank holds one
+        centroid per speaker (unique ids), so a single +1 bump on the rare self-collision suffices."""
+        emb, sid = self._build_swap_bank(device)
+        K = emb.shape[0]
+        src = src_speaker_ids.to(device).long().reshape(-1)
+        tgt = torch.randint(0, K, (src.shape[0],), device=device)
+        collide = sid[tgt] == src              # bank sids unique -> at most one index matches src
+        tgt = torch.where(collide, (tgt + 1) % K, tgt)  # adjacent index = different speaker (guaranteed)
+        return emb[tgt].to(dtype)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
@@ -284,6 +332,7 @@ class SMGTrainer(CommonTrainer):
         speaker_embedding = inputs["speaker_embeddings"]
         f0 = inputs["f0"]
         vuv = inputs["vuv"]
+        source_speaker_ids = inputs.get("speaker_ids")  # [B]; used by the identity_swap_bank exclusion
 
         # Compute KL weight multiplier for KL annealing (ramps from 0 to 1)
         kl_weight_multiplier = 1.0
@@ -847,11 +896,18 @@ class SMGTrainer(CommonTrainer):
 
             emb_own = decode_speaker_embedding.squeeze(1) if decode_speaker_embedding.dim() == 3 else decode_speaker_embedding
             B = emb_own.shape[0]
-            # A DIFFERENT speaker's embedding per sample (avoid self-map).
-            perm = torch.randperm(B, device=emb_own.device)
-            self_map = perm == torch.arange(B, device=emb_own.device)
-            perm[self_map] = (perm[self_map] + 1) % B
-            emb_swapped = emb_own[perm]
+            if self.identity_swap_bank and source_speaker_ids is not None:
+                # Draw a GUARANTEED-different-speaker target per source from the full-dataset
+                # centroid bank. Shard-local batches only hold ~12-25 speakers, so within-batch
+                # swaps starve (and can pair two utts of the SAME speaker) — the bank fixes both.
+                emb_swapped = self._sample_swap_targets(source_speaker_ids, emb_own.device, emb_own.dtype)
+            else:
+                # In-batch swap: a DIFFERENT sample's embedding per position (avoids self-INDEX
+                # only — NOT same-SPEAKER when the batch repeats speakers; use the bank for that).
+                perm = torch.randperm(B, device=emb_own.device)
+                self_map = perm == torch.arange(B, device=emb_own.device)
+                perm[self_map] = (perm[self_map] + 1) % B
+                emb_swapped = emb_own[perm]
 
             # Swapped output = one extra decode (the only backpropped half).
             recon_swap = model.decode(features, speaker_embedding=emb_swapped, features=features)[..., :mel_specs.shape[-1]]
@@ -1492,6 +1548,8 @@ def create_trainer(
         film_contrastive_margin_rampup_steps=args.film_contrastive_margin_rampup_steps,
         identity_loss_weight=args.identity_loss_weight,
         identity_content_loss_weight=getattr(args, 'identity_content_loss_weight', 0.0),
+        identity_swap_bank=getattr(args, 'identity_swap_bank', False),
+        identity_swap_bank_path=getattr(args, 'identity_swap_bank_path', None),
         identity_loss_start_step=args.identity_loss_start_step,
         identity_loss_rampup_steps=args.identity_loss_rampup_steps,
         identity_loss_max_frames=args.identity_loss_max_frames,
@@ -1589,6 +1647,14 @@ def add_cli_args(subparsers):
                            help="Step to start the identity loss (set = resume step so the ramp begins at resume).")
     sub_parser.add_argument("--identity_loss_rampup_steps", type=int, default=5000,
                            help="Steps to ramp the identity-loss weight from 0 to max.")
+    sub_parser.add_argument("--identity_swap_bank", action="store_true", default=False,
+                           help="Draw identity/conversion swap targets from a full-dataset per-speaker "
+                                "centroid bank instead of within-batch. Fixes shard-local speaker starvation "
+                                "(shard-local batches hold only ~12-25 speakers) and GUARANTEES the swap "
+                                "target is a different speaker than the source.")
+    sub_parser.add_argument("--identity_swap_bank_path", type=str, default=None,
+                           help="Optional .pt with {'embeddings':[K,D],'speaker_ids':[K]} for the swap bank. "
+                                "If omitted, it is built once from the train cache at first use.")
     sub_parser.add_argument("--identity_loss_max_frames", type=int, default=0,
                            help="Cap the mel frames fed to ECAPA for the identity loss (0 = no cap). "
                                 "Bounds ECAPA's backprop activation memory (the OOM source); ~300-400 "
