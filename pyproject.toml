@@ -9,26 +9,98 @@ description = "Multimodal transformer research models (SIVE, SMG, vocoder, world
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-# Import-time dependencies, intentionally UNPINNED so an editable install does
-# not clobber a host environment's existing build (e.g. ComfyUI's CUDA torch).
-# torch / torchaudio are deliberately omitted: they are expected to be provided
-# by the runtime environment. requirements.txt still holds the full, pinned
-# training environment for reproducing experiments.
+# Core, INTENTIONALLY UNPINNED library deps: everything a downstream consumer
+# (e.g. the ComfyUI SIVE/ContentVec->SMG inference nodes) needs to `import
+# megatransformer` and run inference. The torch FAMILY (torch/torchaudio/
+# torchvision) is deliberately kept OUT of here so a plain `pip install
+# megatransformer` never clobbers a host env's existing CUDA torch — the
+# training node gets torch via the uv `training` dependency-group instead.
 dependencies = [
     "numpy",
-    "einops",
-    "safetensors",
+    "scipy",
+    "tqdm",
+    "matplotlib",
     "transformers",
+    "huggingface-hub",
+    "safetensors",
+    "librosa",
+    "speechbrain",
+    "torchcrepe",
+    "pyctcdecode",
+    "sentencepiece",   # required by the Mistral tokenizer (not auto-installed by transformers)
+    "protobuf",        # ditto (tokenizer conversion)
     "rotary-embedding-torch",
-    "positional-encodings",
+]
+
+[project.optional-dependencies]
+# Image VAE (LiteVAE) preprocessing + image-synthesis eval. Not needed for the
+# voice/SMG/world path. `open-litevae` = the local checkout (see
+# [tool.uv.sources]); torchvision here resolves from the cu124 index too.
+image = [
+    "torchvision",
+    "pillow",
+    "lpips",
+    "open-clip-torch",
+    "torchmetrics",
+    "omegaconf",
+    "open-litevae",
+]
+# Gradio eval demos (voice_clone, etc.).
+demo = [
+    "gradio",
 ]
 
 [project.urls]
 Repository = "https://github.com/Mekadrom/megatransformer"
 
+# ---------------------------------------------------------------------------
+# uv-specific config (IGNORED by pip — a downstream `pip install megatransformer`
+# never sees any of this, so the library stays installable in non-uv venvs).
+# ---------------------------------------------------------------------------
+
+# Training-node deps. PEP 735 dependency-groups are LOCAL-only (never published
+# in the wheel metadata), so torch et al. reach the training node via `uv sync`
+# but are invisible to a downstream `pip install megatransformer`.
+[dependency-groups]
+training = [
+    "torch",
+    "torchaudio",
+    "deepspeed",
+    "accelerate",
+    "datasets",
+    "tensorboard",
+    "wandb",
+    "jiwer",
+    "openai-whisper",
+    "scikit-learn",
+    "psutil",
+    "requests",
+]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+# `uv sync` installs these groups by default (the full training environment).
+default-groups = ["training", "dev"]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+# Local research checkout, manually packaged (untracked pyproject + local edits),
+# so it is NOT reproducible from the upstream git URL. Editable local path for
+# now; fork+push open-litevae and switch this to a git source to make [image]
+# reproducible on a remote node.
+open-litevae = { path = "../open-litevae", editable = true }
+
 # src-layout: the importable package `megatransformer` lives under src/.
-# `pip install -e .` then makes `import megatransformer.model.smg.smg` work,
-# replacing the old implicit "put src/ on PYTHONPATH" convention.
+# `pip install -e .` (or `uv sync`) then makes `import megatransformer.model.smg.smg` work.
 [tool.setuptools]
 package-dir = { "" = "src" }
 

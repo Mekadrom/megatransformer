@@ -210,14 +210,23 @@ Runs are logged to `runs/<run_name>/` (metrics + checkpoints). Backend is select
 
 ## Environment
 
-- Python 3.10, CUDA 12.4
-- Editable install: `pip install -e .` (makes the `megatransformer` package importable)
-- Full pinned training environment: `pip install -r requirements.txt`
-- venv: `source venv/bin/activate`
+- Python 3.10, CUDA 12.4. Managed with **[uv](https://docs.astral.sh/uv/)** — it
+  provisions its own Python 3.10 and a `.venv`; no system/conda Python needed.
+- Setup: `uv sync` (core + `training` group = torch cu124 + everything to train).
+  Add `--extra demo` (gradio) or `--extra image` (LiteVAE, needs `../open-litevae`).
+- Run commands with `uv run`, e.g. `uv run python -m megatransformer.scripts.train.train ...`
+  (or `source .venv/bin/activate` once, then plain `python -m ...`).
+- `uv.lock` is the source of truth (committed). `requirements.txt` is a generated
+  pip fallback (`uv export`) with the cu124 index URL — regenerate after dep changes.
+- **Dependency layout** (`pyproject.toml`): core `[project.dependencies]` are the
+  unpinned, torch-free libs a downstream consumer needs (the ComfyUI SMG-inference
+  nodes `pip install megatransformer` and use their own torch — torch/torchaudio
+  live in the uv `training` dependency-group, which is invisible to pip consumers).
+  Torch cu124 comes from the `pytorch-cu124` index via `[tool.uv.sources]`.
 
 ## Import Convention
 
 The codebase is a `src`-layout package named `megatransformer` (see `pyproject.toml`).
 All imports are absolute under that namespace, e.g. `from megatransformer.model.smg.smg import SMG`.
-After `pip install -e .` the package is importable from anywhere — no `PYTHONPATH=src` needed.
-Run modules via the package path: `python -m megatransformer.scripts.train.train ...`
+After `uv sync` (or `pip install -e .`) the package is importable from anywhere — no `PYTHONPATH=src` needed.
+Run modules via the package path: `uv run python -m megatransformer.scripts.train.train ...`
