@@ -34,8 +34,12 @@ dependencies = [
 
 [project.optional-dependencies]
 # Image VAE (LiteVAE) preprocessing + image-synthesis eval. Not needed for the
-# voice/SMG/world path. `open-litevae` = the local checkout (see
-# [tool.uv.sources]); torchvision here resolves from the cu124 index too.
+# voice/SMG/world path. torchvision here resolves from the cu124 index too.
+# NOTE: image-VAE preprocessing also needs `olvae` (open-litevae), which is a
+# local, manually-packaged checkout with no reproducible source yet — install it
+# separately where you have it: `uv pip install -e ../open-litevae`. It is kept
+# OUT of the deps so a fresh node without that checkout can `uv sync` (a local
+# path source is validated even when the extra is unselected, which breaks sync).
 image = [
     "torchvision",
     "pillow",
@@ -43,7 +47,6 @@ image = [
     "open-clip-torch",
     "torchmetrics",
     "omegaconf",
-    "open-litevae",
 ]
 # Gradio eval demos (voice_clone, etc.).
 demo = [
@@ -93,11 +96,11 @@ explicit = true
 torch = { index = "pytorch-cu124" }
 torchaudio = { index = "pytorch-cu124" }
 torchvision = { index = "pytorch-cu124" }
-# Local research checkout, manually packaged (untracked pyproject + local edits),
-# so it is NOT reproducible from the upstream git URL. Editable local path for
-# now; fork+push open-litevae and switch this to a git source to make [image]
-# reproducible on a remote node.
-open-litevae = { path = "../open-litevae", editable = true }
+# open-litevae (olvae) is intentionally NOT declared here: it's a local,
+# manually-packaged checkout, and a path source is validated on every `uv sync`
+# even on nodes that don't have it (breaking sync). Install it manually where
+# needed (`uv pip install -e ../open-litevae`); once forked+pushed, add it back
+# as a git source in the [image] extra to make image-VAE preprocessing reproducible.
 
 # src-layout: the importable package `megatransformer` lives under src/.
 # `pip install -e .` (or `uv sync`) then makes `import megatransformer.model.smg.smg` work.
