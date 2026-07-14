@@ -46,8 +46,13 @@ from megatransformer.utils.audio_utils import SharedWindowBuffer
 from megatransformer.utils.train_utils import EarlyStoppingCallback
 
 
-_np_multiarray = getattr(np, "_core", np.core).multiarray
-torch.serialization.add_safe_globals([_np_multiarray._reconstruct, np.ndarray, np.dtype])
+# numpy moved multiarray to numpy._core in 2.0. Import the submodule explicitly
+# (attribute access np._core.multiarray fails when the submodule isn't pre-loaded).
+try:
+    from numpy._core.multiarray import _reconstruct as _np_reconstruct  # numpy >= 2.0
+except ModuleNotFoundError:
+    from numpy.core.multiarray import _reconstruct as _np_reconstruct    # numpy < 2.0
+torch.serialization.add_safe_globals([_np_reconstruct, np.ndarray, np.dtype])
 
 
 def create_or_load_model(args, shared_window_buffer: Optional[SharedWindowBuffer]) -> nn.Module:
