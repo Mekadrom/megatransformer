@@ -219,8 +219,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             (self._scenario_train_text_continuation, {"text"}, {"text_continuation"}),
             (self._scenario_train_generation, set(), {"voice_synthesis", "audio_synthesis", "image_synthesis"}),
             (self._scenario_train_transcription, set(), {"voice_transcription", "audio_transcription", "image_transcription"}),
-            (self._scenario_train_cross_modal, set(), set()),
         ]
+        # Cross-modal round-trips media through the model, so it needs at least two media
+        # modalities to mean anything — with only voice it just renders voice_to_voice.
+        # Not expressible as a required-modes subset, hence the explicit count.
+        if len(self.include_modes & {"audio", "voice", "image"}) >= 2:
+            train_data_scenarios.append((self._scenario_train_cross_modal, set(), set()))
         eval_scenarios = [
             (self._scenario_text_continuation, {"text"}, {"text_continuation"}),
             (self._scenario_text_to_voice, {"voice"}, {"voice_synthesis"}),
