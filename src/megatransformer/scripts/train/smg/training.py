@@ -1243,7 +1243,18 @@ class SMGTrainer(CommonTrainer):
                     # Match training: with --f0_warmup_use_gt_steps the decoder is
                     # conditioned on GT F0, so eval must be too or its loss measures a
                     # different model than the one being trained.
-                    use_gt_f0=(self.f0_warmup_use_gt_steps > 0 and f0 is not None and vuv is not None),
+                    #
+                    # Mirror compute_loss's condition EXACTLY, global_step included. The
+                    # warmup is finite in general (9999999 is just "never hand off"), and
+                    # dropping the step check would leave eval on GT after training had
+                    # switched to predicted -- eval/loss would then flatter the model
+                    # against a path it no longer trains, which is the precise failure
+                    # this comment exists to prevent.
+                    # step_offset included to match compute_loss line-for-line: on a
+                    # resumed run the offset is what makes the step counter continuous.
+                    use_gt_f0=(self.f0_warmup_use_gt_steps > 0 and
+                               (self.state.global_step + self.step_offset) < self.f0_warmup_use_gt_steps and
+                               f0 is not None and vuv is not None),
                 )
 
                 loss = losses["total_loss"]
