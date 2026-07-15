@@ -319,7 +319,12 @@ class MegaTransformerWorldModel(nn.Module):
             if is_synthesis is not None and is_synthesis.any():
                 d_model = self.config.text_prelude_config.d_model
                 shifted_input = voice_flat[:, :, :-1]  # (B*N, C, T-1)
-                shifted_hidden = self.voice_feature_extractor(shifted_input)  # (B*N, T-1, d_model)
+                # THE autoregressive crutch: these are the TRUE previous frames, and they
+                # predict frame t so well on their own that the text earns no gradient.
+                # prenet_dropout (config, default off) is the Tacotron-2 bottleneck.
+                shifted_hidden = self.voice_feature_extractor(
+                    shifted_input, apply_prenet_dropout=True,
+                )  # (B*N, T-1, d_model)
                 zero_prefix = torch.zeros(shifted_hidden.shape[0], 1, d_model, device=shifted_hidden.device, dtype=shifted_hidden.dtype)
                 synth_hidden = torch.cat([zero_prefix, shifted_hidden], dim=1)  # (B*N, T, d_model)
 
@@ -929,6 +934,12 @@ class MegaTransformerWorldModel(nn.Module):
                                 kv_caches=p_kv,
                                 position_offset=p_off,
                                 use_cache=True,
+                                # Same bottleneck as the training-time shifted path. Kept ON
+                                # at generation deliberately (Tacotron 2): dropping it here
+                                # would restore the over-reliance on the previous frame that
+                                # training was regularized to avoid, i.e. a train/inference
+                                # mismatch in exactly the wrong direction.
+                                apply_prenet_dropout=True,
                             )  # embed: (1, 1, d_model)
                             if mod == "voice":
                                 voice_prelude_kv_caches[b] = new_p_kv

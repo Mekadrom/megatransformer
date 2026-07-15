@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from typing import List, Optional, Tuple, Union
@@ -85,6 +86,7 @@ class VoiceSIVEPreludeFeatureExtractor(nn.Module):
         kv_caches: Optional[List] = None,
         position_offset: int = 0,
         use_cache: bool = False,
+        apply_prenet_dropout: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List]]:
         """
         Process SIVE features into token embeddings.
@@ -96,6 +98,12 @@ class VoiceSIVEPreludeFeatureExtractor(nn.Module):
                 that frame t's prelude self-attention sees frames 0..t-1.
             position_offset: RoPE position offset for cached generation.
             use_cache: If True, return (embeddings, kv_caches) tuple.
+            apply_prenet_dropout: Enable the config's prenet_dropout bottleneck. Only for
+                the AUTOREGRESSIVE path (shifted teacher forcing / own-output feedback),
+                where the previous-frame signal otherwise drowns out the text. Must stay
+                False when the prelude is READING real audio (transcription, cross-modal):
+                there the audio is the input, not a crutch, and corrupting it is just
+                damage.
 
         Returns:
             Token embeddings of shape (batch, timesteps, d_model).
@@ -108,6 +116,14 @@ class VoiceSIVEPreludeFeatureExtractor(nn.Module):
             x = self.input_norm(x)
 
         projected = self.projection(x)  # (batch, T, d_model)
+
+        # Tacotron-2 prenet bottleneck. training=True unconditionally: Tacotron 2 keeps
+        # this dropout ON at inference, and that is load-bearing rather than an oversight
+        # — disabling it at generation restores exactly the over-reliance on the
+        # previous frame that the bottleneck exists to break.
+        prenet_p = getattr(self.config, "prenet_dropout", 0.0)
+        if apply_prenet_dropout and prenet_p > 0.0:
+            projected = F.dropout(projected, p=prenet_p, training=True)
 
         if hasattr(self, 'pos_encoding'):
             projected = self.pos_encoding(projected, offset=position_offset)

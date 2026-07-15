@@ -64,6 +64,10 @@ class WorldModelTrainer(CommonTrainer):
         # beta for the voice heteroscedastic beta-NLL (only used when the voice
         # coda is stochastic, i.e. emits a log-variance). 0.5 = Seitzer default.
         voice_beta_nll: float = 0.5,
+        # Per-frame probability of feeding the model's own prediction instead of ground
+        # truth on the AR path, ramped from 0. 0 = off (pure teacher forcing).
+        voice_scheduled_sampling_prob: float = 0.0,
+        voice_scheduled_sampling_ramp_steps: int = 10000,
         # Modality flags
         include_text: bool = True,
         include_audio: bool = True,
@@ -116,6 +120,8 @@ class WorldModelTrainer(CommonTrainer):
         self.audio_stop_loss_weight = audio_stop_loss_weight
         self.voice_stop_loss_weight = voice_stop_loss_weight
         self.voice_beta_nll = voice_beta_nll
+        self.voice_scheduled_sampling_prob = voice_scheduled_sampling_prob
+        self.voice_scheduled_sampling_ramp_steps = voice_scheduled_sampling_ramp_steps
 
         self.include_text = include_text
         self.include_audio = include_audio
@@ -572,6 +578,12 @@ class WorldModelTrainer(CommonTrainer):
         if should_log and hasattr(model_for_stats, 'recurrent_block'):
             model_for_stats.recurrent_block.track_iteration_stats = True
 
+        ss_prob = self._scheduled_sampling_prob(global_step) if model.training else 0.0
+        if ss_prob > 0.0 and voice_inputs is not None and is_synthesis is not None and bool(is_synthesis.any()):
+            voice_inputs = self._apply_scheduled_sampling(
+                model, ss_prob, text_input_ids, voice_inputs, voice_lengths, is_synthesis, global_step,
+            )
+
         outputs = model(
             text_input_ids=text_input_ids,
             audio_inputs=audio_inputs,
@@ -937,6 +949,71 @@ class WorldModelTrainer(CommonTrainer):
         self._module_groups = groups
         return groups
 
+    def _scheduled_sampling_prob(self, global_step: int) -> float:
+        """Per-frame probability of feeding the model's OWN prediction instead of ground
+        truth, ramped linearly from 0 over --voice_scheduled_sampling_ramp_steps.
+
+        Ramped, not constant: at step 0 the model's predictions are noise, and training on
+        noise-as-history teaches nothing. The ramp lets the model first learn to predict,
+        then progressively removes the ground-truth crutch it would otherwise rely on
+        forever.
+        """
+        if self.voice_scheduled_sampling_prob <= 0.0:
+            return 0.0
+        ramp = max(1, self.voice_scheduled_sampling_ramp_steps)
+        return self.voice_scheduled_sampling_prob * min(1.0, global_step / ramp)
+
+    @torch.no_grad()
+    def _apply_scheduled_sampling(
+        self, model, ss_prob, text_input_ids, voice_inputs, voice_lengths, is_synthesis, global_step,
+    ):
+        """Replace a fraction of the teacher-forced frames with the model's own predictions.
+
+        True scheduled sampling is sequential (decode frame t, feed it to t+1), which is
+        unusable here — 500 serial forwards through a 16-iteration recurrence per batch.
+        This is the standard transformer approximation (Mihaylova & Martins 2019): one
+        no-grad teacher-forced pass to get predictions, mix them into the input, then the
+        real pass. The mixed-in frames are one step "stale" (they were predicted from
+        ground-truth history, not from other predictions), so it under-states real
+        exposure bias — but it removes the guarantee that the history is perfect, which is
+        the property the model is currently exploiting.
+
+        Costs one extra forward: ~1.6x step time, since forward is ~2/3 of compute here.
+        Only the INPUT is mixed; voice_latent_labels stays ground truth (the trainer holds
+        it separately and never passes it to the model).
+        """
+        tf_out = model(
+            text_input_ids=text_input_ids,
+            voice_inputs=voice_inputs,
+            voice_lengths=voice_lengths,
+            precomputed_latents=self.precomputed_latents,
+            decode_outputs=False,
+            is_synthesis=is_synthesis,
+        )
+        preds = tf_out.get("voice_latent_preds")
+        if preds is None or preds.shape != voice_inputs.shape:
+            if not getattr(self, "_warned_ss_shape", False):
+                self._warned_ss_shape = True
+                shape = tuple(preds.shape) if preds is not None else None
+                print(f"[scheduled_sampling] disabled: preds shape {shape} != "
+                      f"voice_inputs {tuple(voice_inputs.shape)}", flush=True)
+            return voice_inputs
+
+        # Per-FRAME mask (broadcast over channels): a frame is either the model's or the
+        # truth, never a per-channel chimera of both, which is not a state the model will
+        # ever be fed at generation.
+        b, n, _, t = voice_inputs.shape
+        use_pred = torch.rand(b, n, 1, t, device=voice_inputs.device) < ss_prob
+        # Synthesis rows only — transcription feeds real audio as INPUT, so corrupting it
+        # there would just be damage.
+        synth = is_synthesis.view(b, 1, 1, 1).to(torch.bool)
+        use_pred = use_pred & synth
+        mixed = torch.where(use_pred, preds.detach().to(voice_inputs.dtype), voice_inputs)
+
+        if global_step % self.args.logging_steps == 0:
+            metrics.log_scalar("train/scheduled_sampling_prob", ss_prob, global_step, skip_zero=False)
+        return mixed
+
     def _log_precision_once(self, model):
         """Report the ACTIVE compute precision, probed from INSIDE the model's forward.
 
@@ -1300,6 +1377,7 @@ def load_model(args, device='cuda'):
                       getattr(args, 'share_block_weights', False) or
                       getattr(args, 'max_seq_len', None) is not None or
                       _voice_feature_channels(args) is not None or
+                      getattr(args, 'voice_prenet_dropout', 0.0) > 0.0 or
                       getattr(args, 'mean_thinking_steps', None) is not None or
                       getattr(args, 'voice_stochastic_output', False))
     if needs_override:
@@ -1311,6 +1389,8 @@ def load_model(args, device='cuda'):
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if getattr(args, 'share_block_weights', False):
             config.recurrent_block_config.share_block_weights = True
+        if getattr(args, 'voice_prenet_dropout', 0.0) and args.voice_prenet_dropout > 0.0:
+            config.voice_prelude_config.prenet_dropout = args.voice_prenet_dropout
         if getattr(args, 'mean_thinking_steps', None) is not None:
             # Must be set PRE-construction, unlike --backprop_depth: besides driving the
             # Poisson sampler, it is l_eff for the depth-scaled residual init
@@ -1465,6 +1545,8 @@ def create_trainer(
         audio_stop_loss_weight=getattr(args, 'audio_stop_loss_weight', 1.0),
         voice_stop_loss_weight=getattr(args, 'voice_stop_loss_weight', 1.0),
         voice_beta_nll=getattr(args, 'voice_beta_nll', 0.5),
+        voice_scheduled_sampling_prob=getattr(args, 'voice_scheduled_sampling_prob', 0.0),
+        voice_scheduled_sampling_ramp_steps=getattr(args, 'voice_scheduled_sampling_ramp_steps', 10000),
         include_text="text" in include_modes,
         include_audio="audio" in include_modes,
         include_voice="voice" in include_modes,
@@ -1733,6 +1815,25 @@ def add_cli_args(subparsers):
                             help="Audio hop length")
     sub_parser.add_argument("--sive_total_stride", type=int, default=4,
                             help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
+    sub_parser.add_argument("--voice_prenet_dropout", type=float, default=0.0,
+                            help="Tacotron-2 prenet dropout on the AUTOREGRESSIVE voice path "
+                                 "(shifted teacher forcing in training, own-output feedback at "
+                                 "generation). Under teacher forcing the true previous frames "
+                                 "predict frame t so well that the text earns no gradient and the "
+                                 "model converges to unconditional babble; this bottleneck forces "
+                                 "the text to become the reliable signal. Stays ON at inference, "
+                                 "by design. 0 = off, 0.5 = the Tacotron 2 value.")
+    sub_parser.add_argument("--voice_scheduled_sampling_prob", type=float, default=0.0,
+                            help="Per-frame probability of feeding the model's OWN prediction "
+                                 "instead of ground truth on the AR path, ramped from 0 over "
+                                 "--voice_scheduled_sampling_ramp_steps. Attacks the same "
+                                 "teacher-forcing crutch as --voice_prenet_dropout but by removing "
+                                 "the guarantee that history is perfect. COSTS ~1.6x step time (one "
+                                 "extra no-grad forward per step). 0 = off.")
+    sub_parser.add_argument("--voice_scheduled_sampling_ramp_steps", type=int, default=10000,
+                            help="Linear ramp length for --voice_scheduled_sampling_prob. Ramped "
+                                 "because early predictions are noise, and training on "
+                                 "noise-as-history teaches nothing.")
     sub_parser.add_argument("--voice_token_budget", type=int, default=None,
                             help="Max content frames generate() may emit before force-closing with "
                                  "EOV, for the TensorBoard TTS renders. Default: derived from "
