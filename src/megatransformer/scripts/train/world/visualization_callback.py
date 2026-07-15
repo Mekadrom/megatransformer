@@ -57,6 +57,10 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         self.image_vae_decoder = image_vae_decoder
         self.voice_smg_decoder = voice_smg_decoder
         self.static_speaker_embedding = static_speaker_embedding
+        # Lazily pinned in _resolve_static_speaker when no explicit static embedding was
+        # given, so the TTS renders still have a voice that is constant across evals.
+        self._pinned_speaker = None
+        self._warned_no_smg = False
         self.num_eval_samples = num_eval_samples
         self.step_offset = step_offset if step_offset is not None else 0
         # Voice sampling for TB eval renders. Only bites when the model was trained with
@@ -395,9 +399,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
     def _log_text_perplexity(
         self, outputs: dict, model, device, tag: str, global_step: int,
     ):
-        """Log perplexity of generated text by feeding it back through the model.
+        """Log SELF-perplexity: score the model's own generation back through the model.
 
-        Lower perplexity = model finds its own output more probable = higher quality.
+        Lower = the model finds its own output more probable. This is a fluency proxy and
+        is NOT comparable to eval/{task}/text_loss, which is cross-entropy against ground
+        truth — hence the distinct `text_self_perplexity` tag. Note it also reaches into
+        submodules directly rather than calling forward(), so it bypasses the interleaver.
         """
         gen_ids = outputs.get("generated_token_ids")
         if gen_ids is None or gen_ids.shape[1] < 2:
@@ -420,7 +427,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             )
             perplexity = torch.exp(loss).item()
             if math.isfinite(perplexity):
-                metrics.log_scalar(f"{tag}/text_perplexity", perplexity, global_step)
+                metrics.log_scalar(f"{tag}/text_self_perplexity", perplexity, global_step)
         except Exception as e:
             print(f"Warning: perplexity computation failed: {e}")
 
@@ -471,7 +478,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         predictions on its own training data should increasingly match the targets.
         Uses the same fixed sample indices every eval for consistent comparison.
         """
-        tag = "train_world/reconstruction"
+        tag = "viz/train_data/reconstruction"
         train_dataset = self.trainer.train_dataset
         if train_dataset is None or len(train_dataset) == 0:
             return
@@ -664,7 +671,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         rest. Logs the generated continuation alongside the target text so
         memorization quality can be assessed at a glance.
         """
-        tag = "train_world/text_continuation"
+        tag = "viz/train_data/text_continuation"
         train_dataset = self.trainer.train_dataset
         if train_dataset is None or len(train_dataset) == 0:
             return
@@ -731,7 +738,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         dataset. For each, provides only the text prompt and generates the
         media from scratch. This is the honest measure of generation quality.
         """
-        tag = "train_world/generation"
+        tag = "viz/train_data/generation"
         train_dataset = self.trainer.train_dataset
         if train_dataset is None or len(train_dataset) == 0:
             return
@@ -926,7 +933,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         For voice: provides voice features as input, generates text transcription.
         For image: provides image as input, generates text description.
         """
-        tag = "train_world/transcription"
+        tag = "viz/train_data/transcription"
         train_dataset = self.trainer.train_dataset
         if train_dataset is None or len(train_dataset) == 0:
             return
@@ -1063,7 +1070,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         - Voice→Voice: [BOV] [VOICE_PH] [EOV] [BOV] → generate voice
         - Image→Image: [BOI] [IMAGE_PH] [EOI] [BOI] → generate image
         """
-        tag = "train_world/cross_modal"
+        tag = "viz/train_data/cross_modal"
         train_dataset = self.trainer.train_dataset
         if train_dataset is None or len(train_dataset) == 0:
             return
@@ -1202,7 +1209,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _scenario_text_continuation(self, model, eval_dataset, collator, device, global_step):
         """Scenario 1: Text-only generation (take text, generate continuation)."""
-        tag = "eval_world/1_text_continuation"
+        tag = "viz/eval/1_text_continuation"
         samples = self._get_eval_samples(eval_dataset, collator, self.num_eval_samples, requires_text_only=True)
         if not samples:
             return
@@ -1252,7 +1259,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         Uses the actual transcript from each eval sample as the prompt, so the
         target voice matches the text the model is conditioned on.
         """
-        tag = "eval_world/2_text_to_voice"
+        tag = "viz/eval/2_text_to_voice"
 
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_voice=True
@@ -1387,7 +1394,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _scenario_voice_to_text(self, model, eval_dataset, collator, device, global_step):
         """Scenario 3: Voice -> Text transcription."""
-        tag = "eval_world/3_voice_to_text"
+        tag = "viz/eval/3_voice_to_text"
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_voice=True
         )
@@ -1441,7 +1448,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         Uses the actual caption from each eval sample as the prompt, so the
         target image matches the text the model is conditioned on.
         """
-        tag = "eval_world/4_text_to_image"
+        tag = "viz/eval/4_text_to_image"
 
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_image=True
@@ -1512,7 +1519,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _scenario_image_to_text(self, model, eval_dataset, collator, device, global_step):
         """Scenario 5: Image -> Text description."""
-        tag = "eval_world/5_image_to_text"
+        tag = "viz/eval/5_image_to_text"
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_image=True
         )
@@ -1566,7 +1573,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _scenario_voice_to_image(self, model, eval_dataset, collator, device, global_step):
         """Scenario 6: Voice -> Image cross-modal generation."""
-        tag = "eval_world/6_voice_to_image"
+        tag = "viz/eval/6_voice_to_image"
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_voice=True
         )
@@ -1617,7 +1624,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _scenario_image_to_voice(self, model, eval_dataset, collator, device, global_step):
         """Scenario 7: Image -> Voice cross-modal generation."""
-        tag = "eval_world/7_image_to_voice"
+        tag = "viz/eval/7_image_to_voice"
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_image=True
         )
@@ -1758,8 +1765,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if mel.numel() == 0:
             print(f"[audio_debug] _decode_audio_latent_to_mel returned empty tensor for {tag_prefix}/{speaker_label}")
             return
-        print(f"[audio_debug] Got mel shape={mel.shape} for {tag_prefix}/{speaker_label}")
-
         # Log mel spectrogram as figure
         mel_np = mel.numpy()
         if mel_np.size == 0 or mel_np.shape[0] == 0 or mel_np.shape[-1] == 0:
@@ -1778,10 +1783,30 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             metrics.log_figure(f"{tag_prefix}/{speaker_label}_mel", fig, global_step)
         plt.close(fig)
 
+    def _resolve_static_speaker(self, gt_speaker_emb):
+        """The fixed reference voice for TTS renders.
+
+        Prefers --static_speaker_embedding_path. Without it, pin the FIRST ground-truth
+        embedding ever seen and reuse it forever. Holding the speaker constant across
+        evals is the whole point of the static render: you are listening for the model
+        improving, which you cannot hear if the voice changes under you every eval.
+        """
+        if self.static_speaker_embedding is not None:
+            return self.static_speaker_embedding
+        if self._pinned_speaker is None and gt_speaker_emb is not None:
+            self._pinned_speaker = gt_speaker_emb.detach().clone().cpu()
+            print("[viz] No --static_speaker_embedding_path given; pinning the first eval "
+                  "sample's speaker as the fixed reference voice for TTS renders.", flush=True)
+        return self._pinned_speaker
+
     def _log_audio_with_smg(self, pred_latent, sample, global_step, tag_prefix):
         """Run dual-speaker SMG decoding: ground-truth speaker + static speaker."""
         if self.voice_smg_decoder is None:
-            print(f"[audio_debug] No SMG decoder available for {tag_prefix}")
+            if not self._warned_no_smg:
+                self._warned_no_smg = True
+                print("[viz] WARNING: no SMG decoder loaded — NO TTS AUDIO WILL BE LOGGED. "
+                      "Pass --voice_smg_checkpoint_path (and check the path exists; a bad "
+                      "path is caught and downgraded to a warning at load time).", flush=True)
             # Fallback to direct vocoder (old behavior)
             if self.vocoder is not None:
                 self._try_vocoder_from_latent(
@@ -1800,23 +1825,18 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 break
 
         if gt_speaker_emb is not None:
-            print(f"[audio_debug] Decoding {tag_prefix} with gt_speaker (shape={gt_speaker_emb.shape}, latent shape={pred_latent.shape})")
             self._decode_and_log_audio(
                 pred_latent, gt_speaker_emb, global_step,
                 tag_prefix, "gt_speaker"
             )
-        else:
-            print(f"[audio_debug] No gt speaker embedding found for {tag_prefix}. Sample keys: {list(sample.keys())}")
 
-        # Decode with static speaker embedding
-        if self.static_speaker_embedding is not None:
-            print(f"[audio_debug] Decoding {tag_prefix} with static_speaker")
+        # Decode with the fixed reference speaker, so renders are comparable across evals
+        static_emb = self._resolve_static_speaker(gt_speaker_emb)
+        if static_emb is not None:
             self._decode_and_log_audio(
-                pred_latent, self.static_speaker_embedding, global_step,
+                pred_latent, static_emb, global_step,
                 tag_prefix, "static_speaker"
             )
-        else:
-            print(f"[audio_debug] No static speaker embedding available")
 
     def _try_vocoder_from_latent(self, model, latent, global_step, tag):
         """Try to decode SIVE feature latent directly through vocoder.

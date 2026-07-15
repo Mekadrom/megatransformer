@@ -154,7 +154,7 @@ class WorldModelTrainer(CommonTrainer):
         # which trigger the batch-size-mismatch null-out in world_model.py
         # forward and collapse all eval task_type classification to
         # text_continuation (because voice/image get nulled for non-text-heavy
-        # batches). Result: only `world_eval/text_continuation/*` metrics
+        # batches). Result: only `eval/text_continuation/*` metrics
         # get logged, and eval_loss ends up being text-only rather than a
         # true average across task types.
         self._eval_shard_sampler = None
@@ -564,8 +564,10 @@ class WorldModelTrainer(CommonTrainer):
 
         self._log_precision_once(model)
 
-        # Enable per-iteration stat tracking at logging steps
-        should_log = global_step % self.args.logging_steps == 0
+        # Enable per-iteration stat tracking at logging steps. Training only: the stats are
+        # logged under train/ and collecting them costs ~6 GPU syncs per recurrent
+        # iteration (~192 per step), so paying that on eval batches bought nothing.
+        should_log = model.training and global_step % self.args.logging_steps == 0
         model_for_stats = model.module if hasattr(model, 'module') else model
         if should_log and hasattr(model_for_stats, 'recurrent_block'):
             model_for_stats.recurrent_block.track_iteration_stats = True
@@ -811,22 +813,28 @@ class WorldModelTrainer(CommonTrainer):
         self._last_task_type = task_type
         self._last_loss_components = loss_components
 
-        if global_step % self.args.logging_steps == 0:
-            metrics.log_scalar("world/total_loss", total_loss, global_step)
+        # Training curve only. prediction_step routes eval through compute_loss with
+        # model.eval() and a FROZEN global_step, and eval_steps is normally a multiple of
+        # logging_steps — so without this guard every eval batch re-emitted these tags at
+        # the exact step the train point occupies, welding eval-distribution values onto
+        # the train curve. Eval metrics come from evaluate()'s per-task accumulator
+        # instead, which logs one properly averaged point per eval under eval/.
+        if model.training and global_step % self.args.logging_steps == 0:
+            metrics.log_scalar("train/total_loss", total_loss, global_step)
             for name, value in loss_components.items():
-                metrics.log_scalar(f"world/{name}", value, global_step)
+                metrics.log_scalar(f"train/{name}", value, global_step)
 
             # Recurrent output stats (variance and entropy per modality)
             for key, value in outputs.items():
                 if key.startswith("recurrent_out/"):
-                    metrics.log_scalar(f"world/{key}", value, global_step)
+                    metrics.log_scalar(f"train/{key}", value, global_step)
 
             # Per-iteration activation stats from recurrent block
             iteration_stats = outputs.get("iteration_stats")
             if iteration_stats:
                 from megatransformer.utils import visualization
                 fig = visualization.render_iteration_stats(iteration_stats)
-                metrics.log_figure("world/iteration_stats", fig, global_step)
+                metrics.log_figure("train/iteration_stats", fig, global_step)
                 from matplotlib import pyplot as plt
                 plt.close(fig)
 
@@ -987,9 +995,9 @@ class WorldModelTrainer(CommonTrainer):
                     if p.grad is not None:
                         total_norm_sq += p.grad.data.float().norm(2).item() ** 2
                         num_params += p.numel()
-            metrics.log_scalar(f"world/grad_norm/{name}", total_norm_sq ** 0.5, global_step, skip_zero=False)
+            metrics.log_scalar(f"train/grad_norm/{name}", total_norm_sq ** 0.5, global_step, skip_zero=False)
             if num_params > 0:
-                metrics.log_scalar(f"world/grad_rms/{name}", (total_norm_sq / num_params) ** 0.5, global_step, skip_zero=False)
+                metrics.log_scalar(f"train/grad_rms/{name}", (total_norm_sq / num_params) ** 0.5, global_step, skip_zero=False)
 
     def _get_eval_sampler(self, eval_dataset) -> Optional[torch.utils.data.Sampler]:
         """Group eval batches by task type so per-modality eval metrics fire.
@@ -1002,7 +1010,7 @@ class WorldModelTrainer(CommonTrainer):
         and voice/image eval metrics never appear. Using
         `ModalityGroupedSampler` at eval produces homogeneous batches like
         training does, so per-task eval curves (e.g.
-        `world_eval/voice_synthesis/voice_latent_l1_norm`) populate correctly.
+        `eval/voice_synthesis/voice_latent_l1_norm`) populate correctly.
         """
         if eval_dataset is self.eval_dataset and self._eval_shard_sampler is not None:
             return self._eval_shard_sampler
@@ -1105,7 +1113,7 @@ class WorldModelTrainer(CommonTrainer):
                 if grad_norm is not None:
                     if hasattr(grad_norm, "item"):
                         grad_norm = grad_norm.item()
-                    metrics.log_scalar("world/grad_norm/global", grad_norm, global_step, skip_zero=False)
+                    metrics.log_scalar("train/grad_norm/global", grad_norm, global_step, skip_zero=False)
             else:
                 has_grads = any(p.grad is not None for p in model_to_use.parameters())
                 if has_grads:
@@ -1153,7 +1161,7 @@ class WorldModelTrainer(CommonTrainer):
         Saves a checkpoint BEFORE eval+visualization so that long-running eval
         or visualization errors don't lose trained weights.
 
-        Produces `world_eval/{task_type}/{component}` curves alongside HF's
+        Produces `eval/{task_type}/{component}` curves alongside HF's
         default `eval_loss`. Task type is inferred from batch composition in
         compute_loss (ModalityGroupedSampler makes each batch homogeneous).
         """
@@ -1177,7 +1185,7 @@ class WorldModelTrainer(CommonTrainer):
                 for component, (s, c) in bucket.items():
                     if c > 0:
                         metrics.log_scalar(
-                            f"world_eval/{task_type}/{component}",
+                            f"eval/{task_type}/{component}",
                             s / c,
                             global_step,
                             skip_zero=False,
