@@ -27,6 +27,7 @@ import torch
 from megatransformer.model.smg.smg import SMG
 from megatransformer.utils.model_loading_utils import load_model
 from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
+from megatransformer.scripts.eval.smg import _contour
 
 
 @torch.no_grad()
@@ -40,6 +41,7 @@ def main():
     ap.add_argument("--n", type=int, default=400, help="Number of val utterances to sample")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=7)
+    _contour.add_codebook_arg(ap)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -47,8 +49,10 @@ def main():
 
     model = load_model(SMG, args.config, checkpoint_path=args.checkpoint,
                        overrides={"sive_encoder_dim": args.sive_encoder_dim}).to(args.device).eval()
+    _contour.check_compat(model, args.voice_codebook_path)
     ds = VoiceShardedDataset(args.cache_dir,
-                             columns=["features", "mel_specs", "speaker_embeddings", "speaker_ids", "f0", "vuv"])
+                             columns=["features", "mel_specs", "speaker_embeddings", "speaker_ids", "f0", "vuv"],
+                             codebook=args.voice_codebook_path)
     idxs = sorted(np.random.choice(len(ds), size=min(args.n, len(ds)), replace=False).tolist())
     samples = [ds[i] for i in idxs]
     spks = [int(s["speaker_id"]) for s in samples]
@@ -61,8 +65,11 @@ def main():
         emb_true = embs[k].unsqueeze(0).to(args.device)
         j = next((m for m in range(len(samples)) if spks[m] != spks[k]), k)  # a different speaker
         emb_wrong = embs[j].unsqueeze(0).to(args.device)
-        rt = model.decode(feat, speaker_embedding=emb_true, features=feat)[0]
-        rw = model.decode(feat, speaker_embedding=emb_wrong, features=feat)[0]
+        # Same SOURCE contour for both: the swap re-pitches it through the wrong
+        # speaker's ECAPA, which is the conversion this metric is asking about.
+        con = _contour.sample_contour(s, model, args.device)
+        rt = _contour.decode(model, feat, emb_true, con)[0]
+        rw = _contour.decode(model, feat, emb_wrong, con)[0]
         T = min(rt.shape[-1], rw.shape[-1], int(s["mel_length"]))    # valid frames only
         rt, rw, mg = rt[..., :T], rw[..., :T], mel[..., :T]
         l1_t.append((rt - mg).abs().mean().item())

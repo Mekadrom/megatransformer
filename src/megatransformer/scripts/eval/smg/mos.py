@@ -21,6 +21,7 @@ from megatransformer.utils.model_loading_utils import load_model, load_vocoder
 from megatransformer.utils.audio_utils import SharedWindowBuffer
 from megatransformer.utils import visualization
 from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
+from megatransformer.scripts.eval.smg import _contour
 
 
 @torch.no_grad()
@@ -44,7 +45,8 @@ def main():
                          "likely to over-smooth, i.e. the GAN decision point). On a collapsed "
                          "baseline mos_wrong ~= mos_recon (wrong-emb output == source); "
                          "post-contrastive it exposes conversion naturalness.")
-    args = ap.parse_args()
+    _contour.add_codebook_arg(ap)
+
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     dev = args.device
@@ -52,8 +54,10 @@ def main():
                        overrides={"sive_encoder_dim": args.sive_encoder_dim}).to(dev).eval()
     vocoder = load_vocoder(None, args.vocoder_config, SharedWindowBuffer()).to(dev).eval()
     utmos = torch.hub.load("tarepan/SpeechMOS", "utmos22_strong", trust_repo=True).to(dev).eval()
+    _contour.check_compat(model, args.voice_codebook_path)
     ds = VoiceShardedDataset(args.cache_dir,
-                             columns=["features", "mel_specs", "speaker_embeddings", "speaker_ids", "f0", "vuv"])
+                             columns=["features", "mel_specs", "speaker_embeddings", "speaker_ids", "f0", "vuv"],
+                             codebook=args.voice_codebook_path)
     idxs = sorted(np.random.choice(len(ds), size=min(args.n, len(ds)), replace=False).tolist())
     samples = [ds[i] for i in idxs]
     spks = [int(s["speaker_id"]) for s in samples]
@@ -76,7 +80,8 @@ def main():
         feat = s["features"].float().unsqueeze(0).to(dev)
         mel = s["mel_spec"].float().to(dev)
         emb = embs[k].unsqueeze(0).to(dev)
-        recon = model.decode(feat, speaker_embedding=emb, features=feat)[0]
+        con = _contour.sample_contour(s, model, args.device)
+        recon = _contour.decode(model, feat, emb, con)[0]
         rec = recon[:, :min(recon.shape[-1], T)].unsqueeze(0)   # [1, 80, T]
         gt = mel[:, :T].unsqueeze(0)
         mos_r.append(_mos(rec))
@@ -89,7 +94,7 @@ def main():
             cand = [m for m in range(len(samples)) if spks[m] != spks[k]]
             if cand:
                 emb_w = embs[int(rng.choice(cand))].unsqueeze(0).to(dev)
-                rw = model.decode(feat, speaker_embedding=emb_w, features=feat)[0]
+                rw = _contour.decode(model, feat, emb_w, con)[0]
                 mos_w.append(_mos(rw[:, :min(rw.shape[-1], T)].unsqueeze(0)))
 
     mos_r, mos_g = np.array(mos_r), np.array(mos_g)

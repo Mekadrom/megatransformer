@@ -22,6 +22,7 @@ import torch
 from megatransformer.model.smg.smg import SMG
 from megatransformer.utils.model_loading_utils import load_model
 from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
+from megatransformer.scripts.eval.smg import _contour
 
 
 @torch.no_grad()
@@ -40,13 +41,16 @@ def main():
                          "embedding (the conversion regime). gv_ratio_wrong below gv_ratio => the "
                          "conversion over-smooths more than same-speaker recon (GAN's target). "
                          "Collapsed baseline => ~= gv_ratio (wrong-emb output == source).")
-    args = ap.parse_args()
+    _contour.add_codebook_arg(ap)
+
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     model = load_model(SMG, args.config, checkpoint_path=args.checkpoint,
                        overrides={"sive_encoder_dim": args.sive_encoder_dim}).to(args.device).eval()
+    _contour.check_compat(model, args.voice_codebook_path)
     ds = VoiceShardedDataset(args.cache_dir,
-                             columns=["features", "mel_specs", "speaker_embeddings", "speaker_ids", "f0", "vuv"])
+                             columns=["features", "mel_specs", "speaker_embeddings", "speaker_ids", "f0", "vuv"],
+                             codebook=args.voice_codebook_path)
     idxs = sorted(np.random.choice(len(ds), size=min(args.n, len(ds)), replace=False).tolist())
     samples = [ds[i] for i in idxs]
     spks = [int(s["speaker_id"]) for s in samples]
@@ -60,7 +64,8 @@ def main():
         feat = s["features"].float().unsqueeze(0).to(args.device)
         mel = s["mel_spec"].float().to(args.device)
         emb = embs[k].unsqueeze(0).to(args.device)
-        rec = model.decode(feat, speaker_embedding=emb, features=feat)[0]     # [80, To]
+        con = _contour.sample_contour(s, model, args.device)
+        rec = _contour.decode(model, feat, emb, con)[0]     # [80, To]
         T = min(rec.shape[-1], int(s["mel_length"]))
         rec, gt = rec[:, :T], mel[:, :T]                                       # [80, T]
         if T < 4:
@@ -75,7 +80,7 @@ def main():
             cand = [m for m in range(len(samples)) if spks[m] != spks[k]]
             if cand:
                 emb_w = embs[int(rng.choice(cand))].unsqueeze(0).to(args.device)
-                rw = model.decode(feat, speaker_embedding=emb_w, features=feat)[0][:, :T]
+                rw = _contour.decode(model, feat, emb_w, con)[0][:, :T]
                 gvw_r.append(rw.var(dim=1).mean().item()); gvw_g.append(vg.mean().item())
 
     gv_r, gv_g, hfgv_r, hfgv_g, hf_r, hf_g = map(np.array, (gv_r, gv_g, hfgv_r, hfgv_g, hf_r, hf_g))

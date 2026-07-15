@@ -29,6 +29,7 @@ from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from megatransformer.utils.model_loading_utils import load_model
 from megatransformer.utils.speaker_encoder import get_speaker_encoder
 from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
+from megatransformer.scripts.eval.smg import _contour
 
 
 def _sive_feats(sive, mel, lengths, layer):
@@ -62,7 +63,8 @@ def main():
     ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=7)
-    args = ap.parse_args()
+    _contour.add_codebook_arg(ap)
+
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     dev = args.device
@@ -76,8 +78,10 @@ def main():
         p.requires_grad = False
     ecapa = get_speaker_encoder(encoder_type="ecapa_tdnn", device=dev)
 
+    _contour.check_compat(model, args.voice_codebook_path)
     ds = VoiceShardedDataset(args.cache_dir,
-                             columns=["features", "mel_specs", "speaker_embeddings", "speaker_ids", "f0", "vuv"])
+                             columns=["features", "mel_specs", "speaker_embeddings", "speaker_ids", "f0", "vuv"],
+                             codebook=args.voice_codebook_path)
     idxs = sorted(np.random.choice(len(ds), size=min(args.n, len(ds)), replace=False).tolist())
     samples = [ds[i] for i in idxs]
     spks = [int(s["speaker_id"]) for s in samples]
@@ -90,8 +94,9 @@ def main():
         j = next((m for m in range(len(samples)) if spks[m] != spks[k]), k)
         emb_wrong = embs[j].unsqueeze(0).to(dev)
 
-        rt = model.decode(feat, speaker_embedding=emb_true, features=feat)
-        rw = model.decode(feat, speaker_embedding=emb_wrong, features=feat)
+        con = _contour.sample_contour(s, model, args.device)
+        rt = _contour.decode(model, feat, emb_true, con)
+        rw = _contour.decode(model, feat, emb_wrong, con)
         if rt.dim() == 4:
             rt, rw = rt.squeeze(1), rw.squeeze(1)                   # [1, n_mels, T]
         T = min(rt.shape[-1], rw.shape[-1], int(s["mel_length"]))
