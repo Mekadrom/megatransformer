@@ -1213,6 +1213,20 @@ class WorldModelTrainer(CommonTrainer):
               f"voice={self.voice_latent_loss_weight}, image={self.image_latent_loss_weight}\n")
 
 
+def _voice_feature_channels(args) -> Optional[int]:
+    """Width of the cached voice 'features' tensors.
+
+    The voice coda predicts features and the SMG decodes those same features to mel, so
+    the world model's feature_channels and the SMG's sive_encoder_dim are one quantity,
+    not two that must be kept in sync. --voice_smg_sive_encoder_dim therefore drives both
+    when given; --voice_feature_channels covers runs with no SMG loaded.
+    """
+    explicit = getattr(args, 'voice_feature_channels', None)
+    if explicit is not None:
+        return explicit
+    return getattr(args, 'voice_smg_sive_encoder_dim', None)
+
+
 def load_model(args, device='cuda'):
     include_modes = [m.strip() for m in args.include_modes.split(",")]
     overrides = {"include_modes": include_modes}
@@ -1227,6 +1241,7 @@ def load_model(args, device='cuda'):
     needs_override = (getattr(args, 'iteration_norm', None) is not None or
                       getattr(args, 'share_block_weights', False) or
                       getattr(args, 'max_seq_len', None) is not None or
+                      _voice_feature_channels(args) is not None or
                       getattr(args, 'voice_stochastic_output', False))
     if needs_override:
         import copy
@@ -1237,6 +1252,14 @@ def load_model(args, device='cuda'):
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if getattr(args, 'share_block_weights', False):
             config.recurrent_block_config.share_block_weights = True
+        voice_feature_channels = _voice_feature_channels(args)
+        if voice_feature_channels is not None:
+            # The prelude projects features -> d_model and the coda predicts d_model -> features,
+            # so both ends must agree with the cached tensors' channel width. The config default
+            # (128) tracks neither SIVE (256) nor ContentVec (256/768); a mismatch surfaces as a
+            # matmul shape error in the prelude's projection rather than a useful message.
+            config.voice_prelude_config.feature_channels = voice_feature_channels
+            config.voice_coda_config.feature_channels = voice_feature_channels
         if getattr(args, 'voice_stochastic_output', False):
             config.voice_coda_config.stochastic_output = True
             if getattr(args, 'voice_logvar_init', None) is not None:
@@ -1638,5 +1661,13 @@ def add_cli_args(subparsers):
                             help="Audio hop length")
     sub_parser.add_argument("--sive_total_stride", type=int, default=4,
                             help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
+    sub_parser.add_argument("--voice_feature_channels", type=int, default=None,
+                            help="Channel width of the cached voice 'features' tensors — the voice prelude "
+                                 "projects from this and the voice coda predicts into it. Must match the "
+                                 "content encoder the cache was built with (SIVE: 256; ContentVec: 256 for "
+                                 "final_proj, 768 for last_hidden_state). Defaults to "
+                                 "--voice_smg_sive_encoder_dim (same quantity: the coda's output is the "
+                                 "SMG's input), then to the config value (128). Only needed when no SMG "
+                                 "is loaded.")
 
     return sub_parser
