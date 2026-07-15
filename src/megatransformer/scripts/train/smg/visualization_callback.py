@@ -170,12 +170,17 @@ class SMGVisualizationCallback(VisualizationCallback):
                     mel = mel_specs[..., :mel_lengths].to(device)
                     mel_spec_masks = mel_spec_masks[..., :mel_lengths].to(device) if mel_spec_masks is not None else None
 
-                    # Prepare F0 data if available
+                    # Prepare F0 data if available. The collator already batches, so these
+                    # arrive as [1, T]: slice the TIME axis and do not unsqueeze. (The old
+                    # code did sample_f0[:mel_lengths].unsqueeze(0), which sliced the batch
+                    # dim and produced [1, 1, T]. It never fired, because sample_voiced was
+                    # always None from the "voiced"/"vuv" key mismatch above, so the shape
+                    # bug sat here undetected until that was fixed.)
                     target_f0 = None
                     target_voiced = None
                     if sample_f0 is not None and sample_voiced is not None:
-                        target_f0 = sample_f0[:mel_lengths].unsqueeze(0).to(device)  # [1, T]
-                        target_voiced = sample_voiced[:mel_lengths].unsqueeze(0).to(device)  # [1, T]
+                        target_f0 = sample_f0[..., :mel_lengths].to(device)  # [1, T]
+                        target_voiced = sample_voiced[..., :mel_lengths].to(device)  # [1, T]
 
                     spk_emb = speaker_embeddings.to(device)
 
