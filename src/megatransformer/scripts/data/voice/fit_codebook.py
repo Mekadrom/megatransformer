@@ -31,7 +31,7 @@ import torch
 from megatransformer.utils.codebook import save_codebook
 
 
-def fit_f0_stats(cache_dir: str):
+def fit_f0_stats(cache_dirs):
     """Per-speaker log-F0 mean/std over the whole TRAIN split.
 
     Shipped inside the codebook so there is ONE artifact both models share and neither can
@@ -39,10 +39,24 @@ def fit_f0_stats(cache_dir: str):
     contour is meaningless without the speaker statistics that denormalize it.
 
     Per SPEAKER, not per utterance -- see utils.codebook.normalize_f0 for why.
+
+    Scan EVERY split, not just train. Speakers are typically disjoint across splits (0/40
+    overlap on LibriTTS-R), so a train-only table sends every val speaker to the global
+    fallback: their contour then carries the very speaker offset normalization exists to
+    remove, and eval F0 metrics measure how far that speaker sits from the corpus mean --
+    something the model cannot and should not predict.
+
+    This is not meaningful leakage. Per-speaker F0 mean/std is a preprocessing constant
+    used only to CONSTRUCT training targets; the model never sees it, and nothing looks it
+    up at inference (the SMG denormalizes from ECAPA, which it learned on train speakers
+    and which generalizes to unseen voices).
     """
     from collections import defaultdict
     sums, sqs, ns = defaultdict(float), defaultdict(float), defaultdict(float)
-    for path in sorted(glob.glob(os.path.join(cache_dir, "*.pt"))):
+    paths = []
+    for d in cache_dirs:
+        paths.extend(sorted(glob.glob(os.path.join(d, "*.pt"))))
+    for path in paths:
         sh = torch.load(path, map_location="cpu", weights_only=False)
         if "f0" not in sh or "speaker_ids" not in sh:
             return None
@@ -115,6 +129,13 @@ def main():
                     help="Frames sampled for fitting. 400k is ample for K<=2000.")
     ap.add_argument("--batch_size", type=int, default=8192, help="MiniBatchKMeans batch size")
     ap.add_argument("--max_iter", type=int, default=100)
+    ap.add_argument("--f0_stats_cache_dirs", nargs="*", default=None, metavar="DIR",
+                    help="Extra shard dirs to include when computing per-speaker F0 stats (e.g. "
+                         "the val split). k-means still fits on --cache_dir ALONE. Splits usually "
+                         "have disjoint speakers, so without this every val speaker falls back to "
+                         "the global mean and eval F0 metrics measure the speaker offset rather "
+                         "than the model. Not meaningful leakage: the stats only build training "
+                         "targets and are never consulted at inference.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -143,13 +164,15 @@ def main():
         "frames_repeat": repeat,
     }
 
-    stats = fit_f0_stats(args.cache_dir)
+    stats_dirs = [args.cache_dir] + list(args.f0_stats_cache_dirs or [])
+    stats = fit_f0_stats(stats_dirs)
     if stats is not None:
         mean, std, g_mean, g_std, n_spk, n_seen = stats
         meta.update({"speaker_f0_mean": mean, "speaker_f0_std": std,
                      "global_f0_mean": g_mean, "global_f0_std": g_std})
         import numpy as _np
         est = mean[mean != g_mean]
+        print(f"  f0 stats from : {', '.join(stats_dirs)}")
         print(f"  f0 stats      = {n_spk}/{n_seen} speakers estimated "
               f"(rest fall back to global mu={g_mean:.3f} sd={g_std:.3f})")
         if len(est):
