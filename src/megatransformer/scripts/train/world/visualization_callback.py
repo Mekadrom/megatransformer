@@ -51,7 +51,14 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         voice_hop_length: int = 256,
         voice_temperature: float = 0.6,
         voice_variance_floor: float = 0.0,
+        include_modes: Optional[list[str]] = None,
+        include_tasks: Optional[list[str]] = None,
     ):
+        # What this run actually trains. Scenarios outside it are skipped rather than
+        # emitting empty/meaningless panels — a text->voice run has no business rendering
+        # transcription or cross-modal examples. None = no restriction (all tasks).
+        self.include_modes = set(include_modes) if include_modes else {"text", "audio", "voice", "image"}
+        self.include_tasks = set(include_tasks) if include_tasks else None
         self.tokenizer = tokenizer
         self.vocoder = vocoder
         self.image_vae_decoder = image_vae_decoder
@@ -170,6 +177,19 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 break
         return samples
 
+    def _scenario_enabled(self, required_modes: set, satisfying_tasks: set) -> bool:
+        """Should this scenario run, given --include_modes / --include_tasks?
+
+        Every required mode must be enabled. If the scenario names tasks, at least one
+        must be enabled — include_tasks=None means "all tasks", so nothing is gated out.
+        Cross-modal scenarios name no tasks and are gated by their modes alone.
+        """
+        if not required_modes.issubset(self.include_modes):
+            return False
+        if satisfying_tasks and self.include_tasks is not None:
+            return bool(satisfying_tasks & self.include_tasks)
+        return True
+
     def on_evaluate(self, args, state, control, model=None, **kwargs):
         global_step = state.global_step + self.step_offset
 
@@ -192,41 +212,44 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
         dtype = torch.bfloat16 if bool(args.bf16) else torch.float16 if args.fp16 else torch.float32
 
-        print(f"Running world model visualization at step {global_step}...")
+        # (method, required modes, satisfying tasks). A scenario runs only if every
+        # required mode is enabled AND at least one satisfying task is enabled. Empty
+        # task set = the scenario is task-agnostic (mode gating alone decides).
+        train_data_scenarios = [
+            (self._scenario_train_text_continuation, {"text"}, {"text_continuation"}),
+            (self._scenario_train_generation, set(), {"voice_synthesis", "audio_synthesis", "image_synthesis"}),
+            (self._scenario_train_transcription, set(), {"voice_transcription", "audio_transcription", "image_transcription"}),
+            (self._scenario_train_cross_modal, set(), set()),
+        ]
+        eval_scenarios = [
+            (self._scenario_text_continuation, {"text"}, {"text_continuation"}),
+            (self._scenario_text_to_voice, {"voice"}, {"voice_synthesis"}),
+            (self._scenario_voice_to_text, {"voice"}, {"voice_transcription"}),
+            (self._scenario_text_to_image, {"image"}, {"image_synthesis"}),
+            (self._scenario_image_to_text, {"image"}, {"image_transcription"}),
+            (self._scenario_voice_to_image, {"voice", "image"}, set()),
+            (self._scenario_image_to_voice, {"voice", "image"}, set()),
+        ]
+
+        selected = [fn.__name__ for fn, m, t in train_data_scenarios + eval_scenarios
+                    if self._scenario_enabled(m, t)]
+        print(f"Running world model visualization at step {global_step}... "
+              f"({len(selected)} applicable scenarios: {', '.join(s.replace('_scenario_', '') for s in selected)})")
 
         with torch.no_grad():
             with autocast(device.type, dtype=dtype, enabled=args.bf16 or args.fp16):
-                # Training data text continuation — complete memorized text
-                self._scenario_train_text_continuation(
-                    model, args, device, global_step, dtype
-                )
-
-                # Training data generation — generates media from text prompts
-                self._scenario_train_generation(
-                    model, args, device, global_step, dtype
-                )
-
-                # Training data transcription — provide media, generate text
-                self._scenario_train_transcription(
-                    model, args, device, global_step, dtype
-                )
-
-                # Training data cross-modal — input one modality, generate another
-                self._scenario_train_cross_modal(
-                    model, args, device, global_step, dtype
-                )
+                for scenario_fn, modes, tasks in train_data_scenarios:
+                    if not self._scenario_enabled(modes, tasks):
+                        continue
+                    try:
+                        scenario_fn(model, args, device, global_step, dtype)
+                    except Exception as e:
+                        print(f"Warning: Train-data scenario {scenario_fn.__name__} failed: {e}")
 
                 # Eval scenarios — generation and transcription with eval dataset
-                eval_scenarios = [
-                    self._scenario_text_continuation,
-                    self._scenario_text_to_voice,
-                    self._scenario_voice_to_text,
-                    self._scenario_text_to_image,
-                    self._scenario_image_to_text,
-                    self._scenario_voice_to_image,
-                    self._scenario_image_to_voice,
-                ]
-                for scenario_fn in eval_scenarios:
+                for scenario_fn, modes, tasks in eval_scenarios:
+                    if not self._scenario_enabled(modes, tasks):
+                        continue
                     try:
                         scenario_fn(model, eval_dataset, collator, device, global_step)
                     except Exception as e:
@@ -478,7 +501,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         predictions on its own training data should increasingly match the targets.
         Uses the same fixed sample indices every eval for consistent comparison.
         """
-        tag = "viz/train_data/reconstruction"
+        tag = "train_data/reconstruction"
         train_dataset = self.trainer.train_dataset
         if train_dataset is None or len(train_dataset) == 0:
             return
@@ -590,7 +613,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 if valid.sum() == 0:
                     continue
                 correct = (preds[i][valid] == targets_aligned[i][valid]).float().mean().item()
-                metrics.log_scalar(f"{tag}/text_accuracy/{i}", correct, global_step)
+                metrics.log_scalar(f"{tag}/{i}/text_accuracy", correct, global_step)
 
                 # Log predicted vs target text
                 pred_text = self._decode_tokens(preds[i][valid])
@@ -621,7 +644,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 metrics.log_image(f"{tag}/voice/{i}/target", self._latent_to_image(tgt_lat), global_step)
 
                 cos = F.cosine_similarity(pred_lat.flatten().unsqueeze(0), tgt_lat.flatten().unsqueeze(0)).item()
-                metrics.log_scalar(f"{tag}/voice_cosine_sim/{i}", cos, global_step)
+                metrics.log_scalar(f"{tag}/{i}/voice_cosine_sim", cos, global_step)
 
                 # Decode predicted voice to audio if SMG available
                 sample = samples[i] if i < len(samples) else {}
@@ -656,7 +679,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 metrics.log_image(f"{tag}/image/{i}/target", self._latent_to_image(image_labels[i]), global_step)
 
                 cos = F.cosine_similarity(image_preds[i].flatten().unsqueeze(0), image_labels[i].flatten().unsqueeze(0)).item()
-                metrics.log_scalar(f"{tag}/image_cosine_sim/{i}", cos, global_step)
+                metrics.log_scalar(f"{tag}/{i}/image_cosine_sim", cos, global_step)
 
                 # Decode through image VAE if available
                 if self.image_vae_decoder is not None:
@@ -671,7 +694,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         rest. Logs the generated continuation alongside the target text so
         memorization quality can be assessed at a glance.
         """
-        tag = "viz/train_data/text_continuation"
+        tag = "train_data/text_continuation"
         train_dataset = self.trainer.train_dataset
         if train_dataset is None or len(train_dataset) == 0:
             return
@@ -738,7 +761,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         dataset. For each, provides only the text prompt and generates the
         media from scratch. This is the honest measure of generation quality.
         """
-        tag = "viz/train_data/generation"
+        tag = "train_data/generation"
         train_dataset = self.trainer.train_dataset
         if train_dataset is None or len(train_dataset) == 0:
             return
@@ -853,7 +876,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                         tgt_lat = tgt_lat[0]
                         metrics.log_image(f"{tag}/voice/{i}/target", self._latent_to_image(tgt_lat), global_step)
                         cos = F.cosine_similarity(pred_lat.flatten().unsqueeze(0), tgt_lat.flatten().to(pred_lat.device).unsqueeze(0)).item()
-                        metrics.log_scalar(f"{tag}/voice_cosine_sim/{i}", cos, global_step)
+                        metrics.log_scalar(f"{tag}/{i}/voice_cosine_sim", cos, global_step)
                         self._log_audio_with_smg(tgt_lat, sample, global_step, f"{tag}/voice/{i}/target")
 
                     self._log_audio_with_smg(pred_lat, sample, global_step, f"{tag}/voice/{i}/generated")
@@ -915,7 +938,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                         tgt_lat = tgt_lat[0]
                         metrics.log_image(f"{tag}/image/{i}/target", self._latent_to_image(tgt_lat), global_step)
                         cos = F.cosine_similarity(pred_lat.flatten().unsqueeze(0), tgt_lat.flatten().to(pred_lat.device).unsqueeze(0)).item()
-                        metrics.log_scalar(f"{tag}/image_cosine_sim/{i}", cos, global_step)
+                        metrics.log_scalar(f"{tag}/{i}/image_cosine_sim", cos, global_step)
 
                     if self.image_vae_decoder is not None:
                         self._try_decode_image(pred_lat, global_step, f"{tag}/image/{i}/generated_decoded")
@@ -933,7 +956,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         For voice: provides voice features as input, generates text transcription.
         For image: provides image as input, generates text description.
         """
-        tag = "viz/train_data/transcription"
+        tag = "train_data/transcription"
         train_dataset = self.trainer.train_dataset
         if train_dataset is None or len(train_dataset) == 0:
             return
@@ -1070,7 +1093,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         - Voice→Voice: [BOV] [VOICE_PH] [EOV] [BOV] → generate voice
         - Image→Image: [BOI] [IMAGE_PH] [EOI] [BOI] → generate image
         """
-        tag = "viz/train_data/cross_modal"
+        tag = "train_data/cross_modal"
         train_dataset = self.trainer.train_dataset
         if train_dataset is None or len(train_dataset) == 0:
             return
@@ -1209,7 +1232,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _scenario_text_continuation(self, model, eval_dataset, collator, device, global_step):
         """Scenario 1: Text-only generation (take text, generate continuation)."""
-        tag = "viz/eval/1_text_continuation"
+        tag = "text_continuation"
         samples = self._get_eval_samples(eval_dataset, collator, self.num_eval_samples, requires_text_only=True)
         if not samples:
             return
@@ -1259,7 +1282,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         Uses the actual transcript from each eval sample as the prompt, so the
         target voice matches the text the model is conditioned on.
         """
-        tag = "viz/eval/2_text_to_voice"
+        tag = "text_to_voice"
 
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_voice=True
@@ -1394,7 +1417,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _scenario_voice_to_text(self, model, eval_dataset, collator, device, global_step):
         """Scenario 3: Voice -> Text transcription."""
-        tag = "viz/eval/3_voice_to_text"
+        tag = "voice_to_text"
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_voice=True
         )
@@ -1448,7 +1471,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         Uses the actual caption from each eval sample as the prompt, so the
         target image matches the text the model is conditioned on.
         """
-        tag = "viz/eval/4_text_to_image"
+        tag = "text_to_image"
 
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_image=True
@@ -1519,7 +1542,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _scenario_image_to_text(self, model, eval_dataset, collator, device, global_step):
         """Scenario 5: Image -> Text description."""
-        tag = "viz/eval/5_image_to_text"
+        tag = "image_to_text"
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_image=True
         )
@@ -1573,7 +1596,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _scenario_voice_to_image(self, model, eval_dataset, collator, device, global_step):
         """Scenario 6: Voice -> Image cross-modal generation."""
-        tag = "viz/eval/6_voice_to_image"
+        tag = "voice_to_image"
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_voice=True
         )
@@ -1624,7 +1647,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
     def _scenario_image_to_voice(self, model, eval_dataset, collator, device, global_step):
         """Scenario 7: Image -> Voice cross-modal generation."""
-        tag = "viz/eval/7_image_to_voice"
+        tag = "image_to_voice"
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_image=True
         )

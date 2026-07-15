@@ -419,6 +419,9 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             voice_hop_length=getattr(args, 'voice_hop_length', 256),
             voice_temperature=getattr(args, 'viz_voice_temperature', 0.6),
             voice_variance_floor=getattr(args, 'viz_voice_variance_floor', 0.0),
+            include_modes=[m.strip() for m in args.include_modes.split(",")],
+            include_tasks=([t.strip() for t in args.include_tasks.split(",")]
+                           if getattr(args, 'include_tasks', None) else None),
         )
     return callback
 
