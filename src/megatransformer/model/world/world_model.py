@@ -1413,8 +1413,15 @@ class MegaTransformerWorldModel(nn.Module):
         outputs["voice_stop_logit_trace"] = voice_stop_logit_trace
         outputs["voice_unit_id_trace"] = voice_unit_id_trace
         # Padded like voice_latent_preds (same helper, same time_dim) so the contour lines
-        # up frame-for-frame with the units it belongs to and can be handed straight to
-        # SMG.f0_embedding(log_f0, voiced).
+        # up frame-for-frame with the units it belongs to.
+        #
+        # This is a speaker-NORMALIZED contour, (log_f0 - mu_spk) / sd_spk, in sigma units
+        # -- not log Hz. Pass it as SMG.decode(f0_contour=...) so the SMG's F0 predictor
+        # denormalizes it with ECAPA. Do NOT hand it to SMG.f0_embedding(log_f0, voiced)
+        # directly: that expects absolute log Hz and would read ~1.1 sigma as ~3 Hz. The
+        # split exists because the speaker offset is the larger term (between-speaker
+        # spread of mean log-F0 0.267 vs within-speaker contour spread 0.195) and is
+        # exactly the part a text-only model cannot know.
         if any(len(f) > 0 for f in completed_voice_f0):
             stacked, _, _ = self._stack_variable_length_media(
                 completed_voice_f0, device, time_dim=-1

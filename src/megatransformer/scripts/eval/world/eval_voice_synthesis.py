@@ -98,14 +98,31 @@ def load_dataset(args, split="val"):
         )
 
 
-def decode_sive_to_mel(smg_decoder, latent, speaker_embedding):
-    """Decode SIVE latent (C, T) → mel spectrogram (n_mels, T)."""
+def decode_sive_to_mel(smg_decoder, latent, speaker_embedding, f0_contour=None):
+    """Decode SIVE latent (C, T) → mel spectrogram (n_mels, T).
+
+    f0_contour (T,) is the world model's SPEAKER-NORMALIZED contour, in sigma units
+    rather than log Hz. It goes to the SMG's F0 predictor, which denormalizes it with
+    ECAPA -- that denormalization is the SMG's job precisely because the world model
+    only sees text and cannot know the speaker's pitch offset. Handing this straight to
+    f0_embedding() instead would read ~1.1 sigma as ~1.1 log Hz, i.e. 3 Hz.
+    """
     device = next(smg_decoder.parameters()).device
     dtype = next(smg_decoder.parameters()).dtype
     z = latent.to(device=device, dtype=dtype).unsqueeze(0)
     spk = speaker_embedding.to(device=device, dtype=dtype).unsqueeze(0)
+    kwargs = {}
+    if f0_contour is not None:
+        contour = f0_contour.to(device=device, dtype=dtype)
+        if contour.shape[-1] != z.shape[-1]:
+            # Same generation loop appends both, so this should not drift; trim rather
+            # than interpolate so a real desync shows up as a length mismatch instead of
+            # being silently resampled into plausible-looking prosody.
+            T = min(contour.shape[-1], z.shape[-1])
+            contour, z = contour[..., :T], z[..., :T]
+        kwargs["f0_contour"] = contour.unsqueeze(0)  # (1, T)
     with torch.no_grad():
-        mel = smg_decoder.decode(z=z, speaker_embedding=spk, features=z)
+        mel = smg_decoder.decode(z=z, speaker_embedding=spk, features=z, **kwargs)
     if isinstance(mel, tuple):
         mel = mel[0]
     if isinstance(mel, dict):
@@ -211,6 +228,26 @@ def main():
     model.to(device)
     model.eval()
 
+    # The SMG and the world model have to agree about who supplies F0, and the two are
+    # loaded from independent checkpoints with nothing forcing them to match. Check once
+    # here rather than discovering it after generating every sample.
+    smg_needs_contour = (
+        smg_decoder is not None
+        and getattr(smg_decoder, "f0_predictor_input", "features") == "contour"
+    )
+    world_predicts_f0 = getattr(getattr(model, "voice_generator", None), "f0_head", None) is not None
+    if smg_needs_contour and not world_predicts_f0:
+        raise SystemExit(
+            f"--voice_smg_config {args.voice_smg_config} reads a speaker-normalized F0 "
+            "contour (f0_predictor_input='contour'), but this world model has no F0 head "
+            "and cannot supply one. Its units are prosody-free, so the result would be "
+            "flat regardless. Train the world model with --voice_predict_f0, or pair this "
+            "checkpoint with an f0_predictor_input='features' SMG."
+        )
+    if world_predicts_f0 and not smg_needs_contour:
+        print("Note: world model predicts an F0 contour but this SMG infers F0 from "
+              "content features — the predicted contour will be ignored.")
+
     # Load dataset
     print("Loading dataset...")
     dataset = load_dataset(args, split=args.split)
@@ -266,6 +303,16 @@ def main():
 
         gen_latent = voice_preds[0, 0]  # (C, T)
 
+        # The contour the coda emitted for these same frames (see generate()). Padded by
+        # the same helper with the same time_dim, so it lines up frame-for-frame.
+        gen_contour = None
+        f0_preds = outputs.get("voice_f0_preds")
+        if f0_preds is not None and f0_preds.numel() > 0:
+            gen_contour = f0_preds[0, 0]  # (T,)
+        if smg_needs_contour and gen_contour is None:
+            print(f"[{i}] Voice generated but no F0 contour came back, skipping")
+            continue
+
         # Get speaker embedding (from sample or static)
         speaker_emb = sample.get("voice_speaker_embedding", static_speaker_emb)
         if speaker_emb is None:
@@ -277,7 +324,7 @@ def main():
         # MCD: compare generated vs target mel spectrograms
         if smg_decoder is not None:
             target_mel = sample.get("voice_mel_spec")  # (n_mels, T)
-            gen_mel = decode_sive_to_mel(smg_decoder, gen_latent, speaker_emb)
+            gen_mel = decode_sive_to_mel(smg_decoder, gen_latent, speaker_emb, f0_contour=gen_contour)
 
             if target_mel is not None:
                 mcd = compute_mcd(gen_mel, target_mel)
