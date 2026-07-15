@@ -374,7 +374,11 @@ class WorldModelTrainer(CommonTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         global_step = self.state.global_step + self.step_offset
 
-        if not self.has_logged_cli and torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        # A single-process run never initializes torch.distributed, and is trivially rank 0.
+        # Requiring is_initialized() here meant these tags silently never logged outside
+        # torchrun/DeepSpeed. Mirrors smg/training.py:330.
+        is_main_process = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        if not self.has_logged_cli and is_main_process:
             metrics.log_text("training/command_line", self.cmdline, global_step)
             metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
             metrics.log_text("training/model_architecture", str(model), global_step)
