@@ -1292,6 +1292,7 @@ def load_model(args, device='cuda'):
                       getattr(args, 'share_block_weights', False) or
                       getattr(args, 'max_seq_len', None) is not None or
                       _voice_feature_channels(args) is not None or
+                      getattr(args, 'mean_thinking_steps', None) is not None or
                       getattr(args, 'voice_stochastic_output', False))
     if needs_override:
         import copy
@@ -1302,6 +1303,12 @@ def load_model(args, device='cuda'):
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if getattr(args, 'share_block_weights', False):
             config.recurrent_block_config.share_block_weights = True
+        if getattr(args, 'mean_thinking_steps', None) is not None:
+            # Must be set PRE-construction, unlike --backprop_depth: besides driving the
+            # Poisson sampler, it is l_eff for the depth-scaled residual init
+            # (recurrent.py:161-173), so patching it onto a built model would leave the
+            # weights initialized for the old depth.
+            config.recurrent_block_config.mean_thinking_steps = args.mean_thinking_steps
         voice_feature_channels = _voice_feature_channels(args)
         if voice_feature_channels is not None:
             # The prelude projects features -> d_model and the coda predicts d_model -> features,
@@ -1645,6 +1652,13 @@ def add_cli_args(subparsers):
                                  "square (e.g. 64, 144, 256). Default: use the prelude's patch count.")
 
     # Recurrent block overrides
+    sub_parser.add_argument("--mean_thinking_steps", type=int, default=None,
+                            help="Mean recurrent iterations per forward (Poisson log-normal). "
+                                 "Sets effective depth = n_recurrent_blocks x this, and is also "
+                                 "the l_eff for depth-scaled residual init — so it changes "
+                                 "initialization, and runs at different values are not "
+                                 "checkpoint-compatible. Dominates step cost: ~2/3 of compute is "
+                                 "the no-grad iterations. Default: config value (32).")
     sub_parser.add_argument("--backprop_depth", type=int, default=None,
                             help="Override truncated BPTT depth (default: use config, typically 8)")
     sub_parser.add_argument("--block_init_gain", type=float, default=None,
