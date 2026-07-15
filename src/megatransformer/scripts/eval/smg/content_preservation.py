@@ -64,7 +64,7 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=7)
     _contour.add_codebook_arg(ap)
-
+    args = ap.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     dev = args.device
@@ -94,7 +94,7 @@ def main():
         j = next((m for m in range(len(samples)) if spks[m] != spks[k]), k)
         emb_wrong = embs[j].unsqueeze(0).to(dev)
 
-        con = _contour.sample_contour(s, model, args.device)
+        con = _contour.sample_contour(s, model, dev)
         rt = _contour.decode(model, feat, emb_true, con)
         rw = _contour.decode(model, feat, emb_wrong, con)
         if rt.dim() == 4:

@@ -46,7 +46,7 @@ def main():
                          "baseline mos_wrong ~= mos_recon (wrong-emb output == source); "
                          "post-contrastive it exposes conversion naturalness.")
     _contour.add_codebook_arg(ap)
-
+    args = ap.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     dev = args.device

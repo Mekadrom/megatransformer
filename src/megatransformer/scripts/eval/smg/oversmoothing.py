@@ -42,7 +42,7 @@ def main():
                          "conversion over-smooths more than same-speaker recon (GAN's target). "
                          "Collapsed baseline => ~= gv_ratio (wrong-emb output == source).")
     _contour.add_codebook_arg(ap)
-
+    args = ap.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     model = load_model(SMG, args.config, checkpoint_path=args.checkpoint,
