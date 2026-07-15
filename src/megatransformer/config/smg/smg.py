@@ -192,6 +192,12 @@ class F0PredictorConfig:
     hidden_dim: int = 256
     n_layers: int = 3
     kernel_size: int = 5
+    # Width of the CONTENT features fed to a separate voicing branch. When set, the
+    # voicing head is split off the F0 trunk and reads content instead of whatever
+    # encoder_dim carries; when None, voicing stays on the shared trunk (legacy
+    # "features" path). SMG.from_config wires this from sive_encoder_dim iff
+    # f0_predictor_input == "contour". See F0Predictor for why the split exists.
+    vuv_encoder_dim: Optional[int] = None
 
 
     def __post_init__(self):
@@ -341,7 +347,10 @@ SMG_CONFIGS = {
     ),
     "medium_decoder_only_1d_1x_f0contourinput": SMGConfig(
         decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_1x"],
-        f0_predictor_config=F0PredictorConfig(encoder_dim=1),
+        # encoder_dim / vuv_encoder_dim are both re-derived in SMG.from_config from
+        # f0_predictor_input + sive_encoder_dim; set here only so the dataclass reads
+        # honestly on its own.
+        f0_predictor_config=F0PredictorConfig(encoder_dim=1, vuv_encoder_dim=256),
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
         f0_predictor_input="contour",
     ),

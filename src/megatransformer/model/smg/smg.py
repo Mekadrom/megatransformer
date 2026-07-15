@@ -631,6 +631,28 @@ class F0Predictor(nn.Module):
     SIVE features provide prosodic timing cues (where stress/emphasis occurs).
 
     Output is per-frame: log F0 values and voiced/unvoiced probability.
+
+    Those two outputs are determined by DIFFERENT inputs, so when vuv_encoder_dim is set
+    they get different trunks:
+
+      pitch   needs contour + speaker. Content cannot supply it: an SMG trained on
+              prosody-free units plateaued at f0_loss ~0.09 predicting F0 from full
+              256-dim ContentVec, while the contour path reaches ~0.03. Worse, letting
+              the F0 head see content is an active hazard -- it is the shortcut that
+              produced the collapsed F0 path in the first place, so the F0 trunk here
+              reads ONLY sive_features (the contour) and never content_features. This
+              is why the branches are separate rather than one trunk over a concat: a
+              shared trunk would leak content into the F0 head via its receptive field.
+
+      voicing needs content. Voicing is phonemic (/s/ vs /z/), so ContentVec must carry
+              it. The contour cannot: measured on 869k val frames, H(vuv)=0.691 and
+              H(vuv|contour)=0.677 -- the contour explains 2% of voicing entropy, while
+              a bare unit id with no temporal context explains 23% (H(vuv|unit)=0.530).
+              A contour-fed voicing head is reading a channel that structurally does not
+              contain its answer.
+
+    Voicing gates harmonic content in F0ConditioningEmbedding, so its errors are audible
+    as wrong harmonic energy, not merely a bad number.
     """
     def __init__(self, config: F0PredictorConfig):
         super().__init__()
@@ -653,8 +675,28 @@ class F0Predictor(nn.Module):
             for _ in range(config.n_layers)
         ])
 
-        # Output: log_f0 (continuous) + voiced_logit
-        self.output_proj = nn.Conv1d(config.hidden_dim, 2, kernel_size=1)
+        self.vuv_encoder_dim = getattr(config, 'vuv_encoder_dim', None)
+        if self.vuv_encoder_dim is not None:
+            # Voicing gets its own trunk over content. Speaker is included because the
+            # reference point for this head -- the features-fed predictor that reached
+            # vuv_loss 0.42 -- had both, and speaker habits (creak, final devoicing) do
+            # move the soft periodicity target.
+            self.vuv_speaker_proj = nn.Linear(config.speaker_embedding_dim, config.hidden_dim)
+            self.vuv_proj = nn.Conv1d(self.vuv_encoder_dim, config.hidden_dim, kernel_size=1)
+            self.vuv_conv_layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv1d(config.hidden_dim, config.hidden_dim, config.kernel_size, padding=config.kernel_size // 2),
+                    nn.GroupNorm(8, config.hidden_dim),
+                    nn.SiLU(),
+                )
+                for _ in range(config.n_layers)
+            ])
+            self.vuv_out = nn.Conv1d(config.hidden_dim, 1, kernel_size=1)
+            # Only log_f0 comes off the shared trunk now.
+            self.output_proj = nn.Conv1d(config.hidden_dim, 1, kernel_size=1)
+        else:
+            # Output: log_f0 (continuous) + voiced_logit
+            self.output_proj = nn.Conv1d(config.hidden_dim, 2, kernel_size=1)
 
         self._init_weights()
 
@@ -664,7 +706,12 @@ class F0Predictor(nn.Module):
         if self.output_proj.bias is not None:
             # Initialize log_f0 bias to ~5.0 (≈150 Hz), voiced bias to 0
             self.output_proj.bias.data[0] = 5.0  # log(150) ≈ 5.0
-            self.output_proj.bias.data[1] = 0.0
+            if self.output_proj.out_channels > 1:
+                self.output_proj.bias.data[1] = 0.0
+        if self.vuv_encoder_dim is not None:
+            nn.init.zeros_(self.vuv_out.weight)
+            if self.vuv_out.bias is not None:
+                self.vuv_out.bias.data[0] = 0.0
 
     @classmethod
     def from_config(cls, config: str, **overrides) -> "F0Predictor":
@@ -694,11 +741,17 @@ class F0Predictor(nn.Module):
         self,
         speaker_embedding: torch.Tensor,
         sive_features: torch.Tensor,
+        content_features: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             speaker_embedding: [B, speaker_dim] or [B, 1, speaker_dim]
-            sive_features: [B, sive_dim, T']
+            sive_features: [B, sive_dim, T'] - what the F0 head reads (contour, or
+                content in the legacy "features" path). NEVER content when a vuv branch
+                is configured; see the class docstring.
+            content_features: [B, vuv_encoder_dim, T] - content for the voicing branch.
+                Required iff vuv_encoder_dim is set. Deliberately kept out of the F0
+                trunk.
 
         Returns:
             log_f0: [B, T'] - log fundamental frequency (in log Hz)
@@ -723,9 +776,30 @@ class F0Predictor(nn.Module):
             x = x + conv(x)
 
         # Predict F0 and voicing
-        out = self.output_proj(x)  # [B, 2, T']
+        out = self.output_proj(x)  # [B, 1 or 2, T']
         log_f0 = out[:, 0, :]      # [B, T']
-        voiced_prob = torch.sigmoid(out[:, 1, :])  # [B, T']
+
+        if self.vuv_encoder_dim is None:
+            voiced_prob = torch.sigmoid(out[:, 1, :])  # [B, T']
+            return log_f0, voiced_prob
+
+        if content_features is None:
+            # Same reasoning as SMG._f0_predictor_input's contour raise: silently
+            # degrading here would leave the voicing head reading nothing, and its
+            # output gates harmonics -- the failure would sound like a modelling
+            # problem rather than a missing argument.
+            raise ValueError(
+                "vuv_encoder_dim is set (voicing reads content on its own branch) but "
+                "no content_features were passed. Pass content_features=; the F0 head "
+                "still reads only sive_features."
+            )
+        if content_features.size(-1) != T:
+            content_features = F.interpolate(content_features, size=T, mode='linear', align_corners=False)
+        v = self.vuv_speaker_proj(speaker_embedding).unsqueeze(-1).expand(-1, -1, T) \
+            + self.vuv_proj(content_features)
+        for conv in self.vuv_conv_layers:
+            v = v + conv(v)
+        voiced_prob = torch.sigmoid(self.vuv_out(v)[:, 0, :])  # [B, T']
 
         return log_f0, voiced_prob
 
@@ -942,8 +1016,14 @@ class SMG(nn.Module):
         config_dict.update(overrides)
         # A contour is 1-dim; features are sive_encoder_dim. This sizes the predictor's
         # sive_proj Conv1d, so it must match what forward() actually feeds it.
+        # Set AFTER the overrides splat so a CLI --sive_encoder_dim cannot clobber the 1
+        # and hand the F0 head content.
         _f0_in = getattr(config, 'f0_predictor_input', 'features')
         config_dict['encoder_dim'] = 1 if _f0_in == 'contour' else sive_encoder_dim
+        # On the contour path the F0 head sees only 1 channel of pitch, so voicing has no
+        # content to read unless it gets its own branch. On the legacy features path the
+        # shared trunk already sees content, so leave voicing where it is.
+        config_dict['vuv_encoder_dim'] = sive_encoder_dim if _f0_in == 'contour' else None
         f0_predictor = F0Predictor.from_config(config.f0_predictor_config, **config_dict)
         config_dict = {k: v for k, v in config.f0_conditioning_embedding_config.__dict__.items()}
         config_dict.update(overrides)
@@ -1000,7 +1080,9 @@ class SMG(nn.Module):
         if f0_embedding is None:
             f0_src = self._f0_predictor_input(features, f0_contour)
             if f0_src is not None:
-                log_f0_pred, voiced_pred = self.f0_predictor(speaker_embedding, f0_src)
+                # z IS the content latent, so it stands in when a caller passes only z.
+                log_f0_pred, voiced_pred = self.f0_predictor(
+                    speaker_embedding, f0_src, content_features=features if features is not None else z)
                 f0_embedding = self.f0_embedding(log_f0_pred, voiced_pred)
         return self.decoder(z, speaker_embedding=speaker_embedding, f0_embedding=f0_embedding, return_film_stats=return_film_stats)
 
@@ -1042,7 +1124,8 @@ class SMG(nn.Module):
         # F0 prediction and embedding (if enabled)
         # Always predict F0 (for loss computation even during GT warmup)
         log_f0_pred, voiced_pred = self.f0_predictor(
-            speaker_embedding, self._f0_predictor_input(features, f0_contour))
+            speaker_embedding, self._f0_predictor_input(features, f0_contour),
+            content_features=features)
 
         # Determine which F0 to use for decoder conditioning
         # Determine which F0 to use for decoder conditioning
