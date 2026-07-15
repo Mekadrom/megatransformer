@@ -381,6 +381,9 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
                 smg_overrides = {}
                 if getattr(args, 'voice_smg_sive_encoder_dim', None) is not None:
                     smg_overrides["sive_encoder_dim"] = args.voice_smg_sive_encoder_dim
+                # The SMG's F0 conditioning derives its harmonic phase step from hop/sample_rate,
+                # so it must match the mel rate the SMG was trained at (e.g. 320 for 50 Hz ContentVec).
+                smg_overrides["hop_length"] = getattr(args, 'voice_hop_length', 256)
                 voice_smg_decoder = model_loading_utils.load_model(
                     SMG,
                     getattr(args, 'voice_smg_config', 'small'),

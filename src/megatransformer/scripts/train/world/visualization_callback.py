@@ -93,6 +93,16 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             "A bowl of fresh fruit on a marble countertop in natural light.",
         ]
 
+    def _vocode(self, mel):
+        """Vocode a mel, resampling its time axis to the vocoder's frame rate when the
+        SMG mel hop (voice_hop_length) differs from the vocoder's — e.g. a 50 Hz
+        ContentVec mel @hop320 driving a 62.5 Hz @hop256 vocoder. No-op when equal."""
+        return visualization.render_vocoder_audio(
+            self.vocoder, mel,
+            mel_hop_length=self.voice_hop_length,
+            vocoder_hop_length=getattr(getattr(self.vocoder, "config", None), "hop_length", self.voice_hop_length),
+        )
+
     def _encode_static_prompt(self, text: str, suffix_tokens: list[int], max_new_tokens: int, device: torch.device) -> torch.Tensor:
         """Tokenize a static text prompt, append suffix tokens, and cap to MAX_SEQ_LEN."""
         self._ensure_tokenizer()
@@ -1759,7 +1769,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         fig = visualization.render_mel_spectrogram(mel_np, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
         if self.vocoder is not None:
             try:
-                waveform = visualization.render_vocoder_audio(self.vocoder, mel)
+                waveform = self._vocode(mel)
                 metrics.log_audio(f"{tag_prefix}/{speaker_label}_audio", waveform, global_step, self.voice_sample_rate, context={
                     "mel": fig,
                 })
@@ -1823,7 +1833,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
             mel = latent.float().cpu()
             # SIVE features are (C, T) — use directly as (n_mels, T) if C matches
-            waveform = visualization.render_vocoder_audio(self.vocoder, mel)
+            waveform = self._vocode(mel)
             metrics.log_audio(tag, waveform, global_step, self.voice_sample_rate)
         except Exception as e:
             print(f"Warning: Vocoder decoding failed for {tag}: {e}")
