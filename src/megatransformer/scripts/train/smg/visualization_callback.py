@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Optional
 
@@ -61,6 +62,46 @@ class SMGVisualizationCallback(VisualizationCallback):
             self.vocoder, mel, mel_hop_length=self.voice_hop_length,
         )
 
+    @torch.no_grad()
+    def _log_f0_sensitivity(self, model, features, spk_emb, target_f0, target_voiced, global_step):
+        """Does the DECODER actually use f0_embedding? A causal test, not a correlational one.
+
+        smg_f0_loss only says the F0 PREDICTOR can predict F0. It says nothing about whether
+        the decoder reads the resulting embedding -- and those come apart: measured on the
+        continuous-ContentVec checkpoint, a +50% pitch shift moved the mel by 0.058 against a
+        mel scale of 5.6 (~1%), and GT / +50% / flat-200Hz renders were INDISTINGUISHABLE by
+        ear. The F0 path was inert while its loss looked fine, because continuous features
+        already carried prosody and made F0 redundant.
+
+        So perturb F0 and measure how far the mel moves, normalized by the mel's own scale:
+            ~0.01  => inert. The decoder is ignoring F0 (the continuous-features failure).
+            larger => alive. F0 is carrying prosody, which is the whole point of units.
+        """
+        def _dec(f0):
+            emb = model.f0_embedding(f0, target_voiced)
+            m = model.decode(z=features, speaker_embedding=spk_emb, f0_embedding=emb)
+            if isinstance(m, tuple):
+                m = m[0]
+            if isinstance(m, dict):
+                m = m.get("reconstructed", next(iter(m.values())))
+            return (m.squeeze(1) if m.dim() == 4 else m).float()
+
+        try:
+            base = _dec(target_f0)
+            scale = base.abs().mean().clamp_min(1e-6)
+            # target_f0 is log-domain, so a pitch ratio is an additive shift.
+            up = _dec(target_f0 + math.log(1.5))                       # +50% pitch
+            flat = _dec(torch.full_like(target_f0, math.log(200.0)))   # monotone 200 Hz
+            metrics.log_scalar("eval/f0_sensitivity_shift",
+                               ((base - up).abs().mean() / scale).item(), global_step, skip_zero=False)
+            metrics.log_scalar("eval/f0_sensitivity_flat",
+                               ((base - flat).abs().mean() / scale).item(), global_step, skip_zero=False)
+            metrics.log_scalar("eval/f0_embedding_magnitude",
+                               model.f0_embedding(target_f0, target_voiced).abs().mean().item(),
+                               global_step, skip_zero=False)
+        except Exception as e:
+            print(f"Warning: F0 sensitivity probe failed: {e}")
+
     def on_evaluate(self, args, state, control, model=None, **kwargs):
         """Generate and log reconstructions during evaluation from eval dataset."""
         global_step = state.global_step + self.step_offset
@@ -115,7 +156,11 @@ class SMGVisualizationCallback(VisualizationCallback):
                     mel_spec_masks = sample.get("mel_spec_masks", None)
                     speaker_embeddings = sample.get("speaker_embeddings", None)
                     sample_f0 = sample.get("f0", None)
-                    sample_voiced = sample.get("voiced", None)
+                    # The collator emits "vuv" (data_collator.py:116); "voiced" never
+                    # existed, so this silently read None and the guard below then passed
+                    # target_f0=target_voiced=None into every eval forward -- i.e. the eval
+                    # F0 loss was identically zero and F0 was never exercised at eval.
+                    sample_voiced = sample.get("vuv", sample.get("voiced", None))
 
                     # Ensure correct shape [1, n_mels, T]
                     if mel_specs.dim() == 2:
@@ -133,6 +178,10 @@ class SMGVisualizationCallback(VisualizationCallback):
                         target_voiced = sample_voiced[:mel_lengths].unsqueeze(0).to(device)  # [1, T]
 
                     spk_emb = speaker_embeddings.to(device)
+
+                    if i == 0 and target_f0 is not None:
+                        self._log_f0_sensitivity(model, features, spk_emb, target_f0,
+                                                 target_voiced, global_step)
 
                     # Use reconstruct_with_attention to get attention weights
                     if is_vae:
