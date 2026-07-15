@@ -811,9 +811,7 @@ class MegaTransformerWorldModel(nn.Module):
         voice_stop_logit_trace: List[List[float]] = [[] for _ in range(batch_size)]
         voice_unit_id_trace: List[List[int]] = [[] for _ in range(batch_size)]
         voice_f0_seq: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
-        voice_vuv_seq: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         completed_voice_f0: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
-        completed_voice_vuv: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         audio_stop_logit_trace: List[List[float]] = [[] for _ in range(batch_size)]
 
         # Process initial prompt — replace placeholders with media if provided.
@@ -1151,9 +1149,6 @@ class MegaTransformerWorldModel(nn.Module):
                             f0_p = coda_out.get("voice_f0_preds")
                             if f0_p is not None:
                                 voice_f0_seq[b].append(f0_p[0, -1].detach().reshape(1))
-                                vl = coda_out.get("voice_vuv_logits")
-                                if vl is not None:
-                                    voice_vuv_seq[b].append(torch.sigmoid(vl[0, -1].detach()).reshape(1))
                             frame_pred = self.voice_codebook[unit_id].to(
                                 device=hidden_b.device, dtype=coda_out["voice_latent_preds"].dtype
                             ).view(1, -1, 1)  # (1, C, 1)
@@ -1189,11 +1184,8 @@ class MegaTransformerWorldModel(nn.Module):
                             completed_voice[b].append(voice_pred)
                             if voice_f0_seq[b]:
                                 completed_voice_f0[b].append(torch.cat(voice_f0_seq[b], dim=-1))  # (T,)
-                            if voice_vuv_seq[b]:
-                                completed_voice_vuv[b].append(torch.cat(voice_vuv_seq[b], dim=-1))
                         voice_sequences[b] = []
                         voice_f0_seq[b] = []
-                        voice_vuv_seq[b] = []
                         voice_prelude_kv_caches[b] = None
                         voice_prelude_position_offsets[b] = 0
                         voice_coda_kv_caches[b] = None
@@ -1368,9 +1360,7 @@ class MegaTransformerWorldModel(nn.Module):
                 completed_voice[b].append(torch.cat(voice_sequences[b], dim=-1))  # (C, T)
                 if voice_f0_seq[b]:
                     completed_voice_f0[b].append(torch.cat(voice_f0_seq[b], dim=-1))  # (T,)
-                if voice_vuv_seq[b]:
-                    completed_voice_vuv[b].append(torch.cat(voice_vuv_seq[b], dim=-1))
-                voice_sequences[b], voice_f0_seq[b], voice_vuv_seq[b] = [], [], []
+                voice_sequences[b], voice_f0_seq[b] = [], []
             if audio_sequences[b] and self.audio_generator is not None:
                 completed_audio[b].append(torch.cat(audio_sequences[b], dim=-1))
                 audio_sequences[b] = []
@@ -1448,11 +1438,6 @@ class MegaTransformerWorldModel(nn.Module):
                 completed_voice_f0, device, time_dim=-1
             )
             outputs["voice_f0_preds"] = stacked
-        if any(len(v) > 0 for v in completed_voice_vuv):
-            stacked, _, _ = self._stack_variable_length_media(
-                completed_voice_vuv, device, time_dim=-1
-            )
-            outputs["voice_vuv_preds"] = stacked
         outputs["audio_stop_logit_trace"] = audio_stop_logit_trace
 
         return outputs

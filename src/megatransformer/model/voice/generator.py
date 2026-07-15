@@ -143,13 +143,20 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         if self.unit_vocab_size:
             self.unit_head = nn.Linear(coda_config.d_model, self.unit_vocab_size)
 
-        # F0 + VUV regression, beside the unit classifier. Predicts log-F0 in the same
-        # domain the shards store and the SMG's f0_embedding consumes, so the world's
-        # contour is a drop-in for the SMG's own predictor at inference.
+        # F0 contour regression, beside the unit classifier. Emits a speaker-NORMALIZED
+        # contour, (log_f0 - mu_spk) / sd_spk; the SMG's F0 predictor denormalizes it with
+        # ECAPA. That split exists because this model never sees a speaker embedding, and
+        # the speaker offset is the larger term (between-speaker spread of mean log-F0
+        # 0.267 vs within-speaker contour spread 0.195).
+        #
+        # There is deliberately NO vuv head here. Voicing is phonemic, so it is recoverable
+        # from the units this coda already emits, and the SMG derives it on its own branch
+        # from content + ECAPA. Predicting it here would be strictly worse-informed --
+        # soft periodicity is partly a speaker trait (creak, breathiness) and this model is
+        # speaker-blind by design -- and nothing downstream ever consumed it.
         self.predict_f0 = getattr(config, "predict_f0", False)
         if self.predict_f0:
             self.f0_head = nn.Linear(coda_config.d_model, 1)
-            self.vuv_head = nn.Linear(coda_config.d_model, 1)
 
         # Stop prediction head: single linear → scalar logit per frame.
         # Predicts whether the current frame is the last real frame (or past it).
@@ -279,10 +286,10 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
             outputs[f"{self.prefix}_unit_logits"] = self.unit_head(h)
 
         if self.predict_f0:
-            # (batch, timesteps), matching how the shards store f0/vuv and what
-            # SMG.f0_embedding(log_f0, voiced) expects.
+            # (batch, timesteps). A speaker-normalized contour in sigma units -- pass it
+            # to SMG.decode(f0_contour=...), NOT to SMG.f0_embedding(), which wants
+            # absolute log Hz.
             outputs[f"{self.prefix}_f0_preds"] = self.f0_head(h).squeeze(-1)
-            outputs[f"{self.prefix}_vuv_logits"] = self.vuv_head(h).squeeze(-1)
 
         # Heteroscedastic log-variance (parallel head, off the coda hidden state).
         # feature_preds above is the Gaussian MEAN; this is per-frame log-variance

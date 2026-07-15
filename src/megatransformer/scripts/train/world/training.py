@@ -66,9 +66,9 @@ class WorldModelTrainer(CommonTrainer):
         voice_beta_nll: float = 0.5,
         # Per-frame probability of feeding the model's own prediction instead of ground
         # truth on the AR path, ramped from 0. 0 = off (pure teacher forcing).
-        # F0/VUV head weights. Voicing-weighted L1 on log-F0 + BCE on voicing.
+        # F0 contour head weight. Voicing-weighted L1 on the speaker-normalized log-F0
+        # contour. There is no voicing head here -- see the loss for why.
         voice_f0_loss_weight: float = 1.0,
-        voice_vuv_loss_weight: float = 1.0,
         voice_scheduled_sampling_prob: float = 0.0,
         voice_scheduled_sampling_ramp_steps: int = 10000,
         # Modality flags
@@ -124,7 +124,6 @@ class WorldModelTrainer(CommonTrainer):
         self.voice_stop_loss_weight = voice_stop_loss_weight
         self.voice_beta_nll = voice_beta_nll
         self.voice_f0_loss_weight = voice_f0_loss_weight
-        self.voice_vuv_loss_weight = voice_vuv_loss_weight
         self.voice_scheduled_sampling_prob = voice_scheduled_sampling_prob
         self.voice_scheduled_sampling_ramp_steps = voice_scheduled_sampling_ramp_steps
 
@@ -740,13 +739,11 @@ class WorldModelTrainer(CommonTrainer):
             total_loss = total_loss + self.voice_f0_loss_weight * f0_loss
             loss_components["voice_f0_loss"] = f0_loss.detach()
 
-            vuv_logits = outputs.get("voice_vuv_logits")
-            if vuv_logits is not None and self.voice_vuv_loss_weight > 0:
-                vuv_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                    vuv_logits.float(), vuv_t,
-                )
-                total_loss = total_loss + self.voice_vuv_loss_weight * vuv_loss
-                loss_components["voice_vuv_loss"] = vuv_loss.detach()
+            # vuv_t is used ONLY to weight the F0 loss above -- there is no voicing head
+            # here. Voicing is phonemic and so recoverable from the units this coda emits,
+            # and the SMG predicts it from content + ECAPA. This model is speaker-blind,
+            # while soft periodicity is partly a speaker trait, so a head here would be
+            # strictly worse-informed than the one downstream.
 
             with torch.no_grad():
                 # Does the head recover the CONTOUR, or just the speaker's mean pitch?
@@ -1651,7 +1648,6 @@ def create_trainer(
         voice_stop_loss_weight=getattr(args, 'voice_stop_loss_weight', 1.0),
         voice_beta_nll=getattr(args, 'voice_beta_nll', 0.5),
         voice_f0_loss_weight=getattr(args, 'voice_f0_loss_weight', 1.0),
-        voice_vuv_loss_weight=getattr(args, 'voice_vuv_loss_weight', 1.0),
         voice_scheduled_sampling_prob=getattr(args, 'voice_scheduled_sampling_prob', 0.0),
         voice_scheduled_sampling_ramp_steps=getattr(args, 'voice_scheduled_sampling_ramp_steps', 10000),
         include_text="text" in include_modes,
@@ -1923,18 +1919,20 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--sive_total_stride", type=int, default=4,
                             help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
     sub_parser.add_argument("--voice_predict_f0", action="store_true",
-                            help="Add F0 + VUV regression heads to the voice coda, beside the unit "
-                                 "classifier. Quantization strips prosody from the units by "
+                            help="Add an F0 contour regression head to the voice coda, beside the "
+                                 "unit classifier. Quantization strips prosody from the units by "
                                  "construction, so the contour must come from somewhere; the SMG's own "
                                  "F0 predictor sees only (units, speaker) and recovers ~4% of "
                                  "within-utterance F0 variation over predicting the speaker's mean "
                                  "pitch, because neither input knows the sentence is a question. The "
-                                 "coda sits on text conditioning and can. Pair with "
-                                 "--voice_f0_loss_weight / --voice_vuv_loss_weight.")
+                                 "coda sits on text conditioning and can. The head emits a "
+                                 "SPEAKER-NORMALIZED contour (sigma units); the SMG denormalizes it "
+                                 "with ECAPA. Pair with --voice_f0_loss_weight.")
     sub_parser.add_argument("--voice_f0_loss_weight", type=float, default=1.0,
-                            help="Weight on the coda's voicing-weighted L1 log-F0 loss.")
-    sub_parser.add_argument("--voice_vuv_loss_weight", type=float, default=1.0,
-                            help="Weight on the coda's voicing (VUV) BCE loss.")
+                            help="Weight on the coda's voicing-weighted L1 loss over the "
+                                 "speaker-normalized log-F0 contour. NOTE the contour is in sigma "
+                                 "units (std ~1.1), not log Hz, so this weight is on a different "
+                                 "scale than a raw-F0 loss would be.")
     sub_parser.add_argument("--voice_codebook_path", type=str, default=None,
                             help="k-means codebook .pt (from scripts.data.voice.fit_codebook). Turns "
                                  "ON the DISCRETE voice path: content features are snapped to their "
