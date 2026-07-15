@@ -112,6 +112,23 @@ def get_training_args(args, run_dir) -> TrainingArguments:
     )
 
 
+def media_frame_budget(args, prefix: str) -> int:
+    """Content frames in a max-length clip, for `prefix` in {"voice", "audio"}.
+
+    This single number is BOTH the collator's trim ceiling for the cached features and
+    generate()'s token budget. They must come from the same derivation: generate()'s
+    defaults were a hardcoded 209 = ceil((10*16000//256)/3), i.e. a snapshot of this math
+    for SIVE @hop256/stride3. A ContentVec run (@hop320/stride1) needs 500, so renders
+    were being truncated to 42% of an utterance while training saw the whole thing.
+    """
+    max_seconds = getattr(args, f"{prefix}_max_seconds", 10.0)
+    sample_rate = getattr(args, f"{prefix}_sample_rate", 16000)
+    hop_length = getattr(args, f"{prefix}_hop_length", 256)
+    stride = getattr(args, "sive_total_stride", 1) or 1
+    max_frames = int(max_seconds * sample_rate // hop_length)
+    return math.ceil(max_frames / stride)
+
+
 def get_data_collator(command: str, args) -> Optional[DataCollator]:
     if command in ["smg", 'vocoder', 'audio-sive', 'sive']:
         voice_max_frames = int(args.voice_max_seconds * args.voice_sample_rate // args.voice_hop_length)
@@ -129,7 +146,8 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
             max_seq_len=args.max_seq_len,
             max_waveforms=int(args.voice_max_seconds * args.voice_sample_rate),
             max_mel_spec_frames=voice_max_frames,
-            max_sive_feature_frames=math.ceil(voice_max_frames / args.sive_total_stride),
+            # Same derivation the generation budget uses — see media_frame_budget().
+            max_sive_feature_frames=media_frame_budget(args, "voice"),
         )
     return collator
 
@@ -419,6 +437,10 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             voice_hop_length=getattr(args, 'voice_hop_length', 256),
             voice_temperature=getattr(args, 'viz_voice_temperature', 0.6),
             voice_variance_floor=getattr(args, 'viz_voice_variance_floor', 0.0),
+            voice_token_budget=(args.voice_token_budget if getattr(args, 'voice_token_budget', None)
+                                else media_frame_budget(args, "voice")),
+            audio_token_budget=(args.audio_token_budget if getattr(args, 'audio_token_budget', None)
+                                else media_frame_budget(args, "audio")),
             include_modes=[m.strip() for m in args.include_modes.split(",")],
             include_tasks=([t.strip() for t in args.include_tasks.split(",")]
                            if getattr(args, 'include_tasks', None) else None),

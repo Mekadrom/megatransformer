@@ -53,7 +53,14 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         voice_variance_floor: float = 0.0,
         include_modes: Optional[list[str]] = None,
         include_tasks: Optional[list[str]] = None,
+        voice_token_budget: Optional[int] = None,
+        audio_token_budget: Optional[int] = None,
     ):
+        # How many content frames generate() may emit before force-closing with EO*.
+        # None => keep generate()'s own default, which is a hardcoded 209 (SIVE
+        # @hop256/stride3) and truncates a 50 Hz ContentVec render to ~4.2s.
+        self.voice_token_budget = voice_token_budget
+        self.audio_token_budget = audio_token_budget
         # What this run actually trains. Scenarios outside it are skipped rather than
         # emitting empty/meaningless panels — a text->voice run has no business rendering
         # transcription or cross-modal examples. None = no restriction (all tasks).
@@ -176,6 +183,19 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             if len(samples) >= n:
                 break
         return samples
+
+    def _generate(self, model, **kwargs):
+        """self._generate(model, ) with THIS run's media budgets applied.
+
+        Wrapping rather than passing the budgets at each of the ~17 call sites: a site
+        that forgot them would silently truncate its renders, which is exactly the failure
+        being fixed. Explicit kwargs still win, so a caller can override per-scenario.
+        """
+        if self.voice_token_budget is not None:
+            kwargs.setdefault("voice_token_budget", self.voice_token_budget)
+        if self.audio_token_budget is not None:
+            kwargs.setdefault("audio_token_budget", self.audio_token_budget)
+        return model.generate(**kwargs)
 
     def _scenario_enabled(self, required_modes: set, satisfying_tasks: set) -> bool:
         """Should this scenario run, given --include_modes / --include_tasks?
@@ -736,7 +756,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 prompt_len = max(1, prompt_len)
                 prompt = token_ids[:prompt_len].unsqueeze(0).to(device)
 
-                outputs = model.generate(
+                outputs = self._generate(model, 
                     text_input_ids=prompt,
                     max_new_tokens=max_new,
                     temperature=0.8,
@@ -848,7 +868,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     prompt_text = self._decode_tokens(sample["text_token_ids"])
                 decoded = self._decode_tokens(text_ids[:bov_pos + 1])
 
-                outputs = model.generate(
+                outputs = self._generate(model, 
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
                     voice_temperature=self.voice_temperature, voice_variance_floor=self.voice_variance_floor,
                 )
@@ -911,7 +931,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     prompt_text = self._decode_tokens(sample["text_token_ids"])
                 decoded = self._decode_tokens(text_ids[:boi_pos + 1])
 
-                outputs = model.generate(
+                outputs = self._generate(model, 
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
                     voice_temperature=self.voice_temperature, voice_variance_floor=self.voice_variance_floor,
                 )
@@ -999,7 +1019,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 voice_input = voice_features.unsqueeze(0).unsqueeze(0).to(device)
                 voice_len = torch.tensor([[voice_features.shape[-1]]], device=device)
 
-                outputs = model.generate(
+                outputs = self._generate(model, 
                     text_input_ids=prompt,
                     max_new_tokens=256,
                     temperature=0.8,
@@ -1049,7 +1069,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 )
                 image_input = image_data.unsqueeze(0).unsqueeze(0).to(device)
 
-                outputs = model.generate(
+                outputs = self._generate(model, 
                     text_input_ids=prompt,
                     max_new_tokens=256,
                     temperature=0.8,
@@ -1128,7 +1148,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 voice_input = voice_features.unsqueeze(0).unsqueeze(0).to(device)
                 voice_len = torch.tensor([[voice_features.shape[-1]]], device=device)
 
-                outputs = model.generate(
+                outputs = self._generate(model, 
                     text_input_ids=prompt,
                     max_new_tokens=512,
                     temperature=0.8,
@@ -1188,7 +1208,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 )
                 image_input = image_data.unsqueeze(0).unsqueeze(0).to(device)
 
-                outputs = model.generate(
+                outputs = self._generate(model, 
                     text_input_ids=prompt,
                     max_new_tokens=512,
                     temperature=0.8,
@@ -1258,7 +1278,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             prompt_len = max(1, prompt_len)
             prompt = token_ids[:prompt_len].unsqueeze(0).to(device)
 
-            outputs = model.generate(
+            outputs = self._generate(model, 
                 text_input_ids=prompt,
                 max_new_tokens=max_new,
                 temperature=0.8,
@@ -1305,7 +1325,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             max_new = 512
             prompt = self._encode_static_prompt(str(prompt_text)[:500], [BOV_TOKEN_ID], max_new, device)
 
-            outputs = model.generate(
+            outputs = self._generate(model, 
                 text_input_ids=prompt,
                 max_new_tokens=max_new,
                 temperature=0.8,
@@ -1345,7 +1365,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             )
 
     def _prepare_audio_for_generate(self, sample, device):
-        """Prepare SIVE audio features from a sample for model.generate().
+        """Prepare SIVE audio features from a sample for self._generate(model, ).
 
         Returns (audio_inputs, audio_lengths) shaped for generate() or (None, None).
         Audio inputs are shaped (1, 1, C, T) — batch=1, n_audio=1.
@@ -1375,7 +1395,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         return audio_data, audio_lengths
 
     def _prepare_voice_for_generate(self, sample, device):
-        """Prepare SIVE voice features from a sample for model.generate().
+        """Prepare SIVE voice features from a sample for self._generate(model, ).
 
         Returns (voice_inputs, voice_lengths) shaped for generate() or (None, None).
         Voice inputs are shaped (1, 1, C, T) — batch=1, n_voice=1.
@@ -1402,7 +1422,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         return voice_data, voice_lengths
 
     def _prepare_image_for_generate(self, sample, device):
-        """Prepare image from a sample for model.generate().
+        """Prepare image from a sample for self._generate(model, ).
 
         Returns image_inputs shaped (1, 1, C, H, W) or None.
         """
@@ -1444,7 +1464,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
             voice_inputs, voice_lengths = self._prepare_voice_for_generate(sample, device)
 
-            outputs = model.generate(
+            outputs = self._generate(model, 
                 text_input_ids=prompt,
                 max_new_tokens=256,
                 temperature=0.8,
@@ -1494,7 +1514,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             max_new = 512
             prompt = self._encode_static_prompt(str(prompt_text)[:500], [BOI_TOKEN_ID], max_new, device)
 
-            outputs = model.generate(
+            outputs = self._generate(model, 
                 text_input_ids=prompt,
                 max_new_tokens=max_new,
                 temperature=0.8,
@@ -1568,7 +1588,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
             image_inputs = self._prepare_image_for_generate(sample, device)
 
-            outputs = model.generate(
+            outputs = self._generate(model, 
                 text_input_ids=prompt,
                 max_new_tokens=256,
                 temperature=0.8,
@@ -1617,7 +1637,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
             voice_inputs, voice_lengths = self._prepare_voice_for_generate(sample, device)
 
-            outputs = model.generate(
+            outputs = self._generate(model, 
                 text_input_ids=prompt,
                 max_new_tokens=512,
                 temperature=0.8,
@@ -1668,7 +1688,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
             image_inputs = self._prepare_image_for_generate(sample, device)
 
-            outputs = model.generate(
+            outputs = self._generate(model, 
                 text_input_ids=prompt,
                 max_new_tokens=512,
                 temperature=0.8,

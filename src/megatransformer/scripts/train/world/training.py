@@ -1733,6 +1733,15 @@ def add_cli_args(subparsers):
                             help="Audio hop length")
     sub_parser.add_argument("--sive_total_stride", type=int, default=4,
                             help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
+    sub_parser.add_argument("--voice_token_budget", type=int, default=None,
+                            help="Max content frames generate() may emit before force-closing with "
+                                 "EOV, for the TensorBoard TTS renders. Default: derived from "
+                                 "--voice_max_seconds/--voice_sample_rate/--voice_hop_length/"
+                                 "--sive_total_stride, i.e. the same number as the collator's trim "
+                                 "ceiling (500 for 10s ContentVec @hop320/stride1). The stop head "
+                                 "normally ends generation before this; it is a hard cap.")
+    sub_parser.add_argument("--audio_token_budget", type=int, default=None,
+                            help="As --voice_token_budget, for the non-speech audio modality.")
     sub_parser.add_argument("--voice_feature_channels", type=int, default=None,
                             help="Channel width of the cached voice 'features' tensors — the voice prelude "
                                  "projects from this and the voice coda predicts into it. Must match the "
