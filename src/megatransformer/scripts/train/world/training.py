@@ -719,7 +719,11 @@ class WorldModelTrainer(CommonTrainer):
         # models optimize the same quantity the same way and the world's contour is a
         # drop-in for the SMG's predictor at inference.
         voice_f0_preds = outputs.get("voice_f0_preds")
-        f0_tgt = inputs.get("voice_f0")
+        # SPEAKER-NORMALIZED contour, not absolute F0. The world model has no speaker
+        # embedding by design (it is modality-general; speaker identity belongs to the
+        # decoder), and absolute pitch is dominated by a speaker offset it cannot see.
+        # It predicts the contour; the SMG denormalizes using ECAPA.
+        f0_tgt = inputs.get("voice_f0_contour", inputs.get("voice_f0"))
         vuv_tgt = inputs.get("voice_vuv")
         if voice_f0_preds is not None and f0_tgt is not None and vuv_tgt is not None:
             T = voice_f0_preds.shape[-1]

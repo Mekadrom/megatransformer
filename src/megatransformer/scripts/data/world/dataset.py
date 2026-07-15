@@ -7,7 +7,7 @@ import torch
 
 from torch.utils.data import Dataset
 
-from megatransformer.utils.codebook import load_codebook, quantize
+from megatransformer.utils.codebook import load_codebook, load_f0_stats, normalize_f0, quantize
 
 
 class MultimodalShardedDataset(Dataset):
@@ -102,6 +102,11 @@ class MultimodalShardedDataset(Dataset):
         # world model predicts unit ids the SMG has to interpret, and a re-fit reorders
         # the centroids, silently mapping every unit to the wrong phoneme.
         self.voice_centroids = load_codebook(voice_codebook) if voice_codebook is not None else None
+        # Per-speaker log-F0 stats ride in the same artifact. Used to hand the voice coda a
+        # SPEAKER-NORMALIZED contour: the between-speaker spread of mean log-F0 (0.267) is
+        # larger than the within-speaker contour it carries (0.195), and the offset is the
+        # part a text-only model structurally cannot know. Normalizing removes it.
+        self.voice_f0_stats = load_f0_stats(voice_codebook) if voice_codebook is not None else None
         self.text_columns = text_columns
         self.audio_columns = audio_columns
         self.voice_columns = voice_columns
@@ -334,6 +339,10 @@ class MultimodalShardedDataset(Dataset):
 
         if "speaker_ids" in shard and "speaker_ids" in columns:
             sample["speaker_id"] = shard["speaker_ids"][local_idx]
+
+        if "f0" in shard and "f0" in columns and self.voice_f0_stats is not None:
+            sid = int(shard["speaker_ids"][local_idx]) if "speaker_ids" in shard else -1
+            sample["f0_contour"] = normalize_f0(shard["f0"][local_idx].float(), sid, self.voice_f0_stats)
 
         if "f0" in shard and "f0" in columns:
             sample["f0"] = shard["f0"][local_idx]

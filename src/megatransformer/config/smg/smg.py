@@ -264,6 +264,24 @@ class SMGConfig:
     perceptual_loss_weight: float = 1.0
     multi_scale_mel_weight: float = 1.0
 
+    # What the F0 predictor reads. The two SMG jobs need different answers:
+    #
+    #   "features"  VOICE CLONING. Content+prosody features already carry the contour;
+    #               only the speaker offset changes between speakers, and that is
+    #               recoverable from the features plus ECAPA. (This is also why F0
+    #               conditioning atrophied on continuous features -- it was redundant,
+    #               not broken. The model was right to ignore it.)
+    #
+    #   "contour"   WORLD-MODEL TRANSLATOR. Input is prosody-free k-means units, so the
+    #               contour cannot come from them: predictor(units, speaker) recovers only
+    #               ~4% of within-utterance F0 variation over predicting the speaker mean.
+    #               Instead the world model supplies a SPEAKER-NORMALIZED contour (it has
+    #               the text, where question marks live) and this predictor denormalizes it
+    #               using ECAPA -- a far better-posed job. encoder_dim becomes 1.
+    #
+    # Two purposes, two configs, one codebase.
+    f0_predictor_input: str = "features"
+
     f0_loss_weight: float = 5.0
     vuv_loss_weight: float = 2.0
 

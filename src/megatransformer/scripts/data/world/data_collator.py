@@ -262,6 +262,7 @@ class MultimodalDataCollator(DataCollator):
         all_ctc_lengths = []
         all_texts = []
         all_unit_ids = []
+        all_f0_contour = []
 
         for ex in examples:
             all_waveforms.append(trim(ex.get(f"{prefix}_waveform", None), self.max_waveforms, dim=-1))
@@ -275,6 +276,7 @@ class MultimodalDataCollator(DataCollator):
             all_f0.append(trim(ex.get(f"{prefix}_f0", None), self.max_mel_spec_frames, dim=-1))
             all_vuv.append(trim(ex.get(f"{prefix}_vuv", None), self.max_mel_spec_frames, dim=-1))
             all_unit_ids.append(trim(ex.get(f"{prefix}_unit_ids", None), self.max_sive_feature_frames, dim=-1))
+            all_f0_contour.append(trim(ex.get(f"{prefix}_f0_contour", None), self.max_mel_spec_frames, dim=-1))
             all_ctc_tokens.append(ex.get(f"{prefix}_ctc_tokens", None))
             all_ctc_lengths.append(ex.get(f"{prefix}_ctc_length", None))
             # Text key differs between audio and voice in dataset
@@ -320,6 +322,12 @@ class MultimodalDataCollator(DataCollator):
 
         if all_speaker_ids[0] is not None:
             batch[f"{prefix}_speaker_ids"] = torch.stack(all_speaker_ids)
+
+        if all_f0_contour[0] is not None:
+            # 0-pad is correct here (unlike unit ids): unvoiced frames are already 0 in the
+            # contour, and the F0 loss is voicing-weighted, so padding contributes nothing.
+            padded_c, _ = pad_and_mask(all_f0_contour, all_mel_lengths)
+            batch[f"{prefix}_f0_contour"] = torch.stack(padded_c)
 
         if all_f0[0] is not None:
             padded_f0, _ = pad_and_mask(all_f0, all_mel_lengths)

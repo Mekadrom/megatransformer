@@ -873,6 +873,7 @@ class SMG(nn.Module):
         self.decoder = decoder
 
         # F0 conditioning modules
+        self.f0_predictor_input = getattr(config, 'f0_predictor_input', 'features')
         self.f0_predictor = f0_predictor
         self.f0_embedding = f0_embedding
 
@@ -939,7 +940,10 @@ class SMG(nn.Module):
 
         config_dict = {k: v for k, v in config.f0_predictor_config.__dict__.items()}
         config_dict.update(overrides)
-        config_dict['encoder_dim'] = sive_encoder_dim  # F0 predictor reads SIVE features too
+        # A contour is 1-dim; features are sive_encoder_dim. This sizes the predictor's
+        # sive_proj Conv1d, so it must match what forward() actually feeds it.
+        _f0_in = getattr(config, 'f0_predictor_input', 'features')
+        config_dict['encoder_dim'] = 1 if _f0_in == 'contour' else sive_encoder_dim
         f0_predictor = F0Predictor.from_config(config.f0_predictor_config, **config_dict)
         config_dict = {k: v for k, v in config.f0_conditioning_embedding_config.__dict__.items()}
         config_dict.update(overrides)
@@ -959,7 +963,20 @@ class SMG(nn.Module):
         if hasattr(self.decoder, 'gradient_checkpointing_disable'):
             self.decoder.gradient_checkpointing_disable()
 
-    def decode(self, z, speaker_embedding=None, f0_embedding=None, features=None, return_film_stats=False) -> torch.Tensor:
+    def _f0_predictor_input(self, features, f0_contour):
+        """What the F0 predictor reads, per config.
+
+        "contour": the world model supplies a speaker-normalized contour and this predictor
+        denormalizes it with ECAPA. "features": the classic voice-cloning path, where the
+        content features already carry prosody.
+        """
+        if self.f0_predictor_input == "contour":
+            if f0_contour is None:
+                return None
+            return f0_contour.unsqueeze(1) if f0_contour.dim() == 2 else f0_contour  # (B, 1, T)
+        return features
+
+    def decode(self, z, speaker_embedding=None, f0_embedding=None, features=None, f0_contour=None, return_film_stats=False) -> torch.Tensor:
         """
         Decode latent to mel spectrogram.
 
@@ -971,9 +988,11 @@ class SMG(nn.Module):
             return_film_stats: Whether to return FiLM statistics
         # Predict F0 if conditioning is enabled but embedding not provided
         """
-        if f0_embedding is None and features is not None:
-            log_f0_pred, voiced_pred = self.f0_predictor(speaker_embedding, features)
-            f0_embedding = self.f0_embedding(log_f0_pred, voiced_pred)
+        if f0_embedding is None:
+            f0_src = self._f0_predictor_input(features, f0_contour)
+            if f0_src is not None:
+                log_f0_pred, voiced_pred = self.f0_predictor(speaker_embedding, f0_src)
+                f0_embedding = self.f0_embedding(log_f0_pred, voiced_pred)
         return self.decoder(z, speaker_embedding=speaker_embedding, f0_embedding=f0_embedding, return_film_stats=return_film_stats)
 
     def forward(
@@ -986,6 +1005,7 @@ class SMG(nn.Module):
         target_f0: Optional[torch.Tensor] = None,  # [B, T] ground truth log F0
         target_voiced: Optional[torch.Tensor] = None,  # [B, T] ground truth voicing (0 or 1)
         # F0 warmup: use GT F0 instead of predicted F0 for decoder conditioning
+        f0_contour: Optional[torch.Tensor] = None,  # speaker-normalized contour; read when f0_predictor_input='contour'
         use_gt_f0: bool = False,  # If True, use target_f0/target_voiced for decoder conditioning
         return_film_stats: bool = False,
     ):
@@ -1012,7 +1032,8 @@ class SMG(nn.Module):
 
         # F0 prediction and embedding (if enabled)
         # Always predict F0 (for loss computation even during GT warmup)
-        log_f0_pred, voiced_pred = self.f0_predictor(speaker_embedding, features)
+        log_f0_pred, voiced_pred = self.f0_predictor(
+            speaker_embedding, self._f0_predictor_input(features, f0_contour))
 
         # Determine which F0 to use for decoder conditioning
         # Determine which F0 to use for decoder conditioning

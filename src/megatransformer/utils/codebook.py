@@ -38,6 +38,50 @@ def load_codebook(path_or_tensor) -> torch.Tensor:
     return obj.float()
 
 
+def load_f0_stats(path_or_payload):
+    """Per-speaker log-F0 (mean, std) from a codebook payload, or None if absent.
+
+    Returns (mean[S], std[S], global_mean, global_std). Speakers with too few frames to
+    estimate get the global values, so indexing is always safe.
+    """
+    obj = path_or_payload
+    if isinstance(obj, str):
+        obj = torch.load(obj, map_location="cpu", weights_only=False)
+    if not isinstance(obj, dict) or "speaker_f0_mean" not in obj:
+        return None
+    return (obj["speaker_f0_mean"].float(), obj["speaker_f0_std"].float(),
+            float(obj["global_f0_mean"]), float(obj["global_f0_std"]))
+
+
+def normalize_f0(f0: torch.Tensor, speaker_id: int, stats) -> torch.Tensor:
+    """Speaker-normalize a log-F0 contour: (log_f0 - mu_spk) / sigma_spk.
+
+    Per SPEAKER, not per utterance. Measured on LibriTTS-R, the between-speaker spread of
+    mean log-F0 is 0.267 against a within-speaker spread of 0.195 (ratio 1.36) -- so the
+    speaker offset is the LARGER term, and it is the one a text-only model structurally
+    cannot know (ContentVec is speaker-invariant and text says nothing about who is
+    talking). Removing it leaves the world model a well-posed target: the ~0.195 of
+    genuinely text-driven variation. Normalizing per UTTERANCE would instead delete
+    utterance-level prosody (excitement, emphasis), which is exactly what we want predicted.
+
+    Unvoiced frames are stored as f0 == 0 and stay 0: they carry no pitch, and mapping 0
+    through the normalizer would emit a large negative excursion the head would then chase.
+    """
+    if stats is None:
+        return f0
+    mean, std, g_mean, g_std = stats
+    s = int(speaker_id)
+    mu = float(mean[s]) if 0 <= s < len(mean) else g_mean
+    sd = float(std[s]) if 0 <= s < len(std) else g_std
+    sd = max(sd, 1e-3)
+    return torch.where(f0 > 0, (f0 - mu) / sd, torch.zeros_like(f0))
+
+
+def denormalize_f0(contour: torch.Tensor, mu: float, sd: float) -> torch.Tensor:
+    """Inverse of normalize_f0 for a known speaker. Unvoiced (0) stays 0."""
+    return torch.where(contour != 0, contour * sd + mu, torch.zeros_like(contour))
+
+
 def quantize(
     feats: torch.Tensor,
     centroids: torch.Tensor,

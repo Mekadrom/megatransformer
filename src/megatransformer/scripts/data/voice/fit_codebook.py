@@ -31,6 +31,56 @@ import torch
 from megatransformer.utils.codebook import save_codebook
 
 
+def fit_f0_stats(cache_dir: str):
+    """Per-speaker log-F0 mean/std over the whole TRAIN split.
+
+    Shipped inside the codebook so there is ONE artifact both models share and neither can
+    half-update: unit ids are meaningless without the centroids that define them, and a
+    contour is meaningless without the speaker statistics that denormalize it.
+
+    Per SPEAKER, not per utterance -- see utils.codebook.normalize_f0 for why.
+    """
+    from collections import defaultdict
+    sums, sqs, ns = defaultdict(float), defaultdict(float), defaultdict(float)
+    for path in sorted(glob.glob(os.path.join(cache_dir, "*.pt"))):
+        sh = torch.load(path, map_location="cpu", weights_only=False)
+        if "f0" not in sh or "speaker_ids" not in sh:
+            return None
+        f0s, vuvs, sids, lens = sh["f0"], sh["vuv"], sh["speaker_ids"], sh["feature_lengths"]
+        for i in range(len(f0s)):
+            L = int(lens[i])
+            s_id = int(sids[i])
+            f, v = f0s[i][:L].double(), vuvs[i][:L].double()
+            # Weight by voicing: F0 is undefined where unvoiced, and those frames are
+            # stored as 0, which would drag every mean toward zero if counted.
+            w = float(v.sum())
+            if w < 5:
+                continue
+            sums[s_id] += float((f * v).sum())
+            sqs[s_id] += float(((f ** 2) * v).sum())
+            ns[s_id] += w
+    if not ns:
+        return None
+
+    S = max(ns) + 1
+    g_mean = sum(sums.values()) / sum(ns.values())
+    g_var = sum(sqs.values()) / sum(ns.values()) - g_mean ** 2
+    g_std = max(1e-3, g_var ** 0.5)
+
+    mean = torch.full((S,), g_mean, dtype=torch.float32)
+    std = torch.full((S,), g_std, dtype=torch.float32)
+    n_spk = 0
+    for s_id, n in ns.items():
+        if n < 200:      # too few voiced frames to estimate; keep the global fallback
+            continue
+        mu = sums[s_id] / n
+        var = max(1e-8, sqs[s_id] / n - mu * mu)
+        mean[s_id] = mu
+        std[s_id] = max(1e-3, var ** 0.5)
+        n_spk += 1
+    return mean, std, g_mean, g_std, n_spk, len(ns)
+
+
 def load_frames(cache_dir: str, max_frames: int):
     """Sample up to max_frames real (non-padded) frames from the shards."""
     shards = sorted(glob.glob(os.path.join(cache_dir, "*.pt")))
@@ -87,12 +137,28 @@ def main():
         tot += len(lab) - 1
     repeat = reps / tot if tot else float("nan")
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
-    save_codebook(args.output, C, meta={
+    meta = {
         "source_cache_dir": args.cache_dir, "max_frames": int(X.shape[0]),
         "seed": args.seed, "quant_l1": quant_l1, "trivial_l1": trivial,
         "frames_repeat": repeat,
-    })
+    }
+
+    stats = fit_f0_stats(args.cache_dir)
+    if stats is not None:
+        mean, std, g_mean, g_std, n_spk, n_seen = stats
+        meta.update({"speaker_f0_mean": mean, "speaker_f0_std": std,
+                     "global_f0_mean": g_mean, "global_f0_std": g_std})
+        import numpy as _np
+        est = mean[mean != g_mean]
+        print(f"  f0 stats      = {n_spk}/{n_seen} speakers estimated "
+              f"(rest fall back to global mu={g_mean:.3f} sd={g_std:.3f})")
+        if len(est):
+            print(f"                  between-speaker spread of mean log-F0 = {float(est.std()):.3f} "
+                  f"(this is the component the world model cannot know, and that "
+                  f"normalization removes)")
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
+    save_codebook(args.output, C, meta=meta)
 
     print(f"  quant_l1      = {quant_l1:.4f}  ({100 * quant_l1 / trivial:.0f}% of trivial {trivial:.4f})")
     print(f"  frames_repeat = {100 * repeat:.1f}%   (low => next-unit prediction needs the "
