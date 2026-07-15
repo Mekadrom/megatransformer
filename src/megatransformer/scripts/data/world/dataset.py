@@ -269,15 +269,6 @@ class MultimodalShardedDataset(Dataset):
         if "features" in shard and "features" in columns:
             sample["features"] = shard["features"][local_idx]
             sample["feature_length"] = shard["feature_lengths"][local_idx]
-            if self.voice_centroids is not None:
-                # Quantize per sample, in the dataloader workers, BEFORE padding — pad
-                # frames would otherwise snap to whichever unit sits nearest the origin.
-                feat, unit_ids = quantize(
-                    sample["features"], self.voice_centroids,
-                    length=int(sample["feature_length"]),
-                )
-                sample["features"] = feat
-                sample["unit_ids"] = unit_ids
 
         if "waveforms" in shard and "waveforms" in columns:
             sample["waveform"] = shard["waveforms"][local_idx]
@@ -320,6 +311,15 @@ class MultimodalShardedDataset(Dataset):
         if "features" in shard and "features" in columns:
             sample["features"] = shard["features"][local_idx]
             sample["feature_length"] = shard["feature_lengths"][local_idx]
+            if self.voice_centroids is not None:
+                # Quantize per sample, in the dataloader workers, BEFORE padding — pad
+                # frames would otherwise snap to whichever unit sits nearest the origin.
+                feat, unit_ids = quantize(
+                    sample["features"], self.voice_centroids,
+                    length=int(sample["feature_length"]),
+                )
+                sample["features"] = feat
+                sample["unit_ids"] = unit_ids
 
         if "waveforms" in shard and "waveforms" in columns:
             sample["waveform"] = shard["waveforms"][local_idx]
