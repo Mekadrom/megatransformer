@@ -85,7 +85,12 @@ def fit_f0_stats(cache_dirs):
     std = torch.full((S,), g_std, dtype=torch.float32)
     n_spk = 0
     for s_id, n in ns.items():
-        if n < 200:      # too few voiced frames to estimate; keep the global fallback
+        # Threshold deliberately low. Falling back to the global mean is not a neutral
+        # default -- it injects the speaker's whole offset into the contour (measured: a
+        # 187-frame val speaker got 1.6 sigma of error that way). A mean over ~50 voiced
+        # frames is worth roughly +-0.1 by comparison, since pitch varies slowly and
+        # adjacent frames are highly correlated. A noisy estimate beats a biased one.
+        if n < 50:
             continue
         mu = sums[s_id] / n
         var = max(1e-8, sqs[s_id] / n - mu * mu)
