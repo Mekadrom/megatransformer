@@ -1816,6 +1816,18 @@ def add_cli_args(subparsers):
     # Use GT F0 for first N steps to let embedding learn with clean signal (0 = disabled)
     sub_parser.add_argument("--f0_warmup_use_gt_steps", type=int, default=0,
                             help="Number of steps to use GT F0 for warmup (0 = disabled)")
+    sub_parser.add_argument("--voice_codebook_path", type=str, default=None,
+                            help="k-means codebook .pt from scripts.data.voice.fit_codebook. When "
+                                 "set, content features are snapped to their nearest centroid ON "
+                                 "THE FLY, so trying a different K is a re-fit plus this flag. "
+                                 "Quantization strips the continuous variation, which measurement "
+                                 "showed is where prosody lives (quantized speech is fully "
+                                 "intelligible but flat) -- that is deliberate: it makes F0 the "
+                                 "only prosody source, so the F0 path can no longer atrophy the "
+                                 "way it did on continuous input, where it ended up moving the mel "
+                                 "by ~1% even under a 50% pitch shift. Pair with --use_gan: units "
+                                 "make the decoder one-to-many, and L1/MSE on a one-to-many map "
+                                 "regresses to a muffled mean.")
 
     sub_parser.add_argument("--num_speakers", type=int, default=0,
                            help="Number of speaker classes for speaker ID loss (0 = auto-detect from dataset)")

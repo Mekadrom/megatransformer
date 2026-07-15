@@ -172,6 +172,10 @@ def get_dataset(command: str, args, split: str):
         dataset = VoiceShardedDataset(
             shard_dir=shard_dir,
             cache_size=args.shard_cache_size,
+            # On-the-fly k-means quantization of the content features. Strips the continuous
+            # variation (= prosody), which forces F0 to become the only prosody source the
+            # SMG has and so stops the F0 path atrophying the way it did on continuous input.
+            codebook=getattr(args, "voice_codebook_path", None),
             columns=[
                 "features",  # includes lengths
                 "mel_specs",  # includes lengths

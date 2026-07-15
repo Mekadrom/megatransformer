@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from megatransformer.scripts.data.dataset import ShardAwareSampler
+from megatransformer.utils.codebook import load_codebook, quantize
 
 
 class VoiceShardedDataset(Dataset):
@@ -34,17 +35,24 @@ class VoiceShardedDataset(Dataset):
         self,
         shard_dir: str,
         cache_size: int = 3,
-        columns: list[str] = []
+        columns: list[str] = [],
+        codebook=None,
     ):
         """
         Args:
             shard_dir: Directory containing shard_*.pt files
             cache_size: Number of shards to keep in memory
             columns: List of columns to load from each shard (e.g. ["features", "mel_specs", "speaker_embeddings"])
+            codebook: Optional k-means codebook (path, payload dict, or (K, D) tensor). When
+                given, `features` are snapped to their nearest centroid ON THE FLY, so trying
+                a different K is a re-fit plus a flag rather than a re-preprocess. Quantizing
+                here (per sample, in the dataloader workers) rather than in the collator means
+                it happens BEFORE padding, so pad frames are never snapped to a real unit.
         """
         self.shard_dir = shard_dir
         self.cache_size = cache_size
         self.columns = columns
+        self.centroids = load_codebook(codebook) if codebook is not None else None
 
         if not self.columns or len(self.columns) == 0:
             self.columns = [
@@ -165,6 +173,14 @@ class VoiceShardedDataset(Dataset):
             # - Multi-layer:  [num_layers, encoder_dim, T']
             sample['features'] = shard["features"][local_idx]
             sample["feature_length"] = shard["feature_lengths"][local_idx]
+            if self.centroids is not None:
+                # Snap to centroids. Pass the real length so padding is left alone: zeros
+                # would otherwise snap to whichever unit sits nearest the origin.
+                feat, unit_ids = quantize(
+                    sample['features'], self.centroids, length=int(sample["feature_length"]),
+                )
+                sample['features'] = feat
+                sample['unit_ids'] = unit_ids
 
         if 'waveforms' in shard and 'waveforms' in self.columns:
             sample['waveform'] = shard["waveforms"][local_idx]
