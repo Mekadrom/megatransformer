@@ -558,6 +558,8 @@ class WorldModelTrainer(CommonTrainer):
         # if image_latent_labels is not None:
         #     megatransformer_utils.print_debug_tensor("\timage_latent_labels", image_latent_labels)
 
+        self._log_precision_once(model)
+
         # Enable per-iteration stat tracking at logging steps
         should_log = global_step % self.args.logging_steps == 0
         model_for_stats = model.module if hasattr(model, 'module') else model
@@ -922,6 +924,36 @@ class WorldModelTrainer(CommonTrainer):
 
         self._module_groups = groups
         return groups
+
+    def _log_precision_once(self, model):
+        """Print the ACTIVE compute precision on the first training step.
+
+        Checking parameter dtype is misleading here: HF's --bf16 keeps master weights in
+        fp32 and casts per-op via autocast, so params read float32 even when bf16 is
+        working correctly. The ground truth is whether autocast is live inside
+        compute_loss (HF wraps it in compute_loss_context_manager) and at what dtype —
+        that is what actually decides whether the matmuls hit the bf16 tensor cores.
+        """
+        if getattr(self, "_precision_logged", False):
+            return
+        self._precision_logged = True
+
+        autocast_on = torch.is_autocast_enabled()
+        try:
+            autocast_dtype = torch.get_autocast_dtype("cuda")
+        except (AttributeError, TypeError):  # torch < 2.4
+            autocast_dtype = torch.get_autocast_gpu_dtype()
+
+        param_dtype = next((p.dtype for p in model.parameters()), None)
+        print(
+            f"[precision] autocast={'ON' if autocast_on else 'OFF'} "
+            f"autocast_dtype={autocast_dtype if autocast_on else 'n/a'} | "
+            f"args.bf16={self.args.bf16} args.fp16={self.args.fp16} | "
+            f"param_dtype={param_dtype} (fp32 is EXPECTED under autocast) | "
+            f"tf32_matmul={torch.backends.cuda.matmul.allow_tf32} "
+            f"tf32_cudnn={torch.backends.cudnn.allow_tf32}",
+            flush=True,
+        )
 
     def _log_grad_norms(self, global_step):
         """Compute and log L2 and RMS gradient norms per module group."""
