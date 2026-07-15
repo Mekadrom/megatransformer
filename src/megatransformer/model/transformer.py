@@ -176,26 +176,12 @@ class MegaTransformerAttention(nn.Module):
                 new_kv_cache.key_cache = keys.clone()
                 new_kv_cache.value_cache = values.clone()
 
-        attention_scores = torch.matmul(queries, keys.transpose(-1, -2))
-
         _, _, t = queries.shape[:3]  # Query sequence length (new tokens)
         _, _, T = keys.shape[:3]  # Total key sequence length (cached + new)
 
-        if self.alibi_bias is not None:
-            # For ALiBi, we need the full position range
-            # Query positions: [position_offset, position_offset + t)
-            # Key positions: [0, T)
-            alibi_slice = self.alibi_bias[:, position_offset:position_offset + t, :T]
-            attention_scores = attention_scores + alibi_slice.unsqueeze(0).repeat(N, 1, 1, 1)
-
-        attention_scores = attention_scores / math.sqrt(self.d_queries)
-        if bool(self.use_grok_scaled_attn):
-            attention_scores = 30.0 * torch.tanh(attention_scores / 30.0)
-        elif self.config.attn_logit_cap is not None:
-            cap = self.config.attn_logit_cap
-            attention_scores = cap * torch.tanh(attention_scores / cap)
-
-        # Causal masking (skip for bidirectional attention and cross-attention)
+        # Causal mask slice — shared by both paths, so the cached-generation offset logic
+        # lives in one place. (skip for bidirectional attention and cross-attention)
+        causal_mask_slice = None
         if self.is_causal and not is_cross_attention:
             # For cached generation with Huginn-style cache, position_offset tracks the
             # global position while T (key length) may differ across cache slots.
@@ -218,21 +204,77 @@ class MegaTransformerAttention(nn.Module):
 
             # Slice causal mask for current query/key positions.
             causal_mask_slice = self.causal_mask[:, :, eff_offset:eff_offset + t, :T]
-            attention_scores = attention_scores.masked_fill(causal_mask_slice == 0, float("-inf"))
 
         # Apply attention mask (use encoder_attention_mask for cross-attention)
         active_mask = encoder_attention_mask if is_cross_attention else attention_mask
-        if active_mask is not None:
-            active_mask = active_mask.unsqueeze(1).unsqueeze(2)
-            attention_scores = attention_scores.masked_fill(active_mask == 0, float("-inf"))
 
-        attention_probs = F.softmax(attention_scores, dim=-1)
-        attention_probs = self.attn_dropout(attention_probs)
+        # SDPA fuses scale + mask + softmax + dropout + (probs @ V) into one kernel and
+        # never materializes the (N, heads, t, T) score matrix. The manual path below
+        # materializes it ~5x per call — the two out-of-place masked_fills each CLONE it —
+        # which profiling showed to be ~48% of world-model CUDA time and the reason
+        # attention activations, not FFN, dominated memory.
+        #
+        # These three rewrite the scores mid-kernel and a head_mask reweights the
+        # probabilities, none of which SDPA can express — they keep the manual path.
+        use_sdpa = (
+            self.alibi_bias is None
+            and not bool(self.use_grok_scaled_attn)
+            and self.config.attn_logit_cap is None
+            and head_mask is None
+        )
 
-        if head_mask is not None:
-            attention_probs = attention_probs * head_mask
+        if use_sdpa:
+            # SDPA's is_causal builds a TOP-LEFT-aligned triangular mask, which equals the
+            # tril buffer only when t == T. Under a KV cache (t < T) the queries are the
+            # LAST t positions, so is_causal would wrongly mask the cached keys — pass the
+            # sliced buffer explicitly there. An explicit attn_mask also gives up the flash
+            # backend for the mem-efficient one, so only take it when actually needed.
+            attn_bool = None
+            if causal_mask_slice is not None and not (active_mask is None and t == T):
+                attn_bool = causal_mask_slice != 0
+            if active_mask is not None:
+                pad_bool = active_mask.unsqueeze(1).unsqueeze(2) != 0
+                attn_bool = pad_bool if attn_bool is None else (attn_bool & pad_bool)
 
-        context_layer = torch.matmul(attention_probs, values)
+            context_layer = F.scaled_dot_product_attention(
+                queries, keys, values,
+                attn_mask=attn_bool,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                is_causal=(attn_bool is None and causal_mask_slice is not None),
+                scale=1.0 / math.sqrt(self.d_queries),
+            )
+        else:
+            attention_scores = torch.matmul(queries, keys.transpose(-1, -2))
+
+            if self.alibi_bias is not None:
+                # For ALiBi, we need the full position range
+                # Query positions: [position_offset, position_offset + t)
+                # Key positions: [0, T)
+                alibi_slice = self.alibi_bias[:, position_offset:position_offset + t, :T]
+                attention_scores = attention_scores + alibi_slice.unsqueeze(0).repeat(N, 1, 1, 1)
+
+            attention_scores = attention_scores / math.sqrt(self.d_queries)
+            if bool(self.use_grok_scaled_attn):
+                attention_scores = 30.0 * torch.tanh(attention_scores / 30.0)
+            elif self.config.attn_logit_cap is not None:
+                cap = self.config.attn_logit_cap
+                attention_scores = cap * torch.tanh(attention_scores / cap)
+
+            if causal_mask_slice is not None:
+                attention_scores = attention_scores.masked_fill(causal_mask_slice == 0, float("-inf"))
+
+            if active_mask is not None:
+                attention_scores = attention_scores.masked_fill(
+                    active_mask.unsqueeze(1).unsqueeze(2) == 0, float("-inf"))
+
+            attention_probs = F.softmax(attention_scores, dim=-1)
+            attention_probs = self.attn_dropout(attention_probs)
+
+            if head_mask is not None:
+                attention_probs = attention_probs * head_mask
+
+            context_layer = torch.matmul(attention_probs, values)
+
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
 
         new_context_layer_shape = context_layer.size()[:-2] + (self.d_values * self.n_heads,)
