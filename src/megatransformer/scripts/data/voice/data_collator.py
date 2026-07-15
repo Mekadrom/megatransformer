@@ -78,10 +78,6 @@ class VoiceDataCollator(DataCollator):
             padded_mel_specs, mel_spec_masks = pad_and_mask(all_mel_specs, all_mel_lengths)
         else:
             padded_mel_specs, mel_spec_masks = None, None
-        if all_f0_contour[0] is not None:
-            padded_c, _ = pad_and_mask(all_f0_contour, all_mel_lengths)
-            batch["f0_contour"] = torch.stack(padded_c)
-
         if all_f0[0] is not None:
             padded_f0, _ = pad_and_mask(all_f0, all_mel_lengths)
             padded_vuv, _ = pad_and_mask(all_vuv, all_mel_lengths)
@@ -119,6 +115,11 @@ class VoiceDataCollator(DataCollator):
 
         if padded_f0 is not None:
             batch["f0"] = torch.stack(padded_f0)  # [B, T]
+            if all_f0_contour[0] is not None:
+                # Speaker-normalized contour. 0-pad is fine: unvoiced frames are already 0
+                # and the F0 loss is voicing-weighted, so padding contributes nothing.
+                padded_c, _ = pad_and_mask(all_f0_contour, all_mel_lengths)
+                batch["f0_contour"] = torch.stack(padded_c)
             batch["vuv"] = torch.stack(padded_vuv)  # [B, T]
 
         if padded_ctc_tokens is not None:
