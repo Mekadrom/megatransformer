@@ -186,6 +186,10 @@ class WorldModelTrainer(CommonTrainer):
             label_smoothing=text_label_smoothing,
             ignore_index=TEXT_LOSS_IGNORE_INDEX,
         )
+        # Voice unit CE. Same ignore_index as text: the collator pads unit ids with -100
+        # because 0 is a REAL unit id, and padding supervised as unit 0 is exactly the bug
+        # the text targets had.
+        self.voice_unit_loss_fn = nn.CrossEntropyLoss(ignore_index=TEXT_LOSS_IGNORE_INDEX)
         self.latent_l1_loss = nn.L1Loss()
         self.latent_mse_loss = nn.MSELoss()
 
@@ -671,8 +675,43 @@ class WorldModelTrainer(CommonTrainer):
             total_loss = total_loss + self.audio_latent_loss_weight * audio_modality_loss
             loss_components.update(audio_components)
 
+        # Voice, DISCRETE path: cross-entropy over k-means units. Replaces the continuous
+        # regression below rather than supplementing it -- the two are different answers to
+        # the same question, and mixing them reintroduces the regression objective the
+        # units exist to escape. Regression lets the model be "approximately right" by
+        # extrapolating the audio history, which is solvable without the text (measured:
+        # cosine-sim ~0.02 to target, text-emb grad ~7e-4). CE forces it to NAME the unit.
+        voice_unit_logits = outputs.get("voice_unit_logits")
+        voice_unit_ids = inputs.get("voice_unit_ids")
+        used_unit_loss = False
+        if voice_unit_logits is not None and voice_unit_ids is not None:
+            B, T, K = voice_unit_logits.shape
+            tgt = voice_unit_ids[:, :T].to(voice_unit_logits.device).long()  # -100 = padding
+            if tgt.shape[1] < T:  # logits can outrun targets by the shifted-input frame
+                tgt = torch.nn.functional.pad(tgt, (0, T - tgt.shape[1]), value=-100)
+            unit_loss_raw = self.voice_unit_loss_fn(
+                voice_unit_logits.reshape(B * T, K), tgt.reshape(B * T),
+            )
+            # Whiten by log(K) — CE at uniform predictions is log(K) — so the weight is an
+            # honest emphasis multiplier and the number is comparable to the other losses:
+            # 1.0 = no better than guessing, 0 = perfect.
+            unit_loss_norm = unit_loss_raw / math.log(max(2, K))
+            total_loss = total_loss + self.voice_latent_loss_weight * unit_loss_norm
+            loss_components["voice_unit_ce_loss_raw"] = unit_loss_raw.detach()
+            loss_components["voice_unit_ce_loss_norm"] = unit_loss_norm.detach()
+            with torch.no_grad():
+                valid = tgt != -100
+                if valid.any():
+                    acc = (voice_unit_logits.argmax(-1)[valid] == tgt[valid]).float().mean()
+                    # THE metric: chance is 1/K. "Repeat the previous unit" scores ~30% on
+                    # this data, so beating ~0.30 is the first sign the text is being read.
+                    loss_components["voice_unit_accuracy"] = acc.detach()
+            used_unit_loss = True
+
         # Voice: whitened L1+MSE + variance-matching aux loss (masked by feature lengths)
         voice_latent_preds = outputs.get("voice_latent_preds")
+        if used_unit_loss:
+            voice_latent_preds = None  # discrete path owns the voice loss
         if voice_latent_preds is not None and voice_latent_labels is not None and voice_latent_preds.numel() > 0:
             voice_modality_loss, voice_components = self._compute_modality_recon_loss(
                 "voice_latent", voice_latent_preds, voice_latent_labels,
@@ -1378,6 +1417,7 @@ def load_model(args, device='cuda'):
                       getattr(args, 'max_seq_len', None) is not None or
                       _voice_feature_channels(args) is not None or
                       getattr(args, 'voice_prenet_dropout', 0.0) > 0.0 or
+                      getattr(args, 'voice_codebook_path', None) is not None or
                       getattr(args, 'mean_thinking_steps', None) is not None or
                       getattr(args, 'voice_stochastic_output', False))
     if needs_override:
@@ -1397,6 +1437,15 @@ def load_model(args, device='cuda'):
             # (recurrent.py:161-173), so patching it onto a built model would leave the
             # weights initialized for the old depth.
             config.recurrent_block_config.mean_thinking_steps = args.mean_thinking_steps
+        codebook_path = getattr(args, 'voice_codebook_path', None)
+        if codebook_path:
+            from megatransformer.utils.codebook import load_codebook
+            K = int(load_codebook(codebook_path).shape[0])
+            # Sizes the coda's classifier output layer, so it must be set before the model
+            # is built. Derived from the codebook itself rather than a flag: a mismatch
+            # between K and the codebook would be silent and catastrophic.
+            config.voice_coda_config.unit_vocab_size = K
+            print(f"[world] discrete voice units ON: K={K} from {codebook_path}", flush=True)
         voice_feature_channels = _voice_feature_channels(args)
         if voice_feature_channels is not None:
             # The prelude projects features -> d_model and the coda predicts d_model -> features,
@@ -1458,6 +1507,9 @@ def load_model(args, device='cuda'):
                 model.image_feature_extractor.input_norm = nn_mod.LayerNorm(lat_ch, elementwise_affine=False)
     if getattr(args, 'no_image_output_denorm', False) and model.image_generator is not None:
         model.image_generator.use_output_denorm = False
+    if getattr(args, 'voice_codebook_path', None):
+        from megatransformer.utils.codebook import load_codebook
+        model.set_voice_codebook(load_codebook(args.voice_codebook_path))
     if getattr(args, 'backprop_depth', None) is not None:
         model.recurrent_block.backprop_depth = args.backprop_depth
     if getattr(args, 'block_init_gain', None) is not None:
@@ -1815,6 +1867,17 @@ def add_cli_args(subparsers):
                             help="Audio hop length")
     sub_parser.add_argument("--sive_total_stride", type=int, default=4,
                             help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
+    sub_parser.add_argument("--voice_codebook_path", type=str, default=None,
+                            help="k-means codebook .pt (from scripts.data.voice.fit_codebook). Turns "
+                                 "ON the DISCRETE voice path: content features are snapped to their "
+                                 "nearest centroid on the fly, the voice coda gains a K-way classifier "
+                                 "(K read from the codebook), and the voice loss becomes cross-entropy "
+                                 "over units INSTEAD OF continuous regression. Regression is solvable "
+                                 "from the audio history alone, so the text earns no gradient and the "
+                                 "model converges to fluent babble; CE forces it to NAME the next unit, "
+                                 "which requires the text. MUST be the same codebook the SMG was trained "
+                                 "with -- a re-fit reorders centroids and silently maps every unit to "
+                                 "the wrong phoneme.")
     sub_parser.add_argument("--voice_prenet_dropout", type=float, default=0.0,
                             help="Tacotron-2 prenet dropout on the AUTOREGRESSIVE voice path "
                                  "(shifted teacher forcing in training, own-output feedback at "

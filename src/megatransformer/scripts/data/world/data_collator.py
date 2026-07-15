@@ -261,6 +261,7 @@ class MultimodalDataCollator(DataCollator):
         all_ctc_tokens = []
         all_ctc_lengths = []
         all_texts = []
+        all_unit_ids = []
 
         for ex in examples:
             all_waveforms.append(trim(ex.get(f"{prefix}_waveform", None), self.max_waveforms, dim=-1))
@@ -273,6 +274,7 @@ class MultimodalDataCollator(DataCollator):
             all_speaker_ids.append(ex.get(f"{prefix}_speaker_id", None))
             all_f0.append(trim(ex.get(f"{prefix}_f0", None), self.max_mel_spec_frames, dim=-1))
             all_vuv.append(trim(ex.get(f"{prefix}_vuv", None), self.max_mel_spec_frames, dim=-1))
+            all_unit_ids.append(trim(ex.get(f"{prefix}_unit_ids", None), self.max_sive_feature_frames, dim=-1))
             all_ctc_tokens.append(ex.get(f"{prefix}_ctc_tokens", None))
             all_ctc_lengths.append(ex.get(f"{prefix}_ctc_length", None))
             # Text key differs between audio and voice in dataset
@@ -292,6 +294,20 @@ class MultimodalDataCollator(DataCollator):
             batch[f"{prefix}_features"] = torch.stack(padded)
             batch[f"{prefix}_feature_lengths"] = torch.stack(all_feature_lengths)
             batch[f"{prefix}_feature_masks"] = torch.stack(masks)
+
+        if all_unit_ids[0] is not None:
+            # Pad with -100, NOT 0: 0 is a real unit id. pad_and_mask() pads with 0
+            # (it is the shared waveform/mel helper), which would silently supervise the
+            # coda to predict unit 0 across every padded frame — the exact bug the text
+            # targets had. Pad by hand so padding is the CE ignore_index.
+            T = max(int(u.shape[-1]) for u in all_unit_ids)
+            padded_units = []
+            for u, n in zip(all_unit_ids, all_feature_lengths):
+                n = int(n)
+                out = torch.full((T,), -100, dtype=torch.long)
+                out[:n] = u[:n].to(torch.long)
+                padded_units.append(out)
+            batch[f"{prefix}_unit_ids"] = torch.stack(padded_units)
 
         if all_mel_specs[0] is not None:
             padded, masks = pad_and_mask(all_mel_specs, all_mel_lengths)

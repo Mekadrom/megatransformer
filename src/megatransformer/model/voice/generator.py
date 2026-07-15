@@ -135,6 +135,14 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
             else:
                 self.output_norm = create_norm(coda_config.d_model, config.output_norm_type, config.norm_epsilon)
 
+        # Discrete-unit head: K-way classifier over a k-means codebook, parallel to the
+        # continuous regression head above. Both are computed when enabled; which one the
+        # trainer supervises (and which generate() consumes) is its choice, so an existing
+        # continuous config is bit-for-bit unchanged (unit_vocab_size=None => not built).
+        self.unit_vocab_size = getattr(config, "unit_vocab_size", None)
+        if self.unit_vocab_size:
+            self.unit_head = nn.Linear(coda_config.d_model, self.unit_vocab_size)
+
         # Stop prediction head: single linear → scalar logit per frame.
         # Predicts whether the current frame is the last real frame (or past it).
         self.stop_head = nn.Linear(coda_config.d_model, 1)
@@ -255,6 +263,12 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
             f"{self.prefix}_latent_preds": feature_preds,
             f"{self.prefix}_stop_logits": stop_logits,
         }
+
+        # (batch, seq_length, K) logits over the codebook. Read off the coda hidden state
+        # directly -- NOT off feature_preds -- so the unit head is a sibling of the
+        # regression head rather than a consumer of it.
+        if self.unit_vocab_size:
+            outputs[f"{self.prefix}_unit_logits"] = self.unit_head(h)
 
         # Heteroscedastic log-variance (parallel head, off the coda hidden state).
         # feature_preds above is the Gaussian MEAN; this is per-frame log-variance

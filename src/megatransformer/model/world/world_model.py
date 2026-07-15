@@ -66,6 +66,13 @@ class MegaTransformerWorldModel(nn.Module):
             if "image" in self.include_modes else None
         )
 
+        # k-means codebook for the discrete voice path, set by the trainer via
+        # set_voice_codebook(). generate() emits CENTROIDS rather than the regression
+        # head's frames, so the SMG receives the same manifold it was trained on. A
+        # buffer so it follows .to(device) and persists in the checkpoint -- the codebook
+        # is not optional metadata, it defines what the predicted unit ids MEAN.
+        self.register_buffer("voice_codebook", None, persistent=True)
+
         # Token alignment
         self.token_interleaver = TokenInterleaver(config.token_interleaver_config)
         self.token_uninterleaver = TokenUninterleaver()
@@ -202,6 +209,15 @@ class MegaTransformerWorldModel(nn.Module):
         config = MegaTransformerWorldModelConfig(**config_dict)
 
         return cls(config)
+
+    def set_voice_codebook(self, centroids):
+        """Install the (K, D) k-means codebook used by the discrete voice path.
+
+        Must be the SAME codebook the dataset quantizes with and the SMG was trained on:
+        unit ids are only meaningful relative to a codebook, and a re-fit reorders the
+        centroids, silently mapping every unit to the wrong phoneme.
+        """
+        self.voice_codebook = None if centroids is None else centroids.float()
 
     def forward(
         self,
@@ -793,6 +809,7 @@ class MegaTransformerWorldModel(nn.Module):
         # diagnose why a budget-hit occurred (flat at -5 → head not learning;
         # rising but < 0 → distribution-shift; crosses 0 late → positional bias).
         voice_stop_logit_trace: List[List[float]] = [[] for _ in range(batch_size)]
+        voice_unit_id_trace: List[List[int]] = [[] for _ in range(batch_size)]
         audio_stop_logit_trace: List[List[float]] = [[] for _ in range(batch_size)]
 
         # Process initial prompt — replace placeholders with media if provided.
@@ -1110,18 +1127,35 @@ class MegaTransformerWorldModel(nn.Module):
                         )
                         voice_coda_kv_caches[b] = coda_out.get("kv_caches")
                         voice_coda_position_offsets[b] += 1
-                        frame_pred = coda_out["voice_latent_preds"]  # (1, C, 1) = Gaussian mean
-                        # Heteroscedastic sampling: if the coda emitted a log-variance
-                        # and temperature > 0, draw the frame from N(mu, (temp*std)^2).
-                        # The sampled frame is BOTH emitted and fed back to the prelude
-                        # at the next step (so downstream context sees the sample, not
-                        # the mean). temperature 0 or a deterministic coda => mean.
-                        voice_logvar = coda_out.get("voice_latent_logvar")
-                        if voice_logvar is not None and voice_temperature > 0.0:
-                            std = torch.exp(0.5 * voice_logvar)  # (1, C, 1)
-                            if voice_variance_floor > 0.0:
-                                std = std.clamp_min(voice_variance_floor)
-                            frame_pred = frame_pred + voice_temperature * std * torch.randn_like(frame_pred)
+                        unit_logits = coda_out.get("voice_unit_logits")
+                        if unit_logits is not None and self.voice_codebook is not None:
+                            # DISCRETE path: sample a unit id, emit its CENTROID. The
+                            # centroid (not the regression head's frame) is what gets fed
+                            # back to the prelude and handed to the SMG, so generation
+                            # stays on the same manifold the SMG was trained on.
+                            logits = unit_logits[0, -1]  # (K,)
+                            if voice_temperature > 0.0:
+                                probs = torch.softmax(logits.float() / voice_temperature, dim=-1)
+                                unit_id = torch.multinomial(probs, 1)[0]
+                            else:
+                                unit_id = logits.argmax(-1)
+                            voice_unit_id_trace[b].append(int(unit_id))
+                            frame_pred = self.voice_codebook[unit_id].to(
+                                device=hidden_b.device, dtype=coda_out["voice_latent_preds"].dtype
+                            ).view(1, -1, 1)  # (1, C, 1)
+                        else:
+                            frame_pred = coda_out["voice_latent_preds"]  # (1, C, 1) = Gaussian mean
+                            # Heteroscedastic sampling: if the coda emitted a log-variance
+                            # and temperature > 0, draw the frame from N(mu, (temp*std)^2).
+                            # The sampled frame is BOTH emitted and fed back to the prelude
+                            # at the next step (so downstream context sees the sample, not
+                            # the mean). temperature 0 or a deterministic coda => mean.
+                            voice_logvar = coda_out.get("voice_latent_logvar")
+                            if voice_logvar is not None and voice_temperature > 0.0:
+                                std = torch.exp(0.5 * voice_logvar)  # (1, C, 1)
+                                if voice_variance_floor > 0.0:
+                                    std = std.clamp_min(voice_variance_floor)
+                                frame_pred = frame_pred + voice_temperature * std * torch.randn_like(frame_pred)
                         voice_sequences[b].append(frame_pred.squeeze(0))  # (C, 1)
                         last_voice_pred[b] = frame_pred.squeeze(0)  # (C, 1)
                         # Check stop probability
@@ -1357,6 +1391,7 @@ class MegaTransformerWorldModel(nn.Module):
         # List-of-list Python objects (not tensors) since lengths vary per
         # batch item. Empty list when no voice/audio was generated.
         outputs["voice_stop_logit_trace"] = voice_stop_logit_trace
+        outputs["voice_unit_id_trace"] = voice_unit_id_trace
         outputs["audio_stop_logit_trace"] = audio_stop_logit_trace
 
         return outputs

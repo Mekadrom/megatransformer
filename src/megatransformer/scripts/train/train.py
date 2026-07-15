@@ -308,6 +308,9 @@ def get_dataset(command: str, args, split: str):
                 cache_size=args.shard_cache_size,
                 max_samples=max_samples,
                 include_tasks=include_tasks,
+                # Same codebook the SMG was trained with. Snaps voice features to centroids
+                # on the fly and emits unit_ids as the coda's cross-entropy target.
+                voice_codebook=getattr(args, "voice_codebook_path", None),
             )
     return dataset
 

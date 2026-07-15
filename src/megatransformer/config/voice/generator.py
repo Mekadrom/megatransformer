@@ -2,6 +2,8 @@ from dataclasses import dataclass
 import dataclasses
 import json
 
+from typing import Optional
+
 from megatransformer.config.common import MegaTransformerBlockConfig
 
 
@@ -17,6 +19,21 @@ class VoiceCodaAndSMGConfig:
     )
     n_layers: int = 1
     feature_channels: int = 128
+
+    # Discrete-unit output. When set to a codebook size K, the coda gains a K-way
+    # classifier head alongside the continuous regression head, and the trainer can
+    # supervise it with cross-entropy against k-means unit ids.
+    #
+    # Why this exists: trained to REGRESS continuous content frames, the model predicts
+    # frame t from the audio history alone -- L1/NLL only ask it to be approximately
+    # right, and "approximately right" is reachable by extrapolating acoustics, so the
+    # text earns no gradient and gets ignored (measured: cosine-sim to target ~0.02,
+    # text-embedding grad ~7e-4, fluent babble). Cross-entropy over units cannot be
+    # satisfied that way: the model has to NAME the next unit, and naming it requires
+    # the text. This is what VALL-E / SPEAR-TTS / AudioLM buy with discrete tokens.
+    #
+    # None = off; the coda is the continuous regressor it has always been.
+    unit_vocab_size: Optional[int] = None
     # "linear" (single linear, original) or "conv_refine" (linear + Conv1d refinement)
     output_mode: str = "linear"
 

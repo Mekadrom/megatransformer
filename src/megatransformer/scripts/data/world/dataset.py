@@ -7,6 +7,8 @@ import torch
 
 from torch.utils.data import Dataset
 
+from megatransformer.utils.codebook import load_codebook, quantize
+
 
 class MultimodalShardedDataset(Dataset):
     """
@@ -34,6 +36,7 @@ class MultimodalShardedDataset(Dataset):
         audio_columns: list[str] = None,
         voice_columns: list[str] = None,
         cache_size: int = 3,
+        voice_codebook=None,
         max_samples: int = None,
         include_tasks: list[str] = None,
     ):
@@ -93,6 +96,12 @@ class MultimodalShardedDataset(Dataset):
                 voice_synthesis_shard_dir, "voice:synthesis"
             )
 
+        # k-means codebook for the voice content features. When set, features are snapped
+        # to their nearest centroid ON THE FLY and unit ids are emitted as the coda's
+        # cross-entropy target. Must be the SAME codebook the SMG was trained with: the
+        # world model predicts unit ids the SMG has to interpret, and a re-fit reorders
+        # the centroids, silently mapping every unit to the wrong phoneme.
+        self.voice_centroids = load_codebook(voice_codebook) if voice_codebook is not None else None
         self.text_columns = text_columns
         self.audio_columns = audio_columns
         self.voice_columns = voice_columns
@@ -260,6 +269,15 @@ class MultimodalShardedDataset(Dataset):
         if "features" in shard and "features" in columns:
             sample["features"] = shard["features"][local_idx]
             sample["feature_length"] = shard["feature_lengths"][local_idx]
+            if self.voice_centroids is not None:
+                # Quantize per sample, in the dataloader workers, BEFORE padding — pad
+                # frames would otherwise snap to whichever unit sits nearest the origin.
+                feat, unit_ids = quantize(
+                    sample["features"], self.voice_centroids,
+                    length=int(sample["feature_length"]),
+                )
+                sample["features"] = feat
+                sample["unit_ids"] = unit_ids
 
         if "waveforms" in shard and "waveforms" in columns:
             sample["waveform"] = shard["waveforms"][local_idx]
