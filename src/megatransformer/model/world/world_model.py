@@ -1354,6 +1354,27 @@ class MegaTransformerWorldModel(nn.Module):
                 if all_done:
                     break
 
+        # Flush media still in progress when the max_new_tokens budget ran out.
+        #
+        # The in-loop flush fires only on the stop head or voice_token_budget, so a voice
+        # that is still streaming when the token budget expires would otherwise be dropped
+        # on the floor -- generate() returns NO voice at all rather than a truncated one.
+        # That is silent and it is worst exactly when you most want to look: an
+        # undertrained stop head does not fire, so every eval sample comes back empty and
+        # eval_voice_synthesis reports "No voice generated" for all of them. A truncated
+        # voice is still measurable; nothing is not.
+        for b in range(batch_size):
+            if voice_sequences[b] and self.voice_generator is not None:
+                completed_voice[b].append(torch.cat(voice_sequences[b], dim=-1))  # (C, T)
+                if voice_f0_seq[b]:
+                    completed_voice_f0[b].append(torch.cat(voice_f0_seq[b], dim=-1))  # (T,)
+                if voice_vuv_seq[b]:
+                    completed_voice_vuv[b].append(torch.cat(voice_vuv_seq[b], dim=-1))
+                voice_sequences[b], voice_f0_seq[b], voice_vuv_seq[b] = [], [], []
+            if audio_sequences[b] and self.audio_generator is not None:
+                completed_audio[b].append(torch.cat(audio_sequences[b], dim=-1))
+                audio_sequences[b] = []
+
         # Compile outputs
         outputs: Dict[str, torch.Tensor] = {}
 
