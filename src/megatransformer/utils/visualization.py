@@ -164,6 +164,37 @@ def render_attention_weights(
     return figures
 
 
+def render_feature_grid(
+    feats,
+    target_width: Optional[int] = None,
+) -> np.ndarray:
+    """Content features (SIVE / ContentVec) as a grayscale image: time on X, feature dim on Y.
+
+    Reads the texture of the features directly. Continuous ContentVec looks smooth along
+    time; k-means-quantized features look like a staircase, because every frame is snapped
+    to one of K centroids and adjacent frames sharing a unit produce identical columns.
+    That blockiness IS the prosody being discarded — which is the point of quantizing, and
+    the thing worth being able to see rather than infer.
+
+    Args:
+        feats: (D, T) features, channel-first — the layout the shards and preludes use.
+        target_width: upscale time to roughly this many pixels (repeat, so the staircase
+            stays crisp rather than being smoothed by interpolation). None = no upscale.
+
+    Returns:
+        (1, D', T') float array in [0, 1], row 0 = feature dim 0 at the BOTTOM, matching
+        origin="lower" and the SIVE callback's convention.
+    """
+    x = feats.detach().float().cpu().numpy() if torch.is_tensor(feats) else np.asarray(feats, dtype=np.float32)
+    x = (x - x.min()) / (x.max() - x.min() + 1e-8)
+    if target_width and x.shape[1] > 0:
+        ratio = max(1, target_width // x.shape[1])
+        if ratio > 1:
+            # repeat BOTH axes by the same factor so pixels stay square
+            x = np.repeat(np.repeat(x, ratio, axis=1), ratio, axis=0)
+    return x[::-1][np.newaxis]
+
+
 def render_vocoder_audio(
     vocoder: torch.nn.Module,
     mel_spec: torch.Tensor,

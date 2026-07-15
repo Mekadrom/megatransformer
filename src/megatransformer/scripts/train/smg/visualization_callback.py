@@ -285,6 +285,20 @@ class SMGVisualizationCallback(VisualizationCallback):
                     if is_vae:
                         recon_mu_only_trimmed = recon_mu_only_cpu[..., :mel_lengths]
 
+                    # The features the decoder actually RECEIVES, as a grayscale grid
+                    # (time on X, feature dim on Y). With --voice_codebook_path these are
+                    # k-means centroids, so this shows the quantization staircase directly
+                    # rather than leaving it to be inferred from losses.
+                    feat_len = sample.get("feature_lengths", None)
+                    feat_trimmed = features[0]
+                    if feat_len is not None:
+                        feat_trimmed = feat_trimmed[..., :int(feat_len[0])]
+                    metrics.log_image(
+                        f"eval_smg/input_features/{i}",
+                        visualization.render_feature_grid(feat_trimmed, target_width=int(mel_lengths)),
+                        global_step,
+                    )
+
                     # Log individual mel spectrograms
                     fig = visualization.render_mel_spectrogram(mel_trimmed, hop_length=self.voice_hop_length, sample_rate=self.voice_sample_rate, n_fft=self.voice_n_fft)
                     metrics.log_figure(f"eval_smg/original/{i}", fig, global_step)
