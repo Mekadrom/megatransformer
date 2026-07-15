@@ -10,6 +10,11 @@ from megatransformer.scripts.train.trainer import CommonTrainer
 from megatransformer.utils import model_loading_utils, megatransformer_utils, metrics
 
 
+# Target value for text positions the CE must not supervise (batch padding). Cannot be 0:
+# the collator pads token ids with 0, which is a real vocab entry (<unk> for Mistral).
+TEXT_LOSS_IGNORE_INDEX = -100
+
+
 class WorldModelTrainer(CommonTrainer):
     """
     Trainer for the multimodal world model.
@@ -171,7 +176,10 @@ class WorldModelTrainer(CommonTrainer):
         self.gan_start_condition_value = None
 
         # Loss functions
-        self.text_loss_fn = nn.CrossEntropyLoss(label_smoothing=text_label_smoothing)
+        self.text_loss_fn = nn.CrossEntropyLoss(
+            label_smoothing=text_label_smoothing,
+            ignore_index=TEXT_LOSS_IGNORE_INDEX,
+        )
         self.latent_l1_loss = nn.L1Loss()
         self.latent_mse_loss = nn.MSELoss()
 
@@ -419,6 +427,17 @@ class WorldModelTrainer(CommonTrainer):
             for pid in placeholder_ids:
                 non_ph_mask_full &= (full_ids != pid)
 
+            # The collator right-pads text_token_ids with token id 0 (pad_and_mask), which is a
+            # real vocab entry (<unk> for Mistral) — not a reserved pad slot. Pad targets must
+            # therefore become -100 (the CE ignore_index) rather than staying 0, or the model is
+            # supervised to emit <unk> after EOS. text_token_masks marks valid positions (1.0)
+            # vs padding (0.0); it rides the same shifts as the ids so the two stay aligned.
+            token_masks = inputs.get("text_token_masks")
+            if token_masks is not None:
+                valid_full = token_masks.bool()
+            else:
+                valid_full = torch.ones_like(full_ids, dtype=torch.bool)
+
             # Model input: keep placeholders for the interleaver
             text_input_ids = full_ids[:, :-1].contiguous()
 
@@ -430,20 +449,26 @@ class WorldModelTrainer(CommonTrainer):
             target_list = []
             for b in range(full_ids.shape[0]):
                 clean = full_ids[b][non_ph_mask_full[b]]  # non-PH tokens in order
+                clean_valid = valid_full[b][non_ph_mask_full[b]]  # same positions, same order
                 shifted = clean[1:]  # causal shift: predict next non-PH token
+                shifted = shifted.masked_fill(~clean_valid[1:], TEXT_LOSS_IGNORE_INDEX)
                 K = non_ph_input[b].sum().item()  # number of logits this item will produce
                 # Truncate or pad targets to exactly K
                 if shifted.shape[0] >= K:
                     target_list.append(shifted[:K])
                 else:
-                    target_list.append(torch.cat([shifted, shifted.new_zeros(K - shifted.shape[0])]))
+                    target_list.append(torch.cat([
+                        shifted, shifted.new_full((K - shifted.shape[0],), TEXT_LOSS_IGNORE_INDEX)
+                    ]))
 
             # Pad and stack targets across batch
             max_len = max(t.shape[0] for t in target_list)
             padded_targets = []
             for t in target_list:
                 if t.shape[0] < max_len:
-                    padded_targets.append(torch.cat([t, t.new_zeros(max_len - t.shape[0])]))
+                    padded_targets.append(torch.cat([
+                        t, t.new_full((max_len - t.shape[0],), TEXT_LOSS_IGNORE_INDEX)
+                    ]))
                 else:
                     padded_targets.append(t)
             text_targets = torch.stack(padded_targets)  # [B, T_text]
