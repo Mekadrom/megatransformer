@@ -930,34 +930,48 @@ class WorldModelTrainer(CommonTrainer):
         return groups
 
     def _log_precision_once(self, model):
-        """Print the ACTIVE compute precision on the first training step.
+        """Report the ACTIVE compute precision, probed from INSIDE the model's forward.
 
-        Checking parameter dtype is misleading here: HF's --bf16 keeps master weights in
-        fp32 and casts per-op via autocast, so params read float32 even when bf16 is
-        working correctly. The ground truth is whether autocast is live inside
-        compute_loss (HF wraps it in compute_loss_context_manager) and at what dtype —
-        that is what actually decides whether the matmuls hit the bf16 tensor cores.
+        Every obvious place to check this lies:
+          - Parameter dtype reads float32 even when bf16 works: --bf16 keeps fp32 master
+            weights and casts per-op.
+          - torch.is_autocast_enabled() in compute_loss is always False on GPU. HF's
+            autocast_smart_context_manager (trainer.py:3969) returns nullcontext for
+            anything but CPU AMP.
+          - Model output dtype is always fp32: Accelerate wraps forward in
+            convert_outputs_to_fp32(autocast(...)) (accelerator.py:1780).
+
+        Accelerate applies autocast around model.forward, so the only honest probe is a
+        hook on a SUBMODULE, which runs inside that context. The hook prints once and
+        removes itself.
         """
-        if getattr(self, "_precision_logged", False):
+        if getattr(self, "_precision_probe_installed", False):
             return
-        self._precision_logged = True
+        self._precision_probe_installed = True
 
-        autocast_on = torch.is_autocast_enabled()
-        try:
-            autocast_dtype = torch.get_autocast_dtype("cuda")
-        except (AttributeError, TypeError):  # torch < 2.4
-            autocast_dtype = torch.get_autocast_gpu_dtype()
+        unwrapped = model.module if hasattr(model, "module") else model
+        target = getattr(unwrapped, "recurrent_block", None) or unwrapped
+        handle = {}
 
-        param_dtype = next((p.dtype for p in model.parameters()), None)
-        print(
-            f"[precision] autocast={'ON' if autocast_on else 'OFF'} "
-            f"autocast_dtype={autocast_dtype if autocast_on else 'n/a'} | "
-            f"args.bf16={self.args.bf16} args.fp16={self.args.fp16} | "
-            f"param_dtype={param_dtype} (fp32 is EXPECTED under autocast) | "
-            f"tf32_matmul={torch.backends.cuda.matmul.allow_tf32} "
-            f"tf32_cudnn={torch.backends.cudnn.allow_tf32}",
-            flush=True,
-        )
+        def _probe(_module, _args):
+            autocast_on = torch.is_autocast_enabled()
+            try:
+                autocast_dtype = torch.get_autocast_dtype("cuda")
+            except (AttributeError, TypeError):  # torch < 2.4
+                autocast_dtype = torch.get_autocast_gpu_dtype()
+            mixed = getattr(getattr(self, "accelerator", None), "mixed_precision", "<none>")
+            print(
+                f"[precision] autocast_in_model={'ON' if autocast_on else 'OFF'} "
+                f"dtype={autocast_dtype if autocast_on else 'n/a'} | "
+                f"accelerate.mixed_precision={mixed} | "
+                f"args.bf16={self.args.bf16} args.fp16={self.args.fp16} | "
+                f"tf32_matmul={torch.backends.cuda.matmul.allow_tf32}",
+                flush=True,
+            )
+            if handle.get("h") is not None:
+                handle["h"].remove()
+
+        handle["h"] = target.register_forward_pre_hook(_probe)
 
     def _log_grad_norms(self, global_step):
         """Compute and log L2 and RMS gradient norms per module group."""
