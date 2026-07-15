@@ -725,7 +725,8 @@ class SIVEVisualizationCallback(VisualizationCallback):
 
             # Generate audio from mel spectrogram
             try:
-                waveform = visualization.render_vocoder_audio(self.vocoder, mel_cropped)
+                waveform = visualization.render_vocoder_audio(self.vocoder, mel_cropped,
+                                                              mel_hop_length=self.voice_hop_length)
                 metrics.log_audio(f"audio_samples/sample_{i}", waveform, step, self.voice_sample_rate)
             except Exception as e:
                 print(f"Failed to generate audio with vocoder: {e}")

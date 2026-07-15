@@ -58,9 +58,7 @@ class SMGVisualizationCallback(VisualizationCallback):
         SMG mel hop (voice_hop_length) differs from the vocoder's — e.g. a 50 Hz
         ContentVec mel @hop320 driving a 62.5 Hz @hop256 vocoder. No-op when equal."""
         return visualization.render_vocoder_audio(
-            self.vocoder, mel,
-            mel_hop_length=self.voice_hop_length,
-            vocoder_hop_length=getattr(getattr(self.vocoder, "config", None), "hop_length", self.voice_hop_length),
+            self.vocoder, mel, mel_hop_length=self.voice_hop_length,
         )
 
     def on_evaluate(self, args, state, control, model=None, **kwargs):

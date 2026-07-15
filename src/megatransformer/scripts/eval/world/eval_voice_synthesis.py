@@ -46,6 +46,10 @@ def parse_args():
     p.add_argument("--save_audio", type=str, default=None,
                    help="Directory to save generated .wav files")
     p.add_argument("--sample_rate", type=int, default=16000)
+    p.add_argument("--mel_hop_length", type=int, default=320,
+                   help="Hop the SMG's mel output is at. 320 = 50 Hz (ContentVec-rate SMG, "
+                        "the 1x decoder configs); 256 = 62.5 Hz (SIVE-rate SMG). Resampled to "
+                        "the vocoder's own rate before synthesis when the two differ.")
     p.add_argument("--split", type=str, default="val", help="Dataset split (train/val)")
     p.add_argument("--log_dir", type=str, default=None, help="TensorBoard log dir for metrics")
     p.add_argument("--step", type=int, default=None, help="Step number (inferred from checkpoint path if omitted)")
@@ -109,10 +113,15 @@ def decode_sive_to_mel(smg_decoder, latent, speaker_embedding):
     return mel[0].float().cpu()
 
 
-def mel_to_waveform(vocoder, mel):
-    """Decode mel (n_mels, T) → waveform (samples,)."""
+def mel_to_waveform(vocoder, mel, mel_hop_length=None):
+    """Decode mel (n_mels, T) → waveform (samples,).
+
+    mel_hop_length is the rate the SMG emits at; render_vocoder_audio resamples to the
+    vocoder's own rate when they differ. Without it a 50 Hz mel plays 1.25x too fast
+    through the 62.5 Hz HiFi-GAN, which also skews every metric computed downstream.
+    """
     from megatransformer.utils.visualization import render_vocoder_audio
-    return render_vocoder_audio(vocoder, mel)
+    return render_vocoder_audio(vocoder, mel, mel_hop_length=mel_hop_length)
 
 
 def compute_mcd(pred_mel, target_mel, n_mfcc=13):
@@ -279,7 +288,7 @@ def main():
             if args.save_audio and vocoder is not None:
                 try:
                     import torchaudio
-                    gen_wav = mel_to_waveform(vocoder, gen_mel)
+                    gen_wav = mel_to_waveform(vocoder, gen_mel, mel_hop_length=args.mel_hop_length)
                     if gen_wav is not None:
                         if gen_wav.dim() == 1:
                             gen_wav = gen_wav.unsqueeze(0)
@@ -288,7 +297,7 @@ def main():
                             gen_wav.cpu(), args.sample_rate,
                         )
                     if target_mel is not None:
-                        tgt_wav = mel_to_waveform(vocoder, target_mel)
+                        tgt_wav = mel_to_waveform(vocoder, target_mel, mel_hop_length=args.mel_hop_length)
                         if tgt_wav is not None:
                             if tgt_wav.dim() == 1:
                                 tgt_wav = tgt_wav.unsqueeze(0)

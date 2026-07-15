@@ -349,7 +349,8 @@ def render_samples(dec, feats, mels, embs, spks, gens, eval_idx, vocoder, args, 
                        (f"xref_spk{spk_j}_{gj}", mels[j])]
             for tag, mel in renders:
                 try:
-                    wav = visualization.render_vocoder_audio(vocoder, mel.to(torch.float32))
+                    wav = visualization.render_vocoder_audio(vocoder, mel.to(torch.float32),
+                                                            mel_hop_length=args.voice_hop_length)
                     wav = np.clip(np.asarray(wav), -1, 1)
                     wavfile.write(os.path.join(out, f"sample{k}_spk{int(spks[i])}_{gmap[gi]}_{tag}.wav"),
                                   args.voice_sample_rate, (wav * 32767).astype(np.int16))
@@ -409,7 +410,8 @@ def spectral_gender_analysis(dec, feats, mels, embs, gens, eval_idx, vocoder, ar
     os.makedirs(out_dir, exist_ok=True)
 
     def _f0(mel):
-        wav = np.asarray(visualization.render_vocoder_audio(vocoder, mel.to(torch.float32)))
+        wav = np.asarray(visualization.render_vocoder_audio(vocoder, mel.to(torch.float32),
+                                                            mel_hop_length=args.voice_hop_length))
         w = torch.tensor(np.clip(wav, -1, 1), dtype=torch.float32).unsqueeze(0)
         pitch, period = torchcrepe.predict(
             w, 16000, hop_length=256, fmin=50.0, fmax=550.0, model="full",

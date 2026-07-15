@@ -175,19 +175,28 @@ def render_vocoder_audio(
     Args:
         vocoder: Vocoder model.
         mel_spec: Mel spectrogram, shape (n_mels, T) or (B, n_mels, T).
-        mel_hop_length: hop the incoming mel was computed at (e.g. 320 = 50 Hz).
-        vocoder_hop_length: hop the vocoder was trained at (e.g. 256 = 62.5 Hz).
-            If both are given and differ, the mel is resampled along the TIME axis to
-            the vocoder's frame rate before synthesis (new_T = T * mel_hop/voc_hop) —
-            lets a 50 Hz SMG mel drive the existing 62.5 Hz vocoder without a retrain.
-            The frequency params (n_mels/fmin/fmax/log-scale) must still match. Both
-            None (default) = no resample, so existing callers are unaffected.
+        mel_hop_length: hop the incoming mel was computed at (e.g. 320 = 50 Hz). This is
+            the one thing this function cannot work out for itself, so pass it whenever
+            the mel might not be at the vocoder's native rate. Leaving it None means
+            "assume it already matches" and skips the resample.
+        vocoder_hop_length: hop the vocoder was trained at (e.g. 256 = 62.5 Hz). Defaults
+            to the vocoder's own `config.hop_length` when it advertises one, so callers
+            normally only need to pass mel_hop_length. Pass explicitly to override.
+
+    When the two differ, the mel is resampled along the TIME axis to the vocoder's frame
+    rate before synthesis (new_T = T * mel_hop/voc_hop) — this lets a 50 Hz SMG mel drive
+    the existing 62.5 Hz vocoder without a retrain. Interpolation is linear; F.interpolate
+    has no cubic mode for 3D (B, n_mels, T) input. The FREQUENCY params (n_mels/fmin/fmax/
+    log-scale) are not touched and must already match, or you get shaped-correctly noise.
 
     Returns:
         Waveform as 1D numpy float32 array, normalized to [-1, 1].
     """
     if mel_spec.dim() == 2:
         mel_spec = mel_spec.unsqueeze(0)
+
+    if vocoder_hop_length is None:
+        vocoder_hop_length = getattr(getattr(vocoder, "config", None), "hop_length", None)
 
     if (mel_hop_length is not None and vocoder_hop_length is not None
             and mel_hop_length != vocoder_hop_length):
