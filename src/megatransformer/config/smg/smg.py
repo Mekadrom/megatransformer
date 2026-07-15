@@ -339,9 +339,10 @@ SMG_CONFIGS = {
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
-    "small_decoder_only_1d_snake": SMGConfig(
-        decoder_1d_config=SMG_DECODER_1D_CONFIGS["small_snake"],
-        f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
+    "medium_decoder_only_1d_1x_f0contourinput": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_1x"],
+        f0_predictor_config=F0PredictorConfig(encoder_dim=1),
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+        f0_predictor_input="contour",
     ),
 }

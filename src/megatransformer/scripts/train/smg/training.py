@@ -355,6 +355,9 @@ class SMGTrainer(CommonTrainer):
         speaker_embedding = inputs["speaker_embeddings"]
         f0 = inputs["f0"]
         vuv = inputs["vuv"]
+        # Speaker-normalized contour, present only when the codebook carries F0 stats.
+        # Read by the predictor when the SMG is configured f0_predictor_input="contour".
+        f0_contour = inputs.get("f0_contour")
         source_speaker_ids = inputs.get("speaker_ids")  # [B]; used by the identity_swap_bank exclusion
 
         # Compute KL weight multiplier for KL annealing (ramps from 0 to 1)
@@ -377,6 +380,7 @@ class SMGTrainer(CommonTrainer):
             return_film_stats=self.log_film_stats,
             target_f0=f0,
             target_voiced=vuv,
+            f0_contour=f0_contour,
             use_gt_f0=use_gt_f0,
         )
         mu = None
@@ -399,7 +403,7 @@ class SMGTrainer(CommonTrainer):
         mu_only_recon_loss = torch.tensor(0.0, device=mel_specs.device)
         if mu is not None and self.mu_only_recon_weight > 0:
             # Decode mu directly (no reparameterization noise)
-            recon_mu_only = model.decode(mu.detach(), speaker_embedding=decode_speaker_embedding, features=features)[..., :mel_specs.shape[-1]]
+            recon_mu_only = model.decode(mu.detach(), speaker_embedding=decode_speaker_embedding, features=features, f0_contour=f0_contour)[..., :mel_specs.shape[-1]]
 
             # Compute masked loss if mask is available (prevents optimizing padded regions)
             if mel_spec_masks is not None:
@@ -479,7 +483,7 @@ class SMGTrainer(CommonTrainer):
                 with autocast(mel_specs.device.type, dtype=_dt, enabled=self.args.fp16 or self.args.bf16):
                     perm = torch.roll(torch.arange(decode_speaker_embedding.shape[0],
                                                    device=decode_speaker_embedding.device), shifts=1)
-                    rw = model.decode(features, speaker_embedding=decode_speaker_embedding[perm], features=features)
+                    rw = model.decode(features, speaker_embedding=decode_speaker_embedding[perm], features=features, f0_contour=f0_contour)
                     if rw.dim() == 4 and rw.shape[1] == 1:
                         rw = rw.squeeze(1)
                     recon_wrong = rw[..., :recon.shape[-1]]
@@ -845,7 +849,7 @@ class SMGTrainer(CommonTrainer):
 
             # Decode with shuffled speaker embeddings
             # Pass features for F0 prediction if enabled
-            recon_shuffled = model.decode(features, speaker_embedding=shuffled_speaker_embedding, features=features)
+            recon_shuffled = model.decode(features, speaker_embedding=shuffled_speaker_embedding, features=features, f0_contour=f0_contour)
 
             # Handle 2D decoder output: [B, 1, 80, T] -> [B, 80, T]
             if recon_shuffled.dim() == 4 and recon_shuffled.shape[1] == 1:
@@ -933,7 +937,7 @@ class SMGTrainer(CommonTrainer):
                 emb_swapped = emb_own[perm]
 
             # Swapped output = one extra decode (the only backpropped half).
-            recon_swap = model.decode(features, speaker_embedding=emb_swapped, features=features)[..., :mel_specs.shape[-1]]
+            recon_swap = model.decode(features, speaker_embedding=emb_swapped, features=features, f0_contour=f0_contour)[..., :mel_specs.shape[-1]]
             if recon_swap.dim() == 4 and recon_swap.shape[1] == 1:
                 recon_swap = recon_swap.squeeze(1)
 

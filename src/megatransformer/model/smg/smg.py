@@ -972,7 +972,16 @@ class SMG(nn.Module):
         """
         if self.f0_predictor_input == "contour":
             if f0_contour is None:
-                return None
+                # Loudly. Falling back to no F0 conditioning would produce flat delivery
+                # that looks like a modelling failure rather than a missing argument --
+                # and this SMG is trained on prosody-free units, so F0 is the ONLY place
+                # prosody can come from. A caller that forgot it wants to know now.
+                raise ValueError(
+                    "f0_predictor_input='contour' but no f0_contour was passed. This SMG "
+                    "reads a speaker-normalized contour (from the world model's F0 head), "
+                    "not content features — its input carries no prosody. Pass f0_contour=, "
+                    "or f0_embedding= to bypass the predictor entirely."
+                )
             return f0_contour.unsqueeze(1) if f0_contour.dim() == 2 else f0_contour  # (B, 1, T)
         return features
 

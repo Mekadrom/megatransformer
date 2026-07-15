@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from megatransformer.scripts.data.dataset import ShardAwareSampler
-from megatransformer.utils.codebook import load_codebook, quantize
+from megatransformer.utils.codebook import load_codebook, load_f0_stats, normalize_f0, quantize
 
 
 class VoiceShardedDataset(Dataset):
@@ -53,6 +53,10 @@ class VoiceShardedDataset(Dataset):
         self.cache_size = cache_size
         self.columns = columns
         self.centroids = load_codebook(codebook) if codebook is not None else None
+        # Per-speaker log-F0 stats ride in the same artifact. Needed when the SMG is
+        # configured with f0_predictor_input="contour": its predictor then denormalizes a
+        # speaker-normalized contour rather than inferring pitch from prosody-free units.
+        self.f0_stats = load_f0_stats(codebook) if codebook is not None else None
 
         if not self.columns or len(self.columns) == 0:
             self.columns = [
@@ -202,6 +206,9 @@ class VoiceShardedDataset(Dataset):
         # Add F0 data if available
         if "f0" in shard and "f0" in self.columns:
             sample["f0"] = shard["f0"][local_idx]
+            if self.f0_stats is not None:
+                sid = int(shard["speaker_ids"][local_idx]) if "speaker_ids" in shard else -1
+                sample["f0_contour"] = normalize_f0(shard["f0"][local_idx].float(), sid, self.f0_stats)
 
         if "vuv" in shard and "vuv" in self.columns:
             sample["vuv"] = shard["vuv"][local_idx]

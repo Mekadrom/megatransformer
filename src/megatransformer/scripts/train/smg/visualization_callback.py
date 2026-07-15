@@ -182,6 +182,11 @@ class SMGVisualizationCallback(VisualizationCallback):
                         target_f0 = sample_f0[..., :mel_lengths].to(device)  # [1, T]
                         target_voiced = sample_voiced[..., :mel_lengths].to(device)  # [1, T]
 
+                    # Present only when the codebook carries F0 stats; required when the
+                    # SMG is configured f0_predictor_input="contour".
+                    sc = sample.get("f0_contour", None)
+                    sample_contour = sc[..., :mel_lengths].to(device) if sc is not None else None
+
                     spk_emb = speaker_embeddings.to(device)
 
                     if i == 0 and target_f0 is not None:
@@ -205,6 +210,7 @@ class SMGVisualizationCallback(VisualizationCallback):
                             speaker_embedding=spk_emb,
                             target_f0=target_f0,
                             target_voiced=target_voiced,
+                            f0_contour=sample_contour,
                             mask=mel_spec_masks
                         )
                         mu = None
@@ -226,6 +232,10 @@ class SMGVisualizationCallback(VisualizationCallback):
                     # Store sample data for cross-speaker reconstruction later
                     eval_samples_data.append({
                         "features": features,  # [1, C, H, W]
+                        # Speaker-NORMALIZED, so it transfers across speakers unchanged:
+                        # for the cross-speaker swaps below, keep the intonation and let
+                        # the predictor rescale it to the target speaker via their ECAPA.
+                        "f0_contour": sample_contour,
                         "mel": mel,  # [1, n_mels, T]
                         "speaker_embedding": speaker_embeddings,  # [192] or None (pretrained)
                         "mu": mu.cpu() if mu is not None else None,  # [1, C, H, W]
@@ -235,7 +245,7 @@ class SMGVisualizationCallback(VisualizationCallback):
                     if is_vae:
                         # Generate mu-only reconstruction (no sampling, z = mu)
                         # This is what diffusion will see during inference
-                        recon_mu_only = model.decode(mu, speaker_embedding=decode_spk_emb, features=features)
+                        recon_mu_only = model.decode(mu, speaker_embedding=decode_spk_emb, features=features, f0_contour=sample_contour)
 
                     if is_vae:
                         kl_per_element: torch.Tensor = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
@@ -440,7 +450,7 @@ class SMGVisualizationCallback(VisualizationCallback):
 
                         # For cross-speaker, use source features with target speaker for F0 prediction
                         features_a = sample_a["features"].to(device)
-                        cross_recon_a_with_b = model.decode(z_a, speaker_embedding=spk_emb_b, features=features_a)
+                        cross_recon_a_with_b = model.decode(z_a, speaker_embedding=spk_emb_b, features=features_a, f0_contour=sample_a.get("f0_contour"))
 
                         # Reconstruct B's content with A's speaker embedding
                         if is_vae:
@@ -458,7 +468,7 @@ class SMGVisualizationCallback(VisualizationCallback):
                             spk_emb_a = sample_a["speaker_embedding"].to(device)
 
                         features_b = sample_b["features"].to(device)
-                        cross_recon_b_with_a = model.decode(z_b, speaker_embedding=spk_emb_a, features=features_b)
+                        cross_recon_b_with_a = model.decode(z_b, speaker_embedding=spk_emb_a, features=features_b, f0_contour=sample_b.get("f0_contour"))
 
                         # Log A with B's speaker
                         mel_a_trimmed = sample_a["mel"].squeeze(0).cpu().numpy()[..., :sample_a["mel_length"]]
