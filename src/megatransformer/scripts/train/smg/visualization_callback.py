@@ -201,6 +201,7 @@ class SMGVisualizationCallback(VisualizationCallback):
                             speaker_embedding=spk_emb,
                             target_f0=target_f0,
                             target_voiced=target_voiced,
+                            f0_contour=sample_contour,
                             mask=mel_spec_masks
                         )
                     else:

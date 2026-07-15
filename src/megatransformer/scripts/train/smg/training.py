@@ -1204,9 +1204,22 @@ class SMGTrainer(CommonTrainer):
             mel_spec_lengths = inputs.get("mel_lengths", None)
             mel_spec_masks = inputs.get("mel_spec_masks", None)
             speaker_embeddings = inputs.get("speaker_embeddings", None)
+            # F0 was never passed here, so the eval F0/VUV losses were silently zero --
+            # the same latent gap the "voiced"/"vuv" key mismatch left in the viz callback.
+            # It only surfaced once f0_predictor_input='contour' made a missing contour a
+            # hard error instead of a quiet degradation.
+            f0 = inputs.get("f0", None)
+            vuv = inputs.get("vuv", None)
+            f0_contour = inputs.get("f0_contour", None)
 
             # Move to device
             mel_spec = mel_spec.to(self.args.device)
+            if f0 is not None:
+                f0 = f0.to(self.args.device)
+            if vuv is not None:
+                vuv = vuv.to(self.args.device)
+            if f0_contour is not None:
+                f0_contour = f0_contour.to(self.args.device)
 
             if mel_spec_lengths is not None:
                 mel_spec_lengths = mel_spec_lengths.to(self.args.device)
@@ -1224,6 +1237,13 @@ class SMGTrainer(CommonTrainer):
                     target=mel_spec,
                     mask=mel_spec_masks,
                     speaker_embedding=speaker_embeddings,
+                    target_f0=f0,
+                    target_voiced=vuv,
+                    f0_contour=f0_contour,
+                    # Match training: with --f0_warmup_use_gt_steps the decoder is
+                    # conditioned on GT F0, so eval must be too or its loss measures a
+                    # different model than the one being trained.
+                    use_gt_f0=(self.f0_warmup_use_gt_steps > 0 and f0 is not None and vuv is not None),
                 )
 
                 loss = losses["total_loss"]
