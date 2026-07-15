@@ -66,6 +66,9 @@ class WorldModelTrainer(CommonTrainer):
         voice_beta_nll: float = 0.5,
         # Per-frame probability of feeding the model's own prediction instead of ground
         # truth on the AR path, ramped from 0. 0 = off (pure teacher forcing).
+        # F0/VUV head weights. Voicing-weighted L1 on log-F0 + BCE on voicing.
+        voice_f0_loss_weight: float = 1.0,
+        voice_vuv_loss_weight: float = 1.0,
         voice_scheduled_sampling_prob: float = 0.0,
         voice_scheduled_sampling_ramp_steps: int = 10000,
         # Modality flags
@@ -120,6 +123,8 @@ class WorldModelTrainer(CommonTrainer):
         self.audio_stop_loss_weight = audio_stop_loss_weight
         self.voice_stop_loss_weight = voice_stop_loss_weight
         self.voice_beta_nll = voice_beta_nll
+        self.voice_f0_loss_weight = voice_f0_loss_weight
+        self.voice_vuv_loss_weight = voice_vuv_loss_weight
         self.voice_scheduled_sampling_prob = voice_scheduled_sampling_prob
         self.voice_scheduled_sampling_ramp_steps = voice_scheduled_sampling_ramp_steps
 
@@ -707,6 +712,47 @@ class WorldModelTrainer(CommonTrainer):
                     # this data, so beating ~0.30 is the first sign the text is being read.
                     loss_components["voice_unit_accuracy"] = acc.detach()
             used_unit_loss = True
+
+        # Voice F0/VUV: the prosody half of the split. Units carry content (CE above);
+        # this carries the contour. Voicing-weighted L1 on log-F0 + BCE on voicing,
+        # mirroring SMG.forward's own formulation exactly (smg.py:1113-1125) so the two
+        # models optimize the same quantity the same way and the world's contour is a
+        # drop-in for the SMG's predictor at inference.
+        voice_f0_preds = outputs.get("voice_f0_preds")
+        f0_tgt = inputs.get("voice_f0")
+        vuv_tgt = inputs.get("voice_vuv")
+        if voice_f0_preds is not None and f0_tgt is not None and vuv_tgt is not None:
+            T = voice_f0_preds.shape[-1]
+            f0_t = f0_tgt[..., :T].to(voice_f0_preds.device).float()
+            vuv_t = vuv_tgt[..., :T].to(voice_f0_preds.device).float()
+            if f0_t.shape[-1] < T:  # pad if targets are shorter than the coda's frames
+                pad = T - f0_t.shape[-1]
+                f0_t = torch.nn.functional.pad(f0_t, (0, pad))
+                vuv_t = torch.nn.functional.pad(vuv_t, (0, pad))
+            # Weight by voicing: F0 is undefined on unvoiced frames, so supervising them
+            # would train the head to fit noise. vuv is a soft 0-1 periodicity, not a mask.
+            vsum = vuv_t.sum().clamp(min=1e-8)
+            f0_loss = ((voice_f0_preds.float() - f0_t).abs() * vuv_t).sum() / vsum
+            total_loss = total_loss + self.voice_f0_loss_weight * f0_loss
+            loss_components["voice_f0_loss"] = f0_loss.detach()
+
+            vuv_logits = outputs.get("voice_vuv_logits")
+            if vuv_logits is not None and self.voice_vuv_loss_weight > 0:
+                vuv_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    vuv_logits.float(), vuv_t,
+                )
+                total_loss = total_loss + self.voice_vuv_loss_weight * vuv_loss
+                loss_components["voice_vuv_loss"] = vuv_loss.detach()
+
+            with torch.no_grad():
+                # Does the head recover the CONTOUR, or just the speaker's mean pitch?
+                # The SMG's predictor manages only ~4% over the mean baseline from
+                # (units, speaker); the coda has the text and should beat that clearly.
+                mask = vuv_t > 0.5
+                if mask.sum() > 8:
+                    mu = (f0_t * vuv_t).sum() / vsum
+                    mean_l1 = ((mu - f0_t).abs() * vuv_t).sum() / vsum
+                    loss_components["voice_f0_vs_mean_baseline"] = (f0_loss / mean_l1.clamp(min=1e-8)).detach()
 
         # Voice: whitened L1+MSE + variance-matching aux loss (masked by feature lengths)
         voice_latent_preds = outputs.get("voice_latent_preds")
@@ -1418,6 +1464,7 @@ def load_model(args, device='cuda'):
                       _voice_feature_channels(args) is not None or
                       getattr(args, 'voice_prenet_dropout', 0.0) > 0.0 or
                       getattr(args, 'voice_codebook_path', None) is not None or
+                      getattr(args, 'voice_predict_f0', False) or
                       getattr(args, 'mean_thinking_steps', None) is not None or
                       getattr(args, 'voice_stochastic_output', False))
     if needs_override:
@@ -1437,6 +1484,8 @@ def load_model(args, device='cuda'):
             # (recurrent.py:161-173), so patching it onto a built model would leave the
             # weights initialized for the old depth.
             config.recurrent_block_config.mean_thinking_steps = args.mean_thinking_steps
+        if getattr(args, 'voice_predict_f0', False):
+            config.voice_coda_config.predict_f0 = True
         codebook_path = getattr(args, 'voice_codebook_path', None)
         if codebook_path:
             from megatransformer.utils.codebook import load_codebook
@@ -1597,6 +1646,8 @@ def create_trainer(
         audio_stop_loss_weight=getattr(args, 'audio_stop_loss_weight', 1.0),
         voice_stop_loss_weight=getattr(args, 'voice_stop_loss_weight', 1.0),
         voice_beta_nll=getattr(args, 'voice_beta_nll', 0.5),
+        voice_f0_loss_weight=getattr(args, 'voice_f0_loss_weight', 1.0),
+        voice_vuv_loss_weight=getattr(args, 'voice_vuv_loss_weight', 1.0),
         voice_scheduled_sampling_prob=getattr(args, 'voice_scheduled_sampling_prob', 0.0),
         voice_scheduled_sampling_ramp_steps=getattr(args, 'voice_scheduled_sampling_ramp_steps', 10000),
         include_text="text" in include_modes,
@@ -1867,6 +1918,19 @@ def add_cli_args(subparsers):
                             help="Audio hop length")
     sub_parser.add_argument("--sive_total_stride", type=int, default=4,
                             help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
+    sub_parser.add_argument("--voice_predict_f0", action="store_true",
+                            help="Add F0 + VUV regression heads to the voice coda, beside the unit "
+                                 "classifier. Quantization strips prosody from the units by "
+                                 "construction, so the contour must come from somewhere; the SMG's own "
+                                 "F0 predictor sees only (units, speaker) and recovers ~4% of "
+                                 "within-utterance F0 variation over predicting the speaker's mean "
+                                 "pitch, because neither input knows the sentence is a question. The "
+                                 "coda sits on text conditioning and can. Pair with "
+                                 "--voice_f0_loss_weight / --voice_vuv_loss_weight.")
+    sub_parser.add_argument("--voice_f0_loss_weight", type=float, default=1.0,
+                            help="Weight on the coda's voicing-weighted L1 log-F0 loss.")
+    sub_parser.add_argument("--voice_vuv_loss_weight", type=float, default=1.0,
+                            help="Weight on the coda's voicing (VUV) BCE loss.")
     sub_parser.add_argument("--voice_codebook_path", type=str, default=None,
                             help="k-means codebook .pt (from scripts.data.voice.fit_codebook). Turns "
                                  "ON the DISCRETE voice path: content features are snapped to their "

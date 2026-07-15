@@ -1344,8 +1344,14 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     context={"prompt": prompt_text},
                 )
 
+                # The coda's own contour when it has an F0 head; None falls back to the
+                # SMG predicting F0 from the units.
+                f0_p = outputs.get("voice_f0_preds")
+                vuv_p = outputs.get("voice_vuv_preds")
                 self._log_audio_with_smg(
-                    pred_latent, sample, global_step, f"{tag}/{i}"
+                    pred_latent, sample, global_step, f"{tag}/{i}",
+                    f0=(f0_p[0, 0] if f0_p is not None and f0_p.numel() > 0 else None),
+                    vuv=(vuv_p[0, 0] if vuv_p is not None and vuv_p.numel() > 0 else None),
                 )
 
             # Log target voice for comparison
@@ -1761,12 +1767,17 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
         return grid.unsqueeze(0).numpy()  # (1, grid_H, grid_W)
 
-    def _decode_audio_latent_to_mel(self, latent: torch.Tensor, speaker_embedding: torch.Tensor) -> Optional[torch.Tensor]:
+    def _decode_audio_latent_to_mel(
+        self, latent: torch.Tensor, speaker_embedding: torch.Tensor,
+        f0: Optional[torch.Tensor] = None, vuv: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """Decode SIVE feature latent through SMG decoder to mel spectrogram.
 
         Args:
             latent: (C, T) predicted SIVE features from the world model's audio coda
             speaker_embedding: (speaker_dim,) speaker embedding
+            f0: (T,) log-F0 predicted by the world coda's F0 head, if it has one.
+            vuv: (T,) voicing probability from the same head.
 
         Returns:
             mel_spec (n_mels, T) or None on failure
@@ -1781,9 +1792,26 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             z = latent.to(device=device, dtype=dtype).unsqueeze(0)  # (1, C, T)
             spk = speaker_embedding.to(device=device, dtype=dtype).unsqueeze(0)  # (1, speaker_dim)
 
+            # Prefer the WORLD model's contour when it has an F0 head. Falling through to
+            # features=z makes the SMG infer F0 from the latents instead — fine for
+            # continuous features (prosody is in them), but with quantized units prosody is
+            # gone by construction and the SMG's predictor only sees (units, speaker),
+            # recovering ~4% of F0 variation over the speaker's mean. The coda has the text.
+            f0_emb = None
+            if f0 is not None:
+                lf0 = f0.to(device=device, dtype=dtype).reshape(1, -1)
+                v = (vuv if vuv is not None else torch.ones_like(f0)).to(device=device, dtype=dtype).reshape(1, -1)
+                n = min(lf0.shape[-1], z.shape[-1])
+                with torch.no_grad():
+                    f0_emb = self.voice_smg_decoder.f0_embedding(lf0[..., :n], v[..., :n])
+
             with torch.no_grad():
-                # Pass features=z so the F0 predictor can run (SIVE features are the latent)
-                mel = self.voice_smg_decoder.decode(z=z, speaker_embedding=spk, features=z)
+                mel = self.voice_smg_decoder.decode(
+                    z=z, speaker_embedding=spk,
+                    f0_embedding=f0_emb,
+                    # only used when f0_emb is None: SMG predicts F0 from the latents
+                    features=(None if f0_emb is not None else z),
+                )
 
             # mel: (1, n_mels, T) -> (n_mels, T)
             if isinstance(mel, tuple):
@@ -1803,9 +1831,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             traceback.print_exc()
             return None
 
-    def _decode_and_log_audio(self, pred_latent, speaker_embedding, global_step, tag_prefix, speaker_label):
+    def _decode_and_log_audio(self, pred_latent, speaker_embedding, global_step, tag_prefix, speaker_label, f0=None, vuv=None):
         """Decode latent -> mel via SMG, then mel -> waveform via vocoder, logging both."""
-        mel = self._decode_audio_latent_to_mel(pred_latent, speaker_embedding)
+        mel = self._decode_audio_latent_to_mel(pred_latent, speaker_embedding, f0=f0, vuv=vuv)
         if mel is None:
             print(f"[audio_debug] _decode_audio_latent_to_mel returned None for {tag_prefix}/{speaker_label}")
             return
@@ -1846,7 +1874,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                   "sample's speaker as the fixed reference voice for TTS renders.", flush=True)
         return self._pinned_speaker
 
-    def _log_audio_with_smg(self, pred_latent, sample, global_step, tag_prefix):
+    def _log_audio_with_smg(self, pred_latent, sample, global_step, tag_prefix, f0=None, vuv=None):
         """Run dual-speaker SMG decoding: ground-truth speaker + static speaker."""
         if self.voice_smg_decoder is None:
             if not self._warned_no_smg:
@@ -1874,7 +1902,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if gt_speaker_emb is not None:
             self._decode_and_log_audio(
                 pred_latent, gt_speaker_emb, global_step,
-                tag_prefix, "gt_speaker"
+                tag_prefix, "gt_speaker", f0=f0, vuv=vuv,
             )
 
         # Decode with the fixed reference speaker, so renders are comparable across evals
@@ -1882,7 +1910,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if static_emb is not None:
             self._decode_and_log_audio(
                 pred_latent, static_emb, global_step,
-                tag_prefix, "static_speaker"
+                tag_prefix, "static_speaker", f0=f0, vuv=vuv,
             )
 
     def _try_vocoder_from_latent(self, model, latent, global_step, tag):

@@ -143,6 +143,14 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         if self.unit_vocab_size:
             self.unit_head = nn.Linear(coda_config.d_model, self.unit_vocab_size)
 
+        # F0 + VUV regression, beside the unit classifier. Predicts log-F0 in the same
+        # domain the shards store and the SMG's f0_embedding consumes, so the world's
+        # contour is a drop-in for the SMG's own predictor at inference.
+        self.predict_f0 = getattr(config, "predict_f0", False)
+        if self.predict_f0:
+            self.f0_head = nn.Linear(coda_config.d_model, 1)
+            self.vuv_head = nn.Linear(coda_config.d_model, 1)
+
         # Stop prediction head: single linear → scalar logit per frame.
         # Predicts whether the current frame is the last real frame (or past it).
         self.stop_head = nn.Linear(coda_config.d_model, 1)
@@ -269,6 +277,12 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         # regression head rather than a consumer of it.
         if self.unit_vocab_size:
             outputs[f"{self.prefix}_unit_logits"] = self.unit_head(h)
+
+        if self.predict_f0:
+            # (batch, timesteps), matching how the shards store f0/vuv and what
+            # SMG.f0_embedding(log_f0, voiced) expects.
+            outputs[f"{self.prefix}_f0_preds"] = self.f0_head(h).squeeze(-1)
+            outputs[f"{self.prefix}_vuv_logits"] = self.vuv_head(h).squeeze(-1)
 
         # Heteroscedastic log-variance (parallel head, off the coda hidden state).
         # feature_preds above is the Gaussian MEAN; this is per-frame log-variance

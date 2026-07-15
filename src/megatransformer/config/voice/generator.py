@@ -34,6 +34,20 @@ class VoiceCodaAndSMGConfig:
     #
     # None = off; the coda is the continuous regressor it has always been.
     unit_vocab_size: Optional[int] = None
+
+    # F0/VUV regression head, beside the unit classifier.
+    #
+    # Quantization strips prosody from the content units by construction, so the contour
+    # has to come from somewhere. The SMG's own F0 predictor can only see (units, speaker)
+    # — measured, it recovers ~4% of within-utterance F0 variation over just predicting the
+    # speaker's mean pitch (r=0.45, right shape, squashed amplitude). It cannot do better,
+    # because neither units nor an ECAPA embedding knows the sentence is a question.
+    #
+    # The world coda does know: it sits on text conditioning. So the split is units for
+    # content (cross-entropy — forces naming, forces reading the text) and F0 for prosody
+    # (regression — a contour is genuinely continuous). The SMG's predictor remains the
+    # fallback for standalone use where no external contour exists.
+    predict_f0: bool = False
     # "linear" (single linear, original) or "conv_refine" (linear + Conv1d refinement)
     output_mode: str = "linear"
 
