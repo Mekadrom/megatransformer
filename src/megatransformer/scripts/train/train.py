@@ -312,6 +312,9 @@ def get_dataset(command: str, args, split: str):
                 # Same codebook the SMG was trained with. Snaps voice features to centroids
                 # on the fly and emits unit_ids as the coda's cross-entropy target.
                 voice_codebook=getattr(args, "voice_codebook_path", None),
+                # Also emit deduped (unit, duration) segments + per-segment F0/VUV so the
+                # coda can run at segment rate instead of 50Hz (the text-conditioning fix).
+                voice_dedup=getattr(args, "voice_dedup", False),
             )
     return dataset
 

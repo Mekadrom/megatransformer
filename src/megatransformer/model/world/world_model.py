@@ -812,6 +812,21 @@ class MegaTransformerWorldModel(nn.Module):
         voice_unit_id_trace: List[List[int]] = [[] for _ in range(batch_size)]
         voice_f0_seq: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         completed_voice_f0: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+        # Per-segment durations on the deduped path (empty otherwise). Each loop step is a
+        # SEGMENT there; these expand the segment centroids/F0 back to 50Hz at flush so the
+        # frozen SMG still receives frame-rate features.
+        voice_duration_seq: List[List[int]] = [[] for _ in range(batch_size)]
+
+        def _finalize_voice(seqs, f0s, durs):
+            """Concat a voice's steps; on the deduped path expand segments->frames by duration."""
+            feat = torch.cat(seqs, dim=-1)                       # (C, S)
+            f0 = torch.cat(f0s, dim=-1) if f0s else None         # (S,)
+            if durs and len(durs) == feat.shape[-1]:
+                rep = torch.tensor(durs, device=feat.device)
+                feat = feat.repeat_interleave(rep, dim=-1)       # (C, T)
+                if f0 is not None and f0.shape[-1] == rep.shape[0]:
+                    f0 = f0.repeat_interleave(rep, dim=-1)
+            return feat, f0
         audio_stop_logit_trace: List[List[float]] = [[] for _ in range(batch_size)]
 
         # Process initial prompt — replace placeholders with media if provided.
@@ -1149,6 +1164,13 @@ class MegaTransformerWorldModel(nn.Module):
                             f0_p = coda_out.get("voice_f0_preds")
                             if f0_p is not None:
                                 voice_f0_seq[b].append(f0_p[0, -1].detach().reshape(1))
+                            # Deduped path: this step is a SEGMENT, so record how many 50Hz
+                            # frames it becomes. exp(log-frames), round, clamp >=1; cap at
+                            # 100 (2s) so a runaway prediction can't blow up the expand.
+                            dur_p = coda_out.get("voice_duration_preds")
+                            if dur_p is not None:
+                                d = int(torch.exp(dur_p[0, -1].detach()).round().clamp(min=1, max=100))
+                                voice_duration_seq[b].append(d)
                             frame_pred = self.voice_codebook[unit_id].to(
                                 device=hidden_b.device, dtype=coda_out["voice_latent_preds"].dtype
                             ).view(1, -1, 1)  # (1, C, 1)
@@ -1180,12 +1202,13 @@ class MegaTransformerWorldModel(nn.Module):
                     if should_stop_voice or len(voice_sequences[b]) >= voice_token_budget:
                         current_modality[b] = None
                         if self.voice_generator is not None:
-                            voice_pred = torch.cat(voice_sequences[b], dim=-1)  # (C, T)
-                            completed_voice[b].append(voice_pred)
-                            if voice_f0_seq[b]:
-                                completed_voice_f0[b].append(torch.cat(voice_f0_seq[b], dim=-1))  # (T,)
+                            feat, f0 = _finalize_voice(voice_sequences[b], voice_f0_seq[b], voice_duration_seq[b])
+                            completed_voice[b].append(feat)
+                            if f0 is not None:
+                                completed_voice_f0[b].append(f0)
                         voice_sequences[b] = []
                         voice_f0_seq[b] = []
+                        voice_duration_seq[b] = []
                         voice_prelude_kv_caches[b] = None
                         voice_prelude_position_offsets[b] = 0
                         voice_coda_kv_caches[b] = None
@@ -1357,10 +1380,11 @@ class MegaTransformerWorldModel(nn.Module):
         # voice is still measurable; nothing is not.
         for b in range(batch_size):
             if voice_sequences[b] and self.voice_generator is not None:
-                completed_voice[b].append(torch.cat(voice_sequences[b], dim=-1))  # (C, T)
-                if voice_f0_seq[b]:
-                    completed_voice_f0[b].append(torch.cat(voice_f0_seq[b], dim=-1))  # (T,)
-                voice_sequences[b], voice_f0_seq[b] = [], []
+                feat, f0 = _finalize_voice(voice_sequences[b], voice_f0_seq[b], voice_duration_seq[b])
+                completed_voice[b].append(feat)
+                if f0 is not None:
+                    completed_voice_f0[b].append(f0)
+                voice_sequences[b], voice_f0_seq[b], voice_duration_seq[b] = [], [], []
             if audio_sequences[b] and self.audio_generator is not None:
                 completed_audio[b].append(torch.cat(audio_sequences[b], dim=-1))
                 audio_sequences[b] = []

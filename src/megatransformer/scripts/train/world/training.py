@@ -1556,6 +1556,17 @@ def load_model(args, device='cuda'):
             config.recurrent_block_config.mean_thinking_steps = args.mean_thinking_steps
         if getattr(args, 'voice_predict_f0', False):
             config.voice_coda_config.predict_f0 = True
+        if getattr(args, 'voice_dedup', False):
+            # Segment-rate path: the coda predicts a per-segment duration, and the dataset
+            # must emit the deduped streams. Implies units (the segments ARE units) and F0
+            # (the contour rides the segments), so require both rather than silently
+            # half-configuring.
+            if not getattr(args, 'voice_codebook_path', None):
+                raise SystemExit("--voice_dedup requires --voice_codebook_path (segments are units).")
+            config.voice_coda_config.predict_duration = True
+            if not getattr(args, 'voice_predict_f0', False):
+                config.voice_coda_config.predict_f0 = True
+                print("[world] --voice_dedup implies F0: enabling predict_f0", flush=True)
         codebook_path = getattr(args, 'voice_codebook_path', None)
         if codebook_path:
             from megatransformer.utils.codebook import load_codebook
@@ -1717,6 +1728,8 @@ def create_trainer(
         voice_stop_loss_weight=getattr(args, 'voice_stop_loss_weight', 1.0),
         voice_beta_nll=getattr(args, 'voice_beta_nll', 0.5),
         voice_f0_loss_weight=getattr(args, 'voice_f0_loss_weight', 1.0),
+        voice_dedup=getattr(args, 'voice_dedup', False),
+        voice_duration_loss_weight=getattr(args, 'voice_duration_loss_weight', 1.0),
         voice_scheduled_sampling_prob=getattr(args, 'voice_scheduled_sampling_prob', 0.0),
         voice_scheduled_sampling_ramp_steps=getattr(args, 'voice_scheduled_sampling_ramp_steps', 10000),
         include_text="text" in include_modes,
@@ -1991,7 +2004,7 @@ def add_cli_args(subparsers):
                             help="Add an F0 contour regression head to the voice coda, beside the "
                                  "unit classifier. Quantization strips prosody from the units by "
                                  "construction, so the contour must come from somewhere; the SMG's own "
-                                 "F0 predictor sees only (units, speaker) and recovers ~4% of "
+                                 "F0 predictor sees only (units, speaker) and recovers ~4%% of "
                                  "within-utterance F0 variation over predicting the speaker's mean "
                                  "pitch, because neither input knows the sentence is a question. The "
                                  "coda sits on text conditioning and can. The head emits a "
@@ -2002,6 +2015,19 @@ def add_cli_args(subparsers):
                                  "speaker-normalized log-F0 contour. NOTE the contour is in sigma "
                                  "units (std ~1.1), not log Hz, so this weight is on a different "
                                  "scale than a raw-F0 loss would be.")
+    sub_parser.add_argument("--voice_dedup", action="store_true",
+                            help="Run the voice coda on deduped (unit, duration) SEGMENTS instead of "
+                                 "50Hz frames. At 50Hz the next unit is dominated by 'where am I in "
+                                 "this phoneme', which teacher-forced history predicts and text "
+                                 "cannot -- the measured cause of the text-conditioning collapse. "
+                                 "Collapsing consecutive-equal units removes that redundancy so the "
+                                 "text gradient survives (marginal text signal +0.004 -> +0.033). The "
+                                 "coda predicts unit + duration per segment; generation expands by "
+                                 "duration back to 50Hz for the frozen SMG. Requires "
+                                 "--voice_codebook_path; implies --voice_predict_f0.")
+    sub_parser.add_argument("--voice_duration_loss_weight", type=float, default=1.0,
+                            help="Weight on the per-segment duration head's L1-on-log-frames loss "
+                                 "(only with --voice_dedup).")
     sub_parser.add_argument("--voice_codebook_path", type=str, default=None,
                             help="k-means codebook .pt (from scripts.data.voice.fit_codebook). Turns "
                                  "ON the DISCRETE voice path: content features are snapped to their "
