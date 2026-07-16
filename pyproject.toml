@@ -68,9 +68,8 @@ Repository = "https://github.com/Mekadrom/megatransformer"
 training = [
     "torch",
     "torchaudio",
-    "deepspeed",
     "accelerate",
-    "datasets",
+    "datasets>=2.19,<3",
     "tensorboard",
     "wandb",
     "jiwer",
@@ -82,10 +81,13 @@ training = [
 dev = [
     "pytest",
 ]
+deepspeed = [
+    "deepspeed"
+]
 
 [tool.uv]
 # `uv sync` installs these groups by default (the full training environment).
-default-groups = ["training", "dev"]
+default-groups = ["training", "dev", "deepspeed"]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
