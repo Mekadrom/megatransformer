@@ -69,6 +69,10 @@ class WorldModelTrainer(CommonTrainer):
         # F0 contour head weight. Voicing-weighted L1 on the speaker-normalized log-F0
         # contour. There is no voicing head here -- see the loss for why.
         voice_f0_loss_weight: float = 1.0,
+        # Deduped (unit, duration) path. When on, the voice coda runs on segments instead
+        # of 50Hz frames; the duration head's L1-on-log-frames gets this weight.
+        voice_dedup: bool = False,
+        voice_duration_loss_weight: float = 1.0,
         voice_scheduled_sampling_prob: float = 0.0,
         voice_scheduled_sampling_ramp_steps: int = 10000,
         # Modality flags
@@ -124,6 +128,8 @@ class WorldModelTrainer(CommonTrainer):
         self.voice_stop_loss_weight = voice_stop_loss_weight
         self.voice_beta_nll = voice_beta_nll
         self.voice_f0_loss_weight = voice_f0_loss_weight
+        self.voice_dedup = voice_dedup
+        self.voice_duration_loss_weight = voice_duration_loss_weight
         self.voice_scheduled_sampling_prob = voice_scheduled_sampling_prob
         self.voice_scheduled_sampling_ramp_steps = voice_scheduled_sampling_ramp_steps
 
@@ -512,6 +518,28 @@ class WorldModelTrainer(CommonTrainer):
                     audio_lengths = feat_lengths.unsqueeze(1)  # [B, 1]
                     audio_loss_lengths = feat_lengths  # (B,) for masked loss
 
+        # Deduped path: swap the 50Hz voice streams for the (unit, duration) segment
+        # streams BEFORE the rest of the voice code runs, so the model input, the unit CE,
+        # F0, VUV and stop all transparently operate on segments. The model input becomes
+        # the segment centroids (codebook[dedup_unit_ids]); the only genuinely new term is
+        # the duration loss below. Everything else is unchanged, just shorter sequences.
+        if self.voice_dedup and inputs.get("voice_dedup_unit_ids") is not None:
+            unwrapped = model.module if hasattr(model, "module") else model
+            cb = getattr(unwrapped, "voice_codebook", None)
+            if cb is None:
+                raise ValueError("--voice_dedup requires a codebook; call model.set_voice_codebook().")
+            d_ids = inputs["voice_dedup_unit_ids"]                    # (B, M) with -100 pad
+            cb = cb.to(d_ids.device)
+            seg_feats = cb[d_ids.clamp(min=0)].permute(0, 2, 1)      # (B, C, M); pad rows harmless (masked by length)
+            inputs = dict(inputs)                                    # shallow copy; don't mutate caller's batch
+            inputs["voice_features"] = seg_feats
+            inputs["voice_feature_lengths"] = inputs["voice_dedup_lengths"]
+            inputs["voice_unit_ids"] = d_ids
+            if inputs.get("voice_dedup_f0_contour") is not None:
+                inputs["voice_f0_contour"] = inputs["voice_dedup_f0_contour"]
+            if inputs.get("voice_dedup_vuv") is not None:
+                inputs["voice_vuv"] = inputs["voice_dedup_vuv"]
+
         # Voice: same shape contract as audio (SIVE features). Separate placeholder token.
         voice_inputs = None
         voice_lengths = None
@@ -711,6 +739,28 @@ class WorldModelTrainer(CommonTrainer):
                     # this data, so beating ~0.30 is the first sign the text is being read.
                     loss_components["voice_unit_accuracy"] = acc.detach()
             used_unit_loss = True
+
+        # Duration loss (deduped path): L1 on log-frames, masked to real segments. The
+        # coda predicts log(duration) per segment; targets are the run lengths the dataset
+        # emitted. Position i predicts segment i's duration (same alignment as the F0/VUV
+        # heads, which also read per-segment), NOT shifted like the unit CE -- duration is
+        # a property OF the current segment, not a next-token prediction.
+        dur_preds = outputs.get("voice_duration_preds")
+        dur_tgt = inputs.get("voice_durations")
+        if dur_preds is not None and dur_tgt is not None and self.voice_duration_loss_weight > 0:
+            T = dur_preds.shape[-1]
+            dt = dur_tgt[:, :T].to(dur_preds.device).float()
+            if dt.shape[1] < T:
+                dt = torch.nn.functional.pad(dt, (0, T - dt.shape[1]))
+            mask = (dt >= 1).float()                              # 0-padded segments dropped
+            log_tgt = torch.log(dt.clamp(min=1.0))
+            dur_l1 = (torch.abs(dur_preds.float() - log_tgt) * mask).sum() / mask.sum().clamp(min=1.0)
+            total_loss = total_loss + self.voice_duration_loss_weight * dur_l1
+            loss_components["voice_duration_loss"] = dur_l1.detach()
+            with torch.no_grad():
+                # Frames off, on the real scale, so it reads in the same units as the data.
+                frame_err = (torch.abs(torch.exp(dur_preds.float()) - dt) * mask).sum() / mask.sum().clamp(min=1.0)
+                loss_components["voice_duration_frame_l1"] = frame_err.detach()
 
         # Voice F0/VUV: the prosody half of the split. Units carry content (CE above);
         # this carries the contour. Voicing-weighted L1 on log-F0 + BCE on voicing,

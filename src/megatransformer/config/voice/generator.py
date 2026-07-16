@@ -48,6 +48,11 @@ class VoiceCodaAndSMGConfig:
     # (regression — a contour is genuinely continuous). The SMG's predictor remains the
     # fallback for standalone use where no external contour exists.
     predict_f0: bool = False
+    # Predict per-segment DURATION (log-frames) alongside the unit. Turned on with the
+    # deduped-units path: the coda runs on (unit, duration) segments instead of 50Hz
+    # frames, so a duration head is what lets generation expand each unit back to the
+    # right number of frames for the frozen SMG. Off = frame-rate path (no durations).
+    predict_duration: bool = False
     # "linear" (single linear, original) or "conv_refine" (linear + Conv1d refinement)
     output_mode: str = "linear"
 

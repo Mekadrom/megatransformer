@@ -158,6 +158,13 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         if self.predict_f0:
             self.f0_head = nn.Linear(coda_config.d_model, 1)
 
+        # Per-segment duration head (deduped path). Predicts log(frames) so the output is
+        # unbounded and the loss is scale-sensible; generation does exp+round+clamp(>=1).
+        # A point estimate, mirroring f0_head -- durations are regressed, not sampled.
+        self.predict_duration = getattr(config, "predict_duration", False)
+        if self.predict_duration:
+            self.duration_head = nn.Linear(coda_config.d_model, 1)
+
         # Stop prediction head: single linear → scalar logit per frame.
         # Predicts whether the current frame is the last real frame (or past it).
         self.stop_head = nn.Linear(coda_config.d_model, 1)
@@ -290,6 +297,10 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
             # to SMG.decode(f0_contour=...), NOT to SMG.f0_embedding(), which wants
             # absolute log Hz.
             outputs[f"{self.prefix}_f0_preds"] = self.f0_head(h).squeeze(-1)
+
+        if self.predict_duration:
+            # (batch, timesteps) log-frames. exp+round+clamp(>=1) at generation.
+            outputs[f"{self.prefix}_duration_preds"] = self.duration_head(h).squeeze(-1)
 
         # Heteroscedastic log-variance (parallel head, off the coda hidden state).
         # feature_preds above is the Gaussian MEAN; this is per-frame log-variance
