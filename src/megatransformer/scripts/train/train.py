@@ -89,6 +89,7 @@ def get_training_args(args, run_dir) -> TrainingArguments:
         logging_dir=run_dir,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
         gradient_checkpointing=args.use_gradient_checkpointing,
         bf16=args.bf16,
         fp16=args.fp16,
@@ -737,6 +738,13 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--eval_strategy', type=str, default='epoch', help='Evaluation strategy: steps or epoch')
         sub_parser.add_argument('--eval_steps', type=int, default=0, help='Evaluation steps')
         sub_parser.add_argument('--save_steps', type=int, default=500, help='Save steps')
+        sub_parser.add_argument('--save_total_limit', type=int, default=None,
+            help='Keep only the N most recent checkpoints, deleting older ones as new ones land '
+                 '(HF Trainer semantics). Default None = keep every checkpoint, which fills the '
+                 'disk on a long run: at --save_steps 2500 a 100k-step run writes 40 checkpoints, '
+                 'and an SMG+discriminator checkpoint is ~0.6-0.9GB. Training dies on ENOSPC '
+                 'mid-run with no warning, so set this on any run whose '
+                 'max_steps/save_steps x checkpoint_size exceeds free disk.')
         sub_parser.add_argument('--metrics_backend', type=str, default='tensorboard', choices=['tensorboard', 'wandb'], help='Metrics logging backend')
 
         sub_parser.add_argument('--stop_step', type=int, default=-1, help='Step to stop training at. For preserving the LR schedule while not training further.')
