@@ -129,6 +129,7 @@ class SpeakerInvariantVoiceEncoderConfig:
     vq_commitment_weight: float = 0.25
     vq_ema_decay: float = 0.99
     vq_dead_code_threshold: float = 1.0  # re-seed codes used < this (EMA-window count)
+    vq_codebook_init_path: Optional[str] = None  # k-means codebook (utils.codebook fmt) to seed vq.embed; None = random data-dependent init
 
     speaker_classifier_hidden_dim: Optional[int] = None
 

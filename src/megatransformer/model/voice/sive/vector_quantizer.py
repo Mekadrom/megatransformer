@@ -59,6 +59,24 @@ class VectorQuantizerEMA(nn.Module):
         self.cluster_size.fill_(1.0)
         self.initted.fill_(True)
 
+    @torch.no_grad()
+    def load_kmeans(self, centroids: torch.Tensor):
+        """Seed the codebook from a precomputed k-means codebook (utils.codebook format).
+
+        Marks the VQ initialized so the random data-dependent init is skipped. Fit the
+        k-means on the SAME features the (warm-started) encoder produces, or the centroids
+        sit outside the encoder's output distribution and the seed is worse than random.
+        A later checkpoint load (resume) with its own vq.embed overrides this, as intended.
+        """
+        if tuple(centroids.shape) != tuple(self.embed.shape):
+            raise ValueError(f"k-means codebook shape {tuple(centroids.shape)} != VQ embed "
+                             f"{tuple(self.embed.shape)} (num_codes/dim mismatch)")
+        c = centroids.to(self.embed.dtype)
+        self.embed.copy_(c)
+        self.embed_avg.copy_(c)
+        self.cluster_size.fill_(1.0)
+        self.initted.fill_(True)
+
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
         """x: [B, T, D] post-norm features. mask: [B, T] True=valid (None => all valid).
 

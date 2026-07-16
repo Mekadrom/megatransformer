@@ -147,6 +147,10 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 commitment_weight=config.vq_commitment_weight, decay=config.vq_ema_decay,
                 dead_code_threshold=config.vq_dead_code_threshold,
             )
+            init_path = getattr(config, "vq_codebook_init_path", None)
+            if init_path:
+                from megatransformer.utils.codebook import load_codebook
+                self.vq.load_kmeans(load_codebook(init_path))
 
         # Feature dropout (applied before heads)
         self.feature_dropout = nn.Dropout(config.feature_dropout) if config.feature_dropout > 0 else nn.Identity()

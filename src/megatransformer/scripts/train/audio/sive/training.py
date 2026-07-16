@@ -749,6 +749,7 @@ def load_model(args):
         'vq_commitment_weight': args.vq_commitment_weight,
         'vq_ema_decay': args.vq_ema_decay,
         'vq_dead_code_threshold': args.vq_dead_code_threshold,
+        'vq_codebook_init_path': args.vq_codebook_init_path,
     }
     # Norm levers (frontend / block pre-norm / conformer conv / final norm).
     # Override the config ONLY when a value is explicitly passed (CLI default is
@@ -1065,6 +1066,12 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--vq_dead_code_threshold", type=float, default=1.0,
                             help="Re-seed codes whose EMA usage falls below this from live encoder "
                                  "outputs (dead-code reset; fights codebook collapse).")
+    sub_parser.add_argument("--vq_codebook_init_path", type=str, default=None,
+                            help="Seed the EMA codebook from a precomputed k-means codebook "
+                                 "(fit_codebook.py output). Fit it on the SAME features the warm-start "
+                                 "encoder produces (i.e. this checkpoint's own feature cache), else the "
+                                 "centroids sit outside the encoder's output distribution. None = random "
+                                 "data-dependent init from the first batch.")
 
     # Vocoder settings (for audio generation in TensorBoard)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,
