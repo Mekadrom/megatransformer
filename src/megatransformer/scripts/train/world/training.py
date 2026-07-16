@@ -1076,14 +1076,33 @@ class WorldModelTrainer(CommonTrainer):
             decode_outputs=False,
             is_synthesis=is_synthesis,
         )
-        preds = tf_out.get("voice_latent_preds")
-        if preds is None or preds.shape != voice_inputs.shape:
+        # What to feed back must MATCH what generate() feeds back, or this simulates the
+        # wrong exposure bias. On the DISCRETE path generate() feeds the sampled unit's
+        # centroid (world_model.py: voice_codebook[unit_id]); the continuous
+        # feature_projection head is unused there and, because used_unit_loss skips its
+        # loss, untrained — feeding it would inject off-manifold noise. So: units path ->
+        # argmax-unit centroid; continuous path -> the regression mean.
+        unwrapped = model.module if hasattr(model, "module") else model
+        codebook = getattr(unwrapped, "voice_codebook", None)
+        unit_logits = tf_out.get("voice_unit_logits")            # (num_seg, T, K)
+        if unit_logits is not None and codebook is not None:
+            ids = unit_logits.argmax(-1)                          # (num_seg, T)
+            preds = codebook.to(ids.device)[ids].permute(0, 2, 1)  # (num_seg, C, T)
+        else:
+            preds = tf_out.get("voice_latent_preds")             # (num_seg, C, T)
+
+        # The coda returns (num_seg, C, T); voice_inputs is (b, n, C, t) with num_seg=b*n.
+        # Reshape by element count rather than requiring identical shapes — the old
+        # equality check compared 3-D vs 4-D and was therefore ALWAYS false, making
+        # scheduled sampling a silent no-op on every path since it was written.
+        if preds is None or preds.numel() != voice_inputs.numel():
             if not getattr(self, "_warned_ss_shape", False):
                 self._warned_ss_shape = True
                 shape = tuple(preds.shape) if preds is not None else None
-                print(f"[scheduled_sampling] disabled: preds shape {shape} != "
+                print(f"[scheduled_sampling] disabled: preds numel {shape} != "
                       f"voice_inputs {tuple(voice_inputs.shape)}", flush=True)
             return voice_inputs
+        preds = preds.reshape(voice_inputs.shape)
 
         # Per-FRAME mask (broadcast over channels): a frame is either the model's or the
         # truth, never a per-channel chimera of both, which is not a state the model will
