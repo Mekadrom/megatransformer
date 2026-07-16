@@ -263,6 +263,10 @@ class MultimodalDataCollator(DataCollator):
         all_texts = []
         all_unit_ids = []
         all_f0_contour = []
+        all_dedup_unit_ids = []
+        all_durations = []
+        all_dedup_f0_contour = []
+        all_dedup_vuv = []
 
         for ex in examples:
             all_waveforms.append(trim(ex.get(f"{prefix}_waveform", None), self.max_waveforms, dim=-1))
@@ -277,6 +281,13 @@ class MultimodalDataCollator(DataCollator):
             all_vuv.append(trim(ex.get(f"{prefix}_vuv", None), self.max_mel_spec_frames, dim=-1))
             all_unit_ids.append(trim(ex.get(f"{prefix}_unit_ids", None), self.max_sive_feature_frames, dim=-1))
             all_f0_contour.append(trim(ex.get(f"{prefix}_f0_contour", None), self.max_mel_spec_frames, dim=-1))
+            # Dedup streams are their OWN length (M segments), NOT trimmed to a frame cap:
+            # they are already collapsed (<= feature frames), so a frame-based trim would
+            # never fire, and durations must sum to the real frame count to expand back.
+            all_dedup_unit_ids.append(ex.get(f"{prefix}_dedup_unit_ids", None))
+            all_durations.append(ex.get(f"{prefix}_durations", None))
+            all_dedup_f0_contour.append(ex.get(f"{prefix}_dedup_f0_contour", None))
+            all_dedup_vuv.append(ex.get(f"{prefix}_dedup_vuv", None))
             all_ctc_tokens.append(ex.get(f"{prefix}_ctc_tokens", None))
             all_ctc_lengths.append(ex.get(f"{prefix}_ctc_length", None))
             # Text key differs between audio and voice in dataset
@@ -310,6 +321,40 @@ class MultimodalDataCollator(DataCollator):
                 out[:n] = u[:n].to(torch.long)
                 padded_units.append(out)
             batch[f"{prefix}_unit_ids"] = torch.stack(padded_units)
+
+        if all_dedup_unit_ids[0] is not None:
+            # Deduped (unit, duration) segment sequence, variable length M per sample.
+            # dedup_lengths (M per sample) is the mask everything downstream uses — the
+            # coda, the CE, the duration/F0/stop losses, and the expand-before-SMG all key
+            # off it, since M is unrelated to feature/mel length.
+            dedup_lengths = torch.tensor([int(u.shape[-1]) for u in all_dedup_unit_ids], dtype=torch.long)
+            Md = int(dedup_lengths.max())
+            d_units, d_dur, d_f0, d_vuv = [], [], [], []
+            for i, m in enumerate(dedup_lengths.tolist()):
+                # unit ids: -100 pad (CE ignore_index), same reason as 50Hz unit_ids.
+                u = torch.full((Md,), -100, dtype=torch.long)
+                u[:m] = all_dedup_unit_ids[i][:m].to(torch.long)
+                d_units.append(u)
+                # durations: 0 pad. Real durations are >= 1, so 0 is an unambiguous pad
+                # marker and a duration loss masks it out via dedup_lengths anyway.
+                dr = torch.zeros(Md, dtype=torch.long)
+                dr[:m] = all_durations[i][:m].to(torch.long)
+                d_dur.append(dr)
+                if all_dedup_f0_contour[0] is not None:
+                    f = torch.zeros(Md, dtype=torch.float32)
+                    f[:m] = all_dedup_f0_contour[i][:m].float()
+                    d_f0.append(f)
+                if all_dedup_vuv[0] is not None:
+                    v = torch.zeros(Md, dtype=torch.float32)
+                    v[:m] = all_dedup_vuv[i][:m].float()
+                    d_vuv.append(v)
+            batch[f"{prefix}_dedup_unit_ids"] = torch.stack(d_units)
+            batch[f"{prefix}_durations"] = torch.stack(d_dur)
+            batch[f"{prefix}_dedup_lengths"] = dedup_lengths
+            if d_f0:
+                batch[f"{prefix}_dedup_f0_contour"] = torch.stack(d_f0)
+            if d_vuv:
+                batch[f"{prefix}_dedup_vuv"] = torch.stack(d_vuv)
 
         if all_mel_specs[0] is not None:
             padded, masks = pad_and_mask(all_mel_specs, all_mel_lengths)

@@ -114,3 +114,59 @@ def quantize(
     q[:, :n] = c[idx].T.to(feats.dtype)
     ids[:n] = idx
     return q, ids
+
+
+def dedup_units(unit_ids: torch.Tensor, length: Optional[int] = None):
+    """Collapse consecutive-equal units into (unit, duration) segments.
+
+    This is the coarsening that gives the world model a text gradient: at the 50Hz frame
+    rate the next unit is dominated by "where am I in this phoneme", which teacher-forced
+    unit history answers and text cannot (measured: text adds +0.004 accuracy over
+    history). Collapsing runs removes that within-phoneme redundancy -- consecutive
+    repeats are gone by construction, so "predict the same unit again" is impossible and
+    the model must predict a genuinely different unit each step, which needs the text (the
+    marginal jumps ~8x to +0.033 on deduped units).
+
+    Args:
+        unit_ids: (T,) int64 from quantize(), possibly -1-padded past `length`.
+        length: real frame count; frames beyond it are ignored.
+
+    Returns:
+        dedup_ids:   (M,) the surviving units, no two adjacent equal.
+        durations:   (M,) run length of each in ORIGINAL 50Hz frames (sums to `length`).
+        seg_of_frame:(length,) segment index each original frame belongs to -- use it to
+                     pool any per-frame quantity (F0, VUV) to per-segment with
+                     pool_by_segment().
+    """
+    T = unit_ids.shape[0]
+    n = T if length is None else max(0, min(int(length), T))
+    dev = unit_ids.device
+    if n == 0:
+        z = torch.zeros(0, dtype=torch.long, device=dev)
+        return z, z, torch.zeros(0, dtype=torch.long, device=dev)
+
+    ids = unit_ids[:n]
+    change = torch.ones(n, dtype=torch.bool, device=dev)
+    change[1:] = ids[1:] != ids[:-1]
+    starts = torch.nonzero(change, as_tuple=False).squeeze(1)   # (M,) run start indices
+    dedup_ids = ids[starts]
+    ends = torch.cat([starts[1:], torch.tensor([n], device=dev)])
+    durations = ends - starts                                    # (M,)
+    seg_of_frame = torch.cumsum(change.long(), 0) - 1           # (n,) in [0, M)
+    return dedup_ids, durations, seg_of_frame
+
+
+def pool_by_segment(x: torch.Tensor, seg_of_frame: torch.Tensor, num_segments: int,
+                    weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Average a per-frame quantity within each dedup segment.
+
+    Used to carry the per-frame F0 contour and VUV onto the deduped sequence (one value
+    per segment). For F0, pass weights=vuv so unvoiced frames -- where the contour is 0 by
+    construction -- don't drag the segment's pitch toward zero, matching how the per-speaker
+    F0 stats were fit.
+    """
+    x = x[:seg_of_frame.shape[0]].float()
+    w = torch.ones_like(x) if weights is None else weights[:seg_of_frame.shape[0]].float()
+    num = torch.zeros(num_segments, device=x.device).index_add_(0, seg_of_frame, x * w)
+    den = torch.zeros(num_segments, device=x.device).index_add_(0, seg_of_frame, w)
+    return num / den.clamp_min(1e-8)

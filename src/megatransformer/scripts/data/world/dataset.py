@@ -7,7 +7,9 @@ import torch
 
 from torch.utils.data import Dataset
 
-from megatransformer.utils.codebook import load_codebook, load_f0_stats, normalize_f0, quantize
+from megatransformer.utils.codebook import (
+    dedup_units, load_codebook, load_f0_stats, normalize_f0, pool_by_segment, quantize,
+)
 
 
 class MultimodalShardedDataset(Dataset):
@@ -37,6 +39,7 @@ class MultimodalShardedDataset(Dataset):
         voice_columns: list[str] = None,
         cache_size: int = 3,
         voice_codebook=None,
+        voice_dedup: bool = False,
         max_samples: int = None,
         include_tasks: list[str] = None,
     ):
@@ -107,6 +110,9 @@ class MultimodalShardedDataset(Dataset):
         # larger than the within-speaker contour it carries (0.195), and the offset is the
         # part a text-only model structurally cannot know. Normalizing removes it.
         self.voice_f0_stats = load_f0_stats(voice_codebook) if voice_codebook is not None else None
+        # Emit deduped (unit, duration) segments + per-segment F0/VUV alongside the 50Hz
+        # streams. On-the-fly (not preprocessed) so a codebook re-fit stays a flag change.
+        self.voice_dedup = voice_dedup and self.voice_centroids is not None
         self.text_columns = text_columns
         self.audio_columns = audio_columns
         self.voice_columns = voice_columns
@@ -361,6 +367,23 @@ class MultimodalShardedDataset(Dataset):
         if "token_ids" in shard:
             sample["token_ids"] = shard["token_ids"][local_idx]
             sample["text_length"] = shard["text_lengths"][local_idx]
+
+        # Deduped (unit, duration) segments + per-segment F0/VUV. Built here, after every
+        # per-frame stream exists, so F0/VUV can be pooled onto the same segmentation the
+        # units define. Everything downstream (coda, loss, generation) runs on this
+        # segment sequence; it is expanded back to 50Hz by duration only just before the
+        # frozen SMG, which still consumes frame-rate features.
+        if self.voice_dedup and "unit_ids" in sample:
+            L = int(sample["feature_length"])
+            d_ids, durations, seg = dedup_units(sample["unit_ids"], L)
+            sample["dedup_unit_ids"] = d_ids                 # (M,)
+            sample["durations"] = durations                  # (M,) sums to L
+            M = d_ids.shape[0]
+            if "f0_contour" in sample:
+                w = sample["vuv"][:L].float() if "vuv" in sample else None
+                sample["dedup_f0_contour"] = pool_by_segment(sample["f0_contour"], seg, M, weights=w)
+            if "vuv" in sample:
+                sample["dedup_vuv"] = pool_by_segment(sample["vuv"], seg, M)
 
         return sample
 
