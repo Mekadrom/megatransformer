@@ -113,8 +113,12 @@ class VectorQuantizerEMA(nn.Module):
             else x.new_zeros(())
         commit = commit * self.commitment_weight
 
-        # Straight-through: identity forward-value swap so downstream grads reach the encoder.
-        quant_st = x + (quant - x).detach()
+        # Straight-through in TRAIN so downstream (CTC/GRL) grads reach the encoder. In EVAL
+        # return the code exactly: no grad is needed, and x + (quant - x) roundtrips x, which
+        # loses precision (bf16/float rounding) and would leave the "quantized" features a hair
+        # off the codebook -- the downstream dataset needs them ON the codebook so quantize()
+        # recovers exact ids. So eval returns bit-exact codebook rows.
+        quant_st = x + (quant - x).detach() if self.training else quant
 
         with torch.no_grad():
             if valid.any():
