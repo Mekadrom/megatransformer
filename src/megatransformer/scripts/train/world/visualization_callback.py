@@ -656,6 +656,14 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         # --- Log voice reconstruction quality ---
         voice_preds = outputs.get("voice_latent_preds")
         if voice_preds is not None and voice_labels is not None:
+            # On the deduped path voice_latent_preds is segment-rate (and untrained -- the
+            # unit head owns the loss), while voice_labels stay 50Hz, so the time dims
+            # differ. Align to the common prefix so l1/mse/cosine don't crash; the numbers
+            # are a rough proxy either way (and noise on the units path).
+            if voice_preds.shape[-1] != voice_labels.shape[-1]:
+                Tc = min(voice_preds.shape[-1], voice_labels.shape[-1])
+                voice_preds = voice_preds[..., :Tc]
+                voice_labels = voice_labels[..., :Tc]
             v_l1 = F.l1_loss(voice_preds, voice_labels).item()
             v_mse = F.mse_loss(voice_preds, voice_labels).item()
             metrics.log_scalar(f"{tag}/voice_latent_l1_loss", v_l1, global_step)
@@ -899,7 +907,16 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     if tgt_lat is not None:
                         tgt_lat = tgt_lat[0]
                         metrics.log_image(f"{tag}/voice/{i}/target", self._latent_to_image(tgt_lat), global_step)
-                        cos = F.cosine_similarity(pred_lat.flatten().unsqueeze(0), tgt_lat.flatten().to(pred_lat.device).unsqueeze(0)).item()
+                        # Free-running generation almost never matches the target frame count
+                        # (the stop head decides length; deduped durations vary it further),
+                        # so flatten() over the full tensors mismatches. Compare over the
+                        # common prefix — a rough similarity proxy anyway, since generation is
+                        # not time-aligned to the target.
+                        Tc = min(pred_lat.shape[-1], tgt_lat.shape[-1])
+                        cos = F.cosine_similarity(
+                            pred_lat[..., :Tc].flatten().unsqueeze(0),
+                            tgt_lat[..., :Tc].flatten().to(pred_lat.device).unsqueeze(0),
+                        ).item()
                         metrics.log_scalar(f"{tag}/{i}/voice_cosine_sim", cos, global_step)
                         self._log_audio_with_smg(tgt_lat, sample, global_step, f"{tag}/voice/{i}/target")
 
