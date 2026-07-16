@@ -137,6 +137,17 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 f"Expected one of 'layernorm', 'rmsnorm', 'batchnorm', 'none'."
             )
 
+        # Optional VQ bottleneck on the post-final-norm features. Discretizes the
+        # representation the CTC/GRL heads (and downstream SMG) consume.
+        self.use_vq = getattr(config, "use_vq", False)
+        if self.use_vq:
+            from megatransformer.model.voice.sive.vector_quantizer import VectorQuantizerEMA
+            self.vq = VectorQuantizerEMA(
+                num_codes=config.vq_num_codes, dim=config.encoder_dim,
+                commitment_weight=config.vq_commitment_weight, decay=config.vq_ema_decay,
+                dead_code_threshold=config.vq_dead_code_threshold,
+            )
+
         # Feature dropout (applied before heads)
         self.feature_dropout = nn.Dropout(config.feature_dropout) if config.feature_dropout > 0 else nn.Identity()
 
@@ -332,6 +343,16 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         else:
             features = self.final_norm(x)
 
+        # VQ bottleneck (post-norm): replace features with their quantized codes so every
+        # consumer -- variance reg, CTC head, GRL adversary, feature extraction -- operates
+        # on the discrete representation. valid_mask excludes padding from the codebook.
+        vq_commitment_loss = None
+        vq_indices = None
+        vq_perplexity = None
+        if self.use_vq:
+            vq_mask = (~padding_mask) if padding_mask is not None else None
+            features, vq_indices, vq_commitment_loss, vq_perplexity = self.vq(features, mask=vq_mask)
+
         # Compute variance regularization loss (for VAE-friendly features)
         variance_loss = torch.tensor(0.0, device=mel_spec.device)
         temporal_smoothness = None
@@ -476,6 +497,13 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             "temporal_smoothness": temporal_smoothness if self.config.use_variance_reg and self.training else None,
             "std_hinge_loss": std_hinge_loss,
             "cov_loss": cov_loss,
+            # VQ (None when use_vq is False). vq_commitment_loss goes into the objective;
+            # vq_perplexity is the code-usage health metric (near vq_num_codes = healthy,
+            # collapsing toward 1 = codebook collapse); vq_indices [B, T] are the codes the
+            # world model will predict and the SMG will consume.
+            "vq_commitment_loss": vq_commitment_loss,
+            "vq_indices": vq_indices,
+            "vq_perplexity": vq_perplexity,
         }
 
         if return_all_hiddens:

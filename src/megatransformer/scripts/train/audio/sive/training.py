@@ -433,6 +433,11 @@ class SIVETrainer(CommonTrainer):
         # computation, so no further multiplier is applied here).
         std_hinge_loss = result.get("std_hinge_loss", torch.zeros((), device=ctc_loss.device))
         cov_loss = result.get("cov_loss", torch.zeros((), device=ctc_loss.device))
+        # VQ commitment (None unless use_vq). Already scaled by commitment_weight inside the
+        # VQ layer; the codebook itself is EMA-updated, so there is no codebook-loss term.
+        vq_commitment_loss = result.get("vq_commitment_loss")
+        if vq_commitment_loss is None:
+            vq_commitment_loss = torch.zeros((), device=ctc_loss.device)
 
         # Combined loss
         # During pre-training phase, speaker loss still contributes but doesn't affect encoder
@@ -444,6 +449,7 @@ class SIVETrainer(CommonTrainer):
             + self.pad_blank_weight * pad_blank_loss
             + std_hinge_loss
             + cov_loss
+            + vq_commitment_loss
         )
 
         # Log to TensorBoard
@@ -457,6 +463,13 @@ class SIVETrainer(CommonTrainer):
             metrics.log_scalar("train/grl_alpha", grl_alpha, global_step)
             metrics.log_scalar("train/total_loss", total_loss, global_step)
             metrics.log_scalar("train/grl_pretraining", float(in_pretraining), global_step)
+            # VQ health: commitment loss + code-usage perplexity. Perplexity collapsing
+            # toward 1 (of vq_num_codes) is codebook collapse; dead-code reset fights it,
+            # but a perplexity stuck low means the codebook is not being used and the
+            # bottleneck is degenerate. Watch this the way you watch CTC accuracy.
+            if result.get("vq_perplexity") is not None:
+                metrics.log_scalar("train/vq_commitment_loss", vq_commitment_loss, global_step)
+                metrics.log_scalar("train/vq_perplexity", result["vq_perplexity"], global_step)
             # Adversary diagnostics — id-mode logs classifier accuracy/collapse;
             # embedding-mode logs cosine sim to the ECAPA target.
             if self.speaker_adversary_target == "speaker_id":
@@ -730,6 +743,12 @@ def load_model(args):
         # Covariance/decorrelation regularization (disabled unless --use_covariance_reg)
         'use_covariance_reg': args.use_covariance_reg,
         'cov_weight': args.cov_weight,
+        # VQ bottleneck (disabled unless --use_vq). Post-final-norm discretization.
+        'use_vq': args.use_vq,
+        'vq_num_codes': args.vq_num_codes,
+        'vq_commitment_weight': args.vq_commitment_weight,
+        'vq_ema_decay': args.vq_ema_decay,
+        'vq_dead_code_threshold': args.vq_dead_code_threshold,
     }
     # Norm levers (frontend / block pre-norm / conformer conv / final norm).
     # Override the config ONLY when a value is explicitly passed (CLI default is
@@ -1027,6 +1046,25 @@ def add_cli_args(subparsers):
                                  "Penalizes the squared off-diagonal of the per-batch feature covariance matrix.")
     sub_parser.add_argument("--cov_weight", type=float, default=0.04,
                             help="Weight on covariance loss (default: 0.04, VICReg paper)")
+
+    # VQ bottleneck (post-final-norm discretization; the capacity constraint that makes the
+    # GRL's speaker-invariance objective bite). Off by default.
+    sub_parser.add_argument("--use_vq", action="store_true",
+                            help="Discretize the post-final-norm features through an EMA VQ codebook. "
+                                 "CTC + GRL then supervise the codes: content is forced in, speaker "
+                                 "is forced out, and the K-code budget is the constraint continuous "
+                                 "SIVE lacked. Watch train/vq_perplexity for codebook collapse.")
+    sub_parser.add_argument("--vq_num_codes", type=int, default=512,
+                            help="Codebook size K. Post-hoc k-means suggested K~100-500 is the "
+                                 "interesting range; a trained codebook is more efficient so it can "
+                                 "go lower. Sweep once the pipeline works.")
+    sub_parser.add_argument("--vq_commitment_weight", type=float, default=0.25,
+                            help="Weight on the commitment loss (encoder->code pull). VQ-VAE default 0.25.")
+    sub_parser.add_argument("--vq_ema_decay", type=float, default=0.99,
+                            help="EMA decay for the codebook (higher = slower/steadier codes).")
+    sub_parser.add_argument("--vq_dead_code_threshold", type=float, default=1.0,
+                            help="Re-seed codes whose EMA usage falls below this from live encoder "
+                                 "outputs (dead-code reset; fights codebook collapse).")
 
     # Vocoder settings (for audio generation in TensorBoard)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,

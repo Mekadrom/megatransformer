@@ -119,6 +119,17 @@ class SpeakerInvariantVoiceEncoderConfig:
     # invariant), or "none" (skip — let consumers normalize).
     final_norm_type: str = "layernorm"
 
+    # VQ bottleneck on the POST-final-norm features (what CTC + GRL read). Turns SIVE's
+    # output into discrete codes: the K-code budget is the capacity constraint that makes
+    # the GRL's speaker-invariance objective bite (continuous features had spare capacity
+    # to smuggle speaker past it). The world model then predicts code indices (K-way) and
+    # the SMG consumes the code embeddings. Off by default; existing SIVE runs unchanged.
+    use_vq: bool = False
+    vq_num_codes: int = 512
+    vq_commitment_weight: float = 0.25
+    vq_ema_decay: float = 0.99
+    vq_dead_code_threshold: float = 1.0  # re-seed codes used < this (EMA-window count)
+
     speaker_classifier_hidden_dim: Optional[int] = None
 
     # GRL speaker-adversary target: "speaker_id" (cross-entropy over training
