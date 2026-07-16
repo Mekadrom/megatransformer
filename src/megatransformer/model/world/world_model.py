@@ -818,14 +818,19 @@ class MegaTransformerWorldModel(nn.Module):
         voice_duration_seq: List[List[int]] = [[] for _ in range(batch_size)]
 
         def _finalize_voice(seqs, f0s, durs):
-            """Concat a voice's steps; on the deduped path expand segments->frames by duration."""
+            """Concat a voice's steps; on the deduped path expand the CENTROIDS by duration.
+
+            F0 is NOT expanded here: on the deduped path each f0 entry is already a frame-
+            rate chunk (the segment's hidden state expanded by its duration, run through the
+            F0 head), so concatenating the chunks is already 50Hz and aligns with the
+            expanded centroids. Off the deduped path f0 is one value per frame and durs is
+            empty, so both branches just concatenate.
+            """
             feat = torch.cat(seqs, dim=-1)                       # (C, S)
-            f0 = torch.cat(f0s, dim=-1) if f0s else None         # (S,)
             if durs and len(durs) == feat.shape[-1]:
                 rep = torch.tensor(durs, device=feat.device)
                 feat = feat.repeat_interleave(rep, dim=-1)       # (C, T)
-                if f0 is not None and f0.shape[-1] == rep.shape[0]:
-                    f0 = f0.repeat_interleave(rep, dim=-1)
+            f0 = torch.cat(f0s, dim=-1) if f0s else None         # (T,) already frame-rate
             return feat, f0
         audio_stop_logit_trace: List[List[float]] = [[] for _ in range(batch_size)]
 
@@ -1161,16 +1166,25 @@ class MegaTransformerWorldModel(nn.Module):
                             # the contour the SMG will be conditioned on -- the whole point
                             # of predicting it here rather than letting the SMG infer it
                             # from prosody-free units.
-                            f0_p = coda_out.get("voice_f0_preds")
-                            if f0_p is not None:
-                                voice_f0_seq[b].append(f0_p[0, -1].detach().reshape(1))
-                            # Deduped path: this step is a SEGMENT, so record how many 50Hz
-                            # frames it becomes. exp(log-frames), round, clamp >=1; cap at
-                            # 100 (2s) so a runaway prediction can't blow up the expand.
                             dur_p = coda_out.get("voice_duration_preds")
                             if dur_p is not None:
+                                # Deduped path: this step is a SEGMENT. Record how many 50Hz
+                                # frames it becomes (exp(log-frames), round, clamp 1..100),
+                                # then predict F0 at frame rate by expanding THIS segment's
+                                # hidden state by that duration and running the F0 head --
+                                # matching training, where F0 comes off the expanded h.
                                 d = int(torch.exp(dur_p[0, -1].detach()).round().clamp(min=1, max=100))
                                 voice_duration_seq[b].append(d)
+                                hid = coda_out.get("voice_hidden")
+                                f0_head = getattr(self.voice_generator, "f0_head", None)
+                                if hid is not None and f0_head is not None:
+                                    h_exp = hid[0, -1].unsqueeze(0).expand(d, -1)  # (d, d_model)
+                                    voice_f0_seq[b].append(f0_head(h_exp).squeeze(-1).detach())  # (d,)
+                            else:
+                                # Frame-rate path: one F0 value per frame, from the coda.
+                                f0_p = coda_out.get("voice_f0_preds")
+                                if f0_p is not None:
+                                    voice_f0_seq[b].append(f0_p[0, -1].detach().reshape(1))
                             frame_pred = self.voice_codebook[unit_id].to(
                                 device=hidden_b.device, dtype=coda_out["voice_latent_preds"].dtype
                             ).view(1, -1, 1)  # (1, C, 1)

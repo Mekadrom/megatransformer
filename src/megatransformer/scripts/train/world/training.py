@@ -535,10 +535,12 @@ class WorldModelTrainer(CommonTrainer):
             inputs["voice_features"] = seg_feats
             inputs["voice_feature_lengths"] = inputs["voice_dedup_lengths"]
             inputs["voice_unit_ids"] = d_ids
-            if inputs.get("voice_dedup_f0_contour") is not None:
-                inputs["voice_f0_contour"] = inputs["voice_dedup_f0_contour"]
-            if inputs.get("voice_dedup_vuv") is not None:
-                inputs["voice_vuv"] = inputs["voice_dedup_vuv"]
+            # F0/VUV are NOT swapped to segment rate: the contour stays 50Hz and is
+            # predicted from the duration-expanded hidden state below, so within-segment
+            # pitch survives. Keep voice_f0_contour / voice_vuv as the collator emitted
+            # them. Stash the 50Hz frame length (lost when feature_lengths became segment
+            # counts) for the expansion.
+            inputs["_voice_frame_lengths"] = voice_frame_lengths_50hz = inputs.get("voice_mel_lengths")
 
         # Voice: same shape contract as audio (SIVE features). Separate placeholder token.
         voice_inputs = None
@@ -635,6 +637,26 @@ class WorldModelTrainer(CommonTrainer):
 
         if should_log and hasattr(model_for_stats, 'recurrent_block'):
             model_for_stats.recurrent_block.track_iteration_stats = False
+
+        # Deduped path: F0 at 50Hz, not per segment. Expand the coda's segment-rate hidden
+        # state by the GT durations (teacher forcing) to the 50Hz timeline, run the F0 head
+        # there, and hand the result to the ordinary F0 loss below -- which then compares it
+        # to the un-pooled 50Hz contour. The hidden state carries the text (it has attended
+        # to the transcript), so the contour stays text-conditioned; expanding raw centroids
+        # instead would strip that and just re-derive the SMG's own text-free predictor.
+        if (self.voice_dedup and outputs.get("voice_hidden") is not None
+                and inputs.get("voice_durations") is not None
+                and inputs.get("voice_f0_contour") is not None):
+            from megatransformer.utils.codebook import frame_to_segment_index
+            h = outputs["voice_hidden"]                                  # (B, M, d)
+            contour = inputs["voice_f0_contour"]
+            Tf = contour.shape[-1]
+            seg_idx = frame_to_segment_index(
+                inputs["voice_durations"], inputs["voice_dedup_lengths"], Tf,
+            ).to(h.device)
+            h_exp = h.gather(1, seg_idx.unsqueeze(-1).expand(-1, -1, h.shape[-1]))  # (B, Tf, d)
+            unwrapped = model.module if hasattr(model, "module") else model
+            outputs["voice_f0_preds"] = unwrapped.voice_generator.f0_head(h_exp).squeeze(-1)
 
         # for k, v in outputs.items():
         #     if isinstance(v, torch.Tensor):

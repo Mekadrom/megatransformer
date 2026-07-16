@@ -284,6 +284,11 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         outputs = {
             f"{self.prefix}_latent_preds": feature_preds,
             f"{self.prefix}_stop_logits": stop_logits,
+            # The coda hidden state, (batch, seq, d_model). Exposed so the deduped path can
+            # expand it by duration to 50Hz and run the F0 head at frame rate (F0 is a
+            # frame-rate signal; predicting it per SEGMENT flattens within-segment pitch).
+            # Off the deduped path nothing reads it.
+            f"{self.prefix}_hidden": h,
         }
 
         # (batch, seq_length, K) logits over the codebook. Read off the coda hidden state
@@ -292,7 +297,11 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         if self.unit_vocab_size:
             outputs[f"{self.prefix}_unit_logits"] = self.unit_head(h)
 
-        if self.predict_f0:
+        # F0 head: on the SEGMENT-rate deduped path it is applied by the caller (trainer /
+        # generation) on the duration-EXPANDED hidden state, so the contour keeps 50Hz
+        # resolution AND stays text-conditioned (h has attended to the transcript; the raw
+        # expanded centroids have not). Applied here only on the frame-rate path.
+        if self.predict_f0 and not self.predict_duration:
             # (batch, timesteps). A speaker-normalized contour in sigma units -- pass it
             # to SMG.decode(f0_contour=...), NOT to SMG.f0_embedding(), which wants
             # absolute log Hz.

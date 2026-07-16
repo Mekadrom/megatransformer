@@ -156,6 +156,26 @@ def dedup_units(unit_ids: torch.Tensor, length: Optional[int] = None):
     return dedup_ids, durations, seg_of_frame
 
 
+def frame_to_segment_index(durations: torch.Tensor, seg_lengths: torch.Tensor,
+                           max_frames: int) -> torch.Tensor:
+    """Inverse of durations: a (B, max_frames) gather index mapping each 50Hz frame to the
+    segment it belongs to. Use it to expand a per-segment tensor (e.g. coda hidden states)
+    to frame rate: expanded = h.gather(1, index[..., None].expand(-1, -1, D)).
+
+    durations: (B, Md) run lengths, 0-padded past seg_lengths.
+    seg_lengths: (B,) real segment count per row.
+    Padded frames map to segment 0 (they are masked downstream by the frame length).
+    """
+    B = durations.shape[0]
+    idx = torch.zeros(B, max_frames, dtype=torch.long, device=durations.device)
+    for i in range(B):
+        m = int(seg_lengths[i])
+        reps = durations[i, :m].clamp(min=0)
+        expanded = torch.repeat_interleave(torch.arange(m, device=durations.device), reps)
+        idx[i, :expanded.shape[0]] = expanded[:max_frames]
+    return idx
+
+
 def pool_by_segment(x: torch.Tensor, seg_of_frame: torch.Tensor, num_segments: int,
                     weights: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Average a per-frame quantity within each dedup segment.

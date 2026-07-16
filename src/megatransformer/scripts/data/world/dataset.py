@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from megatransformer.utils.codebook import (
-    dedup_units, load_codebook, load_f0_stats, normalize_f0, pool_by_segment, quantize,
+    dedup_units, load_codebook, load_f0_stats, normalize_f0, quantize,
 )
 
 
@@ -375,15 +375,13 @@ class MultimodalShardedDataset(Dataset):
         # frozen SMG, which still consumes frame-rate features.
         if self.voice_dedup and "unit_ids" in sample:
             L = int(sample["feature_length"])
-            d_ids, durations, seg = dedup_units(sample["unit_ids"], L)
+            d_ids, durations, _ = dedup_units(sample["unit_ids"], L)
             sample["dedup_unit_ids"] = d_ids                 # (M,)
             sample["durations"] = durations                  # (M,) sums to L
-            M = d_ids.shape[0]
-            if "f0_contour" in sample:
-                w = sample["vuv"][:L].float() if "vuv" in sample else None
-                sample["dedup_f0_contour"] = pool_by_segment(sample["f0_contour"], seg, M, weights=w)
-            if "vuv" in sample:
-                sample["dedup_vuv"] = pool_by_segment(sample["vuv"], seg, M)
+            # F0/VUV stay at 50Hz (not pooled to segments): the coda's per-segment hidden
+            # state is expanded by duration at training and the F0 head runs at frame rate,
+            # so the contour keeps within-segment pitch. The existing 50Hz f0_contour / vuv
+            # are the targets.
 
         return sample
 
