@@ -25,6 +25,30 @@ from megatransformer.utils.speaker_encoder import SpeakerEncoderType, get_speake
 from megatransformer.utils.text_encoder import TextEncoderType
 
 
+def _detect_vq_codes(checkpoint_path: str) -> Optional[int]:
+    """Peek a SIVE checkpoint for a VQ codebook. Returns the code count if the model has a
+    VQ bottleneck (a `*vq.embed` buffer), else None. Used to load a VQ-trained SIVE WITH its
+    codebook so extract_features returns quantized codes rather than continuous features."""
+    path = checkpoint_path
+    if os.path.isdir(path):
+        for cand in ("pytorch_model.bin", "model.safetensors"):
+            if os.path.exists(os.path.join(path, cand)):
+                path = os.path.join(path, cand)
+                break
+    try:
+        if path.endswith(".safetensors"):
+            import safetensors.torch as st
+            sd = st.load_file(path)
+        else:
+            obj = torch.load(path, map_location="cpu", weights_only=False)
+            sd = obj.get("state_dict", obj) if isinstance(obj, dict) else obj
+        key = next((k for k in sd if k.endswith("vq.embed")), None)
+        return int(sd[key].shape[0]) if key is not None else None
+    except Exception as e:
+        print(f"  [warn] could not probe checkpoint for VQ ({e}); assuming no VQ")
+        return None
+
+
 # Canonical gender label mapping. Datasets use varied conventions (Common
 # Voice: "male"/"female"/"other"/""; LibriTTS, VCTK: "M"/"F"); we collapse to
 # integer codes downstream consumers can rely on. Values not in this map
@@ -547,6 +571,19 @@ class VoiceDatasetPreprocessor(Preprocessor):
             if args.speaker_pooling:
                 model_config_overrides['speaker_pooling'] = args.speaker_pooling
 
+            # Auto-detect a VQ bottleneck in the checkpoint. Without this the model would be
+            # built use_vq=False, the vq.embed buffer would be dropped on load, and
+            # extract_features(layer=-1) would silently return CONTINUOUS features instead of
+            # the quantized codes -- an unquantized dataset that looks fine. Reading the code
+            # count from the checkpoint also means it can't be mis-specified.
+            vq_codes = _detect_vq_codes(args.sive_checkpoint_path)
+            if vq_codes is not None:
+                model_config_overrides['use_vq'] = True
+                model_config_overrides['vq_num_codes'] = vq_codes
+                print(f"  Detected VQ bottleneck in checkpoint: {vq_codes} codes -> use_vq=True")
+                print(f"  NOTE: VQ codes exist ONLY at the final tap -- extract with --layers -1 "
+                      f"(any earlier layer is pre-VQ / continuous).")
+
             # Load SIVE model
             print(f"Loading SIVE model from {args.sive_checkpoint_path}...")
             sive_model = load_model(
@@ -556,6 +593,21 @@ class VoiceDatasetPreprocessor(Preprocessor):
                 device=device,
                 overrides=model_config_overrides,
             ).eval()
+
+            # Export the learned codebook in the ContentVec-compatible format, so the
+            # downstream world/SMG dataset drives the existing units pipeline unchanged
+            # (--voice_codebook_path -> quantize the stored code vectors to exact ids).
+            if getattr(sive_model, "use_vq", False):
+                from megatransformer.utils.codebook import save_codebook
+                os.makedirs(self.output_dir, exist_ok=True)
+                cb_path = os.path.join(self.output_dir, "sive_vq_codebook.pt")
+                save_codebook(cb_path, sive_model.vq.embed.detach().cpu(), meta={
+                    "source": "sive_vq",
+                    "sive_checkpoint": args.sive_checkpoint_path,
+                    "commitment_weight": float(sive_model.config.vq_commitment_weight),
+                })
+                print(f"  Exported SIVE VQ codebook ({sive_model.vq.embed.shape[0]} codes) "
+                      f"-> {cb_path}")
 
             print(f"  SIVE config: {args.sive_config}")
             print(f"  Encoder dimension: {sive_model.config.encoder_dim}")
