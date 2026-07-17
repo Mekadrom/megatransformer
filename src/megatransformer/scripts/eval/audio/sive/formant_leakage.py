@@ -307,16 +307,18 @@ def _r2_per_col(y, yhat):
     return 1.0 - ss_res / ss_tot
 
 
-def train_regressor(Xtr, Ytr, Xte, Yte, device, hidden, layers, dropout,
-                    lr, max_epochs, patience, batch, y_std):
-    """Train one regressor; return dict with per-formant val R² + RMSE(Hz)."""
+def train_and_predict(Xtr, Ytr, Xte, Yte, device, hidden, layers, dropout,
+                      lr, max_epochs, patience, batch):
+    """Train one regressor (early-stop on standardized test mean-R²); return the
+    best-epoch standardized test predictions [Nte, out] + meta. R²/RMSE are
+    computed by the caller, which differs per probe (frame vs per-speaker)."""
     in_dim, out_dim = Xtr.shape[1], Ytr.shape[1]
     model = MLPRegressor(in_dim, out_dim, hidden, layers, dropout).to(device)
     opt = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     Xtr_t = torch.from_numpy(Xtr).to(device); Ytr_t = torch.from_numpy(Ytr).to(device)
-    Xte_t = torch.from_numpy(Xte).to(device); Yte_t = torch.from_numpy(Yte).to(device)
+    Xte_t = torch.from_numpy(Xte).to(device); Yte_np = Yte
     n = Xtr_t.shape[0]
-    best_mean_r2, best_state, best_r2, wait = -1e9, None, None, 0
+    best_mean_r2, best_pred, wait = -1e9, None, 0
     for ep in range(max_epochs):
         model.train()
         perm = torch.randperm(n, device=device)
@@ -327,84 +329,148 @@ def train_regressor(Xtr, Ytr, Xte, Yte, device, hidden, layers, dropout,
             loss.backward(); opt.step()
         model.eval()
         with torch.no_grad():
-            pred = model(Xte_t)
-            r2 = _r2_per_col(Yte_t.cpu().numpy(), pred.cpu().numpy())
-        mean_r2 = float(np.mean(r2))
+            pred = model(Xte_t).cpu().numpy()
+        mean_r2 = float(np.mean(_r2_per_col(Yte_np, pred)))
         if mean_r2 > best_mean_r2 + 1e-4:
-            best_mean_r2, best_r2, wait = mean_r2, r2, 0
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_mean_r2, best_pred, wait = mean_r2, pred, 0
         else:
             wait += 1
             if wait >= patience:
                 break
-    model.load_state_dict(best_state)
-    with torch.no_grad():
-        pred = model(Xte_t).cpu().numpy()
-    yte = Yte_t.cpu().numpy()
-    rmse_std = np.sqrt(((yte - pred) ** 2).mean(axis=0))
-    return {
-        "r2": [float(x) for x in best_r2],
-        "mean_r2": float(np.mean(best_r2)),
-        "rmse_hz": [float(r * s) for r, s in zip(rmse_std, y_std)],
-        "epochs": ep + 1,
-        "plateaued": wait >= patience,
-    }
+    return best_pred, {"epochs": ep + 1, "plateaued": wait >= patience}
 
 
-def run_probe(name, X, Y, U, args):
-    """Utterance-disjoint split (fixed by seed), standardize, train linear+MLP."""
-    rng = np.random.default_rng(args.seed)
-    utts = np.unique(U)
-    rng.shuffle(utts)
-    n_test = max(1, int(len(utts) * args.test_split))
-    test_utts = set(utts[:n_test].tolist())
-    te = np.array([u in test_utts for u in U])
-    tr = ~te
-    xmu, xsd = X[tr].mean(0), X[tr].std(0) + 1e-6
-    ymu, ysd = Y[tr].mean(0), Y[tr].std(0) + 1e-6
-    Xtr = ((X[tr] - xmu) / xsd).astype(np.float32)
-    Xte = ((X[te] - xmu) / xsd).astype(np.float32)
-    Ytr = ((Y[tr] - ymu) / ysd).astype(np.float32)
-    Yte = ((Y[te] - ymu) / ysd).astype(np.float32)
+def _fit_report(Xtr, Ytr, Xte, Yte, ymu, ysd, args, agg=None):
+    """Standardized-in inputs. Fit linear + MLP; return per-formant R²/RMSE(Hz).
+
+    agg: optional (n_test,) group id (e.g. speaker) -> metrics are averaged
+    within group first (per-speaker R²), else per-row (per-frame R²)."""
+    def metrics(pred_std):
+        if agg is not None:
+            groups = np.unique(agg)
+            p = np.stack([pred_std[agg == g].mean(0) for g in groups])
+            t = np.stack([Yte[agg == g].mean(0) for g in groups])
+        else:
+            p, t = pred_std, Yte
+        r2 = _r2_per_col(t, p)
+        rmse_hz = np.sqrt(((t - p) ** 2).mean(0)) * ysd
+        return [float(x) for x in r2], float(np.mean(r2)), [float(x) for x in rmse_hz]
+    out = {}
     common = dict(device=args.device, dropout=args.mlp_dropout, lr=args.probe_lr,
                   max_epochs=args.probe_max_epochs, patience=args.probe_patience,
-                  batch=args.probe_batch, y_std=ysd)
-    lin = train_regressor(Xtr, Ytr, Xte, Yte, hidden=0, layers=0, **common)
-    mlp = train_regressor(Xtr, Ytr, Xte, Yte, hidden=args.mlp_hidden_dim,
-                          layers=args.mlp_num_layers, **common)
-    print(f"[{name}] frames={len(X)} (train {int(tr.sum())}/test {int(te.sum())}) "
-          f"linear mean-R2={lin['mean_r2']:.3f} r2={['%.3f'%r for r in lin['r2']]} "
-          f"| mlp mean-R2={mlp['mean_r2']:.3f} r2={['%.3f'%r for r in mlp['r2']]}")
-    return {"name": name, "n_frames": int(len(X)), "n_test_utts": n_test,
-            "linear": lin, "mlp": mlp}
+                  batch=args.probe_batch)
+    for label, h, ly in (("linear", 0, 0), ("mlp", args.mlp_hidden_dim, args.mlp_num_layers)):
+        pred, meta = train_and_predict(Xtr, Ytr, Xte, Yte, hidden=h, layers=ly, **common)
+        r2, mean_r2, rmse = metrics(pred)
+        out[label] = {"r2": r2, "mean_r2": mean_r2, "rmse_hz": rmse, **meta}
+    return out
+
+
+def run_frame_probe(name, X, Y, U, args):
+    """FRAME mode (V1): utterance-disjoint, regress frame formants from frame
+    features. Confounded by content (a stronger content encoder scores higher)."""
+    rng = np.random.default_rng(args.seed)
+    utts = np.unique(U); rng.shuffle(utts)
+    n_test = max(1, int(len(utts) * args.test_split))
+    test_utts = set(utts[:n_test].tolist())
+    te = np.array([u in test_utts for u in U]); tr = ~te
+    xmu, xsd = X[tr].mean(0), X[tr].std(0) + 1e-6
+    ymu, ysd = Y[tr].mean(0), Y[tr].std(0) + 1e-6
+    Xtr = ((X[tr] - xmu) / xsd).astype(np.float32); Xte = ((X[te] - xmu) / xsd).astype(np.float32)
+    Ytr = ((Y[tr] - ymu) / ysd).astype(np.float32); Yte = ((Y[te] - ymu) / ysd).astype(np.float32)
+    out = _fit_report(Xtr, Ytr, Xte, Yte, ymu, ysd, args, agg=None)
+    print(f"[{name}] FRAME frames={len(X)} (tr {int(tr.sum())}/te {int(te.sum())}) "
+          f"mlp mean-R2={out['mlp']['mean_r2']:.3f} r2={['%.3f'%r for r in out['mlp']['r2']]}")
+    out.update({"name": name, "n_frames": int(len(X)), "n_test_utts": n_test})
+    return out
+
+
+def shared_speaker_split(U, S, min_utts, test_split, seed):
+    """Feature-INDEPENDENT speaker filter + train/test split, computed once and
+    reused for every feature so all are scored on the SAME speakers (a frame-
+    count filter would admit more speakers for a higher-frame-rate feature like
+    ContentVec, an unfair comparison). Keyed on utterance count in the subset,
+    which is identical across features."""
+    u2s = {}
+    for u, s in zip(U, S):
+        u2s[int(u)] = int(s)
+    counts = {}
+    for s in u2s.values():
+        counts[s] = counts.get(s, 0) + 1
+    keep = np.array(sorted(s for s, c in counts.items() if c >= min_utts))
+    rng = np.random.default_rng(seed)
+    ks = keep.copy(); rng.shuffle(ks)
+    n_test = max(1, int(len(ks) * test_split))
+    return set(int(s) for s in keep), set(int(s) for s in ks[:n_test])
+
+
+def run_vtl_probe(name, X, Y, U, S, keep_spk, test_spk, args):
+    """VTL mode (V2): content-controlled. Target = each speaker's MEAN formant
+    (their vocal-tract signature; content averages out). Regress it from the
+    UTTERANCE-pooled feature on a SPEAKER-disjoint split (shared across features);
+    R² is per-speaker. This is the pure timbre axis: ContentVec should fall BELOW
+    SIVE here if it strips renderable timbre."""
+    m = np.array([int(s) in keep_spk for s in S])
+    Xk, Yk, Uk, Sk = X[m], Y[m], U[m], S[m]
+    mu = {int(s): Yk[Sk == s].mean(0) for s in np.unique(Sk)}  # speaker VTL signature
+    utts = np.unique(Uk)
+    Xu = np.stack([Xk[Uk == u].mean(0) for u in utts])         # utt-pooled feature
+    Su = np.array([int(Sk[Uk == u][0]) for u in utts])          # utt's speaker
+    Yu = np.stack([mu[s] for s in Su])                          # target = speaker VTL
+    te = np.array([s in test_spk for s in Su]); tr = ~te
+    xmu, xsd = Xu[tr].mean(0), Xu[tr].std(0) + 1e-6
+    ymu, ysd = Yu[tr].mean(0), Yu[tr].std(0) + 1e-6
+    Xtr = ((Xu[tr] - xmu) / xsd).astype(np.float32); Xte = ((Xu[te] - xmu) / xsd).astype(np.float32)
+    Ytr = ((Yu[tr] - ymu) / ysd).astype(np.float32); Yte = ((Yu[te] - ymu) / ysd).astype(np.float32)
+    out = _fit_report(Xtr, Ytr, Xte, Yte, ymu, ysd, args, agg=Su[te])  # per-speaker R²
+    print(f"[{name}] VTL speakers={len(keep_spk)} (tr {int(tr.sum())}/te {int(te.sum())} utts, "
+          f"{len(test_spk)} test spk) mlp mean-R2={out['mlp']['mean_r2']:.3f} "
+          f"r2={['%.3f'%r for r in out['mlp']['r2']]}")
+    out.update({"name": name, "n_speakers": len(keep_spk), "n_test_spk": len(test_spk),
+                "min_spk_utts": args.min_spk_utts})
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
-def write_report(results, args):
+_MODE_HEADER = {
+    "frame": ("formant-recoverability (FRAME — V1, content-CONFOUNDED)",
+              "Frame formants regressed from frame features, utterance-disjoint. A stronger "
+              "content encoder scores higher regardless of timbre, so cross-feature ranking is "
+              "unreliable — use the VTL report for the timbre verdict."),
+    "vtl": ("VTL-signature (V2 — content-controlled timbre probe)",
+            "Target = each speaker's MEAN formant (their vocal-tract-length signature; content "
+            "averages out). Regressed from the UTTERANCE-pooled feature, SPEAKER-disjoint, R² "
+            "per-speaker. This is the pure timbre axis: a feature that strips renderable timbre "
+            "(ContentVec) should score LOW; one that keeps it (SIVE) HIGH."),
+}
+
+
+def write_report(results, args, mode):
     os.makedirs(args.output_dir, exist_ok=True)
     fl = [f"F{i+1}" for i in range(args.n_formants)]
-    lines = ["# SIVE formant-recoverability report", "",
-             f"- Frame-level formants {fl} via LPC (order {args.lpc_order}), aligned to each "
-             f"feature's own frame rate; regressed from the FROZEN frame-level feature.",
-             f"- Utterance-disjoint split (test_split={args.test_split}, seed {args.seed}), "
-             f"{args.subset_size} val utts. R² per formant on held-out frames (higher = formant "
-             f"more recoverable = MORE timbre leakage). RMSE in Hz.",
-             "- **Lower R² (esp. F3) = raw formants stripped = better for cloning.** Cross-feature "
-             "comparison isolates the speaker part (content recovery ≈ constant across features).",
-             "",
-             "## Formant-R² (MLP probe)", "",
-             "| run | mean R² | " + " | ".join(f"{f} R²" for f in fl) + " | "
-             + " | ".join(f"{f} RMSE Hz" for f in fl) + " | plateaued |",
-             "|---|---|" + "---|" * (2 * args.n_formants + 1)]
+    title, blurb = _MODE_HEADER[mode]
+    unit = "per-speaker" if mode == "vtl" else "per-frame"
+    lines = [f"# SIVE {title} report", "", f"- {blurb}",
+             f"- LPC order {args.lpc_order}, {args.subset_size} val utts, seed {args.seed}, "
+             f"test_split={args.test_split}. R² is {unit} (higher = more recoverable). RMSE in Hz.",
+             ""]
+    if mode == "vtl":
+        lines.append(f"- Shared speaker set (≥{args.min_spk_utts} utts, same for all features). "
+                     "**Lower mean-R² = renderable timbre stripped = better for voice cloning.**")
+    else:
+        lines.append("- **Higher R² = formants more recoverable.** Content-confounded (see header).")
+    lines += ["", "## Formant-R² (MLP probe)", "",
+              "| run | mean R² | " + " | ".join(f"{f} R²" for f in fl) + " | "
+              + " | ".join(f"{f} RMSE Hz" for f in fl) + " | plateaued |",
+              "|---|---|" + "---|" * (2 * args.n_formants + 1)]
     for r in results:
         m = r["mlp"]
-        lines.append(
-            f"| {r['name']} | {m['mean_r2']:.3f} | "
-            + " | ".join(f"{x:.3f}" for x in m["r2"]) + " | "
-            + " | ".join(f"{x:.0f}" for x in m["rmse_hz"]) + f" | {m['plateaued']} |")
+        lines.append(f"| {r['name']} | {m['mean_r2']:.3f} | "
+                     + " | ".join(f"{x:.3f}" for x in m["r2"]) + " | "
+                     + " | ".join(f"{x:.0f}" for x in m["rmse_hz"]) + f" | {m['plateaued']} |")
     lines += ["", "## Formant-R² (linear probe)", "",
               "| run | mean R² | " + " | ".join(f"{f} R²" for f in fl) + " |",
               "|---|---|" + "---|" * args.n_formants]
@@ -413,31 +479,33 @@ def write_report(results, args):
         lines.append(f"| {r['name']} | {lin['mean_r2']:.3f} | "
                      + " | ".join(f"{x:.3f}" for x in lin["r2"]) + " |")
 
-    # Validation verdict: ContentVec should sit BELOW a SIVE run.
     by = {r["name"]: r["mlp"]["mean_r2"] for r in results}
     cv = [n for n in by if "contentvec" in n.lower() or "cv" in n.lower()]
     sive = [n for n in by if n not in cv]
     lines += ["", "## Validation verdict", ""]
     if cv and sive:
-        cvm = min(by[n] for n in cv)
-        svm = max(by[n] for n in sive)
-        gap = svm - cvm
-        verdict = ("PROBE VALIDATED — ContentVec's formants are less recoverable than SIVE's, "
-                   "so this metric tracks timbre/cloning where the speaker classifier did not."
-                   if gap > 0.03 else
-                   "INCONCLUSIVE / CONFOUNDED — ContentVec is NOT clearly below SIVE, so formant-R² "
-                   "may be dominated by content; do NOT trust it as a timbre yardstick yet.")
-        lines.append(f"- ContentVec mean-R² {cvm:.3f} vs SIVE max mean-R² {svm:.3f} "
-                     f"(gap {gap:+.3f}). **{verdict}**")
+        # For the stripping story to hold, ContentVec must sit below even the
+        # LOWEST-recoverability SIVE run (the conservative bar) — comparing to the
+        # max would let one high SIVE outlier fake a pass.
+        cvm = min(by[n] for n in cv); svm = min(by[n] for n in sive); gap = svm - cvm
+        if mode == "vtl":
+            verdict = ("PROBE VALIDATED — ContentVec's VTL/timbre is less recoverable than every "
+                       "SIVE run, confirming the timbre-stripping mechanism." if gap > 0.03 else
+                       "NOT VALIDATED — ContentVec is NOT below SIVE on the pure timbre axis. Its "
+                       "VTL is about as recoverable as SIVE's, so the info-stripping story does not "
+                       "hold; the cloning difference is about FORM/ACCESSIBILITY, not stripping.")
+        else:
+            verdict = ("(frame mode is content-confounded; defer to the VTL verdict)")
+        lines.append(f"- ContentVec mean-R² {cvm:.3f} vs LOWEST SIVE {svm:.3f} (gap {gap:+.3f}). "
+                     f"**{verdict}**")
     else:
-        lines.append("- Add a ContentVec run (`--content_encoder contentvec ... "
-                     "--checkpoint contentvec256=CONTENTVEC`) to validate this probe.")
+        lines.append("- Add a ContentVec run (`--checkpoint contentvec256=CONTENTVEC`) to validate.")
     lines.append("")
 
-    path = os.path.join(args.output_dir, "formant_leakage_report.md")
+    path = os.path.join(args.output_dir, f"formant_{mode}_report.md")
     with open(path, "w") as f:
         f.write("\n".join(lines))
-    with open(os.path.join(args.output_dir, "formant_leakage_results.json"), "w") as f:
+    with open(os.path.join(args.output_dir, f"formant_{mode}_results.json"), "w") as f:
         json.dump({"args": {k: str(v) for k, v in vars(args).items()}, "results": results}, f, indent=2)
     print("\n".join(lines))
     print(f"\nReport: {path}")
@@ -478,6 +546,11 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--test_split", type=float, default=0.3)
     ap.add_argument("--no_feature_cache", action="store_true")
+    ap.add_argument("--mode", default="both", choices=["frame", "vtl", "both"],
+                    help="frame=V1 (content-confounded); vtl=V2 (content-controlled timbre); both.")
+    ap.add_argument("--min_spk_utts", type=int, default=2,
+                    help="VTL: keep speakers with >= this many utts in the subset (shared across "
+                         "features; feature-independent so the comparison is fair).")
     # formant extraction
     ap.add_argument("--n_formants", type=int, default=3)
     ap.add_argument("--lpc_order", type=int, default=18)
@@ -504,12 +577,22 @@ def main():
     subset = sorted(rng.choice(len(ds), size=min(args.subset_size, len(ds)), replace=False).tolist())
     del ds
 
-    results = []
+    frame_res, vtl_res = [], []
+    keep_spk = test_spk = None
     for name, ckpt in args.checkpoint:
         print(f"\n{'='*70}\n[{name}] {ckpt}\n{'='*70}")
         X, Y, U, S = cached_frame_data(args, name, ckpt, subset)
-        results.append(run_probe(name, X, Y, U, args))
-    write_report(results, args)
+        if args.mode in ("frame", "both"):
+            frame_res.append(run_frame_probe(name, X, Y, U, args))
+        if args.mode in ("vtl", "both"):
+            if keep_spk is None:  # compute the shared speaker set/split once
+                keep_spk, test_spk = shared_speaker_split(
+                    U, S, args.min_spk_utts, args.test_split, args.seed)
+            vtl_res.append(run_vtl_probe(name, X, Y, U, S, keep_spk, test_spk, args))
+    if frame_res:
+        write_report(frame_res, args, "frame")
+    if vtl_res:
+        write_report(vtl_res, args, "vtl")
 
 
 if __name__ == "__main__":
