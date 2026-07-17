@@ -65,6 +65,8 @@ class SIVETrainer(CommonTrainer):
         grl_alpha_scheduler: GRLAlphaScheduler,
         ctc_weight: float = 1.0,
         grl_weight: float = 0.1,
+        consistency_weight: float = 0.0,  # ContentVec-style perturbation-consistency loss (0=off); non-adversarial timbre strip
+        consistency_rampup_steps: int = 5000,  # ramp the consistency weight 0->max
         grl_start_step: int = 0,  # Step at which GRL kicks in (before this, classifier trains freely)
         grl_lr: float = None,  # Separate LR for speaker classifier (None = use base LR)
         pad_blank_weight: float = 0.05,  # Auxiliary CE pushing pad-region asr_logits toward blank
@@ -87,6 +89,8 @@ class SIVETrainer(CommonTrainer):
         self.grl_alpha_scheduler = grl_alpha_scheduler
         self.ctc_weight = ctc_weight
         self.grl_weight = grl_weight
+        self.consistency_weight = consistency_weight
+        self.consistency_rampup_steps = consistency_rampup_steps
         self.grl_start_step = grl_start_step
         self.grl_lr = grl_lr
         self.pad_blank_weight = pad_blank_weight
@@ -439,6 +443,28 @@ class SIVETrainer(CommonTrainer):
         if vq_commitment_loss is None:
             vq_commitment_loss = torch.zeros((), device=ctc_loss.device)
 
+        # ContentVec-style perturbation-consistency (non-adversarial timbre strip). A SECOND
+        # independently speaker-perturbed view — pitch shift / VTLP / EQ all preserve duration,
+        # so its features are frame-aligned with the first — is forced to match view 1. This
+        # removes whatever the perturbations vary (pitch + formants = timbre) without an
+        # adversary, so it can't hit the GRL floor. CTC on view 1 is the anti-collapse anchor:
+        # the features can't go constant (min consistency) without failing phoneme decode.
+        # Off unless --consistency_weight>0; expects the GRL off (--grl_weight 0) for the clean test.
+        consistency_loss = torch.zeros((), device=ctc_loss.device)
+        consistency_alpha = 0.0
+        if self.consistency_weight > 0:
+            mel2, mel2_lengths = self._prepare_mel_inputs(inputs, augment=True)  # independent aug draw
+            result2 = model(mel2, lengths=mel2_lengths, grl_alpha=0.0)
+            f1, f2 = result["features"], result2["features"]
+            flen = result["feature_lengths"]
+            T = min(f1.shape[1], f2.shape[1])
+            fmask = (torch.arange(T, device=f1.device).unsqueeze(0)
+                     < flen.clamp(max=T).unsqueeze(1)).unsqueeze(-1)  # [B,T,1] valid frames only
+            diff = (f1[:, :T] - f2[:, :T]).pow(2) * fmask
+            consistency_loss = diff.sum() / (fmask.sum() * f1.shape[-1]).clamp(min=1)
+            consistency_alpha = min(1.0, global_step / max(1, self.consistency_rampup_steps))
+            consistency_loss = consistency_loss * consistency_alpha
+
         # Combined loss
         # During pre-training phase, speaker loss still contributes but doesn't affect encoder
         # (because grl_alpha=0 means no gradient reversal, but classifier still learns)
@@ -447,6 +473,7 @@ class SIVETrainer(CommonTrainer):
             + self.grl_weight * speaker_loss
             + self.gender_grl_weight * gender_loss
             + self.pad_blank_weight * pad_blank_loss
+            + self.consistency_weight * consistency_loss
             + std_hinge_loss
             + cov_loss
             + vq_commitment_loss
@@ -461,6 +488,9 @@ class SIVETrainer(CommonTrainer):
             metrics.log_scalar("train/pad_blank_loss", pad_blank_loss, global_step)
             metrics.log_scalar("train/speaker_loss", speaker_loss, global_step)
             metrics.log_scalar("train/grl_alpha", grl_alpha, global_step)
+            if self.consistency_weight > 0:
+                metrics.log_scalar("train/consistency_loss", consistency_loss, global_step)
+                metrics.log_scalar("train/consistency_alpha", consistency_alpha, global_step)
             metrics.log_scalar("train/total_loss", total_loss, global_step)
             metrics.log_scalar("train/grl_pretraining", float(in_pretraining), global_step)
             # VQ health: commitment loss + code-usage perplexity. Perplexity collapsing
@@ -816,6 +846,8 @@ def create_trainer(
         grl_alpha_scheduler=grl_scheduler,
         ctc_weight=args.ctc_weight,
         grl_weight=args.grl_weight,
+        consistency_weight=getattr(args, 'consistency_weight', 0.0),
+        consistency_rampup_steps=getattr(args, 'consistency_rampup_steps', 5000),
         grl_start_step=args.grl_start_step,
         grl_lr=args.grl_lr,
         pad_blank_weight=args.pad_blank_weight,
@@ -913,6 +945,16 @@ def add_cli_args(subparsers):
     # CTC-specific settings
     sub_parser.add_argument("--ctc_weight", type=float, default=1.0,
                             help="Weight for CTC loss in total loss")
+    # ContentVec-style perturbation-consistency (non-adversarial timbre strip). Needs the
+    # speaker-perturbing augments ON (pitch shift + --use_mel_vtlp + --use_mel_freq_response)
+    # and length-CHANGING augments OFF (no speed perturb) so the two views stay frame-aligned.
+    # Run with --grl_weight 0 (no adversary) for the clean ContentVec-analog test.
+    sub_parser.add_argument("--consistency_weight", type=float, default=0.0,
+                            help="Weight for the perturbation-consistency loss (0=off). Two independently "
+                                 "pitch/formant/EQ-perturbed views are forced to the same features; CTC is "
+                                 "the anti-collapse anchor. The non-adversarial alternative to the GRL.")
+    sub_parser.add_argument("--consistency_rampup_steps", type=int, default=5000,
+                            help="Ramp the consistency weight 0->max over this many steps.")
     sub_parser.add_argument("--pad_blank_weight", type=float, default=0.05,
                             help="Auxiliary CE loss pushing pad-region asr_logits toward blank "
                                  "(keeps SIVE features clean past audio end). 0 disables.")
