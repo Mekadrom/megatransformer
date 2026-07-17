@@ -462,7 +462,12 @@ class SIVETrainer(CommonTrainer):
                      < flen.clamp(max=T).unsqueeze(1)).unsqueeze(-1)  # [B,T,1] valid frames only
             diff = (f1[:, :T] - f2[:, :T]).pow(2) * fmask
             consistency_loss = diff.sum() / (fmask.sum() * f1.shape[-1]).clamp(min=1)
-            consistency_alpha = min(1.0, global_step / max(1, self.consistency_rampup_steps))
+            # Ramp over the first rampup_steps of THIS run, so it warms up on a
+            # fine-tune too. self.state.global_step is relative (0 at start);
+            # `global_step` above is absolute (start_step-offset), which on a
+            # resumed base (e.g. 300k) already exceeds rampup and would pin the
+            # ramp to 1.0 instantly — no warmup, full-weight consistency shock.
+            consistency_alpha = min(1.0, self.state.global_step / max(1, self.consistency_rampup_steps))
             consistency_loss = consistency_loss * consistency_alpha
 
         # Combined loss
