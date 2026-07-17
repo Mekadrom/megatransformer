@@ -54,6 +54,19 @@ except ModuleNotFoundError:
     from numpy.core.multiarray import _reconstruct as _np_reconstruct    # numpy < 2.0
 torch.serialization.add_safe_globals([_np_reconstruct, np.ndarray, np.dtype])
 
+# PyTorch 2.6 flipped torch.load(weights_only) to True by default. On a full
+# (non --fresh_schedule) resume, HF Trainer._load_rng_state loads rng_state.pth
+# with a HARDCODED weights_only=True, which rejects numpy's RNG-state globals —
+# and the add_safe_globals allowlist above can't reliably cover them across numpy
+# 2.x (module-path churn on _reconstruct, the new numpy.dtypes.* classes). We only
+# ever torch.load our OWN checkpoints here, so force the pre-2.6 weights_only=False
+# behaviour process-wide (this is what makes true-resume work again).
+_orig_torch_load = torch.load
+def _torch_load_trusted(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _torch_load_trusted
+
 
 def create_or_load_model(args, shared_window_buffer: Optional[SharedWindowBuffer]) -> nn.Module:
     if args.command in ["smg"]:
