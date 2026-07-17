@@ -9,6 +9,34 @@ from megatransformer.model.ema import EMAModel
 from megatransformer.utils.audio_utils import SharedWindowBuffer
 
 
+def detect_sive_vq_codes(checkpoint_path: str) -> Optional[int]:
+    """Peek a SIVE checkpoint for a VQ codebook; return the code count, else None.
+
+    A VQ-trained SIVE loaded into a use_vq=False model SILENTLY drops its vq.* buffers and
+    then returns CONTINUOUS features — an eval that looks fine but measures the wrong
+    representation. Auto-detecting the codebook from the checkpoint means callers can't
+    forget the flag, and a non-VQ checkpoint transparently stays continuous.
+    """
+    path = checkpoint_path
+    if os.path.isdir(path):
+        for cand in ("pytorch_model.bin", "model.safetensors"):
+            if os.path.exists(os.path.join(path, cand)):
+                path = os.path.join(path, cand)
+                break
+    try:
+        if path.endswith(".safetensors"):
+            import safetensors.torch as st
+            sd = st.load_file(path)
+        else:
+            obj = torch.load(path, map_location="cpu", weights_only=False)
+            sd = obj.get("state_dict", obj) if isinstance(obj, dict) else obj
+        key = next((k for k in sd if k.endswith("vq.embed")), None)
+        return int(sd[key].shape[0]) if key is not None else None
+    except Exception as e:
+        print(f"  [warn] could not probe checkpoint for VQ ({e}); assuming no VQ")
+        return None
+
+
 def load_model(
     model_cls,
     config_name: str,

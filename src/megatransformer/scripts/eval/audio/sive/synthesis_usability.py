@@ -49,7 +49,7 @@ from scipy.io import wavfile
 from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
 from megatransformer.utils.audio_utils import SharedWindowBuffer, extract_mels
-from megatransformer.utils.model_loading_utils import load_model, load_vocoder
+from megatransformer.utils.model_loading_utils import detect_sive_vq_codes, load_model, load_vocoder
 from megatransformer.utils import visualization
 
 
@@ -499,9 +499,15 @@ def analyze_checkpoint(args, name, ckpt_path, vocoder, dataset, subset_indices, 
             args.voice_sample_rate, args.voice_n_mels, args.voice_n_fft, args.voice_hop_length,
             dim=getattr(args, "contentvec_dim", 768))
     else:
+        # Auto-detect a VQ codebook: a VQ-trained SIVE loaded use_vq=False silently drops its
+        # vq.* buffers and the probe then measures CONTINUOUS features, not the codes.
+        _vq_codes = detect_sive_vq_codes(ckpt_path)
+        _vq_overrides = {"use_vq": True, "vq_num_codes": _vq_codes} if _vq_codes else {}
+        if _vq_codes:
+            print(f"  Detected VQ bottleneck in checkpoint: {_vq_codes} codes -> use_vq=True (features are QUANTIZED)")
         model = load_model(SpeakerInvariantVoiceEncoder, args.config, checkpoint_path=ckpt_path,
                            device=device,
-                           overrides={"num_speakers": args.num_speakers,
+                           overrides={"num_speakers": args.num_speakers, **_vq_overrides,
                                       **{k: v for k, v in {"final_norm_type": args.final_norm_type,
                                                            "downsample_norm_type": args.downsample_norm_type,
                                                            "block_norm_type": args.block_norm_type,
