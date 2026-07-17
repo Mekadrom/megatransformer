@@ -25,9 +25,27 @@ before the per-group loop, so the GPU isn't pinged for syncs each iteration.
 This module is a no-op outside training mode.
 """
 
+from fractions import Fraction
+
 import torch
 import torch.nn as nn
 import torchaudio.functional as AF
+import torchaudio.transforms as AT
+
+# AF.pitch_shift = phase-vocoder stretch + resample(int(sr/rate), sr). The
+# resample dominates: sr/rate is coprime with sr, so its polyphase sinc kernel
+# is ~sr rows (a ~1GB alloc, rebuilt every call — profiled at ~90% of a
+# consistency-run step). We reuse torchaudio's stretch helper but cache a
+# small-rational Resample per n_steps: approximating the ratio to a bounded
+# denominator shrinks the kernel ~1000x (6GB->~50MB) for a >40dB-SNR,
+# pitch-exact result. If the private helpers ever move, fall back to functional.
+try:
+    from torchaudio.functional.functional import _stretch_waveform, _fix_waveform_shape
+    _HAS_STRETCH_HELPERS = True
+except Exception:  # pragma: no cover - torchaudio internal moved
+    _HAS_STRETCH_HELPERS = False
+
+_PITCH_RATIO_MAX_DEN = 2048  # rational-approx denominator cap (SNR vs kernel size)
 
 
 class WaveformAugment(nn.Module):
@@ -69,6 +87,12 @@ class WaveformAugment(nn.Module):
         self.speed_perturb_prob = speed_perturb_prob
         self.pitch_quantize_step = pitch_quantize_step
         self.speed_quantize_step = speed_quantize_step
+        # Caches for the fast cached-resample pitch shift, keyed by
+        # (n_steps, device, dtype) / (device, dtype). Plain dicts, NOT
+        # submodules: the resample kernels are deterministic and must stay out of
+        # the model state_dict (they'd otherwise add non-checkpoint buffers).
+        self._resample_bank: dict = {}
+        self._hann_cache: dict = {}
 
     @property
     def enabled(self) -> bool:
@@ -114,6 +138,41 @@ class WaveformAugment(nn.Module):
 
     # ---- batched, grouped passes -------------------------------------------
 
+    def _get_resampler(self, ns: float, device, dtype) -> "AT.Resample":
+        """Cached small-rational Resample that restores pitch after the stretch.
+
+        AF.pitch_shift resamples by int(sr/rate)->sr (coprime => huge kernel).
+        We approximate that ratio with a bounded-denominator rational so the
+        kernel is tiny and reusable; the shift lands on the same pitch (>40dB
+        SNR vs functional at the default cap).
+        """
+        key = (round(float(ns), 6), device, dtype)
+        r = self._resample_bank.get(key)
+        if r is None:
+            rate = 2.0 ** (-float(ns) / 12.0)
+            orig_freq = int(self.sample_rate / rate)
+            frac = Fraction(self.sample_rate, orig_freq).limit_denominator(_PITCH_RATIO_MAX_DEN)
+            # resample ratio = new/orig = frac.numerator/frac.denominator
+            r = AT.Resample(frac.denominator, frac.numerator).to(device=device, dtype=dtype)
+            self._resample_bank[key] = r
+        return r
+
+    def _hann(self, device, dtype) -> torch.Tensor:
+        key = (device, dtype)
+        w = self._hann_cache.get(key)
+        if w is None:
+            w = torch.hann_window(512, device=device, dtype=dtype)
+            self._hann_cache[key] = w
+        return w
+
+    def _pitch_shift_cached(self, batch: torch.Tensor, ns: float) -> torch.Tensor:
+        """Fast cached-resample equivalent of AF.pitch_shift (length preserved)."""
+        stretched = _stretch_waveform(
+            batch, ns, 12, 512, 512, 128, self._hann(batch.device, batch.dtype),
+        )
+        shifted = self._get_resampler(ns, batch.device, batch.dtype)(stretched)
+        return _fix_waveform_shape(shifted, batch.size())
+
     def _apply_grouped_pitch(self, work: torch.Tensor, steps: list) -> torch.Tensor:
         """Pitch shift, grouped by quantized n_steps. Length preserved."""
         groups: dict = {}
@@ -127,11 +186,23 @@ class WaveformAugment(nn.Module):
         # as zeros, so we can shift the full padded [G, T] batch and the valid
         # region of each sample comes back correctly. Length is preserved by
         # pitch_shift, so we can write back in place.
+        # Quantized draws (the default) reuse a cached small-rational resampler
+        # so the sinc kernel isn't rebuilt each call. Unquantized (step<=0) draws
+        # are unique floats with no reuse, so fall back to functional pitch_shift;
+        # ditto if torchaudio's stretch helpers ever move.
+        cache_ok = (
+            _HAS_STRETCH_HELPERS
+            and self.pitch_quantize_step is not None
+            and self.pitch_quantize_step > 0
+        )
         out = work.clone()
         for ns, idxs in groups.items():
             idx_t = torch.tensor(idxs, device=work.device, dtype=torch.long)
             batch = work.index_select(0, idx_t)  # [G, T]
-            shifted = AF.pitch_shift(batch, self.sample_rate, ns)
+            if cache_ok:
+                shifted = self._pitch_shift_cached(batch, ns)
+            else:
+                shifted = AF.pitch_shift(batch, self.sample_rate, ns)
             out.index_copy_(0, idx_t, shifted)
         return out
 
