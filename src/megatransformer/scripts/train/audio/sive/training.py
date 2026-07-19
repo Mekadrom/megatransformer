@@ -73,6 +73,7 @@ class SIVETrainer(CommonTrainer):
         recon_weight: float = 0.0,  # Speaker-conditioned mel-recon aux (0=off); forces per-frame content, kills VQ tail-collapse
         recon_ramp_steps: int = 5000,  # ramp recon weight 0->max over THIS run's first N steps (protects encoder while head warms up)
         recon_freeze_encoder_steps: int = 0,  # opt-in: for the first N steps only the recon head trains (no DeepSpeed)
+        recon_dom_weight: float = 0.0,  # weight on the anti-domination penalty (needs config.recon_dom_cap>0)
         cmdline: str = "",
         git_commit_hash: str = "",
         step_offset: int = 0,
@@ -100,6 +101,7 @@ class SIVETrainer(CommonTrainer):
         self.recon_weight = recon_weight
         self.recon_ramp_steps = recon_ramp_steps
         self.recon_freeze_encoder_steps = recon_freeze_encoder_steps
+        self.recon_dom_weight = recon_dom_weight
         self.recon_head_present = getattr(getattr(self.model, "config", None), "use_recon_aux", False)
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
@@ -506,6 +508,11 @@ class SIVETrainer(CommonTrainer):
             recon_alpha = min(1.0, self.state.global_step / max(1, self.recon_ramp_steps))
             recon_loss = recon_loss_raw
 
+        # Anti-domination penalty (caps single-dim massive activations the recon head
+        # otherwise induces). Not ramped -- it's a guardrail we want active from step 0.
+        dom_loss_raw = result.get("dom_loss")
+        dom_loss = dom_loss_raw if dom_loss_raw is not None else torch.zeros((), device=ctc_loss.device)
+
         # Combined loss
         # During pre-training phase, speaker loss still contributes but doesn't affect encoder
         # (because grl_alpha=0 means no gradient reversal, but classifier still learns)
@@ -516,6 +523,7 @@ class SIVETrainer(CommonTrainer):
             + self.pad_blank_weight * pad_blank_loss
             + self.consistency_weight * consistency_loss
             + self.recon_weight * recon_alpha * recon_loss
+            + self.recon_dom_weight * dom_loss
             + std_hinge_loss
             + cov_loss
             + vq_commitment_loss
@@ -531,6 +539,8 @@ class SIVETrainer(CommonTrainer):
             if recon_loss_raw is not None:
                 metrics.log_scalar("train/recon_loss", recon_loss_raw, global_step)
                 metrics.log_scalar("train/recon_alpha", recon_alpha, global_step)
+            if dom_loss_raw is not None:
+                metrics.log_scalar("train/recon_dom_loss", dom_loss_raw, global_step)
             metrics.log_scalar("train/speaker_loss", speaker_loss, global_step)
             metrics.log_scalar("train/grl_alpha", grl_alpha, global_step)
             if self.consistency_weight > 0:
@@ -831,6 +841,8 @@ def load_model(args):
         'recon_aux_blocks': args.recon_aux_blocks,
         'recon_aux_kernel': args.recon_aux_kernel,
         'recon_aux_speaker_dim': args.speaker_embedding_dim,
+        'recon_target_cmn': args.recon_target_cmn,
+        'recon_dom_cap': args.recon_dom_cap,
     }
     # Norm levers (frontend / block pre-norm / conformer conv / final norm).
     # Override the config ONLY when a value is explicitly passed (CLI default is
@@ -905,6 +917,7 @@ def create_trainer(
         recon_weight=args.recon_weight,
         recon_ramp_steps=args.recon_ramp_steps,
         recon_freeze_encoder_steps=args.recon_freeze_encoder_steps,
+        recon_dom_weight=args.recon_dom_weight,
         speaker_adversary_target=args.speaker_adversary_target,
         gender_grl_weight=args.gender_grl_weight,
         cmdline=args.cmdline,
@@ -1204,6 +1217,22 @@ def add_cli_args(subparsers):
                             help="Separate (higher) AdamW LR for the recon head (norms/biases). The "
                                  "encoder's 1.5e-4 is far too slow for a fresh decoder. None = share "
                                  "encoder lr_adamw. Suggest ~5e-4-1e-3.")
+    sub_parser.add_argument("--recon_target_cmn", action="store_true",
+                            help="Reconstruct the per-utterance mean-normalized mel (cepstral mean "
+                                 "normalization) instead of the raw mel. Strips the static spectral "
+                                 "envelope (bulk of speaker/VTL timbre) from the target so the head "
+                                 "has no reason to pull speaker into the features -> relieves the "
+                                 "recon-induced leakage spike. Removes STATIC speaker only; dynamic "
+                                 "residual remains.")
+    sub_parser.add_argument("--recon_dom_cap", type=float, default=0.0,
+                            help="Anti-domination cap: penalize post-norm feature magnitudes above "
+                                 "this (relu(|f|-cap)). Stops the recon head from blowing up a single "
+                                 "carrier dim (dim-91 -> |156|) that dominates the per-frame norm and "
+                                 "squashes content. Symmetric to std_hinge (collapse-only). 0=off; "
+                                 "~15-20 typical (normal p99.9 ~6). Needs --recon_dom_weight>0.")
+    sub_parser.add_argument("--recon_dom_weight", type=float, default=0.0,
+                            help="Weight on the anti-domination penalty (with --recon_dom_cap). "
+                                 "Not ramped -- a guardrail active from step 0. Suggest ~0.1-1.0.")
 
     # Vocoder settings (for audio generation in TensorBoard)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,

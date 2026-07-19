@@ -82,19 +82,30 @@ class ReconAuxHead(nn.Module):
         emb: torch.Tensor,
         target_mel: torch.Tensor,
         mel_mask: Optional[torch.Tensor] = None,
+        cmn: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns (recon_mel [B, n_mels, T_mel], masked_l1 scalar).
 
         target_mel: [B, n_mels, T_mel]  mel_mask: [B, T_mel] True=valid (real frame).
         Loss is masked to real frames ONLY -- padded tail is zero in the target and
         must not dilute the signal (same masking the CTC/std-hinge already use).
+
+        cmn=True: subtract the per-utterance masked time-mean (per mel-bin) from the
+        target = cepstral mean normalization. Removes the static spectral envelope
+        (bulk of the speaker/VTL signature) so the head reconstructs content dynamics
+        only and has no gradient reason to pull speaker into the features.
         """
         t_mel = target_mel.shape[-1]
-        recon = self.decode(features, emb, t_mel)  # [B, n_mels, T_mel]
-        recon = recon.float()
+        recon = self.decode(features, emb, t_mel).float()  # [B, n_mels, T_mel]
         target = target_mel.float()
-        if mel_mask is not None:
-            m = mel_mask.unsqueeze(1).float()  # [B, 1, T_mel]
+        m = mel_mask.unsqueeze(1).float() if mel_mask is not None else None  # [B, 1, T_mel]
+        if cmn:
+            if m is not None:
+                tmean = (target * m).sum(-1, keepdim=True) / m.sum(-1, keepdim=True).clamp(min=1.0)
+            else:
+                tmean = target.mean(-1, keepdim=True)
+            target = target - tmean  # head predicts the mean-normalized (speaker-stripped) mel
+        if m is not None:
             denom = (m.sum() * recon.shape[1]).clamp(min=1.0)
             loss = ((recon - target).abs() * m).sum() / denom
         else:

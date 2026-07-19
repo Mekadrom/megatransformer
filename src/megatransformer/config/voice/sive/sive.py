@@ -142,6 +142,15 @@ class SpeakerInvariantVoiceEncoderConfig:
     recon_aux_blocks: int = 6
     recon_aux_kernel: int = 5
     recon_aux_speaker_dim: int = 192  # ECAPA embedding dim fed to the head's FiLM
+    # CMN: reconstruct the per-utterance mean-normalized mel (remove the static
+    # spectral envelope = bulk of the timbre/VTL signature) so the head has no reason
+    # to draw speaker into the features. Relieves the recon-induced leakage spike.
+    recon_target_cmn: bool = False
+    # Anti-domination cap: penalize post-norm feature magnitudes above this (relu(|f|-cap)),
+    # symmetric to std_hinge (which only penalizes COLLAPSE). Stops the recon head from
+    # blowing up a single carrier dim (dim-91 -> |156|) that dominates the per-frame norm.
+    # 0 = off. Typical ~15-20 (normal p99.9 ~6). Weight is the trainer's --recon_dom_weight.
+    recon_dom_cap: float = 0.0
 
     speaker_classifier_hidden_dim: Optional[int] = None
 

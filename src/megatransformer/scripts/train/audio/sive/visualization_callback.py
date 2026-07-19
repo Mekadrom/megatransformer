@@ -323,7 +323,10 @@ class SIVEVisualizationCallback(VisualizationCallback):
             ctc_tokens = sample["ctc_tokens"]
             ctc_length = sample["ctc_length"].item()
 
-            result = model(mel_spec, lengths=mel_length, grl_alpha=0.0)
+            # Pass ECAPA so the recon-aux head runs (no-op when use_recon_aux is off).
+            _spk = sample.get("speaker_embedding", None)
+            _spk_b = _spk.unsqueeze(0).to(device) if _spk is not None else None
+            result = model(mel_spec, lengths=mel_length, grl_alpha=0.0, speaker_embeddings=_spk_b)
             asr_logits = result["asr_logits"]  # [1, T_ctc, vocab]
             features = result["features"]  # [1, T_feat, D]
             feature_length = result["feature_lengths"][0].item() if result["feature_lengths"] is not None else features.size(1)
@@ -500,6 +503,25 @@ class SIVEVisualizationCallback(VisualizationCallback):
                 plt.tight_layout(rect=[0, bottom_margin, 1, top_margin])
                 metrics.log_figure(f"ctc_alignment/sample_{i}", fig, step)
                 plt.close(fig)
+
+                # Recon-aux side-by-side: target mel vs the aux head's reconstruction
+                # (only when use_recon_aux is on). Independent color scales per panel so
+                # both read regardless of CMN (recon target is mean-normalized under CMN).
+                recon_mel = result.get("recon_mel")
+                if recon_mel is not None:
+                    rm = recon_mel[0, :, :actual_mel_len].detach().float().cpu().numpy()
+                    tgt = mel_spec_cpu[:, :actual_mel_len].numpy()
+                    rfig, rax = plt.subplots(1, 2, figsize=(14, 5))
+                    imt = rax[0].imshow(tgt, aspect="auto", origin="lower", cmap="viridis")
+                    rax[0].set_title("target mel"); rax[0].set_ylabel("mel bin")
+                    plt.colorbar(imt, ax=rax[0])
+                    imr = rax[1].imshow(rm, aspect="auto", origin="lower", cmap="viridis")
+                    _cmn = getattr(getattr(model, "config", None), "recon_target_cmn", False)
+                    rax[1].set_title("recon-aux mel" + (" (CMN target)" if _cmn else ""))
+                    plt.colorbar(imr, ax=rax[1])
+                    plt.tight_layout()
+                    metrics.log_figure(f"recon_aux/sample_{i}", rfig, step)
+                    plt.close(rfig)
 
         # Log greedy metrics (consistent with previous runs)
         avg_cer = total_cer / len(transcriptions) if transcriptions else 0

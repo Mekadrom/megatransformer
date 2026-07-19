@@ -368,6 +368,19 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         else:
             features = self.final_norm(x)
 
+        # Anti-domination penalty on the post-norm features (before VQ): relu(|f|-cap),
+        # masked to valid frames. Caps single-dim massive activations (the recon head's
+        # dim-91 carrier blowing up to |156| and dominating the per-frame norm). Symmetric
+        # to std_hinge (which only penalizes collapse). 0 = off.
+        dom_loss = None
+        if getattr(self.config, "recon_dom_cap", 0.0) > 0:
+            excess = F.relu(features.abs() - self.config.recon_dom_cap)
+            if padding_mask is not None:
+                vm = (~padding_mask).unsqueeze(-1).float()  # [B, T, 1]
+                dom_loss = (excess * vm).sum() / (vm.sum() * features.shape[-1]).clamp(min=1.0)
+            else:
+                dom_loss = excess.mean()
+
         # VQ bottleneck (post-norm): replace features with their quantized codes so every
         # consumer -- variance reg, CTC head, GRL adversary, feature extraction -- operates
         # on the discrete representation. valid_mask excludes padding from the codebook.
@@ -525,7 +538,8 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                     < lengths.to(recon_target_mel.device)[:, None]
                 )
             recon_mel, recon_loss = self.recon_head(
-                features, speaker_embeddings, recon_target_mel, mel_mask
+                features, speaker_embeddings, recon_target_mel, mel_mask,
+                cmn=getattr(self.config, "recon_target_cmn", False),
             )
 
         result = {
@@ -550,6 +564,8 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             # Recon-aux (None unless use_recon_aux + speaker_embeddings provided).
             "recon_loss": recon_loss,
             "recon_mel": recon_mel,
+            # Anti-domination penalty (None unless recon_dom_cap > 0).
+            "dom_loss": dom_loss,
         }
 
         if return_all_hiddens:
