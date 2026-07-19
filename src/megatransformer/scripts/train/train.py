@@ -19,7 +19,7 @@ import megatransformer.scripts.train.image.vae.training as image_vae_training
 import megatransformer.scripts.train.world.training as world_training
 
 
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 
 from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
@@ -617,6 +617,7 @@ def get_optimizer(args, model: nn.Module) -> Optional[MuonAdamW]:
     # to its own LRs distinct from the encoder's lr_muon / lr_adamw.
     param_groupers = None
     if args.command in ('audio-sive', 'sive'):
+        groupers: List[Tuple[str, str, Dict[str, float]]] = []
         spk_overrides: Dict[str, float] = {}
         grl_lr = getattr(args, 'grl_lr', None)
         grl_lr_muon = getattr(args, 'grl_lr_muon', None)
@@ -625,7 +626,20 @@ def get_optimizer(args, model: nn.Module) -> Optional[MuonAdamW]:
         if grl_lr_muon is not None:
             spk_overrides['lr_muon'] = grl_lr_muon
         if spk_overrides:
-            param_groupers = [('spk', 'speaker_classifier', spk_overrides)]
+            groupers.append(('spk', 'speaker_classifier', spk_overrides))
+        # Recon-aux head gets its own (higher) LR: a random-init decoder converges
+        # slowly at the encoder's gentle finetune LRs (esp. 1.5e-4 AdamW), which both
+        # drags out the run AND lengthens the window where the bad head disrupts the
+        # encoder. First-match wins, so 'recon_head' won't collide with the spk group.
+        if getattr(args, 'use_recon_aux', False):
+            recon_overrides: Dict[str, float] = {}
+            if getattr(args, 'recon_lr_muon', None) is not None:
+                recon_overrides['lr_muon'] = args.recon_lr_muon
+            if getattr(args, 'recon_lr_adamw', None) is not None:
+                recon_overrides['lr_adamw'] = args.recon_lr_adamw
+            if recon_overrides:
+                groupers.append(('recon', 'recon_head', recon_overrides))
+        param_groupers = groupers or None
 
     optimizer = create_muon_adamw_optimizer(
         model=model,

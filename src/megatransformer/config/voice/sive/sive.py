@@ -131,6 +131,18 @@ class SpeakerInvariantVoiceEncoderConfig:
     vq_dead_code_threshold: float = 1.0  # re-seed codes used < this (EMA-window count)
     vq_codebook_init_path: Optional[str] = None  # k-means codebook (utils.codebook fmt) to seed vq.embed; None = random data-dependent init
 
+    # Speaker-conditioned mel-reconstruction auxiliary head (a tiny probe-sized
+    # mini-SMG: features + ECAPA -> mel, masked L1). Forces EVERY real frame to carry
+    # renderable content, structurally preventing the CTC-blank/VQ tail-collapse that
+    # front-loaded alignments produce. Speaker comes from the embedding (FiLM) so the
+    # features stay speaker-invariant. Kept small ON PURPOSE (a big head hallucinates
+    # around content-thin features and weakens the pressure). See model/.../recon_aux.py.
+    use_recon_aux: bool = False
+    recon_aux_width: int = 256
+    recon_aux_blocks: int = 6
+    recon_aux_kernel: int = 5
+    recon_aux_speaker_dim: int = 192  # ECAPA embedding dim fed to the head's FiLM
+
     speaker_classifier_hidden_dim: Optional[int] = None
 
     # GRL speaker-adversary target: "speaker_id" (cross-entropy over training

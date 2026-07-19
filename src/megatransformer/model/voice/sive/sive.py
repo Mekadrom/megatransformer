@@ -190,6 +190,21 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 adversary_target="speaker_id",
             )
 
+        # Optional speaker-conditioned mel-reconstruction aux head (a tiny mini-SMG).
+        # Forces per-frame renderable content into the features so the CTC-blank/VQ
+        # tail-collapse can't form. See model/voice/sive/recon_aux.py.
+        self.recon_head = None
+        if getattr(config, "use_recon_aux", False):
+            from megatransformer.model.voice.sive.recon_aux import ReconAuxHead
+            self.recon_head = ReconAuxHead(
+                feat_dim=config.encoder_dim,
+                emb_dim=getattr(config, "recon_aux_speaker_dim", 192),
+                n_mels=config.voice_n_mels,
+                width=getattr(config, "recon_aux_width", 256),
+                n_blocks=getattr(config, "recon_aux_blocks", 6),
+                kernel=getattr(config, "recon_aux_kernel", 5),
+            )
+
         # Initialize weights
         self._init_weights()
 
@@ -263,6 +278,7 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
         lengths: Optional[torch.Tensor] = None,
         grl_alpha: float = 1.0,
         return_all_hiddens: bool = False,
+        speaker_embeddings: Optional[torch.Tensor] = None,
     ) -> dict:
         """
         Forward pass through SIVE.
@@ -284,6 +300,11 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 - temporal_smoothness: scalar metric (if variance_reg enabled and training)
                 - all_hiddens: list of [B, T', D] if return_all_hiddens=True
         """
+        # Clean (pre-augmentation) mel is the recon-aux target: reconstruct the
+        # UNCORRUPTED mel from features derived from the (possibly augmented) input,
+        # so the head forces content, not noise. Captured before augmentation below.
+        recon_target_mel = mel_spec if self.recon_head is not None else None
+
         # Mel-space augmentations (training-only; no-op in eval). Isolated in a
         # @torch._dynamo.disable method so --compile_model doesn't graph-break on
         # SpecAugment's data-dependent random mask shapes (.item() per sample).
@@ -489,6 +510,24 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 reversed_gender = GradientReversalFunction.apply(gender_grl_input, grl_alpha)
             gender_logits = self.gender_classifier(reversed_gender, mask=valid_mask)
 
+        # Speaker-conditioned mel-reconstruction aux (regularizer): reconstruct the
+        # clean mel from the (post-VQ) features + ECAPA. Masked to real mel frames via
+        # `lengths` (the mel is the model INPUT, so its true length == `lengths`).
+        # Gradients flow to the encoder/VQ (forcing per-frame content) AND to the head.
+        recon_loss = None
+        recon_mel = None
+        if self.recon_head is not None and speaker_embeddings is not None and recon_target_mel is not None:
+            T_mel = recon_target_mel.shape[-1]
+            mel_mask = None
+            if lengths is not None:
+                mel_mask = (
+                    torch.arange(T_mel, device=recon_target_mel.device)[None, :]
+                    < lengths.to(recon_target_mel.device)[:, None]
+                )
+            recon_mel, recon_loss = self.recon_head(
+                features, speaker_embeddings, recon_target_mel, mel_mask
+            )
+
         result = {
             "features": features,  # Normalized features (preferred for VAE)
             "features_unnorm": features_unnorm,  # Pre-LayerNorm (for comparison)
@@ -508,6 +547,9 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
             "vq_commitment_loss": vq_commitment_loss,
             "vq_indices": vq_indices,
             "vq_perplexity": vq_perplexity,
+            # Recon-aux (None unless use_recon_aux + speaker_embeddings provided).
+            "recon_loss": recon_loss,
+            "recon_mel": recon_mel,
         }
 
         if return_all_hiddens:

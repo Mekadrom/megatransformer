@@ -70,6 +70,9 @@ class SIVETrainer(CommonTrainer):
         grl_start_step: int = 0,  # Step at which GRL kicks in (before this, classifier trains freely)
         grl_lr: float = None,  # Separate LR for speaker classifier (None = use base LR)
         pad_blank_weight: float = 0.05,  # Auxiliary CE pushing pad-region asr_logits toward blank
+        recon_weight: float = 0.0,  # Speaker-conditioned mel-recon aux (0=off); forces per-frame content, kills VQ tail-collapse
+        recon_ramp_steps: int = 5000,  # ramp recon weight 0->max over THIS run's first N steps (protects encoder while head warms up)
+        recon_freeze_encoder_steps: int = 0,  # opt-in: for the first N steps only the recon head trains (no DeepSpeed)
         cmdline: str = "",
         git_commit_hash: str = "",
         step_offset: int = 0,
@@ -94,6 +97,10 @@ class SIVETrainer(CommonTrainer):
         self.grl_start_step = grl_start_step
         self.grl_lr = grl_lr
         self.pad_blank_weight = pad_blank_weight
+        self.recon_weight = recon_weight
+        self.recon_ramp_steps = recon_ramp_steps
+        self.recon_freeze_encoder_steps = recon_freeze_encoder_steps
+        self.recon_head_present = getattr(getattr(self.model, "config", None), "use_recon_aux", False)
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
         self.step_offset = step_offset if step_offset is not None else 0
@@ -326,8 +333,25 @@ class SIVETrainer(CommonTrainer):
             effective_step = global_step - self.grl_start_step
             grl_alpha = self.grl_alpha_scheduler.get_alpha(effective_step)
 
-        # Forward pass
-        result = model(mel_specs, lengths=mel_lengths, grl_alpha=grl_alpha)
+        # Recon-aux freeze warmup (optional): for the first N steps only the recon
+        # head trains, on the (good, from-stdhinge11) features, so its random init
+        # can't disrupt the encoder before it's competent. Ramp alone usually
+        # suffices; this is opt-in (recon_freeze_encoder_steps>0). Toggling
+        # requires_grad is incompatible with DeepSpeed ZeRO param partitioning —
+        # only use with plain DDP/single-GPU.
+        if self.recon_freeze_encoder_steps > 0 and self.recon_head_present:
+            freeze = global_step < self.recon_freeze_encoder_steps
+            for n, p in model.named_parameters():
+                want = ("recon_head" in n) if freeze else True
+                if p.requires_grad != want:
+                    p.requires_grad_(want)
+
+        # Forward pass. speaker_embeddings (ECAPA) drives the recon-aux head's FiLM;
+        # it's a no-op when use_recon_aux is off (head is None).
+        result = model(
+            mel_specs, lengths=mel_lengths, grl_alpha=grl_alpha,
+            speaker_embeddings=inputs.get("speaker_embeddings"),
+        )
 
         asr_logits = result["asr_logits"]  # [B, T, vocab]
         speaker_logits = result["speaker_logits"]  # [B, num_speakers]
@@ -470,6 +494,18 @@ class SIVETrainer(CommonTrainer):
             consistency_alpha = min(1.0, self.state.global_step / max(1, self.consistency_rampup_steps))
             consistency_loss = consistency_loss * consistency_alpha
 
+        # Recon-aux (speaker-conditioned mel reconstruction): forces per-frame
+        # renderable content into the features so the CTC-blank/VQ tail-collapse
+        # can't form. Ramped over recon_ramp_steps of THIS run (relative step, so it
+        # warms up on a fine-tune) — a low early weight lets the random-init head
+        # become competent before its gradients strongly shape the encoder.
+        recon_loss_raw = result.get("recon_loss")
+        recon_loss = torch.zeros((), device=ctc_loss.device)
+        recon_alpha = 0.0
+        if recon_loss_raw is not None:
+            recon_alpha = min(1.0, self.state.global_step / max(1, self.recon_ramp_steps))
+            recon_loss = recon_loss_raw
+
         # Combined loss
         # During pre-training phase, speaker loss still contributes but doesn't affect encoder
         # (because grl_alpha=0 means no gradient reversal, but classifier still learns)
@@ -479,6 +515,7 @@ class SIVETrainer(CommonTrainer):
             + self.gender_grl_weight * gender_loss
             + self.pad_blank_weight * pad_blank_loss
             + self.consistency_weight * consistency_loss
+            + self.recon_weight * recon_alpha * recon_loss
             + std_hinge_loss
             + cov_loss
             + vq_commitment_loss
@@ -491,6 +528,9 @@ class SIVETrainer(CommonTrainer):
             metrics.log_scalar("train/ctc_underflow_frac", ctc_underflow_frac, global_step)
             metrics.log_scalar("train/ctc_margin_min", ctc_margin_min, global_step)
             metrics.log_scalar("train/pad_blank_loss", pad_blank_loss, global_step)
+            if recon_loss_raw is not None:
+                metrics.log_scalar("train/recon_loss", recon_loss_raw, global_step)
+                metrics.log_scalar("train/recon_alpha", recon_alpha, global_step)
             metrics.log_scalar("train/speaker_loss", speaker_loss, global_step)
             metrics.log_scalar("train/grl_alpha", grl_alpha, global_step)
             if self.consistency_weight > 0:
@@ -785,6 +825,12 @@ def load_model(args):
         'vq_ema_decay': args.vq_ema_decay,
         'vq_dead_code_threshold': args.vq_dead_code_threshold,
         'vq_codebook_init_path': args.vq_codebook_init_path,
+        # Speaker-conditioned mel-recon aux head (disabled unless --use_recon_aux).
+        'use_recon_aux': args.use_recon_aux,
+        'recon_aux_width': args.recon_aux_width,
+        'recon_aux_blocks': args.recon_aux_blocks,
+        'recon_aux_kernel': args.recon_aux_kernel,
+        'recon_aux_speaker_dim': args.speaker_embedding_dim,
     }
     # Norm levers (frontend / block pre-norm / conformer conv / final norm).
     # Override the config ONLY when a value is explicitly passed (CLI default is
@@ -856,6 +902,9 @@ def create_trainer(
         grl_start_step=args.grl_start_step,
         grl_lr=args.grl_lr,
         pad_blank_weight=args.pad_blank_weight,
+        recon_weight=args.recon_weight,
+        recon_ramp_steps=args.recon_ramp_steps,
+        recon_freeze_encoder_steps=args.recon_freeze_encoder_steps,
         speaker_adversary_target=args.speaker_adversary_target,
         gender_grl_weight=args.gender_grl_weight,
         cmdline=args.cmdline,
@@ -1119,6 +1168,42 @@ def add_cli_args(subparsers):
                                  "encoder produces (i.e. this checkpoint's own feature cache), else the "
                                  "centroids sit outside the encoder's output distribution. None = random "
                                  "data-dependent init from the first batch.")
+
+    # Speaker-conditioned mel-reconstruction aux head (a tiny mini-SMG). Forces
+    # per-frame renderable content into the features so a front-loaded CTC alignment
+    # can't leave a blank tail for the VQ to collapse (the SMG-flatline root cause).
+    sub_parser.add_argument("--use_recon_aux", action="store_true",
+                            help="Add a tiny speaker-conditioned (ECAPA-FiLM) mel-recon head that "
+                                 "reconstructs the mel from the post-VQ features. Its masked L1 forces "
+                                 "EVERY real frame to carry renderable content, structurally preventing "
+                                 "the CTC-blank/VQ tail-collapse. Small ON PURPOSE (a big head "
+                                 "hallucinates around content-thin features). Needs speaker_embeddings "
+                                 "in the shards (ECAPA).")
+    sub_parser.add_argument("--recon_weight", type=float, default=1.0,
+                            help="Max weight on the recon-aux L1 (ramped in over --recon_ramp_steps). "
+                                 "Only active with --use_recon_aux.")
+    sub_parser.add_argument("--recon_ramp_steps", type=int, default=5000,
+                            help="Ramp recon weight 0->max over the first N steps of THIS run, so the "
+                                 "random-init head becomes competent before its gradients strongly "
+                                 "shape the encoder (relative step, so it warms up on a fine-tune).")
+    sub_parser.add_argument("--recon_freeze_encoder_steps", type=int, default=0,
+                            help="Opt-in warmup: for the first N steps only the recon head trains "
+                                 "(encoder requires_grad off). Ramp usually suffices; toggling "
+                                 "requires_grad is INCOMPATIBLE with DeepSpeed ZeRO — plain DDP/1-GPU only.")
+    sub_parser.add_argument("--recon_aux_width", type=int, default=256,
+                            help="Recon head conv width (probe-sized; keep small).")
+    sub_parser.add_argument("--recon_aux_blocks", type=int, default=6,
+                            help="Recon head FiLM conv blocks (probe-sized; keep small).")
+    sub_parser.add_argument("--recon_aux_kernel", type=int, default=5,
+                            help="Recon head conv kernel size.")
+    sub_parser.add_argument("--recon_lr_muon", type=float, default=None,
+                            help="Separate (higher) Muon LR for the recon head so the random-init "
+                                 "decoder converges fast under --use_muon. None = share encoder lr_muon. "
+                                 "Suggest ~0.01-0.02.")
+    sub_parser.add_argument("--recon_lr_adamw", type=float, default=None,
+                            help="Separate (higher) AdamW LR for the recon head (norms/biases). The "
+                                 "encoder's 1.5e-4 is far too slow for a fresh decoder. None = share "
+                                 "encoder lr_adamw. Suggest ~5e-4-1e-3.")
 
     # Vocoder settings (for audio generation in TensorBoard)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,
