@@ -74,6 +74,9 @@ class SIVETrainer(CommonTrainer):
         recon_ramp_steps: int = 5000,  # ramp recon weight 0->max over THIS run's first N steps (protects encoder while head warms up)
         recon_freeze_encoder_steps: int = 0,  # opt-in: for the first N steps only the recon head trains (no DeepSpeed)
         recon_dom_weight: float = 0.0,  # weight on the anti-domination penalty (needs config.recon_dom_cap>0)
+        recon_decay_start: int = 0,  # 0=off. After this step, anneal recon_alpha 1.0->recon_floor (fix tail high, then release content)
+        recon_decay_steps: int = 10000,  # anneal duration
+        recon_floor: float = 0.25,  # recon_alpha floor after decay (set == 1.0 => a lower static peak with no decay)
         cmdline: str = "",
         git_commit_hash: str = "",
         step_offset: int = 0,
@@ -102,6 +105,9 @@ class SIVETrainer(CommonTrainer):
         self.recon_ramp_steps = recon_ramp_steps
         self.recon_freeze_encoder_steps = recon_freeze_encoder_steps
         self.recon_dom_weight = recon_dom_weight
+        self.recon_decay_start = recon_decay_start
+        self.recon_decay_steps = recon_decay_steps
+        self.recon_floor = recon_floor
         self.recon_head_present = getattr(getattr(self.model, "config", None), "use_recon_aux", False)
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
@@ -501,11 +507,25 @@ class SIVETrainer(CommonTrainer):
         # can't form. Ramped over recon_ramp_steps of THIS run (relative step, so it
         # warms up on a fine-tune) — a low early weight lets the random-init head
         # become competent before its gradients strongly shape the encoder.
+        # recon_alpha schedule: ramp 0->1 over recon_ramp_steps (establish the tail-fix,
+        # which scales with weight), HOLD at 1, then optionally anneal 1->recon_floor over
+        # [recon_decay_start, +recon_decay_steps] to RELEASE the content-degrading pressure
+        # once the tail is structurally learned (the tail-fix's maintenance cost is lower
+        # than its establishment cost -- the whole bet). recon_decay_start=0 disables the
+        # decay (ramp+hold at 1); recon_floor==1.0 also makes it a no-op. All keyed on the
+        # RELATIVE step (self.state.global_step) so it behaves the same on a fresh run or a
+        # true resume. Both ramp and decay are min()'d so a misordered config degrades safely.
         recon_loss_raw = result.get("recon_loss")
         recon_loss = torch.zeros((), device=ctc_loss.device)
         recon_alpha = 0.0
         if recon_loss_raw is not None:
-            recon_alpha = min(1.0, self.state.global_step / max(1, self.recon_ramp_steps))
+            s = self.state.global_step
+            ramp = min(1.0, s / max(1, self.recon_ramp_steps))
+            decay = 1.0
+            if self.recon_decay_start > 0 and s > self.recon_decay_start:
+                frac = min(1.0, (s - self.recon_decay_start) / max(1, self.recon_decay_steps))
+                decay = 1.0 - frac * (1.0 - self.recon_floor)
+            recon_alpha = min(ramp, decay)
             recon_loss = recon_loss_raw
 
         # Anti-domination penalty (caps single-dim massive activations the recon head
@@ -918,6 +938,9 @@ def create_trainer(
         recon_ramp_steps=args.recon_ramp_steps,
         recon_freeze_encoder_steps=args.recon_freeze_encoder_steps,
         recon_dom_weight=args.recon_dom_weight,
+        recon_decay_start=args.recon_decay_start,
+        recon_decay_steps=args.recon_decay_steps,
+        recon_floor=args.recon_floor,
         speaker_adversary_target=args.speaker_adversary_target,
         gender_grl_weight=args.gender_grl_weight,
         cmdline=args.cmdline,
@@ -1233,6 +1256,19 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--recon_dom_weight", type=float, default=0.0,
                             help="Weight on the anti-domination penalty (with --recon_dom_cap). "
                                  "Not ramped -- a guardrail active from step 0. Suggest ~0.1-1.0.")
+    sub_parser.add_argument("--recon_decay_start", type=int, default=0,
+                            help="0=off. After this RELATIVE step, anneal recon_alpha from 1.0 down to "
+                                 "--recon_floor over --recon_decay_steps. Rationale: the tail-fix needs "
+                                 "HIGH weight to ESTABLISH (scales with weight) but sustained high weight "
+                                 "degrades phonetic content (L1-recon is phoneme-confusion-tolerant); "
+                                 "decaying releases that pressure once the tail is structurally learned. "
+                                 "Set past --recon_ramp_steps (e.g. 5000).")
+    sub_parser.add_argument("--recon_decay_steps", type=int, default=10000,
+                            help="Anneal duration for the recon_alpha decay.")
+    sub_parser.add_argument("--recon_floor", type=float, default=0.25,
+                            help="recon_alpha floor after the decay. THE knob to tune: too low and the "
+                                 "tail may creep back, too high and content stays degraded. ==1.0 makes "
+                                 "the decay a no-op (i.e. a lower static peak is just --recon_weight).")
 
     # Vocoder settings (for audio generation in TensorBoard)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,
