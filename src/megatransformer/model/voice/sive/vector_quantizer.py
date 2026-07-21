@@ -133,7 +133,11 @@ class VectorQuantizerEMA(nn.Module):
         # Project into the code space (identity when code_dim == dim). [B,T,cd]
         z = self.in_proj(x) if self.in_proj is not None else x
         cd = z.shape[-1]
-        flat = z.reshape(-1, cd)                                  # [N, cd]  (raw projected features)
+        # VQ math in fp32 to match the fp32 codebook buffers (under --bf16 autocast the
+        # in_proj Linear returns bf16, which would dtype-mismatch the embed index_put in the
+        # dead-code reset). .float() is differentiable, so grads still reach z. Output is cast
+        # back to z's dtype below.
+        flat = z.reshape(-1, cd).float()                         # [N, cd]  (raw projected features)
         if mask is None:
             valid = torch.ones(flat.shape[0], dtype=torch.bool, device=flat.device)
         else:
@@ -190,6 +194,7 @@ class VectorQuantizerEMA(nn.Module):
         quant_c_bt = quant_c.view(B, T, cd)
         fq_bt = fq.view(B, T, cd)
         quant_st_c = fq_bt + (quant_c_bt - fq_bt).detach() if self.training else quant_c_bt
+        quant_st_c = quant_st_c.to(z.dtype)  # back to the input (autocast) dtype for out_proj / downstream
         quant_st = self.out_proj(quant_st_c) if self.out_proj is not None else quant_st_c  # [B,T,D]
 
         with torch.no_grad():
