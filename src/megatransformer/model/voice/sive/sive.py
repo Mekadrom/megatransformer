@@ -146,6 +146,8 @@ class SpeakerInvariantVoiceEncoder(nn.Module):
                 num_codes=config.vq_num_codes, dim=config.encoder_dim,
                 commitment_weight=config.vq_commitment_weight, decay=config.vq_ema_decay,
                 dead_code_threshold=config.vq_dead_code_threshold,
+                cosine=getattr(config, "vq_cosine", False),
+                code_dim=getattr(config, "vq_code_dim", 0),
             )
             init_path = getattr(config, "vq_codebook_init_path", None)
             if init_path:

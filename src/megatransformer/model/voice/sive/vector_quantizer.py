@@ -27,8 +27,25 @@ import torch.nn.functional as F
 
 
 class VectorQuantizerEMA(nn.Module):
+    """EMA-VQ with two optional codebook-utilization levers (ViT-VQGAN, Yu et al. 2021):
+
+    - cosine=True: L2-normalize BOTH the (projected) features and the codebook and quantize
+      by cosine distance. Fixes codebook collapse / under-utilization -- the standard reason
+      a K-code budget only uses ~55% of its codes.
+    - code_dim < dim: quantize in a LOW-dim space (learned in_proj dim->code_dim, out_proj
+      back). Low-dim codes are far easier to fill fully (under-utilization is partly curse-of-
+      dimensionality). The codes are stored in code_dim; downstream (SMG / world model) still
+      consume dim-D features via out_proj -- see effective_codebook() for the export.
+
+    Both default OFF (cosine=False, code_dim=dim) -> exactly the original EMA-VQ. The EMA
+    machinery is unchanged (accumulate raw projected features); cosine only changes the
+    read/distance/commitment/straight-through steps (normalize at use). kmeans-init is
+    incompatible with a low-dim codebook (the code space is defined by the random in_proj) --
+    use data-dependent init (drop --vq_codebook_init_path) for that variant.
+    """
     def __init__(self, num_codes: int, dim: int, commitment_weight: float = 0.25,
-                 decay: float = 0.99, eps: float = 1e-5, dead_code_threshold: float = 1.0):
+                 decay: float = 0.99, eps: float = 1e-5, dead_code_threshold: float = 1.0,
+                 cosine: bool = False, code_dim: int = 0):
         super().__init__()
         self.num_codes = num_codes
         self.dim = dim
@@ -36,13 +53,35 @@ class VectorQuantizerEMA(nn.Module):
         self.decay = decay
         self.eps = eps
         self.dead_code_threshold = dead_code_threshold
+        self.cosine = cosine
+        # code_dim<=0 or ==dim => no projection (identity), codes live in dim-D.
+        self.code_dim = code_dim if (0 < code_dim < dim) else dim
+        if self.code_dim != dim:
+            self.in_proj = nn.Linear(dim, self.code_dim, bias=False)
+            self.out_proj = nn.Linear(self.code_dim, dim, bias=False)
+        else:
+            self.in_proj = None
+            self.out_proj = None
 
-        embed = torch.randn(num_codes, dim)
+        embed = torch.randn(num_codes, self.code_dim)
         # Codebook + EMA accumulators are BUFFERS (no gradient): EMA updates them.
         self.register_buffer("embed", embed)
         self.register_buffer("embed_avg", embed.clone())
         self.register_buffer("cluster_size", torch.zeros(num_codes))
         self.register_buffer("initted", torch.zeros((), dtype=torch.bool))
+
+    def _codebook(self) -> torch.Tensor:
+        """Codebook as used for distance/quantization (L2-normalized if cosine)."""
+        return F.normalize(self.embed, dim=-1) if self.cosine else self.embed
+
+    @torch.no_grad()
+    def effective_codebook(self) -> torch.Tensor:
+        """The dim-D codebook that downstream consumers (SMG / world model) actually see:
+        the (normalized) codes projected back up through out_proj. == self.embed in the
+        default (no-projection, no-cosine) case. Use THIS for the codebook export, not
+        self.embed (which is code_dim and normalized-at-use)."""
+        ce = self._codebook()
+        return self.out_proj(ce) if self.out_proj is not None else ce
 
     @torch.no_grad()
     def _init_from_data(self, flat_valid: torch.Tensor):
@@ -68,6 +107,11 @@ class VectorQuantizerEMA(nn.Module):
         sit outside the encoder's output distribution and the seed is worse than random.
         A later checkpoint load (resume) with its own vq.embed overrides this, as intended.
         """
+        if self.code_dim != self.dim:
+            raise ValueError(
+                "k-means codebook init is incompatible with a LOW-dim VQ (code_dim != dim): the "
+                "code space is defined by the random in_proj, so a dim-D k-means codebook doesn't "
+                "map into it. Use data-dependent init (drop --vq_codebook_init_path) for this variant.")
         if tuple(centroids.shape) != tuple(self.embed.shape):
             raise ValueError(f"k-means codebook shape {tuple(centroids.shape)} != VQ embed "
                              f"{tuple(self.embed.shape)} (num_codes/dim mismatch)")
@@ -86,7 +130,10 @@ class VectorQuantizerEMA(nn.Module):
         indices are meaningless -- consumers mask by feature_lengths as before.
         """
         B, T, D = x.shape
-        flat = x.reshape(-1, D)                                   # [N, D]
+        # Project into the code space (identity when code_dim == dim). [B,T,cd]
+        z = self.in_proj(x) if self.in_proj is not None else x
+        cd = z.shape[-1]
+        flat = z.reshape(-1, cd)                                  # [N, cd]  (raw projected features)
         if mask is None:
             valid = torch.ones(flat.shape[0], dtype=torch.bool, device=flat.device)
         else:
@@ -96,19 +143,24 @@ class VectorQuantizerEMA(nn.Module):
         if self.training and not bool(self.initted):
             self._init_from_data(flat_valid.detach())
 
-        # Nearest code by L2 (expanded form avoids a full cdist allocation).
-        dist = (flat.pow(2).sum(1, keepdim=True)
-                - 2 * flat @ self.embed.t()
-                + self.embed.pow(2).sum(1))                       # [N, K]
-        idx = dist.argmin(1)                                       # [N]
-        quant = self.embed[idx].view(B, T, D)
+        # Cosine: normalize features + codebook to the unit sphere (argmin-L2 == argmax-cosine
+        # on the sphere). Default: raw. EMA still accumulates RAW projected features (below);
+        # normalization is only at read/distance/commit/ST, so the EMA path is unchanged.
+        fq = F.normalize(flat, dim=-1) if self.cosine else flat  # [N, cd]
+        ce = self._codebook()                                    # [K, cd] (normalized if cosine)
+
+        dist = (fq.pow(2).sum(1, keepdim=True)
+                - 2 * fq @ ce.t()
+                + ce.pow(2).sum(1))                              # [N, K]
+        idx = dist.argmin(1)                                     # [N]
+        quant_c = ce[idx]                                        # [N, cd] (the chosen code)
 
         if self.training and flat_valid.shape[0] > 0:
             with torch.no_grad():
                 iv = idx[valid]
                 onehot = F.one_hot(iv, self.num_codes).type(flat.dtype)   # [Nv, K]
                 cs = onehot.sum(0)                                        # [K]
-                embed_sum = onehot.t() @ flat_valid                      # [K, D]
+                embed_sum = onehot.t() @ flat_valid                      # [K, cd] (RAW projected)
                 self.cluster_size.mul_(self.decay).add_(cs, alpha=1 - self.decay)
                 self.embed_avg.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
                 # Laplace smoothing so a briefly-unused code doesn't divide by ~0.
@@ -126,17 +178,19 @@ class VectorQuantizerEMA(nn.Module):
                     self.embed_avg[dead] = seed
                     self.cluster_size[dead] = 1.0
 
-        # Commitment: encoder is pulled toward its chosen (detached) code. Valid frames only.
-        commit = F.mse_loss(flat_valid, quant.reshape(-1, D)[valid].detach()) if flat_valid.shape[0] > 0 \
+        # Commitment: encoder is pulled toward its chosen (detached) code, in code space
+        # (normalized if cosine). Valid frames only.
+        commit = F.mse_loss(fq[valid], quant_c[valid].detach()) if flat_valid.shape[0] > 0 \
             else x.new_zeros(())
         commit = commit * self.commitment_weight
 
-        # Straight-through in TRAIN so downstream (CTC/GRL) grads reach the encoder. In EVAL
-        # return the code exactly: no grad is needed, and x + (quant - x) roundtrips x, which
-        # loses precision (bf16/float rounding) and would leave the "quantized" features a hair
-        # off the codebook -- the downstream dataset needs them ON the codebook so quantize()
-        # recovers exact ids. So eval returns bit-exact codebook rows.
-        quant_st = x + (quant - x).detach() if self.training else quant
+        # Straight-through in code space, then project back up to dim-D. In EVAL return the
+        # code exactly (no ST roundtrip) so the exported features sit ON the codebook and
+        # quantize() recovers exact ids.
+        quant_c_bt = quant_c.view(B, T, cd)
+        fq_bt = fq.view(B, T, cd)
+        quant_st_c = fq_bt + (quant_c_bt - fq_bt).detach() if self.training else quant_c_bt
+        quant_st = self.out_proj(quant_st_c) if self.out_proj is not None else quant_st_c  # [B,T,D]
 
         with torch.no_grad():
             if valid.any():

@@ -130,6 +130,12 @@ class SpeakerInvariantVoiceEncoderConfig:
     vq_ema_decay: float = 0.99
     vq_dead_code_threshold: float = 1.0  # re-seed codes used < this (EMA-window count)
     vq_codebook_init_path: Optional[str] = None  # k-means codebook (utils.codebook fmt) to seed vq.embed; None = random data-dependent init
+    # Codebook-utilization levers (ViT-VQGAN): cosine-distance quantization (L2-normalize
+    # features + codebook) and a low-dim codebook (quantize in vq_code_dim, project back).
+    # Both fix under-utilization (only ~55% of K used). vq_code_dim=0 => same as encoder_dim
+    # (no projection). NOTE: kmeans init is incompatible with low-dim (drop vq_codebook_init_path).
+    vq_cosine: bool = False
+    vq_code_dim: int = 0
 
     # Speaker-conditioned mel-reconstruction auxiliary head (a tiny probe-sized
     # mini-SMG: features + ECAPA -> mel, masked L1). Forces EVERY real frame to carry

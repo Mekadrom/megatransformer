@@ -855,6 +855,8 @@ def load_model(args):
         'vq_ema_decay': args.vq_ema_decay,
         'vq_dead_code_threshold': args.vq_dead_code_threshold,
         'vq_codebook_init_path': args.vq_codebook_init_path,
+        'vq_cosine': args.vq_cosine,
+        'vq_code_dim': args.vq_code_dim,
         # Speaker-conditioned mel-recon aux head (disabled unless --use_recon_aux).
         'use_recon_aux': args.use_recon_aux,
         'recon_aux_width': args.recon_aux_width,
@@ -1198,6 +1200,15 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--vq_dead_code_threshold", type=float, default=1.0,
                             help="Re-seed codes whose EMA usage falls below this from live encoder "
                                  "outputs (dead-code reset; fights codebook collapse).")
+    sub_parser.add_argument("--vq_cosine", action="store_true",
+                            help="Cosine-distance VQ: L2-normalize both features and codebook (ViT-VQGAN "
+                                 "codebook-collapse fix). Improves codebook utilization (~55%% of K used -> "
+                                 "much higher). Cheap; composes with --vq_code_dim.")
+    sub_parser.add_argument("--vq_code_dim", type=int, default=0,
+                            help="Quantize in a LOW-dim space (learned proj encoder_dim->this, and back). "
+                                 "Low-dim codes fill more fully (under-util is partly curse-of-dim). "
+                                 "0 = same as encoder_dim (no projection). Try ~32. NOTE: incompatible with "
+                                 "--vq_codebook_init_path (kmeans) -- use data-dependent init.")
     sub_parser.add_argument("--vq_codebook_init_path", type=str, default=None,
                             help="Seed the EMA codebook from a precomputed k-means codebook "
                                  "(fit_codebook.py output). Fit it on the SAME features the warm-start "

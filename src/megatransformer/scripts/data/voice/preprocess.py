@@ -601,12 +601,16 @@ class VoiceDatasetPreprocessor(Preprocessor):
                 from megatransformer.utils.codebook import save_codebook
                 os.makedirs(self.output_dir, exist_ok=True)
                 cb_path = os.path.join(self.output_dir, "sive_vq_codebook.pt")
-                save_codebook(cb_path, sive_model.vq.embed.detach().cpu(), meta={
+                # effective_codebook() = the dim-D codes downstream actually sees (normalized +
+                # out-projected under cosine/low-dim; == vq.embed in the default case). Exporting
+                # vq.embed directly would ship code_dim / un-normalized codes and break consumers.
+                eff_cb = sive_model.vq.effective_codebook().detach().cpu()
+                save_codebook(cb_path, eff_cb, meta={
                     "source": "sive_vq",
                     "sive_checkpoint": args.sive_checkpoint_path,
                     "commitment_weight": float(sive_model.config.vq_commitment_weight),
                 })
-                print(f"  Exported SIVE VQ codebook ({sive_model.vq.embed.shape[0]} codes) "
+                print(f"  Exported SIVE VQ codebook ({eff_cb.shape[0]} codes, dim {eff_cb.shape[1]}) "
                       f"-> {cb_path}")
 
             print(f"  SIVE config: {args.sive_config}")
