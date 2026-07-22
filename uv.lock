@@ -2028,13 +2028,15 @@ image = [
 ]
 
 [package.dev-dependencies]
+deepspeed = [
+    { name = "deepspeed" },
+]
 dev = [
     { name = "pytest" },
 ]
 training = [
     { name = "accelerate" },
     { name = "datasets" },
-    { name = "deepspeed" },
     { name = "jiwer" },
     { name = "openai-whisper" },
     { name = "psutil" },
@@ -2074,11 +2076,11 @@ requires-dist = [
 provides-extras = ["image", "demo"]
 
 [package.metadata.requires-dev]
+deepspeed = [{ name = "deepspeed" }]
 dev = [{ name = "pytest" }]
 training = [
     { name = "accelerate" },
     { name = "datasets", specifier = ">=2.19,<3" },
-    { name = "deepspeed" },
     { name = "jiwer" },
     { name = "openai-whisper" },
     { name = "psutil" },
