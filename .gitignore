@@ -142,3 +142,11 @@ pretrained_models/
 
 eval_output/
 eval_outputs/
+
+# Host-specific ops scripts (systemd units, GPU power-limit, crash telemetry) — these are
+# tied to one machine's hardware, not to the project.
+scripts_local/
+# Salvaged .tfevents from crash-truncated runs; kept locally for forensics, not source.
+tfevents_corrupt_backups/
+# Local convenience shim (. .venv/bin/activate)
+activate.sh

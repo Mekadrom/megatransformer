@@ -9,6 +9,21 @@ from megatransformer.model.ema import EMAModel
 from megatransformer.utils.audio_utils import SharedWindowBuffer
 
 
+def _sive_state_dict(checkpoint_path: str):
+    """Load a SIVE checkpoint's raw state_dict (dir or file), or None on failure."""
+    path = checkpoint_path
+    if os.path.isdir(path):
+        for cand in ("pytorch_model.bin", "model.safetensors"):
+            if os.path.exists(os.path.join(path, cand)):
+                path = os.path.join(path, cand)
+                break
+    if path.endswith(".safetensors"):
+        import safetensors.torch as st
+        return st.load_file(path)
+    obj = torch.load(path, map_location="cpu", weights_only=False)
+    return obj.get("state_dict", obj) if isinstance(obj, dict) else obj
+
+
 def detect_sive_vq_codes(checkpoint_path: str) -> Optional[int]:
     """Peek a SIVE checkpoint for a VQ codebook; return the code count, else None.
 
@@ -17,24 +32,54 @@ def detect_sive_vq_codes(checkpoint_path: str) -> Optional[int]:
     representation. Auto-detecting the codebook from the checkpoint means callers can't
     forget the flag, and a non-VQ checkpoint transparently stays continuous.
     """
-    path = checkpoint_path
-    if os.path.isdir(path):
-        for cand in ("pytorch_model.bin", "model.safetensors"):
-            if os.path.exists(os.path.join(path, cand)):
-                path = os.path.join(path, cand)
-                break
     try:
-        if path.endswith(".safetensors"):
-            import safetensors.torch as st
-            sd = st.load_file(path)
-        else:
-            obj = torch.load(path, map_location="cpu", weights_only=False)
-            sd = obj.get("state_dict", obj) if isinstance(obj, dict) else obj
+        sd = _sive_state_dict(checkpoint_path)
         key = next((k for k in sd if k.endswith("vq.embed")), None)
         return int(sd[key].shape[0]) if key is not None else None
     except Exception as e:
         print(f"  [warn] could not probe checkpoint for VQ ({e}); assuming no VQ")
         return None
+
+
+def detect_sive_variant(checkpoint_path: str) -> dict:
+    """Peek a SIVE checkpoint and return the config overrides needed to load it FAITHFULLY.
+
+    Extends detect_sive_vq_codes to the ViT-VQGAN-style LOW-DIM codebook and the recon-aux
+    head. This matters because load_model runs with strict=False/allow_size_mismatch=True:
+    a low-dim checkpoint (vq.embed [K, 32]) loaded into a default full-dim model (vq.embed
+    [K, 256]) is a SIZE MISMATCH that gets silently SKIPPED, leaving a RANDOM codebook — the
+    probe then reports confident numbers about codes the model never learned. Detecting
+    code_dim from the checkpoint removes that whole failure class.
+
+    Returns a dict of overrides ({} for a plain non-VQ checkpoint):
+      use_vq / vq_num_codes / vq_code_dim  (0 == full-dim, i.e. no projection)
+      use_recon_aux                        (so recon_head.* keys load instead of warning)
+
+    NOTE: vq_cosine is a pure config FLAG with no weights of its own, so it CANNOT be
+    detected — pass --vq_cosine explicitly for a cosine-trained checkpoint. Getting it wrong
+    changes the argmin (normalized vs raw distance) and therefore the code assignments.
+    """
+    try:
+        sd = _sive_state_dict(checkpoint_path)
+    except Exception as e:
+        print(f"  [warn] could not probe checkpoint ({e}); assuming defaults")
+        return {}
+    key = next((k for k in sd if k.endswith("vq.embed")), None)
+    if key is None:
+        out = {}
+    else:
+        num_codes, code_dim = int(sd[key].shape[0]), int(sd[key].shape[1])
+        # in_proj only exists when the codebook is low-dim; its in_features is the model dim.
+        proj = next((k for k in sd if k.endswith("vq.in_proj.weight")), None)
+        model_dim = int(sd[proj].shape[1]) if proj is not None else code_dim
+        out = {"use_vq": True, "vq_num_codes": num_codes,
+               "vq_code_dim": code_dim if code_dim != model_dim else 0}
+        print(f"  Detected VQ: {num_codes} codes, code_dim={code_dim}"
+              f"{f' (low-dim, model dim {model_dim})' if code_dim != model_dim else ' (full-dim)'}")
+    if any(k.startswith("recon_head.") or ".recon_head." in k for k in sd):
+        out["use_recon_aux"] = True
+        print("  Detected recon-aux head in checkpoint -> use_recon_aux=True")
+    return out
 
 
 def load_model(

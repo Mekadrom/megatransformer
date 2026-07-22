@@ -169,6 +169,56 @@ per-dim renorm at eval (not batch-dependent), but it reweights dims in any varia
 per-dim z-score both feature sets before comparing energy-share, and lean on gender +
 synthesis over raw leakage when the two runs differ in final norm.
 
+## VQ-code structure — the tail-collapse gamut (VQ-SIVE only)
+
+For a **VQ** SIVE, leakage/recon/CER are all GLOBAL averages and are **blind to a POSITIONAL
+tail-collapse** — CTC is alignment-free, so it front-loads the transcript and emits blank over
+real speech at the tail; those content-less frames snap to a few codes and an SMG trained on
+them **flatlines partway through every utterance**. Only these probes (and the ear) see it.
+Run all three together — each one catches what the previous misses:
+
+```
+python -m megatransformer.scripts.eval.audio.sive.code_diversity --checkpoint run=runs/sive/<run>/checkpoint-<step> --vq_cosine --n_utts 150
+python -m megatransformer.scripts.eval.audio.sive.code_redundancy --checkpoint run=runs/sive/<run>/checkpoint-<step> --vq_cosine --n_utts 150
+python -m megatransformer.scripts.eval.audio.sive.code_tail_profile --checkpoint run=runs/sive/<run>/checkpoint-<step> --vq_cosine --n_utts 150
+```
+
+1. **`code_diversity.py`** — first screen. 1st-half vs 2nd-half fraction of frames carrying a
+   distinct code; `drop >20%` = TAIL-COLLAPSE. **Alphabet size ONLY — it is not a verdict.**
+2. **`code_redundancy.py`** — repeat / dedup / unigram-entropy / n-gram predictability per
+   region. **Catches what #1 misses:** a checkpoint reading "+16% drop = FIXED" had tail
+   entropy 7.22→6.64b with predictability DOUBLED (11.6%→22.3%). Also note **repeat rate is
+   NOT the collapse signal** — a fully collapsed run had a FLAT 7.7%/7.8% repeat while its
+   tail fell to 4.15b / 17.8 effective codes / 68% predictability. `deduped_bigram_top1` vs
+   the 1/K chance line is the world-model AR-cheatability read (~13% at K=250 is healthy).
+3. **`code_tail_profile.py`** — the arbiter. Positional DECILE profile of code entropy
+   **against an acoustic reference** (`mel_delta` = frame-to-frame spectral change), plus a
+   per-utterance PAIRED test. **Utterance tails genuinely contain trailing silence, so some
+   decline is FAITHFUL** — only `gap = rel(code_H) − rel(mel_delta) < 0` is real monotony.
+   Judge by `gap` + paired `|t|>2`, not by raw decline. Expect the worst region at **70–90%**
+   (full-loudness speech, shrinking alphabet), *not* the very end where low energy explains it.
+
+**Loading is auto-detected** (`detect_sive_variant`): num_codes, low-dim `code_dim`, and the
+recon-aux head are read off the checkpoint. ⚠️ **`--vq_cosine` CANNOT be auto-detected** (it is
+a config flag with no weights) and it CHANGES the code assignments — pass it for any
+`--vq_cosine` run. This matters because `load_model` runs `strict=False,
+allow_size_mismatch=True`: a low-dim checkpoint loaded as full-dim is silently size-mismatched
+and **skipped**, leaving a RANDOM codebook and confident nonsense.
+
+## Is the run still improving? — `tb_trend.py`
+
+`scripts/tb_trend.py` — OLS slope over the trailing fraction of a run vs the series' own
+short-timescale noise, per scalar. `UP`/`DOWN` = real trend, `--` = plateaued. Use it to
+decide **when to stop training**: when the eval-side metrics go `--` (the train-side ones
+flatten much earlier) the run has converged. Also stops noisy metrics being misread — a CER
+that swings 0.489→0.649 between adjacent evals is `--`, not a regression.
+⚠️ Pass **`--merge`** for any run that has ever been resumed (crash restart / fine-tune
+continuation) — the default reads the newest process only, so pre-resume history goes missing.
+
+```
+python -m megatransformer.scripts.tb_trend runs/sive/<run> --merge --frac 0.4 --tags eval/,perplexity
+```
+
 ## Tertiary — feature timelapse
 
 `scripts/eval/audio/sive/timelapse_sive_encoder_features.py` — MP4 of how a
