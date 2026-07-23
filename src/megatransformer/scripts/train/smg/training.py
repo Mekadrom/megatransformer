@@ -1418,12 +1418,20 @@ def create_trainer(
     _need_sive = args.sive_perceptual_loss_weight > 0 or getattr(args, 'identity_content_loss_weight', 0.0) > 0
     if _need_sive and args.sive_perceptual_checkpoint_path is not None:
         from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
+        # Auto-detect the VQ variant (codes / low-dim code_dim / recon-aux head) so a VQ-SIVE --
+        # including a --vq_code_dim 32 low-dim codebook -- loads faithfully; without it the load
+        # size-mismatches (full-dim vq.embed) or silently returns continuous features. vq_cosine
+        # has no weights to detect, so it needs its own flag (and it changes the code assignments).
+        _sive_ov = {"num_speakers": args.sive_perceptual_num_speakers}
+        _sive_ov.update(model_loading_utils.detect_sive_variant(args.sive_perceptual_checkpoint_path))
+        if _sive_ov.get("use_vq") and getattr(args, "sive_perceptual_vq_cosine", False):
+            _sive_ov["vq_cosine"] = True
         sive_perceptual_model = model_loading_utils.load_model(
             SpeakerInvariantVoiceEncoder,
             args.sive_perceptual_config,
             checkpoint_path=args.sive_perceptual_checkpoint_path,
             device=str(device),
-            overrides={"num_speakers": args.sive_perceptual_num_speakers},
+            overrides=_sive_ov,
         )
         for param in sive_perceptual_model.parameters():
             param.requires_grad = False
@@ -1766,6 +1774,11 @@ def add_cli_args(subparsers):
                            help="SIVE config name for perceptual loss model (must be a live SIVE preset and match the perceptual checkpoint's norm settings)")
     sub_parser.add_argument("--sive_perceptual_layer", type=int, default=-1,
                            help="SIVE layer to extract features from (-1 = final, e.g. 10 for layer 10)")
+    sub_parser.add_argument("--sive_perceptual_vq_cosine", action="store_true",
+                           help="the perceptual-loss SIVE checkpoint was trained with cosine-distance VQ "
+                                "(--vq_cosine). Cannot be auto-detected (a config flag with no weights) and it "
+                                "changes the code assignments, so pass it for a cosine-VQ checkpoint. num_codes / "
+                                "low-dim code_dim / recon-aux head are auto-detected.")
     sub_parser.add_argument("--sive_perceptual_loss_start_step", type=int, default=0,
                            help="Step to start applying SIVE perceptual loss (0 = from start)")
     sub_parser.add_argument("--sive_perceptual_loss_rampup_steps", type=int, default=5000,

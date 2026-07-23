@@ -20,33 +20,9 @@ from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from megatransformer.scripts.data.preprocessor import BatchProcessor, Preprocessor, validate_shard_alignment
 from megatransformer.utils import audio_utils
 from megatransformer.utils.audio_utils import SharedWindowBuffer, extract_mels
-from megatransformer.utils.model_loading_utils import load_model
+from megatransformer.utils.model_loading_utils import detect_sive_variant, load_model
 from megatransformer.utils.speaker_encoder import SpeakerEncoderType, get_speaker_embedding_dim, get_speaker_encoder, get_speaker_encoder_input_type
 from megatransformer.utils.text_encoder import TextEncoderType
-
-
-def _detect_vq_codes(checkpoint_path: str) -> Optional[int]:
-    """Peek a SIVE checkpoint for a VQ codebook. Returns the code count if the model has a
-    VQ bottleneck (a `*vq.embed` buffer), else None. Used to load a VQ-trained SIVE WITH its
-    codebook so extract_features returns quantized codes rather than continuous features."""
-    path = checkpoint_path
-    if os.path.isdir(path):
-        for cand in ("pytorch_model.bin", "model.safetensors"):
-            if os.path.exists(os.path.join(path, cand)):
-                path = os.path.join(path, cand)
-                break
-    try:
-        if path.endswith(".safetensors"):
-            import safetensors.torch as st
-            sd = st.load_file(path)
-        else:
-            obj = torch.load(path, map_location="cpu", weights_only=False)
-            sd = obj.get("state_dict", obj) if isinstance(obj, dict) else obj
-        key = next((k for k in sd if k.endswith("vq.embed")), None)
-        return int(sd[key].shape[0]) if key is not None else None
-    except Exception as e:
-        print(f"  [warn] could not probe checkpoint for VQ ({e}); assuming no VQ")
-        return None
 
 
 # Canonical gender label mapping. Datasets use varied conventions (Common
@@ -571,16 +547,24 @@ class VoiceDatasetPreprocessor(Preprocessor):
             if args.speaker_pooling:
                 model_config_overrides['speaker_pooling'] = args.speaker_pooling
 
-            # Auto-detect a VQ bottleneck in the checkpoint. Without this the model would be
-            # built use_vq=False, the vq.embed buffer would be dropped on load, and
+            # Auto-detect the VQ variant (codes, LOW-dim code_dim, recon-aux head) from the
+            # checkpoint. Without this the model would be built use_vq=False and
             # extract_features(layer=-1) would silently return CONTINUOUS features instead of
-            # the quantized codes -- an unquantized dataset that looks fine. Reading the code
-            # count from the checkpoint also means it can't be mis-specified.
-            vq_codes = _detect_vq_codes(args.sive_checkpoint_path)
-            if vq_codes is not None:
-                model_config_overrides['use_vq'] = True
-                model_config_overrides['vq_num_codes'] = vq_codes
-                print(f"  Detected VQ bottleneck in checkpoint: {vq_codes} codes -> use_vq=True")
+            # the quantized codes -- an unquantized dataset that looks fine. And a LOW-dim
+            # codebook (vq.embed [K, 32]) built full-dim [K, 256] is a SIZE MISMATCH that fails
+            # the load outright (what --vq_code_dim 32 checkpoints hit here). detect_sive_variant
+            # reads code_dim off the checkpoint so it can't be mis-specified.
+            vq_overrides = detect_sive_variant(args.sive_checkpoint_path)
+            model_config_overrides.update(vq_overrides)
+            if vq_overrides.get('use_vq'):
+                # vq_cosine has NO weights of its own so it can't be detected -- but it changes
+                # the argmin (normalized vs raw distance) and therefore which code each frame
+                # gets, so it MUST match the training run or the exported features are wrong.
+                if args.vq_cosine:
+                    model_config_overrides['vq_cosine'] = True
+                    print("  --vq_cosine set: quantizing by cosine distance (normalized features+codebook)")
+                else:
+                    print("  [note] assuming NON-cosine VQ; pass --vq_cosine if this checkpoint used it")
                 print(f"  NOTE: VQ codes exist ONLY at the final tap -- extract with --layers -1 "
                       f"(any earlier layer is pre-VQ / continuous).")
 
@@ -816,6 +800,11 @@ class VoiceDatasetPreprocessor(Preprocessor):
                             help="Path to SIVE checkpoint directory. If not specified, features are not saved.")
         sub_parser.add_argument("--sive_config", type=str, default="small_deep_3xdownsample_conv2d_attentive",
                             help="SIVE config name (must be a live preset; collapsed to a single preset in the 2026-06 prune)")
+        sub_parser.add_argument("--vq_cosine", action="store_true",
+                            help="the SIVE checkpoint was trained with cosine-distance VQ (--vq_cosine). CANNOT be "
+                                 "auto-detected (a config flag with no weights) and it CHANGES which code each frame "
+                                 "gets, so pass it for any cosine-VQ checkpoint or the exported features are wrong. "
+                                 "num_codes / low-dim code_dim / recon-aux head ARE auto-detected.")
         sub_parser.add_argument("--num_speakers", type=int, default=3610,
                             help="num_speakers the SIVE checkpoint was trained with; sizes the speaker-classifier head, "
                                  "so it must match the checkpoint or the load fails on a shape mismatch. Current runs use 3610.")
