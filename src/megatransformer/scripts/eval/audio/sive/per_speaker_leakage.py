@@ -59,7 +59,7 @@ from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
 from megatransformer.scripts.eval.audio.sive.speaker_leakage_probe import LinearProbe, MLPProbe
 from megatransformer.utils.audio_utils import SharedWindowBuffer, extract_mels
-from megatransformer.utils.model_loading_utils import detect_sive_vq_codes, load_model
+from megatransformer.utils.model_loading_utils import detect_sive_variant, load_model
 
 
 # ---------------------------------------------------------------------------
@@ -175,13 +175,17 @@ def cached_features(args, name, ckpt_path):
             np.savez(cache_path, features=feats, speaker_ids=spk, gender_ids=gen)
         return feats, spk, gen
 
-    # Auto-detect a VQ codebook in the checkpoint. Without this a VQ-trained SIVE loads
-    # into a use_vq=False model, its vq.* buffers are dropped, and the probe silently
-    # measures CONTINUOUS features instead of the codes. Non-VQ checkpoints are unaffected.
-    _vq_codes = detect_sive_vq_codes(ckpt_path)
-    _vq_overrides = {"use_vq": True, "vq_num_codes": _vq_codes} if _vq_codes else {}
-    if _vq_codes:
-        print(f"  Detected VQ bottleneck in checkpoint: {_vq_codes} codes -> use_vq=True (features are QUANTIZED)")
+    # Auto-detect the VQ variant (codes, LOW-dim code_dim, recon-aux head) from the checkpoint.
+    # Without this a VQ-trained SIVE loads into a use_vq=False model, its vq.* buffers are
+    # dropped, and the probe silently measures CONTINUOUS features instead of the codes --
+    # and a LOW-dim codebook loaded as full-dim is size-mismatched, skipped, and leaves a
+    # RANDOM codebook. Non-VQ checkpoints are unaffected.
+    _vq_overrides = detect_sive_variant(ckpt_path)
+    if args.vq_cosine:
+        _vq_overrides["vq_cosine"] = True
+        print("  --vq_cosine set: quantizing by cosine distance (normalized features+codebook)")
+    elif _vq_overrides.get("use_vq"):
+        print("  [note] assuming NON-cosine VQ; pass --vq_cosine if this checkpoint used it")
 
     model = load_model(
         SpeakerInvariantVoiceEncoder, args.config, checkpoint_path=ckpt_path,
@@ -774,6 +778,11 @@ def main():
                     help="HF model id for ContentVec (transformers.HubertModel), used when --content_encoder contentvec. --extract_layer <0 = last_hidden_state.")
     ap.add_argument("--contentvec_dim", type=int, default=768, choices=[256, 768],
                     help="ContentVec feature width: 768 (last_hidden_state) or 256 (final_proj — same 95M model, matches SIVE's width).")
+    ap.add_argument("--vq_cosine", action="store_true",
+                    help="checkpoint was trained with cosine-distance VQ (--vq_cosine). CANNOT be "
+                         "auto-detected (it is a config flag with no weights of its own) and it CHANGES "
+                         "the code assignments -- pass it for any cosine-VQ run or the codes measured "
+                         "here are not the codes that were trained.")
     ap.add_argument("--final_norm_type", default=None,
                     help="Override the model's final_norm_type to MATCH a norm-variant checkpoint "
                          "(layernorm/rmsnorm/none). REQUIRED for rmsnorm/none runs — without it the "

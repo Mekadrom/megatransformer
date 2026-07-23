@@ -51,7 +51,7 @@ from tqdm import tqdm
 from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
 from megatransformer.utils.audio_utils import SharedWindowBuffer, extract_mels
-from megatransformer.utils.model_loading_utils import detect_sive_vq_codes, load_model
+from megatransformer.utils.model_loading_utils import detect_sive_variant, load_model
 
 
 # ---------------------------------------------------------------------------
@@ -255,12 +255,15 @@ def cached_frame_data(args, name, ckpt_path, subset):
             getattr(args, "contentvec_dim", 768), args.voice_sample_rate,
             args.lpc_order, args.n_formants)
     else:
-        _vq = detect_sive_vq_codes(ckpt_path)
-        if _vq:
-            print(f"  Detected VQ bottleneck: {_vq} codes -> use_vq=True (QUANTIZED features)")
+        # Auto-detect the VQ variant (codes / LOW-dim code_dim / recon-aux head). A low-dim
+        # codebook loaded as full-dim is size-mismatched, silently skipped, and left RANDOM.
         overrides = {"num_speakers": args.num_speakers}
-        if _vq:
-            overrides.update({"use_vq": True, "vq_num_codes": _vq})
+        overrides.update(detect_sive_variant(ckpt_path))
+        if args.vq_cosine:
+            overrides["vq_cosine"] = True
+            print("  --vq_cosine set: quantizing by cosine distance (normalized features+codebook)")
+        elif overrides.get("use_vq"):
+            print("  [note] assuming NON-cosine VQ; pass --vq_cosine if this checkpoint used it")
         for k in ("final_norm_type", "downsample_norm_type", "block_norm_type", "conv_norm_type"):
             v = getattr(args, k, None)
             if v is not None:
@@ -544,6 +547,11 @@ def main():
     ap.add_argument("--contentvec_model", default="lengyue233/content-vec-best")
     ap.add_argument("--contentvec_dim", type=int, default=256)
     ap.add_argument("--extract_layer", type=int, default=-1)
+    ap.add_argument("--vq_cosine", action="store_true",
+                    help="checkpoint was trained with cosine-distance VQ (--vq_cosine). CANNOT be "
+                         "auto-detected (it is a config flag with no weights of its own) and it CHANGES "
+                         "the code assignments -- pass it for any cosine-VQ run or the codes measured "
+                         "here are not the codes that were trained.")
     ap.add_argument("--final_norm_type", default=None)
     ap.add_argument("--downsample_norm_type", default=None)
     ap.add_argument("--block_norm_type", default=None)
