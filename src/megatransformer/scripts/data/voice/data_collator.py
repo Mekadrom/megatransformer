@@ -72,6 +72,17 @@ class VoiceDataCollator(DataCollator):
             padded_waveforms, waveform_masks = None, None
         if all_features[0] is not None:
             padded_features, features_masks = pad_and_mask(all_features, all_feature_lengths)
+            # Zero the feature pad. quantize() deliberately leaves padding frames as their
+            # nonzero stored centroids (so unit_ids stay -1 without snapping to a spurious
+            # unit near the origin), and pad_and_mask masks-but-does-not-zero. But the SMG
+            # decoder applies no input mask, so its conv receptive field bleeds those
+            # real-unit-like pad frames into the last VALID frames -> an end-of-utterance
+            # energy burst (visible in the mel; GT decays to silence, so the model is
+            # manufacturing it). Zeroing here removes the contamination AND makes the
+            # training boundary match the eval path (which trims to length), so the model
+            # can learn to render the stereotyped trailing-silence codes as actual silence.
+            # Mask is [T'] and broadcasts against the last dim of [D, T'] or [L, D, T'].
+            padded_features = [f * m.to(f.dtype) for f, m in zip(padded_features, features_masks)]
         else:
             padded_features, features_masks = None, None
         if all_mel_specs[0] is not None:
