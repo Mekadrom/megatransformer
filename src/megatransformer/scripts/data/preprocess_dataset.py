@@ -85,6 +85,39 @@ def _write_index(shard_dir, shard_files, sample_counts, num_speakers, command):
     print(f"  {shard_dir}: {len(shard_files)} shards, {total:,} samples → {index_path}")
 
 
+def _inject_f0_stats_into_codebooks(all_dirs, codebook_name):
+    """Fit per-speaker log-F0 stats over ALL dirs and inject them into each dir's VQ codebook.
+
+    MUST be called AFTER the speaker-ID remap: fit_f0_stats indexes the table by int(speaker_id),
+    so it has to see the FINAL (dense, remapped) ids the world/SMG dataset will read -- otherwise
+    normalize_f0 indexes the wrong speaker. Preserves the centroids and existing meta; only adds
+    the F0 keys load_f0_stats looks for. Idempotent (re-running overwrites with the same values).
+    """
+    from megatransformer.scripts.data.voice.fit_codebook import fit_f0_stats
+    from megatransformer.utils.codebook import save_codebook
+
+    cbs = [(d, os.path.join(d, codebook_name)) for d in all_dirs]
+    cbs = [(d, p) for d, p in cbs if os.path.exists(p)]
+    if not cbs:
+        print(f"[f0-stats] no '{codebook_name}' in any dir; skipping (non-VQ dataset?)")
+        return
+    print(f"[f0-stats] fitting per-speaker log-F0 over {len(all_dirs)} dir(s) (post-remap ids)...")
+    stats = fit_f0_stats(all_dirs)
+    if stats is None:
+        print("[f0-stats] shards carry no f0/speaker_ids; skipping")
+        return
+    mean, std, g_mean, g_std, n_spk, n_seen = stats
+    print(f"[f0-stats] {n_spk}/{n_seen} speakers estimated (rest -> global mu={g_mean:.3f} sd={g_std:.3f})")
+    for _, p in cbs:
+        obj = torch.load(p, map_location="cpu", weights_only=False)
+        # Keep centroids + any provenance meta; drop the fields save_codebook re-derives.
+        meta = {k: v for k, v in obj.items() if k not in ("centroids", "k", "dim")}
+        meta.update({"speaker_f0_mean": mean, "speaker_f0_std": std,
+                     "global_f0_mean": g_mean, "global_f0_std": g_std})
+        save_codebook(p, obj["centroids"], meta=meta)
+        print(f"[f0-stats]   injected -> {p}")
+
+
 def _stat_shards(args):
     """Build shard index for existing shards, and optionally remap speaker IDs
     to dense sequential integers across all directories (train + val)."""
@@ -149,6 +182,12 @@ def _stat_shards(args):
     print()
     for d, (shard_files, sample_counts) in dir_info.items():
         _write_index(d, shard_files, sample_counts, num_speakers, args.command)
+
+    # F0 stats must be fit AFTER the remap above so the table is keyed by the final ids.
+    if getattr(args, "fit_codebook_f0_stats", False):
+        print()
+        _inject_f0_stats_into_codebooks(list(dir_info.keys()), args.codebook_name)
+
     print(f"\nDone.")
 
 
@@ -173,6 +212,15 @@ def main():
     sub_parser.add_argument("--output_dir", type=str, required=True, help="Output directory for shards")
     sub_parser.add_argument("--speaker_id_column", type=str, default=None, help="If specified, remap speaker IDs to dense sequential integers")
     sub_parser.add_argument("--additional_shard_dirs", type=str, nargs="*", default=[], help="Extra shard dirs (e.g. val split) to include in global speaker ID mapping. These dirs also get remapped and their own shard_index.json written.")
+    sub_parser.add_argument("--fit_codebook_f0_stats", action="store_true",
+                            help="After the speaker-ID remap, fit per-speaker log-F0 mean/std over ALL "
+                                 "dirs and inject them into each dir's VQ codebook (preserving centroids). "
+                                 "The world model reads these to build the speaker-normalized F0 contour "
+                                 "target; they MUST be indexed by the FINAL (remapped) speaker ids, which "
+                                 "is why this runs here and not at preprocess time. Idempotent; no-op if a "
+                                 "dir has no codebook or the shards carry no f0.")
+    sub_parser.add_argument("--codebook_name", type=str, default="sive_vq_codebook.pt",
+                            help="Codebook filename to update in each dir (with --fit_codebook_f0_stats).")
     for preprocessor_cls in preprocessor_clss:
         # Dataset
         sub_parser = preprocessor_cls.add_cli_args(subparsers)

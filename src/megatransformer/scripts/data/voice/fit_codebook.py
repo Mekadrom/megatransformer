@@ -59,7 +59,10 @@ def fit_f0_stats(cache_dirs):
     for path in paths:
         sh = torch.load(path, map_location="cpu", weights_only=False)
         if "f0" not in sh or "speaker_ids" not in sh:
-            return None
+            # Not a shard (e.g. the exported sive_vq_codebook.pt, which now lives in the same
+            # dir and also matches *.pt). Skip it -- do NOT abort, or a stray file zeroes the
+            # whole fit. "dataset genuinely has no f0" is caught by the `if not ns` below.
+            continue
         f0s, vuvs, sids, lens = sh["f0"], sh["vuv"], sh["speaker_ids"], sh["feature_lengths"]
         for i in range(len(f0s)):
             L = int(lens[i])
