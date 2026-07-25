@@ -1155,39 +1155,48 @@ class MegaTransformerWorldModel(nn.Module):
                             # centroid (not the regression head's frame) is what gets fed
                             # back to the prelude and handed to the SMG, so generation
                             # stays on the same manifold the SMG was trained on.
-                            logits = unit_logits[0, -1]  # (K,)
+                            logits = unit_logits[0, -1]  # (K+1,) -- includes the EOV token
                             if voice_temperature > 0.0:
                                 probs = torch.softmax(logits.float() / voice_temperature, dim=-1)
                                 unit_id = torch.multinomial(probs, 1)[0]
                             else:
                                 unit_id = logits.argmax(-1)
                             voice_unit_id_trace[b].append(int(unit_id))
-                            # The coda's F0/VUV for this frame, if the head exists. This is
-                            # the contour the SMG will be conditioned on -- the whole point
-                            # of predicting it here rather than letting the SMG infer it
-                            # from prosody-free units.
-                            dur_p = coda_out.get("voice_duration_preds")
-                            if dur_p is not None:
-                                # Deduped path: this step is a SEGMENT. Record how many 50Hz
-                                # frames it becomes (exp(log-frames), round, clamp 1..100),
-                                # then predict F0 at frame rate by expanding THIS segment's
-                                # hidden state by that duration and running the F0 head --
-                                # matching training, where F0 comes off the expanded h.
-                                d = int(torch.exp(dur_p[0, -1].detach()).round().clamp(min=1, max=100))
-                                voice_duration_seq[b].append(d)
-                                hid = coda_out.get("voice_hidden")
-                                f0_head = getattr(self.voice_generator, "f0_head", None)
-                                if hid is not None and f0_head is not None:
-                                    h_exp = hid[0, -1].unsqueeze(0).expand(d, -1)  # (d, d_model)
-                                    voice_f0_seq[b].append(f0_head(h_exp).squeeze(-1).detach())  # (d,)
+                            # EOV token: the terminal unit (id == codebook size; the codebook
+                            # has no row there). It is the discrete-vocab replacement for the
+                            # old stop head -- terminate WITHOUT emitting a frame (no centroid,
+                            # no F0), so the finalized utterance is exactly the content frames.
+                            if int(unit_id) == self.voice_codebook.shape[0]:
+                                should_stop_voice = True
                             else:
-                                # Frame-rate path: one F0 value per frame, from the coda.
-                                f0_p = coda_out.get("voice_f0_preds")
-                                if f0_p is not None:
-                                    voice_f0_seq[b].append(f0_p[0, -1].detach().reshape(1))
-                            frame_pred = self.voice_codebook[unit_id].to(
-                                device=hidden_b.device, dtype=coda_out["voice_latent_preds"].dtype
-                            ).view(1, -1, 1)  # (1, C, 1)
+                                # The coda's F0/VUV for this frame, if the head exists. This is
+                                # the contour the SMG will be conditioned on -- the whole point
+                                # of predicting it here rather than letting the SMG infer it
+                                # from prosody-free units.
+                                dur_p = coda_out.get("voice_duration_preds")
+                                if dur_p is not None:
+                                    # Deduped path: this step is a SEGMENT. Record how many 50Hz
+                                    # frames it becomes (exp(log-frames), round, clamp 1..100),
+                                    # then predict F0 at frame rate by expanding THIS segment's
+                                    # hidden state by that duration and running the F0 head --
+                                    # matching training, where F0 comes off the expanded h.
+                                    d = int(torch.exp(dur_p[0, -1].detach()).round().clamp(min=1, max=100))
+                                    voice_duration_seq[b].append(d)
+                                    hid = coda_out.get("voice_hidden")
+                                    f0_head = getattr(self.voice_generator, "f0_head", None)
+                                    if hid is not None and f0_head is not None:
+                                        h_exp = hid[0, -1].unsqueeze(0).expand(d, -1)  # (d, d_model)
+                                        voice_f0_seq[b].append(f0_head(h_exp).squeeze(-1).detach())  # (d,)
+                                else:
+                                    # Frame-rate path: one F0 value per frame, from the coda.
+                                    f0_p = coda_out.get("voice_f0_preds")
+                                    if f0_p is not None:
+                                        voice_f0_seq[b].append(f0_p[0, -1].detach().reshape(1))
+                                frame_pred = self.voice_codebook[unit_id].to(
+                                    device=hidden_b.device, dtype=coda_out["voice_latent_preds"].dtype
+                                ).view(1, -1, 1)  # (1, C, 1)
+                                voice_sequences[b].append(frame_pred.squeeze(0))  # (C, 1)
+                                last_voice_pred[b] = frame_pred.squeeze(0)  # (C, 1)
                         else:
                             frame_pred = coda_out["voice_latent_preds"]  # (1, C, 1) = Gaussian mean
                             # Heteroscedastic sampling: if the coda emitted a log-variance
@@ -1201,21 +1210,27 @@ class MegaTransformerWorldModel(nn.Module):
                                 if voice_variance_floor > 0.0:
                                     std = std.clamp_min(voice_variance_floor)
                                 frame_pred = frame_pred + voice_temperature * std * torch.randn_like(frame_pred)
-                        voice_sequences[b].append(frame_pred.squeeze(0))  # (C, 1)
-                        last_voice_pred[b] = frame_pred.squeeze(0)  # (C, 1)
-                        # Check stop probability
-                        stop_logit = coda_out["voice_stop_logits"]  # (1, 1)
-                        stop_logit_val = stop_logit[0, 0].item()
-                        voice_stop_logit_trace[b].append(stop_logit_val)
-                        if torch.sigmoid(torch.tensor(stop_logit_val)).item() > 0.5:
-                            should_stop_voice = True
+                            voice_sequences[b].append(frame_pred.squeeze(0))  # (C, 1)
+                            last_voice_pred[b] = frame_pred.squeeze(0)  # (C, 1)
+                            # Stop head (CONTINUOUS path only; the discrete path stops on the
+                            # EOV unit above and has no stop head).
+                            stop_logit = coda_out["voice_stop_logits"]  # (1, 1)
+                            stop_logit_val = stop_logit[0, 0].item()
+                            voice_stop_logit_trace[b].append(stop_logit_val)
+                            if torch.sigmoid(torch.tensor(stop_logit_val)).item() > 0.5:
+                                should_stop_voice = True
                     else:
                         voice_sequences[b].append(current_hidden[b])
 
                     # Stop on predicted stop or hard budget
                     if should_stop_voice or len(voice_sequences[b]) >= voice_token_budget:
                         current_modality[b] = None
-                        if self.voice_generator is not None:
+                        # `and voice_sequences[b]`: EOV can fire on the FIRST step (an
+                        # undertrained model), leaving no frames -- _finalize_voice would
+                        # torch.cat([]) and crash. An empty utterance is a valid outcome
+                        # (the model chose to emit nothing); skip finalizing it, mirroring
+                        # the end-of-generation flush guard below.
+                        if self.voice_generator is not None and voice_sequences[b]:
                             feat, f0 = _finalize_voice(voice_sequences[b], voice_f0_seq[b], voice_duration_seq[b])
                             completed_voice[b].append(feat)
                             if f0 is not None:

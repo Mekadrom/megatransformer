@@ -165,9 +165,13 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         if self.predict_duration:
             self.duration_head = nn.Linear(coda_config.d_model, 1)
 
-        # Stop prediction head: single linear → scalar logit per frame.
-        # Predicts whether the current frame is the last real frame (or past it).
-        self.stop_head = nn.Linear(coda_config.d_model, 1)
+        # Stop prediction head: single linear → scalar logit per frame. Built ONLY for the
+        # continuous path. When a unit vocabulary is present, end-of-voice is the terminal
+        # unit instead -- the EOV token, index (unit_vocab_size - 1) in the K+1-way unit head
+        # -- so a separate stop head is redundant and is not created at all (no unused branch
+        # in the discrete-path model).
+        if not self.unit_vocab_size:
+            self.stop_head = nn.Linear(coda_config.d_model, 1)
 
         self.l1_loss = nn.L1Loss()
         self.mse_loss = nn.MSELoss()
@@ -187,10 +191,12 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         if getattr(self, "stochastic_output", False):
             nn.init.zeros_(self.logvar_projection.weight)
             nn.init.constant_(self.logvar_projection.bias, self.logvar_init)
-        # Bias the stop head toward "continue" at init so an untrained model
-        # generates full sequences instead of stopping immediately.
-        nn.init.zeros_(self.stop_head.weight)
-        nn.init.constant_(self.stop_head.bias, -5.0)  # sigmoid(-5) ≈ 0.007
+        # Bias the stop head toward "continue" at init so an untrained model generates full
+        # sequences instead of stopping immediately. Continuous path only -- the discrete
+        # path has no stop head (EOV lives in the unit vocabulary).
+        if getattr(self, "stop_head", None) is not None:
+            nn.init.zeros_(self.stop_head.weight)
+            nn.init.constant_(self.stop_head.bias, -5.0)  # sigmoid(-5) ≈ 0.007
         if self.temporal_refine is not None:
             if isinstance(self.temporal_refine, TemporalRefine):
                 # TemporalRefine uses Conv1d — Kaiming init for ReLU/GELU.
@@ -278,18 +284,20 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         if self.temporal_refine is not None:
             feature_preds = self.temporal_refine(feature_preds)
 
-        # Stop logits: (batch, timesteps) — probability that this frame is at/past the end
-        stop_logits = self.stop_head(h).squeeze(-1)  # (batch, seq_length)
-
         outputs = {
             f"{self.prefix}_latent_preds": feature_preds,
-            f"{self.prefix}_stop_logits": stop_logits,
             # The coda hidden state, (batch, seq, d_model). Exposed so the deduped path can
             # expand it by duration to 50Hz and run the F0 head at frame rate (F0 is a
             # frame-rate signal; predicting it per SEGMENT flattens within-segment pitch).
             # Off the deduped path nothing reads it.
             f"{self.prefix}_hidden": h,
         }
+
+        # Stop logits: (batch, timesteps) — probability that this frame is at/past the end.
+        # Continuous path ONLY; the discrete path terminates on the EOV unit (see the unit
+        # head below), so there is no stop head to read.
+        if getattr(self, "stop_head", None) is not None:
+            outputs[f"{self.prefix}_stop_logits"] = self.stop_head(h).squeeze(-1)  # (B, T)
 
         # (batch, seq_length, K) logits over the codebook. Read off the coda hidden state
         # directly -- NOT off feature_preds -- so the unit head is a sibling of the

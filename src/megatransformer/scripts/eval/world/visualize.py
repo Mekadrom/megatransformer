@@ -93,7 +93,8 @@ def parse_args():
     # these training-time overrides must be re-applied or the coda's unit head / feature
     # projections won't match the saved weights.
     p.add_argument("--voice_codebook_path", type=str, default=None,
-                   help="Sizes the coda's unit head (unit_vocab_size = K from this codebook).")
+                   help="Sizes the coda's unit head (unit_vocab_size = K+1: K content units "
+                        "from this codebook plus the EOV terminal token).")
     p.add_argument("--voice_feature_channels", type=int, default=None,
                    help="SIVE feature width (256 for VQ-SIVE); sizes prelude/coda feature I/O.")
     p.add_argument("--voice_predict_f0", action="store_true",
@@ -196,7 +197,10 @@ def load_world_model(args, device):
         cbp = getattr(args, "voice_codebook_path", None)
         if cbp:
             from megatransformer.utils.codebook import load_codebook
-            config.voice_coda_config.unit_vocab_size = int(load_codebook(cbp).shape[0])
+            # +1 for the EOV terminal token (must match training: unit head is K+1-way,
+            # EOV = class K). Loading with only K would shape-mismatch the checkpoint's
+            # unit head and drop the discrete stop mechanism.
+            config.voice_coda_config.unit_vocab_size = int(load_codebook(cbp).shape[0]) + 1
         vfc = getattr(args, "voice_feature_channels", None)
         if vfc:
             config.voice_prelude_config.feature_channels = vfc
@@ -313,11 +317,20 @@ def main():
 
     # Collator
     voice_max_frames = int(args.voice_max_seconds * args.voice_sample_rate // args.voice_hop_length)
+    # Discrete voice: append the EOV terminal unit (id == K) so teacher-forced
+    # reconstructions match the training layout. None on the continuous path.
+    _cbp = getattr(args, "voice_codebook_path", None)
+    if _cbp:
+        from megatransformer.utils.codebook import load_codebook
+        voice_eov_id = int(load_codebook(_cbp).shape[0])
+    else:
+        voice_eov_id = None
     collator = MultimodalDataCollator(
         max_seq_len=args.max_seq_len,
         max_waveforms=int(args.voice_max_seconds * args.voice_sample_rate),
         max_mel_spec_frames=voice_max_frames,
         max_sive_feature_frames=math.ceil(voice_max_frames / args.sive_total_stride),
+        voice_eov_id=voice_eov_id,
     )
 
     # Decoders

@@ -1,4 +1,5 @@
 import random
+from typing import Optional
 
 import torch
 
@@ -41,11 +42,20 @@ class MultimodalDataCollator(DataCollator):
         max_waveforms: int = 160000,
         max_mel_spec_frames: int = 625,
         max_sive_feature_frames: int = 157,
+        # End-of-voice / end-of-audio terminal unit ids. When set (discrete path), a
+        # terminal EOV/EOA token is appended right after each utterance's last content
+        # frame -- the discrete-vocab replacement for the stop head. Value is the
+        # codebook size K (the id of the (K+1)-th class). None => continuous path,
+        # no terminal token inserted (backward compatible; the stop head governs).
+        voice_eov_id: Optional[int] = None,
+        audio_eov_id: Optional[int] = None,
     ):
         self.max_seq_len = max_seq_len
         self.max_waveforms = max_waveforms
         self.max_mel_spec_frames = max_mel_spec_frames
         self.max_sive_feature_frames = max_sive_feature_frames
+        self.voice_eov_id = voice_eov_id
+        self.audio_eov_id = audio_eov_id
         self.force_direction = None  # Set to "synthesis" or "transcription" to override random direction
 
     def __call__(self, examples: list[dict]) -> dict[str, torch.Tensor]:
@@ -246,7 +256,7 @@ class MultimodalDataCollator(DataCollator):
             "is_synthesis": torch.tensor(all_is_synthesis, dtype=torch.bool),
         }
 
-    def _collate_audio_like(self, examples: list[dict], prefix: str) -> dict:
+    def _collate_audio_like(self, examples: list[dict], prefix: str, eov_id: Optional[int] = None) -> dict:
         """Collate audio-like modality (audio or voice) with the given key prefix."""
         all_waveforms = []
         all_waveform_lengths = []
@@ -298,16 +308,43 @@ class MultimodalDataCollator(DataCollator):
             batch[f"{prefix}_waveform_lengths"] = torch.stack(all_waveform_lengths)
             batch[f"{prefix}_waveform_masks"] = torch.stack(masks)
 
+        # EOV/EOA terminal token (discrete path only). When an eov_id is configured AND
+        # this batch carries unit ids, extend every utterance's supervised span by ONE
+        # position: the frame at index `length` (the first slot after the last content
+        # frame, which occupies indices 0..length-1) becomes the terminal token. Driving
+        # the extension through the LENGTHS -- so pad_and_mask derives both the pad width
+        # (max+1) and each sample's mask from length+1 -- makes the terminal position a
+        # genuine valid position everywhere downstream (the interleaver places length+1
+        # voice tokens; the coda is supervised at index length) while real padding stays
+        # strictly beyond it. The terminal token therefore can NEVER land in padding.
+        use_eov = eov_id is not None and all_unit_ids[0] is not None
+        if use_eov:
+            span_lengths = [torch.as_tensor(int(n) + 1, dtype=torch.long) for n in all_feature_lengths]
+        else:
+            span_lengths = all_feature_lengths
+
         if all_features[0] is not None:
-            padded, masks = pad_and_mask(all_features, all_feature_lengths)
+            padded, masks = pad_and_mask(all_features, span_lengths)
             # Zero the feature pad. VQ quantizes EVERY frame (pad included) to a nonzero
             # centroid, and pad_and_mask masks-but-doesn't-zero — so the prelude's conv would
             # bleed real-unit-like pad frames into the last valid frames, and the viz SMG
             # decodes the pad tail as babble (the "N real seconds + nonsense to the cap" the
             # transcription-input render shows). Mask is [T]; broadcasts over [D, T] / [L, D, T].
+            # With EOV the terminal frame at index `length` is a zero column (no stored feature
+            # there) that the coda never consumes as INPUT -- its target is the EOV unit, not a
+            # feature -- so zeroing it is both harmless and consistent with the rest of the pad.
             padded = [f * m.to(f.dtype) for f, m in zip(padded, masks)]
+            if use_eov:
+                # Explicitly zero the terminal (EOV) frame at index `length`. pad_and_mask's
+                # mask marks it VALID (so voice_lengths / the interleaver include it), which
+                # leaves it UNzeroed by the mask-multiply above -- and a feature tensor stored
+                # slightly longer than feature_length would otherwise leak a real frame there.
+                # The coda never consumes it as input (its target is the EOV unit), so zeroing
+                # is safe and keeps the terminal frame content-free.
+                for f, n in zip(padded, all_feature_lengths):
+                    f[..., int(n)] = 0.0
             batch[f"{prefix}_features"] = torch.stack(padded)
-            batch[f"{prefix}_feature_lengths"] = torch.stack(all_feature_lengths)
+            batch[f"{prefix}_feature_lengths"] = torch.stack(span_lengths)
             batch[f"{prefix}_feature_masks"] = torch.stack(masks)
 
         if all_unit_ids[0] is not None:
@@ -315,12 +352,23 @@ class MultimodalDataCollator(DataCollator):
             # (it is the shared waveform/mel helper), which would silently supervise the
             # coda to predict unit 0 across every padded frame — the exact bug the text
             # targets had. Pad by hand so padding is the CE ignore_index.
-            T = max(int(u.shape[-1]) for u in all_unit_ids)
+            if use_eov:
+                # Width matches the EOV-extended features (max feature length + 1) so the
+                # coda's logits and this target align position-for-position.
+                T = max(int(n) for n in all_feature_lengths) + 1
+            else:
+                T = max(int(u.shape[-1]) for u in all_unit_ids)
             padded_units = []
             for u, n in zip(all_unit_ids, all_feature_lengths):
                 n = int(n)
                 out = torch.full((T,), -100, dtype=torch.long)
                 out[:n] = u[:n].to(torch.long)
+                if use_eov:
+                    # Terminal EOV at index `length` -- immediately after the last content
+                    # frame (indices 0..n-1), before any -100 padding. Supervised (not -100)
+                    # so the coda learns to emit it; the codebook has no row at id==K, so
+                    # generation stops on it before any centroid lookup.
+                    out[n] = eov_id
                 padded_units.append(out)
             batch[f"{prefix}_unit_ids"] = torch.stack(padded_units)
 
@@ -385,11 +433,11 @@ class MultimodalDataCollator(DataCollator):
 
     def _collate_audio(self, examples: list[dict]) -> dict:
         filtered = [ex for ex in examples if any(k.startswith("audio_") for k in ex)]
-        return self._collate_audio_like(filtered, "audio") if filtered else {}
+        return self._collate_audio_like(filtered, "audio", eov_id=self.audio_eov_id) if filtered else {}
 
     def _collate_voice(self, examples: list[dict]) -> dict:
         filtered = [ex for ex in examples if any(k.startswith("voice_") for k in ex)]
-        return self._collate_audio_like(filtered, "voice") if filtered else {}
+        return self._collate_audio_like(filtered, "voice", eov_id=self.voice_eov_id) if filtered else {}
 
     def _collate_image(self, examples: list[dict]) -> dict:
         images = [ex["image_image"] for ex in examples if "image_image" in ex]

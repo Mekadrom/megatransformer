@@ -1595,9 +1595,12 @@ def load_model(args, device='cuda'):
             K = int(load_codebook(codebook_path).shape[0])
             # Sizes the coda's classifier output layer, so it must be set before the model
             # is built. Derived from the codebook itself rather than a flag: a mismatch
-            # between K and the codebook would be silent and catastrophic.
-            config.voice_coda_config.unit_vocab_size = K
-            print(f"[world] discrete voice units ON: K={K} from {codebook_path}", flush=True)
+            # between K and the codebook would be silent and catastrophic. +1 for the EOV
+            # terminal token (class index K): the coda classifies K content units plus one
+            # end-of-voice token, which replaces the old stop head. The codebook stays K
+            # entries -- EOV has no centroid; generation stops on it before any lookup.
+            config.voice_coda_config.unit_vocab_size = K + 1
+            print(f"[world] discrete voice units ON: K={K} (+1 EOV token) from {codebook_path}", flush=True)
         voice_feature_channels = _voice_feature_channels(args)
         if voice_feature_channels is not None:
             # The prelude projects features -> d_model and the coda predicts d_model -> features,

@@ -156,12 +156,20 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
         collator = ImageVAEDataCollator()
     elif command in ["world"]:
         voice_max_frames = int(args.voice_max_seconds * args.voice_sample_rate // args.voice_hop_length)
+        # Discrete voice path: append an EOV terminal unit (id == K, the codebook size)
+        # after each utterance's last frame. Matches the coda's K+1-way unit head; None on
+        # the continuous path (no codebook) so the stop head governs instead.
+        voice_eov_id = None
+        if getattr(args, "voice_codebook_path", None):
+            from megatransformer.utils.codebook import load_codebook
+            voice_eov_id = int(load_codebook(args.voice_codebook_path).shape[0])
         collator = MultimodalDataCollator(
             max_seq_len=args.max_seq_len,
             max_waveforms=int(args.voice_max_seconds * args.voice_sample_rate),
             max_mel_spec_frames=voice_max_frames,
             # Same derivation the generation budget uses — see media_frame_budget().
             max_sive_feature_frames=media_frame_budget(args, "voice"),
+            voice_eov_id=voice_eov_id,
         )
     return collator
 
