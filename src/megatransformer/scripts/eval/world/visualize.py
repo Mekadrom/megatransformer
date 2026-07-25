@@ -167,6 +167,9 @@ def load_dataset(args, split):
             # loads per-speaker F0 stats so samples carry voice_f0_contour — which the
             # contour-mode SMG needs for target/input decodes.
             voice_codebook=getattr(args, "voice_codebook_path", None),
+            # Match training's task filter so the dataset's round-robin only yields tasks
+            # whose modalities are loaded (e.g. voice_synthesis, not text_continuation).
+            include_tasks=[t.strip() for t in args.include_tasks.split(",")] if getattr(args, "include_tasks", None) else None,
         )
 
 

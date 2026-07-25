@@ -416,7 +416,14 @@ class MultimodalShardedDataset(Dataset):
         Each media modality produces two tasks (synthesis + transcription); text-only
         (text_continuation) is always present.
         """
-        tasks = [("text_continuation", "text", None)]
+        # text_continuation only when the text modality is actually loaded -- otherwise
+        # __getitem__ would round-robin onto a task whose modality isn't present and
+        # _source_for_task hits self.modalities["text"] -> KeyError 'text' (e.g. a
+        # voice-only eval with --include_modes voice). Media tasks already iterate only
+        # loaded modalities.
+        tasks = []
+        if "text" in self.modalities:
+            tasks.append(("text_continuation", "text", None))
         for mod in self.modalities:
             if mod == "text":
                 continue
