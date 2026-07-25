@@ -86,6 +86,15 @@ def parse_args():
     p.add_argument("--voice_smg_checkpoint_path", type=str, default=None)
     p.add_argument("--voice_smg_config", type=str, default="small")
     p.add_argument("--voice_smg_sive_encoder_dim", type=int, default=None)
+    # VQ-voice config (mirror world/training.py) — the checkpoint saves no config.json, so
+    # these training-time overrides must be re-applied or the coda's unit head / feature
+    # projections won't match the saved weights.
+    p.add_argument("--voice_codebook_path", type=str, default=None,
+                   help="Sizes the coda's unit head (unit_vocab_size = K from this codebook).")
+    p.add_argument("--voice_feature_channels", type=int, default=None,
+                   help="SIVE feature width (256 for VQ-SIVE); sizes prelude/coda feature I/O.")
+    p.add_argument("--voice_predict_f0", action="store_true",
+                   help="Enable the coda's F0 head (must match the trained checkpoint).")
     p.add_argument("--static_speaker_embedding_path", type=str, default=None)
 
     # Model overrides
@@ -106,10 +115,20 @@ def parse_args():
 def resolve_shard_dir(cache_dir, split):
     if cache_dir is None:
         return None
-    candidate = cache_dir + "_" + split
-    if os.path.isdir(candidate):
-        return candidate
-    print(f"Warning: {candidate} not found, skipping")
+    # Accept, in order: a dir already pointing AT the split (…/val passed for split "val");
+    # the subdir layout <base>/<split> (the standard preprocess output); and the legacy
+    # suffix layout <base>_<split>.
+    base = cache_dir.rstrip("/")
+    candidates = []
+    if os.path.basename(base) == split:
+        candidates.append(cache_dir)
+    candidates.append(os.path.join(cache_dir, split))
+    candidates.append(cache_dir + "_" + split)
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    print(f"Warning: no shard dir for split '{split}' under {cache_dir} "
+          f"(tried /{split} and _{split}), skipping")
     return None
 
 
@@ -140,6 +159,10 @@ def load_dataset(args, split):
             image_shard_dir=image_dir,
             cache_size=32,
             max_samples=max_samples,
+            # Same codebook the world model trained with: quantizes features to unit ids AND
+            # loads per-speaker F0 stats so samples carry voice_f0_contour — which the
+            # contour-mode SMG needs for target/input decodes.
+            voice_codebook=getattr(args, "voice_codebook_path", None),
         )
 
 
@@ -154,7 +177,10 @@ def load_world_model(args, device):
         overrides["n_image_gen_positions"] = args.n_image_gen_positions
 
     config_name = args.config
-    if args.iteration_norm is not None or args.share_block_weights:
+    _voice_over = (getattr(args, "voice_codebook_path", None)
+                   or getattr(args, "voice_feature_channels", None)
+                   or getattr(args, "voice_predict_f0", False))
+    if args.iteration_norm is not None or args.share_block_weights or _voice_over:
         import copy
         from megatransformer.config.world.world_model import WORLD_MODEL_CONFIGS
         config = copy.deepcopy(WORLD_MODEL_CONFIGS[args.config])
@@ -162,6 +188,18 @@ def load_world_model(args, device):
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if args.share_block_weights:
             config.recurrent_block_config.share_block_weights = True
+        # VQ-voice: re-apply the training-time voice config so the loaded architecture
+        # matches the checkpoint (no config.json to recover it from).
+        cbp = getattr(args, "voice_codebook_path", None)
+        if cbp:
+            from megatransformer.utils.codebook import load_codebook
+            config.voice_coda_config.unit_vocab_size = int(load_codebook(cbp).shape[0])
+        vfc = getattr(args, "voice_feature_channels", None)
+        if vfc:
+            config.voice_prelude_config.feature_channels = vfc
+            config.voice_coda_config.feature_channels = vfc
+        if getattr(args, "voice_predict_f0", False):
+            config.voice_coda_config.predict_f0 = True
         for k, v in overrides.items():
             setattr(config, k, v)
         WORLD_MODEL_CONFIGS[config_name + "_eval"] = config
