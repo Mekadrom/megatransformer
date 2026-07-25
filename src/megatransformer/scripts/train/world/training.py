@@ -2041,8 +2041,8 @@ def add_cli_args(subparsers):
                             help="Number of audio mel filterbanks")
     sub_parser.add_argument("--audio_hop_length", type=int, default=256,
                             help="Audio hop length")
-    sub_parser.add_argument("--sive_total_stride", type=int, default=4,
-                            help="Total temporal downsampling stride of the SIVE encoder (e.g. 4 for 4x, 3 for 3x)")
+    sub_parser.add_argument("--sive_total_stride", type=int, default=3,
+                            help="Total temporal downsampling stride of the SIVE encoder (default 3 = 3x; 4x was found to over-compress SIVE)")
     sub_parser.add_argument("--voice_predict_f0", action="store_true",
                             help="Add an F0 contour regression head to the voice coda, beside the "
                                  "unit classifier. Quantization strips prosody from the units by "

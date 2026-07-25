@@ -79,7 +79,7 @@ def parse_args():
     p.add_argument("--audio_hop_length", type=int, default=256)
     p.add_argument("--audio_n_mels", type=int, default=80)
     p.add_argument("--audio_n_fft", type=int, default=1024)
-    p.add_argument("--sive_total_stride", type=int, default=4)
+    p.add_argument("--sive_total_stride", type=int, default=3)
 
     # Optional decoders
     p.add_argument("--vocoder_checkpoint_path", type=str, default=None)
