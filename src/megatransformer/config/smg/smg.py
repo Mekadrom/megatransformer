@@ -340,6 +340,12 @@ SMG_CONFIGS = {
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
     ),
+    "medium_decoder_only_1d_3x_f0contourinput": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_3x"],
+        f0_predictor_config=F0PredictorConfig(encoder_dim=1, vuv_encoder_dim=256),
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+        f0_predictor_input="contour",
+    ),
     "medium_decoder_only_1d_4x": SMGConfig(
         decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_4x"],
         f0_predictor_config=F0_PREDICTOR_CONFIGS["default"],
