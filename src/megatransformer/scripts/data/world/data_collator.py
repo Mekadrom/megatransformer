@@ -300,6 +300,12 @@ class MultimodalDataCollator(DataCollator):
 
         if all_features[0] is not None:
             padded, masks = pad_and_mask(all_features, all_feature_lengths)
+            # Zero the feature pad. VQ quantizes EVERY frame (pad included) to a nonzero
+            # centroid, and pad_and_mask masks-but-doesn't-zero — so the prelude's conv would
+            # bleed real-unit-like pad frames into the last valid frames, and the viz SMG
+            # decodes the pad tail as babble (the "N real seconds + nonsense to the cap" the
+            # transcription-input render shows). Mask is [T]; broadcasts over [D, T] / [L, D, T].
+            padded = [f * m.to(f.dtype) for f, m in zip(padded, masks)]
             batch[f"{prefix}_features"] = torch.stack(padded)
             batch[f"{prefix}_feature_lengths"] = torch.stack(all_feature_lengths)
             batch[f"{prefix}_feature_masks"] = torch.stack(masks)
