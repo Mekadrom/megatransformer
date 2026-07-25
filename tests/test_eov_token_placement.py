@@ -79,6 +79,26 @@ def test_maxed_out_utterance_gets_no_eov():
     assert int(flens[1]) == 4                     # length bumped by 1
 
 
+def test_feature_length_exceeding_cap_is_clamped():
+    """feature_length can EXCEED the frame cap: features/unit_ids are trimmed to the cap,
+    but feature_length is the pre-trim value. The collator must clamp the effective length
+    to the cap (not over-run the trimmed tensors -> the RuntimeError this regresses), and
+    treat the over-cap clip as truncated (no EOV). A short clip in the batch still gets EOV."""
+    cap = 7
+    col = MultimodalDataCollator(max_seq_len=64, max_sive_feature_frames=cap, voice_eov_id=EOV)
+    batch = col([_make_ex(11), _make_ex(3)])   # 11 > cap=7 -> trimmed to 7, length reported 11
+    uids = batch["voice_unit_ids"]
+    flens = batch["voice_feature_lengths"]
+    assert uids.shape[1] == cap                    # width clamped to cap (no crash, no cap+1)
+    # over-cap clip: clamped to cap content, NO EOV, no padding
+    assert int(flens[0]) == cap
+    assert int((uids[0] == EOV).sum()) == 0
+    assert torch.all(uids[0] == torch.arange(1, cap + 1))
+    # short clip still gets its EOV
+    assert int(uids[1, 3]) == EOV and torch.all(uids[1, 4:] == -100)
+    assert int(flens[1]) == 4
+
+
 def test_all_maxed_batch_has_no_eov_and_no_crash():
     cap = 5
     col = MultimodalDataCollator(max_seq_len=64, max_sive_feature_frames=cap, voice_eov_id=EOV)
