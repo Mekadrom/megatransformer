@@ -1213,12 +1213,15 @@ class MegaTransformerWorldModel(nn.Module):
                             voice_sequences[b].append(frame_pred.squeeze(0))  # (C, 1)
                             last_voice_pred[b] = frame_pred.squeeze(0)  # (C, 1)
                             # Stop head (CONTINUOUS path only; the discrete path stops on the
-                            # EOV unit above and has no stop head).
-                            stop_logit = coda_out["voice_stop_logits"]  # (1, 1)
-                            stop_logit_val = stop_logit[0, 0].item()
-                            voice_stop_logit_trace[b].append(stop_logit_val)
-                            if torch.sigmoid(torch.tensor(stop_logit_val)).item() > 0.5:
-                                should_stop_voice = True
+                            # EOV unit above and has no stop head). Guarded: a discrete model
+                            # whose codebook was not installed lands here with no stop head --
+                            # degrade to budget-based stopping instead of a hard KeyError.
+                            stop_logit = coda_out.get("voice_stop_logits")
+                            if stop_logit is not None:
+                                stop_logit_val = stop_logit[0, 0].item()
+                                voice_stop_logit_trace[b].append(stop_logit_val)
+                                if torch.sigmoid(torch.tensor(stop_logit_val)).item() > 0.5:
+                                    should_stop_voice = True
                     else:
                         voice_sequences[b].append(current_hidden[b])
 

@@ -301,6 +301,15 @@ def main():
     # Model
     print(f"Loading model from {args.checkpoint_path} (config={args.config})...")
     model = load_world_model(args, device)
+    # Install the discrete-voice codebook (mirrors training). Without it voice_codebook is
+    # None, so generate() falls out of the unit/EOV branch into the continuous branch, which
+    # references the removed stop head -> KeyError 'voice_stop_logits'. Sizing unit_vocab_size
+    # (above) is NOT enough; the codebook is what routes generation through the discrete path.
+    _cbp = getattr(args, "voice_codebook_path", None)
+    if _cbp:
+        from megatransformer.utils.codebook import load_codebook
+        model.set_voice_codebook(load_codebook(_cbp))
+        print(f"Installed voice codebook ({int(load_codebook(_cbp).shape[0])} units) for discrete generation")
     model.to(device)
     model.eval()
     print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")

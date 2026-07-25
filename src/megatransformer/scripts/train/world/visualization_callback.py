@@ -273,7 +273,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     try:
                         scenario_fn(model, args, device, global_step, dtype)
                     except Exception as e:
+                        import traceback
                         print(f"Warning: Train-data scenario {scenario_fn.__name__} failed: {e}")
+                        traceback.print_exc()
 
                 # Eval scenarios — generation and transcription with eval dataset
                 for scenario_fn, modes, tasks in eval_scenarios:
@@ -282,7 +284,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     try:
                         scenario_fn(model, eval_dataset, collator, device, global_step)
                     except Exception as e:
+                        import traceback
                         print(f"Warning: Eval scenario {scenario_fn.__name__} failed: {e}")
+                        traceback.print_exc()
 
         print(f"World model visualization complete at step {global_step}")
         metrics.flush()
