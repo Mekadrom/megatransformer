@@ -575,6 +575,15 @@ class SIVETrainer(CommonTrainer):
             if result.get("vq_perplexity") is not None:
                 metrics.log_scalar("train/vq_commitment_loss", vq_commitment_loss, global_step)
                 metrics.log_scalar("train/vq_perplexity", result["vq_perplexity"], global_step)
+                # Normalized by codebook size: perplexity / K = the fraction of the codebook
+                # effectively in use (1.0 = perfectly uniform use of all K codes; 1/K =
+                # collapsed to one code). Unlike the raw count this is interpretable on its
+                # own and comparable across codebook sizes (e.g. k=250 vs k=384). ×100 = %.
+                metrics.log_scalar(
+                    "train/vq_perplexity_frac",
+                    result["vq_perplexity"] / self.model.vq.num_codes,
+                    global_step,
+                )
             # Adversary diagnostics — id-mode logs classifier accuracy/collapse;
             # embedding-mode logs cosine sim to the ECAPA target.
             if self.speaker_adversary_target == "speaker_id":
