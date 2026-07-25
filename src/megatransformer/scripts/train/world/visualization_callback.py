@@ -206,7 +206,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         """
         if not required_modes.issubset(self.include_modes):
             return False
-        if satisfying_tasks and self.include_tasks is not None:
+        if self.include_tasks is not None:
+            # A named --include_tasks gates task-agnostic (cross-modal) scenarios OUT too: if
+            # the user asked for specific tasks, cross-modal round-trips aren't among them and
+            # are just noise (e.g. voice_to_voice under a voice_synthesis-only run).
+            if not satisfying_tasks:
+                return False
             return bool(satisfying_tasks & self.include_tasks)
         return True
 
@@ -894,7 +899,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     ctx = {"prompt": str(prompt_text)[:500] if prompt_text else decoded[:500]}
                     if target_text_full:
                         ctx["target"] = str(target_text_full)[:500]
-                    metrics.log_text(f"{tag}/voice/{i}/generated_text", gen_text[:500], global_step, context=ctx)
+                    # Only log the generated TEXT when text generation is an enabled task. Under
+                    # a voice_synthesis-only run text loss is masked, so any emitted text is OOD
+                    # noise (the prompt/target context above is still useful and rides on the
+                    # audio/mel tags).
+                    if self.include_tasks is None or "text_continuation" in self.include_tasks:
+                        metrics.log_text(f"{tag}/voice/{i}/generated_text", gen_text[:500], global_step, context=ctx)
 
                 voice_preds = outputs.get("voice_latent_preds")
                 if voice_preds is not None and voice_preds.numel() > 0:

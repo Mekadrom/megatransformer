@@ -60,6 +60,9 @@ def parse_args():
     p.add_argument("--voice_cache_dir", type=str, default=None)
     p.add_argument("--image_cache_dir", type=str, default=None)
     p.add_argument("--include_modes", type=str, default="text,voice,image")
+    p.add_argument("--include_tasks", type=str, default=None,
+                   help="Comma-separated tasks to visualize (e.g. voice_synthesis). Gates out "
+                        "transcription / cross-modal / OOD generated-text. None = all applicable.")
     p.add_argument("--use_memorization_dataset", action="store_true")
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--num_eval_samples", type=int, default=4)
@@ -333,6 +336,8 @@ def main():
         voice_n_mels=args.voice_n_mels,
         voice_n_fft=args.voice_n_fft,
         voice_hop_length=args.voice_hop_length,
+        include_modes=[m.strip() for m in args.include_modes.split(",")],
+        include_tasks=[t.strip() for t in args.include_tasks.split(",")] if args.include_tasks else None,
     )
 
     # Wire up the fake trainer
