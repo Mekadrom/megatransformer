@@ -920,7 +920,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                         metrics.log_scalar(f"{tag}/{i}/voice_cosine_sim", cos, global_step)
                         self._log_audio_with_smg(tgt_lat, sample, global_step, f"{tag}/voice/{i}/target")
 
-                    self._log_audio_with_smg(pred_lat, sample, global_step, f"{tag}/voice/{i}/generated")
+                    # Generated audio must render the world model's PREDICTED F0 contour, not
+                    # the sample's GT contour — that's the prosody the AR test is judging.
+                    gen_f0 = outputs.get("voice_f0_preds")
+                    self._log_audio_with_smg(
+                        pred_lat, sample, global_step, f"{tag}/voice/{i}/generated",
+                        f0_contour=(gen_f0[0, 0] if gen_f0 is not None and gen_f0.numel() > 0 else None),
+                    )
             except Exception as e:
                 print(f"Warning: Train generation (voice) failed for sample {i}: {e}")
 
@@ -1727,9 +1733,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     global_step,
                 )
 
-                # Image->voice has no ground-truth speaker, use static only
+                # Image->voice has no ground-truth speaker, use static only. Generated =>
+                # render the model's PREDICTED F0 contour, not any GT fallback.
+                gen_f0 = outputs.get("voice_f0_preds")
                 self._log_audio_with_smg(
-                    pred_latent, sample, global_step, f"{tag}/{i}"
+                    pred_latent, sample, global_step, f"{tag}/{i}",
+                    f0_contour=(gen_f0[0, 0] if gen_f0 is not None and gen_f0.numel() > 0 else None),
                 )
 
             voice_preds = outputs.get("voice_latent_preds")
@@ -1910,6 +1919,18 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             if v is not None:
                 gt_speaker_emb = v
                 break
+
+        # A contour-mode SMG (f0_predictor_input="contour") has no internal F0 predictor and
+        # REQUIRES a speaker-normalized contour, or decode() raises. Generated decodes pass the
+        # world model's PREDICTED contour explicitly; for target/input decodes of GROUND-TRUTH
+        # features the caller passes nothing, so fall back to the sample's own GT contour (the
+        # same normalize_f0 output the SMG trained on). This never overrides an explicit contour.
+        if f0_contour is None:
+            for key in ("voice_f0_contour", "f0_contour", "audio_f0_contour"):
+                v = sample.get(key)
+                if v is not None:
+                    f0_contour = v[0] if (hasattr(v, "dim") and v.dim() > 1) else v
+                    break
 
         if gt_speaker_emb is not None:
             self._decode_and_log_audio(
