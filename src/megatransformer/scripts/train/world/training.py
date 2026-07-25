@@ -69,14 +69,6 @@ class WorldModelTrainer(CommonTrainer):
         # F0 contour head weight. Voicing-weighted L1 on the speaker-normalized log-F0
         # contour. There is no voicing head here -- see the loss for why.
         voice_f0_loss_weight: float = 1.0,
-        # Constant reference lines for the voice_unit_accuracy curve, measured offline by
-        # scripts_local/ngram_unit_baseline.py (the text-free n-gram ceiling + the
-        # repeat-unit AR crutch). When set, logged as flat scalars each step so the accuracy
-        # curve has guides: below the ceiling = local-statistics regime; above it = the model
-        # is using text/long-range context. None = not logged. Codebook-specific.
-        voice_unit_repeat_baseline: Optional[float] = None,
-        voice_unit_ngram_ceiling: Optional[float] = None,
-        voice_unit_ngram_asymptote: Optional[float] = None,
         # Deduped (unit, duration) path. When on, the voice coda runs on segments instead
         # of 50Hz frames; the duration head's L1-on-log-frames gets this weight.
         voice_dedup: bool = False,
@@ -136,9 +128,6 @@ class WorldModelTrainer(CommonTrainer):
         self.voice_stop_loss_weight = voice_stop_loss_weight
         self.voice_beta_nll = voice_beta_nll
         self.voice_f0_loss_weight = voice_f0_loss_weight
-        self.voice_unit_repeat_baseline = voice_unit_repeat_baseline
-        self.voice_unit_ngram_ceiling = voice_unit_ngram_ceiling
-        self.voice_unit_ngram_asymptote = voice_unit_ngram_asymptote
         self.voice_dedup = voice_dedup
         self.voice_duration_loss_weight = voice_duration_loss_weight
         self.voice_scheduled_sampling_prob = voice_scheduled_sampling_prob
@@ -789,18 +778,10 @@ class WorldModelTrainer(CommonTrainer):
                     # long-range context (the "snap"); below that, gains are indistinguishable
                     # from better n-gram statistics. These are CODEBOOK-SPECIFIC -- re-measure
                     # for a new codebook. (The old "~0.30" here was stale/wrong for this VQ.)
+                    # Reference lines for this curve are drawn as separate TB "runs" that
+                    # share this exact tag (scripts_local/write_baseline_runs.py) so they
+                    # overlay as flat lines on the same chart -- no per-step logging here.
                     loss_components["voice_unit_accuracy"] = acc.detach()
-                    # Flat reference lines (constants) so the accuracy curve has guides in TB.
-                    # Named to sort adjacent to voice_unit_accuracy; only when provided.
-                    if self.voice_unit_repeat_baseline is not None:
-                        loss_components["voice_unit_accuracy_repeat_baseline"] = torch.tensor(
-                            self.voice_unit_repeat_baseline)
-                    if self.voice_unit_ngram_ceiling is not None:
-                        loss_components["voice_unit_accuracy_ngram_ceiling"] = torch.tensor(
-                            self.voice_unit_ngram_ceiling)
-                    if self.voice_unit_ngram_asymptote is not None:
-                        loss_components["voice_unit_accuracy_ngram_asymptote"] = torch.tensor(
-                            self.voice_unit_ngram_asymptote)
             # else: no synthesis voice rows this batch -> voice adds no generation loss.
 
         # Duration loss (deduped path): L1 on log-frames, masked to real segments. The
@@ -1800,9 +1781,6 @@ def create_trainer(
         voice_stop_loss_weight=getattr(args, 'voice_stop_loss_weight', 1.0),
         voice_beta_nll=getattr(args, 'voice_beta_nll', 0.5),
         voice_f0_loss_weight=getattr(args, 'voice_f0_loss_weight', 1.0),
-        voice_unit_repeat_baseline=getattr(args, 'voice_unit_repeat_baseline', None),
-        voice_unit_ngram_ceiling=getattr(args, 'voice_unit_ngram_ceiling', None),
-        voice_unit_ngram_asymptote=getattr(args, 'voice_unit_ngram_asymptote', None),
         voice_dedup=getattr(args, 'voice_dedup', False),
         voice_duration_loss_weight=getattr(args, 'voice_duration_loss_weight', 1.0),
         voice_scheduled_sampling_prob=getattr(args, 'voice_scheduled_sampling_prob', 0.0),
@@ -2090,18 +2068,6 @@ def add_cli_args(subparsers):
                                  "speaker-normalized log-F0 contour. NOTE the contour is in sigma "
                                  "units (std ~1.1), not log Hz, so this weight is on a different "
                                  "scale than a raw-F0 loss would be.")
-    sub_parser.add_argument("--voice_unit_repeat_baseline", type=float, default=None,
-                            help="Flat reference line for voice_unit_accuracy: the repeat-previous-unit "
-                                 "AR-crutch accuracy from scripts_local/ngram_unit_baseline.py. Logged as "
-                                 "a constant each step so the accuracy curve has a floor guide.")
-    sub_parser.add_argument("--voice_unit_ngram_ceiling", type=float, default=None,
-                            help="Flat reference line for voice_unit_accuracy: the text-free n-gram "
-                                 "ceiling (best backed-off n-gram top-1, held out) from "
-                                 "ngram_unit_baseline.py. Clearing it = the model uses more than local "
-                                 "unit history (text/long-range).")
-    sub_parser.add_argument("--voice_unit_ngram_asymptote", type=float, default=None,
-                            help="Flat reference line for voice_unit_accuracy: the highest-order n-gram "
-                                 "seen-only top-1 (the local-statistics asymptote) from ngram_unit_baseline.py.")
     sub_parser.add_argument("--voice_dedup", action="store_true",
                             help="Run the voice coda on deduped (unit, duration) SEGMENTS instead of "
                                  "50Hz frames. At 50Hz the next unit is dominated by 'where am I in "
