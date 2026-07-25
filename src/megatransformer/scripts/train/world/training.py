@@ -739,28 +739,40 @@ class WorldModelTrainer(CommonTrainer):
         voice_unit_ids = inputs.get("voice_unit_ids")
         used_unit_loss = False
         if voice_unit_logits is not None and voice_unit_ids is not None:
+            # Discrete voice model: the continuous recon head stays OFF (set below) whether
+            # or not a supervised loss is actually added this batch.
+            used_unit_loss = True
             B, T, K = voice_unit_logits.shape
             tgt = voice_unit_ids[:, :T].to(voice_unit_logits.device).long()  # -100 = padding
             if tgt.shape[1] < T:  # logits can outrun targets by the shifted-input frame
                 tgt = torch.nn.functional.pad(tgt, (0, T - tgt.shape[1]), value=-100)
-            unit_loss_raw = self.voice_unit_loss_fn(
-                voice_unit_logits.reshape(B * T, K), tgt.reshape(B * T),
-            )
-            # Whiten by log(K) — CE at uniform predictions is log(K) — so the weight is an
-            # honest emphasis multiplier and the number is comparable to the other losses:
-            # 1.0 = no better than guessing, 0 = perfect.
-            unit_loss_norm = unit_loss_raw / math.log(max(2, K))
-            total_loss = total_loss + self.voice_latent_loss_weight * unit_loss_norm
-            loss_components["voice_unit_ce_loss_raw"] = unit_loss_raw.detach()
-            loss_components["voice_unit_ce_loss_norm"] = unit_loss_norm.detach()
-            with torch.no_grad():
-                valid = tgt != -100
-                if valid.any():
+            # SYNTHESIS-ONLY supervision. In transcription the voice is INPUT and the
+            # non-shifted coda predicts each frame's unit from its OWN features -- a trivial
+            # near-identity task that dilutes the metric/gradient and would mis-teach the EOV
+            # terminal token (a generation-completion signal, meaningless when reading voice).
+            # Mask transcription rows to the CE ignore_index. No-op for an all-synthesis batch
+            # (current runs) or when no direction info is present.
+            if is_synthesis is not None and is_synthesis.shape[0] == B and not bool(is_synthesis.all()):
+                tgt = tgt.clone()
+                tgt[~is_synthesis.to(tgt.device).bool()] = -100
+            if bool((tgt != -100).any()):
+                unit_loss_raw = self.voice_unit_loss_fn(
+                    voice_unit_logits.reshape(B * T, K), tgt.reshape(B * T),
+                )
+                # Whiten by log(K) — CE at uniform predictions is log(K) — so the weight is an
+                # honest emphasis multiplier and the number is comparable to the other losses:
+                # 1.0 = no better than guessing, 0 = perfect.
+                unit_loss_norm = unit_loss_raw / math.log(max(2, K))
+                total_loss = total_loss + self.voice_latent_loss_weight * unit_loss_norm
+                loss_components["voice_unit_ce_loss_raw"] = unit_loss_raw.detach()
+                loss_components["voice_unit_ce_loss_norm"] = unit_loss_norm.detach()
+                with torch.no_grad():
+                    valid = tgt != -100
                     acc = (voice_unit_logits.argmax(-1)[valid] == tgt[valid]).float().mean()
                     # THE metric: chance is 1/K. "Repeat the previous unit" scores ~30% on
                     # this data, so beating ~0.30 is the first sign the text is being read.
                     loss_components["voice_unit_accuracy"] = acc.detach()
-            used_unit_loss = True
+            # else: no synthesis voice rows this batch -> voice adds no generation loss.
 
         # Duration loss (deduped path): L1 on log-frames, masked to real segments. The
         # coda predicts log(duration) per segment; targets are the run lengths the dataset
@@ -806,6 +818,12 @@ class WorldModelTrainer(CommonTrainer):
                 vuv_t = torch.nn.functional.pad(vuv_t, (0, pad))
             # Weight by voicing: F0 is undefined on unvoiced frames, so supervising them
             # would train the head to fit noise. vuv is a soft 0-1 periodicity, not a mask.
+            # SYNTHESIS-ONLY (same rationale as the unit CE): zero the voicing weight on
+            # transcription rows so they contribute nothing to the F0 loss or the baseline
+            # metric below. No-op for an all-synthesis batch.
+            if (is_synthesis is not None and is_synthesis.shape[0] == vuv_t.shape[0]
+                    and not bool(is_synthesis.all())):
+                vuv_t = vuv_t * is_synthesis.to(vuv_t.device).float().unsqueeze(1)
             vsum = vuv_t.sum().clamp(min=1e-8)
             f0_loss = ((voice_f0_preds.float() - f0_t).abs() * vuv_t).sum() / vsum
             total_loss = total_loss + self.voice_f0_loss_weight * f0_loss

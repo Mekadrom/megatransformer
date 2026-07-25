@@ -309,19 +309,32 @@ class MultimodalDataCollator(DataCollator):
             batch[f"{prefix}_waveform_masks"] = torch.stack(masks)
 
         # EOV/EOA terminal token (discrete path only). When an eov_id is configured AND
-        # this batch carries unit ids, extend every utterance's supervised span by ONE
+        # this batch carries unit ids, extend an utterance's supervised span by ONE
         # position: the frame at index `length` (the first slot after the last content
         # frame, which occupies indices 0..length-1) becomes the terminal token. Driving
         # the extension through the LENGTHS -- so pad_and_mask derives both the pad width
-        # (max+1) and each sample's mask from length+1 -- makes the terminal position a
-        # genuine valid position everywhere downstream (the interleaver places length+1
-        # voice tokens; the coda is supervised at index length) while real padding stays
+        # and each sample's mask from length+1 -- makes the terminal position a genuine
+        # valid position everywhere downstream (the interleaver places length+1 media
+        # tokens; the coda is supervised at index length) while real padding stays
         # strictly beyond it. The terminal token therefore can NEVER land in padding.
-        use_eov = eov_id is not None and all_unit_ids[0] is not None
-        if use_eov:
-            span_lengths = [torch.as_tensor(int(n) + 1, dtype=torch.long) for n in all_feature_lengths]
-        else:
-            span_lengths = all_feature_lengths
+        #
+        # PER-SAMPLE, and NOT for a maxed-out utterance: an utterance whose length is at
+        # the frame cap (max_sive_feature_frames, which is ALSO the inference generation
+        # budget) was cut at the cap -- it did not genuinely end. Appending EOV there
+        # would (a) teach a false "end" at a truncation boundary and (b) desync train from
+        # inference, where generation budget-stops at the cap WITHOUT emitting EOV. So it
+        # gets no EOV, exactly as the text collator withholds EOS from truncated text.
+        # (feature_length <= cap holds in the data -- the existing out[:n]=u[:n] copy
+        # already assumes it -- so `< cap` cleanly separates ended from truncated.)
+        eov_here = (
+            [eov_id is not None and all_unit_ids[0] is not None and int(n) < self.max_sive_feature_frames
+             for n in all_feature_lengths]
+        )
+        any_eov = any(eov_here)
+        span_lengths = [
+            torch.as_tensor(int(n) + (1 if e else 0), dtype=torch.long)
+            for n, e in zip(all_feature_lengths, eov_here)
+        ]
 
         if all_features[0] is not None:
             padded, masks = pad_and_mask(all_features, span_lengths)
@@ -334,15 +347,17 @@ class MultimodalDataCollator(DataCollator):
             # there) that the coda never consumes as INPUT -- its target is the EOV unit, not a
             # feature -- so zeroing it is both harmless and consistent with the rest of the pad.
             padded = [f * m.to(f.dtype) for f, m in zip(padded, masks)]
-            if use_eov:
+            if any_eov:
                 # Explicitly zero the terminal (EOV) frame at index `length`. pad_and_mask's
                 # mask marks it VALID (so voice_lengths / the interleaver include it), which
                 # leaves it UNzeroed by the mask-multiply above -- and a feature tensor stored
                 # slightly longer than feature_length would otherwise leak a real frame there.
                 # The coda never consumes it as input (its target is the EOV unit), so zeroing
-                # is safe and keeps the terminal frame content-free.
-                for f, n in zip(padded, all_feature_lengths):
-                    f[..., int(n)] = 0.0
+                # is safe and keeps the terminal frame content-free. Only for samples that got
+                # an EOV (index `length` < cap <= width, so always in bounds).
+                for f, n, e in zip(padded, all_feature_lengths, eov_here):
+                    if e:
+                        f[..., int(n)] = 0.0
             batch[f"{prefix}_features"] = torch.stack(padded)
             batch[f"{prefix}_feature_lengths"] = torch.stack(span_lengths)
             batch[f"{prefix}_feature_masks"] = torch.stack(masks)
@@ -352,22 +367,23 @@ class MultimodalDataCollator(DataCollator):
             # (it is the shared waveform/mel helper), which would silently supervise the
             # coda to predict unit 0 across every padded frame — the exact bug the text
             # targets had. Pad by hand so padding is the CE ignore_index.
-            if use_eov:
-                # Width matches the EOV-extended features (max feature length + 1) so the
-                # coda's logits and this target align position-for-position.
-                T = max(int(n) for n in all_feature_lengths) + 1
+            if any_eov:
+                # Width matches the EOV-extended features (max span) so the coda's logits
+                # and this target align position-for-position.
+                T = max(int(s) for s in span_lengths)
             else:
                 T = max(int(u.shape[-1]) for u in all_unit_ids)
             padded_units = []
-            for u, n in zip(all_unit_ids, all_feature_lengths):
+            for u, n, e in zip(all_unit_ids, all_feature_lengths, eov_here):
                 n = int(n)
                 out = torch.full((T,), -100, dtype=torch.long)
                 out[:n] = u[:n].to(torch.long)
-                if use_eov:
+                if e:
                     # Terminal EOV at index `length` -- immediately after the last content
                     # frame (indices 0..n-1), before any -100 padding. Supervised (not -100)
                     # so the coda learns to emit it; the codebook has no row at id==K, so
-                    # generation stops on it before any centroid lookup.
+                    # generation stops on it before any centroid lookup. Skipped for maxed-out
+                    # (truncated) utterances -- see the eov_here note above.
                     out[n] = eov_id
                 padded_units.append(out)
             batch[f"{prefix}_unit_ids"] = torch.stack(padded_units)

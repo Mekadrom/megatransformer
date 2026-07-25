@@ -58,6 +58,37 @@ def test_eov_lands_at_length_never_in_padding(lengths):
         assert torch.all(fmask[i, n + 1:] == 0.0)                  # padding is invalid
 
 
+def test_maxed_out_utterance_gets_no_eov():
+    """An utterance at the frame cap (== the inference generation budget) was truncated,
+    not ended: it must get NO EOV (mirroring how the text collator withholds EOS from
+    truncated text, and matching inference which budget-stops at the cap without EOV).
+    A shorter utterance in the same batch still gets its EOV."""
+    cap = 7
+    col = MultimodalDataCollator(max_seq_len=64, max_sive_feature_frames=cap, voice_eov_id=EOV)
+    batch = col([_make_ex(cap), _make_ex(3)])   # one maxed, one normal
+    uids = batch["voice_unit_ids"]
+    flens = batch["voice_feature_lengths"]
+
+    assert uids.shape[1] == cap                  # width stays at the cap, never cap+1
+    # maxed row: full content, NO EOV, NO padding
+    assert torch.equal(uids[0], torch.arange(1, cap + 1))
+    assert int((uids[0] == EOV).sum()) == 0
+    assert int(flens[0]) == cap                  # length NOT bumped
+    # normal row: EOV at index 3, padding after
+    assert int(uids[1, 3]) == EOV and torch.all(uids[1, 4:] == -100)
+    assert int(flens[1]) == 4                     # length bumped by 1
+
+
+def test_all_maxed_batch_has_no_eov_and_no_crash():
+    cap = 5
+    col = MultimodalDataCollator(max_seq_len=64, max_sive_feature_frames=cap, voice_eov_id=EOV)
+    batch = col([_make_ex(cap), _make_ex(cap)])
+    uids = batch["voice_unit_ids"]
+    assert uids.shape[1] == cap
+    assert int((uids == EOV).sum()) == 0
+    assert torch.all(batch["voice_feature_lengths"] == cap)
+
+
 def test_no_eov_id_is_backward_compatible():
     """Without voice_eov_id (continuous path / debug scripts), the collator must be
     unchanged: original width, no terminal token, no length bumping."""
