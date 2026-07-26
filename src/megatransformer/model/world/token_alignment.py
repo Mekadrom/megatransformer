@@ -438,62 +438,6 @@ class TokenUninterleaver(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def _pad_and_stack(
-        self,
-        tensors: list[torch.Tensor],
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Pad a list of variable-length tensors and stack into a batch.
-
-        Args:
-            tensors: List of (seq_len, d_model) tensors, one per batch item.
-            device: Device for output tensors.
-            dtype: Dtype for output tensors.
-
-        Returns:
-            Tuple of:
-            - Padded batch tensor (batch_size, max_seq_len, d_model), or None if all empty.
-            - Lengths tensor (batch_size,) with actual lengths, or None if all empty.
-        """
-        lengths = [t.size(0) for t in tensors]
-        max_len = max(lengths) if lengths else 0
-
-        if max_len == 0:
-            return None, None
-
-        d_model = tensors[0].size(1) if tensors[0].numel() > 0 else 0
-        if d_model == 0:
-            # Find first non-empty tensor to get d_model
-            for t in tensors:
-                if t.numel() > 0:
-                    d_model = t.size(1)
-                    break
-            if d_model == 0:
-                return None, None
-
-        padded = []
-        for t, length in zip(tensors, lengths):
-            if length < max_len:
-                # Pad (left, right) for last dim, (top, bottom) for second-to-last
-                # For 2D tensor (seq, d_model): pad format is (left, right, top, bottom)
-                # We want to pad rows (sequence dim), so (0, 0, 0, pad_amount)
-                pad_amount = max_len - length
-                if length == 0:
-                    # Empty tensor - create zeros
-                    padded_t = torch.zeros(max_len, d_model, device=device, dtype=dtype)
-                else:
-                    padded_t = nn.functional.pad(t, (0, 0, 0, pad_amount), value=0.0)
-            else:
-                padded_t = t
-            padded.append(padded_t)
-
-        batch_tensor = torch.stack(padded, dim=0)  # (batch_size, max_seq_len, d_model)
-        lengths_tensor = torch.tensor(lengths, dtype=torch.long, device=device)
-
-        return batch_tensor, lengths_tensor
-
     def forward(
         self,
         interleaved_tokens: torch.Tensor,
@@ -511,38 +455,55 @@ class TokenUninterleaver(nn.Module):
             - 'text', 'audio', 'voice', 'image': Padded batch tensors (batch, max_len, d_model) or None
             - 'text_lengths', 'audio_lengths', etc.: Length tensors (batch,) or None
         """
-        batch_size = interleaved_tokens.shape[0]
-        device = interleaved_tokens.device
-        dtype = interleaved_tokens.dtype
+        # Vectorized masked left-pack. The former per-batch boolean-index loop cost ~4*B
+        # GPU->CPU syncs per step (one per modality per sample, because a boolean index's
+        # output size is data-dependent) and stalled the pipeline. This is one scatter per
+        # modality with a SINGLE host sync total (all four max-lengths read at once), and is
+        # bit-identical: boolean indexing returns elements in ascending-position order, which
+        # is exactly the order a cumsum-derived slot assigns.
+        mods = (
+            ("text", MODALITY_TEXT),
+            ("audio", MODALITY_AUDIO),
+            ("voice", MODALITY_VOICE),
+            ("image", MODALITY_IMAGE),
+        )
+        masks = {name: (modality_map == mod) for name, mod in mods}
+        lengths = {name: m.sum(1) for name, m in masks.items()}         # each (B,), long
+        # One sync for all four max lengths instead of 4*B.
+        max_lens = {
+            name: int(v) for name, v in
+            zip([n for n, _ in mods], torch.stack([lengths[n].max() for n, _ in mods]).tolist())
+        }
 
-        text_list: list[torch.Tensor] = []
-        audio_list: list[torch.Tensor] = []
-        voice_list: list[torch.Tensor] = []
-        image_list: list[torch.Tensor] = []
-
-        for batch_idx in range(batch_size):
-            batch_tokens = interleaved_tokens[batch_idx]  # (seq_len, d_model)
-            batch_modality = modality_map[batch_idx]      # (seq_len,)
-
-            # Boolean indexing gives (filtered_len, d_model)
-            text_list.append(batch_tokens[batch_modality == MODALITY_TEXT])
-            audio_list.append(batch_tokens[batch_modality == MODALITY_AUDIO])
-            voice_list.append(batch_tokens[batch_modality == MODALITY_VOICE])
-            image_list.append(batch_tokens[batch_modality == MODALITY_IMAGE])
-
-        # Pad and stack each modality
-        text_batch, text_lengths = self._pad_and_stack(text_list, device, dtype)
-        audio_batch, audio_lengths = self._pad_and_stack(audio_list, device, dtype)
-        voice_batch, voice_lengths = self._pad_and_stack(voice_list, device, dtype)
-        image_batch, image_lengths = self._pad_and_stack(image_list, device, dtype)
+        packed = {}
+        for name, _ in mods:
+            packed[name] = self._masked_left_pack(
+                interleaved_tokens, masks[name], lengths[name], max_lens[name])
 
         return {
-            "text": text_batch,
-            "text_lengths": text_lengths,
-            "audio": audio_batch,
-            "audio_lengths": audio_lengths,
-            "voice": voice_batch,
-            "voice_lengths": voice_lengths,
-            "image": image_batch,
-            "image_lengths": image_lengths,
+            "text": packed["text"], "text_lengths": lengths["text"] if packed["text"] is not None else None,
+            "audio": packed["audio"], "audio_lengths": lengths["audio"] if packed["audio"] is not None else None,
+            "voice": packed["voice"], "voice_lengths": lengths["voice"] if packed["voice"] is not None else None,
+            "image": packed["image"], "image_lengths": lengths["image"] if packed["image"] is not None else None,
         }
+
+    @staticmethod
+    def _masked_left_pack(tokens: torch.Tensor, mask: torch.Tensor,
+                          length: torch.Tensor, max_len: int) -> Optional[torch.Tensor]:
+        """Left-pack the mask-selected rows of ``tokens`` into (B, max_len, d), zeros
+        beyond each row's length. Returns None when no sample has any such token (matching
+        the old _pad_and_stack, which returned None for an all-empty modality).
+
+        Fully vectorized: a per-True-position destination slot is the running count of
+        selected elements (cumsum), and a single scatter places every token; unselected
+        positions scatter to a throwaway column that is then sliced off. No per-sample loop
+        and no ``nonzero`` (whose output size would itself force a sync)."""
+        if max_len == 0:
+            return None
+        B, S, d = tokens.shape
+        slots = mask.long().cumsum(1) - 1                              # (B, S); >=0 at True
+        # Unselected positions -> the throwaway column (index max_len), discarded below.
+        target = torch.where(mask, slots, slots.new_full((), max_len))
+        out = tokens.new_zeros(B, max_len + 1, d)
+        out.scatter_(1, target.unsqueeze(-1).expand(-1, -1, d), tokens)
+        return out[:, :max_len].contiguous()
