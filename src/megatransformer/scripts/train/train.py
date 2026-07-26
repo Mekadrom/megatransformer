@@ -729,6 +729,17 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--gradient_accumulation_steps', type=int, default=32, help='Gradient accumulation steps')
         sub_parser.add_argument('--dataloader_num_workers', type=int, default=4, help='Number of dataloader worker processes')
         sub_parser.add_argument('--shard_cache_size', type=int, default=8, help='Per-modality shard cache size (multiplied across workers/GPUs)')
+        sub_parser.add_argument('--bucket_by_length', action='store_true',
+                                help='Group similar-length samples into the same batch (within '
+                                     'each shard, so shard locality is preserved) to cut padding '
+                                     'FLOPs. Lengths are read from the shards via mmap at sampler '
+                                     'init (~400x cheaper than a full load). Opt-in; changes batch '
+                                     'composition, so do NOT enable on a resume of an existing run '
+                                     'you want to continue identically. Trainer support is added '
+                                     'per model.')
+        sub_parser.add_argument('--bucket_mega_factor', type=int, default=25,
+                                help='Length-bucketing sort-pool size = batch_size * this. Larger '
+                                     '= tighter length homogeneity but less batch randomness.')
         sub_parser.add_argument('--warmup_steps', type=int, default=0, help='Warmup steps')
         sub_parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm')
         sub_parser.add_argument('--fp16', action='store_true', help='Whether to use fp16')

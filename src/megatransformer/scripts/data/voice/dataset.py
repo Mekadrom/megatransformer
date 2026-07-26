@@ -6,7 +6,11 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from megatransformer.scripts.data.dataset import ShardAwareSampler
+from megatransformer.scripts.data.dataset import (
+    LengthGroupedShardSampler,
+    ShardAwareSampler,
+    scan_shard_lengths,
+)
 from megatransformer.utils.codebook import load_codebook, load_f0_stats, normalize_f0, quantize
 
 
@@ -222,8 +226,35 @@ class VoiceShardedDataset(Dataset):
 
         return sample
 
-    def get_sampler(self, shuffle: bool = True, seed: int = 42) -> ShardAwareSampler:
-        """Get a shard-aware sampler for efficient training."""
+    def get_sampler(
+        self,
+        shuffle: bool = True,
+        seed: int = 42,
+        bucket_by_length: bool = False,
+        batch_size: int = None,
+        mega_factor: int = 25,
+        length_key: str = "mel_lengths",
+    ) -> ShardAwareSampler:
+        """Get a shard-aware sampler for efficient training.
+
+        When ``bucket_by_length`` is set, similar-length samples are grouped into the same
+        batch (within each shard) to cut padding FLOPs; lengths are read from the shards via
+        mmap. ``length_key`` selects which per-sample length drives the bucketing (default
+        the mel length, which is what the SMG collator pads to).
+        """
+        if bucket_by_length:
+            if not batch_size:
+                raise ValueError("bucket_by_length requires a positive batch_size")
+            lengths = scan_shard_lengths(self.shard_dir, self.shard_files, length_key)
+            return LengthGroupedShardSampler(
+                shard_offsets=self.shard_offsets,
+                total_samples=self.total_samples,
+                lengths=lengths,
+                batch_size=batch_size,
+                mega_factor=mega_factor,
+                shuffle=shuffle,
+                seed=seed,
+            )
         return ShardAwareSampler(
             shard_offsets=self.shard_offsets,
             total_samples=self.total_samples,

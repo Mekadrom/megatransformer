@@ -156,6 +156,9 @@ class SMGTrainer(CommonTrainer):
         sive_perceptual_loss_start_step: int = 0,
         sive_perceptual_loss_rampup_steps: int = 5000,  # Ramp SIVE-perceptual weight 0 -> max over this many steps after start_step (0 = hard on)
         sive_perceptual_layer: int = -1,  # Which SIVE layer to extract (-1 = final)
+        # Length bucketing (opt-in): group similar-length mels into a batch to cut padding.
+        bucket_by_length: bool = False,
+        bucket_mega_factor: int = 25,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -163,8 +166,16 @@ class SMGTrainer(CommonTrainer):
         # Store shard-aware sampler if available
         self._shard_sampler = None
         if hasattr(self.train_dataset, 'get_sampler'):
-            self._shard_sampler = self.train_dataset.get_sampler(shuffle=True, seed=42)
-            print("Using ShardAwareSampler for efficient shard loading")
+            self._shard_sampler = self.train_dataset.get_sampler(
+                shuffle=True, seed=42,
+                bucket_by_length=bucket_by_length,
+                batch_size=self.args.per_device_train_batch_size,
+                mega_factor=bucket_mega_factor,
+                length_key="mel_lengths",
+            )
+            print("Using "
+                  + ("LengthGroupedShardSampler (bucketed)" if bucket_by_length else "ShardAwareSampler")
+                  + " for efficient shard loading")
         self.step_offset = step_offset if step_offset is not None else 0
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
@@ -1634,6 +1645,8 @@ def create_trainer(
         sive_perceptual_loss_start_step=args.sive_perceptual_loss_start_step,
         sive_perceptual_loss_rampup_steps=args.sive_perceptual_loss_rampup_steps,
         sive_perceptual_layer=args.sive_perceptual_layer,
+        bucket_by_length=getattr(args, 'bucket_by_length', False),
+        bucket_mega_factor=getattr(args, 'bucket_mega_factor', 25),
     )
 
 

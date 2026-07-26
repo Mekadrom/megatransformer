@@ -8,6 +8,29 @@ def _shard_debug_enabled():
     return os.environ.get("SHARD_DEBUG", "0") == "1"
 
 
+def scan_shard_lengths(shard_dir: str, shard_files: list[str], length_key: str) -> list[int]:
+    """Read ONLY the per-sample ``length_key`` array from every shard, concatenated into
+    one Python list indexed by global sample index.
+
+    Uses ``torch.load(..., mmap=True)`` so only that small array is paged in, NOT the
+    multi-GB feature/waveform/mel tensors beside it — measured ~400x cheaper than a full
+    shard load. This is what lets length-bucketing get every sample's length at sampler
+    init without either re-loading all shards or duplicating lengths into the index.
+    """
+    lengths: list[int] = []
+    for fname in shard_files:
+        path = os.path.join(shard_dir, fname)
+        shard = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        if length_key not in shard:
+            raise KeyError(
+                f"shard {fname} has no '{length_key}' (present: "
+                f"{[k for k in shard.keys() if k.endswith('_lengths')]}); "
+                f"cannot bucket by length on this key."
+            )
+        lengths.extend(int(x) for x in shard[length_key].tolist())
+    return lengths
+
+
 class ShardAwareSampler(torch.utils.data.Sampler):
     """
     Sampler that groups indices by shard to minimize shard loading.
@@ -183,3 +206,92 @@ class ShardAwareSampler(torch.utils.data.Sampler):
         self.epoch = epoch
         if _shard_debug_enabled():
             print(f"[ShardAwareSampler] Rank {self.rank}: set_epoch({epoch}) called (was {old_epoch})")
+
+
+class LengthGroupedShardSampler(ShardAwareSampler):
+    """Shard-aware sampler that also groups similar-LENGTH samples into the same batch,
+    cutting the padding FLOPs wasted when a batch mixes short and long sequences.
+
+    Bucketing happens WITHIN each shard, so shard locality (one load per shard per epoch)
+    is fully preserved — only the intra-shard emission order changes. Per shard, per epoch:
+        shuffle indices -> megabatches of batch_size*mega_factor -> sort each by length
+        -> chunk into batch_size batches -> shuffle batch order.
+    Consecutive ``batch_size`` indices are then length-homogeneous, while the per-epoch
+    shuffle keeps batch membership varying across epochs (so it is not the same fixed
+    batches every time, which would hurt SGD).
+
+    Emits FLAT indices; the DataLoader chunks them by ``batch_size``. When a shard's size
+    is not a multiple of ``batch_size`` its remainder merges with the next shard's head
+    into one mixed-length batch — the same shard-boundary straddle the base sampler already
+    has, ~1 batch per shard, negligible.
+    """
+
+    def __init__(
+        self,
+        shard_offsets: list[int],
+        total_samples: int,
+        lengths: list[int],
+        batch_size: int,
+        mega_factor: int = 25,
+        shuffle: bool = True,
+        seed: int = 42,
+        num_replicas: int = None,
+        rank: int = None,
+    ):
+        super().__init__(shard_offsets, total_samples, shuffle=shuffle, seed=seed,
+                         num_replicas=num_replicas, rank=rank)
+        if len(lengths) != total_samples:
+            raise ValueError(
+                f"lengths ({len(lengths)}) must match total_samples ({total_samples})")
+        self.lengths = lengths
+        self.batch_size = max(1, int(batch_size))
+        self.mega_factor = max(1, int(mega_factor))
+
+    def _bucket_shard(self, shard_global: list[int], g: torch.Generator) -> list[int]:
+        """Length-bucketed emission order for one shard's global indices."""
+        perm = torch.randperm(len(shard_global), generator=g).tolist()
+        shuffled = [shard_global[i] for i in perm]
+
+        mb = self.batch_size * self.mega_factor
+        batches: list[list[int]] = []
+        for s in range(0, len(shuffled), mb):
+            mega = shuffled[s:s + mb]
+            mega.sort(key=lambda idx: self.lengths[idx])
+            for b in range(0, len(mega), self.batch_size):
+                batches.append(mega[b:b + self.batch_size])
+
+        # Shuffle the ORDER of the length-homogeneous batches (keeps batches intact).
+        border = torch.randperm(len(batches), generator=g).tolist()
+        out: list[int] = []
+        for bi in border:
+            out.extend(batches[bi])
+        return out
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        if self.shuffle:
+            perm = torch.randperm(len(self.my_shards), generator=g).tolist()
+            shard_order = [self.my_shards[i] for i in perm]
+        else:
+            shard_order = self.my_shards
+
+        indices: list[int] = []
+        for shard_idx in shard_order:
+            start = self.shard_offsets[shard_idx]
+            size = self.shard_sizes[shard_idx]
+            shard_global = list(range(start, start + size))
+            if self.shuffle:
+                shard_g = torch.Generator()
+                shard_g.manual_seed(self.seed + self.epoch + shard_idx)
+                indices.extend(self._bucket_shard(shard_global, shard_g))
+            else:
+                # Deterministic eval: strict length sort, no shuffle.
+                indices.extend(sorted(shard_global, key=lambda idx: self.lengths[idx]))
+
+        # Distributed padding, mirroring the base sampler.
+        if len(indices) < self._num_samples:
+            indices.extend(indices[:self._num_samples - len(indices)])
+
+        return self._tracked_iter(indices)
