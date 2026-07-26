@@ -121,8 +121,18 @@ class VectorQuantizerEMA(nn.Module):
         self.cluster_size.fill_(1.0)
         self.initted.fill_(True)
 
+    @torch._dynamo.disable
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
         """x: [B, T, D] post-norm features. mask: [B, T] True=valid (None => all valid).
+
+        Excluded from torch.compile via @torch._dynamo.disable (like SpecAugment in
+        sive.py): the EMA codebook maintenance is inherently data-dependent and dynamo
+        cannot trace it — `bool(self.initted)` (init check), `int(dead.sum())` +
+        boolean-mask dead-code reseeding, and `scatter_add_` (perplexity) each graph-break,
+        and the dead-code churn drives a cache_size_limit recompile storm that makes
+        --compile_model SLOWER than eager. The VQ math is tiny next to the conformer, so
+        running it eager costs ~nothing while the encoder still compiles around it. The
+        straight-through output still carries autograd across the eager boundary.
 
         Returns (quantized [B, T, D] with straight-through grad, code indices [B, T] long,
         commitment_loss scalar, perplexity scalar). Padded positions in the returned tensor
