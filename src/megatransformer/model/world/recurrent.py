@@ -106,6 +106,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         use_cache: bool,
         share_kv_cache: bool,
         _extend_mask_fn=None,
+        additive_attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run one full recurrent iteration through all blocks sequentially.
 
@@ -124,7 +125,7 @@ class MegatransformerRecurrentBlock(nn.Module):
 
             if self.gradient_checkpointing and self.training and not use_cache:
                 h, updated_cache = torch_checkpoint(
-                    block, h, mask, None, iter_cache, position_offset, use_cache,
+                    block, h, mask, None, iter_cache, position_offset, use_cache, additive_attn_bias,
                     use_reentrant=False,
                 )
             else:
@@ -134,6 +135,7 @@ class MegatransformerRecurrentBlock(nn.Module):
                     kv_cache=iter_cache,
                     position_offset=position_offset,
                     use_cache=use_cache,
+                    additive_attn_bias=additive_attn_bias,
                 )
 
             if use_cache and updated_cache is not None and kv_cache is not None:
@@ -273,6 +275,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         use_cache: bool = False,
         share_kv_cache: bool = False,
         max_iterations_override: Optional[int] = None,
+        additive_attn_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache], int, List[float]]:
         """
         Forward pass through recurrent block with optional KV caching.
@@ -360,6 +363,7 @@ class MegatransformerRecurrentBlock(nn.Module):
                         x_0, last_thought_state, iteration,
                         attention_mask, new_kv_cache, position_offset,
                         use_cache, share_kv_cache, _extend_mask_for_cache,
+                        additive_attn_bias=additive_attn_bias,
                     )
 
                     kl_per_token = None
@@ -401,6 +405,7 @@ class MegatransformerRecurrentBlock(nn.Module):
                     x_0, last_thought_state, iteration,
                     attention_mask, new_kv_cache, position_offset,
                     use_cache, share_kv_cache, _extend_mask_for_cache,
+                    additive_attn_bias=additive_attn_bias,
                 )
 
                 kl_per_token = None

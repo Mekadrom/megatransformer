@@ -251,6 +251,9 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         if hasattr(self, 'input_norm'):
             x = self.input_norm(x)
 
+        # NAR→AR curriculum voice→voice down-scale (None outside the curriculum).
+        additive_attn_bias = kwargs.get("additive_attn_bias", None)
+
         # MegaTransformerEncoderBlock.forward already adds residuals internally,
         # so the loop just chains layers without re-adding the input.
         h = x
@@ -259,7 +262,7 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
             block_cache = kv_caches[i] if kv_caches is not None else None
             if self.gradient_checkpointing and self.training and not use_cache:
                 h, new_cache = torch_checkpoint(
-                    block, h, None, None, block_cache, position_offset, use_cache,
+                    block, h, None, None, block_cache, position_offset, use_cache, additive_attn_bias,
                     use_reentrant=False,
                 )
             else:
@@ -268,6 +271,7 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
                     kv_cache=block_cache,
                     position_offset=position_offset,
                     use_cache=use_cache,
+                    additive_attn_bias=additive_attn_bias,
                 )
             if use_cache:
                 new_kv_caches.append(new_cache)

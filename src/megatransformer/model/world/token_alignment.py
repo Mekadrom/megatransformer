@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 import torch
@@ -12,6 +13,89 @@ MODALITY_AUDIO = 1
 MODALITY_VOICE = 2
 MODALITY_IMAGE = 3
 MODALITY_PAD = -1
+
+
+# ── NAR→AR voice-attention curriculum (Variant B) ──────────────────────────────
+# The world-TTS voice AR leans on the voice-history CRUTCH (earlier voice frames
+# predict the next one via local acoustic smoothness), so the text is under-used.
+# The curriculum starves that crutch by DOWN-SCALING voice→voice attention by a
+# schedulable factor alpha in the prelude, recurrent trunk, and coda: at alpha=0 a
+# voice position attends to text (and its own shifted-TF input frame) ONLY; alpha
+# ramps 0→1 to hand history back once the text pathway is established.
+#
+# Mechanism: add log(alpha) to the QK score of every VOICE-query × VOICE-key pair
+# (off-diagonal only — a position always keeps its own diagonal so no softmax row is
+# fully masked). Adding log(alpha) multiplies that pair's pre-normalization softmax
+# weight by alpha. alpha>=1 => bias 0 (identity, callers pass None for the fast path).
+
+# "Fully severed" sentinel for alpha==0. A large FINITE negative (not -inf) so it is
+# representable in fp16/bf16 and never produces NaN from inf-inf inside a fused
+# attention kernel; exp(-1e4) underflows to 0 all the same.
+VOICE_ATTN_MASK_NEG = -1e4
+
+
+def voice_attn_bias_value(alpha: Optional[float]) -> float:
+    """Per-pair additive logit that scales a voice→voice softmax weight by ``alpha``."""
+    if alpha is None or alpha >= 1.0:
+        return 0.0
+    if alpha <= 0.0:
+        return VOICE_ATTN_MASK_NEG
+    return math.log(alpha)
+
+
+def build_voice_voice_attn_bias(
+    modality_map: torch.Tensor,
+    alpha: Optional[float],
+    dtype: torch.dtype,
+    is_synthesis: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """(B, S, S) additive attention bias down-scaling VOICE-query × VOICE-key attention
+    (off-diagonal) by ``alpha`` for the interleaved recurrent trunk.
+
+    The diagonal is left at 0 so a voice row is never fully masked (a fully-masked row
+    would NaN the softmax). ``is_synthesis`` (B,) gates it per row: transcription rows
+    read real audio as INPUT, so their voice attention is left untouched (bias 0).
+    Returns None when ``alpha >= 1`` (no-op) so callers keep the fast attention path.
+    """
+    if alpha is None or alpha >= 1.0:
+        return None
+    val = voice_attn_bias_value(alpha)
+    voice = modality_map == MODALITY_VOICE                       # (B, S)
+    pair = voice.unsqueeze(2) & voice.unsqueeze(1)              # (B, S, S): voice_i & voice_j
+    S = modality_map.shape[1]
+    eye = torch.eye(S, dtype=torch.bool, device=modality_map.device).unsqueeze(0)
+    offdiag = pair & ~eye
+    bias = offdiag.to(dtype) * val                              # (B, S, S)
+    if is_synthesis is not None:
+        gate = is_synthesis.to(dtype).view(-1, 1, 1)           # 0 for transcription rows
+        bias = bias * gate
+    return bias
+
+
+def build_all_voice_attn_bias(
+    seq_len: int,
+    alpha: Optional[float],
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int = 1,
+    is_synthesis: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """(B, T, T) additive bias for an all-voice sequence (prelude / coda): off-diagonal
+    entries get log(alpha), the diagonal stays 0. With ``is_synthesis`` (B,) the bias is
+    zeroed on transcription rows. Returns None when ``alpha >= 1`` (no-op).
+
+    Padding positions need no special handling: these attentions are causal, so a valid
+    query never attends to trailing padding, and padded query rows are discarded.
+    """
+    if alpha is None or alpha >= 1.0:
+        return None
+    val = voice_attn_bias_value(alpha)
+    m = torch.full((seq_len, seq_len), val, device=device, dtype=dtype)
+    m.fill_diagonal_(0.0)
+    bias = m.unsqueeze(0).expand(batch_size, -1, -1)           # (B, T, T)
+    if is_synthesis is not None:
+        bias = bias * is_synthesis.to(dtype).view(-1, 1, 1)
+    return bias.contiguous()
 
 
 class TokenInterleaver(nn.Module):

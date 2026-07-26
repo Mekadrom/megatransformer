@@ -94,6 +94,7 @@ class MegaTransformerAttention(nn.Module):
         use_cache: bool = False,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
+        additive_attn_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         """
         Forward pass with optional KV caching for efficient generation.
@@ -109,6 +110,10 @@ class MegaTransformerAttention(nn.Module):
             encoder_hidden_states: If provided, keys and values come from this tensor
                 instead of hidden_states (cross-attention mode).
             encoder_attention_mask: Attention mask for encoder states in cross-attention.
+            additive_attn_bias: Optional float bias added to the pre-softmax scores,
+                shape (N, t, T) or (N, 1, t, T) (broadcast over heads). Used by the
+                NAR→AR voice curriculum to down-scale voice→voice attention. Only ever
+                passed on the no-KV-cache (training) path.
 
         Returns:
             output: Attention output, shape (batch, seq_len, d_model)
@@ -236,13 +241,37 @@ class MegaTransformerAttention(nn.Module):
                 pad_bool = active_mask.unsqueeze(1).unsqueeze(2) != 0
                 attn_bool = pad_bool if attn_bool is None else (attn_bool & pad_bool)
 
-            context_layer = F.scaled_dot_product_attention(
-                queries, keys, values,
-                attn_mask=attn_bool,
-                dropout_p=self.attn_dropout.p if self.training else 0.0,
-                is_causal=(attn_bool is None and causal_mask_slice is not None),
-                scale=1.0 / math.sqrt(self.d_queries),
-            )
+            if additive_attn_bias is not None:
+                # NAR→AR curriculum: a FLOAT additive mask (voice→voice down-scale) gives
+                # up flash for the mem-efficient SDPA backend, so it's only built when the
+                # curriculum is active (alpha < 1). At alpha >= 1 the caller passes None
+                # and the fast boolean path above runs unchanged. Bake causal + padding
+                # into the same float mask (any disallowed key -> -inf, dominating the bias).
+                bias = additive_attn_bias
+                if bias.dim() == 3:
+                    bias = bias.unsqueeze(1)                       # (N, 1, t, T)
+                attn_float = bias.to(queries.dtype).expand(N, -1, t, T).contiguous()
+                if attn_bool is not None:
+                    attn_float = attn_float.masked_fill(~attn_bool, float("-inf"))
+                elif causal_mask_slice is not None:
+                    # attn_bool was short-circuited (causal, no padding, t == T); is_causal
+                    # can't be used with an explicit mask, so apply the slice here.
+                    attn_float = attn_float.masked_fill(causal_mask_slice == 0, float("-inf"))
+                context_layer = F.scaled_dot_product_attention(
+                    queries, keys, values,
+                    attn_mask=attn_float,
+                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    is_causal=False,
+                    scale=1.0 / math.sqrt(self.d_queries),
+                )
+            else:
+                context_layer = F.scaled_dot_product_attention(
+                    queries, keys, values,
+                    attn_mask=attn_bool,
+                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    is_causal=(attn_bool is None and causal_mask_slice is not None),
+                    scale=1.0 / math.sqrt(self.d_queries),
+                )
         else:
             attention_scores = torch.matmul(queries, keys.transpose(-1, -2))
 
@@ -259,6 +288,14 @@ class MegaTransformerAttention(nn.Module):
             elif self.config.attn_logit_cap is not None:
                 cap = self.config.attn_logit_cap
                 attention_scores = cap * torch.tanh(attention_scores / cap)
+
+            if additive_attn_bias is not None:
+                # NAR→AR curriculum voice→voice down-scale — added before the masked_fills
+                # so a disallowed (-inf) key still wins over the finite bias.
+                bias = additive_attn_bias
+                if bias.dim() == 3:
+                    bias = bias.unsqueeze(1)
+                attention_scores = attention_scores + bias.to(attention_scores.dtype)
 
             if causal_mask_slice is not None:
                 attention_scores = attention_scores.masked_fill(causal_mask_slice == 0, float("-inf"))
@@ -448,6 +485,7 @@ class MegaTransformerEncoderBlock(nn.Module):
         kv_cache: Optional[KVCache] = None,
         position_offset: int = 0,
         use_cache: bool = False,
+        additive_attn_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         """
         Forward pass with optional KV caching.
@@ -459,6 +497,8 @@ class MegaTransformerEncoderBlock(nn.Module):
             kv_cache: Optional KVCache for efficient generation
             position_offset: Position offset for RoPE
             use_cache: Whether to return updated KV cache
+            additive_attn_bias: Optional float bias added to pre-softmax scores
+                (NAR→AR voice curriculum). See MegaTransformerAttention.forward.
 
         Returns:
             hidden_states: Output tensor, shape (batch, seq_len, d_model)
@@ -476,6 +516,7 @@ class MegaTransformerEncoderBlock(nn.Module):
             kv_cache=kv_cache,
             position_offset=position_offset,
             use_cache=use_cache,
+            additive_attn_bias=additive_attn_bias,
         )
 
         hidden_states = hidden_states + attn_output

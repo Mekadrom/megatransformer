@@ -23,7 +23,13 @@ from megatransformer.model.image.decoder import ImageDecoder
 from megatransformer.model.image.diffusion_decoder import DiffusionBridgeImageDecoder
 from megatransformer.model.world.kv_cache import RecurrentKVCache
 from megatransformer.model.world.recurrent import MegatransformerRecurrentBlock
-from megatransformer.model.world.token_alignment import MODALITY_TEXT, TokenInterleaver, TokenUninterleaver
+from megatransformer.model.world.token_alignment import (
+    MODALITY_TEXT,
+    TokenInterleaver,
+    TokenUninterleaver,
+    build_all_voice_attn_bias,
+    build_voice_voice_attn_bias,
+)
 from megatransformer.utils import constants, megatransformer_utils
 
 
@@ -240,6 +246,11 @@ class MegaTransformerWorldModel(nn.Module):
         decode_outputs: bool = False,
         # Per-sample direction: True = synthesis (text→media), False = transcription
         is_synthesis: Optional[torch.Tensor] = None,
+        # NAR→AR curriculum (Variant B): scalar in [0, 1] that down-scales voice→voice
+        # attention in the prelude, recurrent trunk, and voice coda on SYNTHESIS rows.
+        # alpha=0 severs voice history (position t sees text + its own shifted-TF frame
+        # only); alpha=1 (or None) is the identity — no bias built, fast path preserved.
+        voice_attn_alpha: Optional[float] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass through the world model.
@@ -335,11 +346,19 @@ class MegaTransformerWorldModel(nn.Module):
             if is_synthesis is not None and is_synthesis.any():
                 d_model = self.config.text_prelude_config.d_model
                 shifted_input = voice_flat[:, :, :-1]  # (B*N, C, T-1)
+                # NAR→AR curriculum: sever the prelude's voice→voice self-attention so a
+                # frame encodes only its own (shifted) input, not the aggregated history.
+                # Built for every row here — non-synthesis rows' output is overwritten by
+                # the un-suppressed normal_hidden below, so no per-row gating is needed.
+                prelude_bias = build_all_voice_attn_bias(
+                    shifted_input.shape[-1], voice_attn_alpha,
+                    shifted_input.device, voice_flat.dtype,
+                )
                 # THE autoregressive crutch: these are the TRUE previous frames, and they
                 # predict frame t so well on their own that the text earns no gradient.
                 # prenet_dropout (config, default off) is the Tacotron-2 bottleneck.
                 shifted_hidden = self.voice_feature_extractor(
-                    shifted_input, apply_prenet_dropout=True,
+                    shifted_input, apply_prenet_dropout=True, additive_attn_bias=prelude_bias,
                 )  # (B*N, T-1, d_model)
                 zero_prefix = torch.zeros(shifted_hidden.shape[0], 1, d_model, device=shifted_hidden.device, dtype=shifted_hidden.dtype)
                 synth_hidden = torch.cat([zero_prefix, shifted_hidden], dim=1)  # (B*N, T, d_model)
@@ -423,10 +442,17 @@ class MegaTransformerWorldModel(nn.Module):
         # print("\tInputs to recurrent block:")
         # megatransformer_utils.print_debug_tensor("\t\tinterleaved_tokens", interleaved_tokens)
 
+        # NAR→AR curriculum: down-scale voice→voice attention in the trunk on synthesis
+        # rows so the recurrent block can't route the next-frame answer from voice history.
+        trunk_voice_bias = build_voice_voice_attn_bias(
+            modality_map, voice_attn_alpha, interleaved_tokens.dtype, is_synthesis=is_synthesis,
+        )
+
         # Main Transformer (Recurrent Block)
         recurrent_output, _, _, _, iteration_stats = self.recurrent_block(
             interleaved_tokens,
-            attention_mask=attn_mask  # True for attend, False for padding
+            attention_mask=attn_mask,  # True for attend, False for padding
+            additive_attn_bias=trunk_voice_bias,
         )
 
         # print("\tInputs to uninterleaver:")
@@ -500,11 +526,20 @@ class MegaTransformerWorldModel(nn.Module):
 
         # Voice
         if voice_batch is not None and self.voice_generator is not None:
+            # NAR→AR curriculum: sever the coda's causal voice→voice self-attention on
+            # synthesis rows so it can't re-mix voice history after the trunk. voice_batch
+            # is all-voice (uninterleaved), one row per batch item, so is_synthesis aligns
+            # row-for-row. Causal attention means trailing padding is never attended.
+            coda_voice_bias = build_all_voice_attn_bias(
+                voice_batch.shape[1], voice_attn_alpha, voice_batch.device, voice_batch.dtype,
+                batch_size=voice_batch.shape[0], is_synthesis=is_synthesis,
+            )
             voice_outputs = self.voice_generator(
                 voice_batch,
                 latent_labels=voice_latent_labels,
                 lengths=uninterleaved["voice_lengths"],
                 decode_to_mel=decode_outputs,
+                additive_attn_bias=coda_voice_bias,
             )
             outputs.update(voice_outputs)
 

@@ -87,6 +87,7 @@ class VoiceSIVEPreludeFeatureExtractor(nn.Module):
         position_offset: int = 0,
         use_cache: bool = False,
         apply_prenet_dropout: bool = False,
+        additive_attn_bias: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List]]:
         """
         Process SIVE features into token embeddings.
@@ -136,7 +137,7 @@ class VoiceSIVEPreludeFeatureExtractor(nn.Module):
             block_cache = kv_caches[i] if kv_caches is not None else None
             if self.gradient_checkpointing and self.training and not use_cache:
                 x, new_cache = torch_checkpoint(
-                    block, x, None, None, block_cache, position_offset, use_cache,
+                    block, x, None, None, block_cache, position_offset, use_cache, additive_attn_bias,
                     use_reentrant=False,
                 )
             else:
@@ -145,6 +146,7 @@ class VoiceSIVEPreludeFeatureExtractor(nn.Module):
                     kv_cache=block_cache,
                     position_offset=position_offset,
                     use_cache=use_cache,
+                    additive_attn_bias=additive_attn_bias,
                 )
             if use_cache:
                 new_kv_caches.append(new_cache)

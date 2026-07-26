@@ -75,6 +75,16 @@ class WorldModelTrainer(CommonTrainer):
         voice_duration_loss_weight: float = 1.0,
         voice_scheduled_sampling_prob: float = 0.0,
         voice_scheduled_sampling_ramp_steps: int = 10000,
+        # NAR→AR voice-attention curriculum (Variant B). Down-scales voice→voice
+        # attention in the prelude + recurrent trunk + coda by a schedulable alpha,
+        # starving the voice-history crutch so the text pathway is forced to carry
+        # content. Replaces scheduled sampling (mutually exclusive — see __init__).
+        # Schedule: alpha=floor for the first mask_steps (NAR phase), then ramps
+        # floor→cap over ramp_steps, then holds at cap. Off when mask_steps==ramp_steps==0.
+        voice_ar_attn_mask_steps: int = 0,
+        voice_ar_attn_ramp_steps: int = 0,
+        voice_ar_attn_floor: float = 0.0,
+        voice_ar_attn_cap: float = 1.0,
         # Modality flags
         include_text: bool = True,
         include_audio: bool = True,
@@ -132,6 +142,21 @@ class WorldModelTrainer(CommonTrainer):
         self.voice_duration_loss_weight = voice_duration_loss_weight
         self.voice_scheduled_sampling_prob = voice_scheduled_sampling_prob
         self.voice_scheduled_sampling_ramp_steps = voice_scheduled_sampling_ramp_steps
+
+        # NAR→AR voice-attention curriculum (Variant B).
+        self.voice_ar_attn_mask_steps = voice_ar_attn_mask_steps
+        self.voice_ar_attn_ramp_steps = voice_ar_attn_ramp_steps
+        self.voice_ar_attn_floor = voice_ar_attn_floor
+        self.voice_ar_attn_cap = voice_ar_attn_cap
+        self._voice_ar_attn_enabled = (voice_ar_attn_mask_steps > 0 or voice_ar_attn_ramp_steps > 0)
+        # Both attack the teacher-forcing crutch; stacking them confounds the ablation and
+        # the curriculum is the stronger, decisive lever, so it REPLACES scheduled sampling.
+        if self._voice_ar_attn_enabled and voice_scheduled_sampling_prob > 0.0:
+            raise ValueError(
+                "The NAR→AR voice-attention curriculum (--voice_ar_attn_mask_steps/"
+                "--voice_ar_attn_ramp_steps) replaces scheduled sampling and is mutually "
+                "exclusive with --voice_scheduled_sampling_prob > 0. Disable one."
+            )
 
         self.include_text = include_text
         self.include_audio = include_audio
@@ -622,6 +647,12 @@ class WorldModelTrainer(CommonTrainer):
                 model, ss_prob, text_input_ids, voice_inputs, voice_lengths, is_synthesis, global_step,
             )
 
+        # NAR→AR curriculum: voice→voice attention scale at this step (None => off).
+        voice_attn_alpha = self._voice_attn_alpha(global_step)
+        if (voice_attn_alpha is not None and model.training
+                and global_step % self.args.logging_steps == 0):
+            metrics.log_scalar("train/voice_attn_alpha", voice_attn_alpha, global_step, skip_zero=False)
+
         outputs = model(
             text_input_ids=text_input_ids,
             audio_inputs=audio_inputs,
@@ -633,6 +664,7 @@ class WorldModelTrainer(CommonTrainer):
             precomputed_latents=self.precomputed_latents,
             decode_outputs=False,
             is_synthesis=is_synthesis,
+            voice_attn_alpha=voice_attn_alpha,
         )
 
         if should_log and hasattr(model_for_stats, 'recurrent_block'):
@@ -1134,6 +1166,27 @@ class WorldModelTrainer(CommonTrainer):
 
         self._module_groups = groups
         return groups
+
+    def _voice_attn_alpha(self, global_step: int) -> Optional[float]:
+        """Voice→voice attention scale for the NAR→AR curriculum at ``global_step``.
+
+        Returns None when the curriculum is off (no bias built, fast attention path).
+        Otherwise: ``floor`` for the first ``mask_steps`` (NAR phase, history severed),
+        a linear ramp ``floor``→``cap`` over the next ``ramp_steps``, then ``cap`` (AR).
+        A function of the step only, so train and eval at the same step use the same alpha.
+        """
+        if not self._voice_ar_attn_enabled:
+            return None
+        mask_steps = max(0, self.voice_ar_attn_mask_steps)
+        ramp = max(1, self.voice_ar_attn_ramp_steps)
+        floor = self.voice_ar_attn_floor
+        cap = self.voice_ar_attn_cap
+        if global_step < mask_steps:
+            return floor
+        t = global_step - mask_steps
+        if t >= ramp:
+            return cap
+        return floor + (cap - floor) * (t / ramp)
 
     def _scheduled_sampling_prob(self, global_step: int) -> float:
         """Per-frame probability of feeding the model's OWN prediction instead of ground
@@ -1790,6 +1843,10 @@ def create_trainer(
         voice_duration_loss_weight=getattr(args, 'voice_duration_loss_weight', 1.0),
         voice_scheduled_sampling_prob=getattr(args, 'voice_scheduled_sampling_prob', 0.0),
         voice_scheduled_sampling_ramp_steps=getattr(args, 'voice_scheduled_sampling_ramp_steps', 10000),
+        voice_ar_attn_mask_steps=getattr(args, 'voice_ar_attn_mask_steps', 0),
+        voice_ar_attn_ramp_steps=getattr(args, 'voice_ar_attn_ramp_steps', 0),
+        voice_ar_attn_floor=getattr(args, 'voice_ar_attn_floor', 0.0),
+        voice_ar_attn_cap=getattr(args, 'voice_ar_attn_cap', 1.0),
         include_text="text" in include_modes,
         include_audio="audio" in include_modes,
         include_voice="voice" in include_modes,
@@ -2116,6 +2173,30 @@ def add_cli_args(subparsers):
                             help="Linear ramp length for --voice_scheduled_sampling_prob. Ramped "
                                  "because early predictions are noise, and training on "
                                  "noise-as-history teaches nothing.")
+    sub_parser.add_argument("--voice_ar_attn_mask_steps", type=int, default=0,
+                            help="NAR→AR curriculum (Variant B): number of steps to HOLD "
+                                 "voice→voice attention at --voice_ar_attn_floor (the NAR phase, "
+                                 "voice history severed). The voice AR leans on the voice-history "
+                                 "crutch so the text earns no gradient; down-scaling voice→voice "
+                                 "attention in the prelude + recurrent trunk + coda forces content "
+                                 "onto the text pathway. Input stays shifted-TF (a voice position "
+                                 "still sees its own frame t-1 — a weak 1-frame residual). REPLACES "
+                                 "and is mutually exclusive with --voice_scheduled_sampling_prob. "
+                                 "0 (default) = curriculum off. Suggested: 10000.")
+    sub_parser.add_argument("--voice_ar_attn_ramp_steps", type=int, default=0,
+                            help="Linear ramp length (steps) over which voice→voice attention scale "
+                                 "goes --voice_ar_attn_floor → --voice_ar_attn_cap after the "
+                                 "--voice_ar_attn_mask_steps NAR phase, handing history back once the "
+                                 "text pathway is established. Suggested: 20000.")
+    sub_parser.add_argument("--voice_ar_attn_floor", type=float, default=0.0,
+                            help="Minimum voice→voice attention scale alpha during the NAR phase "
+                                 "(0 = fully severed: a voice position attends text + its own "
+                                 "shifted-TF frame only). Adding log(alpha) to a voice→voice QK "
+                                 "score scales that softmax weight by alpha.")
+    sub_parser.add_argument("--voice_ar_attn_cap", type=float, default=1.0,
+                            help="Maximum voice→voice attention scale alpha the ramp reaches "
+                                 "(1.0 = full attention restored; <1.0 keeps some suppression "
+                                 "permanent, which then also applies at generation).")
     sub_parser.add_argument("--voice_token_budget", type=int, default=None,
                             help="Max content frames generate() may emit before force-closing with "
                                  "EOV, for the TensorBoard TTS renders. Default: derived from "
