@@ -1184,9 +1184,14 @@ class WorldModelTrainer(CommonTrainer):
         # argmax-unit centroid; continuous path -> the regression mean.
         unwrapped = model.module if hasattr(model, "module") else model
         codebook = getattr(unwrapped, "voice_codebook", None)
-        unit_logits = tf_out.get("voice_unit_logits")            # (num_seg, T, K)
+        unit_logits = tf_out.get("voice_unit_logits")            # (num_seg, T, K+1)
         if unit_logits is not None and codebook is not None:
-            ids = unit_logits.argmax(-1)                          # (num_seg, T)
+            ids = unit_logits.argmax(-1)                          # (num_seg, T), in [0, K]
+            # The unit head is K+1-way (EOV = id K), but the codebook has only K rows, so an
+            # argmax of EOV would index out of bounds (device-side assert). EOV is a terminator
+            # with no centroid; clamp it to a valid code for this SS INPUT substitution (rare,
+            # and only mixed in per the random use_pred mask below, not a target).
+            ids = ids.clamp(max=codebook.shape[0] - 1)
             preds = codebook.to(ids.device)[ids].permute(0, 2, 1)  # (num_seg, C, T)
         else:
             preds = tf_out.get("voice_latent_preds")             # (num_seg, C, T)
