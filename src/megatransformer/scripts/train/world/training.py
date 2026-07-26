@@ -109,6 +109,9 @@ class WorldModelTrainer(CommonTrainer):
         # True. Set False to reproduce the legacy uniform shuffle order
         # when resuming a checkpoint from a pre-shard-aware run.
         shard_aware_sampler: bool = True,
+        # Length bucketing (opt-in): group similar-length samples per task into a batch.
+        bucket_by_length: bool = False,
+        bucket_mega_factor: int = 25,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -116,6 +119,8 @@ class WorldModelTrainer(CommonTrainer):
         self.lr_dit = lr_dit
         self.mask_text_loss_in_synthesis = mask_text_loss_in_synthesis
         self.shard_aware_sampler = shard_aware_sampler
+        self.bucket_by_length = bucket_by_length
+        self.bucket_mega_factor = bucket_mega_factor
 
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
@@ -187,6 +192,8 @@ class WorldModelTrainer(CommonTrainer):
                 batch_size=self.args.per_device_train_batch_size,
                 world_size=world_size,
                 shard_aware=self.shard_aware_sampler,
+                bucket_by_length=self.bucket_by_length,
+                bucket_mega_factor=self.bucket_mega_factor,
             )
 
         # Eval sampler — mirrors the train sampler structure to ensure eval
@@ -1856,6 +1863,8 @@ def create_trainer(
         lr_dit=getattr(args, 'lr_dit', None),
         mask_text_loss_in_synthesis=getattr(args, 'mask_text_loss_in_synthesis', False),
         shard_aware_sampler=getattr(args, 'shard_aware_sampler', True),
+        bucket_by_length=getattr(args, 'bucket_by_length', False),
+        bucket_mega_factor=getattr(args, 'bucket_mega_factor', 25),
     )
 
 

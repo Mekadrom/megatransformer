@@ -134,3 +134,73 @@ def test_scan_shard_lengths_mmap(tmp_path):
         assert False, "expected KeyError"
     except KeyError:
         pass
+
+
+# ── World ModalityGroupedSampler: round-robin + optional length bucketing ────────
+from megatransformer.scripts.data.world.dataset import ModalityGroupedSampler  # noqa: E402
+
+# 2 tasks (modality 0 = "voice"-like, bucketable; modality 1 = "image"-like, fixed).
+# idx % 2 = modality; within = idx // 2; wrapped = within % mod_total.
+N_MOD = 2
+MOD_TOTAL = 200
+WORLD_TOTAL = MOD_TOTAL * N_MOD          # dataset len = max(mod_totals) * n_tasks
+WBATCH = 8
+# voice shard layout: 4 shards of 50; image: 1 shard of 200.
+V_SHARD_INFO = ([0, 50, 100, 150], MOD_TOTAL)
+I_SHARD_INFO = ([0], MOD_TOTAL)
+
+
+def _voice_lengths(seed=3):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randint(20, 500, (MOD_TOTAL,), generator=g).tolist()
+
+
+def _world_sampler(bucket):
+    vlen = _voice_lengths()
+    bucket_lengths = [vlen, None] if bucket else None       # image (mod 1) not bucketed
+    s = ModalityGroupedSampler(
+        total_samples=WORLD_TOTAL, n_modalities=N_MOD, shuffle=True, seed=42,
+        batch_size=WBATCH, world_size=1,
+        shard_info=[V_SHARD_INFO, I_SHARD_INFO],
+        bucket_lengths=bucket_lengths,
+    )
+    return s, vlen
+
+
+def test_world_sampler_off_is_byte_identical():
+    """bucket_lengths=None must reproduce the pre-change shard-aware order exactly (the
+    generator draw sequence is unchanged), so a live-run resume is unaffected."""
+    a, _ = _world_sampler(bucket=False)
+    b, _ = _world_sampler(bucket=False)
+    assert list(iter(a)) == list(iter(b))                   # deterministic
+    # And every index exactly once.
+    assert sorted(iter(a)) == list(range(WORLD_TOTAL))
+
+
+def test_world_sampler_bucket_coverage_and_modality_homogeneity():
+    s, _ = _world_sampler(bucket=True)
+    idx = list(iter(s))
+    assert sorted(idx) == list(range(WORLD_TOTAL))           # exact coverage
+    # Each batch_size chunk stays single-modality (the round-robin invariant).
+    for a in range(0, len(idx), WBATCH):
+        mods = {i % N_MOD for i in idx[a:a + WBATCH]}
+        assert len(mods) == 1
+
+
+def test_world_sampler_bucket_makes_voice_batches_homogeneous():
+    s_b, vlen = _world_sampler(bucket=True)
+    s_r, _ = _world_sampler(bucket=False)
+
+    def voice_len(gidx):
+        return vlen[(gidx // N_MOD) % MOD_TOTAL]
+
+    def avg_voice_batch_range(idx):
+        rs = []
+        for a in range(0, len(idx), WBATCH):
+            chunk = idx[a:a + WBATCH]
+            if all(i % N_MOD == 0 for i in chunk) and len(chunk) > 1:   # pure voice batch
+                ls = [voice_len(i) for i in chunk]
+                rs.append(max(ls) - min(ls))
+        return sum(rs) / len(rs)
+
+    assert avg_voice_batch_range(list(iter(s_b))) < 0.5 * avg_voice_batch_range(list(iter(s_r)))

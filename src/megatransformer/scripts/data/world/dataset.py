@@ -7,6 +7,8 @@ import torch
 
 from torch.utils.data import Dataset
 
+from megatransformer.scripts.data.dataset import scan_shard_lengths
+
 from megatransformer.utils.codebook import (
     dedup_units, load_codebook, load_f0_stats, normalize_f0, quantize,
 )
@@ -494,9 +496,19 @@ class MultimodalShardedDataset(Dataset):
 
         return sample
 
+    # Per-modality length key that drives collator padding (None => fixed size, no
+    # bucketing). Voice/audio pad SIVE features; text pads token ids; image is fixed.
+    _BUCKET_LENGTH_KEY = {
+        "text": "text_lengths",
+        "audio": "feature_lengths",
+        "voice": "feature_lengths",
+        "image": None,
+    }
+
     def get_sampler(self, shuffle: bool = True, seed: int = 42,
                     batch_size: int = 1, world_size: int = 1,
-                    shard_aware: bool = True):
+                    shard_aware: bool = True,
+                    bucket_by_length: bool = False, bucket_mega_factor: int = 25):
         """
         Get a task-grouped sampler that yields indices such that each
         batch contains only one task type (e.g., all voice_synthesis or
@@ -513,13 +525,30 @@ class MultimodalShardedDataset(Dataset):
         cache misses vs. the prior uniform-random shuffle. Changes the
         sampling order, so pass False to preserve legacy ordering when
         resuming a checkpoint from a pre-shard-aware run.
+
+        When bucket_by_length=True (requires shard_aware), each task's within-shard
+        order additionally groups similar-length samples into the same batch to cut
+        padding FLOPs — which is multiplied through the recurrent trunk that reprocesses
+        every padded frame. Lengths are read per task from its source shards via mmap.
         """
         shard_info = None
+        bucket_lengths = None
         if shard_aware:
             shard_info = []
+            if bucket_by_length:
+                bucket_lengths = []
             for task_name, modality_name, direction in self.task_types:
                 src = self._source_for_task(modality_name, direction)
                 shard_info.append((src["shard_offsets"], src["total_samples"]))
+                if bucket_by_length:
+                    key = self._BUCKET_LENGTH_KEY.get(modality_name)
+                    if key is None:
+                        bucket_lengths.append(None)  # fixed-size (image): leave shuffled
+                    else:
+                        bucket_lengths.append(
+                            scan_shard_lengths(src["shard_dir"], src["shard_files"], key))
+        elif bucket_by_length:
+            print("[MultimodalShardedDataset] bucket_by_length ignored: requires shard_aware")
         return ModalityGroupedSampler(
             total_samples=self.total_samples,
             n_modalities=len(self.task_types),
@@ -528,6 +557,8 @@ class MultimodalShardedDataset(Dataset):
             batch_size=batch_size,
             world_size=world_size,
             shard_info=shard_info,
+            bucket_lengths=bucket_lengths,
+            bucket_mega_factor=bucket_mega_factor,
         )
 
 
@@ -556,7 +587,8 @@ class ModalityGroupedSampler(torch.utils.data.Sampler):
 
     def __init__(self, total_samples: int, n_modalities: int, shuffle: bool = True,
                  seed: int = 42, batch_size: int = 1, world_size: int = 1,
-                 shard_info: Optional[list] = None):
+                 shard_info: Optional[list] = None,
+                 bucket_lengths: Optional[list] = None, bucket_mega_factor: int = 25):
         self.total_samples = total_samples
         self.n_modalities = n_modalities
         self.shuffle = shuffle
@@ -564,7 +596,37 @@ class ModalityGroupedSampler(torch.utils.data.Sampler):
         self.batch_size = batch_size
         self.world_size = world_size
         self.shard_info = shard_info
+        # bucket_lengths: optional list parallel to the tasks (len == n_modalities). Each
+        # entry is either a per-modality-sample length list (indexed by the WRAPPED modality
+        # index) that turns intra-shard shuffling into length-bucketing, or None to leave
+        # that task shuffled (e.g. fixed-size image). Requires shard_info + shuffle.
+        self.bucket_lengths = bucket_lengths
+        self.bucket_mega_factor = max(1, int(bucket_mega_factor))
         self.epoch = 0
+
+    def _bucket_order(self, indices: list, mod_lengths: list, mod_total: int,
+                      g: torch.Generator) -> list:
+        """Length-bucketed order for one shard-group: shuffle -> megabatches of
+        batch_size*mega_factor -> sort each by length -> chunk into batches -> shuffle
+        batch order. A global index's length is mod_lengths[(idx // n_modalities) % mod_total].
+        """
+        def length_of(gidx):
+            return mod_lengths[(gidx // self.n_modalities) % mod_total]
+
+        perm = torch.randperm(len(indices), generator=g).tolist()
+        shuffled = [indices[p] for p in perm]
+        mb = self.batch_size * self.bucket_mega_factor
+        batches = []
+        for s in range(0, len(shuffled), mb):
+            mega = shuffled[s:s + mb]
+            mega.sort(key=length_of)
+            for b in range(0, len(mega), self.batch_size):
+                batches.append(mega[b:b + self.batch_size])
+        border = torch.randperm(len(batches), generator=g).tolist()
+        out = []
+        for bi in border:
+            out.extend(batches[bi])
+        return out
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
@@ -597,11 +659,17 @@ class ModalityGroupedSampler(torch.utils.data.Sampler):
                     wrapped = within_task_idx % mod_total
                     shard_idx = bisect.bisect_right(shard_offsets, wrapped) - 1
                     shard_groups.setdefault(shard_idx, []).append(global_idx)
+                mod_lengths = self.bucket_lengths[i] if self.bucket_lengths is not None else None
                 shard_keys = list(shard_groups.keys())
                 for sk in shard_keys:
                     group = shard_groups[sk]
-                    perm = torch.randperm(len(group), generator=g).tolist()
-                    shard_groups[sk] = [group[p] for p in perm]
+                    if mod_lengths is not None:
+                        # Length-bucket this shard-group (keeps shard locality; only the
+                        # intra-shard order changes so similar-length samples batch together).
+                        shard_groups[sk] = self._bucket_order(group, mod_lengths, mod_total, g)
+                    else:
+                        perm = torch.randperm(len(group), generator=g).tolist()
+                        shard_groups[sk] = [group[p] for p in perm]
                 sperm = torch.randperm(len(shard_keys), generator=g).tolist()
                 shard_keys = [shard_keys[p] for p in sperm]
                 modality_indices[i] = [idx for sk in shard_keys for idx in shard_groups[sk]]
