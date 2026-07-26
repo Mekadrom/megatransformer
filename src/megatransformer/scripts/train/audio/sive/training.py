@@ -89,6 +89,9 @@ class SIVETrainer(CommonTrainer):
         max_mel_frames: Optional[int] = None,
         speaker_adversary_target: str = "speaker_id",
         gender_grl_weight: float = 0.1,
+        # Length bucketing (opt-in): group similar-length mels into a batch to cut padding.
+        bucket_by_length: bool = False,
+        bucket_mega_factor: int = 25,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -139,7 +142,15 @@ class SIVETrainer(CommonTrainer):
         # Set up shard-aware sampler if dataset supports it
         self._shard_sampler = None
         if hasattr(self.train_dataset, 'get_sampler'):
-            self._shard_sampler = self.train_dataset.get_sampler(shuffle=True, seed=42)
+            # SIVE trains on raw waveforms (mel is derived on-GPU per step), so the
+            # collator pads WAVEFORMS — bucket on waveform length, not mel length.
+            self._shard_sampler = self.train_dataset.get_sampler(
+                shuffle=True, seed=42,
+                bucket_by_length=bucket_by_length,
+                batch_size=self.args.per_device_train_batch_size,
+                mega_factor=bucket_mega_factor,
+                length_key="waveform_lengths",
+            )
 
 
     def create_optimizer(self):
@@ -964,6 +975,8 @@ def create_trainer(
         mel_n_fft=args.voice_n_fft,
         mel_hop_length=args.voice_hop_length,
         max_mel_frames=max_mel_frames,
+        bucket_by_length=getattr(args, 'bucket_by_length', False),
+        bucket_mega_factor=getattr(args, 'bucket_mega_factor', 25),
     )
 
 
