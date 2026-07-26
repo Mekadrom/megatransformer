@@ -150,3 +150,7 @@ scripts_local/
 tfevents_corrupt_backups/
 # Local convenience shim (. .venv/bin/activate)
 activate.sh
+
+# profiler trace artifacts
+*_prof*.json.gz
+world_prof*.json.gz
