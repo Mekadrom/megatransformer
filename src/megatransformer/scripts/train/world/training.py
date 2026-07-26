@@ -15,6 +15,50 @@ from megatransformer.utils import model_loading_utils, megatransformer_utils, me
 TEXT_LOSS_IGNORE_INDEX = -100
 
 
+def _build_text_targets(full_ids, non_ph_mask_full, valid_full, non_ph_input,
+                        ignore_index=TEXT_LOSS_IGNORE_INDEX):
+    """Build per-item text targets: strip placeholders from the full sequence, causal-shift
+    by one, mark pad positions ignore, and truncate/pad each row to its non-placeholder
+    INPUT count K (the number of logits that item produces). Returns (B, max_K).
+
+    Vectorized replacement for the former per-batch loop, which cost ~3*B GPU->CPU syncs
+    per step (two boolean-index reads + a `.sum().item()` per row). BIT-IDENTICAL: the
+    boolean index that produced `clean`/`clean_valid` returns ascending-position order,
+    which is exactly what the cumsum left-pack assigns. Two host syncs total (the two max
+    lengths), read together.
+    """
+    B, T = full_ids.shape
+    n_clean = non_ph_mask_full.sum(1)                    # (B,) non-PH count in full seq
+    K = non_ph_input.sum(1)                              # (B,) logits per item
+    mc, W = (int(x) for x in torch.stack([n_clean.max(), K.max()]).tolist())  # one sync
+
+    targets = full_ids.new_full((B, max(W, 0)), ignore_index)
+    if W == 0 or mc < 2:
+        return targets                                  # no shifted target survives
+
+    # Left-pack the non-PH tokens (and their validity) per row: destination slot = running
+    # count of kept elements; one scatter each; unselected positions go to a throwaway col.
+    slots = non_ph_mask_full.long().cumsum(1) - 1
+    dst = torch.where(non_ph_mask_full, slots, slots.new_full((), mc))
+    clean = full_ids.new_zeros(B, mc + 1)
+    clean.scatter_(1, dst, full_ids)
+    valid = full_ids.new_zeros(B, mc + 1)
+    valid.scatter_(1, dst, valid_full.long())
+
+    shifted = clean[:, 1:mc]                             # (B, mc-1) causal shift (drop col 0)
+    valid_shifted = valid[:, 1:mc].bool()
+    L = (n_clean - 1).clamp(min=0)                       # (B,) shifted length per row
+
+    use_w = min(W, mc - 1)
+    if use_w > 0:
+        j = torch.arange(use_w, device=full_ids.device).unsqueeze(0)   # (1, use_w)
+        # keep col j iff within this row's logit count (j<K), within its shifted length
+        # (j<L), and the shifted token is a valid (non-pad) position.
+        keep = (j < K.unsqueeze(1)) & (j < L.unsqueeze(1)) & valid_shifted[:, :use_w]
+        targets[:, :use_w] = torch.where(keep, shifted[:, :use_w], targets[:, :use_w])
+    return targets
+
+
 class WorldModelTrainer(CommonTrainer):
     """
     Trainer for the multimodal world model.
@@ -502,32 +546,9 @@ class WorldModelTrainer(CommonTrainer):
             for pid in placeholder_ids:
                 non_ph_input &= (text_input_ids != pid)
 
-            target_list = []
-            for b in range(full_ids.shape[0]):
-                clean = full_ids[b][non_ph_mask_full[b]]  # non-PH tokens in order
-                clean_valid = valid_full[b][non_ph_mask_full[b]]  # same positions, same order
-                shifted = clean[1:]  # causal shift: predict next non-PH token
-                shifted = shifted.masked_fill(~clean_valid[1:], TEXT_LOSS_IGNORE_INDEX)
-                K = non_ph_input[b].sum().item()  # number of logits this item will produce
-                # Truncate or pad targets to exactly K
-                if shifted.shape[0] >= K:
-                    target_list.append(shifted[:K])
-                else:
-                    target_list.append(torch.cat([
-                        shifted, shifted.new_full((K - shifted.shape[0],), TEXT_LOSS_IGNORE_INDEX)
-                    ]))
-
-            # Pad and stack targets across batch
-            max_len = max(t.shape[0] for t in target_list)
-            padded_targets = []
-            for t in target_list:
-                if t.shape[0] < max_len:
-                    padded_targets.append(torch.cat([
-                        t, t.new_full((max_len - t.shape[0],), TEXT_LOSS_IGNORE_INDEX)
-                    ]))
-                else:
-                    padded_targets.append(t)
-            text_targets = torch.stack(padded_targets)  # [B, T_text]
+            # Vectorized, bit-identical to the former per-item loop (see _build_text_targets).
+            text_targets = _build_text_targets(
+                full_ids, non_ph_mask_full, valid_full, non_ph_input, TEXT_LOSS_IGNORE_INDEX)
 
         # Audio inputs: SIVE features shaped [B, C, T].
         # The world model expects (B, n_audio, C, T) where n_audio is the number
