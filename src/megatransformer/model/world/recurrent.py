@@ -75,8 +75,37 @@ class MegatransformerRecurrentBlock(nn.Module):
         
         self.step = 0
         self.track_iteration_stats = False
+        self._blocks_compiled = False
 
         self._init_weights()
+
+    def compile_blocks(self, dynamic: bool = True):
+        """torch.compile each recurrent block's forward, leaving the Python iteration loop
+        (forward's ``range(n_steps)``) EAGER.
+
+        The world model's throughput ceiling is launch overhead: the trunk runs the same
+        block ~mean_thinking_steps times per step, each iteration firing many tiny kernels.
+        A whole-model compile is a non-starter here — the data-dependent Poisson iteration
+        count and the interleaver's Python control flow cause a recompile storm / graph
+        breaks. Compiling only the BLOCK sidesteps that: the block sees identical shapes on
+        every iteration, so one graph is captured and reused across all iterations, and the
+        varying Poisson count stays in eager Python where it costs nothing to change.
+
+        We compile the block's ``forward`` METHOD (not wrap the module in an OptimizedModule)
+        so ``state_dict`` keys stay clean — no ``_orig_mod.`` prefix that would break every
+        checkpoint/eval loader. ``dynamic=True`` lets the varying interleaved sequence length
+        share the single graph instead of recompiling per length. Idempotent, and it
+        deduplicates shared blocks (share_block_weights => one object in the ModuleList).
+        """
+        if self._blocks_compiled:
+            return
+        seen = set()
+        for block in self.recurrent_blocks:
+            if id(block) in seen:
+                continue
+            seen.add(id(block))
+            block.forward = torch.compile(block.forward, dynamic=dynamic)
+        self._blocks_compiled = True
 
     def _combine(self, x_0: torch.Tensor, thought: torch.Tensor) -> torch.Tensor:
         """Combine input embedding with thought state for block input."""

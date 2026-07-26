@@ -714,6 +714,14 @@ def add_args(parser: argparse.ArgumentParser):
 
         # efficiency params
         sub_parser.add_argument('--compile_model', action='store_true', help='Whether to compile the model')
+        sub_parser.add_argument('--compile_recurrent_block', action='store_true',
+                                help='World model only: torch.compile the recurrent trunk block '
+                                     '(dynamic=True), leaving the Python iteration loop eager so '
+                                     'the Poisson step count never recompiles. Fuses the tiny '
+                                     'per-iteration kernels that make the trunk launch-bound. '
+                                     'Distinct from --compile_model (whole-model), which breaks '
+                                     'the recurrent world model. Not bit-identical (fusion reorders '
+                                     'fp ops ~1e-4); use on a fresh run, not a bit-exact resume.')
         sub_parser.add_argument('--cudnn_benchmark', action='store_true', help='Whether to enable cuDNN benchmark')
         sub_parser.add_argument('--use_gradient_checkpointing', action='store_true', help='Whether to use gradient checkpointing')
 
@@ -888,6 +896,22 @@ if __name__ == "__main__":
         torch._dynamo.config.cache_size_limit = 64
 
     model.to(device)
+
+    # Block-level compile of the recurrent trunk (world model only). Whole-model compile
+    # is a non-starter here — the interleaver's Python control flow + the data-dependent
+    # Poisson iteration count cause graph breaks / a recompile storm. Compiling just the
+    # repeated block (leaving the iteration loop eager) fuses the many tiny per-iteration
+    # kernels that make the trunk launch-bound (~75% GPU idle in profiling), with the
+    # varying interleaved sequence length shared across one graph via dynamic=True.
+    if getattr(args, 'compile_recurrent_block', False) and not args.use_deepspeed:
+        if hasattr(model, 'recurrent_block'):
+            import torch._dynamo
+            torch._dynamo.config.cache_size_limit = max(
+                torch._dynamo.config.cache_size_limit, 64)
+            model.recurrent_block.compile_blocks(dynamic=True)
+            print("[compile] recurrent trunk blocks compiled (dynamic=True)")
+        else:
+            print("[compile] --compile_recurrent_block ignored: model has no recurrent_block")
 
     # Create optimizer if using Muon (not passed to trainer yet)
     optimizer = get_optimizer(args, model)
