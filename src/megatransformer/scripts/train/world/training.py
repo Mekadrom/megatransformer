@@ -129,6 +129,7 @@ class WorldModelTrainer(CommonTrainer):
         voice_ar_attn_ramp_steps: int = 0,
         voice_ar_attn_floor: float = 0.0,
         voice_ar_attn_cap: float = 1.0,
+        voice_ar_attn_ramp_power: float = 1.0,
         # Modality flags
         include_text: bool = True,
         include_audio: bool = True,
@@ -197,6 +198,7 @@ class WorldModelTrainer(CommonTrainer):
         self.voice_ar_attn_ramp_steps = voice_ar_attn_ramp_steps
         self.voice_ar_attn_floor = voice_ar_attn_floor
         self.voice_ar_attn_cap = voice_ar_attn_cap
+        self.voice_ar_attn_ramp_power = voice_ar_attn_ramp_power
         self._voice_ar_attn_enabled = (voice_ar_attn_mask_steps > 0 or voice_ar_attn_ramp_steps > 0)
         # Both attack the teacher-forcing crutch; stacking them confounds the ablation and
         # the curriculum is the stronger, decisive lever, so it REPLACES scheduled sampling.
@@ -1200,8 +1202,16 @@ class WorldModelTrainer(CommonTrainer):
 
         Returns None when the curriculum is off (no bias built, fast attention path).
         Otherwise: ``floor`` for the first ``mask_steps`` (NAR phase, history severed),
-        a linear ramp ``floor``→``cap`` over the next ``ramp_steps``, then ``cap`` (AR).
-        A function of the step only, so train and eval at the same step use the same alpha.
+        then a ``floor``→``cap`` ramp over the next ``ramp_steps`` shaped by
+        ``ramp_power``, then ``cap`` (AR). A function of the step only, so train and eval
+        at the same step use the same alpha.
+
+        ``ramp_power`` shapes the ramp: 1.0 = linear; >1 = EASE-IN (slow start) — alpha
+        crawls through the low range and accelerates late. This matters because the
+        fragility sweep showed the model tolerates the low-alpha band and only breaks
+        higher up, and the linear ramp diverged (grad explosion ~alpha 0.35): spending
+        far more steps re-integrating history at small alpha is the fix. E.g. power=3
+        reaches alpha=0.3 only ~67% into the ramp (0.67^3), then covers 0.3→1 quickly.
         """
         if not self._voice_ar_attn_enabled:
             return None
@@ -1209,12 +1219,14 @@ class WorldModelTrainer(CommonTrainer):
         ramp = max(1, self.voice_ar_attn_ramp_steps)
         floor = self.voice_ar_attn_floor
         cap = self.voice_ar_attn_cap
+        power = max(1e-6, self.voice_ar_attn_ramp_power)
         if global_step < mask_steps:
             return floor
         t = global_step - mask_steps
         if t >= ramp:
             return cap
-        return floor + (cap - floor) * (t / ramp)
+        progress = (t / ramp) ** power
+        return floor + (cap - floor) * progress
 
     def _scheduled_sampling_prob(self, global_step: int) -> float:
         """Per-frame probability of feeding the model's OWN prediction instead of ground
@@ -1875,6 +1887,7 @@ def create_trainer(
         voice_ar_attn_ramp_steps=getattr(args, 'voice_ar_attn_ramp_steps', 0),
         voice_ar_attn_floor=getattr(args, 'voice_ar_attn_floor', 0.0),
         voice_ar_attn_cap=getattr(args, 'voice_ar_attn_cap', 1.0),
+        voice_ar_attn_ramp_power=getattr(args, 'voice_ar_attn_ramp_power', 1.0),
         include_text="text" in include_modes,
         include_audio="audio" in include_modes,
         include_voice="voice" in include_modes,
@@ -2227,6 +2240,12 @@ def add_cli_args(subparsers):
                             help="Maximum voice→voice attention scale alpha the ramp reaches "
                                  "(1.0 = full attention restored; <1.0 keeps some suppression "
                                  "permanent, which then also applies at generation).")
+    sub_parser.add_argument("--voice_ar_attn_ramp_power", type=float, default=1.0,
+                            help="Ramp shape: 1.0 = linear; >1 = EASE-IN (slow start) so alpha "
+                                 "crawls through the low band and accelerates late. Use >1 (e.g. 3) "
+                                 "when the low-alpha history-reintroduction is the fragile part — the "
+                                 "linear ramp diverged (grad explosion ~alpha 0.35); an ease-in "
+                                 "spends most ramp steps re-integrating history at small alpha.")
     sub_parser.add_argument("--voice_token_budget", type=int, default=None,
                             help="Max content frames generate() may emit before force-closing with "
                                  "EOV, for the TensorBoard TTS renders. Default: derived from "

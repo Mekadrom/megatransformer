@@ -197,7 +197,7 @@ def test_loss_forward_finite(world_model, voice_batch, alpha):
 
 
 # ── 5. Trainer alpha schedule (duck-typed — avoids constructing a full Trainer) ──
-def _schedule(mask_steps, ramp_steps, floor, cap, step):
+def _schedule(mask_steps, ramp_steps, floor, cap, step, power=1.0):
     from megatransformer.scripts.train.world.training import WorldModelTrainer
 
     class _Dummy:
@@ -208,6 +208,7 @@ def _schedule(mask_steps, ramp_steps, floor, cap, step):
     d.voice_ar_attn_ramp_steps = ramp_steps
     d.voice_ar_attn_floor = floor
     d.voice_ar_attn_cap = cap
+    d.voice_ar_attn_ramp_power = power
     d._voice_ar_attn_enabled = (mask_steps > 0 or ramp_steps > 0)
     return WorldModelTrainer._voice_attn_alpha(d, step)
 
@@ -233,3 +234,20 @@ def test_schedule_respects_floor_and_cap():
     assert _schedule(5000, 10000, 0.2, 0.8, 0) == 0.2
     assert math.isclose(_schedule(5000, 10000, 0.2, 0.8, 10000), 0.5, abs_tol=1e-6)
     assert _schedule(5000, 10000, 0.2, 0.8, 999999) == 0.8
+
+
+def test_ease_in_ramp_power():
+    """power>1 crawls through low alpha: same boundaries, but midpoint is far lower and
+    the low band is stretched (spends most ramp steps re-integrating history at small alpha)."""
+    ms, ramp = 10000, 20000
+    # Boundaries unchanged regardless of power.
+    assert _schedule(ms, ramp, 0.0, 1.0, ms, power=3) == 0.0
+    assert _schedule(ms, ramp, 0.0, 1.0, ms + ramp, power=3) == 1.0
+    # Ramp midpoint: linear=0.5, power=3 => 0.5^3=0.125 (much lower — still deep in the low band).
+    assert math.isclose(_schedule(ms, ramp, 0.0, 1.0, ms + ramp // 2, power=3), 0.125, abs_tol=1e-6)
+    # alpha=0.3 is reached only ~67% into the ramp under power=3 (0.669^3 ≈ 0.3).
+    a = _schedule(ms, ramp, 0.0, 1.0, ms + int(0.669 * ramp), power=3)
+    assert math.isclose(a, 0.3, abs_tol=1e-2)
+    # Monotonic increasing and always <= the linear value in the ramp interior.
+    lin = _schedule(ms, ramp, 0.0, 1.0, ms + ramp // 2, power=1)
+    assert _schedule(ms, ramp, 0.0, 1.0, ms + ramp // 2, power=3) < lin
