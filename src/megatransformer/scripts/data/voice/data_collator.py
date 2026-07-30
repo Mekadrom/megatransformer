@@ -36,6 +36,7 @@ class VoiceDataCollator(DataCollator):
         all_waveforms = []
         all_waveform_lengths = []
         all_features = []
+        all_unit_ids = []
         all_feature_lengths = []
         all_mel_specs = []
         all_speaker_embeddings = []
@@ -53,6 +54,7 @@ class VoiceDataCollator(DataCollator):
             all_waveforms.append(trim(ex.get("waveform", None), self.max_waveforms, dim=-1))
             all_waveform_lengths.append(ex.get("waveform_length", None))
             all_features.append(trim(ex.get("features", None), self.max_sive_feature_frames, dim=-1))
+            all_unit_ids.append(trim(ex.get("unit_ids", None), self.max_sive_feature_frames, dim=-1))
             all_feature_lengths.append(ex.get("feature_length", None))
             all_mel_specs.append(trim(ex.get("mel_spec", None), self.max_mel_spec_frames, dim=-1))
             all_mel_lengths.append(ex.get("mel_length", None))
@@ -85,6 +87,21 @@ class VoiceDataCollator(DataCollator):
             padded_features = [f * m.to(f.dtype) for f, m in zip(padded_features, features_masks)]
         else:
             padded_features, features_masks = None, None
+        # Pre-quantized unit ids (Mimi): [T'] int. Padded into the "features" slot so the
+        # SMG's _embed_ids sees integer ids. Only when there are no continuous features
+        # (the SIVE-VQ path already yields float centroids). Pad id 0 is a valid code but
+        # its frames are masked downstream by the mel length, so it never reaches the loss.
+        if padded_features is None and all_unit_ids[0] is not None:
+            padded_unit_ids, unit_id_masks = pad_and_mask(all_unit_ids, all_feature_lengths)
+            # Mark every pad frame (the collator's batch pad AND the shard's internal 0-pad
+            # past feature_length) with -1 so the SMG embeds it to ZERO instead of code 0's
+            # real vector. Otherwise the decoder renders code-0 content in the padded tail =
+            # an end-of-clip burst (invisible in the length-trimmed mel viz, audible in the
+            # vocoded clip). Mirrors the continuous feature-pad zeroing above.
+            padded_unit_ids = [torch.where(m.bool(), u, torch.full_like(u, -1))
+                               for u, m in zip(padded_unit_ids, unit_id_masks)]
+        else:
+            padded_unit_ids, unit_id_masks = None, None
         if all_mel_specs[0] is not None:
             padded_mel_specs, mel_spec_masks = pad_and_mask(all_mel_specs, all_mel_lengths)
         else:
@@ -111,6 +128,10 @@ class VoiceDataCollator(DataCollator):
             batch["features"] = torch.stack(padded_features)  # [B, encoder_dim, T'] or [B, num_layers, encoder_dim, T']
             batch["feature_lengths"] = torch.stack(all_feature_lengths)  # [B]
             batch["feature_masks"] = torch.stack(features_masks)  # [B, T'] mask for features
+        elif padded_unit_ids is not None:
+            batch["features"] = torch.stack(padded_unit_ids)  # [B, T'] integer unit ids
+            batch["feature_lengths"] = torch.stack(all_feature_lengths)  # [B]
+            batch["feature_masks"] = torch.stack(unit_id_masks)  # [B, T']
 
         if padded_mel_specs is not None:
             batch["mel_specs"] = torch.stack(padded_mel_specs)  # [B, num_mel_bins, T']

@@ -158,6 +158,17 @@ def extract_f0_batch_gpu(
 
     waveforms = waveforms.to(device)
 
+    if sample_rate != 16000:
+        # torchcrepe's INTERNAL resample can't handle a [B>1, T] batch (it does .squeeze(0),
+        # which errors for B>1). So resample to 16k here (torchaudio handles batches) and run
+        # torchcrepe at 16k so it skips that path. Scale the hop to preserve the frame rate
+        # (e.g. hop256@24kHz=93.75Hz -> hop171@16kHz=93.57Hz; the ~0.2% drift is absorbed when
+        # F0/VUV are padded to mel_length downstream).
+        import torchaudio.functional as AF
+        waveforms = AF.resample(waveforms, sample_rate, 16000)
+        hop_length = max(1, round(hop_length * 16000 / sample_rate))
+        sample_rate = 16000
+
     # Extract pitch and periodicity (voicing confidence)
     # Using viterbi decoder for smoother pitch contours
     # batch_size controls frames per CNN forward pass, not audio files
@@ -338,6 +349,66 @@ class ContentVecBatchProcessor(BatchProcessor):
         return {"features": feats, "feature_lengths": feat_lengths}
 
 
+class MimiBatchProcessor(BatchProcessor):
+    """Pretrained Mimi (Kyutai) semantic codebook-0 as a DISCRETE content tokenizer.
+
+    Emits INTEGER unit ids at Mimi's native 12.5 Hz (NOT interpolated to the mel grid):
+    the SMG embeds the ids via nn.Embedding and a 4x-upsample decoder brings 12.5 Hz ->
+    50 Hz mel (pair with `--hop_length 320` and the medium_decoder_only_1d_4x_mimicontour
+    config). Mimi wants 24 kHz, so the 16 kHz waveforms are resampled up per utterance
+    (trimmed first, so no padding bleeds into the conv edges). Only the semantic
+    (WavLM-distilled) codebook is taken, so the ids carry content, not timbre — the
+    speaker arrives via ECAPA at the SMG, exactly as with SIVE. encoder_dim (256) is the
+    codebook dim; set the SMG's --sive_encoder_dim to match and build its unit embedding
+    from `extract_mimi_codebook`'s codebook.
+    """
+
+    def __init__(self, voice_max_frames: int, mel_frame_rate: float, device: str = "cuda",
+                 model_id: str = "kyutai/mimi", source_sr: int = 16000):
+        from transformers import MimiModel
+        self.model = MimiModel.from_pretrained(model_id).to(device).eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.device = device
+        self.source_sr = source_sr                                 # rate of the input waveforms
+        self.model_sr = self.model.config.sampling_rate            # 24000
+        self.frame_rate = float(self.model.config.frame_rate)      # 12.5
+        # Pad ids to the MIMI (12.5Hz) budget, NOT the mel budget: voice_max_frames counts
+        # mel frames, so unit ids are mel_rate/12.5 fewer (4x @50Hz/16k, 7.5x @93.75Hz/24k).
+        # The collator caps units at max_sive_feature_frames = ceil(voice_max_frames /
+        # sive_total_stride), so pass --sive_total_stride = floor(mel_frame_rate/12.5): 4 for
+        # the 16k/50Hz path, 7 (NOT 8) for the 24k/93.75Hz path. It is an integer DIVISOR, so
+        # round the fractional 7.5 DOWN -- rounding up to 8 caps below this max_id_frames budget
+        # and truncates the longest clips' unit tails.
+        self.max_id_frames = int(voice_max_frames * self.frame_rate / mel_frame_rate) + 1
+        self.encoder_dim = self.model.quantizer.semantic_residual_vector_quantizer.layers[0].codebook.embed.shape[1]
+        self.num_layers = 1
+
+    @torch.no_grad()
+    def process_batch(
+        self,
+        waveforms: list[torch.Tensor],
+        waveform_lengths: torch.Tensor,
+        mel_spec_lengths: torch.Tensor = None,
+    ) -> Dict[str, torch.Tensor]:
+        import torchaudio.functional as AF
+        B = len(waveforms)
+        unit_ids = torch.zeros(B, self.max_id_frames, dtype=torch.long)
+        feat_lengths = torch.zeros(B, dtype=torch.long)
+        for i in range(B):
+            wlen = int(waveform_lengths[i].item())
+            wav = waveforms[i][:wlen].float().to(self.device).reshape(1, 1, -1)  # trim pad
+            if self.source_sr != self.model_sr:                    # native 24k -> no resample
+                wav = AF.resample(wav, self.source_sr, self.model_sr)
+            enc = self.model.encode(wav, num_quantizers=1)            # semantic cb0 only
+            codes = enc.audio_codes if hasattr(enc, "audio_codes") else enc[0]  # [1, 1, L]
+            ids = codes[0, 0].long().cpu()                            # [L]
+            L = min(int(ids.shape[0]), self.max_id_frames)
+            unit_ids[i, :L] = ids[:L]
+            feat_lengths[i] = max(L, 1)
+        return {"unit_ids": unit_ids, "feature_lengths": feat_lengths}
+
+
 class SpeakerEmbeddingBatchProcessor(BatchProcessor):
     """Batched GPU processing for extracting speaker embeddings."""
 
@@ -513,9 +584,9 @@ class VoiceDatasetPreprocessor(Preprocessor):
         self._samples_in_shard = 0
 
         assert args.save_waveforms or args.save_mel_specs or args.sive_checkpoint_path is not None \
-            or args.content_encoder == "contentvec", \
+            or args.content_encoder in ("contentvec", "mimi"), \
             "At least one of --save_waveforms, --save_mel_specs, --sive_checkpoint_path, or " \
-            "--content_encoder contentvec must be specified."
+            "--content_encoder contentvec|mimi must be specified."
 
         self.voice_max_frames = (args.voice_max_seconds * args.sample_rate) // args.hop_length
 
@@ -639,12 +710,44 @@ class VoiceDatasetPreprocessor(Preprocessor):
                 'shard_feature_lengths': [],
             })
 
+        # Vocos mel TARGETS (--mel_extractor vocos): 100-mel 24kHz from Vocos's own extractor,
+        # so mel_specs are byte-for-byte what Vocos synthesizes. Requires --sample_rate 24000.
+        self._vocos = None
+        if getattr(args, "mel_extractor", "default") == "vocos":
+            from megatransformer.utils.vocos_features import load_vocos
+            self._vocos = load_vocos(self.device)
+            print("  Vocos mel targets ON (100-mel, 24kHz, hop256). Ensure --sample_rate 24000 "
+                  "--hop_length 256; train SMG with medium_decoder_only_1d_8x_mimicontour_vocos "
+                  "+ --vocoder_config vocos.")
+
+        self.mimi_batch_processor = None
+        if args.content_encoder == "mimi":
+            print("Loading Mimi (kyutai/mimi) semantic codebook-0 as a discrete tokenizer ...")
+            self.mimi_batch_processor = MimiBatchProcessor(
+                voice_max_frames=self.voice_max_frames,
+                mel_frame_rate=args.sample_rate / args.hop_length,
+                device=self.device,
+                model_id=args.mimi_model,
+                source_sr=args.sample_rate,   # native 24k -> Mimi skips the 16->24 upsample
+            )
+            print(f"  Mimi 12.5Hz semantic ids (codebook dim {self.mimi_batch_processor.encoder_dim}); "
+                  f"use --hop_length 320 (mel 50Hz) + the medium_decoder_only_1d_4x_mimicontour SMG "
+                  f"config + a codebook from extract_mimi_codebook.")
+            shard_fields.update({
+                'shard_unit_ids': [],
+                'shard_feature_lengths': [],
+            })
+
         self.speaker_feature_batch_processor = None
         if args.compute_speaker_embeddings:
+            # ECAPA/WavLM are 16kHz models -> build the speaker processor at 16kHz; on a
+            # 24kHz (Vocos) run the process loop hands it a 16k-resampled waveform.
+            _spk_sr = 16000 if self.args.sample_rate > 16000 else self.args.sample_rate
+            _spk_hop = 256 if self.args.sample_rate > 16000 else self.args.hop_length
             self.speaker_feature_batch_processor = SpeakerEmbeddingBatchProcessor(
                 shared_window_buffer=self.shared_window_buffer,
-                sample_rate=self.args.sample_rate,
-                hop_length=self.args.hop_length,
+                sample_rate=_spk_sr,
+                hop_length=_spk_hop,
                 voice_max_seconds=self.args.voice_max_seconds,
                 speaker_encoder_type=self.args.speaker_encoder_type,
                 device=self.device,
@@ -784,12 +887,16 @@ class VoiceDatasetPreprocessor(Preprocessor):
     
         # SIVE model
         sub_parser.add_argument("--content_encoder", type=str, default="sive",
-                            choices=["sive", "contentvec"],
-                            help="Which content encoder to store as the 'features' field. 'sive' (default) = the "
-                                 "custom SIVE checkpoint (--sive_checkpoint_path). 'contentvec' = off-the-shelf "
-                                 "ContentVec (speaker-disentangled HuBERT) on the waveforms, ~50 Hz — pair with "
-                                 "--hop_length 320 so mel matches, and set the SMG's --sive_encoder_dim to the "
-                                 "ContentVec dim (768 for the default model) + a 1x-upsample SMG decoder.")
+                            choices=["sive", "contentvec", "mimi"],
+                            help="Which content encoder to store. 'sive' (default) = the custom SIVE checkpoint "
+                                 "(--sive_checkpoint_path), continuous 'features'. 'contentvec' = off-the-shelf "
+                                 "ContentVec (~50 Hz continuous 'features'; pair --hop_length 320 + 1x decoder). "
+                                 "'mimi' = pretrained Mimi semantic codebook-0, stored as DISCRETE integer "
+                                 "'unit_ids' at 12.5 Hz; pair --hop_length 320 (mel 50Hz), the SMG "
+                                 "medium_decoder_only_1d_4x_mimicontour config, --sive_encoder_dim 256, and a "
+                                 "codebook from scripts.data.voice.extract_mimi_codebook.")
+        sub_parser.add_argument("--mimi_model", type=str, default="kyutai/mimi",
+                            help="HF model id for the Mimi tokenizer (--content_encoder mimi).")
         sub_parser.add_argument("--contentvec_dim", type=int, default=768, choices=[256, 768],
                             help="ContentVec feature width: 768 (last_hidden_state) or 256 (final_proj — same 95M "
                                  "model, matches SIVE's width; pair with the SMG's --sive_encoder_dim).")
@@ -821,6 +928,14 @@ class VoiceDatasetPreprocessor(Preprocessor):
         sub_parser.add_argument("--n_mels", type=int, default=80)
         sub_parser.add_argument("--n_fft", type=int, default=1024)
         sub_parser.add_argument("--hop_length", type=int, default=256)
+        sub_parser.add_argument("--mel_extractor", type=str, default="default",
+                                choices=["default", "vocos"],
+                                help="'default' = the repo's log-mel (--n_mels/--n_fft/--hop_length). "
+                                     "'vocos' = compute mel TARGETS with Vocos's own feature extractor "
+                                     "(100-mel, 24kHz, hop256, for lossless charactr/vocos-mel-24khz "
+                                     "synthesis). Pair with --sample_rate 24000 --hop_length 256; the "
+                                     "waveform is treated as native 24kHz (so LibriTTS-R without "
+                                     "downsampling, and Mimi skips its 16->24 upsample).")
         sub_parser.add_argument("--voice_max_seconds", type=int, default=10,
                             help="Maximum audio length in seconds")
         sub_parser.add_argument("--min_audio_seconds", type=float, default=0.1,
@@ -956,8 +1071,24 @@ class VoiceDatasetPreprocessor(Preprocessor):
             shard_data["feature_lengths"] = torch.cat(self.shard_fields['shard_feature_lengths'], dim=0)
             
             num_samples = shard_data["features"].shape[0]
-            
+
             self.shard_fields['shard_features'] = []
+            self.shard_fields['shard_feature_lengths'] = []
+
+        if self.args.content_encoder == "mimi":
+            # Discrete unit ids (Mimi): [N, T'] int at 12.5Hz. Stored under "unit_ids"
+            # (NOT "features") so the dataset embeds them rather than treating them as
+            # continuous features / snapping them to a k-means codebook.
+            max_id_len = max(u.shape[-1] for u in self.shard_fields['shard_unit_ids'])
+            padded_ids = []
+            for u in self.shard_fields['shard_unit_ids']:
+                if u.shape[-1] < max_id_len:
+                    u = F.pad(u, (0, max_id_len - u.shape[-1]), value=0)
+                padded_ids.append(u)
+            shard_data["unit_ids"] = torch.cat(padded_ids, dim=0)
+            shard_data["feature_lengths"] = torch.cat(self.shard_fields['shard_feature_lengths'], dim=0)
+            num_samples = shard_data["unit_ids"].shape[0]
+            self.shard_fields['shard_unit_ids'] = []
             self.shard_fields['shard_feature_lengths'] = []
 
         if self.args.save_waveforms:
@@ -1086,14 +1217,21 @@ class VoiceDatasetPreprocessor(Preprocessor):
             waveform_lengths.append(len(waveform))
 
             # Extract mel spectrogram
-            mel = extract_mels(
-                self.shared_window_buffer,
-                waveform,
-                sr=self.args.sample_rate,
-                n_mels=self.args.n_mels,
-                n_fft=self.args.n_fft,
-                hop_length=self.args.hop_length,
-            )
+            if self._vocos is not None:
+                # Vocos-compatible mel TARGETS (100-mel, 24kHz, hop 256) computed with Vocos's
+                # OWN feature extractor -> byte-for-byte match for lossless synthesis. Requires
+                # --sample_rate 24000 (the waveform is native 24kHz here).
+                from megatransformer.utils.vocos_features import vocos_mel
+                mel = vocos_mel(self._vocos, waveform.to(self.device)).cpu()
+            else:
+                mel = extract_mels(
+                    self.shared_window_buffer,
+                    waveform,
+                    sr=self.args.sample_rate,
+                    n_mels=self.args.n_mels,
+                    n_fft=self.args.n_fft,
+                    hop_length=self.args.hop_length,
+                )
 
             mel_length = min(mel.shape[-1], self.voice_max_frames)
             mel_lengths.append(mel_length)
@@ -1122,13 +1260,31 @@ class VoiceDatasetPreprocessor(Preprocessor):
             mel_specs, mel_spec_lengths, waveform_lengths = self.encode_to_mels(waveforms)
 
             features_result = None
+            unit_ids_result = None
             if self.sive_batch_processor is not None:
                 features_result = self.sive_batch_processor.process_batch(mel_specs.to(self.sive_batch_processor.device), mel_spec_lengths.to(self.sive_batch_processor.device))
             elif self.contentvec_batch_processor is not None:
                 features_result = self.contentvec_batch_processor.process_batch(waveforms, waveform_lengths, mel_spec_lengths)
+            elif self.mimi_batch_processor is not None:
+                unit_ids_result = self.mimi_batch_processor.process_batch(waveforms, waveform_lengths, mel_spec_lengths)
 
             if self.args.compute_speaker_embeddings:
-                speaker_features_result = self.speaker_feature_batch_processor.process_batch(waveforms, waveform_lengths, mel_specs, mel_spec_lengths)
+                spk_wavs, spk_wav_lens = waveforms, waveform_lengths
+                spk_mels, spk_mel_lens = mel_specs, mel_spec_lengths
+                if self.args.sample_rate != 16000:
+                    # ECAPA/WavLM are 16kHz. WavLM reads the WAVEFORM -> resample to 16k.
+                    # ECAPA reads the MEL -> it would need a separate 16k 80-mel (the Vocos
+                    # 100-mel is wrong for it), which isn't wired yet; require WavLM for 24kHz.
+                    import torchaudio.functional as AF
+                    if self.speaker_feature_batch_processor.speaker_encoder_input_type != "waveform":
+                        raise ValueError(
+                            "24kHz preprocessing currently supports only --speaker_encoder_type wavlm "
+                            "(it reads the waveform). ECAPA reads a mel and would need a separate 16k "
+                            "80-mel, not the Vocos 100-mel target -- not yet wired.")
+                    spk_wavs = [AF.resample(w.float(), self.args.sample_rate, 16000) for w in waveforms]
+                    spk_wav_lens = torch.tensor([len(w) for w in spk_wavs], dtype=torch.long)
+                speaker_features_result = self.speaker_feature_batch_processor.process_batch(
+                    spk_wavs, spk_wav_lens, spk_mels, spk_mel_lens)
 
             if self.args.extract_f0:
                 f0_vuv_result = self.f0_vuv_batch_processor.process_batch(waveforms, waveform_lengths)
@@ -1149,6 +1305,10 @@ class VoiceDatasetPreprocessor(Preprocessor):
             if features_result is not None:
                 self.shard_fields['shard_features'].append(features_result["features"])
                 self.shard_fields['shard_feature_lengths'].append(features_result["feature_lengths"])
+
+            if unit_ids_result is not None:
+                self.shard_fields['shard_unit_ids'].append(unit_ids_result["unit_ids"])
+                self.shard_fields['shard_feature_lengths'].append(unit_ids_result["feature_lengths"])
 
             if self.args.save_waveforms:
                 self.shard_fields['shard_waveforms'].extend(waveforms)
@@ -1321,7 +1481,8 @@ class VoiceDatasetPreprocessor(Preprocessor):
             "content_encoder": self.args.content_encoder,
             "contentvec_model": self.args.contentvec_model if self.contentvec_batch_processor is not None else None,
             "encoder_dim": (self.sive_batch_processor.sive_model.config.encoder_dim if self.sive_batch_processor is not None
-                            else self.contentvec_batch_processor.encoder_dim if self.contentvec_batch_processor is not None else 0),
+                            else self.contentvec_batch_processor.encoder_dim if self.contentvec_batch_processor is not None
+                            else self.mimi_batch_processor.encoder_dim if self.mimi_batch_processor is not None else 0),
             # ContentVec features are interpolated to the mel-frame count, so 1:1 with mel (stride 1).
             "total_stride": (self.sive_batch_processor.sive_model.conv_subsample.total_stride if self.sive_batch_processor is not None
                              else 1 if self.contentvec_batch_processor is not None else 0),
@@ -1329,7 +1490,12 @@ class VoiceDatasetPreprocessor(Preprocessor):
             "dataset_config": self.args.dataset_config,
             "split": self.args.split,
             "sample_rate": self.args.sample_rate,
-            "n_mels": self.args.n_mels,
+            # The mel target extractor: "default" = the repo's log-mel (--n_mels/--n_fft/--hop_length);
+            # "vocos" = Vocos's own 100-mel 24kHz extractor (byte-exact vocoder targets, ignores --n_mels).
+            "mel_extractor": getattr(self.args, "mel_extractor", "default"),
+            # EFFECTIVE mel bands actually stored: Vocos is a fixed 100-band extractor regardless of
+            # --n_mels (default 80), so log 100 for it — else the manifest lies about the shard shape.
+            "n_mels": 100 if getattr(self.args, "mel_extractor", "default") == "vocos" else self.args.n_mels,
             "n_fft": self.args.n_fft,
             "hop_length": self.args.hop_length,
             "voice_max_seconds": self.args.voice_max_seconds,
@@ -1345,7 +1511,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
             # Feature extraction settings
             "normalize": self.args.normalize,
             "layers": self.args.layers,  # None for single layer (default), list for multi-layer
-            "num_layers": self.sive_batch_processor.num_layers if self.sive_batch_processor is not None else (1 if self.contentvec_batch_processor is not None else 0),  # 1 for single layer, >1 for multi-layer
+            "num_layers": self.sive_batch_processor.num_layers if self.sive_batch_processor is not None else (1 if (self.contentvec_batch_processor is not None or self.mimi_batch_processor is not None) else 0),  # 1 for single layer, >1 for multi-layer
             # F0 extraction settings
             "extract_f0": self.args.extract_f0,
             "f0_fmin": self.args.f0_fmin,

@@ -240,8 +240,32 @@ def _load_pretrained_hifigan():
                                     hop_length=256, sample_rate=16000)
 
 
+def _load_pretrained_vocos():
+    """Load Vocos (charactr/vocos-mel-24khz): fast ISTFT-head 24 kHz vocoder, ~13.5M params.
+
+    Mel parameters: 100 bins, 1024 n_fft, 256 hop_length (-> 93.75 Hz), power=1
+    (magnitude), log(clip 1e-7). Compute the SMG's mel TARGETS with vocos_features.vocos_mel
+    (Vocos's own extractor) so they match exactly.
+    """
+    from megatransformer.utils.vocos_features import load_vocos
+    vocos = load_vocos(device="cuda:0" if torch.cuda.is_available() else "cpu")
+
+    class VocosInner(torch.nn.Module):
+        def __init__(self, v):
+            super().__init__()
+            self.vocos = v
+
+        def forward(self, mel_spec: torch.Tensor) -> torch.Tensor:
+            # mel_spec: [B, 100, T] log-mel in Vocos's format -> [B, T] waveform
+            return self.vocos.decode(mel_spec.float())
+
+    return PretrainedVocoderWrapper(VocosInner(vocos), name="vocos-mel-24khz",
+                                    hop_length=256, sample_rate=24000)
+
+
 PRETRAINED_VOCODERS = {
     "hifigan": _load_pretrained_hifigan,
+    "vocos": _load_pretrained_vocos,
 }
 
 

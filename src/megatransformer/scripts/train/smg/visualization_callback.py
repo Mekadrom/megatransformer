@@ -307,7 +307,16 @@ class SMGVisualizationCallback(VisualizationCallback):
                     # rather than leaving it to be inferred from losses.
                     feat_len = sample.get("feature_lengths", None)
                     feat_trimmed = features[0]
-                    if feat_len is not None:
+                    if not torch.is_floating_point(feat_trimmed):
+                        # Discrete unit ids (Mimi): the decoder RECEIVES the EMBEDDED ids,
+                        # so render that [D, T'] grid rather than the raw 1-D id sequence
+                        # (which has no feature-dim axis for render_feature_grid).
+                        _core = getattr(model, "module", model)
+                        ids = feat_trimmed.long()
+                        if feat_len is not None:
+                            ids = ids[:int(feat_len[0])]
+                        feat_trimmed = _core.unit_embedding(ids.clamp(min=0)).transpose(0, 1)  # [D, T']
+                    elif feat_len is not None:
                         feat_trimmed = feat_trimmed[..., :int(feat_len[0])]
                     metrics.log_image(
                         f"eval_smg/input_features/{i}",

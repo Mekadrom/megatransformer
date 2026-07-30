@@ -497,7 +497,21 @@ class SMGTrainer(CommonTrainer):
                     rw = model.decode(features, speaker_embedding=decode_speaker_embedding[perm], features=features, f0_contour=f0_contour)
                     if rw.dim() == 4 and rw.shape[1] == 1:
                         rw = rw.squeeze(1)
-                    recon_wrong = rw[..., :recon.shape[-1]]
+                    # Match recon's time length. recon was pad/cropped to the target in the
+                    # model forward, but this raw decode() is not — and a discrete-unit 4x
+                    # decoder (Mimi 12.5->50Hz) can round to a slightly different length, so
+                    # PAD as well as crop (a bare :recon.shape[-1] slice can't lengthen).
+                    T = recon.shape[-1]
+                    if rw.shape[-1] > T:
+                        rw = rw[..., :T]
+                    elif rw.shape[-1] < T:
+                        # Replicate the last frame, not 0-pad: 0 is near-max energy in
+                        # log-mel space, so a 0-pad tail hands the discriminator an easy
+                        # "fake" tell (max-energy last frame) it can exploit instead of
+                        # judging real quality. Matches the main recon reconciliation.
+                        edge = rw[..., -1:]
+                        rw = torch.cat([rw, edge.repeat(1, 1, T - rw.shape[-1])], dim=-1)
+                    recon_wrong = rw
 
             # Discriminator Update
             if global_step % self.discriminator_update_frequency == 0:
@@ -1186,7 +1200,10 @@ class SMGTrainer(CommonTrainer):
             # Log FiLM statistics (for diagnosing speaker conditioning health)
             if film_stats is not None:
                 for stat_name, stat_value in film_stats.items():
-                    metrics.log_scalar(f"{prefix}film/{stat_name}", stat_value, global_step)
+                    # Stats arrive as detached 0-dim tensors (kept in-graph to stay
+                    # torch.compile-safe); .item() them here, outside the compiled model.
+                    v = stat_value.item() if torch.is_tensor(stat_value) else stat_value
+                    metrics.log_scalar(f"{prefix}film/{stat_name}", v, global_step)
 
         outputs = {
             "loss": total_loss,
@@ -1388,11 +1405,20 @@ class SMGTrainer(CommonTrainer):
 
 def load_model(args):
     overrides = {"sive_encoder_dim": args.sive_encoder_dim}
+    # Speaker-embedding width must match the preprocessed embeddings (192 ECAPA, 768
+    # WavLM). Sizes the decoder FiLM + F0-predictor speaker_proj Linears; from_config
+    # threads it into just those sub-configs. Default 192 = a no-op for ECAPA runs.
+    overrides["speaker_embedding_dim"] = args.speaker_embedding_dim
     # Keep the F0 conditioning embedding's harmonic-phase step (hop/sample_rate) in
     # sync with the mel/F0 frame rate. Routed to the F0-embedding sub-config only
     # (from_config pops it before the F0-predictor build). e.g. 320 for a 50 Hz
     # ContentVec run; 256 (the default) matches existing runs = no change.
     overrides["hop_length"] = args.voice_hop_length
+    # Same for the F0-embedding sample_rate: frame_duration = hop/sample_rate, so the 24 kHz
+    # Vocos path (256/24000) needs this or the harmonic phase runs at the 16 kHz default and
+    # the F0 conditioning harmonics come out 1.5x off. Routed to the F0-embedding sub-config
+    # only (from_config pops it before the decoder/F0-predictor builds).
+    overrides["sample_rate"] = args.voice_sample_rate
     # Architectural input InstanceNorm on the raw SIVE features (strips the speaker
     # envelope at the SMG input). Only override when the flag is passed, so a preset
     # that enables it isn't clobbered by the CLI default.
@@ -1409,6 +1435,15 @@ def load_model(args):
         "vuv_loss_weight": args.vuv_loss_weight,
     }
     overrides.update({k: v for k, v in _loss_overrides.items() if v is not None})
+    # Discrete-unit SMG (Mimi ids): feed the codebook centroids so the unit embedding can
+    # init from them (learned_centroid / frozen). from_config uses these only when the
+    # config's num_codes>0; harmless otherwise. --code_embed_init overrides the preset.
+    cb_path = getattr(args, "voice_codebook_path", None)
+    if cb_path:
+        from megatransformer.utils.codebook import load_codebook
+        overrides["unit_embed_centroids"] = load_codebook(cb_path)
+    if getattr(args, "code_embed_init", None):
+        overrides["code_embed_init"] = args.code_embed_init
     return model_loading_utils.load_model(SMG, args.config, checkpoint_path=args.resume_from_checkpoint, overrides=overrides)
 
 
@@ -1480,7 +1515,11 @@ def create_trainer(
     if args.multi_scale_mel_loss_weight > 0:
         multi_scale_mel_loss = MultiScaleMelSpectrogramLoss()
         multi_scale_mel_loss.to(device)
-        print(f"Created MultiScaleMelSpectrogramLoss (weight={args.multi_scale_mel_loss_weight})")
+        _ms_active = args.audio_perceptual_loss_weight > 0
+        print(f"Created MultiScaleMelSpectrogramLoss (weight={args.multi_scale_mel_loss_weight}) -- "
+              + ("ACTIVE" if _ms_active else
+                 "INACTIVE: it is a component of AudioPerceptualLoss, so it does nothing until "
+                 "--audio_perceptual_loss_weight > 0"))
 
     # Create audio perceptual loss if enabled
     audio_perceptual_loss = None
@@ -1618,7 +1657,10 @@ def create_trainer(
         audio_perceptual_loss_weight=args.audio_perceptual_loss_weight,
         audio_perceptual_loss_start_step=args.audio_perceptual_loss_start_step,
         vocoder=vocoder,
-        log_film_stats=args.log_film_stats,
+        # NB: --log_film_stats is a string; "false" is a TRUTHY non-empty string, so parse
+        # it to a real bool (otherwise film-stats .item() collection runs every step and
+        # graph-breaks torch.compile even at the default).
+        log_film_stats=str(args.log_film_stats).lower() in ("true", "1", "yes"),
         film_contrastive_loss_weight=args.film_contrastive_loss_weight,
         film_contrastive_loss_start_step=args.film_contrastive_loss_start_step,
         film_contrastive_margin_max=args.film_contrastive_margin_max,
@@ -1762,16 +1804,31 @@ def add_cli_args(subparsers):
     # Audio perceptual loss settings (speech-focused)
     # Total weight for all audio perceptual losses (0 = disabled)
     sub_parser.add_argument("--audio_perceptual_loss_weight", type=float, default=0.0,
-                           help="Total weight for audio perceptual loss (0 = disabled)")
-    # Waveform-domain losses (require vocoder, gradients flow through frozen vocoder)
-    # These losses operate on waveforms generated by the vocoder, providing direct audio supervision
+                           help="MASTER SWITCH for the whole audio-perceptual family (multi_scale_mel + "
+                                "waveform_stft + waveform_mel). At 0 (default) the AudioPerceptualLoss module "
+                                "is not even built, so ALL of those sub-losses are OFF regardless of their own "
+                                "weights. Must be >0 for any of them to apply; each then contributes "
+                                "audio_perceptual_loss_weight * (its own weight). In particular a nonzero "
+                                "--multi_scale_mel_loss_weight does NOTHING unless this is >0.")
+    # Waveform-domain losses (sub-components of AudioPerceptualLoss): require
+    # --audio_perceptual_loss_weight > 0, AND they RUN THE VOCODER in the training loop
+    # (gradients flow through the frozen vocoder) -- expensive. Leave at 0 for cheap
+    # mel-domain de-blur (see --multi_scale_mel_loss_weight).
     sub_parser.add_argument("--waveform_stft_loss_weight", type=float, default=0.0,
-                           help="Weight for MultiResolutionSTFTLoss on waveforms")
+                           help="Weight for MultiResolutionSTFTLoss on VOCODED waveforms. Needs "
+                                "--audio_perceptual_loss_weight > 0 AND runs the vocoder in-loop (expensive).")
     sub_parser.add_argument("--waveform_mel_loss_weight", type=float, default=0.0,
-                           help="Weight for MultiScaleMelLoss on waveforms")
-    # Individual component weights (relative to total audio perceptual loss weight)
+                           help="Weight for MultiScaleMelLoss on VOCODED waveforms. Needs "
+                                "--audio_perceptual_loss_weight > 0 AND runs the vocoder in-loop (expensive).")
+    # Individual component weights (each scaled by --audio_perceptual_loss_weight)
     sub_parser.add_argument("--multi_scale_mel_loss_weight", type=float, default=1.0,
-                           help="Weight for multi-scale mel spectrogram loss component")
+                           help="Multi-scale mel-spectrogram de-blur loss. Mel DOMAIN -- compares pred vs "
+                                "target mel directly, NO vocoder (cheap). IMPORTANT: only applied when "
+                                "--audio_perceptual_loss_weight > 0 (it is a component of AudioPerceptualLoss); "
+                                "effective weight = audio_perceptual_loss_weight * this. The startup line "
+                                "'Created MultiScaleMelSpectrogramLoss (weight=...)' fires on THIS weight alone "
+                                "and does NOT mean it is active. For cheap mel-domain de-blur with no vocoder: "
+                                "--audio_perceptual_loss_weight 1.0 + keep this at 1.0 + waveform weights at 0.")
     # Step to start applying perceptual loss (0 = from start, >0 = delay to let L1/MSE settle)
     sub_parser.add_argument("--audio_perceptual_loss_start_step", type=int, default=0,
                            help="Step to start applying audio perceptual loss (0 = from start)")
@@ -1886,9 +1943,17 @@ def add_cli_args(subparsers):
                                  "intelligible but flat) -- that is deliberate: it makes F0 the "
                                  "only prosody source, so the F0 path can no longer atrophy the "
                                  "way it did on continuous input, where it ended up moving the mel "
-                                 "by ~1% even under a 50% pitch shift. Pair with --use_gan: units "
+                                 "by ~1%% even under a 50%% pitch shift. Pair with --use_gan: units "
                                  "make the decoder one-to-many, and L1/MSE on a one-to-many map "
                                  "regresses to a muffled mean.")
+    sub_parser.add_argument("--code_embed_init", type=str, default=None,
+                            choices=["learned_centroid", "frozen", "learned_random"],
+                            help="For a discrete-unit SMG config (num_codes>0, e.g. Mimi): how to "
+                                 "init the id->vector embedding. learned_centroid (default in the "
+                                 "preset): init from the --voice_codebook_path centroids, trainable. "
+                                 "frozen: same init, requires_grad=False (a fixed prior). "
+                                 "learned_random: random init, trainable (strips the tokenizer's "
+                                 "geometry). Ablation lever; overrides the preset's value.")
 
     sub_parser.add_argument("--num_speakers", type=int, default=0,
                            help="Number of speaker classes for speaker ID loss (0 = auto-detect from dataset)")

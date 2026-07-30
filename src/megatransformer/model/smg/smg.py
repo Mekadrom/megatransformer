@@ -278,8 +278,10 @@ class SMGDecoder2D(nn.Module):
             shift = film_params[:, channels:].unsqueeze(-1)
 
             if return_film_stats:
-                film_stats["early_scale_raw_mean"] = scale.mean().item()
-                film_stats["early_shift_raw_mean"] = shift.mean().item()
+                # Keep as detached tensors (NOT .item()) so this stays inside the compiled
+                # graph; the logging site converts to float. See _apply_film.
+                film_stats["early_scale_raw_mean"] = scale.mean().detach()
+                film_stats["early_shift_raw_mean"] = shift.mean().detach()
 
             if self.config.film_scale_bound > 0:
                 scale = self.config.film_scale_bound * torch.tanh(scale)
@@ -327,8 +329,8 @@ class SMGDecoder2D(nn.Module):
                 shift = film_params[:, out_c:].unsqueeze(-1).unsqueeze(-1)
 
                 if return_film_stats:
-                    film_stats[f"stage2d_{i}_scale_raw_mean"] = scale.mean().item()
-                    film_stats[f"stage2d_{i}_shift_raw_mean"] = shift.mean().item()
+                    film_stats[f"stage2d_{i}_scale_raw_mean"] = scale.mean().detach()
+                    film_stats[f"stage2d_{i}_shift_raw_mean"] = shift.mean().detach()
 
                 if self.config.film_scale_bound > 0:
                     scale = self.config.film_scale_bound * torch.tanh(scale)
@@ -535,8 +537,10 @@ class SMGDecoder1D(nn.Module):
         shift = film_params[:, channels:].unsqueeze(-1)
 
         if return_film_stats and stats_dict is not None:
-            stats_dict[f"{prefix}_scale_raw_mean"] = scale.mean().item()
-            stats_dict[f"{prefix}_shift_raw_mean"] = shift.mean().item()
+            # Detached tensors (NOT .item()) so FiLM-stat logging doesn't graph-break
+            # torch.compile; the logging site (compute_loss) converts to float.
+            stats_dict[f"{prefix}_scale_raw_mean"] = scale.mean().detach()
+            stats_dict[f"{prefix}_shift_raw_mean"] = shift.mean().detach()
 
         if self.config.film_scale_bound > 0:
             scale = self.config.film_scale_bound * torch.tanh(scale)
@@ -876,27 +880,29 @@ class F0ConditioningEmbedding(nn.Module):
         B, T = log_f0.shape
         device = log_f0.device
 
-        # Convert log F0 to Hz
-        f0_hz = torch.exp(log_f0)  # [B, T]
+        # Harmonic PHASE, computed in fp32 and wrapped to [0, 2π). The phase accumulates
+        # over time, so it must be both correct (cumulative sum of f0, not absolute time)
+        # and bounded before sin/cos.
+        #
+        # The old code used base_phase = 2π·f0[t]·(t·dt) — absolute time. That (a) is wrong
+        # for a time-varying f0 and (b) grows WITHOUT BOUND in the frame index, so on longer
+        # clips the argument gets huge (t=500, f0=200, h=8 -> ~1e5 rad). In bf16 the spacing
+        # near 1e5 is ~512, so sin/cos of it is NOISE that worsens toward the clip end — an
+        # end-of-clip energy burst, gated on by voicing and added into the decoder (only bites
+        # when the decoder actually uses F0, i.e. contour mode). cumsum + fmod keeps the sin/cos
+        # argument exact for any T. (The comment always said "cumulative sum"; the code didn't.)
+        f0_hz = torch.exp(log_f0.float())  # [B, T] fp32
+        cumulative_phase = (2 * torch.pi * self.frame_duration) * torch.cumsum(f0_hz, dim=1)  # [B, T]
 
-        # Create time axis: cumulative phase based on F0
-        # For frame t, phase = 2π * f0 * t * frame_duration
-        # Use cumulative sum for proper phase continuity
-        frame_times = torch.arange(T, device=device, dtype=log_f0.dtype) * self.frame_duration
-        frame_times = frame_times.unsqueeze(0).expand(B, -1)  # [B, T]
-
-        # Base phase: 2π * f0 * t
-        base_phase = 2 * torch.pi * f0_hz * frame_times  # [B, T]
-
-        # Create harmonic sinusoids
+        # Create harmonic sinusoids (argument wrapped so it never loses precision)
         harmonic_features = []
         for h in range(1, self.config.n_harmonics + 1):
-            phase = h * base_phase  # [B, T]
+            phase = torch.remainder(h * cumulative_phase, 2 * torch.pi)  # [B, T] in [0, 2π)
             harmonic_features.append(torch.sin(phase))
             harmonic_features.append(torch.cos(phase))
 
-        # Stack harmonics: [B, T, 2*n_harmonics]
-        harmonics = torch.stack(harmonic_features, dim=-1)
+        # Stack harmonics: [B, T, 2*n_harmonics], back to the input dtype.
+        harmonics = torch.stack(harmonic_features, dim=-1).to(log_f0.dtype)
 
         # Gate harmonics by voicing probability
         # Unvoiced frames should have no harmonic content
@@ -951,7 +957,53 @@ class SMG(nn.Module):
         self.f0_predictor = f0_predictor
         self.f0_embedding = f0_embedding
 
+        # Optional discrete-unit input: id -> embedding. Built by from_config when
+        # config.num_codes > 0 (see init_unit_embedding). None => continuous features.
+        self.unit_embedding = None
+        self.code_embed_init = getattr(config, "code_embed_init", "learned_centroid")
+
         self.gradient_checkpointing = False
+
+    def init_unit_embedding(self, num_codes, dim, init_mode, centroids=None):
+        """Create the id->vector table for discrete-token content input.
+
+        init_mode: 'learned_centroid' (init from codebook, trainable), 'frozen' (init
+        from codebook, requires_grad=False), 'learned_random' (random, trainable).
+        """
+        self.unit_embedding = nn.Embedding(num_codes, dim)
+        if init_mode in ("learned_centroid", "frozen"):
+            if centroids is None:
+                raise ValueError(
+                    f"code_embed_init='{init_mode}' needs codebook centroids; pass them "
+                    "via --voice_codebook_path (the Mimi codebook)."
+                )
+            if tuple(centroids.shape) != (num_codes, dim):
+                raise ValueError(
+                    f"centroid shape {tuple(centroids.shape)} != (num_codes={num_codes}, "
+                    f"sive_encoder_dim={dim})"
+                )
+            with torch.no_grad():
+                self.unit_embedding.weight.copy_(centroids.float())
+        if init_mode == "frozen":
+            self.unit_embedding.weight.requires_grad_(False)
+        self.code_embed_init = init_mode
+
+    def _embed_ids(self, x):
+        """Integer unit ids [B, T'] -> embedded [B, D, T'] float; float input passes
+        through unchanged."""
+        if x is None or torch.is_floating_point(x):
+            return x
+        if self.unit_embedding is None:
+            raise ValueError("received integer unit ids but the SMG has no unit_embedding "
+                             "(config.num_codes==0). Set num_codes / build a discrete config.")
+        # Pad frames arrive as id -1 (collator sentinel); embed them to ZERO so the decoder
+        # renders silence in the padded tail. Without this, code 0 is a REAL Mimi unit whose
+        # content the decoder manufactures past the utterance -> an end-of-clip energy burst.
+        # This is the discrete analogue of VoiceDataCollator zeroing the continuous feature
+        # pad. masked_fill (no .item()/.any()) keeps it torch.compile-safe.
+        emb = self.unit_embedding(x.clamp(min=0))                  # [B, T', D]
+        emb = emb.masked_fill((x < 0).unsqueeze(-1), 0.0)          # pad -> 0 (silence)
+        return emb.transpose(1, 2).contiguous()                    # [B, D, T']
 
     @classmethod
     def from_config(cls, config: Union[str, SMGConfig], **overrides) -> "SMG":
@@ -984,21 +1036,40 @@ class SMG(nn.Module):
         if _top_overrides:
             config = _dc.replace(config, **_top_overrides)
 
-        # hop_length is ONLY a field of the F0 conditioning embedding (it sets the
-        # harmonic phase step = hop/sample_rate). Pop it up front so it doesn't reach
-        # the decoder or F0-predictor sub-configs (which have no such field), and
-        # re-add to the conditioning config below. Driven from --voice_hop_length so
-        # the F0-embedding phase tracks the mel/F0 rate (e.g. 320 for 50 Hz ContentVec).
+        # hop_length and sample_rate are ONLY fields of the F0 conditioning embedding
+        # (together they set the harmonic phase step, frame_duration = hop/sample_rate).
+        # Pop both up front so they don't reach the decoder or F0-predictor sub-configs
+        # (which have no such fields), and re-add to the conditioning config below. Driven
+        # from --voice_hop_length / --voice_sample_rate so the F0-embedding phase tracks
+        # the true mel/F0 rate (e.g. 320 for 50 Hz ContentVec; 256/24000 for the 24 kHz
+        # Vocos path — WITHOUT threading sample_rate the phase would advance at the 16 kHz
+        # default and the harmonics would be 1.5x off).
         _f0emb_hop = overrides.pop('hop_length', None)
+        _f0emb_sr = overrides.pop('sample_rate', None)
+
+        # Codebook centroids for discrete-unit embedding init (not a sub-config field);
+        # pop before the sub-config splats below so it never reaches them.
+        _unit_centroids = overrides.pop('unit_embed_centroids', None)
+
+        # Speaker-embedding width (e.g. 192 ECAPA vs 768 WavLM). It IS a field of the
+        # decoder + F0-predictor sub-configs (sizes their FiLM/speaker_proj Linears) but
+        # NOT of the F0-conditioning-embedding config, so — like sive_encoder_dim — pop it
+        # here and thread it explicitly into just those two, or splatting it into the
+        # conditioning config would TypeError. None => keep each sub-config's own default.
+        _speaker_dim = overrides.pop('speaker_embedding_dim', None)
 
         # Select decoder type based on config
         if config.decoder_1d_config is not None:
             config_dict = {k: v for k, v in config.decoder_1d_config.__dict__.items()}
             config_dict.update(overrides)
+            if _speaker_dim is not None:
+                config_dict['speaker_embedding_dim'] = _speaker_dim
             decoder = SMGDecoder1D.from_config(config.decoder_1d_config, **config_dict)
         else:
             config_dict = {k: v for k, v in config.decoder_config.__dict__.items()}
             config_dict.update(overrides)
+            if _speaker_dim is not None:
+                config_dict['speaker_embedding_dim'] = _speaker_dim
             decoder = SMGDecoder2D.from_config(config.decoder_config, **config_dict)
 
         # The F0 predictor consumes the SAME SIVE features as the decoder (via its
@@ -1014,6 +1085,8 @@ class SMG(nn.Module):
 
         config_dict = {k: v for k, v in config.f0_predictor_config.__dict__.items()}
         config_dict.update(overrides)
+        if _speaker_dim is not None:
+            config_dict['speaker_embedding_dim'] = _speaker_dim
         # A contour is 1-dim; features are sive_encoder_dim. This sizes the predictor's
         # sive_proj Conv1d, so it must match what forward() actually feeds it.
         # Set AFTER the overrides splat so a CLI --sive_encoder_dim cannot clobber the 1
@@ -1029,9 +1102,32 @@ class SMG(nn.Module):
         config_dict.update(overrides)
         if _f0emb_hop is not None:
             config_dict['hop_length'] = _f0emb_hop
+        if _f0emb_sr is not None:
+            config_dict['sample_rate'] = _f0emb_sr
         f0_embedding = F0ConditioningEmbedding.from_config(config.f0_conditioning_embedding_config, **config_dict)
 
-        return cls(config, decoder, f0_predictor, f0_embedding)
+        # Write the RESOLVED sub-configs (the ones the modules were actually built from,
+        # post-override) back into a copy of the top-level SMGConfig, so model.config is a
+        # faithful record of what got built — e.g. speaker_embedding_dim 768, F0-embedding
+        # sample_rate 24000. Without this, model.config still holds the preset defaults
+        # (192 / 16000), which is what HuggingFace's TensorBoardCallback logs as
+        # "model_config", making the summary lie about the model. Each module stashed its
+        # resolved dataclass on `.config`; graft those in.
+        config = _dc.replace(
+            config,
+            decoder_1d_config=decoder.config if config.decoder_1d_config is not None else config.decoder_1d_config,
+            decoder_config=decoder.config if config.decoder_1d_config is None else config.decoder_config,
+            f0_predictor_config=f0_predictor.config,
+            f0_conditioning_embedding_config=f0_embedding.config,
+        )
+
+        model = cls(config, decoder, f0_predictor, f0_embedding)
+        if getattr(config, "num_codes", 0) and config.num_codes > 0:
+            model.init_unit_embedding(
+                config.num_codes, sive_encoder_dim,
+                getattr(config, "code_embed_init", "learned_centroid"),
+                centroids=_unit_centroids)
+        return model
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.gradient_checkpointing = True
@@ -1077,6 +1173,10 @@ class SMG(nn.Module):
             return_film_stats: Whether to return FiLM statistics
         # Predict F0 if conditioning is enabled but embedding not provided
         """
+        # Discrete-token input: embed ids -> float (both the content latent z and, if the
+        # predictor runs here, the F0/voicing content features). Float passes through.
+        z = self._embed_ids(z)
+        features = self._embed_ids(features)
         if f0_embedding is None:
             f0_src = self._f0_predictor_input(features, f0_contour)
             if f0_src is not None:
@@ -1119,6 +1219,8 @@ class SMG(nn.Module):
             recon_x: Generated mel spectrogram
             losses: Dict with loss components
         """
+        # Discrete-token input: embed integer unit ids -> [B, D, T'] (float passes through).
+        features = self._embed_ids(features)
         z = features
 
         # F0 prediction and embedding (if enabled)
@@ -1163,16 +1265,31 @@ class SMG(nn.Module):
 
         # Align reconstruction to input size (decoder stride may cause size mismatch)
         if recon_x.shape != target.shape:
+            # If the TIME axis is off by more than rounding (a genuine rate difference --
+            # e.g. an 8x decoder running at 100Hz feeding a 93.75Hz Vocos mel target), RESAMPLE
+            # it to the target length rather than crop/pad (a crop would time-compress the whole
+            # utterance). Small (<=4-frame) mismatches from integer-stride rounding fall through
+            # to the crop / replicate-pad below.
+            if recon_x.dim() == 3 and abs(recon_x.shape[-1] - target.shape[-1]) > 4:
+                recon_x = F.interpolate(recon_x, size=target.shape[-1], mode="linear",
+                                        align_corners=False)
             # Truncate or pad to match input dimensions
             slices = [slice(None)] * recon_x.dim()
             for dim in range(2, recon_x.dim()):  # Skip batch and channel dims
                 if recon_x.shape[dim] > target.shape[dim]:
                     slices[dim] = slice(0, target.shape[dim])
                 elif recon_x.shape[dim] < target.shape[dim]:
-                    # Pad if reconstruction is smaller (shouldn't happen normally)
+                    # REPLICATE the last frame, do NOT 0-pad. Mels are log-magnitude
+                    # (floor ~-11, loud ~0, mean ~-5), so 0 is near-MAXIMUM energy across
+                    # all bins -- a 0-pad tail is a broadband high-energy frame the vocoder
+                    # renders as an end-of-clip NOISE BURST. The 4x Mimi decoder's 4*T'
+                    # rarely equals mel_length, so this pad fires on ~every clip (ContentVec's
+                    # 1x decoder produced exactly mel_length and never hit this).
                     pad_size = target.shape[dim] - recon_x.shape[dim]
-                    pad_dims = [0, 0] * (recon_x.dim() - dim - 1) + [0, pad_size]
-                    recon_x = F.pad(recon_x, pad_dims)
+                    edge = recon_x.narrow(dim, recon_x.shape[dim] - 1, 1)
+                    reps = [1] * recon_x.dim()
+                    reps[dim] = pad_size
+                    recon_x = torch.cat([recon_x, edge.repeat(*reps)], dim=dim)
             recon_x = recon_x[tuple(slices)]
 
         # Reconstruction losses (with optional masking)

@@ -200,6 +200,7 @@ def get_dataset(command: str, args, split: str):
             codebook=getattr(args, "voice_codebook_path", None),
             columns=[
                 "features",  # includes lengths
+                "unit_ids",  # pre-quantized integer units (Mimi); mutually exclusive w/ features
                 "mel_specs",  # includes lengths
                 "speaker_embeddings",
                 "speaker_ids",
@@ -343,6 +344,22 @@ def get_dataset(command: str, args, split: str):
 def get_visualization_callback(args, command: str, model: nn.Module, shared_window_buffer=None, legacy_vocoder: bool = False) -> VisualizationCallback:
     if command in ["smg"]:
         vocoder = model_loading_utils.load_vocoder(args.vocoder_checkpoint_path, args.vocoder_config, shared_window_buffer, is_wrapped=legacy_vocoder)
+        # Guard: --voice_sample_rate must match the vocoder's native rate. They are one
+        # physical rate (the mel is extracted at it, the vocoder synthesizes at it), split
+        # across two knobs. A mismatch is silent and costly: the collator sizes
+        # voice_max_frames = max_seconds*voice_sample_rate//hop from --voice_sample_rate, so
+        # a too-low value truncates every long clip in TRAINING, while eval audio gets tagged
+        # at the wrong rate (24 kHz Vocos logged as 16 kHz plays 1.5x slow + pitched down).
+        # Only pretrained wrappers advertise a sample_rate; skip the check when unknown.
+        _voc_sr = getattr(getattr(vocoder, "config", None), "sample_rate", None)
+        if _voc_sr is not None and _voc_sr != args.voice_sample_rate:
+            raise ValueError(
+                f"--voice_sample_rate ({args.voice_sample_rate}) != the '{args.vocoder_config}' "
+                f"vocoder's native sample rate ({_voc_sr}). These must be equal: the mel is "
+                f"extracted at --voice_sample_rate and the vocoder synthesizes at its own rate. "
+                f"Pass --voice_sample_rate {_voc_sr}. (Left mismatched, the collator truncates "
+                f"long clips in training and eval audio plays at the wrong speed/pitch.)"
+            )
         callback = SMGVisualizationCallback(
             shared_window_buffer=shared_window_buffer,
             step_offset=args.start_step,
@@ -894,6 +911,15 @@ if __name__ == "__main__":
         import torch._dynamo
         torch._dynamo.config.automatic_dynamic_shapes = True
         torch._dynamo.config.cache_size_limit = 64
+        # The SMG GAN's adaptive-weight step double-backwards (autograd.grad of the recon
+        # vs adversarial loss w.r.t. the decoder's last layer to balance them). torch.compile's
+        # donated-buffer memory optimization forbids retain_graph/create_graph, so that grad
+        # call raises and the trainer silently falls back to a FIXED gan weight. Disable
+        # donated buffers so the double-backward runs under compile. (Whole-model --compile_model
+        # is only used for the SMG here — the world model uses block-compile — so the small extra
+        # memory is a non-issue.)
+        import torch._functorch.config as _functorch_config
+        _functorch_config.donated_buffer = False
 
     model.to(device)
 

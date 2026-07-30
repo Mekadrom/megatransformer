@@ -190,6 +190,13 @@ class VoiceShardedDataset(Dataset):
                 sample['features'] = feat
                 sample['unit_ids'] = unit_ids
 
+        # Pre-quantized units (e.g. Mimi): integer ids stored directly in the shard, no
+        # continuous features and no on-the-fly quantize. The SMG embeds these ids via its
+        # unit_embedding; the f0_contour path below still applies (needs only f0 + stats).
+        if 'unit_ids' in shard and 'unit_ids' in self.columns and 'unit_ids' not in sample:
+            sample['unit_ids'] = shard['unit_ids'][local_idx]
+            sample['feature_length'] = shard['feature_lengths'][local_idx]
+
         if 'waveforms' in shard and 'waveforms' in self.columns:
             sample['waveform'] = shard["waveforms"][local_idx]
             sample["waveform_length"] = shard["waveform_lengths"][local_idx]

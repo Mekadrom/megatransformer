@@ -173,6 +173,20 @@ SMG_DECODER_1D_CONFIGS = {
         pre_upsample_residual_blocks=3,
         pre_upsample_kernel_size=7,
     ),
+    # Mimi 12.5Hz -> 8x -> 100Hz, then SMG.forward resamples to the Vocos target rate
+    # (93.75Hz @ hop256/24kHz; the 12.5->93.75 ratio is 7.5x, non-integer, so we
+    # over-upsample to a clean 8x and interpolate the ~6.7% down to mel_length).
+    # output_dim=100 = Vocos's mel bands.
+    "medium_8x_100mel": SMGDecoder1DConfig(
+        initial_channels=640,
+        stage_channels=[640, 384, 256],
+        stage_kernel_sizes=[7, 5, 5],
+        time_upsample_factors=[2, 2, 2],  # 8x total
+        n_residual_blocks_per_stage=3,
+        pre_upsample_residual_blocks=3,
+        pre_upsample_kernel_size=7,
+        output_dim=100,
+    ),
     "small_snake": SMGDecoder1DConfig(
         activation="snake",
         initial_channels=512,
@@ -288,6 +302,18 @@ class SMGConfig:
     # Two purposes, two configs, one codebase.
     f0_predictor_input: str = "features"
 
+    # Discrete-token content input. num_codes>0 makes the SMG accept integer unit ids
+    # [B, T'] and embed them via nn.Embedding(num_codes, sive_encoder_dim) instead of
+    # continuous features (for pretrained VQ tokenizers like Mimi, which emit ids). The
+    # embedding width tracks sive_encoder_dim, so the whole downstream [B, D, T'] float
+    # contract is unchanged. code_embed_init controls the table's init/trainability:
+    #   "learned_centroid" init from the codebook centroids, trainable (best of both);
+    #   "frozen"           init from centroids, requires_grad=False (a fixed prior);
+    #   "learned_random"   random init, trainable (strips the tokenizer's geometry).
+    # Centroid-init modes need the codebook centroids (passed via --voice_codebook_path).
+    num_codes: int = 0
+    code_embed_init: str = "learned_centroid"
+
     f0_loss_weight: float = 5.0
     vuv_loss_weight: float = 2.0
 
@@ -359,5 +385,32 @@ SMG_CONFIGS = {
         f0_predictor_config=F0PredictorConfig(encoder_dim=1, vuv_encoder_dim=256),
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
         f0_predictor_input="contour",
+    ),
+    # Mimi (12.5Hz semantic cb0) -> ids embedded (num_codes=2048, dim=sive_encoder_dim
+    # 256) -> 4x time-upsample to mel@50Hz (--voice_hop_length 320, reusing the 50Hz
+    # ContentVec mel/vocoder). Contour F0 (Mimi units carry little prosody), voicing on
+    # content. Pair with --voice_codebook_path <mimi_semantic_codebook.pt>.
+    "medium_decoder_only_1d_4x_mimicontour": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_4x"],
+        f0_predictor_config=F0PredictorConfig(encoder_dim=1, vuv_encoder_dim=256),
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+        f0_predictor_input="contour",
+        num_codes=2048,
+        code_embed_init="learned_centroid",
+    ),
+    # 24kHz Vocos variant of the above: 100-mel, 8x decoder -> forward resamples to the
+    # 93.75Hz Vocos mel target. Pair with --vocoder_config vocos, --voice_hop_length 256,
+    # --sample_rate 24000 preprocessing (mel targets from vocos_features.vocos_mel), and
+    # --sive_total_stride 7. (The mel/unit rate is 93.75/12.5 = 7.5x, but sive_total_stride
+    # is an integer DIVISOR for the collator cap ceil(voice_max_frames/stride); it must round
+    # DOWN to 7 so the cap [ceil(937/7)=134] stays >= the stored unit budget [125]. Stride 8
+    # under-caps to 118 and truncates ~7 unit frames off the longest 10s clips.)
+    "medium_decoder_only_1d_8x_mimicontour_vocos": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_8x_100mel"],
+        f0_predictor_config=F0PredictorConfig(encoder_dim=1, vuv_encoder_dim=256),
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+        f0_predictor_input="contour",
+        num_codes=2048,
+        code_embed_init="learned_centroid",
     ),
 }
