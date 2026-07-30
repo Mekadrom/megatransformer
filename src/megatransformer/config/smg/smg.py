@@ -116,6 +116,12 @@ class SMGDecoder1DConfig:
     stage_channels: Optional[list[int]] = None
     stage_kernel_sizes: Optional[list[int]] = None
     time_upsample_factors: Optional[list[int]] = None
+    # Optional integer time DOWNSAMPLE applied once after the upsample stages (a strided
+    # Conv1d), so the net rate can be a non-integer like 7.5x WITHOUT any fractional
+    # resample of the output mel: e.g. upsample 15x ([3,5]) then downsample 2x -> exactly
+    # 12.5Hz*15/2 = 93.75Hz (Vocos), landing on mel_length +-1 frame (handled by the
+    # replicate-pad in SMG.forward, never F.interpolate). 1 = no downsample (default).
+    time_downsample_factor: int = 1
     n_residual_blocks_per_stage: int = 2
     pre_upsample_residual_blocks: int = 2
     pre_upsample_kernel_size: int = 5
@@ -182,6 +188,22 @@ SMG_DECODER_1D_CONFIGS = {
         stage_channels=[640, 384, 256],
         stage_kernel_sizes=[7, 5, 5],
         time_upsample_factors=[2, 2, 2],  # 8x total
+        n_residual_blocks_per_stage=3,
+        pre_upsample_residual_blocks=3,
+        pre_upsample_kernel_size=7,
+        output_dim=100,
+    ),
+    # Mimi 12.5Hz -> EXACT 93.75Hz (Vocos) with NO fractional resample: upsample 15x ([3,5])
+    # then a strided-conv downsample 2x = net 7.5x. Output lands on mel_length +-1 frame
+    # (replicate-pad in SMG.forward handles the rounding; F.interpolate never fires). Big
+    # kernels smooth the 3x/5x nearest-upsample staircases; the last (5x) stage runs at
+    # 187.5Hz so its channels are kept lean (320) to bound compute before the 2x decimation.
+    "medium_15x2_100mel": SMGDecoder1DConfig(
+        initial_channels=640,
+        stage_channels=[512, 320],
+        stage_kernel_sizes=[7, 11],
+        time_upsample_factors=[3, 5],       # 15x up -> 187.5Hz
+        time_downsample_factor=2,           # 2x down -> 93.75Hz (net 7.5x)
         n_residual_blocks_per_stage=3,
         pre_upsample_residual_blocks=3,
         pre_upsample_kernel_size=7,
@@ -407,6 +429,17 @@ SMG_CONFIGS = {
     # under-caps to 118 and truncates ~7 unit frames off the longest 10s clips.)
     "medium_decoder_only_1d_8x_mimicontour_vocos": SMGConfig(
         decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_8x_100mel"],
+        f0_predictor_config=F0PredictorConfig(encoder_dim=1, vuv_encoder_dim=256),
+        f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
+        f0_predictor_input="contour",
+        num_codes=2048,
+        code_embed_init="learned_centroid",
+    ),
+    # Same as the 8x Vocos variant but with the EXACT-RATE 15x/2x decoder (net 7.5x) so the
+    # output is natively 93.75Hz = mel_length +-1 — no fractional F.interpolate on the mel,
+    # which kills the ~6Hz warble + frame-blend slurring the 8x->interpolate path caused.
+    "medium_decoder_only_1d_15x2_mimicontour_vocos": SMGConfig(
+        decoder_1d_config=SMG_DECODER_1D_CONFIGS["medium_15x2_100mel"],
         f0_predictor_config=F0PredictorConfig(encoder_dim=1, vuv_encoder_dim=256),
         f0_conditioning_embedding_config=F0_CONDITIONING_EMBEDDING_CONFIGS["small"],
         f0_predictor_input="contour",

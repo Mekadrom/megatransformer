@@ -472,6 +472,22 @@ class SMGDecoder1D(nn.Module):
                 for out_c in config.stage_channels
             ])
 
+        # Optional integer time downsample (strided Conv1d) so a non-integer net rate (e.g.
+        # 7.5x = 15x up / 2x down) needs NO fractional resample of the output mel. kernel=2f,
+        # stride=f, padding=f//2 -> L_out = floor((L + 2*(f//2) - 2f)/f) + 1 = floor(L/f) for
+        # even f. Learned conv (not interpolation), so no periodic warble. FiLM-free: it's a
+        # rate-matching step after the last conditioned stage, like final_conv.
+        self.time_downsample_factor = config.time_downsample_factor
+        self.downsample = None
+        if config.time_downsample_factor > 1:
+            f = config.time_downsample_factor
+            self.downsample = nn.Sequential(
+                nn.Conv1d(config.stage_channels[-1], config.stage_channels[-1],
+                          kernel_size=2 * f, stride=f, padding=f // 2),
+                nn.GroupNorm(max(1, config.stage_channels[-1] // 4), config.stage_channels[-1]),
+                self.get_activation(config.stage_channels[-1]),
+            )
+
         # Final output conv — named final_conv for adaptive weight compatibility
         self.final_conv = nn.Conv1d(config.stage_channels[-1], config.output_dim, kernel_size=3, padding=1)
 
@@ -529,6 +545,10 @@ class SMGDecoder1D(nn.Module):
         length = input_length
         for factor in self.config.time_upsample_factors:
             length = length * factor
+        f = getattr(self.config, "time_downsample_factor", 1)
+        if f > 1:
+            # mirror the strided Conv1d (kernel=2f, stride=f, padding=f//2)
+            length = (length + 2 * (f // 2) - 2 * f) // f + 1
         return length
 
     def _apply_film(self, x: torch.Tensor, film_params: torch.Tensor, return_film_stats: bool, stats_dict: Optional[dict], prefix: str) -> torch.Tensor:
@@ -617,6 +637,10 @@ class SMGDecoder1D(nn.Module):
             if speaker_embedding is not None and self.config.speaker_embedding_dim > 0:
                 film_params = self.stage_film_projections[i](speaker_embedding)
                 x = self._apply_film(x, film_params, return_film_stats, film_stats, f"stage_{i}")
+
+        # Integer time downsample (e.g. 15x-up -> 2x-down = net 7.5x for Vocos), no resample
+        if self.downsample is not None:
+            x = self.downsample(x)
 
         # Final output: [B, output_dim, T]
         x = self.final_conv(x)
