@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -354,18 +356,51 @@ def add_mel_instance_noise(
     return mels + std * torch.randn_like(mels)
 
 
+def _time_mask_like(ref: torch.Tensor, valid_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Downsample a frame-level validity mask to a discriminator output/feature's time axis.
+
+    ref: a D output or feature map [B, C, (H,) T_out]; valid_mask: [B, T] (1=valid speech
+    frame, 0=pad). The period/scale reshapes preserve contiguous time ordering, so each output
+    column spans a contiguous block of input frames — adaptive MAX pool marks a column valid
+    (1) if it covers ANY valid frame. Returns a mask broadcastable to ref: [B, 1, (1,) T_out],
+    or None when no mask is given. Padding is contiguous at the tail, so this cleanly zeroes
+    the pure-padding patches that would otherwise be gradient-dead dead weight in the loss.
+    """
+    if valid_mask is None:
+        return None
+    T_out = ref.shape[-1]
+    m = F.adaptive_max_pool1d(valid_mask.float().unsqueeze(1), T_out)  # [B,1,T_out]
+    return m.view([ref.shape[0]] + [1] * (ref.dim() - 2) + [T_out])
+
+
+def _masked_mean(x: torch.Tensor, m: Optional[torch.Tensor]) -> torch.Tensor:
+    """Mean of x over valid patches only (m broadcastable, 1=keep). Plain mean when m is None."""
+    if m is None:
+        return x.mean()
+    m = m.expand_as(x)
+    return (x * m).sum() / m.sum().clamp(min=1.0)
+
+
 def mel_discriminator_loss(
     disc_real_outputs: list[torch.Tensor],
     disc_fake_outputs: list[torch.Tensor],
+    real_mask: Optional[torch.Tensor] = None,
+    fake_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Discriminator hinge loss for mel spectrogram discriminators.
     Real samples should produce positive values, fake should produce negative.
+
+    real_mask/fake_mask: optional [B, T] frame validity masks. When given, the hinge is
+    averaged over VALID patches only — padded patches are excluded so they can't dominate
+    (they're most of the sequence) or turn into contradictory targets when real/fake padding
+    is matched-filled. real and fake may have different batch sizes (fake includes the
+    converted output), so their masks are threaded separately.
     """
     loss = 0.0
     for real, fake in zip(disc_real_outputs, disc_fake_outputs):
-        loss += torch.mean(F.relu(1 - real))
-        loss += torch.mean(F.relu(1 + fake))
+        loss += _masked_mean(F.relu(1 - real), _time_mask_like(real, real_mask))
+        loss += _masked_mean(F.relu(1 + fake), _time_mask_like(fake, fake_mask))
     return loss
 
 
@@ -373,6 +408,8 @@ def compute_mel_discriminator_loss(
     discriminator: nn.Module,
     real_mels: torch.Tensor,
     fake_mels: torch.Tensor,
+    real_mask: Optional[torch.Tensor] = None,
+    fake_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Compute discriminator loss for mel spectrogram discriminators.
@@ -381,6 +418,10 @@ def compute_mel_discriminator_loss(
         discriminator: The discriminator module
         real_mels: Real mel spectrograms from the dataset [B, 1, n_mels, T]
         fake_mels: Fake mel spectrograms from the generator (detached)
+        real_mask/fake_mask: optional [B, T] frame validity masks — restrict the hinge AND
+            the logged d_real_mean/d_fake_mean to valid patches so padded frames neither
+            dominate the metric nor dilute the gradient (fake may be a larger batch than real
+            when the converted output is appended, hence separate masks).
 
     Returns:
         total_loss: Combined discriminator loss
@@ -395,12 +436,14 @@ def compute_mel_discriminator_loss(
         real_outputs = [real_outputs]
         fake_outputs = [fake_outputs]
 
-    d_loss = mel_discriminator_loss(real_outputs, fake_outputs)
+    d_loss = mel_discriminator_loss(real_outputs, fake_outputs, real_mask=real_mask, fake_mask=fake_mask)
 
+    # Metrics over VALID patches too, so d_real_mean/d_fake_mean report the real speech margin
+    # instead of being pulled to ~0 by the (majority) padded patches.
     loss_dict = {
         "d_loss": d_loss,
-        "d_real_mean": sum(r.mean() for r in real_outputs) / len(real_outputs),
-        "d_fake_mean": sum(f.mean() for f in fake_outputs) / len(fake_outputs),
+        "d_real_mean": sum(_masked_mean(r, _time_mask_like(r, real_mask)) for r in real_outputs) / len(real_outputs),
+        "d_fake_mean": sum(_masked_mean(f, _time_mask_like(f, fake_mask)) for f in fake_outputs) / len(fake_outputs),
     }
 
     return d_loss, loss_dict
@@ -409,6 +452,7 @@ def compute_mel_discriminator_loss(
 def r1_mel_gradient_penalty(
     real_mels: torch.Tensor,
     discriminator: nn.Module,
+    valid_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     R1 gradient penalty for mel spectrogram discriminators (Mescheder et al., 2018).
@@ -420,6 +464,10 @@ def r1_mel_gradient_penalty(
     Args:
         real_mels: [B, 1, n_mels, T] real mel spectrogram tensor (will enable gradients)
         discriminator: The mel discriminator module
+        valid_mask: optional [B, T] frame validity mask. R1 sums the gradient over every
+            input position, so the padded frames (~900 of 937, a flat silence floor) otherwise
+            dominate the penalty and make it spike. Masking restricts R1 to valid speech
+            positions — the region we actually want the D to be smooth on.
 
     Returns:
         R1 penalty (scalar tensor)
@@ -443,36 +491,50 @@ def r1_mel_gradient_penalty(
         only_inputs=True,
     )[0]
 
+    # Zero the gradient at padded input positions so R1 penalizes D sensitivity to SPEECH only.
+    if valid_mask is not None:
+        m = valid_mask.float()
+        grads = grads * m.view(m.shape[0], *([1] * (grads.dim() - 2)), m.shape[-1])
+
     # R1 = E[||∇D(x)||²]
     penalty = grads.pow(2).reshape(grads.size(0), -1).sum(1).mean()
 
     return penalty
 
 
-def mel_generator_loss(disc_fake_outputs: list[torch.Tensor]) -> torch.Tensor:
+def mel_generator_loss(disc_fake_outputs: list[torch.Tensor],
+                       fake_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Generator hinge loss for mel spectrogram discriminators.
     Generator wants discriminator to output positive values for fake samples.
+
+    fake_mask: optional [B, T] frame validity mask — the generator's adversarial signal is
+    averaged over valid patches only (padded frames carry no target and are silence-filled).
     """
     loss = 0.0
     for fake in disc_fake_outputs:
-        loss += -torch.mean(fake)
+        loss += -_masked_mean(fake, _time_mask_like(fake, fake_mask))
     return loss
 
 
 def mel_feature_matching_loss(
     disc_real_features: list[list[torch.Tensor]],
     disc_fake_features: list[list[torch.Tensor]],
+    valid_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Feature matching loss: L1 distance between real and fake intermediate features.
+
+    valid_mask: optional [B, T] frame validity mask — matched over valid patches only, so the
+    (identical, matched-filled) padded regions don't dilute the FM signal toward zero.
     """
     loss = 0.0
     num_layers = 0
 
     for real_feats, fake_feats in zip(disc_real_features, disc_fake_features):
         for real_feat, fake_feat in zip(real_feats, fake_feats):
-            loss += F.l1_loss(fake_feat, real_feat.detach())
+            m = _time_mask_like(fake_feat, valid_mask)
+            loss += _masked_mean((fake_feat - real_feat.detach()).abs(), m)
             num_layers += 1
 
     return loss / num_layers if num_layers > 0 else loss
@@ -483,6 +545,7 @@ def compute_mel_generator_gan_loss(
     real_mels: torch.Tensor,
     fake_mels: torch.Tensor,
     feature_matching_weight: float = 0.0,
+    valid_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Compute generator adversarial and feature matching losses for mel spectrograms.
@@ -492,6 +555,8 @@ def compute_mel_generator_gan_loss(
         real_mels: Real mel spectrograms (for feature matching)
         fake_mels: Fake mel spectrograms from the generator (not detached)
         feature_matching_weight: Weight for feature matching loss
+        valid_mask: optional [B, T] frame validity mask — the adversarial + FM signals are
+            restricted to valid patches (real and fake share this batch/length here).
 
     Returns:
         total_loss: Combined generator GAN loss
@@ -507,7 +572,7 @@ def compute_mel_generator_gan_loss(
         fake_features = [fake_features]
 
     # Adversarial loss
-    g_adv_loss = mel_generator_loss(fake_outputs)
+    g_adv_loss = mel_generator_loss(fake_outputs, fake_mask=valid_mask)
 
     loss_dict = {
         "g_adv_loss": g_adv_loss,
@@ -522,7 +587,7 @@ def compute_mel_generator_gan_loss(
             if not isinstance(real_features[0], list):
                 real_features = [real_features]
 
-        fm_loss = mel_feature_matching_loss(real_features, fake_features)
+        fm_loss = mel_feature_matching_loss(real_features, fake_features, valid_mask=valid_mask)
         total_loss = total_loss + feature_matching_weight * fm_loss
         loss_dict["g_fm_loss"] = fm_loss
 

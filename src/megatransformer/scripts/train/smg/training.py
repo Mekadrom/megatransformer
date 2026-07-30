@@ -480,6 +480,30 @@ class SMGTrainer(CommonTrainer):
                 gan_rel_step = global_step - (self.gan_start_step if self.gan_start_step is not None else 0)
                 noise_std = self.noise_scheduler.get_std(gan_rel_step)
 
+            # PADDING FILL for the discriminator. The D must judge SPEECH, not padded frames.
+            # mel padding is 0, which is HIGH energy in log-magnitude mel space (Vocos floor
+            # ~ -16, bulk mean ~ -0.4), and padding is >50% of most clips. Fed raw, real pad
+            # is a flat 0 wall while fake (recon) pad is the decoder's response to -1 units --
+            # a mismatched high-energy region that dominates the D input, inflates R1, and lets
+            # the D discriminate on padding instead of quality (thin margin + huge R1/d_loss).
+            # Fill BOTH real and fake pad frames with the per-sample silence floor (the quietest
+            # VALID frame) so padding reads as extended silence, matched across real/fake, with
+            # no tell and near-zero R1 gradient. _prep also adds instance noise to valid content
+            # first, then re-fills pad so the padded region stays exactly the (clean) floor.
+            # No-op when no mask is present (mask filling only kicks in with mel_spec_masks).
+            _gan_vm = mel_spec_masks.bool().unsqueeze(1) if mel_spec_masks is not None else None  # [B,1,T]
+            if _gan_vm is not None:
+                _pad_floor = torch.where(
+                    _gan_vm, mel_specs, mel_specs.new_full((), float("inf"))
+                ).amin(dim=(1, 2), keepdim=True)  # [B,1,1] quietest valid frame per sample
+            def _fill_pad(x):
+                return x if _gan_vm is None else torch.where(_gan_vm, x, _pad_floor)
+            def _prep(x):
+                # valid-content instance noise, then silence-fill the padded frames
+                if noise_std > 0:
+                    x = add_mel_instance_noise(x, noise_std)
+                return _fill_pad(x)
+
             # WRONG-SPEAKER (converted) output for the GAN. Only the same-speaker recon enters
             # the GAN below, so the conversion regime gets ZERO adversarial pressure and stays
             # over-smoothed (audible on swaps). Decode content with a shuffled batch embedding
@@ -536,12 +560,19 @@ class SMGTrainer(CommonTrainer):
                         if old_state["state"]:
                             self.discriminator_optimizer.load_state_dict(old_state)
 
-                # Apply instance noise to both real and fake mel spectrograms. The fake set
-                # includes the wrong-speaker (converted) output when enabled, so D learns that
-                # converted outputs must also look like real speech.
-                real_for_disc = add_mel_instance_noise(mel_specs, noise_std) if noise_std > 0 else mel_specs
-                fake_base = recon.detach() if recon_wrong is None else torch.cat([recon.detach(), recon_wrong.detach()], dim=0)
-                fake_for_disc = add_mel_instance_noise(fake_base, noise_std) if noise_std > 0 else fake_base
+                # Apply instance noise to valid content + silence-fill padding on both real and
+                # fake (see _prep above). The fake set includes the wrong-speaker (converted)
+                # output when enabled, so D learns that converted outputs must also look like
+                # real speech. Each component is prepped at [B] before the concat (the mask is
+                # per-sample and the converted output shares the source clip's lengths).
+                real_for_disc = _prep(mel_specs)
+                fake_for_disc = (_prep(recon).detach() if recon_wrong is None
+                                 else torch.cat([_prep(recon).detach(), _prep(recon_wrong).detach()], dim=0))
+                # Frame validity masks for patch-level loss masking: real is [B], fake is [2B]
+                # when the converted output is appended (its clip lengths match the source).
+                d_real_mask = mel_spec_masks
+                d_fake_mask = (mel_spec_masks if recon_wrong is None
+                               else torch.cat([mel_spec_masks, mel_spec_masks], dim=0)) if mel_spec_masks is not None else None
 
                 # Compute discriminator loss in fp32 to avoid gradient underflow
                 # Mixed precision can cause discriminator gradients to vanish
@@ -560,14 +591,18 @@ class SMGTrainer(CommonTrainer):
                         self.discriminator,
                         real_mels=real_fp32,
                         fake_mels=fake_fp32,
+                        real_mask=d_real_mask,
+                        fake_mask=d_fake_mask,
                     )
 
                 # R1 gradient penalty (on clean real mels, not noisy)
                 r1_loss = torch.tensor(0.0, device=mel_specs.device)
                 if self.r1_penalty_weight > 0 and global_step % self.r1_penalty_interval == 0:
-                    # Add channel dimension for discriminator: [B, n_mels, T] -> [B, 1, n_mels, T]
-                    mel_spec_4d = mel_specs.float().unsqueeze(1) if mel_specs.dim() == 3 else mel_specs.float()
-                    r1_loss = r1_mel_gradient_penalty(mel_spec_4d, self.discriminator)
+                    # Silence-fill padding (clean, no noise) so R1 penalizes D sensitivity to
+                    # SPEECH, not to the padded-region wall. Add channel dim: [B,n_mels,T]->[B,1,n_mels,T]
+                    real_r1 = _fill_pad(mel_specs).float()
+                    mel_spec_4d = real_r1.unsqueeze(1) if real_r1.dim() == 3 else real_r1
+                    r1_loss = r1_mel_gradient_penalty(mel_spec_4d, self.discriminator, valid_mask=mel_spec_masks)
                     d_loss = d_loss + self.r1_penalty_weight * r1_loss
 
                 # Log discriminator diagnostics
@@ -606,23 +641,27 @@ class SMGTrainer(CommonTrainer):
             device_type = mel_specs.device.type
             dtype = torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else torch.float32
             with autocast(device_type, dtype=dtype, enabled=self.args.fp16 or self.args.bf16):
-                # Add channel dimension for discriminator: [B, n_mels, T] -> [B, 1, n_mels, T]
-                mel_spec_for_gen = mel_specs.unsqueeze(1) if mel_specs.dim() == 3 else mel_specs
-                recon_for_gen = recon.unsqueeze(1) if recon.dim() == 3 else recon
+                # Silence-fill padding on real + fake so the generator's adversarial gradient
+                # comes only from valid speech frames (pad frames become a no-grad constant
+                # floor); matches the D-step feed. Add channel dim: [B,n_mels,T]->[B,1,n_mels,T]
+                mel_spec_for_gen = _fill_pad(mel_specs).unsqueeze(1) if mel_specs.dim() == 3 else _fill_pad(mel_specs)
+                recon_for_gen = _fill_pad(recon).unsqueeze(1) if recon.dim() == 3 else _fill_pad(recon)
                 g_gan_loss, g_loss_dict = compute_mel_generator_gan_loss(
                     self.discriminator,
                     real_mels=mel_spec_for_gen,
                     fake_mels=recon_for_gen,
                     feature_matching_weight=self.feature_matching_weight,
+                    valid_mask=mel_spec_masks,
                 )
                 # Adversarial-only realism pressure on the converted output (no GT → no FM).
                 if recon_wrong is not None:
-                    rw_for_gen = recon_wrong.unsqueeze(1) if recon_wrong.dim() == 3 else recon_wrong
+                    rw_for_gen = _fill_pad(recon_wrong).unsqueeze(1) if recon_wrong.dim() == 3 else _fill_pad(recon_wrong)
                     g_wrong, _ = compute_mel_generator_gan_loss(
                         self.discriminator,
                         real_mels=mel_spec_for_gen,
                         fake_mels=rw_for_gen,
                         feature_matching_weight=0.0,
+                        valid_mask=mel_spec_masks,
                     )
                     g_gan_loss = g_gan_loss + self.gan_wrong_emb_weight * g_wrong
                     g_loss_dict["g_adv_wrong"] = g_wrong
