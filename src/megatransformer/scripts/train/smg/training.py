@@ -156,6 +156,16 @@ class SMGTrainer(CommonTrainer):
         sive_perceptual_loss_start_step: int = 0,
         sive_perceptual_loss_rampup_steps: int = 5000,  # Ramp SIVE-perceptual weight 0 -> max over this many steps after start_step (0 = hard on)
         sive_perceptual_layer: int = -1,  # Which SIVE layer to extract (-1 = final)
+        # Mimi content-cycle loss on the SWAPPED output (fixes cross-speaker phonemic drift):
+        # vocode swap -> Mimi -> cb0 semantic latent -> match the SOURCE's unit ids. 0 = off.
+        mimi_content_loss_weight: float = 0.0,
+        mimi_content_loss_start_step: int = 0,
+        mimi_content_loss_rampup_steps: int = 5000,
+        mimi_content_loss_every_n_steps: int = 2,   # amortize the vocode+Mimi cost
+        mimi_content_loss_type: str = "ce",         # "ce" (cb0 cross-entropy) or "l1"
+        mimi_content_loss_temperature: float = 0.1,
+        mimi_content_loss_max_items: int = 16,      # cap batch subset fed through vocoder+Mimi (0 = all)
+        mimi_content_model_id: str = "kyutai/mimi",
         # Length bucketing (opt-in): group similar-length mels into a batch to cut padding.
         bucket_by_length: bool = False,
         bucket_mega_factor: int = 25,
@@ -266,6 +276,18 @@ class SMGTrainer(CommonTrainer):
         self.sive_perceptual_loss_start_step = sive_perceptual_loss_start_step
         self.sive_perceptual_loss_rampup_steps = sive_perceptual_loss_rampup_steps
         self.sive_perceptual_layer = sive_perceptual_layer
+
+        # Mimi content-cycle loss on swaps (lazy-loaded frozen Mimi + Vocos)
+        self.mimi_content_loss_weight = mimi_content_loss_weight
+        self.mimi_content_loss_start_step = mimi_content_loss_start_step
+        self.mimi_content_loss_rampup_steps = mimi_content_loss_rampup_steps
+        self.mimi_content_loss_every_n_steps = max(1, mimi_content_loss_every_n_steps)
+        self.mimi_content_loss_type = mimi_content_loss_type
+        self.mimi_content_loss_temperature = mimi_content_loss_temperature
+        self.mimi_content_loss_max_items = mimi_content_loss_max_items
+        self.mimi_content_model_id = mimi_content_model_id
+        self._mimi_content_model = None
+        self._mimi_content_vocos = None
 
         self.has_logged_cli = False
 
@@ -626,14 +648,17 @@ class SMGTrainer(CommonTrainer):
                     self.discriminator_optimizer.zero_grad()
                     d_loss.backward()
 
-                    # Log gradient statistics to diagnose training issues
+                    # Clip the D gradient (the D optimizer is separate from the HF Trainer's, so
+                    # --max_grad_norm did NOT reach it). Without this the D update is unbounded --
+                    # a spike (e.g. R1's double-backward on the high-sensitivity sharp D, or a bad
+                    # batch) can NaN the D params and then poison the generator. Log the PRE-clip
+                    # norm so the diagnostic still shows spikes.
+                    total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.discriminator.parameters(),
+                        max_norm=(self.args.max_grad_norm if self.args.max_grad_norm and self.args.max_grad_norm > 0 else 1.0),
+                    )
                     if global_step % self.args.logging_steps == 0:
-                        total_grad_norm = 0.0
-                        for p in self.discriminator.parameters():
-                            if p.grad is not None:
-                                total_grad_norm += p.grad.norm().item() ** 2
-                        total_grad_norm = total_grad_norm ** 0.5
-                        metrics.log_scalar("train/d_grad_norm", total_grad_norm, global_step)
+                        metrics.log_scalar("train/d_grad_norm", float(total_grad_norm), global_step)
 
                     self.discriminator_optimizer.step()
 
@@ -1074,6 +1099,58 @@ class SMGTrainer(CommonTrainer):
                 metrics.log_scalar(f"{prefix}identity/alpha", identity_alpha, global_step, skip_zero=False)
                 metrics.log_scalar(f"{prefix}identity/weighted_loss",
                                    self.identity_loss_weight * identity_alpha * identity_loss, global_step, skip_zero=False)
+
+        # Mimi content-cycle loss on the SWAPPED output: vocode the swap -> Mimi -> cb0
+        # semantic latent -> match the SOURCE's unit ids. Anchors CONTENT on conversions,
+        # which nothing else does (a swap has no GT mel, so recon/mel-perceptual can't touch
+        # it, and adversarial realism makes wrong words sound confident). Fixes cross-speaker
+        # phonemic drift ("dine"->"died"). Expensive (frozen Vocos + Mimi in the loop, grad
+        # through both), so amortized every N steps and capped to a batch subset.
+        mimi_content_loss = torch.tensor(0.0, device=mel_specs.device)
+        mc_fires = ((global_step - self.mimi_content_loss_start_step) % self.mimi_content_loss_every_n_steps == 0)
+        mimi_content_enabled = (
+            self.mimi_content_loss_weight > 0
+            and global_step >= self.mimi_content_loss_start_step
+            and mc_fires
+            and model.training
+            and decode_speaker_embedding is not None
+            and decode_speaker_embedding.shape[0] > 1
+            and not torch.is_floating_point(features)  # integer unit ids => the Mimi content path
+        )
+        if mimi_content_enabled:
+            from megatransformer.utils.mimi_content import load_mimi, mimi_content_cycle_loss
+            from megatransformer.utils.vocos_features import load_vocos, vocos_decode_grad
+            dev = mel_specs.device
+            if self._mimi_content_model is None:
+                self._mimi_content_model = load_mimi(dev, self.mimi_content_model_id)
+                self._mimi_content_vocos = load_vocos(dev)
+            mc_alpha = min(1.0, (global_step - self.mimi_content_loss_start_step) / max(1, self.mimi_content_loss_rampup_steps))
+            n = features.shape[0]
+            k = n if self.mimi_content_loss_max_items <= 0 else min(n, self.mimi_content_loss_max_items)
+            emb_own = decode_speaker_embedding.squeeze(1) if decode_speaker_embedding.dim() == 3 else decode_speaker_embedding
+            perm = torch.roll(torch.arange(k, device=dev), shifts=1)  # guaranteed-different (shift by 1)
+            feats_k = features[:k]
+            contour_k = f0_contour[:k] if f0_contour is not None else None
+            recon_swap_mc = model.decode(feats_k, speaker_embedding=emb_own[:k][perm],
+                                         features=feats_k, f0_contour=contour_k)
+            if recon_swap_mc.dim() == 4 and recon_swap_mc.shape[1] == 1:
+                recon_swap_mc = recon_swap_mc.squeeze(1)
+            # fp32 for the frozen vocoder+Mimi cycle (stable double-model gradient); autograd
+            # casts back into the bf16 SMG. recon_swap_mc keeps its graph to the decoder.
+            with autocast(dev.type, enabled=False):
+                swap_wav = vocos_decode_grad(self._mimi_content_vocos, recon_swap_mc.float())
+                mimi_content_loss = mimi_content_cycle_loss(
+                    self._mimi_content_model, swap_wav, feats_k,
+                    loss_type=self.mimi_content_loss_type,
+                    temperature=self.mimi_content_loss_temperature,
+                )
+            total_loss = total_loss + self.mimi_content_loss_weight * mc_alpha * mimi_content_loss
+            if global_step % self.args.logging_steps == 0:
+                prefix = "train/" if model.training else "eval/"
+                metrics.log_scalar(f"{prefix}mimi_content/loss", mimi_content_loss, global_step, skip_zero=False)
+                metrics.log_scalar(f"{prefix}mimi_content/weighted",
+                                   self.mimi_content_loss_weight * mc_alpha * mimi_content_loss, global_step, skip_zero=False)
+                metrics.log_scalar(f"{prefix}mimi_content/alpha", mc_alpha, global_step, skip_zero=False)
 
         # Log losses (skip non-loss values like learned_speaker_embedding)
         if global_step % self.args.logging_steps == 0:
@@ -1726,6 +1803,14 @@ def create_trainer(
         sive_perceptual_loss_start_step=args.sive_perceptual_loss_start_step,
         sive_perceptual_loss_rampup_steps=args.sive_perceptual_loss_rampup_steps,
         sive_perceptual_layer=args.sive_perceptual_layer,
+        mimi_content_loss_weight=args.mimi_content_loss_weight,
+        mimi_content_loss_start_step=args.mimi_content_loss_start_step,
+        mimi_content_loss_rampup_steps=args.mimi_content_loss_rampup_steps,
+        mimi_content_loss_every_n_steps=args.mimi_content_loss_every_n_steps,
+        mimi_content_loss_type=args.mimi_content_loss_type,
+        mimi_content_loss_temperature=args.mimi_content_loss_temperature,
+        mimi_content_loss_max_items=args.mimi_content_loss_max_items,
+        mimi_content_model_id=args.mimi_content_model_id,
         bucket_by_length=getattr(args, 'bucket_by_length', False),
         bucket_mega_factor=getattr(args, 'bucket_mega_factor', 25),
     )
@@ -1893,6 +1978,32 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--sive_perceptual_loss_rampup_steps", type=int, default=5000,
                            help="Ramp the SIVE perceptual weight 0 -> max over this many steps after the start step "
                                 "(mirrors --identity_loss_rampup_steps; 0 = hard on at full weight)")
+
+    # Mimi content-cycle loss on the SWAPPED (cross-speaker) output. Vocodes the swap ->
+    # re-encodes with frozen Mimi -> matches the SOURCE's cb0 unit ids, so conversions keep
+    # their words (the recon/mel-perceptual losses can't reach a swap -- no GT mel). Mimi path
+    # only (integer unit ids) + the 24kHz Vocos vocoder. Expensive: it runs a frozen Vocos AND
+    # Mimi in the loop with gradients through both -- hence --mimi_content_loss_every_n_steps /
+    # --mimi_content_loss_max_items to amortize + cap.
+    sub_parser.add_argument("--mimi_content_loss_weight", type=float, default=0.0,
+                           help="Weight for the Mimi content-cycle loss on swaps (0 = off). Fixes cross-speaker "
+                                "phonemic drift; adversarial realism alone can't (it makes wrong words sound confident).")
+    sub_parser.add_argument("--mimi_content_loss_start_step", type=int, default=0,
+                           help="Step to start the Mimi content-cycle loss (0 = from start)")
+    sub_parser.add_argument("--mimi_content_loss_rampup_steps", type=int, default=5000,
+                           help="Ramp the weight 0 -> max over this many steps after the start step (0 = hard on)")
+    sub_parser.add_argument("--mimi_content_loss_every_n_steps", type=int, default=2,
+                           help="Apply the content-cycle loss every N steps to amortize the vocoder+Mimi cost")
+    sub_parser.add_argument("--mimi_content_loss_type", type=str, default="ce", choices=["ce", "l1"],
+                           help="'ce' = cross-entropy over cb0 codes (penalize wrong-code assignment; recommended); "
+                                "'l1' = push the re-encoded latent toward the source centroid")
+    sub_parser.add_argument("--mimi_content_loss_temperature", type=float, default=0.1,
+                           help="Softmax temperature for the 'ce' loss (scales the -distance logits)")
+    sub_parser.add_argument("--mimi_content_loss_max_items", type=int, default=16,
+                           help="Cap the batch subset fed through the vocoder+Mimi each fire (0 = whole batch). "
+                                "Bounds the extra memory/compute of the double-model cycle.")
+    sub_parser.add_argument("--mimi_content_model_id", type=str, default="kyutai/mimi",
+                           help="HF id of the Mimi model used to re-encode the swap (must match the content tokenizer)")
 
     # Vocoder settings (optional - for audio generation during visualization AND waveform losses)
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,

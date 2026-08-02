@@ -39,5 +39,19 @@ def vocos_mel(vocos, wav_24k) -> torch.Tensor:
     return feats[0]
 
 
+def vocos_decode_grad(vocos, mel: torch.Tensor) -> torch.Tensor:
+    """Vocode a log-mel to a 24 kHz waveform, GRADIENT-PRESERVING.
+
+    `vocos.decode()` is wrapped in no_grad/inference_mode (fine for viz, useless for a
+    loss), so replicate its body (backbone -> head) directly to keep the graph. mel:
+    [B, 100, T] log-mel (Vocos space). Returns [B, samples]. Used by the content-cycle
+    swap loss, where gradients must flow wave -> Vocos -> the SMG decoder.
+    """
+    if mel.dim() == 2:
+        mel = mel.unsqueeze(0)
+    x = vocos.backbone(mel)
+    return vocos.head(x)
+
+
 def vocos_frame_rate(model_id="charactr/vocos-mel-24khz") -> float:
     return 24000 / 256  # 93.75 Hz
