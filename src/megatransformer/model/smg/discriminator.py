@@ -16,6 +16,8 @@ class MelDomainPeriodSubDiscriminator(nn.Module):
         period: int = 2,
         n_layers: int = 4,
         use_spectral_norm: bool = True,
+        time_stride: int = 3,
+        max_channels: int = 512,
     ):
         super().__init__()
 
@@ -27,10 +29,10 @@ class MelDomainPeriodSubDiscriminator(nn.Module):
         channels = in_channels * period
 
         for i in range(n_layers):
-            out_channels = min(base_channels * (2 ** i), 512)
+            out_channels = min(base_channels * (2 ** i), max_channels)
             # Use asymmetric kernel: small in freq, larger in time
             kernel_size = (3, 5)
-            stride = (2, 3) if i < n_layers - 1 else (1, 1)
+            stride = (2, time_stride) if i < n_layers - 1 else (1, 1)
             padding = (1, 2)
 
             layer = nn.Sequential(
@@ -93,6 +95,8 @@ class MelDomainMultiPeriodDiscriminator(nn.Module):
                 base_channels=config.base_channels,
                 period=p,
                 use_spectral_norm=config.use_spectral_norm,
+                time_stride=getattr(config, "time_stride", 3),
+                max_channels=getattr(config, "max_channels", 512),
             )
             for p in config.periods
         ])
@@ -124,6 +128,7 @@ class MelDomainPatchDiscriminator(nn.Module):
         kernel_sizes: list = None,
         strides: list = None,
         use_spectral_norm: bool = True,
+        max_channels: int = 512,
     ):
         super().__init__()
 
@@ -141,7 +146,7 @@ class MelDomainPatchDiscriminator(nn.Module):
         channels = in_channels
 
         for i in range(n_layers):
-            out_channels = min(base_channels * (2 ** i), 512)
+            out_channels = min(base_channels * (2 ** i), max_channels)
             kernel_size = kernel_sizes[i]
             stride = strides[i]
             padding = (kernel_size[0] // 2, kernel_size[1] // 2)
@@ -191,13 +196,19 @@ class MelDomainMultiScaleDiscriminator(nn.Module):
                 in_channels=config.in_channels,
                 base_channels=config.base_channels,
                 n_layers=config.n_layers,
+                kernel_sizes=getattr(config, "kernel_sizes", None),
+                strides=getattr(config, "strides", None),
                 use_spectral_norm=config.use_spectral_norm,
+                max_channels=getattr(config, "max_channels", 512),
             )
             for _ in range(config.n_scales)
         ])
 
-        # Downsample more in time than frequency
-        self.downsample = nn.AvgPool2d(kernel_size=(2, 3), stride=(2, 3), padding=(0, 1))
+        # Between-scale input pool. Configurable so the branch can vary only TIME (1,2) or only
+        # FREQ (2,1) across scales instead of coarsening both (the (2,3) default -> global).
+        sp = getattr(config, "scale_pool", (2, 3))
+        pad = (0 if sp[0] == 1 else sp[0] // 2, 0 if sp[1] == 1 else sp[1] // 2)
+        self.downsample = nn.AvgPool2d(kernel_size=sp, stride=sp, padding=pad)
 
     def forward(self, x: torch.Tensor) -> tuple[list[torch.Tensor], list[list[torch.Tensor]]]:
         """
@@ -238,6 +249,12 @@ class MelDomainCombinedDiscriminator(nn.Module):
 
         if config.multi_scale_config is not None:
             self.discriminators.append(MelDomainMultiScaleDiscriminator(config=config.multi_scale_config))
+
+        # Optional FREQUENCY-resolved multi-scale group (time-heavy strides, freq preserved) —
+        # a second MelDomainMultiScaleDiscriminator, just oriented for the other axis. Catches
+        # inharmonic/formant artifacts the time-resolved branch smooths over.
+        if getattr(config, "multi_scale_freq_config", None) is not None:
+            self.discriminators.append(MelDomainMultiScaleDiscriminator(config=config.multi_scale_freq_config))
 
         if config.multi_period_config is not None:
             self.discriminators.append(MelDomainMultiPeriodDiscriminator(config=config.multi_period_config))
