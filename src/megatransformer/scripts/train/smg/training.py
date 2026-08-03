@@ -149,6 +149,9 @@ class SMGTrainer(CommonTrainer):
         speaker_id_loss_rampup_steps: int = 0,  # Steps to ramp weight from 0 to max (0 = no rampup)
         # F0 predictor pretraining settings
         f0_predictor_freeze_steps: int = 0,  # Steps to keep F0 predictor frozen (0 = no freezing)
+        freeze_f0_in_gan: bool = False,  # Freeze the F0 predictor once the GAN starts (pitch is
+        # solved in pregan; the adversarial gradient into it has no accuracy objective and
+        # inevitably diverges it -- config only shifts the timeline). Decoder still uses its preds.
         f0_warmup_use_gt_steps: int = 0,  # Steps to use GT F0 instead of predicted (0 = disabled)
         # SIVE perceptual loss: frozen SIVE as content-preserving loss
         sive_perceptual_model: Optional[torch.nn.Module] = None,
@@ -268,6 +271,7 @@ class SMGTrainer(CommonTrainer):
 
         # F0 predictor pretraining settings
         self.f0_predictor_freeze_steps = f0_predictor_freeze_steps
+        self.freeze_f0_in_gan = freeze_f0_in_gan
         self.f0_warmup_use_gt_steps = f0_warmup_use_gt_steps
 
         # SIVE perceptual loss: frozen SIVE encoder as content loss
@@ -485,6 +489,22 @@ class SMGTrainer(CommonTrainer):
                 self.gan_start_step = global_step
                 print(f"GAN training starting at step {global_step}")
             self.gan_already_started = True
+
+            # Freeze the F0 predictor for the GAN phase. Pitch is solved in pregan (smg_f0
+            # ~0.07); the adversarial gradient reaching the predictor via the f0-conditioned
+            # recon has no accuracy objective, so left trainable it inevitably diverges (only
+            # the timeline shifts with config -- observed A ~116k, A'-detach ~64k). Freezing
+            # once at GAN start cuts EVERY gradient path in (recon, GAN, swaps, f0_loss); the
+            # decoder still consumes its good static predictions and the GAN polishes only the
+            # decoder. requires_grad=False -> AdamW skips these params (no optimizer rebuild).
+            if self.freeze_f0_in_gan:
+                _f0p = getattr(unwrapped_model, "f0_predictor", None)
+                if _f0p is not None:
+                    _fp = next(_f0p.parameters(), None)
+                    if _fp is not None and _fp.requires_grad:
+                        for p in _f0p.parameters():
+                            p.requires_grad = False
+                        print(f"Step {global_step}: froze F0 predictor for the GAN phase (freeze_f0_in_gan)")
 
             # Compute GAN warmup factor (ramps from 0 to 1 over gan_warmup_steps)
             gan_warmup_factor = 1.0
@@ -1841,6 +1861,7 @@ def create_trainer(
         speaker_id_loss_start_step=args.speaker_id_loss_start_step,
         speaker_id_loss_rampup_steps=args.speaker_id_loss_rampup_steps,
         f0_predictor_freeze_steps=args.f0_predictor_freeze_steps,
+        freeze_f0_in_gan=getattr(args, "freeze_f0_in_gan", False),
         f0_warmup_use_gt_steps=args.f0_warmup_use_gt_steps,
         sive_perceptual_model=sive_perceptual_model,
         sive_perceptual_loss_weight=args.sive_perceptual_loss_weight,
@@ -2125,6 +2146,12 @@ def add_cli_args(subparsers):
     # Number of steps to keep F0 predictor frozen (0 = no freezing)
     sub_parser.add_argument("--f0_predictor_freeze_steps", type=int, default=0,
                             help="Number of steps to keep F0 predictor frozen (0 = no freezing)")
+    sub_parser.add_argument("--freeze_f0_in_gan", action="store_true",
+                            help="Freeze the F0 predictor once the GAN phase starts. Pitch is solved "
+                                 "in pregan; leaving the predictor trainable lets the adversarial "
+                                 "gradient (no accuracy objective) diverge it -- config only shifts "
+                                 "the timeline (A ~116k, detach ~64k). The decoder still uses its "
+                                 "predictions; the GAN polishes only the decoder.")
     # Use GT F0 for first N steps to let embedding learn with clean signal (0 = disabled)
     sub_parser.add_argument("--f0_warmup_use_gt_steps", type=int, default=0,
                             help="Number of steps to use GT F0 for warmup (0 = disabled)")
