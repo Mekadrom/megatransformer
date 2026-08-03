@@ -540,7 +540,12 @@ class SMGTrainer(CommonTrainer):
                 with autocast(mel_specs.device.type, dtype=_dt, enabled=self.args.fp16 or self.args.bf16):
                     perm = torch.roll(torch.arange(decode_speaker_embedding.shape[0],
                                                    device=decode_speaker_embedding.device), shifts=1)
-                    rw = model.decode(features, speaker_embedding=decode_speaker_embedding[perm], features=features, f0_contour=f0_contour)
+                    # detach_f0: like the content-cycle, the wrong-emb adversarial term must shape
+                    # the converted output's CONTENT/texture, not train the pitch predictor -- that
+                    # backprop drove the falsetto in the content+wrong_emb arm. Pitch is applied
+                    # from current weights; the F0 predictor learns only from smg_f0_loss.
+                    rw = model.decode(features, speaker_embedding=decode_speaker_embedding[perm],
+                                      features=features, f0_contour=f0_contour, detach_f0=True)
                     if rw.dim() == 4 and rw.shape[1] == 1:
                         rw = rw.squeeze(1)
                     # Match recon's time length. recon was pad/cropped to the target in the
