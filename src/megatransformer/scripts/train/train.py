@@ -989,4 +989,10 @@ if __name__ == "__main__":
     if args.fresh_schedule:
         print("--fresh_schedule: HF Trainer optimizer/scheduler/global_step will start fresh; "
               "model weights loaded from --resume_from_checkpoint via load_model.")
+    # Restore the discriminator (weights + optimizer) and GAN schedule state on resume. HF
+    # Trainer restores only the generator, so without this the D restarts from RANDOM and the
+    # GAN warmup re-anchors -> every metric spikes right after resume. SMG-only; no-op if the
+    # checkpoint has no discriminator.pt.
+    if args.resume_from_checkpoint and hasattr(trainer, "load_discriminator_state"):
+        trainer.load_discriminator_state(args.resume_from_checkpoint)
     trainer.train(resume_from_checkpoint=resume_path)

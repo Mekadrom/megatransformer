@@ -1432,6 +1432,10 @@ class SMGTrainer(CommonTrainer):
                     self.discriminator_optimizer.state_dict()
                     if self.discriminator_optimizer is not None else None
                 ),
+                # GAN schedule state, so warmup / instance-noise decay don't re-anchor to the
+                # resume step (see load_discriminator_state).
+                "gan_start_step": self.gan_start_step,
+                "gan_already_started": self.gan_already_started,
             }, discriminator_path)
             print(f"Discriminator saved to {discriminator_path}")
 
@@ -1447,6 +1451,37 @@ class SMGTrainer(CommonTrainer):
                 ),
             }, learned_speaker_classifier_path)
             print(f"Learned speaker classifier saved to {learned_speaker_classifier_path}")
+
+    def load_discriminator_state(self, checkpoint_dir: str):
+        """Restore the discriminator (weights + its optimizer) and the GAN schedule state on
+        resume. HF Trainer restores ONLY the generator; without this the D restarts from random
+        and gan_start_step re-anchors to the resume step -- so every GAN metric spikes on resume
+        (fresh D vs a trained generator + a re-ramping warmup). Call before trainer.train()."""
+        if getattr(self, "discriminator", None) is None:
+            return
+        path = os.path.join(checkpoint_dir, "discriminator.pt")
+        if not os.path.exists(path):
+            print(f"[gan-resume] no discriminator.pt in {checkpoint_dir}; D would start FRESH")
+            return
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        self.discriminator.load_state_dict(ckpt["discriminator_state_dict"])
+        try:
+            dev = next(self.model.parameters()).device
+            self.discriminator.to(dev)
+        except StopIteration:
+            pass
+        if (self.discriminator_optimizer is not None
+                and ckpt.get("discriminator_optimizer_state_dict") is not None):
+            self.discriminator_optimizer.load_state_dict(ckpt["discriminator_optimizer_state_dict"])
+        # Keep the ORIGINAL gan_start_step so warmup/noise stay anchored. Older checkpoints
+        # didn't save it -> infer from the step-based start condition (else warmup re-ramps).
+        self.gan_already_started = bool(ckpt.get("gan_already_started", True))
+        gs = ckpt.get("gan_start_step")
+        if gs is None and self.gan_start_condition_key == "step" and self.gan_start_condition_value is not None:
+            gs = int(self.gan_start_condition_value)
+        self.gan_start_step = gs
+        print(f"[gan-resume] restored discriminator + optimizer + GAN state "
+              f"(gan_start_step={self.gan_start_step}, already_started={self.gan_already_started}) from {path}")
 
     def start_train_print(self, args):
         model = self.model
