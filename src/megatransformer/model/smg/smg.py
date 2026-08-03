@@ -1,3 +1,5 @@
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1185,7 +1187,7 @@ class SMG(nn.Module):
             return f0_contour.unsqueeze(1) if f0_contour.dim() == 2 else f0_contour  # (B, 1, T)
         return features
 
-    def decode(self, z, speaker_embedding=None, f0_embedding=None, features=None, f0_contour=None, return_film_stats=False) -> torch.Tensor:
+    def decode(self, z, speaker_embedding=None, f0_embedding=None, features=None, f0_contour=None, return_film_stats=False, detach_f0=False) -> torch.Tensor:
         """
         Decode latent to mel spectrogram.
 
@@ -1195,6 +1197,13 @@ class SMG(nn.Module):
             f0_embedding: Pre-computed F0 embedding (optional)
             features: SIVE features for F0 prediction (optional, used if f0_embedding not provided)
             return_film_stats: Whether to return FiLM statistics
+            detach_f0: Run the F0 predictor + harmonic embedding under no_grad, so this decode
+                APPLIES pitch from current weights but no gradient reaches the pitch-prediction
+                modules. For swap-path losses (the Mimi content-cycle): those must anchor CONTENT
+                without training PITCH — backprop into the F0 predictor there fights its own
+                f0_loss and drives falsetto/warble (observed: content+wrong_emb -> falsetto). The
+                decoder (incl. its f0_projection) still trains; only self.f0_predictor /
+                self.f0_embedding are frozen for this call.
         # Predict F0 if conditioning is enabled but embedding not provided
         """
         # Discrete-token input: embed ids -> float (both the content latent z and, if the
@@ -1205,9 +1214,10 @@ class SMG(nn.Module):
             f0_src = self._f0_predictor_input(features, f0_contour)
             if f0_src is not None:
                 # z IS the content latent, so it stands in when a caller passes only z.
-                log_f0_pred, voiced_pred = self.f0_predictor(
-                    speaker_embedding, f0_src, content_features=features if features is not None else z)
-                f0_embedding = self.f0_embedding(log_f0_pred, voiced_pred)
+                with torch.no_grad() if detach_f0 else contextlib.nullcontext():
+                    log_f0_pred, voiced_pred = self.f0_predictor(
+                        speaker_embedding, f0_src, content_features=features if features is not None else z)
+                    f0_embedding = self.f0_embedding(log_f0_pred, voiced_pred)
         return self.decoder(z, speaker_embedding=speaker_embedding, f0_embedding=f0_embedding, return_film_stats=return_film_stats)
 
     def forward(

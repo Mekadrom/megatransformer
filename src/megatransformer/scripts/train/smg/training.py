@@ -1131,8 +1131,11 @@ class SMGTrainer(CommonTrainer):
             perm = torch.roll(torch.arange(k, device=dev), shifts=1)  # guaranteed-different (shift by 1)
             feats_k = features[:k]
             contour_k = f0_contour[:k] if f0_contour is not None else None
+            # detach_f0: the content-cycle anchors CONTENT, not pitch. Training the F0 predictor
+            # through this swap decode fights its own f0_loss and drives falsetto/warble (seen in
+            # the content+wrong_emb arm). Apply pitch from current weights, no grad to the predictor.
             recon_swap_mc = model.decode(feats_k, speaker_embedding=emb_own[:k][perm],
-                                         features=feats_k, f0_contour=contour_k)
+                                         features=feats_k, f0_contour=contour_k, detach_f0=True)
             if recon_swap_mc.dim() == 4 and recon_swap_mc.shape[1] == 1:
                 recon_swap_mc = recon_swap_mc.squeeze(1)
             # fp32 for the frozen vocoder+Mimi cycle (stable double-model gradient); autograd
