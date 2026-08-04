@@ -2123,6 +2123,10 @@ def add_cli_args(subparsers):
                             help="Voice SMG decoder config name")
     sub_parser.add_argument("--voice_smg_sive_encoder_dim", type=int, default=None,
                             help="Override sive_encoder_dim for voice SMG (must match what it was trained with)")
+    sub_parser.add_argument("--voice_smg_speaker_embedding_dim", type=int, default=None,
+                            help="Speaker-embedding width of the voice SMG checkpoint (192 ECAPA, 768 WavLM). "
+                                 "Required to load a WavLM-conditioned SMG or its FiLM/F0 speaker weights "
+                                 "load as random under strict=False.")
     sub_parser.add_argument("--viz_voice_temperature", type=float, default=0.6,
                             help="Sampling temperature for voice latents in TB eval renders (0=deterministic mu; "
                                  "~0.5-0.7=moderate). Only active if the model was trained with "

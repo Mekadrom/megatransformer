@@ -449,8 +449,20 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
                 if getattr(args, 'voice_smg_sive_encoder_dim', None) is not None:
                     smg_overrides["sive_encoder_dim"] = args.voice_smg_sive_encoder_dim
                 # The SMG's F0 conditioning derives its harmonic phase step from hop/sample_rate,
-                # so it must match the mel rate the SMG was trained at (e.g. 320 for 50 Hz ContentVec).
+                # so it must match the mel rate the SMG was trained at (e.g. 320 for 50 Hz ContentVec,
+                # 256/24000 for the 24 kHz Vocos path -- without sample_rate the phase runs at the
+                # 16 kHz default and is 1.5x off).
                 smg_overrides["hop_length"] = getattr(args, 'voice_hop_length', 256)
+                smg_overrides["sample_rate"] = getattr(args, 'voice_sample_rate', 16000)
+                # Speaker-embedding width must match the SMG checkpoint (192 ECAPA vs 768 WavLM);
+                # without it the SMG builds at 192 and the 768 FiLM / F0 speaker_proj weights load
+                # as random under strict=False -> broken speaker conditioning.
+                if getattr(args, 'voice_smg_speaker_embedding_dim', None) is not None:
+                    smg_overrides["speaker_embedding_dim"] = args.voice_smg_speaker_embedding_dim
+                # A discrete-unit SMG (num_codes>0, e.g. Mimi) needs a code_embed_init at build;
+                # centroids aren't needed for a checkpoint load (the trained unit embedding
+                # overwrites), so learned_random avoids requiring the codebook. No-op if num_codes==0.
+                smg_overrides["code_embed_init"] = "learned_random"
                 voice_smg_decoder = model_loading_utils.load_model(
                     SMG,
                     getattr(args, 'voice_smg_config', 'small'),

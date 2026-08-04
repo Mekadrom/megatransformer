@@ -1896,18 +1896,28 @@ class WorldModelVisualizationCallback(VisualizationCallback):
     def _resolve_static_speaker(self, gt_speaker_emb):
         """The fixed reference voice for TTS renders.
 
-        Prefers --static_speaker_embedding_path. Without it, pin the FIRST ground-truth
-        embedding ever seen and reuse it forever. Holding the speaker constant across
-        evals is the whole point of the static render: you are listening for the model
-        improving, which you cannot hear if the voice changes under you every eval.
+        Prefers --static_speaker_embedding_path. Without it, pin a RANDOM eval speaker
+        embedding (collected from the first pool of eval samples) and reuse it forever. A
+        static path was ECAPA-SMG-specific (the best-recon ECAPA vector) and doesn't apply to
+        a WavLM SMG, so a random WavLM eval speaker is the analog. Still PINNED once for
+        consistency: you are listening for the model improving, not the voice drifting.
         """
         if self.static_speaker_embedding is not None:
             return self.static_speaker_embedding
         if self._pinned_speaker is None and gt_speaker_emb is not None:
-            self._pinned_speaker = gt_speaker_emb.detach().clone().cpu()
-            print("[viz] No --static_speaker_embedding_path given; pinning the first eval "
-                  "sample's speaker as the fixed reference voice for TTS renders.", flush=True)
-        return self._pinned_speaker
+            if not hasattr(self, "_speaker_pool"):
+                self._speaker_pool = []
+            self._speaker_pool.append(gt_speaker_emb.detach().clone().cpu())
+            if len(self._speaker_pool) >= 8:  # seen enough eval speakers -> pin a random one
+                import random as _rnd
+                self._pinned_speaker = self._speaker_pool[_rnd.randrange(len(self._speaker_pool))]
+                print(f"[viz] No --static_speaker_embedding_path; pinned a RANDOM eval speaker "
+                      f"(1 of {len(self._speaker_pool)}) as the fixed reference voice for TTS renders.",
+                      flush=True)
+        if self._pinned_speaker is not None:
+            return self._pinned_speaker
+        # provisional until the pool fills (first eval only): the latest seen
+        return self._speaker_pool[-1] if getattr(self, "_speaker_pool", None) else None
 
     def _log_audio_with_smg(self, pred_latent, sample, global_step, tag_prefix, f0_contour=None):
         """Run dual-speaker SMG decoding: ground-truth speaker + static speaker."""
