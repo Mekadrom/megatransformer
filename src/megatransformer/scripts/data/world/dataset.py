@@ -333,6 +333,18 @@ class MultimodalShardedDataset(Dataset):
                 )
                 sample["features"] = feat
                 sample["unit_ids"] = unit_ids
+        elif "unit_ids" in shard:
+            # PRE-quantized cache (e.g. Mimi): unit ids are stored directly, no continuous
+            # `features` column. Set the unit-id target + real length, and derive the
+            # continuous prelude feature (centroid per id) from the codebook so the voice
+            # prelude has its (D, T) input -- mirroring what quantize() produces on the path
+            # above. Pad ids (0/-1 beyond feature_length) map to centroid 0 and are masked
+            # by feature_length downstream.
+            unit_ids = shard["unit_ids"][local_idx]
+            sample["unit_ids"] = unit_ids
+            sample["feature_length"] = shard["feature_lengths"][local_idx]
+            if self.voice_centroids is not None:
+                sample["features"] = self.voice_centroids[unit_ids.clamp(min=0)].transpose(0, 1).contiguous()  # (D, T)
 
         if "waveforms" in shard and "waveforms" in columns:
             sample["waveform"] = shard["waveforms"][local_idx]
