@@ -53,6 +53,19 @@ def parse_args():
     p.add_argument("--voice_smg_speaker_embedding_dim", type=int, default=None,
                    help="Speaker-embedding width the SMG was trained at (192 ECAPA vs 768 WavLM). "
                         "Required for a WavLM SMG or the speaker_proj weights load as random.")
+    # World-model build overrides -- must match the values the run was TRAINED with, or the
+    # rebuilt architecture won't match the checkpoint (feature_channels defaults to 128 in
+    # small_sum; a Mimi run uses 256). Mirror the training --voice_* args.
+    p.add_argument("--voice_feature_channels", type=int, default=None,
+                   help="Voice prelude/coda feature width the world model was trained at "
+                        "(256 for the Mimi/WavLM run; small_sum defaults to 128).")
+    p.add_argument("--voice_predict_f0", action="store_true",
+                   help="The world run trained a coda F0 head (--voice_predict_f0). Required to "
+                        "rebuild the matching coda + emit the SMG's F0 contour.")
+    p.add_argument("--voice_codebook_path", type=str, default=None,
+                   help="Discrete (Mimi/VQ) codebook the run used. Sizes the coda's unit_vocab "
+                        "head (K+1) and is installed as the model's centroid buffer so generate() "
+                        "can map sampled unit ids -> centroids.")
     p.add_argument("--vocoder_config", type=str, default="hifigan")
     p.add_argument("--vocoder_checkpoint_path", type=str, default=None)
     p.add_argument("--static_speaker_embedding_path", type=str, default=None)
@@ -71,15 +84,46 @@ def parse_args():
 
 
 def load_world_model(args, device):
+    import copy
+    from megatransformer.model.world.world_model import WORLD_MODEL_CONFIGS
+
     include_modes = [m.strip() for m in args.include_modes.split(",")]
     overrides = {"include_modes": include_modes}
     if args.tie_word_embeddings:
         overrides["tie_word_embeddings"] = True
-    return model_loading_utils.load_model(
+
+    # Rebuild the voice prelude/coda sub-configs to match the TRAINED architecture before the
+    # checkpoint loads (mirrors world/training.py's load_model). small_sum's defaults differ
+    # from a Mimi run (feature_channels 128 vs 256, no F0 head, default unit vocab), which is a
+    # hard state_dict size mismatch otherwise. Deep-copy so the shared global config is untouched.
+    base = WORLD_MODEL_CONFIGS.get(args.config)
+    if base is not None and (args.voice_feature_channels is not None
+                             or args.voice_predict_f0
+                             or args.voice_codebook_path is not None):
+        prelude_cfg = copy.deepcopy(base.voice_prelude_config)
+        coda_cfg = copy.deepcopy(base.voice_coda_config)
+        if args.voice_feature_channels is not None:
+            prelude_cfg.feature_channels = args.voice_feature_channels
+            coda_cfg.feature_channels = args.voice_feature_channels
+        if args.voice_predict_f0:
+            coda_cfg.predict_f0 = True
+        if args.voice_codebook_path:
+            from megatransformer.utils.codebook import load_codebook
+            K = int(load_codebook(args.voice_codebook_path).shape[0])
+            coda_cfg.unit_vocab_size = K + 1  # +1 for the terminal EOV unit
+        overrides["voice_prelude_config"] = prelude_cfg
+        overrides["voice_coda_config"] = coda_cfg
+
+    model = model_loading_utils.load_model(
         MegaTransformerWorldModel, args.config,
         checkpoint_path=args.checkpoint_path,
         overrides=overrides, device=device,
     )
+    # Install the centroids so generate()'s discrete path can map unit ids -> centroid frames.
+    if args.voice_codebook_path:
+        from megatransformer.utils.codebook import load_codebook
+        model.set_voice_codebook(load_codebook(args.voice_codebook_path))
+    return model
 
 
 def load_dataset(args, split="val"):
@@ -105,9 +149,14 @@ def load_dataset(args, split="val"):
         )
     else:
         from megatransformer.scripts.data.world.dataset import MultimodalShardedDataset
+        # Pass the codebook so a pre-quantized (Mimi/VQ) cache -- which stores only unit_ids --
+        # expands into continuous centroid `voice_features`. Without it every sample has no
+        # voice_features and the eval loop skips all of them (0 samples). Must be the SAME
+        # codebook the run trained with.
         return MultimodalShardedDataset(
             text_shard_dir=text_dir, voice_shard_dir=voice_dir,
             cache_size=32, max_samples=args.max_samples,
+            voice_codebook=args.voice_codebook_path,
         )
 
 
@@ -363,23 +412,24 @@ def main():
             if args.save_audio and vocoder is not None:
                 try:
                     import torchaudio
-                    gen_wav = mel_to_waveform(vocoder, gen_mel, mel_hop_length=args.mel_hop_length)
-                    if gen_wav is not None:
-                        if gen_wav.dim() == 1:
-                            gen_wav = gen_wav.unsqueeze(0)
-                        torchaudio.save(
-                            os.path.join(args.save_audio, f"gen_{i}.wav"),
-                            gen_wav.cpu(), args.sample_rate,
-                        )
+
+                    def _save_wav(wav, path):
+                        # render_vocoder_audio returns a numpy array; torchaudio needs a
+                        # (channels, samples) float tensor.
+                        if wav is None:
+                            return
+                        if not isinstance(wav, torch.Tensor):
+                            wav = torch.as_tensor(wav)
+                        wav = wav.float().cpu()
+                        if wav.dim() == 1:
+                            wav = wav.unsqueeze(0)
+                        torchaudio.save(path, wav, args.sample_rate)
+
+                    _save_wav(mel_to_waveform(vocoder, gen_mel, mel_hop_length=args.mel_hop_length),
+                              os.path.join(args.save_audio, f"gen_{i}.wav"))
                     if target_mel is not None:
-                        tgt_wav = mel_to_waveform(vocoder, target_mel, mel_hop_length=args.mel_hop_length)
-                        if tgt_wav is not None:
-                            if tgt_wav.dim() == 1:
-                                tgt_wav = tgt_wav.unsqueeze(0)
-                            torchaudio.save(
-                                os.path.join(args.save_audio, f"target_{i}.wav"),
-                                tgt_wav.cpu(), args.sample_rate,
-                            )
+                        _save_wav(mel_to_waveform(vocoder, target_mel, mel_hop_length=args.mel_hop_length),
+                                  os.path.join(args.save_audio, f"target_{i}.wav"))
                 except Exception as e:
                     print(f"  Warning: audio save failed: {e}")
 
@@ -388,8 +438,10 @@ def main():
         feat_len = sample.get("voice_feature_length", target_features.shape[-1])
         if isinstance(feat_len, torch.Tensor):
             feat_len = feat_len.item()
-        target_flat = target_features[:, :feat_len].flatten()
-        gen_flat = gen_latent[:, :min(gen_latent.shape[-1], feat_len)].flatten()
+        # gen_latent is on the model device; target_features comes off the CPU dataset --
+        # bring both to CPU before the cosine or it's a cross-device RuntimeError.
+        target_flat = target_features[:, :feat_len].flatten().cpu()
+        gen_flat = gen_latent[:, :min(gen_latent.shape[-1], feat_len)].flatten().float().cpu()
         # Pad shorter to match
         max_len = max(target_flat.shape[0], gen_flat.shape[0])
         target_padded = F.pad(target_flat, (0, max_len - target_flat.shape[0]))
