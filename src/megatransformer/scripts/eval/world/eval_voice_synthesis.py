@@ -33,13 +33,26 @@ def parse_args():
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--use_memorization_dataset", action="store_true")
     p.add_argument("--max_new_tokens", type=int, default=512)
-    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--temperature", type=float, default=0.8,
+                   help="TEXT sampling temperature (does not affect the voice path -- use "
+                        "--voice_temperature for that).")
+    p.add_argument("--voice_temperature", type=float, default=0.0,
+                   help="Voice sampling temperature. 0.0 = greedy/argmax (default). The discrete "
+                        "(Mimi/VQ) coda softmaxes its unit logits at this temperature, so this is "
+                        "the knob to sweep for the machine-gun-vs-coherence question. Higher = more "
+                        "random token switching.")
+    p.add_argument("--voice_token_budget", type=int, default=None,
+                   help="Hard cap on generated content frames before force-closing with EOV. "
+                        "None => generate()'s default (209). For 12.5 Hz Mimi, 125 ~= 10 s.")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--tie_word_embeddings", action="store_true")
     # Decoders
     p.add_argument("--voice_smg_checkpoint_path", type=str, default=None)
     p.add_argument("--voice_smg_config", type=str, default="small")
     p.add_argument("--voice_smg_sive_encoder_dim", type=int, default=None)
+    p.add_argument("--voice_smg_speaker_embedding_dim", type=int, default=None,
+                   help="Speaker-embedding width the SMG was trained at (192 ECAPA vs 768 WavLM). "
+                        "Required for a WavLM SMG or the speaker_proj weights load as random.")
     p.add_argument("--vocoder_config", type=str, default="hifigan")
     p.add_argument("--vocoder_checkpoint_path", type=str, default=None)
     p.add_argument("--static_speaker_embedding_path", type=str, default=None)
@@ -194,6 +207,17 @@ def main():
         smg_overrides = {}
         if args.voice_smg_sive_encoder_dim is not None:
             smg_overrides["sive_encoder_dim"] = args.voice_smg_sive_encoder_dim
+        # F0 conditioning derives its harmonic phase step from hop/sample_rate, so both must
+        # match the mel rate the SMG was trained at (256/24000 for the 24 kHz Vocos path).
+        smg_overrides["hop_length"] = args.mel_hop_length
+        smg_overrides["sample_rate"] = args.sample_rate
+        # Speaker-embedding width must match the checkpoint (192 ECAPA vs 768 WavLM) or the
+        # FiLM / F0 speaker_proj weights load as random under strict=False.
+        if args.voice_smg_speaker_embedding_dim is not None:
+            smg_overrides["speaker_embedding_dim"] = args.voice_smg_speaker_embedding_dim
+        # A discrete-unit SMG (num_codes>0, e.g. Mimi) needs a code_embed_init at build; the
+        # trained unit embedding overwrites it, so learned_random avoids requiring the codebook.
+        smg_overrides["code_embed_init"] = "learned_random"
         smg_decoder = model_loading_utils.load_model(
             SMG, args.voice_smg_config,
             checkpoint_path=args.voice_smg_checkpoint_path,
@@ -290,11 +314,15 @@ def main():
         # Generate voice
         with torch.no_grad():
             with autocast(device, dtype=dtype, enabled=args.bf16):
-                outputs = model.generate(
+                gen_kwargs = dict(
                     text_input_ids=prompt,
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
+                    voice_temperature=args.voice_temperature,
                 )
+                if args.voice_token_budget is not None:
+                    gen_kwargs["voice_token_budget"] = args.voice_token_budget
+                outputs = model.generate(**gen_kwargs)
 
         voice_preds = outputs.get("voice_latent_preds")
         if voice_preds is None or voice_preds.numel() == 0:
