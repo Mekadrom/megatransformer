@@ -885,6 +885,25 @@ if __name__ == "__main__":
     current_process_pid = psutil.Process().pid
     setattr(args, 'cmdline', " ".join(get_process_cmdline(current_process_pid)))
 
+    # --fresh_schedule makes HF Trainer start global_step from 0 (resume_path=None below), so
+    # every logged step becomes step_offset + local_step. Without --start_step, step_offset is 0
+    # and the CLI/metrics/curriculum all collapse onto step 0 -- colliding with the original run's
+    # step-0 entries, which is why a fresh_schedule resume appears to log NO new command_line
+    # (a true resume restores global_step, so SIVE/SMG land at the resumed step automatically).
+    # Auto-infer start_step from the checkpoint-<N> path so a warm restart continues step numbering
+    # like a true resume. An explicit --start_step (including 0, to intentionally restart the
+    # schedule at 0) always wins.
+    if (getattr(args, 'fresh_schedule', False) and getattr(args, 'start_step', None) is None
+            and getattr(args, 'resume_from_checkpoint', None)):
+        import re
+        m = re.search(r'checkpoint-(\d+)', args.resume_from_checkpoint)
+        if m:
+            args.start_step = int(m.group(1))
+            print(f"--fresh_schedule + no --start_step: inferred --start_step {args.start_step} "
+                  f"from {args.resume_from_checkpoint} so logged steps (command_line, metrics, "
+                  f"curriculum) continue from the checkpoint. Pass --start_step explicitly to "
+                  f"override (e.g. --start_step 0 to restart the schedule at step 0).")
+
     run_dir = os.path.join(args.logging_base_dir, args.run_name)
     if not os.path.exists(run_dir):
         os.makedirs(run_dir, exist_ok=True)
