@@ -87,6 +87,7 @@ class VoiceSIVEPreludeFeatureExtractor(nn.Module):
         position_offset: int = 0,
         use_cache: bool = False,
         apply_prenet_dropout: bool = False,
+        prenet_dropout_override: Optional[float] = None,
         additive_attn_bias: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List]]:
         """
@@ -122,7 +123,11 @@ class VoiceSIVEPreludeFeatureExtractor(nn.Module):
         # this dropout ON at inference, and that is load-bearing rather than an oversight
         # — disabling it at generation restores exactly the over-reliance on the
         # previous frame that the bottleneck exists to break.
-        prenet_p = getattr(self.config, "prenet_dropout", 0.0)
+        # prenet_dropout_override lets the trainer supply a per-step RAMPED value (the
+        # NAR→AR prenet curriculum); None falls back to the config's static rate, which is
+        # also what generation/inference uses (prenet stays ON at inference, by design).
+        prenet_p = (prenet_dropout_override if prenet_dropout_override is not None
+                    else getattr(self.config, "prenet_dropout", 0.0))
         if apply_prenet_dropout and prenet_p > 0.0:
             projected = F.dropout(projected, p=prenet_p, training=True)
 

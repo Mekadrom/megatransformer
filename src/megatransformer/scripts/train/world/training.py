@@ -130,6 +130,13 @@ class WorldModelTrainer(CommonTrainer):
         voice_ar_attn_floor: float = 0.0,
         voice_ar_attn_cap: float = 1.0,
         voice_ar_attn_ramp_power: float = 1.0,
+        # NAR→AR prenet curriculum. Ramps Tacotron-2 prenet dropout on the AR voice path
+        # (the shifted-input crutch voice_ar_attn leaves intact) 0→voice_prenet_dropout over
+        # ramp_steps, held at 0 for the first start_step. ramp_steps==0 => the static
+        # --voice_prenet_dropout (config field) is used unchanged.
+        voice_prenet_dropout: float = 0.0,
+        voice_prenet_dropout_ramp_steps: int = 0,
+        voice_prenet_dropout_start_step: int = 0,
         # Modality flags
         include_text: bool = True,
         include_audio: bool = True,
@@ -200,6 +207,14 @@ class WorldModelTrainer(CommonTrainer):
         self.voice_ar_attn_cap = voice_ar_attn_cap
         self.voice_ar_attn_ramp_power = voice_ar_attn_ramp_power
         self._voice_ar_attn_enabled = (voice_ar_attn_mask_steps > 0 or voice_ar_attn_ramp_steps > 0)
+
+        # NAR→AR prenet curriculum. Ramp is active only when a positive target AND a positive
+        # ramp length are given; otherwise the static config prenet_dropout is used as-is (the
+        # forward gets no override), preserving the pre-ramp constant behavior exactly.
+        self.voice_prenet_dropout = voice_prenet_dropout
+        self.voice_prenet_dropout_ramp_steps = voice_prenet_dropout_ramp_steps
+        self.voice_prenet_dropout_start_step = voice_prenet_dropout_start_step
+        self._voice_prenet_ramp_enabled = (voice_prenet_dropout > 0.0 and voice_prenet_dropout_ramp_steps > 0)
         # Both attack the teacher-forcing crutch; stacking them confounds the ablation and
         # the curriculum is the stronger, decisive lever, so it REPLACES scheduled sampling.
         if self._voice_ar_attn_enabled and voice_scheduled_sampling_prob > 0.0:
@@ -683,6 +698,12 @@ class WorldModelTrainer(CommonTrainer):
                 and global_step % self.args.logging_steps == 0):
             metrics.log_scalar("train/voice_attn_alpha", voice_attn_alpha, global_step, skip_zero=False)
 
+        # NAR→AR prenet curriculum: per-step ramped prenet dropout (None => static config value).
+        voice_prenet_dropout = self._voice_prenet_dropout(global_step)
+        if (voice_prenet_dropout is not None and model.training
+                and global_step % self.args.logging_steps == 0):
+            metrics.log_scalar("train/voice_prenet_dropout", voice_prenet_dropout, global_step, skip_zero=False)
+
         outputs = model(
             text_input_ids=text_input_ids,
             audio_inputs=audio_inputs,
@@ -695,6 +716,7 @@ class WorldModelTrainer(CommonTrainer):
             decode_outputs=False,
             is_synthesis=is_synthesis,
             voice_attn_alpha=voice_attn_alpha,
+            voice_prenet_dropout=voice_prenet_dropout,
         )
 
         if should_log and hasattr(model_for_stats, 'recurrent_block'):
@@ -1227,6 +1249,33 @@ class WorldModelTrainer(CommonTrainer):
             return cap
         progress = (t / ramp) ** power
         return floor + (cap - floor) * progress
+
+    def _voice_prenet_dropout(self, global_step: int) -> Optional[float]:
+        """Per-step Tacotron-2 prenet dropout for the NAR→AR prenet curriculum.
+
+        Returns None when the ramp is off (target<=0 or ramp_steps<=0) — the forward then
+        uses the prelude config's static prenet_dropout (which build set to the target), so
+        the constant --voice_prenet_dropout behaves exactly as before. When the ramp is on:
+        0.0 for the first start_step, then a linear 0→target ramp over ramp_steps, then
+        target. Ramped UP (not held high from step 0) because early text is noise — the
+        bottleneck is only useful once the text pathway has something to offer; front-loading
+        it just starves both crutches at once and stalls convergence.
+
+        A function of the step only, so train and eval at the same step match. Attacks the
+        shifted-INPUT crutch (position t is handed frame t-1), the dominant one that
+        _voice_attn_alpha (which only severs voice→voice attention over history) leaves intact.
+        """
+        if not self._voice_prenet_ramp_enabled:
+            return None
+        target = self.voice_prenet_dropout
+        start = max(0, self.voice_prenet_dropout_start_step)
+        ramp = max(1, self.voice_prenet_dropout_ramp_steps)
+        if global_step < start:
+            return 0.0
+        t = global_step - start
+        if t >= ramp:
+            return target
+        return target * (t / ramp)
 
     def _scheduled_sampling_prob(self, global_step: int) -> float:
         """Per-frame probability of feeding the model's OWN prediction instead of ground
@@ -1888,6 +1937,9 @@ def create_trainer(
         voice_ar_attn_floor=getattr(args, 'voice_ar_attn_floor', 0.0),
         voice_ar_attn_cap=getattr(args, 'voice_ar_attn_cap', 1.0),
         voice_ar_attn_ramp_power=getattr(args, 'voice_ar_attn_ramp_power', 1.0),
+        voice_prenet_dropout=getattr(args, 'voice_prenet_dropout', 0.0),
+        voice_prenet_dropout_ramp_steps=getattr(args, 'voice_prenet_dropout_ramp_steps', 0),
+        voice_prenet_dropout_start_step=getattr(args, 'voice_prenet_dropout_start_step', 0),
         include_text="text" in include_modes,
         include_audio="audio" in include_modes,
         include_voice="voice" in include_modes,
@@ -2208,7 +2260,20 @@ def add_cli_args(subparsers):
                                  "predict frame t so well that the text earns no gradient and the "
                                  "model converges to unconditional babble; this bottleneck forces "
                                  "the text to become the reliable signal. Stays ON at inference, "
-                                 "by design. 0 = off, 0.5 = the Tacotron 2 value.")
+                                 "by design. 0 = off, 0.5 = the Tacotron 2 value. This is the RAMP "
+                                 "TARGET when --voice_prenet_dropout_ramp_steps > 0, else a constant.")
+    sub_parser.add_argument("--voice_prenet_dropout_ramp_steps", type=int, default=0,
+                            help="Linear ramp length (steps) over which prenet dropout goes 0 → "
+                                 "--voice_prenet_dropout. 0 (default) = constant (no ramp), the "
+                                 "prior behavior. Ramped UP (not held high from step 0) because "
+                                 "early text is noise: the bottleneck only helps once the text "
+                                 "pathway has something to offer. Attacks the shifted-INPUT crutch "
+                                 "that --voice_ar_attn_* leaves intact; the two compose. Suggested: "
+                                 "20000, aligned with the attention ramp.")
+    sub_parser.add_argument("--voice_prenet_dropout_start_step", type=int, default=0,
+                            help="Hold prenet dropout at 0 for this many steps before the ramp "
+                                 "begins. Set to --voice_ar_attn_mask_steps to start starving the "
+                                 "input crutch exactly when history-attention is handed back.")
     sub_parser.add_argument("--voice_scheduled_sampling_prob", type=float, default=0.0,
                             help="Per-frame probability of feeding the model's OWN prediction "
                                  "instead of ground truth on the AR path, ramped from 0 over "

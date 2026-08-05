@@ -251,6 +251,11 @@ class MegaTransformerWorldModel(nn.Module):
         # alpha=0 severs voice history (position t sees text + its own shifted-TF frame
         # only); alpha=1 (or None) is the identity — no bias built, fast path preserved.
         voice_attn_alpha: Optional[float] = None,
+        # NAR→AR prenet curriculum: per-step Tacotron-2 prenet dropout on the AR voice path
+        # (shifted teacher forcing). Overrides the prelude config's static prenet_dropout so
+        # the trainer can RAMP it; None => use the config value. Attacks the shifted-input
+        # crutch (the dominant one) that voice_attn_alpha leaves intact.
+        voice_prenet_dropout: Optional[float] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass through the world model.
@@ -358,7 +363,9 @@ class MegaTransformerWorldModel(nn.Module):
                 # predict frame t so well on their own that the text earns no gradient.
                 # prenet_dropout (config, default off) is the Tacotron-2 bottleneck.
                 shifted_hidden = self.voice_feature_extractor(
-                    shifted_input, apply_prenet_dropout=True, additive_attn_bias=prelude_bias,
+                    shifted_input, apply_prenet_dropout=True,
+                    prenet_dropout_override=voice_prenet_dropout,
+                    additive_attn_bias=prelude_bias,
                 )  # (B*N, T-1, d_model)
                 zero_prefix = torch.zeros(shifted_hidden.shape[0], 1, d_model, device=shifted_hidden.device, dtype=shifted_hidden.dtype)
                 synth_hidden = torch.cat([zero_prefix, shifted_hidden], dim=1)  # (B*N, T, d_model)
