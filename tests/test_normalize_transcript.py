@@ -3,11 +3,9 @@
 The inputs are real / real-derived LibriTTS-R transcripts (LibriTTS-R is mixed-case WITH
 punctuation, and heavy on quoted dialogue). Every case asserts the CORRECT normalized output.
 
-The bug groups are marked xfail(strict=True): they encode the intended behavior and currently
-FAIL, so the suite stays green while documenting the defects. When normalize_transcript is
-fixed, the strict xfail turns into an XPASS failure -- a reminder to drop the marker. The bugs
-were found from the mimi cache, where ~14% of transcripts carry the group-A artifact
-(e.g. '"Yes.".', 'disappeared!".', 'Gryce?".').
+The three "regression" groups below guard bugs that were found from the mimi cache (~14% of
+transcripts carried the group-A artifact, e.g. '"Yes.".', 'disappeared!".', 'Gryce?".') and
+fixed in normalize_transcript. They previously required xfail; they now pass.
 """
 import sys
 import os
@@ -55,12 +53,11 @@ def test_normalize_correct(raw, expected):
 
 
 # ---------------------------------------------------------------------------
-# BUG A: terminal punctuation followed by a CLOSING QUOTE. normalize_transcript
-# checks only text[-1], so the closing quote (") is treated as "no punctuation" and a
-# spurious period is appended: '."' -> '.".', '!"' -> '!".', '?"' -> '?".'.
-# This is the '"Yes.".' artifact and the most common one (~14% of the mimi cache).
+# Regression A: terminal punctuation followed by a CLOSING QUOTE. The old code checked only
+# text[-1], so the closing quote (") read as "no punctuation" and a spurious period was
+# appended: '."' -> '.".', '!"' -> '!".', '?"' -> '?".'. The '"Yes.".' artifact (~14% of cache).
 # ---------------------------------------------------------------------------
-BUG_QUOTE_TERMINAL = [
+CLOSING_QUOTE_TERMINAL = [
     ('"Yes."', '"Yes."'),
     ('How quickly he disappeared!"', 'How quickly he disappeared!"'),
     ('"So they tell me."', '"So they tell me."'),
@@ -70,47 +67,40 @@ BUG_QUOTE_TERMINAL = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="BUG A: appends '.' after a closing quote that already "
-                                       "follows terminal punctuation (.\"/!\"/?\") -> '.\".'")
-@pytest.mark.parametrize("raw,expected", BUG_QUOTE_TERMINAL)
-def test_bug_quote_terminal(raw, expected):
+@pytest.mark.parametrize("raw,expected", CLOSING_QUOTE_TERMINAL)
+def test_closing_quote_terminal(raw, expected):
     assert normalize_transcript(raw) == expected
 
 
 # ---------------------------------------------------------------------------
-# BUG B: the first word is preceded by an OPENING QUOTE, so neither the sentence-start
-# regex (^ must be immediately followed by [a-z]) nor the first-char check ('"'.islower()
-# is False) capitalizes it. '"but ...' stays lowercase.
+# Regression B: the first word preceded by an OPENING QUOTE must still be capitalized
+# ('"but ...' -> '"But ...'). The old ^([a-z]) regex and first-char check both skipped it.
 # ---------------------------------------------------------------------------
-BUG_OPENING_QUOTE_CAP = [
+OPENING_QUOTE_CAP = [
     ('"but it works!', '"But it works!'),
     ("'tis a fine morning", "'Tis a fine morning."),
     ('"come in," said the host.', '"Come in," said the host.'),
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="BUG B: a first word preceded by an opening quote "
-                                       "is not capitalized ('\"but' stays lowercase)")
-@pytest.mark.parametrize("raw,expected", BUG_OPENING_QUOTE_CAP)
-def test_bug_opening_quote_capitalization(raw, expected):
+@pytest.mark.parametrize("raw,expected", OPENING_QUOTE_CAP)
+def test_opening_quote_capitalization(raw, expected):
     assert normalize_transcript(raw) == expected
 
 
 # ---------------------------------------------------------------------------
-# BUG C: a transcript ending in NON-terminal punctuation (comma/semicolon/colon) -- e.g. a
-# LibriTTS-R sentence split mid-clause -- gets a period appended anyway: ',' -> ',.'.
+# Regression C: a transcript ending in NON-terminal punctuation (comma/semicolon/colon) -- e.g.
+# a LibriTTS-R mid-clause sentence split -- must be left alone, not get a period: ',' !-> ',.'.
 # ---------------------------------------------------------------------------
-BUG_TRAILING_PUNCT = [
+TRAILING_NONTERMINAL_PUNCT = [
     ("Uplifting light the reinvested flesh,", "Uplifting light the reinvested flesh,"),
     ("less dear and less delightful;", "Less dear and less delightful;"),
     ("as follows:", "As follows:"),
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="BUG C: appends '.' after non-terminal trailing "
-                                       "punctuation (',' ';' ':') -> ',.' ';.' ':.'")
-@pytest.mark.parametrize("raw,expected", BUG_TRAILING_PUNCT)
-def test_bug_trailing_nonterminal_punct(raw, expected):
+@pytest.mark.parametrize("raw,expected", TRAILING_NONTERMINAL_PUNCT)
+def test_trailing_nonterminal_punct(raw, expected):
     assert normalize_transcript(raw) == expected
 
 

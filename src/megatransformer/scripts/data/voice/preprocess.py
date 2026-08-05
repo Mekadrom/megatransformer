@@ -103,26 +103,31 @@ def normalize_transcript(text: str) -> str:
 
     "THE QUICK BROWN FOX JUMPED" -> "The quick brown fox jumped."
     "Already normal text." -> "Already normal text."
+    '"Yes."' -> '"Yes."'   (the closing quote already follows terminal punctuation)
     """
     if not text or not text.strip():
         return text
 
     text = text.strip()
 
-    # Only normalize if text appears to be ALL CAPS (>80% uppercase letters)
+    # Only normalize casing if the text appears to be ALL CAPS (>80% uppercase letters).
     alpha_chars = [c for c in text if c.isalpha()]
     if alpha_chars and sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars) > 0.8:
         text = text.lower()
 
-    # Capitalize first letter of each sentence
-    text = re.sub(r'(^|[.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), text)
+    # Capitalize the first letter of each sentence. The optional ["']* lets the letter be
+    # preceded by an opening quote ('"but ...' -> '"But ...'), which a bare
+    # (^|[.!?]\s+)([a-z]) skips; the ^ branch (with an empty quote group) also covers a plain
+    # lowercase start, so no separate first-character pass is needed.
+    text = re.sub(r'(^|[.!?]\s+)(["\']*)([a-z])',
+                  lambda m: m.group(1) + m.group(2) + m.group(3).upper(), text)
 
-    # Ensure first character is capitalized
-    if text and text[0].islower():
-        text = text[0].upper() + text[1:]
-
-    # Add period at end if no punctuation
-    if text and text[-1] not in '.!?':
+    # Add a terminal period ONLY when the transcript ends in an alphanumeric character.
+    # Anything ending in punctuation is left alone: terminal (.?!), a closing quote following
+    # it ('."/!"/?"'), or a mid-clause sentence split (',' ';' ':'). Appending unconditionally
+    # here (the old `text[-1] not in '.!?'` check) is what produced the '"Yes.".' and 'flesh,.'
+    # artifacts, since a trailing quote or comma reads as "no punctuation".
+    if text and text[-1].isalnum():
         text = text + '.'
 
     return text
