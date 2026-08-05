@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 import json
 
@@ -420,3 +421,13 @@ WORLD_MODEL_CONFIGS = {
     ),
 
 }
+
+# small_sum with the shared recurrent trunk at Huginn's depth (4 blocks) instead of 6.
+# small_sum's 6 was a param-budget pick to round the FULL multimodal stack to ~300M; it was
+# never depth-tuned, and Huginn used 4. Depth 4 drops the trunk 127.5M→85.0M (−42.5M): the
+# full stack lands ~268M and a text→voice-only build ~184M (vs 226M), and it cuts the AR
+# effective depth per token 32×6=192 → 32×4=128 (~33% faster generation). Derived from
+# small_sum so everything BUT the recurrent depth stays identical and in sync. From-scratch
+# only — existing checkpoints have 6 distinct blocks baked into their weights.
+WORLD_MODEL_CONFIGS["small_sum_recd4"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum"])
+WORLD_MODEL_CONFIGS["small_sum_recd4"].recurrent_block_config.n_recurrent_blocks = 4
