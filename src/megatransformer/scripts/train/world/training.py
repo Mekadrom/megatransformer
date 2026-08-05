@@ -491,7 +491,12 @@ class WorldModelTrainer(CommonTrainer):
         # Requiring is_initialized() here meant these tags silently never logged outside
         # torchrun/DeepSpeed. Mirrors smg/training.py:330.
         is_main_process = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
-        if not self.has_logged_cli and is_main_process:
+        # `and model.training`: unlike sive/smg, this trainer's prediction_step routes EVAL
+        # through compute_loss. Without the training guard, an eval-time call on resume (world
+        # evaluates on resume) sets has_logged_cli=True first -- and that eval write does NOT
+        # land in the training event file -- so the first training step then skips the block and
+        # the run logs no command_line/model_architecture. Only ever consume the flag in training.
+        if not self.has_logged_cli and model.training and is_main_process:
             metrics.log_text("training/command_line", self.cmdline, global_step)
             metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
             metrics.log_text("training/model_architecture", str(model), global_step)
