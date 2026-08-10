@@ -107,6 +107,12 @@ class MegaTransformerWorldModelConfig:
         default_factory=lambda: ["text", "audio", "voice", "image"]
     )
 
+    # Classifier-free guidance: create the learned null_text_embed parameter. Gated so a
+    # non-CFG model has ZERO extra params -- adding a param unconditionally breaks true resumes
+    # of pre-CFG checkpoints (optimizer-state param-group size mismatch). The trainer sets this
+    # True when --voice_cfg_text_dropout_prob > 0.
+    voice_cfg_enabled: bool = False
+
     # Feature extractor configs
     text_prelude_config: TextPreludeFeatureExtractorConfig = dataclasses.field(
         default_factory=TextPreludeFeatureExtractorConfig

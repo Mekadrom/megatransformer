@@ -1740,6 +1740,7 @@ def load_model(args, device='cuda'):
                       getattr(args, 'voice_prenet_dropout', 0.0) > 0.0 or
                       getattr(args, 'voice_codebook_path', None) is not None or
                       getattr(args, 'voice_predict_f0', False) or
+                      getattr(args, 'voice_cfg_text_dropout_prob', 0.0) > 0.0 or
                       getattr(args, 'mean_thinking_steps', None) is not None or
                       getattr(args, 'voice_stochastic_output', False))
     if needs_override:
@@ -1753,6 +1754,8 @@ def load_model(args, device='cuda'):
             config.recurrent_block_config.share_block_weights = True
         if getattr(args, 'voice_prenet_dropout', 0.0) and args.voice_prenet_dropout > 0.0:
             config.voice_prelude_config.prenet_dropout = args.voice_prenet_dropout
+        if getattr(args, 'voice_cfg_text_dropout_prob', 0.0) > 0.0:
+            config.voice_cfg_enabled = True  # create the null_text_embed param (CFG)
         if getattr(args, 'mean_thinking_steps', None) is not None:
             # Must be set PRE-construction, unlike --backprop_depth: besides driving the
             # Poisson sampler, it is l_eff for the depth-scaled residual init

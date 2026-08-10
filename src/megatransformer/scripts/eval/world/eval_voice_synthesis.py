@@ -91,6 +91,8 @@ def load_world_model(args, device):
     overrides = {"include_modes": include_modes}
     if args.tie_word_embeddings:
         overrides["tie_word_embeddings"] = True
+    if getattr(args, "voice_cfg_enabled", False):
+        overrides["voice_cfg_enabled"] = True  # create null_text_embed to load a CFG checkpoint
 
     # Rebuild the voice prelude/coda sub-configs to match the TRAINED architecture before the
     # checkpoint loads (mirrors world/training.py's load_model). small_sum's defaults differ

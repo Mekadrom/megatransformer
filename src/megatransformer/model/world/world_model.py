@@ -66,9 +66,11 @@ class MegaTransformerWorldModel(nn.Module):
         # Classifier-free guidance: a learned "null text" embedding that replaces the text
         # hidden states on dropped SYNTHESIS examples during training, so the model also learns
         # an unconditional (text-free) voice distribution. At inference, cond vs. null-forced
-        # forwards are combined as uncond + w*(cond-uncond). Zero-init: starts as "no signal"
-        # and learns. Inert unless --voice_cfg_text_dropout_prob > 0 (or cfg_force_null_text).
-        self.null_text_embed = nn.Parameter(torch.zeros(config.text_prelude_config.d_model))
+        # forwards are combined as uncond + w*(cond-uncond). Zero-init: starts as "no signal".
+        # GATED on voice_cfg_enabled: a non-CFG model gets NO extra param, so pre-CFG checkpoints
+        # (and their optimizer state) resume without a size mismatch.
+        if getattr(config, "voice_cfg_enabled", False):
+            self.null_text_embed = nn.Parameter(torch.zeros(config.text_prelude_config.d_model))
 
         # Modality-specific preludes (only instantiate if included)
         self.audio_feature_extractor = (
@@ -322,7 +324,12 @@ class MegaTransformerWorldModel(nn.Module):
 
         # Classifier-free guidance text-drop / null-forcing. Replace text hidden states with the
         # learned null embedding; text_token_ids is left intact so the interleaver still finds
-        # media placeholders and sequence positions -- only the text CONTENT goes null.
+        # media placeholders and sequence positions -- only the text CONTENT goes null. Requires
+        # a CFG-enabled model (null_text_embed exists); a no-op otherwise.
+        if (cfg_force_null_text or (self.training and cfg_text_dropout_prob > 0.0)) \
+                and getattr(self, "null_text_embed", None) is None:
+            raise ValueError("CFG requested (cfg_force_null_text / cfg_text_dropout_prob) but the "
+                             "model was built without voice_cfg_enabled=True (no null_text_embed).")
         if cfg_force_null_text:
             text_hidden_states = self.null_text_embed.to(text_hidden_states.dtype).view(1, 1, -1).expand_as(text_hidden_states)
         elif self.training and cfg_text_dropout_prob > 0.0:
