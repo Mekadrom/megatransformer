@@ -135,6 +135,7 @@ class WorldModelTrainer(CommonTrainer):
         # ramp_steps, held at 0 for the first start_step. ramp_steps==0 => the static
         # --voice_prenet_dropout (config field) is used unchanged.
         voice_prenet_dropout: float = 0.0,
+        voice_cfg_text_dropout_prob: float = 0.0,
         voice_prenet_dropout_ramp_steps: int = 0,
         voice_prenet_dropout_start_step: int = 0,
         # Modality flags
@@ -212,6 +213,7 @@ class WorldModelTrainer(CommonTrainer):
         # ramp length are given; otherwise the static config prenet_dropout is used as-is (the
         # forward gets no override), preserving the pre-ramp constant behavior exactly.
         self.voice_prenet_dropout = voice_prenet_dropout
+        self.voice_cfg_text_dropout_prob = voice_cfg_text_dropout_prob
         self.voice_prenet_dropout_ramp_steps = voice_prenet_dropout_ramp_steps
         self.voice_prenet_dropout_start_step = voice_prenet_dropout_start_step
         self._voice_prenet_ramp_enabled = (voice_prenet_dropout > 0.0 and voice_prenet_dropout_ramp_steps > 0)
@@ -722,6 +724,7 @@ class WorldModelTrainer(CommonTrainer):
             is_synthesis=is_synthesis,
             voice_attn_alpha=voice_attn_alpha,
             voice_prenet_dropout=voice_prenet_dropout,
+            cfg_text_dropout_prob=self.voice_cfg_text_dropout_prob,
         )
 
         if should_log and hasattr(model_for_stats, 'recurrent_block'):
@@ -1943,6 +1946,7 @@ def create_trainer(
         voice_ar_attn_cap=getattr(args, 'voice_ar_attn_cap', 1.0),
         voice_ar_attn_ramp_power=getattr(args, 'voice_ar_attn_ramp_power', 1.0),
         voice_prenet_dropout=getattr(args, 'voice_prenet_dropout', 0.0),
+        voice_cfg_text_dropout_prob=getattr(args, 'voice_cfg_text_dropout_prob', 0.0),
         voice_prenet_dropout_ramp_steps=getattr(args, 'voice_prenet_dropout_ramp_steps', 0),
         voice_prenet_dropout_start_step=getattr(args, 'voice_prenet_dropout_start_step', 0),
         include_text="text" in include_modes,
@@ -2258,6 +2262,13 @@ def add_cli_args(subparsers):
                                  "which requires the text. MUST be the same codebook the SMG was trained "
                                  "with -- a re-fit reorders centroids and silently maps every unit to "
                                  "the wrong phoneme.")
+    sub_parser.add_argument("--voice_cfg_text_dropout_prob", type=float, default=0.0,
+                            help="Classifier-free guidance: per-synthesis-row probability of "
+                                 "replacing text with a learned null embedding during training, so "
+                                 "the model learns an unconditional voice distribution. Enables "
+                                 "inference guidance (uncond + w*(cond-uncond)). 0 = off; typical "
+                                 "0.1-0.15. For finetuning a converged base into CFG, pair with a "
+                                 "fresh low LR (see notes). Deterministic at inference (no dropout).")
     sub_parser.add_argument("--voice_prenet_dropout", type=float, default=0.0,
                             help="Tacotron-2 prenet dropout on the AUTOREGRESSIVE voice path "
                                  "(shifted teacher forcing in training, own-output feedback at "

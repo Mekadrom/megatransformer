@@ -58,6 +58,13 @@ class MegaTransformerWorldModel(nn.Module):
         # Feature extractors — text is always required
         self.text_feature_extractor = TextPreludeFeatureExtractor(config.text_prelude_config)
 
+        # Classifier-free guidance: a learned "null text" embedding that replaces the text
+        # hidden states on dropped SYNTHESIS examples during training, so the model also learns
+        # an unconditional (text-free) voice distribution. At inference, cond vs. null-forced
+        # forwards are combined as uncond + w*(cond-uncond). Zero-init: starts as "no signal"
+        # and learns. Inert unless --voice_cfg_text_dropout_prob > 0 (or cfg_force_null_text).
+        self.null_text_embed = nn.Parameter(torch.zeros(config.text_prelude_config.d_model))
+
         # Modality-specific preludes (only instantiate if included)
         self.audio_feature_extractor = (
             VoiceSIVEPreludeFeatureExtractor(config.audio_prelude_config)
@@ -256,6 +263,12 @@ class MegaTransformerWorldModel(nn.Module):
         # the trainer can RAMP it; None => use the config value. Attacks the shifted-input
         # crutch (the dominant one) that voice_attn_alpha leaves intact.
         voice_prenet_dropout: Optional[float] = None,
+        # Classifier-free guidance. cfg_text_dropout_prob>0 (training only): per-synthesis-row
+        # probability of replacing text with the learned null embedding, so the model learns the
+        # unconditional voice distribution. cfg_force_null_text: unconditionally replace text with
+        # null (the uncond forward at eval/inference, for the uncond+w*(cond-uncond) combine).
+        cfg_text_dropout_prob: float = 0.0,
+        cfg_force_null_text: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass through the world model.
@@ -301,6 +314,23 @@ class MegaTransformerWorldModel(nn.Module):
                 image_latent_labels = None
 
         text_hidden_states = self.text_feature_extractor(text_input_ids)
+
+        # Classifier-free guidance text-drop / null-forcing. Replace text hidden states with the
+        # learned null embedding; text_token_ids is left intact so the interleaver still finds
+        # media placeholders and sequence positions -- only the text CONTENT goes null.
+        if cfg_force_null_text:
+            text_hidden_states = self.null_text_embed.to(text_hidden_states.dtype).view(1, 1, -1).expand_as(text_hidden_states)
+        elif self.training and cfg_text_dropout_prob > 0.0:
+            Bt = text_hidden_states.shape[0]
+            drop = torch.rand(Bt, device=text_hidden_states.device) < cfg_text_dropout_prob
+            # Only drop text on SYNTHESIS rows (text->voice); dropping text on a transcription
+            # row (voice->text) would corrupt its target. is_synthesis may be None (all-synthesis).
+            if is_synthesis is not None:
+                drop = drop & is_synthesis.to(drop.device).bool()
+            if drop.any():
+                null = self.null_text_embed.to(text_hidden_states.dtype).view(1, 1, -1)
+                text_hidden_states = torch.where(
+                    drop.view(Bt, 1, 1), null.expand_as(text_hidden_states), text_hidden_states)
 
         # Audio and voice generation:
         #   - Synthesis (is_synthesis=True): shifted teacher forcing. The prelude
