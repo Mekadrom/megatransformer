@@ -49,6 +49,11 @@ class MegaTransformerWorldModel(nn.Module):
     - Modality-specific codas (with optional VAE decoders)
     """
 
+    # HF Trainer's _issue_warnings_after_load reads this PreTrainedModel attribute whenever a
+    # resume has missing/unexpected keys. This is a plain nn.Module, so provide it (None) or the
+    # access raises AttributeError. Harmless for our own save/load (we don't ignore any keys).
+    _keys_to_ignore_on_save = None
+
     def __init__(self, config: MegaTransformerWorldModelConfig):
         super(MegaTransformerWorldModel, self).__init__()
 
