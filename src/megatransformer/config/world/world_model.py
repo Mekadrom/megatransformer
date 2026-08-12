@@ -113,6 +113,14 @@ class MegaTransformerWorldModelConfig:
     # True when --voice_cfg_text_dropout_prob > 0.
     voice_cfg_enabled: bool = False
 
+    # Voice generation-query mode. None = the AR crutch (shifted-TF prelude output feeds the
+    # recurrent trunk). "learned" = the trunk's SYNTHESIS voice input is a learned positional
+    # gen query (text-only conditioning, crutch REMOVED from the shared trunk), and the coda
+    # gets the previous-unit signal directly (local coherence stays at the coda, AR + EOV drive
+    # length). Mirrors the image input/output split; input/transcription voice is unaffected.
+    # Gated so a non-gen-query model has ZERO extra params (clean resumes). From-scratch only.
+    voice_gen_query_mode: Optional[str] = None
+
     # Feature extractor configs
     text_prelude_config: TextPreludeFeatureExtractorConfig = dataclasses.field(
         default_factory=TextPreludeFeatureExtractorConfig

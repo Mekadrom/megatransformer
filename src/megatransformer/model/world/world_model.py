@@ -166,6 +166,20 @@ class MegaTransformerWorldModel(nn.Module):
         # queries are needed — the recurrent block KV cache provides text context
         # and the causal coda provides sequential voice/audio context.
 
+        # Voice gen-query mode (opt-in via config.voice_gen_query_mode): the trunk's SYNTHESIS
+        # voice input becomes a learned per-position gen query (text-only conditioning; text
+        # arrives via the trunk's attention), removing the AR crutch from the shared trunk. The
+        # coda keeps local coherence via a direct projection of the PREVIOUS frame's centroid.
+        # Gated so a non-gen-query model has zero extra params. Input/transcription voice path is
+        # untouched. Learned (not fixed-sinusoidal) queries — positional-only collapsed for image.
+        self.voice_gen_query_mode = getattr(config, "voice_gen_query_mode", None)
+        if self.voice_gen_query_mode is not None and "voice" in self.include_modes:
+            vd = config.text_prelude_config.d_model
+            _coda_block = getattr(config.voice_coda_config, "coda_config", None)
+            max_pos = getattr(_coda_block, "max_position_embeddings", 1024) or 1024
+            self.voice_gen_queries = nn.Embedding(max_pos, vd)
+            self.voice_coda_prev_proj = nn.Linear(config.voice_prelude_config.feature_channels, vd)
+
         # Huginn-style embedding scale: multiply embeddings by sqrt(d_model) so
         # the injected input x_0 matches the thought state initialization variance.
         self.embed_scale = math.sqrt(config.text_prelude_config.d_model) if config.scale_embeddings else 1.0
@@ -386,31 +400,48 @@ class MegaTransformerWorldModel(nn.Module):
                 audio_hidden_states = audio_hidden_flat.view(batch_size, n_audio, seq_len, d_model)
 
         voice_hidden_states = None
+        voice_coda_prev = None  # gen-query mode: previous-unit signal routed to the coda (below)
         if voice_inputs is not None and self.voice_feature_extractor is not None:
             batch_size, n_voice = voice_inputs.shape[:2]
             voice_flat = voice_inputs.view(batch_size * n_voice, *voice_inputs.shape[2:])
 
             if is_synthesis is not None and is_synthesis.any():
                 d_model = self.config.text_prelude_config.d_model
-                shifted_input = voice_flat[:, :, :-1]  # (B*N, C, T-1)
-                # NAR→AR curriculum: sever the prelude's voice→voice self-attention so a
-                # frame encodes only its own (shifted) input, not the aggregated history.
-                # Built for every row here — non-synthesis rows' output is overwritten by
-                # the un-suppressed normal_hidden below, so no per-row gating is needed.
-                prelude_bias = build_all_voice_attn_bias(
-                    shifted_input.shape[-1], voice_attn_alpha,
-                    shifted_input.device, voice_flat.dtype,
-                )
-                # THE autoregressive crutch: these are the TRUE previous frames, and they
-                # predict frame t so well on their own that the text earns no gradient.
-                # prenet_dropout (config, default off) is the Tacotron-2 bottleneck.
-                shifted_hidden = self.voice_feature_extractor(
-                    shifted_input, apply_prenet_dropout=True,
-                    prenet_dropout_override=voice_prenet_dropout,
-                    additive_attn_bias=prelude_bias,
-                )  # (B*N, T-1, d_model)
-                zero_prefix = torch.zeros(shifted_hidden.shape[0], 1, d_model, device=shifted_hidden.device, dtype=shifted_hidden.dtype)
-                synth_hidden = torch.cat([zero_prefix, shifted_hidden], dim=1)  # (B*N, T, d_model)
+                if self.voice_gen_query_mode is not None:
+                    # GEN-QUERY synthesis: the trunk's voice input is a learned per-position query
+                    # (text-only; text arrives via the trunk's attention) -- the AR crutch is
+                    # REMOVED from the shared trunk. Position 0..T-1 index the learned embedding.
+                    T_v = voice_flat.shape[-1]
+                    pos = torch.arange(T_v, device=voice_flat.device)
+                    synth_hidden = self.voice_gen_queries(pos).to(voice_flat.dtype).unsqueeze(0).expand(
+                        batch_size * n_voice, T_v, d_model)  # (B*N, T, d_model)
+                    # The coda keeps local coherence via the PREVIOUS frame's centroid (frame t-1
+                    # at position t, zero at 0), projected and routed to the coda after uninterleave
+                    # -- NOT to the trunk.
+                    prev_c = voice_flat[:, :, :-1].transpose(1, 2)  # (B*N, T-1, C)
+                    prev_h = self.voice_coda_prev_proj(prev_c)      # (B*N, T-1, d_model)
+                    zpref = torch.zeros(prev_h.shape[0], 1, d_model, device=prev_h.device, dtype=prev_h.dtype)
+                    voice_coda_prev = torch.cat([zpref, prev_h], dim=1)  # (B*N, T, d_model)
+                else:
+                    shifted_input = voice_flat[:, :, :-1]  # (B*N, C, T-1)
+                    # NAR→AR curriculum: sever the prelude's voice→voice self-attention so a
+                    # frame encodes only its own (shifted) input, not the aggregated history.
+                    # Built for every row here — non-synthesis rows' output is overwritten by
+                    # the un-suppressed normal_hidden below, so no per-row gating is needed.
+                    prelude_bias = build_all_voice_attn_bias(
+                        shifted_input.shape[-1], voice_attn_alpha,
+                        shifted_input.device, voice_flat.dtype,
+                    )
+                    # THE autoregressive crutch: these are the TRUE previous frames, and they
+                    # predict frame t so well on their own that the text earns no gradient.
+                    # prenet_dropout (config, default off) is the Tacotron-2 bottleneck.
+                    shifted_hidden = self.voice_feature_extractor(
+                        shifted_input, apply_prenet_dropout=True,
+                        prenet_dropout_override=voice_prenet_dropout,
+                        additive_attn_bias=prelude_bias,
+                    )  # (B*N, T-1, d_model)
+                    zero_prefix = torch.zeros(shifted_hidden.shape[0], 1, d_model, device=shifted_hidden.device, dtype=shifted_hidden.dtype)
+                    synth_hidden = torch.cat([zero_prefix, shifted_hidden], dim=1)  # (B*N, T, d_model)
 
                 if is_synthesis.all():
                     voice_hidden_states = synth_hidden.view(batch_size, n_voice, synth_hidden.shape[1], d_model)
@@ -575,6 +606,14 @@ class MegaTransformerWorldModel(nn.Module):
 
         # Voice
         if voice_batch is not None and self.voice_generator is not None:
+            # Gen-query mode: the trunk got text-only queries, so inject the previous-unit signal
+            # HERE so the coda's causal attention still has voice history for local coherence.
+            # Row-for-row aligned (n_voice=1, uninterleave preserves order); trim to the common
+            # length defensively in case padding differs.
+            if voice_coda_prev is not None and voice_coda_prev.shape[0] == voice_batch.shape[0]:
+                m = min(voice_coda_prev.shape[1], voice_batch.shape[1])
+                voice_batch = voice_batch.clone()
+                voice_batch[:, :m] = voice_batch[:, :m] + voice_coda_prev[:, :m].to(voice_batch.dtype)
             # NAR→AR curriculum: sever the coda's causal voice→voice self-attention on
             # synthesis rows so it can't re-mix voice history after the trunk. voice_batch
             # is all-voice (uninterleaved), one row per batch item, so is_synthesis aligns
