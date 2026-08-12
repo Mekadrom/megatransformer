@@ -1780,6 +1780,10 @@ def load_model(args, device='cuda'):
             config.voice_prelude_config.prenet_dropout = args.voice_prenet_dropout
         if getattr(args, 'voice_cfg_text_dropout_prob', 0.0) > 0.0:
             config.voice_cfg_enabled = True  # create the null_text_embed param (CFG)
+        if getattr(args, 'voice_gen_query_mode', None):
+            # Gen-query voice synthesis: creates voice_gen_queries + voice_coda_prev_proj
+            # params (world_model.py __init__). Removes the AR crutch from the shared trunk.
+            config.voice_gen_query_mode = args.voice_gen_query_mode
         if getattr(args, 'mean_thinking_steps', None) is not None:
             # Must be set PRE-construction, unlike --backprop_depth: besides driving the
             # Poisson sampler, it is l_eff for the depth-scaled residual init
@@ -2298,6 +2302,16 @@ def add_cli_args(subparsers):
                                  "inference guidance (uncond + w*(cond-uncond)). 0 = off; typical "
                                  "0.1-0.15. For finetuning a converged base into CFG, pair with a "
                                  "fresh low LR (see notes). Deterministic at inference (no dropout).")
+    sub_parser.add_argument("--voice_gen_query_mode", type=str, default=None,
+                            choices=["learned_pos"],
+                            help="Gen-query voice synthesis: replace the AR crutch feeding the "
+                                 "SHARED recurrent trunk with a learned per-position query (text-"
+                                 "only), and route local coherence to the coda via the previous "
+                                 "frame's centroid (voice_coda_prev_proj). Mirrors the image path's "
+                                 "gen queries; the coda + EOV still drive length autoregressively. "
+                                 "Adds params (voice_gen_queries, voice_coda_prev_proj) -- start a "
+                                 "FRESH run (or --fresh_schedule). None = off (AR crutch). "
+                                 "'learned_pos' = the only mode.")
     sub_parser.add_argument("--voice_early_text_weight_alpha", type=float, default=1.0,
                             help="Early-text loss weighting: peak per-frame CE weight at the "
                                  "utterance ONSET, decaying linearly to 1 by frame "

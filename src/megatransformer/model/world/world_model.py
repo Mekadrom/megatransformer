@@ -1081,7 +1081,21 @@ class MegaTransformerWorldModel(nn.Module):
                 # runs every step but its output is only meaningful in text mode.
                 if current_modality[b] in ("audio", "voice", "image"):
                     mod = current_modality[b]
-                    if mod in ("voice", "audio"):
+                    if mod == "voice" and self.voice_gen_query_mode is not None:
+                        # GEN-QUERY synthesis: the trunk's voice input is a learned
+                        # per-position query (text-only), NOT the prelude of the
+                        # previous frame — the AR crutch is off the shared trunk.
+                        # The segment position is the count of frames emitted so far
+                        # in THIS voice block (0 at entry, handled by the entry pass
+                        # below; this path covers positions >= 1). Mirrors the forward
+                        # gen-query branch (world_model.py:410-424).
+                        seg_pos = len(voice_sequences[b])
+                        pos_idx = min(seg_pos, self.voice_gen_queries.num_embeddings - 1)
+                        gq = self.voice_gen_queries(
+                            torch.tensor([pos_idx], device=device)
+                        ).to(current_hidden.dtype)  # (1, d_model)
+                        next_hidden_list.append(gq)
+                    elif mod in ("voice", "audio"):
                         # Autoregressive: re-encode previous coda prediction
                         # through the causal prelude with KV caching, or use
                         # zeros for position 0 (shifted, like text).
@@ -1247,11 +1261,19 @@ class MegaTransformerWorldModel(nn.Module):
                     # sampled mid-generation so both entry paths converge.
                     if just_entered_streaming[b] == "voice":
                         d_model_ = self.config.text_prelude_config.d_model
-                        zero_hidden = torch.zeros(
-                            1, 1, d_model_, device=device, dtype=current_hidden.dtype,
-                        )
+                        if self.voice_gen_query_mode is not None:
+                            # Gen-query position 0: the trunk's first voice input is
+                            # gen_query(0), not the zero vector (matches forward, where
+                            # synth_hidden[0] = voice_gen_queries(0), NOT a zero prefix).
+                            entry_input = self.voice_gen_queries(
+                                torch.tensor([0], device=device)
+                            ).to(current_hidden.dtype).unsqueeze(0)  # (1, 1, d_model)
+                        else:
+                            entry_input = torch.zeros(
+                                1, 1, d_model_, device=device, dtype=current_hidden.dtype,
+                            )
                         entry_hidden, kv_cache, _, _, _ = self.recurrent_block(
-                            zero_hidden * self.embed_scale,
+                            entry_input * self.embed_scale,
                             attention_mask=None,
                             kv_cache=kv_cache,
                             position_offset=position_offset,
@@ -1263,6 +1285,15 @@ class MegaTransformerWorldModel(nn.Module):
                     else:
                         hidden_b = current_hidden[b:b+1]  # (1, 1, d_model)
                     should_stop_voice = False
+                    if self.voice_gen_query_mode is not None:
+                        # Route the previous frame's centroid to the coda for local
+                        # coherence (forward: voice_coda_prev added to voice_batch,
+                        # world_model.py:613-616). At entry (last_voice_pred None) the
+                        # coda-prev is zero, so this is a no-op for the first frame.
+                        if last_voice_pred[b] is not None:
+                            prev_c = last_voice_pred[b].transpose(0, 1).unsqueeze(0)  # (C,1)->(1,C)->(1,1,C)
+                            prev_h = self.voice_coda_prev_proj(prev_c).to(hidden_b.dtype)  # (1,1,d_model)
+                            hidden_b = hidden_b + prev_h
                     if self.voice_generator is not None:
                         coda_out = self.voice_generator(
                             hidden_b,
