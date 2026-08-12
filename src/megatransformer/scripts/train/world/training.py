@@ -136,6 +136,8 @@ class WorldModelTrainer(CommonTrainer):
         # --voice_prenet_dropout (config field) is used unchanged.
         voice_prenet_dropout: float = 0.0,
         voice_cfg_text_dropout_prob: float = 0.0,
+        voice_early_text_weight_alpha: float = 1.0,
+        voice_early_text_weight_frames: int = 0,
         voice_prenet_dropout_ramp_steps: int = 0,
         voice_prenet_dropout_start_step: int = 0,
         # Modality flags
@@ -214,6 +216,8 @@ class WorldModelTrainer(CommonTrainer):
         # forward gets no override), preserving the pre-ramp constant behavior exactly.
         self.voice_prenet_dropout = voice_prenet_dropout
         self.voice_cfg_text_dropout_prob = voice_cfg_text_dropout_prob
+        self.voice_early_text_weight_alpha = voice_early_text_weight_alpha
+        self.voice_early_text_weight_frames = voice_early_text_weight_frames
         self.voice_prenet_dropout_ramp_steps = voice_prenet_dropout_ramp_steps
         self.voice_prenet_dropout_start_step = voice_prenet_dropout_start_step
         self._voice_prenet_ramp_enabled = (voice_prenet_dropout > 0.0 and voice_prenet_dropout_ramp_steps > 0)
@@ -848,9 +852,29 @@ class WorldModelTrainer(CommonTrainer):
                 tgt = tgt.clone()
                 tgt[~is_synthesis.to(tgt.device).bool()] = -100
             if bool((tgt != -100).any()):
-                unit_loss_raw = self.voice_unit_loss_fn(
-                    voice_unit_logits.reshape(B * T, K), tgt.reshape(B * T),
-                )
+                if self.voice_early_text_weight_alpha > 1.0 and self.voice_early_text_weight_frames > 0:
+                    # Early-text loss weighting: onset frames have the least AR history, so the
+                    # crutch can't help and text must carry -- up-weight them so gradient
+                    # concentrates where text is NECESSARY. Weight decays alpha->1 over the first
+                    # K frames; renormalized by total weight so the loss SCALE is unchanged (no
+                    # silent LR inflation) and reduces to the plain mean when alpha=1.
+                    Kf = self.voice_early_text_weight_frames
+                    alpha = self.voice_early_text_weight_alpha
+                    ce = F.cross_entropy(
+                        voice_unit_logits.reshape(B * T, K), tgt.reshape(B * T),
+                        ignore_index=-100, reduction="none",
+                    ).reshape(B, T)
+                    valid = (tgt != -100).float()
+                    pos = torch.arange(T, device=ce.device).float()
+                    frame_w = 1.0 + (alpha - 1.0) * torch.clamp(1.0 - pos / Kf, min=0.0)  # (T,)
+                    w = frame_w.unsqueeze(0) * valid  # (B, T); 0 on pad/transcription
+                    denom = w.sum().clamp(min=1.0)
+                    unit_loss_raw = (ce * w).sum() / denom
+                    loss_components["voice_early_text_meanw"] = (denom / valid.sum().clamp(min=1.0)).detach()
+                else:
+                    unit_loss_raw = self.voice_unit_loss_fn(
+                        voice_unit_logits.reshape(B * T, K), tgt.reshape(B * T),
+                    )
                 # Whiten by log(K) — CE at uniform predictions is log(K) — so the weight is an
                 # honest emphasis multiplier and the number is comparable to the other losses:
                 # 1.0 = no better than guessing, 0 = perfect.
@@ -1950,6 +1974,8 @@ def create_trainer(
         voice_ar_attn_ramp_power=getattr(args, 'voice_ar_attn_ramp_power', 1.0),
         voice_prenet_dropout=getattr(args, 'voice_prenet_dropout', 0.0),
         voice_cfg_text_dropout_prob=getattr(args, 'voice_cfg_text_dropout_prob', 0.0),
+        voice_early_text_weight_alpha=getattr(args, 'voice_early_text_weight_alpha', 1.0),
+        voice_early_text_weight_frames=getattr(args, 'voice_early_text_weight_frames', 0),
         voice_prenet_dropout_ramp_steps=getattr(args, 'voice_prenet_dropout_ramp_steps', 0),
         voice_prenet_dropout_start_step=getattr(args, 'voice_prenet_dropout_start_step', 0),
         include_text="text" in include_modes,
@@ -2272,6 +2298,17 @@ def add_cli_args(subparsers):
                                  "inference guidance (uncond + w*(cond-uncond)). 0 = off; typical "
                                  "0.1-0.15. For finetuning a converged base into CFG, pair with a "
                                  "fresh low LR (see notes). Deterministic at inference (no dropout).")
+    sub_parser.add_argument("--voice_early_text_weight_alpha", type=float, default=1.0,
+                            help="Early-text loss weighting: peak per-frame CE weight at the "
+                                 "utterance ONSET, decaying linearly to 1 by frame "
+                                 "--voice_early_text_weight_frames. Onset frames have the least AR "
+                                 "history, so the crutch can't help and text must carry -- this "
+                                 "concentrates gradient where text is necessary. Renormalized so "
+                                 "loss scale is unchanged. 1.0 = off (plain mean); typical 2-4.")
+    sub_parser.add_argument("--voice_early_text_weight_frames", type=int, default=0,
+                            help="Onset region (frames) over which the early-text weight decays "
+                                 "alpha->1. 0 = off. Typical 8-16 (~0.6-1.3s at 12.5Hz), matching "
+                                 "where early_text_delta shows the clean text signal.")
     sub_parser.add_argument("--voice_prenet_dropout", type=float, default=0.0,
                             help="Tacotron-2 prenet dropout on the AUTOREGRESSIVE voice path "
                                  "(shifted teacher forcing in training, own-output feedback at "
