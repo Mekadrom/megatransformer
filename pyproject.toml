@@ -74,6 +74,7 @@ training = [
     "wandb",
     "jiwer",
     "openai-whisper",
+    "vocos",  # 24kHz mel->wave vocoder for world/SMG visualization (pulls encodec)
     "scikit-learn",
     "psutil",
     "requests",
