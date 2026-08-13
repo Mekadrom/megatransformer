@@ -485,6 +485,11 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         # Text conditioning
         sub_parser.add_argument("--text_column", type=str, default=None,
                                 help="Column containing text captions/prompts/descriptions")
+        sub_parser.add_argument("--text_subfield", type=str, default=None,
+                                help="If --text_column is a dict (e.g. WebDataset JSON sidecar like "
+                                     "jackyhate/text-to-image-2M's 'json' -> {'prompt': ...}), pull this "
+                                     "subfield as the caption. If omitted, common keys "
+                                     "(prompt/caption/text/txt/description) are tried in order.")
         sub_parser.add_argument("--encode_text", action="store_true", default=False,
                                 help="Encode text through T5 (if False, stores raw text)")
         sub_parser.add_argument("--t5_model_name", type=str, default="google/t5-v1_1-small",
@@ -665,6 +670,19 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
             if isinstance(text, str):
                 stripped = text.strip()
                 return [stripped] if stripped else []
+            elif isinstance(text, dict):
+                # WebDataset JSON-sidecar captions (e.g. {'prompt': ...}). Honor an
+                # explicit --text_subfield, else try common caption keys in order.
+                sub = getattr(self.args, "text_subfield", None)
+                keys = [sub] if sub else ["prompt", "caption", "text", "txt", "description"]
+                for k in keys:
+                    if k and k in text and text[k] is not None:
+                        val = text[k]
+                        if isinstance(val, list):
+                            return [str(t).strip() for t in val if str(t).strip()]
+                        stripped = str(val).strip()
+                        return [stripped] if stripped else []
+                return []
             elif isinstance(text, list):
                 # Multiple captions (e.g. Flickr30k) — return all non-empty
                 return [str(t).strip() for t in text if str(t).strip()]

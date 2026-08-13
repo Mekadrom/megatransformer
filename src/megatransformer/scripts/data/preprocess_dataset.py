@@ -236,6 +236,11 @@ def main():
                                  "subdirectories without proper HF configs (e.g. "
                                  "bigcode/starcoderdata --data_dir python). When set, only "
                                  "files under that subdirectory are loaded.")
+        sub_parser.add_argument("--data_files", type=str, default=None, nargs="+",
+                            help="Explicit file(s)/glob(s) to load, passed to load_dataset(data_files=...). "
+                                 "Use with --dataset_name webdataset to select specific tar shards, e.g. "
+                                 "carving a held-out val split from a single-split WebDataset: "
+                                 "--dataset_name webdataset --data_files hf://datasets/jackyhate/text-to-image-2M/data_512_2M/data_000000.tar")
         sub_parser.add_argument("--split", type=str,
                             help="Dataset split")
         # Multi-GPU
@@ -289,6 +294,10 @@ def main():
     )
     if data_dir:
         load_kwargs["data_dir"] = data_dir
+    data_files = getattr(args, "data_files", None)
+    if data_files:
+        # argparse nargs="+" gives a list; a single glob/URL is fine as a 1-elem list.
+        load_kwargs["data_files"] = data_files if len(data_files) > 1 else data_files[0]
     dataset = load_dataset(**load_kwargs)
 
     # Shard accumulators
