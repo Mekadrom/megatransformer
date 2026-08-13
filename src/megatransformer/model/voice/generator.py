@@ -12,6 +12,7 @@ from megatransformer.model.norms import create_norm
 from megatransformer.model.transformer import MegaTransformerEncoderBlock
 from megatransformer.utils.megatransformer_utils import (
     apply_depth_scaled_residual_init,
+    _depth_scaled_residual_init_,
     conv2d_weight_init,
     linear_weight_init,
 )
@@ -69,6 +70,26 @@ class FramewiseRefine(nn.Module):
         return x + h.permute(0, 2, 1)
 
 
+class CodaFFNBlock(nn.Module):
+    """Attention-free coda body: a pre-norm position-wise FFN with a residual.
+
+    Each position maps independently (no cross-position mixing, no KV cache), so
+    the coda cannot neighbor-extrapolate emitted history. Used when
+    VoiceCodaAndSMGConfig.coda_type == "mlp".
+    """
+
+    def __init__(self, d_model: int, ratio: float, norm_type: str, eps: float):
+        super().__init__()
+        hidden = max(1, round(d_model * ratio))
+        self.norm = create_norm(d_model, norm_type, eps)
+        self.fc1 = nn.Linear(d_model, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.fc2(self.act(self.fc1(self.norm(x))))
+
+
 class VoiceCodaAndSMGWithLoss(nn.Module):
     """
     Voice output head for the multimodal world model.
@@ -97,10 +118,24 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         if config.use_input_norm:
             self.input_norm = create_norm(coda_config.d_model, config.input_norm_type, config.norm_epsilon)
 
-        self.coda = nn.ModuleList([
-            MegaTransformerEncoderBlock(coda_config)
-            for _ in range(config.n_layers)
-        ])
+        # Coda body: causal-attention transformer stack (default) or an attention-free
+        # position-wise FFN stack. The MLP variant is stateless (no KV cache) and cannot
+        # attend across positions -- it decodes each trunk position to a unit independently,
+        # so local coherence can no longer be a crutch that bypasses text conditioning.
+        self.coda_type = getattr(config, "coda_type", "transformer")
+        if self.coda_type == "mlp":
+            self.coda = nn.ModuleList([
+                CodaFFNBlock(
+                    coda_config.d_model, getattr(config, "mlp_ratio", 4.0),
+                    config.input_norm_type, config.norm_epsilon,
+                )
+                for _ in range(config.n_layers)
+            ])
+        else:
+            self.coda = nn.ModuleList([
+                MegaTransformerEncoderBlock(coda_config)
+                for _ in range(config.n_layers)
+            ])
 
         self.feature_projection = nn.Linear(coda_config.d_model, config.feature_channels)
 
@@ -183,7 +218,13 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         init_linear = linear_weight_init(gain=1.0)
         for block in self.coda:
             block.apply(init_linear)
-        apply_depth_scaled_residual_init(self.coda)
+        if getattr(self, "coda_type", "transformer") == "mlp":
+            # Residual-output layer of each FFN block is fc2; depth-scale it the same
+            # way apply_depth_scaled_residual_init handles attn/ffn output projections.
+            for block in self.coda:
+                _depth_scaled_residual_init_(block.fc2, len(self.coda))
+        else:
+            apply_depth_scaled_residual_init(self.coda)
         self.feature_projection.apply(init_linear)
         # Log-variance head starts homoscedastic: zero weight => log_var == bias
         # everywhere (= logvar_init), so the model begins with a constant predicted
@@ -258,23 +299,35 @@ class VoiceCodaAndSMGWithLoss(nn.Module):
         # so the loop just chains layers without re-adding the input.
         h = x
         new_kv_caches = []
-        for i, block in enumerate(self.coda):
-            block_cache = kv_caches[i] if kv_caches is not None else None
-            if self.gradient_checkpointing and self.training and not use_cache:
-                h, new_cache = torch_checkpoint(
-                    block, h, None, None, block_cache, position_offset, use_cache, additive_attn_bias,
-                    use_reentrant=False,
-                )
-            else:
-                h, new_cache = block(
-                    h,
-                    kv_cache=block_cache,
-                    position_offset=position_offset,
-                    use_cache=use_cache,
-                    additive_attn_bias=additive_attn_bias,
-                )
-            if use_cache:
-                new_kv_caches.append(new_cache)
+        if getattr(self, "coda_type", "transformer") == "mlp":
+            # Position-wise FFN body: stateless (no KV cache, no attention bias). Each
+            # position is decoded independently, so there is nothing to cache and
+            # position_offset/additive_attn_bias are inapplicable. At generation the
+            # caller still passes kv_caches/use_cache for interface parity; we ignore
+            # them and (if requested) return an empty cache list.
+            for block in self.coda:
+                if self.gradient_checkpointing and self.training and not use_cache:
+                    h = torch_checkpoint(block, h, use_reentrant=False)
+                else:
+                    h = block(h)
+        else:
+            for i, block in enumerate(self.coda):
+                block_cache = kv_caches[i] if kv_caches is not None else None
+                if self.gradient_checkpointing and self.training and not use_cache:
+                    h, new_cache = torch_checkpoint(
+                        block, h, None, None, block_cache, position_offset, use_cache, additive_attn_bias,
+                        use_reentrant=False,
+                    )
+                else:
+                    h, new_cache = block(
+                        h,
+                        kv_cache=block_cache,
+                        position_offset=position_offset,
+                        use_cache=use_cache,
+                        additive_attn_bias=additive_attn_bias,
+                    )
+                if use_cache:
+                    new_kv_caches.append(new_cache)
 
         feature_preds = self.feature_projection(h)  # (batch, seq_length, feature_channels)
         # Denormalize: learnable scale and bias map back to original latent range

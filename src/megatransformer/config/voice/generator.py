@@ -20,6 +20,17 @@ class VoiceCodaAndSMGConfig:
     n_layers: int = 1
     feature_channels: int = 128
 
+    # Coda body type: "transformer" (causal self-attention stack, default — the
+    # Huginn-style readout) or "mlp" (position-wise FFN stack, NO attention and NO
+    # KV cache). The MLP variant denies the coda cross-position access to emitted
+    # history, so it cannot satisfy next-unit prediction by neighbor-extrapolation —
+    # forcing content to arrive through the text-conditioned trunk. Pair with the
+    # gen-query trunk for a fully crutch-free voice path. Default keeps the coda
+    # bit-for-bit unchanged.
+    coda_type: str = "transformer"
+    # FFN expansion ratio for coda_type="mlp" (hidden = round(d_model * mlp_ratio)).
+    mlp_ratio: float = 4.0
+
     # Discrete-unit output. When set to a codebook size K, the coda gains a K-way
     # classifier head alongside the continuous regression head, and the trainer can
     # supervise it with cross-entropy against k-means unit ids.

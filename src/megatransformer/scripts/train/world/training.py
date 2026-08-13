@@ -1784,6 +1784,13 @@ def load_model(args, device='cuda'):
             # Gen-query voice synthesis: creates voice_gen_queries + voice_coda_prev_proj
             # params (world_model.py __init__). Removes the AR crutch from the shared trunk.
             config.voice_gen_query_mode = args.voice_gen_query_mode
+        if getattr(args, 'voice_coda_type', None):
+            # Voice coda body: "mlp" swaps the transformer stack for an attention-free
+            # position-wise FFN (no cross-position mixing, no KV cache), so the coda can't
+            # neighbor-extrapolate emitted history. Pair with --voice_gen_query_mode.
+            config.voice_coda_config.coda_type = args.voice_coda_type
+            if getattr(args, 'voice_coda_mlp_ratio', None) is not None:
+                config.voice_coda_config.mlp_ratio = args.voice_coda_mlp_ratio
         if getattr(args, 'mean_thinking_steps', None) is not None:
             # Must be set PRE-construction, unlike --backprop_depth: besides driving the
             # Poisson sampler, it is l_eff for the depth-scaled residual init
@@ -2331,6 +2338,17 @@ def add_cli_args(subparsers):
                                  "Adds params (voice_gen_queries, voice_coda_prev_proj) -- start a "
                                  "FRESH run (or --fresh_schedule). None = off (AR crutch). "
                                  "'learned_pos' = the only mode.")
+    sub_parser.add_argument("--voice_coda_type", type=str, default=None,
+                            choices=["transformer", "mlp"],
+                            help="Voice coda body: 'transformer' (causal self-attention stack, "
+                                 "default) or 'mlp' (attention-free position-wise FFN stack, no KV "
+                                 "cache). The MLP coda decodes each trunk position to a mimi unit "
+                                 "INDEPENDENTLY, so it cannot use local coherence as a crutch that "
+                                 "bypasses text -- pair with --voice_gen_query_mode for a fully "
+                                 "crutch-free voice path. None = leave the config default (transformer).")
+    sub_parser.add_argument("--voice_coda_mlp_ratio", type=float, default=None,
+                            help="FFN expansion ratio for --voice_coda_type mlp (hidden = "
+                                 "round(d_model * ratio)). Default (None) uses the config's 4.0.")
     sub_parser.add_argument("--voice_early_text_weight_alpha", type=float, default=1.0,
                             help="Early-text loss weighting: peak per-frame CE weight at the "
                                  "utterance ONSET, decaying linearly to 1 by frame "
