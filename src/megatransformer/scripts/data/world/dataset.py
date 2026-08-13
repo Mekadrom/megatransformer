@@ -520,7 +520,8 @@ class MultimodalShardedDataset(Dataset):
     def get_sampler(self, shuffle: bool = True, seed: int = 42,
                     batch_size: int = 1, world_size: int = 1,
                     shard_aware: bool = True,
-                    bucket_by_length: bool = False, bucket_mega_factor: int = 25):
+                    bucket_by_length: bool = False, bucket_mega_factor: int = 25,
+                    curriculum_max_frames: int = 0):
         """
         Get a task-grouped sampler that yields indices such that each
         batch contains only one task type (e.g., all voice_synthesis or
@@ -543,24 +544,34 @@ class MultimodalShardedDataset(Dataset):
         padding FLOPs — which is multiplied through the recurrent trunk that reprocesses
         every padded frame. Lengths are read per task from its source shards via mmap.
         """
+        curriculum_on = curriculum_max_frames and curriculum_max_frames > 0
         shard_info = None
         bucket_lengths = None
+        curriculum_lengths = None
+        need_lengths = bucket_by_length or curriculum_on
         if shard_aware:
             shard_info = []
-            if bucket_by_length:
-                bucket_lengths = []
+            scanned = [] if need_lengths else None
             for task_name, modality_name, direction in self.task_types:
                 src = self._source_for_task(modality_name, direction)
                 shard_info.append((src["shard_offsets"], src["total_samples"]))
-                if bucket_by_length:
+                if need_lengths:
                     key = self._BUCKET_LENGTH_KEY.get(modality_name)
-                    if key is None:
-                        bucket_lengths.append(None)  # fixed-size (image): leave shuffled
-                    else:
-                        bucket_lengths.append(
-                            scan_shard_lengths(src["shard_dir"], src["shard_files"], key))
-        elif bucket_by_length:
-            print("[MultimodalShardedDataset] bucket_by_length ignored: requires shard_aware")
+                    scanned.append(
+                        None if key is None
+                        else scan_shard_lengths(src["shard_dir"], src["shard_files"], key))
+            if bucket_by_length:
+                bucket_lengths = scanned  # every length-keyed task (image stays None/shuffled)
+            if curriculum_on:
+                # The length curriculum caps VOICE utterances only; other tasks pass through
+                # unfiltered so a mixed run keeps its text/image samples intact.
+                curriculum_lengths = [
+                    scanned[i] if self.task_types[i][1] == "voice" else None
+                    for i in range(len(self.task_types))
+                ]
+        elif bucket_by_length or curriculum_on:
+            print("[MultimodalShardedDataset] bucket_by_length/curriculum ignored: requires shard_aware")
+            curriculum_max_frames = 0
         return ModalityGroupedSampler(
             total_samples=self.total_samples,
             n_modalities=len(self.task_types),
@@ -571,6 +582,8 @@ class MultimodalShardedDataset(Dataset):
             shard_info=shard_info,
             bucket_lengths=bucket_lengths,
             bucket_mega_factor=bucket_mega_factor,
+            curriculum_lengths=curriculum_lengths,
+            curriculum_max_frames=curriculum_max_frames,
         )
 
 
@@ -600,7 +613,8 @@ class ModalityGroupedSampler(torch.utils.data.Sampler):
     def __init__(self, total_samples: int, n_modalities: int, shuffle: bool = True,
                  seed: int = 42, batch_size: int = 1, world_size: int = 1,
                  shard_info: Optional[list] = None,
-                 bucket_lengths: Optional[list] = None, bucket_mega_factor: int = 25):
+                 bucket_lengths: Optional[list] = None, bucket_mega_factor: int = 25,
+                 curriculum_lengths: Optional[list] = None, curriculum_max_frames: int = 0):
         self.total_samples = total_samples
         self.n_modalities = n_modalities
         self.shuffle = shuffle
@@ -615,6 +629,37 @@ class ModalityGroupedSampler(torch.utils.data.Sampler):
         self.bucket_lengths = bucket_lengths
         self.bucket_mega_factor = max(1, int(bucket_mega_factor))
         self.epoch = 0
+
+        # LENGTH CURRICULUM: when curriculum_max_frames > 0, precompute the filtered
+        # per-modality index pools (voice tasks keep only utterances with feature_length
+        # <= cap; other tasks pass through). Deterministic (depends only on lengths+cap),
+        # so __len__ is stable across epochs — a STATIC per-stage cap, advanced via manual
+        # resumes. _curric_pools=None => no filtering (byte-identical to the old sampler).
+        self._curric_pools = None
+        self._effective_total = total_samples
+        if curriculum_max_frames and curriculum_max_frames > 0 and curriculum_lengths is not None:
+            pools = [[] for _ in range(n_modalities)]
+            for idx in range(total_samples):
+                mod = idx % n_modalities
+                lens = curriculum_lengths[mod]
+                if lens is None:
+                    pools[mod].append(idx)  # unfiltered task (text/image, or non-voice)
+                else:
+                    mod_total = len(lens)
+                    if int(lens[(idx // n_modalities) % mod_total]) <= curriculum_max_frames:
+                        pools[mod].append(idx)
+            eff = sum(len(p) for p in pools)
+            if eff == 0:
+                print(f"[ModalityGroupedSampler] curriculum_max_frames={curriculum_max_frames} "
+                      f"matched 0 samples — DISABLING curriculum (using full dataset).")
+            else:
+                self._curric_pools = pools
+                self._effective_total = eff
+                kept_voice = sum(len(pools[i]) for i in range(n_modalities)
+                                 if curriculum_lengths[i] is not None)
+                print(f"[ModalityGroupedSampler] length curriculum: <= {curriculum_max_frames} "
+                      f"voice frames -> {kept_voice} voice samples kept, effective epoch "
+                      f"{eff}/{total_samples} ({100.0*eff/max(total_samples,1):.1f}%).")
 
     def _bucket_order(self, indices: list, mod_lengths: list, mod_total: int,
                       g: torch.Generator) -> list:
@@ -644,17 +689,22 @@ class ModalityGroupedSampler(torch.utils.data.Sampler):
         self.epoch = epoch
 
     def __len__(self):
-        return self.total_samples
+        return self._effective_total
 
     def __iter__(self):
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
 
-        # Build per-modality index lists
-        modality_indices = [[] for _ in range(self.n_modalities)]
-        for idx in range(self.total_samples):
-            mod = idx % self.n_modalities
-            modality_indices[mod].append(idx)
+        # Build per-modality index lists. Under the length curriculum, start from the
+        # precomputed filtered pools (voice capped to short utterances) instead of the
+        # full range; every downstream step operates on those indices unchanged.
+        if self._curric_pools is not None:
+            modality_indices = [list(p) for p in self._curric_pools]
+        else:
+            modality_indices = [[] for _ in range(self.n_modalities)]
+            for idx in range(self.total_samples):
+                mod = idx % self.n_modalities
+                modality_indices[mod].append(idx)
 
         # Order within each modality group
         if self.shard_info is not None and self.shuffle:
@@ -718,7 +768,8 @@ class ModalityGroupedSampler(torch.utils.data.Sampler):
         for chunk in chunked:
             all_indices.extend(chunk)
 
-        # Trim to total_samples
-        all_indices = all_indices[:self.total_samples]
+        # Trim to the effective epoch size (== total_samples unless the length
+        # curriculum filtered the pools down).
+        all_indices = all_indices[:self._effective_total]
 
         return iter(all_indices)

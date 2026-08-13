@@ -167,6 +167,9 @@ class WorldModelTrainer(CommonTrainer):
         # Length bucketing (opt-in): group similar-length samples per task into a batch.
         bucket_by_length: bool = False,
         bucket_mega_factor: int = 25,
+        # Length curriculum (opt-in): cap voice utterances to <= this many feature frames
+        # for THIS run stage (0 = off). A STATIC cap advanced via manual resumes.
+        voice_curriculum_max_frames: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -176,6 +179,7 @@ class WorldModelTrainer(CommonTrainer):
         self.shard_aware_sampler = shard_aware_sampler
         self.bucket_by_length = bucket_by_length
         self.bucket_mega_factor = bucket_mega_factor
+        self.voice_curriculum_max_frames = voice_curriculum_max_frames
 
         self.cmdline = cmdline
         self.git_commit_hash = git_commit_hash
@@ -261,6 +265,7 @@ class WorldModelTrainer(CommonTrainer):
                 shard_aware=self.shard_aware_sampler,
                 bucket_by_length=self.bucket_by_length,
                 bucket_mega_factor=self.bucket_mega_factor,
+                curriculum_max_frames=self.voice_curriculum_max_frames,
             )
 
         # Eval sampler — mirrors the train sampler structure to ensure eval
@@ -2011,6 +2016,7 @@ def create_trainer(
         shard_aware_sampler=getattr(args, 'shard_aware_sampler', True),
         bucket_by_length=getattr(args, 'bucket_by_length', False),
         bucket_mega_factor=getattr(args, 'bucket_mega_factor', 25),
+        voice_curriculum_max_frames=getattr(args, 'voice_curriculum_max_frames', 0),
     )
 
 
@@ -2338,6 +2344,16 @@ def add_cli_args(subparsers):
                                  "Adds params (voice_gen_queries, voice_coda_prev_proj) -- start a "
                                  "FRESH run (or --fresh_schedule). None = off (AR crutch). "
                                  "'learned_pos' = the only mode.")
+    sub_parser.add_argument("--voice_curriculum_max_frames", type=int, default=0,
+                            help="LENGTH CURRICULUM: train only on voice utterances with "
+                                 "feature_length <= this many frames (Mimi @12.5Hz: 25=~2s, "
+                                 "40=~3.2s, 60=~4.8s, 125=~10s=full). 0 = off (all lengths). A "
+                                 "STATIC per-stage cap: short utts are the regime where text "
+                                 "already drives content (baseline early_text_delta +0.10), so "
+                                 "start small and RAISE it across manual resumes (e.g. 25 -> 40 "
+                                 "-> 60 -> 0) to extend text conditioning to longer sequences. "
+                                 "Voice-only; eval stays uncapped for cross-stage comparability. "
+                                 "Changes sampler order -> use on a fresh stage, not a byte-exact resume.")
     sub_parser.add_argument("--voice_coda_type", type=str, default=None,
                             choices=["transformer", "mlp"],
                             help="Voice coda body: 'transformer' (causal self-attention stack, "
