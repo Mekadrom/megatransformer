@@ -1910,6 +1910,17 @@ def load_model(args, device='cuda'):
                 model.image_generator.config.min_snr_gamma = float(mgs_override)
                 print(f"[load_model] min_snr_gamma overridden to {float(mgs_override)}")
 
+        # Structural override: drop the Q-Former bridge so the DiT cross-attends the
+        # trunk's image-position outputs directly. Nulling the already-built module
+        # here (before create_optimizer runs) keeps its params out of the optimizer
+        # and the checkpoint. Fresh-run only — the param set differs from a bridged
+        # checkpoint, so this is not resume-compatible with a bridged run.
+        if getattr(args, 'image_no_bridge', False):
+            model.image_generator.config.use_bridge = False
+            model.image_generator.bridge = None
+            print("[load_model] image DiT bridge DISABLED (--image_no_bridge): "
+                  "trunk image-position outputs feed the DiT cross-attention directly")
+
         new_scale = None
         if getattr(args, 'image_latent_channel_scales', None) is not None:
             scales = [float(s) for s in args.image_latent_channel_scales.split(',')]
@@ -2143,6 +2154,14 @@ def add_cli_args(subparsers):
                                  "default (typically 5.0) reduces gradient amplification at the hardest "
                                  "timesteps (t near 1), trading a small amount of hard-timestep focus "
                                  "for stability. Set <= 0 to disable min-SNR weighting entirely.")
+
+    # DiT conditioning-path ablation (only applies to DiffusionBridgeImageDecoder)
+    sub_parser.add_argument("--image_no_bridge", action="store_true", default=False,
+                            help="Remove the Q-Former bridge so the DiT cross-attends the recurrent "
+                                 "trunk's image-position outputs directly (shorter/wider conditioning "
+                                 "path). Requires the DiT d_model to equal the trunk d_model (small_sum "
+                                 "matches by design). Fresh-run only — not resume-compatible with a "
+                                 "bridged checkpoint (different param set).")
 
     # Weight tying
     sub_parser.add_argument("--tie_word_embeddings", action="store_true", default=False,

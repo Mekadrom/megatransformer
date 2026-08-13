@@ -391,7 +391,9 @@ class DiffusionBridgeImageDecoder(nn.Module):
         super().__init__()
         self.config = config
 
-        self.bridge = _Bridge(config)
+        # Bridge is optional: when use_bridge=False the DiT cross-attends directly
+        # to the recurrent block's image-position outputs (no Q-Former resampling).
+        self.bridge = _Bridge(config) if getattr(config, "use_bridge", True) else None
         self.dit = _DiTBackbone(config)
 
         # Latent scaling buffer (SD-style). Stored as a (1, C, 1, 1) tensor
@@ -417,8 +419,9 @@ class DiffusionBridgeImageDecoder(nn.Module):
         # Standard Xavier on every Linear in the bridge and DiT...
         self.apply(linear_weight_init(gain=1.0))
 
-        # ...then depth-scale the residual outputs of the bridge stack.
-        apply_depth_scaled_residual_init(self.bridge.layers)
+        # ...then depth-scale the residual outputs of the bridge stack (if present).
+        if self.bridge is not None:
+            apply_depth_scaled_residual_init(self.bridge.layers)
 
         # Re-init the DiT block residual outputs with depth scaling. Each block
         # has self_attn.o_proj, cross_attn.o_proj, and ffn.condense feeding the
@@ -464,7 +467,22 @@ class DiffusionBridgeImageDecoder(nn.Module):
     def _compute_conditioning(
         self, encoder_hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cond_kv = self.bridge(encoder_hidden_states)
+        if self.bridge is not None:
+            cond_kv = self.bridge(encoder_hidden_states)
+        else:
+            # No-bridge ablation: the DiT cross-attends directly to the recurrent
+            # block's image-position outputs. This needs the encoder dim to match
+            # the DiT's d_model (small_sum sets image_coda_config.d_model=768 to the
+            # trunk's d_model exactly for this reason). Fail loudly otherwise rather
+            # than silently mis-projecting.
+            if encoder_hidden_states.shape[-1] != self.config.d_model:
+                raise ValueError(
+                    f"use_bridge=False requires the encoder d_model "
+                    f"({encoder_hidden_states.shape[-1]}) to equal the DiT d_model "
+                    f"({self.config.d_model}). Match them in the config (as small_sum "
+                    f"does) or keep the bridge."
+                )
+            cond_kv = encoder_hidden_states
         cond_global = cond_kv.mean(dim=1)  # mean-pool for global modulation
         return cond_kv, cond_global
 

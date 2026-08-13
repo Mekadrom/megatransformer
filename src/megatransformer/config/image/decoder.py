@@ -126,8 +126,18 @@ class DiffusionBridgeImageDecoderConfig:
     """
 
     # ── Bridge module ─────────────────────────────────────────────────────
+    # If False, the Q-Former bridge is removed entirely and the DiT cross-attends
+    # DIRECTLY to the recurrent block's image-position outputs (the gen-query
+    # hiddens). The bridge's original job — resampling a variable-length input to
+    # a fixed token grid — is moot here: the trunk output is already fixed-length
+    # and the DiT accepts arbitrary conditioning lengths. Removing it gives a
+    # shorter, wider conditioning path (candidate lever for weak text conditioning;
+    # see the DiT decomposition discussion). REQUIRES encoder d_model == DiT
+    # d_model (small_sum matches by design, see the d_model=768 comment below).
+    use_bridge: bool = True
     # Number of learnable query tokens the bridge produces. These are what
     # the DiT cross-attends to as conditioning. ~32–128 is typical.
+    # Ignored when use_bridge=False (DiT cross-attends the trunk outputs directly).
     n_bridge_queries: int = 64
     # Bridge transformer depth.
     n_bridge_layers: int = 4
