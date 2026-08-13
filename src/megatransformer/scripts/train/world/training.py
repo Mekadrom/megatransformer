@@ -1216,8 +1216,12 @@ class WorldModelTrainer(CommonTrainer):
             if hasattr(generator, 'coda'):
                 for i, block in enumerate(generator.coda):
                     groups[f"{prefix}/layer{i}"] = block
-                    groups[f"{prefix}/layer{i}/attn"] = block.self_attn
-                    groups[f"{prefix}/layer{i}/ffn"] = block.ffn
+                    # Attention-free (MLP) coda blocks have no self_attn/ffn — log only the
+                    # coarse per-layer group for them.
+                    if hasattr(block, 'self_attn'):
+                        groups[f"{prefix}/layer{i}/attn"] = block.self_attn
+                    if hasattr(block, 'ffn'):
+                        groups[f"{prefix}/layer{i}/ffn"] = block.ffn
             if hasattr(generator, 'lm_head'):
                 groups[f"{prefix}/lm_head"] = generator.lm_head
             if hasattr(generator, 'feature_projection'):
