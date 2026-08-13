@@ -50,6 +50,15 @@ def main():
     vocos = load_vocos(dev)
     mimi = load_mimi(dev)
     utmos = torch.hub.load("tarepan/SpeechMOS", "utmos22_strong", trust_repo=True).to(dev).eval()
+    # WavLM speaker encoder for the DIRECT conversion metric: does the swap output's speaker
+    # embedding land on the TARGET vs the SOURCE? (mel-L1 disentangle is a poor speaker proxy --
+    # identity is a small fraction of mel-L1, dominated by content + recon error.)
+    import torchaudio.functional as AF
+    from megatransformer.utils.speaker_encoder import SpeakerEncoderWrapper
+    spk_enc = SpeakerEncoderWrapper(encoder_type="wavlm", device=dev).eval()
+    def spk_emb_of(wav24):  # [1, T] @24k -> WavLM 768 embedding
+        w16 = AF.resample(wav24, 24000, 16000)
+        return spk_enc(waveform=w16, sample_rate=16000).reshape(-1)
 
     # gather clips (cap at n)
     clips = []
@@ -71,7 +80,9 @@ def main():
         return float(utmos(wav, 24000).reshape(-1)[0]), wav
 
     acc = {k: [] for k in ["l1_true", "l1_wrong", "output_diff", "gv", "gv_wrong",
-                           "mos_recon", "mos_wrong", "mos_gt", "swap_ce"]}
+                           "mos_recon", "mos_wrong", "mos_gt", "swap_ce",
+                           "conv_target", "conv_source", "recon_source"]}
+    cos = torch.nn.functional.cosine_similarity
     with torch.no_grad():
         for idx, (uid, spk, gtmel, mlen, flen, f0, sid) in enumerate(clips):
             feats = uid[:flen].unsqueeze(0).to(dev)
@@ -99,13 +110,20 @@ def main():
             gvw = (w.var(dim=1) / g.var(dim=1).clamp(min=1e-6)).mean().item()
             acc["gv"].append(gvt); acc["gv_wrong"].append(gvw)
 
-            mr, _ = voc_utmos(r)
+            mr, r_wav = voc_utmos(r)
             mw, sw_wav = voc_utmos(w)
             mg, _ = voc_utmos(g)
             acc["mos_recon"].append(mr); acc["mos_wrong"].append(mw); acc["mos_gt"].append(mg)
             # swap-content drift: re-encode the swapped waveform, CE vs the SOURCE units
             ce = mimi_content_cycle_loss(mimi, sw_wav, feats, loss_type="ce", temperature=0.1)
             acc["swap_ce"].append(float(ce))
+            # DIRECT conversion metric: swap output's speaker embedding vs target/source.
+            src_emb = spk.to(dev); tgt_emb = clips[j][1].to(dev)
+            swap_spk = spk_emb_of(sw_wav)
+            recon_spk = spk_emb_of(r_wav)
+            acc["conv_target"].append(float(cos(swap_spk, tgt_emb, dim=0)))   # want HIGH
+            acc["conv_source"].append(float(cos(swap_spk, src_emb, dim=0)))   # want LOW
+            acc["recon_source"].append(float(cos(recon_spk, src_emb, dim=0))) # sanity: recon=source, HIGH
 
     m = {k: float(np.mean(v)) for k, v in acc.items()}
     disentangle = m["l1_wrong"] - m["l1_true"]
@@ -119,6 +137,11 @@ def main():
     print(f"                     mos_gap(ceil-recon)={m['mos_gt']-m['mos_recon']:+.3f}  "
           f"conv_gap(recon-wrong)={m['mos_recon']-m['mos_wrong']:+.3f}")
     print(f"  swap-content CE  : {m['swap_ce']:.3f}   (lower = conversion keeps source content)")
+    conv_margin = m["conv_target"] - m["conv_source"]
+    print(f"  conversion (WavLM speaker cos):")
+    print(f"    swap->target={m['conv_target']:.3f}  swap->source={m['conv_source']:.3f}  "
+          f"margin={conv_margin:+.3f}  (>0 => swap lands on TARGET, not source)")
+    print(f"    recon->source={m['recon_source']:.3f}  (sanity: recon should match its own speaker)")
 
 
 if __name__ == "__main__":
