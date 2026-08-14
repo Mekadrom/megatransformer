@@ -289,7 +289,8 @@ def main():
         path=args.dataset_name,
         name=args.dataset_config,
         split=args.split,
-        trust_remote_code=True,
+        # trust_remote_code removed in datasets 5.x (loading scripts unsupported); it now
+        # only warns. Our datasets (parquet/webdataset) don't use loading scripts anyway.
         streaming=streaming,
     )
     if data_dir:
@@ -340,9 +341,16 @@ def main():
     start_time = time.time()
 
     if streaming:
-        # Streaming mode: iterate directly, no len() or indexing
+        # Streaming mode: iterate directly, no len() or indexing.
+        # The bar tracks SAVED examples (== the --max_samples target and what lands
+        # in shards), NOT raw stream position. Skips (uid/size/grayscale) advance the
+        # stream but not `saved`, and the skip rate spikes in clustered-junk regions
+        # (e.g. CommonCanvas's solid-color uploader block), so a per-seen bar would
+        # race ahead and blow past 100% before the run actually finishes. `seen` and
+        # `skipped` are surfaced in the postfix so raw throughput is still visible.
         total = args.max_samples or None
         pbar = tqdm(total=total, desc=f"GPU {args.gpu_id}")
+        _last_saved = 0
         for idx, example in enumerate(dataset):
             if idx < args.start_idx:
                 continue
@@ -357,14 +365,22 @@ def main():
             try:
                 if preprocessor.preprocess_example(example):
                     stats["processed"] += 1
-                pbar.update(1)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 print(f"Error processing sample {idx}: {e}")
                 stats["skipped"]["error"] += 1
-                pbar.update(1)
-                continue
+            finally:
+                # Advance by newly-SAVED (batch-flushed) examples; refresh elapsed/rate
+                # coarsely during long skip runs so the bar doesn't look frozen.
+                delta = stats["saved"] - _last_saved
+                if delta:
+                    _last_saved = stats["saved"]
+                    pbar.set_postfix(seen=idx + 1, skipped=sum(stats["skipped"].values()), refresh=False)
+                    pbar.update(delta)
+                elif (idx & 0x3FF) == 0:
+                    pbar.set_postfix(seen=idx + 1, skipped=sum(stats["skipped"].values()), refresh=False)
+                    pbar.update(0)
     else:
         # Standard mode: random access by index
         samples_for_this_gpu = len([
