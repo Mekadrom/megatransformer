@@ -105,6 +105,34 @@ def test_trailing_nonterminal_punct(raw, expected):
 
 
 # ---------------------------------------------------------------------------
+# Stray-symbol stripping + whitespace collapse (from the cache anomaly audit).
+# Editorial/OCR symbols []{}*_<>|\~`^ are removed; runs of whitespace (incl. those
+# left where a symbol or punctuation was dropped) collapse to a single space. Quotes
+# and dashes are deliberately NOT touched.
+# ---------------------------------------------------------------------------
+SYMBOL_AND_WHITESPACE = [
+    # Real examples pulled from the mimi cache.
+    ("[BORN fifteen forty two.", "BORN fifteen forty two."),
+    ("But there's one thing, anyway  Jim's too old to be dug",
+     "But there's one thing, anyway Jim's too old to be dug."),
+    # Symbol removal must not leave a double space behind.
+    ("hello [ world", "Hello world."),
+    ("He said *emphatically* the truth", "He said emphatically the truth."),
+    ("a <tag> b", "A tag b."),
+    # Tabs/newlines collapse too.
+    ("two\tlines\nhere", "Two lines here."),
+    # Dashes and quotes are preserved (not in the stripped class).
+    ("wait -- who goes there?", "Wait -- who goes there?"),
+    ('"a lone opening quote', '"A lone opening quote.'),
+]
+
+
+@pytest.mark.parametrize("raw,expected", SYMBOL_AND_WHITESPACE)
+def test_symbol_and_whitespace(raw, expected):
+    assert normalize_transcript(raw) == expected
+
+
+# ---------------------------------------------------------------------------
 # Edge cases: falsy / whitespace-only input is returned unchanged (guard clause).
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("raw,expected", [

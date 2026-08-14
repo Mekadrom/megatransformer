@@ -104,11 +104,26 @@ def normalize_transcript(text: str) -> str:
     "THE QUICK BROWN FOX JUMPED" -> "The quick brown fox jumped."
     "Already normal text." -> "Already normal text."
     '"Yes."' -> '"Yes."'   (the closing quote already follows terminal punctuation)
+    "[BORN fifteen forty two." -> "BORN fifteen forty two."   (stray symbol stripped)
+    "anyway  Jim's" -> "anyway Jim's"   (collapsed double space)
+
+    Quotes and dashes are left as-is: unbalanced quotes are the true text (a quotation
+    split across sentence-level utterances), not a defect.
     """
     if not text or not text.strip():
         return text
 
     text = text.strip()
+
+    # Strip stray symbols that corrupt tokenization — editorial/OCR artifacts like a lone
+    # '[' in '[BORN ...' or a stray '*'. Removes the class []{}*_<>|\~`^ ONLY; quotes,
+    # dashes, commas, and terminal punctuation are legitimate and left alone. Done before the
+    # whitespace collapse so a removed symbol can't leave a double space behind.
+    text = re.sub(r'[*_\[\]{}<>|\\~`^]', '', text)
+
+    # Collapse any run of whitespace to a single space (tabs/newlines, and the double spaces
+    # left where a symbol was removed or punctuation was dropped, e.g. 'anyway  Jim').
+    text = re.sub(r'\s+', ' ', text).strip()
 
     # Only normalize casing if the text appears to be ALL CAPS (>80% uppercase letters).
     alpha_chars = [c for c in text if c.isalpha()]
