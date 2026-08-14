@@ -24,6 +24,8 @@ dependencies = [
     "huggingface-hub",
     "safetensors",
     "librosa",
+    "soundfile",   # direct audio decode in the voice preprocessor (datasets 5.x Audio decode
+    "soxr",        # needs torchcodec, which is ABI-incompatible with our torch 2.6 wheel)
     "speechbrain",
     "torchcrepe",
     "pyctcdecode",
@@ -69,7 +71,9 @@ training = [
     "torch",
     "torchaudio",
     "accelerate",
-    "datasets>=2.19,<3",
+    "datasets>=5,<6",   # 5.x: fixes the Arrow-parquet-over-HTTP silent image corruption
+                        # (loading scripts + trust_remote_code removed; Audio decode now via
+                        # torchcodec, which we sidestep with soundfile — see decode_audio)
     "tensorboard",
     "wandb",
     "jiwer",
