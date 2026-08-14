@@ -325,6 +325,39 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
 
         print(f"Image source: {'column=' + self.image_column if self.image_column else 'url=' + self.url_column}")
 
+        # Junk-uploader exclusion (checked BEFORE decode, so it costs nothing).
+        # CommonCanvas carries a per-row `uid` (Flickr uploader). The dead-solid-color
+        # "images" that used to trip the latent guard were traced to a SINGLE uploader,
+        # 53005683@N00 ("Your+photos"): a bulk 2007 upload of 640x480 green-screen /
+        # solid-color PNG swatches, ~6k of them, 100% junk, 0 real photos — and they
+        # CLUSTER in streaming order (one shard is ~0% solid, another ~49%). A `uid`
+        # blocklist removes 100% of them and 0 real photos, which no spatial-std cutoff
+        # can do (the "solid + tiny white square" variants sit just above any threshold
+        # that still spares genuine low-detail photos). Pass --exclude_uids to filter.
+        self.uid_column = getattr(args, "uid_column", "uid")
+        exclude_uids = getattr(args, "exclude_uids", None)
+        self.exclude_uids = set(
+            u.strip() for u in exclude_uids.split(",") if u.strip()
+        ) if exclude_uids else set()
+        if self.exclude_uids:
+            print(f"Excluding uploader ids ({self.uid_column}): {sorted(self.exclude_uids)}")
+
+        # Latent-variance guard. Kept as a BACKSTOP after the uid filter above: real
+        # latents have per-image spatial-std ~1.0, dead-solid ones ~0.13. If some other
+        # junk source (a different uploader, a corrupt shard) ever slips past the uid
+        # blocklist, a large low-variance FRACTION trips a HARD-FAIL so a bad run dies
+        # early instead of wasting a training run on garbage targets. With --exclude_uids
+        # set for the known source, this should never fire on CommonCanvas.
+        # Calibrated against real vs solid: solids are ~50% below spatial-std 0.15;
+        # real data is only ~4% below 0.15 (genuine low-detail: dark shots, plain-bg
+        # subjects — and these CLUSTER in streaming order, so per-batch they spike, which
+        # is why the cutoff must be well below the real low-detail band, not at 0.30).
+        self._lv_std_thr = float(getattr(args, "latent_min_spatial_std", 0.15))   # per-image "near-solid" cutoff
+        self._lv_max_frac = float(getattr(args, "latent_max_low_frac", 0.20))     # cumulative fraction that trips the assert
+        self._lv_min_n = 512                                                       # don't judge until this many seen (avoid early noise)
+        self._lv_total = 0
+        self._lv_low = 0
+
         # Text conditioning settings
         self.text_column = args.text_column
         self.encode_text = args.encode_text
@@ -481,6 +514,27 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
                                 help="Minimum image dimension (skip smaller images)")
         sub_parser.add_argument("--skip_grayscale", action="store_true", default=False,
                                 help="Skip grayscale images")
+        sub_parser.add_argument("--exclude_uids", type=str, default=None,
+                                help="Comma-separated uploader ids to drop BEFORE decode (checked against "
+                                     "--uid_column). CommonCanvas's dead-solid-color swatches all come from "
+                                     "one Flickr uploader, 53005683@N00 — pass --exclude_uids 53005683@N00 to "
+                                     "remove 100%% of them and 0 real photos (a uid filter beats any spatial-std "
+                                     "cutoff, which can't separate the 'solid + white square' variants from "
+                                     "genuine low-detail photos).")
+        sub_parser.add_argument("--uid_column", type=str, default="uid",
+                                help="Dataset column holding the uploader id for --exclude_uids (default: uid)")
+
+        # Latent-variance corruption guard (VAE-latent mode). Real latents have per-image
+        # spatial-std ~1.0; a known 4-way-run bug flattened them to ~0.15 (decodes solid).
+        sub_parser.add_argument("--latent_min_spatial_std", type=float, default=0.15,
+                                help="Per-image latent spatial-std below this counts as 'near-solid' "
+                                     "for the corruption guard. Corruption sits at ~0.15, real low-detail "
+                                     "at 0.15-0.30, so the cutoff is at the corruption band, not above it. "
+                                     "Default 0.15.")
+        sub_parser.add_argument("--latent_max_low_frac", type=float, default=0.20,
+                                help="Abort the run if the cumulative fraction below the cutoff exceeds this. "
+                                     "Real data is ~4%% below 0.15; corruption is ~50%%. Default 0.20 (5x real "
+                                     "margin). Raise it for genuinely low-detail datasets.")
 
         # Text conditioning
         sub_parser.add_argument("--text_column", type=str, default=None,
@@ -520,6 +574,12 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
                     return Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
                 elif isinstance(img_data, dict) and "path" in img_data:
                     return Image.open(img_data["path"]).convert("RGB")
+                elif isinstance(img_data, (bytes, bytearray)):
+                    # Raw JPEG/PNG bytes — this is how load_dataset("parquet", ...) yields
+                    # an image column locally (the hub dataset's Image feature is lost when
+                    # reading the parquet directly). Needed for the download-then-local
+                    # preprocess path that avoids the flaky hub streaming.
+                    return Image.open(io.BytesIO(img_data)).convert("RGB")
                 else:
                     # Try treating as numpy array
                     import numpy as np
@@ -592,6 +652,38 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         self.shard_fields['shard_text_lengths'] = []
         self.shard_fields['shard_idx'] += self.args.total_gpus
 
+    def _check_latent_variance(self, latents: torch.Tensor):
+        """Flag/abort on spatially-flattened (near-solid) latents. `latents` is
+        (B, C, H, W). Only meaningful for VAE-latent mode (not raw-image mode)."""
+        if latents is None or latents.ndim != 4:
+            return
+        x = latents.detach().float()
+        ss = x.reshape(x.shape[0], x.shape[1], -1).std(dim=2).mean(dim=1)  # (B,) per-image spatial std
+        n_low = int((ss < self._lv_std_thr).sum())
+        self._lv_total += x.shape[0]
+        self._lv_low += n_low
+        if n_low > 0.6 * x.shape[0]:
+            print(f"[latent_check] WARNING: {n_low}/{x.shape[0]} latents in this batch have "
+                  f"spatial-std < {self._lv_std_thr} (near-solid). Median batch spatial-std "
+                  f"{float(ss.median()):.3f}. Real latents are ~1.0 — possible corruption.", flush=True)
+        frac = self._lv_low / max(1, self._lv_total)
+        if self._lv_total >= self._lv_min_n and frac > self._lv_max_frac:
+            msg = (
+                f"[latent_check] ABORT: {frac*100:.1f}% of {self._lv_total} encoded latents are near-solid "
+                f"(spatial-std < {self._lv_std_thr}) — far above the ~2% expected from real data. The latents "
+                f"are being spatially flattened (the known 4-way-run corruption). Fix the run and regenerate. "
+                f"Override the cutoff/tolerance with --latent_min_spatial_std / --latent_max_low_frac if this is "
+                f"a false positive on genuinely low-detail data."
+            )
+            print(msg, flush=True)
+            # MUST be SystemExit (a BaseException), NOT a plain exception: both
+            # process_and_accumulate and the main loop `except Exception`, which would
+            # swallow a plain raise — silently skipping the batch, then spinning and
+            # skipping EVERY batch once the cumulative threshold is crossed (saving
+            # nothing while appearing to run). SystemExit propagates past both and
+            # actually stops the process.
+            raise SystemExit(1)
+
     def process_and_accumulate(self):
         if not self.batch_accumulators['batch_images']:
             return
@@ -601,6 +693,7 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
                 # Process through VAE
                 result = self.batch_processor.process_batch(self.batch_accumulators['batch_images'])
 
+                self._check_latent_variance(result["latents"])
                 self.shard_fields['shard_latents'].append(result["latents"])
                 self.shard_fields['shard_mu'].append(result["mu"])
                 self.shard_fields['shard_logvar'].append(result["logvar"])
@@ -694,6 +787,13 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
 
     def preprocess_example(self, example) -> bool:
         """Process a single example. Returns True if example was processed."""
+        # Junk-uploader filter — checked BEFORE decode so excluded rows cost nothing.
+        if self.exclude_uids:
+            uid = example.get(self.uid_column)
+            if uid is not None and str(uid) in self.exclude_uids:
+                self.stats_accumulator["skipped"]["excluded_uid"] += 1
+                return False
+
         # Load image
         image = self._load_image_from_example(example)
 
