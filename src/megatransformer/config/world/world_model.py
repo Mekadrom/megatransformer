@@ -120,6 +120,11 @@ class MegaTransformerWorldModelConfig:
     # length). Mirrors the image input/output split; input/transcription voice is unaffected.
     # Gated so a non-gen-query model has ZERO extra params (clean resumes). From-scratch only.
     voice_gen_query_mode: Optional[str] = None
+    # Whether gen-query mode routes the previous frame's centroid to the coda (voice_coda_prev).
+    # True = original behavior (a 1st-order neighbor crutch at the coda, survives even an MLP
+    # coda). False = the coda sees ONLY the text-driven trunk output -> no neighbor crutch
+    # anywhere. Only meaningful when voice_gen_query_mode is set.
+    voice_gen_query_coda_prev: bool = True
 
     # Feature extractor configs
     text_prelude_config: TextPreludeFeatureExtractorConfig = dataclasses.field(

@@ -1793,6 +1793,10 @@ def load_model(args, device='cuda'):
             # Gen-query voice synthesis: creates voice_gen_queries + voice_coda_prev_proj
             # params (world_model.py __init__). Removes the AR crutch from the shared trunk.
             config.voice_gen_query_mode = args.voice_gen_query_mode
+            if getattr(args, 'voice_gen_query_no_coda_prev', False):
+                # Drop the coda's previous-centroid signal -> truly crutch-free (coda sees only
+                # the text-driven trunk output). Pair with --voice_coda_type mlp.
+                config.voice_gen_query_coda_prev = False
         if getattr(args, 'voice_coda_type', None):
             # Voice coda body: "mlp" swaps the transformer stack for an attention-free
             # position-wise FFN (no cross-position mixing, no KV cache), so the coda can't
@@ -2358,6 +2362,15 @@ def add_cli_args(subparsers):
                                  "-> 60 -> 0) to extend text conditioning to longer sequences. "
                                  "Voice-only; eval stays uncapped for cross-stage comparability. "
                                  "Changes sampler order -> use on a fresh stage, not a byte-exact resume.")
+    sub_parser.add_argument("--voice_gen_query_no_coda_prev", action="store_true",
+                            help="With --voice_gen_query_mode, DROP the coda's previous-centroid "
+                                 "signal (voice_coda_prev). That signal is a 1st-order neighbor "
+                                 "crutch that survives even an MLP coda (a position-wise coda can "
+                                 "predict unit t from centroid t-1 with no attention and no text) "
+                                 "-- exactly the 'local coherence without text' failure. With this "
+                                 "flag the coda sees ONLY the text-driven trunk output, so there is "
+                                 "no neighbor-extrapolation crutch anywhere. Pair with "
+                                 "--voice_coda_type mlp for the truly crutch-free path.")
     sub_parser.add_argument("--voice_coda_type", type=str, default=None,
                             choices=["transformer", "mlp"],
                             help="Voice coda body: 'transformer' (causal self-attention stack, "

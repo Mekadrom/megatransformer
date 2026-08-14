@@ -173,12 +173,18 @@ class MegaTransformerWorldModel(nn.Module):
         # Gated so a non-gen-query model has zero extra params. Input/transcription voice path is
         # untouched. Learned (not fixed-sinusoidal) queries — positional-only collapsed for image.
         self.voice_gen_query_mode = getattr(config, "voice_gen_query_mode", None)
+        # voice_coda_prev IS a crutch: handing the coda the previous frame's centroid lets it
+        # predict unit t by 1st-order extrapolation, with NO attention and NO text (a position-
+        # wise MLP coda does exactly this). Default True keeps the original gen-query behavior;
+        # set False for a TRULY crutch-free path (coda sees only the text-driven trunk output).
+        self.voice_gen_query_coda_prev = getattr(config, "voice_gen_query_coda_prev", True)
         if self.voice_gen_query_mode is not None and "voice" in self.include_modes:
             vd = config.text_prelude_config.d_model
             _coda_block = getattr(config.voice_coda_config, "coda_config", None)
             max_pos = getattr(_coda_block, "max_position_embeddings", 1024) or 1024
             self.voice_gen_queries = nn.Embedding(max_pos, vd)
-            self.voice_coda_prev_proj = nn.Linear(config.voice_prelude_config.feature_channels, vd)
+            if self.voice_gen_query_coda_prev:
+                self.voice_coda_prev_proj = nn.Linear(config.voice_prelude_config.feature_channels, vd)
 
         # Huginn-style embedding scale: multiply embeddings by sqrt(d_model) so
         # the injected input x_0 matches the thought state initialization variance.
@@ -415,13 +421,16 @@ class MegaTransformerWorldModel(nn.Module):
                     pos = torch.arange(T_v, device=voice_flat.device)
                     synth_hidden = self.voice_gen_queries(pos).to(voice_flat.dtype).unsqueeze(0).expand(
                         batch_size * n_voice, T_v, d_model)  # (B*N, T, d_model)
-                    # The coda keeps local coherence via the PREVIOUS frame's centroid (frame t-1
-                    # at position t, zero at 0), projected and routed to the coda after uninterleave
-                    # -- NOT to the trunk.
-                    prev_c = voice_flat[:, :, :-1].transpose(1, 2)  # (B*N, T-1, C)
-                    prev_h = self.voice_coda_prev_proj(prev_c)      # (B*N, T-1, d_model)
-                    zpref = torch.zeros(prev_h.shape[0], 1, d_model, device=prev_h.device, dtype=prev_h.dtype)
-                    voice_coda_prev = torch.cat([zpref, prev_h], dim=1)  # (B*N, T, d_model)
+                    # The coda optionally keeps local coherence via the PREVIOUS frame's centroid
+                    # (frame t-1 at position t, zero at 0), projected and routed to the coda after
+                    # uninterleave -- NOT to the trunk. When voice_gen_query_coda_prev is False this
+                    # is skipped entirely: the coda then sees ONLY the text-driven trunk output, so
+                    # there is no neighbor-extrapolation crutch anywhere (trunk or coda).
+                    if self.voice_gen_query_coda_prev:
+                        prev_c = voice_flat[:, :, :-1].transpose(1, 2)  # (B*N, T-1, C)
+                        prev_h = self.voice_coda_prev_proj(prev_c)      # (B*N, T-1, d_model)
+                        zpref = torch.zeros(prev_h.shape[0], 1, d_model, device=prev_h.device, dtype=prev_h.dtype)
+                        voice_coda_prev = torch.cat([zpref, prev_h], dim=1)  # (B*N, T, d_model)
                 else:
                     shifted_input = voice_flat[:, :, :-1]  # (B*N, C, T-1)
                     # NAR→AR curriculum: sever the prelude's voice→voice self-attention so a
@@ -1285,11 +1294,12 @@ class MegaTransformerWorldModel(nn.Module):
                     else:
                         hidden_b = current_hidden[b:b+1]  # (1, 1, d_model)
                     should_stop_voice = False
-                    if self.voice_gen_query_mode is not None:
+                    if self.voice_gen_query_mode is not None and self.voice_gen_query_coda_prev:
                         # Route the previous frame's centroid to the coda for local
                         # coherence (forward: voice_coda_prev added to voice_batch,
                         # world_model.py:613-616). At entry (last_voice_pred None) the
                         # coda-prev is zero, so this is a no-op for the first frame.
+                        # Skipped entirely when coda_prev is disabled (crutch-free path).
                         if last_voice_pred[b] is not None:
                             prev_c = last_voice_pred[b].transpose(0, 1).unsqueeze(0)  # (C,1)->(1,C)->(1,1,C)
                             prev_h = self.voice_coda_prev_proj(prev_c).to(hidden_b.dtype)  # (1,1,d_model)
