@@ -1,0 +1,22 @@
+[Unit]
+Description=Crash-forensics telemetry (CPU Tctl + per-GPU peak watts, fsync/line)
+# WHY: the box hard-cuts with NO kernel log (instant power loss / CPU THERMTRIP).
+# The ONLY witness is this 1Hz fsync'd trace (CPU Tctl distinguishes ~64C electrical
+# vs ~82-85C thermtrip; per-GPU 200Hz PEAK_W catches the inrush the 1Hz avg misses).
+# It MUST auto-start on boot and auto-restart if it dies — the 2026-07-19 crash was
+# undiagnosable because the manual telemetry process had died at noon and stayed dead.
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=simple
+User=zadar
+# self-contained venv python already has pynvml (the 200Hz peak-hold path)
+ExecStart=/home/zadar/dev/projects/megatransformer-refactor/.venv/bin/python /home/zadar/dev/projects/megatransformer-refactor/scripts_local/crash_telemetry.py /home/zadar/crash_telemetry.csv 1.0 200
+# never let it stay dead mid-session again
+Restart=always
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

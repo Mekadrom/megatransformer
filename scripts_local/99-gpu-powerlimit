@@ -1,0 +1,24 @@
+#!/bin/bash
+# /etc/update-motd.d/99-gpu-powerlimit
+# Login reminder that the GPU power limit (PSU1 OPP mitigation) is in force.
+# Reads the ACTUAL enforced limit, so it also SCREAMS if the limit ever reverted
+# (e.g. gpu-powerlimit.service failed, or someone raised it and forgot).
+command -v nvidia-smi >/dev/null 2>&1 || exit 0
+limits=$(nvidia-smi --query-gpu=enforced.power.limit --format=csv,noheader,nounits 2>/dev/null)
+[ -z "$limits" ] && exit 0
+# highest enforced limit across all cards, as an integer watt value
+maxlim=$(printf '%s\n' "$limits" | cut -d. -f1 | sort -n | tail -1)
+
+RED='\e[1;37;41m'; YEL='\e[1;33m'; GRN='\e[1;32m'; RST='\e[0m'
+printf '\n'
+if [ "${maxlim:-999}" -le 305 ]; then
+  printf "${GRN}  ⚡ GPU power limit ACTIVE: %sW/card  (PSU1 over-power mitigation)${RST}\n" "$maxlim"
+  printf "${YEL}     4-GPU full-tilt load is still unproven — soak-test before trusting it.${RST}\n"
+else
+  printf "${RED}  ═══════════════════════════════════════════════════════════════════ ${RST}\n"
+  printf "${RED}   🔥  WARNING: GPU POWER LIMIT IS %sW/card — UNPROTECTED!  🔥         ${RST}\n" "$maxlim"
+  printf "${RED}   PSU1 can OPP-trip and HARD-CUT the box under load. Re-arm it now:   ${RST}\n"
+  printf "${RED}       sudo systemctl restart gpu-powerlimit                          ${RST}\n"
+  printf "${RED}  ═══════════════════════════════════════════════════════════════════ ${RST}\n"
+fi
+printf '\n'

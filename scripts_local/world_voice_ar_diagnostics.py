@@ -1,0 +1,386 @@
+"""World-TTS voice-AR diagnostics: is the SIVE-VQ token stream autoregressable WITHOUT
+n-gram degeneration, and is the AR actually reading the text?
+
+Three probes on a world-model checkpoint (held-out val), written as a markdown report so a
+later checkpoint re-run is a clean before/after:
+
+  1. TEACHER-FORCED unit prediction (real text): top-1 accuracy + perplexity on content
+     units, vs the text-free n-gram ceiling/asymptote (from ngram_unit_baseline.py). Above
+     the ceiling => the model uses more than local unit history.
+  2. TEXT ABLATION: same batch with transcripts SHUFFLED across the batch (each voice paired
+     with a wrong text). Delta accuracy = the text's causal contribution. ~0 => text ignored
+     (which is what "coherent bursts unrelated to the prompt" looks like).
+  3. FREE-RUNNING GENERATION degeneration: generate from text prompts and measure length +
+     EOV behavior, adjacent-repeat rate, longest run, codebook coverage, unit entropy, and
+     distinct bi/tri-gram ratios -- all vs the ground-truth val distribution. Catches
+     collapse-to-repetition / looping vs healthy diverse-but-unconditioned output.
+
+Reuses visualize.py's model/dataset loading. Needs a GPU.
+
+Usage:
+  python scripts_local/world_voice_ar_diagnostics.py \
+      --checkpoint_path runs/world/<run>/checkpoint-7000 --step 7000 \
+      --cache_dir <voice_base_dir> --codebook <codebook.pt> \
+      [--config small_sum] [--n 256] [--gen_n 32] [--device cuda:0] \
+      [--ngram_ceiling 0.211 --asymptote 0.229 --repeat 0.117]
+"""
+import argparse
+import math
+import os
+from argparse import Namespace
+from collections import Counter
+
+import torch
+import torch.nn.functional as F
+
+from megatransformer.scripts.eval.world.visualize import load_world_model, load_dataset
+from megatransformer.scripts.data.world.data_collator import MultimodalDataCollator
+from megatransformer.utils.codebook import load_codebook
+from megatransformer.utils import constants
+
+
+def build_args(a):
+    """A Namespace satisfying visualize.load_world_model + load_dataset for this run shape."""
+    return Namespace(
+        config=a.config, checkpoint_path=a.checkpoint_path,
+        voice_codebook_path=a.codebook, voice_feature_channels=256, voice_predict_f0=True,
+        include_modes="voice", include_tasks="voice_synthesis",
+        cache_dir=None, text_cache_dir=None, audio_cache_dir=None,
+        voice_cache_dir=a.cache_dir, image_cache_dir=None,
+        use_memorization_dataset=False, max_samples=None, num_eval_samples=a.n,
+        tie_word_embeddings=False, share_block_weights=False,
+        gen_query_mode=None, n_image_gen_positions=None, iteration_norm=None,
+    )
+
+
+def make_collator(K):
+    return MultimodalDataCollator(
+        max_seq_len=1024, max_waveforms=160000, max_mel_spec_frames=625,
+        max_sive_feature_frames=209, voice_eov_id=K,
+    )
+
+
+@torch.no_grad()
+def tf_unit_stats(model, logits, tgt, K):
+    """Content-only top-1 accuracy + CE/ppl. tgt: (B,T) with -100 pad, K = EOV id."""
+    B, T, V = logits.shape
+    tgt = tgt[:, :T]
+    if tgt.shape[1] < T:
+        tgt = F.pad(tgt, (0, T - tgt.shape[1]), value=-100)
+    pred = logits.argmax(-1)
+    content = (tgt >= 0) & (tgt < K)           # exclude EOV(=K) and pad(-100)
+    incl_eov = tgt != -100
+    acc_c = (pred[content] == tgt[content]).float().mean().item() if content.any() else float("nan")
+    acc_e = (pred[incl_eov] == tgt[incl_eov]).float().mean().item() if incl_eov.any() else float("nan")
+    ce = F.cross_entropy(logits.reshape(B * T, V), tgt.reshape(B * T), ignore_index=-100)
+    return acc_c, acc_e, ce.item(), math.exp(ce.item())
+
+
+@torch.no_grad()
+def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8, voice_attn_alpha=None):
+    """Teacher-forced forward with real vs batch-shuffled text; aggregate content accuracy.
+
+    early_k: also track accuracy on the FIRST early_k voice frames separately. There the
+    shifted-TF input carries little/no voice history, so text is the dominant (at frame 0,
+    the ONLY) predictive signal -- the cleanest place to see whether text is used, since it
+    isn't confounded by voice-history redundancy the way the all-position delta is."""
+    idxs = list(range(min(n, len(dataset))))
+    tot = {"real_hits": 0, "shuf_hits": 0, "content": 0, "ce_real": 0.0, "ce_n": 0,
+           "eov_hits": 0, "eov_tot": 0,
+           "early_real": 0, "early_shuf": 0, "early_content": 0}
+    for s in range(0, len(idxs), bs):
+        samples = [dataset[i] for i in idxs[s:s + bs]]
+        samples = [x for x in samples if any(k.startswith("voice_") for k in x)]
+        if len(samples) < 2:
+            continue
+        collator.force_direction = "synthesis"
+        b = collator(samples)
+        text = b["text_token_ids"].to(device)
+        vin = b["voice_features"].unsqueeze(1).to(device)
+        vlen = b["voice_feature_lengths"].unsqueeze(1).to(device)
+        vlbl = b["voice_features"].to(device)
+        tgt = b["voice_unit_ids"].to(device)
+        syn = b["is_synthesis"].to(device)
+
+        def fwd(text_ids):
+            out = model(text_input_ids=text_ids, voice_inputs=vin, voice_lengths=vlen,
+                        voice_latent_labels=vlbl, is_synthesis=syn, decode_outputs=False,
+                        voice_attn_alpha=voice_attn_alpha)
+            return out["voice_unit_logits"]
+
+        lr = fwd(text)                                   # real text
+        ls = fwd(torch.roll(text, 1, dims=0))            # each voice + WRONG (rolled) text
+        Bc, Tc, V = lr.shape
+        t = tgt[:, :Tc]
+        if t.shape[1] < Tc:
+            t = F.pad(t, (0, Tc - t.shape[1]), value=-100)
+        content = (t >= 0) & (t < K)
+        pr, ps = lr.argmax(-1), ls.argmax(-1)
+        tot["real_hits"] += (pr[content] == t[content]).sum().item()
+        tot["shuf_hits"] += (ps[content] == t[content]).sum().item()
+        tot["content"] += int(content.sum().item())
+        # Early-frame (text-dominant) region: first early_k voice positions.
+        early = content.clone()
+        early[:, early_k:] = False
+        if early.any():
+            tot["early_real"] += (pr[early] == t[early]).sum().item()
+            tot["early_shuf"] += (ps[early] == t[early]).sum().item()
+            tot["early_content"] += int(early.sum().item())
+        ce = F.cross_entropy(lr.reshape(Bc * Tc, V), t.reshape(Bc * Tc), ignore_index=-100)
+        tot["ce_real"] += ce.item() * Bc
+        tot["ce_n"] += Bc
+        eov = t == K
+        if eov.any():
+            tot["eov_hits"] += (pr[eov] == t[eov]).sum().item()
+            tot["eov_tot"] += int(eov.sum().item())
+    acc_real = tot["real_hits"] / max(tot["content"], 1)
+    acc_shuf = tot["shuf_hits"] / max(tot["content"], 1)
+    ce_real = tot["ce_real"] / max(tot["ce_n"], 1)
+    e_real = tot["early_real"] / max(tot["early_content"], 1)
+    e_shuf = tot["early_shuf"] / max(tot["early_content"], 1)
+    return {
+        "acc_real": acc_real, "acc_shuf": acc_shuf, "text_delta": acc_real - acc_shuf,
+        "ce_real": ce_real, "ppl_real": math.exp(ce_real),
+        "eov_acc": tot["eov_hits"] / max(tot["eov_tot"], 1), "content_positions": tot["content"],
+        "early_acc_real": e_real, "early_acc_shuf": e_shuf, "early_text_delta": e_real - e_shuf,
+    }
+
+
+def seq_degeneration(seqs, K):
+    """Aggregate degeneration stats over a list of unit-id sequences (content units, no EOV)."""
+    if not seqs:
+        return {}
+    lens = [len(s) for s in seqs]
+    rep = run = tot_pairs = 0
+    uni, bi, tri = Counter(), set(), set()
+    n_bi = n_tri = 0
+    for s in seqs:
+        for u in s:
+            uni[u] += 1
+        for t in range(1, len(s)):
+            tot_pairs += 1
+            if s[t] == s[t - 1]:
+                rep += 1
+        # longest run of a repeated unit
+        cur = 1
+        for t in range(1, len(s)):
+            cur = cur + 1 if s[t] == s[t - 1] else 1
+            run = max(run, cur)
+        for t in range(1, len(s)):
+            bi.add((s[t - 1], s[t])); n_bi += 1
+        for t in range(2, len(s)):
+            tri.add((s[t - 2], s[t - 1], s[t])); n_tri += 1
+    total = sum(uni.values())
+    probs = [c / total for c in uni.values()]
+    ent = -sum(p * math.log2(p) for p in probs)
+    return {
+        "n_seqs": len(seqs),
+        "len_mean": sum(lens) / len(lens), "len_min": min(lens), "len_max": max(lens),
+        "adj_repeat_rate": rep / max(tot_pairs, 1),
+        "longest_run": run,
+        "distinct_units": len(uni), "coverage": len(uni) / K,
+        "unit_entropy_bits": ent, "max_entropy_bits": math.log2(K),
+        "distinct_bigram_ratio": len(bi) / max(n_bi, 1),
+        "distinct_trigram_ratio": len(tri) / max(n_tri, 1),
+    }
+
+
+@torch.no_grad()
+def run_generation(model, dataset, collator, device, gen_n, K, budget=209):
+    """Free-running generation from text prompts; return generated + GT unit sequences + EOV info.
+
+    Also collects per-sample prompt TEXT length (tokens before BOV) so the caller can correlate
+    it with generated length -- the clean 'does text drive duration' signal (short prompt ->
+    short utterance) independent of whether the CONTENT aligns."""
+    gen_seqs, gt_seqs, prompt_lens = [], [], []
+    eov_fired = budget_hit = 0
+    collator.force_direction = "synthesis"
+    count = 0
+    for i in range(len(dataset)):
+        s = dataset[i]
+        if not any(k.startswith("voice_") for k in s):
+            continue
+        b = collator([s])
+        text = b["text_token_ids"][0]
+        bov = (text == constants.BOV_TOKEN_ID).nonzero(as_tuple=True)[0]
+        if len(bov) == 0:
+            continue
+        prompt_lens.append(int(bov[0].item()))   # text tokens before BOV = transcript length proxy
+        prompt = text[:bov[0].item() + 1].unsqueeze(0).to(device)
+        out = model.generate(text_input_ids=prompt, max_new_tokens=512,
+                             voice_token_budget=budget, voice_temperature=1.0,
+                             decode_outputs=False)
+        trace = out.get("voice_unit_id_trace", [[]])[0]
+        if trace and trace[-1] == K:            # EOV fired -> strip it
+            eov_fired += 1
+            trace = trace[:-1]
+        elif len(trace) >= budget:
+            budget_hit += 1
+        gen_seqs.append([int(x) for x in trace])
+        # GT content units for the same utterance
+        gt = b["voice_unit_ids"][0]
+        gt = gt[(gt >= 0) & (gt < K)].tolist()
+        gt_seqs.append(gt)
+        count += 1
+        if count >= gen_n:
+            break
+    return gen_seqs, gt_seqs, eov_fired, budget_hit, prompt_lens
+
+
+def pearson(xs, ys):
+    n = len(xs)
+    if n < 3:
+        return float("nan")
+    mx, my = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    vx = sum((x - mx) ** 2 for x in xs) ** 0.5
+    vy = sum((y - my) ** 2 for y in ys) ** 0.5
+    return cov / (vx * vy) if vx > 0 and vy > 0 else float("nan")
+
+
+def fmt(d, keys=None):
+    keys = keys or d.keys()
+    return "\n".join(f"| {k} | {d[k]:.4f} |" if isinstance(d[k], float) else f"| {k} | {d[k]} |"
+                     for k in keys)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--checkpoint_path", required=True)
+    ap.add_argument("--step", type=int, required=True)
+    ap.add_argument("--cache_dir", required=True, help="voice base dir (has /val)")
+    ap.add_argument("--codebook", required=True)
+    ap.add_argument("--config", default="small_sum")
+    ap.add_argument("--n", type=int, default=256, help="TF/ablation val utterances")
+    ap.add_argument("--bs", type=int, default=16, help="TF/ablation batch size (lower to avoid OOM "
+                    "when sharing a GPU with a training run)")
+    ap.add_argument("--gen_n", type=int, default=32, help="free-running generations")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--ngram_ceiling", type=float, default=0.211)
+    ap.add_argument("--asymptote", type=float, default=0.229)
+    ap.add_argument("--repeat", type=float, default=0.117)
+    ap.add_argument("--out_dir", default=None)
+    ap.add_argument("--voice_attn_alpha", type=float, default=None,
+                    help="Voice->voice attention scale to run the TF/ablation forward at, for a "
+                         "1:1 test with the training regime. Pass the curriculum alpha AT THIS "
+                         "STEP (0.0 during the NAR phase, the ramp value during 10k-30k, 1.0 "
+                         "post-ramp). Default None = 1.0 (full attention, the inference regime) — "
+                         "but during NAR that is OOD (the model never trained with history) and "
+                         "acc collapses, so it is NOT the model's real conditioning. Generation "
+                         "(section 3) always runs at alpha=1 (generate() has no alpha hook).")
+    ap.add_argument("--skip_generation", action="store_true",
+                    help="Skip the free-running generation section (always alpha=1, slow). Use for "
+                         "an alpha-sweep where only the TF/ablation numbers vary with alpha.")
+    a = ap.parse_args()
+
+    device = a.device
+    codebook = load_codebook(a.codebook)
+    K = int(codebook.shape[0])
+    args = build_args(a)
+
+    print(f"Loading {a.checkpoint_path} ...", flush=True)
+    model = load_world_model(args, device)
+    model.set_voice_codebook(codebook)
+    model.to(device).eval()
+
+    eval_dataset = load_dataset(args, "val")
+    collator = make_collator(K)
+    print(f"val: {len(eval_dataset)} | K={K}", flush=True)
+
+    alpha_label = ("1.0 (inference regime, full voice attention)" if a.voice_attn_alpha is None
+                   else f"{a.voice_attn_alpha} (1:1 with training at this step)")
+    print(f"1/3 teacher-forced + text ablation (voice_attn_alpha={alpha_label}) ...", flush=True)
+    tf = run_tf_and_ablation(model, eval_dataset, collator, device, a.n, K, bs=a.bs,
+                             voice_attn_alpha=a.voice_attn_alpha)
+    if not a.skip_generation:
+        print("2/3 free-running generation ...", flush=True)
+        gen, gt, eov_fired, budget_hit, prompt_lens = run_generation(model, eval_dataset, collator, device, a.gen_n, K)
+        print("3/3 degeneration stats ...", flush=True)
+        gen_deg = seq_degeneration(gen, K)
+        gt_deg = seq_degeneration(gt, K)
+    else:
+        print("(skipping generation — --skip_generation)", flush=True)
+
+    out_dir = a.out_dir or f"eval_output/world_ar_diag/step_{a.step}"
+    os.makedirs(out_dir, exist_ok=True)
+    lines = []
+    lines.append(f"# World voice-AR diagnostics — step {a.step}\n")
+    lines.append(f"checkpoint: `{a.checkpoint_path}`  |  val n(TF)={a.n}  gen_n={a.gen_n}  K={K}\n")
+    lines.append(f"TF/ablation voice_attn_alpha = **{alpha_label}**  |  generation always alpha=1.\n")
+
+    lines.append("## 1. Teacher-forced unit prediction (held-out) vs n-gram ceiling\n")
+    lines.append("| metric | value |\n|---|---|")
+    lines.append(f"| acc_real (content top-1) | {tf['acc_real']:.4f} |")
+    lines.append(f"| ppl_real | {tf['ppl_real']:.2f} |")
+    lines.append(f"| ce_real (nats) | {tf['ce_real']:.4f} |")
+    lines.append(f"| eov_position_acc | {tf['eov_acc']:.4f} |")
+    lines.append(f"| — n-gram ceiling (ref) | {a.ngram_ceiling:.4f} |")
+    lines.append(f"| — n-gram asymptote (ref) | {a.asymptote:.4f} |")
+    lines.append(f"| — repeat crutch (ref) | {a.repeat:.4f} |")
+    verdict = ("ABOVE asymptote — uses more than local statistics" if tf['acc_real'] > a.asymptote
+               else "ABOVE ceiling — likely using text/long-range" if tf['acc_real'] > a.ngram_ceiling
+               else "between crutch and ceiling — local-statistics regime" if tf['acc_real'] > a.repeat
+               else "at/below repeat crutch — not yet learned")
+    lines.append(f"\n**acc_real vs baselines: {verdict}.**\n")
+
+    lines.append("## 2. Text ablation (real vs shuffled transcript)\n")
+    lines.append("| metric | value |\n|---|---|")
+    lines.append(f"| acc_real (all positions) | {tf['acc_real']:.4f} |")
+    lines.append(f"| acc_shuffled_text (all) | {tf['acc_shuf']:.4f} |")
+    lines.append(f"| text_delta (all positions) | {tf['text_delta']:+.4f} |")
+    lines.append(f"| early_acc_real (first frames) | {tf['early_acc_real']:.4f} |")
+    lines.append(f"| early_acc_shuffled | {tf['early_acc_shuf']:.4f} |")
+    lines.append(f"| **early_text_delta (clean text signal)** | **{tf['early_text_delta']:+.4f}** |")
+    lines.append("\nAll-position delta is confounded: teacher-forced voice history is redundant "
+                 "with the text, so it understates text's role. The **early_text_delta** (first "
+                 f"frames, little/no voice history) is the clean signal.\n")
+    etd = tf['early_text_delta']
+    tv = ("text IS driving the early frames — conditioning works" if etd > 0.03
+          else "text near-ignored even where it's the ONLY signal — conditioning not engaged "
+               "(explains prompt-unrelated output)" if etd < 0.01
+          else "weak/partial text signal at utterance onset")
+    lines.append(f"**early_text_delta read: {tv}.**\n")
+
+    if a.skip_generation:
+        lines.append("## 3. Free-running generation — SKIPPED (--skip_generation)\n")
+        report = "\n".join(lines)
+        path = os.path.join(out_dir, "report.md")
+        with open(path, "w") as f:
+            f.write(report)
+        print("\n" + report)
+        return
+
+    lines.append("## 3. Free-running generation — degeneration vs ground truth\n")
+    lines.append(f"EOV fired: {eov_fired}/{gen_deg.get('n_seqs',0)}  |  budget-capped: {budget_hit}\n")
+    # Text-length -> generated-length correlation: does the model read the text to decide HOW
+    # LONG to speak? A high r means text drives DURATION (structural conditioning) even if
+    # content isn't aligned. GT r is the ceiling (how well real speech length tracks text length).
+    gen_lens = [len(s) for s in gen]
+    gt_lens = [len(s) for s in gt]
+    r_gen = pearson(prompt_lens, gen_lens)
+    r_gt = pearson(prompt_lens, gt_lens)
+    lines.append(f"**text-length → generated-length correlation: r={r_gen:+.3f}** "
+                 f"(GT ceiling r={r_gt:+.3f}). High r = text drives DURATION (structural "
+                 f"conditioning), independent of content alignment.\n")
+    lines.append("| metric | generated | ground-truth |\n|---|---|---|")
+    for k in ["len_mean", "len_min", "len_max", "adj_repeat_rate", "longest_run",
+              "distinct_units", "coverage", "unit_entropy_bits", "distinct_bigram_ratio",
+              "distinct_trigram_ratio"]:
+        g = gen_deg.get(k, float('nan')); r = gt_deg.get(k, float('nan'))
+        gs = f"{g:.4f}" if isinstance(g, float) else str(g)
+        rs = f"{r:.4f}" if isinstance(r, float) else str(r)
+        lines.append(f"| {k} | {gs} | {rs} |")
+    lines.append(f"\nmax unit entropy = {gen_deg.get('max_entropy_bits', 0):.2f} bits (log2 K).")
+    lines.append("Degeneration flags: adj_repeat_rate >> GT, longest_run large, low coverage,")
+    lines.append("entropy << GT, or distinct-bigram ratio << GT all indicate collapse/looping.\n")
+
+    report = "\n".join(lines)
+    path = os.path.join(out_dir, "report.md")
+    with open(path, "w") as f:
+        f.write(report)
+    print("\n" + report)
+    print(f"\nWrote {path}")
+
+
+if __name__ == "__main__":
+    main()

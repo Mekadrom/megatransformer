@@ -1,0 +1,23 @@
+[Unit]
+Description=Clamp all NVIDIA GPUs to 200W (PSU over-power / inrush-transient mitigation)
+# WHY: 4x 4090 at 450W puts PSU1 (Super Flower 1600W, which also carries the
+# CPU + all four cards' 75W slot power) at ~94% + transients -> OPP trips and
+# hard-cuts the box (crash 2026-07-17). 300W/card was NOT enough on its own —
+# the box still hard-cut at 300W (2026-07-18, 11h in, under a GPU-cycling
+# preprocessing load); -pl 200 is the level that has held. Lowered 300->200
+# 2026-07-19 so the limit PERSISTS across reboots (a manual `nvidia-smi -pl 200`
+# was silently reverted to 300 by this service on every boot). Do NOT raise
+# without a power-budget review + new PSUs. See scripts_local/ + crash telemetry.
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# persistence mode first (keeps clocks/limits pinned with no client attached);
+# leading '-' = ignore its failure so the power-limit still applies.
+ExecStart=-/usr/bin/nvidia-smi -pm 1
+ExecStart=/usr/bin/nvidia-smi -pl 200
+
+[Install]
+WantedBy=multi-user.target
