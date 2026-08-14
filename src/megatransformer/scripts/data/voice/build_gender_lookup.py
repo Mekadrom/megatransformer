@@ -240,29 +240,17 @@ def _scan_and_classify(
             continue
 
         # Audio decode (cost lives here).
+        from megatransformer.scripts.data.voice.preprocess import decode_audio
         audio_field = example.get(audio_column)
-        if not isinstance(audio_field, dict):
-            # Some dataset shapes return numpy array directly — skip these,
-            # we need the sampling rate to be guaranteed-correct.
+        # Audio(decode=False) yields the raw {"bytes","path"} struct; decode_audio does
+        # soundfile decode + soxr resample to target_sample_rate (mono float32), so the
+        # old sr-mismatch skip is gone — every utterance arrives at the right rate.
+        try:
+            arr = decode_audio(audio_field, target_sample_rate)
+        except Exception:
             continue
-        arr = audio_field.get("array")
-        sr = audio_field.get("sampling_rate", target_sample_rate)
-        if arr is None or len(arr) == 0:
+        if arr.shape[0] == 0:
             continue
-        if sr != target_sample_rate:
-            # Caller should have cast_column(Audio(sampling_rate=…)); warn
-            # and skip if not, since the feature extractor is sample-rate
-            # sensitive.
-            print(
-                f"  Skipping utterance with sr={sr} != target {target_sample_rate}. "
-                "Cast your dataset via Audio(sampling_rate=target_sample_rate).",
-                file=sys.stderr,
-            )
-            continue
-
-        arr = np.asarray(arr, dtype=np.float32)
-        if arr.ndim > 1:
-            arr = arr.mean(axis=0)  # mono
         if arr.shape[0] > max_audio_samples:
             arr = arr[:max_audio_samples]
 
@@ -478,7 +466,9 @@ def main() -> None:
         split=args.split,
         streaming=args.streaming,
     )
-    ds = ds.cast_column(args.audio_column, Audio(sampling_rate=args.target_sample_rate))
+    # decode=False + soundfile/soxr decode in _scan_and_classify (datasets 5.x Audio decode
+    # needs torchcodec, ABI-incompatible with torch 2.6). See preprocess.decode_audio.
+    ds = ds.cast_column(args.audio_column, Audio(decode=False))
 
     # ---- 3. Stream-scan + classify in one pass (bounded memory) ----
     votes_per_speaker = _scan_and_classify(

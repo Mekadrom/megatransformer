@@ -1,7 +1,11 @@
 
 import argparse
+import io
 import os
 import re
+import numpy as np
+import soundfile as sf
+import soxr
 import torch
 import torch.nn.functional as F
 import traceback
@@ -93,6 +97,29 @@ def _parse_speakers_txt(path: str) -> Dict[str, int]:
             if gender_int != -1:
                 lookup[speaker_id_str] = gender_int
     return lookup
+
+
+def decode_audio(raw, target_sr: int) -> np.ndarray:
+    """Decode an HF audio value to a mono float32 waveform at target_sr.
+
+    Deliberately does NOT use datasets' `Audio` feature decode: datasets 5.x routes
+    that through `torchcodec`, which needs a new-cxx11-ABI torch (incompatible with the
+    project's torch 2.6 cu124 wheel). Instead we load the column with `Audio(decode=False)`
+    — which yields the raw {"bytes", "path"} struct — and decode it here with soundfile,
+    resampling with soxr (the same resampler datasets uses), so behavior matches the old
+    `Audio(sampling_rate=...)` path. `raw` may be that struct or a plain path string.
+    """
+    if isinstance(raw, dict):
+        data = raw.get("bytes")
+        wav, sr = (sf.read(io.BytesIO(data), dtype="float32", always_2d=False) if data is not None
+                   else sf.read(raw["path"], dtype="float32", always_2d=False))
+    else:
+        wav, sr = sf.read(raw, dtype="float32", always_2d=False)
+    if wav.ndim > 1:                      # stereo/multichannel -> mono
+        wav = wav.mean(axis=1)
+    if sr != target_sr:
+        wav = soxr.resample(wav, sr, target_sr)
+    return np.ascontiguousarray(wav, dtype=np.float32)
 
 
 def normalize_transcript(text: str) -> str:
@@ -610,7 +637,10 @@ class VoiceDatasetPreprocessor(Preprocessor):
 
         self.voice_max_frames = (args.voice_max_seconds * args.sample_rate) // args.hop_length
 
-        self.dataset = self.dataset.cast_column("audio", Audio(sampling_rate=args.sample_rate))
+        # decode=False: hand back the raw {"bytes", "path"} struct instead of letting
+        # datasets 5.x decode via torchcodec (ABI-incompatible with torch 2.6). Resampling
+        # to args.sample_rate happens in decode_audio() at read time via soxr.
+        self.dataset = self.dataset.cast_column(args.audio_column, Audio(decode=False))
         try:
             print(f"  Total samples in dataset: {len(self.dataset):,}")
         except TypeError:
@@ -1399,10 +1429,12 @@ class VoiceDatasetPreprocessor(Preprocessor):
             self.batch_accumulators['batch_conditions'] = []
     
     def preprocess_example(self, example) -> bool:
-        # Extract fields
-        audio = example[self.args.audio_column]
-
-        waveform = torch.tensor(audio["array"], dtype=torch.float32)
+        # Extract fields. The audio column is Audio(decode=False) (raw {"bytes","path"});
+        # decode_audio() does soundfile decode + soxr resample to args.sample_rate.
+        waveform = torch.tensor(
+            decode_audio(example[self.args.audio_column], self.args.sample_rate),
+            dtype=torch.float32,
+        )
 
         # Skip samples shorter than the STFT window. torch.stft pads by
         # n_fft/2 on each side and asserts pad < input_length, so an n_fft
