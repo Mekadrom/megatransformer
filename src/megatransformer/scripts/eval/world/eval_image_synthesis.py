@@ -117,7 +117,11 @@ def decode_latent_to_pixels(decoder, latent, device):
             pixels = out.sample if hasattr(out, 'sample') else out
         else:
             pixels = decoder(z)
-        return pixels[0].float().clamp(0, 1).cpu()
+        # LiteVAE (and VAEs trained on [-1,1]-normalized images) decode to [-1,1];
+        # de-normalize with the canonical (x+1)/2 before display/metrics. A bare
+        # clamp(0,1) crushes the entire dark half to black -> darkened, contrast-
+        # boosted images and skewed FID/CLIPScore. Matches the training viz callback.
+        return ((pixels[0].float() + 1.0) / 2.0).clamp(0, 1).cpu()
 
 
 def encode_static_prompt(text, suffix_tokens, tokenizer, max_new_tokens, max_seq_len, device):
