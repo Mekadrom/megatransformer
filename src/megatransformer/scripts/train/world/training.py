@@ -154,6 +154,19 @@ class WorldModelTrainer(CommonTrainer):
         # get this LR instead of args.learning_rate. Useful when the DiT path
         # is the destabilizing module and a lower LR keeps training on-rails.
         lr_dit: Optional[float] = None,
+        # Differential LR schedule (opt-in): give the DiT param group a different
+        # LR *schedule* from the trunk/main group. HF's single scheduler otherwise
+        # applies the SAME decay curve to every group, so a cosine --lr_scheduler_type
+        # silently decays the DiT too. With this on (requires lr_dit set), the DiT
+        # follows `lr_dit_schedule` and everything else follows `lr_trunk_schedule`.
+        # Grounding: diffusion/flow-matching heads (DiT, SD3, Flux) train best at a
+        # flat LR; a settling trunk (cosine/WSD tail) under a constant DiT removes the
+        # documented DiT-adaptation spikes (trunk shifts destabilize the DiT).
+        differential_lr_schedule: bool = False,
+        lr_dit_schedule: str = "constant",      # constant | cosine | wsd
+        lr_trunk_schedule: str = "cosine",      # cosine | wsd | constant
+        lr_min_ratio: float = 0.1,              # LR floor as a fraction of base (cosine/wsd)
+        lr_wsd_decay_frac: float = 0.2,         # fraction of total steps in the WSD decay tail
         # If True, skip text loss in image_synthesis / voice_synthesis batches
         # where text is conditioning rather than target. Default False for
         # backward compatibility with existing runs. Standard practice in
@@ -175,6 +188,11 @@ class WorldModelTrainer(CommonTrainer):
         super().__init__(*args, **kwargs)
 
         self.lr_dit = lr_dit
+        self.differential_lr_schedule = differential_lr_schedule
+        self.lr_dit_schedule = lr_dit_schedule
+        self.lr_trunk_schedule = lr_trunk_schedule
+        self.lr_min_ratio = lr_min_ratio
+        self.lr_wsd_decay_frac = lr_wsd_decay_frac
         self.mask_text_loss_in_synthesis = mask_text_loss_in_synthesis
         self.shard_aware_sampler = shard_aware_sampler
         self.bucket_by_length = bucket_by_length
@@ -1543,7 +1561,11 @@ class WorldModelTrainer(CommonTrainer):
             )
             groups[key]["params"].append(p)
 
-        optimizer_grouped_parameters = [g for g in groups.values() if g["params"]]
+        group_items = [(name, g) for name, g in groups.items() if g["params"]]
+        optimizer_grouped_parameters = [g for _, g in group_items]
+        # Parallel tags aligned to optimizer.param_groups order, so create_scheduler
+        # can hand each group its own LR-schedule lambda (DiT vs trunk/main).
+        self._lr_group_tags = ["dit" if name.startswith("dit") else "main" for name, _ in group_items]
 
         optimizer_cls, optimizer_kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(self.args, opt_model)
         # The 'lr' baked into each group takes precedence, but optimizer_kwargs
@@ -1561,6 +1583,82 @@ class WorldModelTrainer(CommonTrainer):
             )
 
         return self.optimizer
+
+    def _build_lr_lambda(self, schedule: str, warmup: int, total: int):
+        """Return a step->multiplier fn (relative to the group's base LR). All
+        schedules share a linear 0->1 warmup; after warmup:
+          constant : flat 1.0 (the diffusion/flow-matching default; use for the DiT)
+          cosine   : 1.0 -> min_ratio over the remaining steps
+          wsd      : flat 1.0 until the final `lr_wsd_decay_frac` of steps, then a
+                     cosine decay 1.0 -> min_ratio (stable target for most of the run,
+                     one short anneal at the end)
+        """
+        min_ratio = float(self.lr_min_ratio)
+        decay_frac = min(max(float(self.lr_wsd_decay_frac), 1e-6), 1.0)
+
+        def lam(step: int) -> float:
+            if warmup > 0 and step < warmup:
+                return step / max(1, warmup)
+            p = min(1.0, max(0.0, (step - warmup) / max(1, total - warmup)))  # post-warmup progress
+            if schedule == "constant":
+                return 1.0
+            if schedule == "cosine":
+                return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * p))
+            if schedule == "wsd":
+                stable = 1.0 - decay_frac
+                if p <= stable:
+                    return 1.0
+                q = (p - stable) / decay_frac  # 0->1 across the decay tail
+                return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * q))
+            return 1.0
+
+        return lam
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        """Give the DiT and trunk param groups DISTINCT LR schedules.
+
+        Default (differential_lr_schedule=False) delegates to HF, whose single
+        scheduler multiplies every param group by the SAME curve — so a cosine
+        --lr_scheduler_type would decay the DiT along with the trunk. When enabled
+        (and lr_dit is set, so the 4-group split exists), we build one LambdaLR
+        with a per-group lambda list: DiT groups follow `lr_dit_schedule`, all
+        other groups follow `lr_trunk_schedule`.
+        """
+        if not self.differential_lr_schedule or self.lr_dit is None:
+            return super().create_scheduler(num_training_steps, optimizer)
+        if self.lr_scheduler is not None:
+            return self.lr_scheduler
+
+        optimizer = optimizer if optimizer is not None else self.optimizer
+        tags = getattr(self, "_lr_group_tags", None)
+        if tags is None or len(tags) != len(optimizer.param_groups):
+            print("[create_scheduler] WARNING: group tags missing/misaligned; "
+                  "falling back to HF single-curve scheduler.")
+            return super().create_scheduler(num_training_steps, optimizer)
+        if self.is_deepspeed_enabled:
+            # DeepSpeed builds/owns its own scheduler when ds_config has a
+            # "scheduler" block, which would override this. Warn loudly.
+            print("[create_scheduler] WARNING: DeepSpeed is enabled — a 'scheduler' "
+                  "block in the ds_config will OVERRIDE this per-group schedule. "
+                  "Remove it (let HF drive the scheduler) or verify LR curves in TB.")
+
+        from torch.optim.lr_scheduler import LambdaLR
+        warmup = self.args.get_warmup_steps(num_training_steps)
+        dit_lam = self._build_lr_lambda(self.lr_dit_schedule, warmup, num_training_steps)
+        trunk_lam = self._build_lr_lambda(self.lr_trunk_schedule, warmup, num_training_steps)
+        lambdas = [dit_lam if t == "dit" else trunk_lam for t in tags]
+        self.lr_scheduler = LambdaLR(optimizer, lambdas)
+
+        if self.args.local_rank in (-1, 0):
+            n_dit = sum(1 for t in tags if t == "dit")
+            print(
+                f"[create_scheduler] differential LR schedule:\n"
+                f"  DiT groups   ({n_dit}): schedule={self.lr_dit_schedule} @ base lr={self.lr_dit}\n"
+                f"  trunk groups ({len(tags) - n_dit}): schedule={self.lr_trunk_schedule} @ base lr={self.args.learning_rate}\n"
+                f"  warmup={warmup}, total_steps={num_training_steps}, "
+                f"min_ratio={self.lr_min_ratio}, wsd_decay_frac={self.lr_wsd_decay_frac}"
+            )
+        return self.lr_scheduler
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Override to capture gradient norms between backward and optimizer step."""
@@ -2020,6 +2118,11 @@ def create_trainer(
         precomputed_latents=args.precomputed_latents,
         text_label_smoothing=args.text_label_smoothing,
         lr_dit=getattr(args, 'lr_dit', None),
+        differential_lr_schedule=getattr(args, 'differential_lr_schedule', False),
+        lr_dit_schedule=getattr(args, 'lr_dit_schedule', 'constant'),
+        lr_trunk_schedule=getattr(args, 'lr_trunk_schedule', 'cosine'),
+        lr_min_ratio=getattr(args, 'lr_min_ratio', 0.1),
+        lr_wsd_decay_frac=getattr(args, 'lr_wsd_decay_frac', 0.2),
         mask_text_loss_in_synthesis=getattr(args, 'mask_text_loss_in_synthesis', False),
         shard_aware_sampler=getattr(args, 'shard_aware_sampler', True),
         bucket_by_length=getattr(args, 'bucket_by_length', False),
@@ -2168,6 +2271,29 @@ def add_cli_args(subparsers):
                                  "If set, DiT params get this LR while everything else uses --learning_rate. "
                                  "Use to tame the DiT when it's the destabilizing module. "
                                  "Ignored when --use_muon is set (Muon has its own LR split).")
+
+    # Differential LR *schedule* for the DiT vs the trunk (requires --lr_dit).
+    # Without this, HF's single scheduler applies the SAME decay curve to every
+    # group, so a cosine --lr_scheduler_type silently decays the DiT too.
+    sub_parser.add_argument("--differential_lr_schedule", action="store_true", default=False,
+                            help="Give the DiT param group a different LR SCHEDULE from the trunk. "
+                                 "Requires --lr_dit (the 4-group split). DiT follows --lr_dit_schedule, "
+                                 "everything else follows --lr_trunk_schedule. No-op under --use_muon.")
+    sub_parser.add_argument("--lr_dit_schedule", type=str, default="constant",
+                            choices=["constant", "cosine", "wsd"],
+                            help="LR schedule for the DiT group when --differential_lr_schedule is set. "
+                                 "Default 'constant' — diffusion/flow-matching heads (DiT/SD3/Flux) train "
+                                 "best at a flat LR. All schedules share the --warmup_steps/--warmup_ratio warmup.")
+    sub_parser.add_argument("--lr_trunk_schedule", type=str, default="cosine",
+                            choices=["cosine", "wsd", "constant"],
+                            help="LR schedule for the trunk/main group when --differential_lr_schedule is set. "
+                                 "'wsd' (warmup-stable-decay) holds a flat LR then anneals only in the final "
+                                 "--lr_wsd_decay_frac of steps — gives the DiT a stable conditioning target for "
+                                 "most of the run, then one short trunk anneal.")
+    sub_parser.add_argument("--lr_min_ratio", type=float, default=0.1,
+                            help="LR floor as a fraction of base LR for cosine/wsd decay (default 0.1).")
+    sub_parser.add_argument("--lr_wsd_decay_frac", type=float, default=0.2,
+                            help="Fraction of total steps spent in the WSD decay tail (default 0.2).")
 
     # DiT loss-weighting override (only applies to DiffusionBridgeImageDecoder)
     sub_parser.add_argument("--min_snr_gamma", type=float, default=None,
