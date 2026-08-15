@@ -25,11 +25,36 @@ class TextCodaClassifierWithLoss(nn.Module):
     The architecture uses a residual connection around the coda transformer.
     """
 
-    def __init__(self, config: TextCodaClassifierConfig):
+    def __init__(self, config: TextCodaClassifierConfig, text_encoder: Optional[dict] = None):
         super(TextCodaClassifierWithLoss, self).__init__()
 
         self.config = config
         coda_config = config.coda_config
+        self.loss_fn = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
+
+        # PRETRAINED-LLM MODE (opt-in). Replace {transformer coda + lm_head} with a small
+        # residual-MLP translator (trunk d_model -> LLM d_model) + the pretrained LM head. The
+        # coda is STATELESS here (no self-attention/KV cache); forward signature is preserved.
+        self._pretrained = text_encoder is not None
+        if self._pretrained:
+            from transformers import AutoModelForCausalLM
+            llm = AutoModelForCausalLM.from_pretrained(text_encoder["model"], dtype=torch.float32)
+            tgt_vocab = text_encoder.get("vocab_size", None)
+            if tgt_vocab and tgt_vocab != llm.config.vocab_size:
+                llm.resize_token_embeddings(tgt_vocab)
+            self.lm_head = llm.get_output_embeddings()  # keep only the head; body is GC'd
+            if text_encoder.get("freeze", True):
+                for p in self.lm_head.parameters():
+                    p.requires_grad = False
+            llm_d = llm.config.hidden_size
+            trunk_d = coda_config.d_model
+            hidden = max(1, int(trunk_d * text_encoder.get("translator_hidden_mult", 2.0)))
+            self.out_translator_norm = create_norm(trunk_d, config.input_norm_type, config.norm_epsilon)
+            self.out_translator = nn.Sequential(
+                nn.Linear(trunk_d, hidden), nn.GELU(), nn.Linear(hidden, llm_d))
+            del llm
+            self.gradient_checkpointing = False
+            return
 
         if config.use_input_norm:
             self.input_norm = create_norm(coda_config.d_model, config.input_norm_type, config.norm_epsilon)
@@ -40,7 +65,6 @@ class TextCodaClassifierWithLoss(nn.Module):
         ])
 
         self.lm_head = nn.Linear(coda_config.d_model, config.vocab_size)
-        self.loss_fn = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
 
         self.gradient_checkpointing = False
         self._init_weights()
@@ -74,6 +98,22 @@ class TextCodaClassifierWithLoss(nn.Module):
         Returns:
             dict with "logits" and optionally "text_classification_loss" and "kv_caches".
         """
+        if self._pretrained:
+            # Stateless: residual-MLP translator (trunk d_model -> LLM d_model) then the
+            # pretrained LM head. No coda self-attention -> kv_caches passes through untouched.
+            h = self.out_translator(self.out_translator_norm(x))
+            logits = self.lm_head(h.to(self.lm_head.weight.dtype))
+            cap = getattr(self.config, 'lm_head_logit_cap', None)
+            if cap is not None:
+                logits = cap * torch.tanh(logits / cap)
+            output = {"logits": logits}
+            if use_cache:
+                output["kv_caches"] = kv_caches
+            if targets is not None:
+                B, T, V = logits.size()
+                output["text_classification_loss"] = self.loss_fn(
+                    logits.view(B * T, V), targets.view(B * T))
+            return output
 
         if hasattr(self, 'input_norm'):
             x = self.input_norm(x)

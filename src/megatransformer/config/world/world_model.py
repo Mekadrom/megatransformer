@@ -126,6 +126,16 @@ class MegaTransformerWorldModelConfig:
     # anywhere. Only meaningful when voice_gen_query_mode is set.
     voice_gen_query_coda_prev: bool = True
 
+    # SINGLE GATE for the pretrained-LLM text encoder. None (default) => the from-scratch
+    # {wte + prelude transformer} path, byte-identical to current behavior. A dict opts in:
+    #   {"model": "HuggingFaceTB/SmolLM2-135M", "freeze": True,
+    #    "translator_hidden_mult": 2.0, "vocab_size": None}
+    # When set, the text prelude wraps the pretrained LLM body (+ input projection + MLP
+    # translator) and the text coda becomes (MLP translator + the pretrained LM head). The
+    # LLM owns the vocab/tokenizer; "vocab_size" optionally resizes its embed/head to fit
+    # added special tokens. Gated so non-users have zero extra params and load unchanged.
+    text_encoder: Optional[dict] = None
+
     # Feature extractor configs
     text_prelude_config: TextPreludeFeatureExtractorConfig = dataclasses.field(
         default_factory=TextPreludeFeatureExtractorConfig

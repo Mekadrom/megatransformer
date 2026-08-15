@@ -60,8 +60,11 @@ class MegaTransformerWorldModel(nn.Module):
         self.config = config
         self.include_modes = set(config.include_modes)
 
-        # Feature extractors — text is always required
-        self.text_feature_extractor = TextPreludeFeatureExtractor(config.text_prelude_config)
+        # Feature extractors — text is always required. text_encoder (single gate, default None)
+        # swaps the from-scratch prelude for a pretrained-LLM body + translator; None is unchanged.
+        _text_encoder = getattr(config, "text_encoder", None)
+        self.text_feature_extractor = TextPreludeFeatureExtractor(
+            config.text_prelude_config, text_encoder=_text_encoder)
 
         # Classifier-free guidance: a learned "null text" embedding that replaces the text
         # hidden states on dropped SYNTHESIS examples during training, so the model also learns
@@ -101,7 +104,8 @@ class MegaTransformerWorldModel(nn.Module):
         self.recurrent_block = MegatransformerRecurrentBlock(config.recurrent_block_config)
 
         # Generators/codas — text is always required
-        self.text_generator = TextCodaClassifierWithLoss(config.text_coda_config)
+        self.text_generator = TextCodaClassifierWithLoss(
+            config.text_coda_config, text_encoder=_text_encoder)
 
         self.audio_generator = (
             AudioCodaWithLoss("audio", config.audio_coda_config)
@@ -190,8 +194,9 @@ class MegaTransformerWorldModel(nn.Module):
         # the injected input x_0 matches the thought state initialization variance.
         self.embed_scale = math.sqrt(config.text_prelude_config.d_model) if config.scale_embeddings else 1.0
 
-        # Weight tying: share embedding matrix between input and output
-        if getattr(config, 'tie_word_embeddings', False):
+        # Weight tying: share embedding matrix between input and output. Skipped in pretrained-
+        # LLM mode: there is no `wte` (the LLM owns its embeddings, already tied internally).
+        if getattr(config, 'tie_word_embeddings', False) and _text_encoder is None:
             self.text_generator.lm_head.weight = self.text_feature_extractor.wte.weight
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):

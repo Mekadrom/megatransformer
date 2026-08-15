@@ -28,11 +28,39 @@ class TextPreludeFeatureExtractor(nn.Module):
     The embedding includes optional layer normalization and dropout for regularization.
     """
 
-    def __init__(self, config: TextPreludeFeatureExtractorConfig):
+    def __init__(self, config: TextPreludeFeatureExtractorConfig, text_encoder: Optional[dict] = None):
         super().__init__()
 
         self.config = config
         prelude_config = config.prelude_config
+
+        # PRETRAINED-LLM MODE (opt-in). The from-scratch {wte + prelude} below is replaced by a
+        # pretrained causal LM body + an input projection (LLM d_model -> trunk d_model) + a
+        # small residual-MLP translator. The forward signature is preserved, so world_model.py
+        # is unchanged; the LLM's HF KV cache rides through the same kv_caches slot.
+        self._pretrained = text_encoder is not None
+        if self._pretrained:
+            from transformers import AutoModel
+            from megatransformer.model.norms import create_norm as _cn
+            # fp32 at init to match the rest of the model; --bf16 autocast handles training.
+            llm = AutoModel.from_pretrained(text_encoder["model"], dtype=torch.float32)
+            tgt_vocab = text_encoder.get("vocab_size", None)
+            if tgt_vocab and tgt_vocab != llm.config.vocab_size:
+                llm.resize_token_embeddings(tgt_vocab)  # room for added special tokens
+            if text_encoder.get("freeze", True):
+                for p in llm.parameters():
+                    p.requires_grad = False
+                llm.eval()
+            self.llm_body = llm
+            llm_d = llm.config.hidden_size
+            trunk_d = config.d_model
+            hidden = max(1, int(trunk_d * text_encoder.get("translator_hidden_mult", 2.0)))
+            self.input_proj = nn.Linear(llm_d, trunk_d)
+            self.translator_norm = _cn(trunk_d, config.output_norm_type, config.norm_epsilon)
+            self.translator = nn.Sequential(
+                nn.Linear(trunk_d, hidden), nn.GELU(), nn.Linear(hidden, trunk_d))
+            self.gradient_checkpointing = False
+            return
 
         self.wte = nn.Embedding(config.vocab_size, config.d_model)
 
@@ -88,6 +116,18 @@ class TextPreludeFeatureExtractor(nn.Module):
             Hidden states of shape (batch_size, seq_len, d_model).
             If use_cache=True, returns (hidden_states, new_kv_caches) tuple.
         """
+        if self._pretrained:
+            # LLM body handles positions/causality internally via its HF cache; position_offset
+            # is ignored (the cache length determines the position). kv_caches carries the HF
+            # Cache object opaquely, which world_model.py threads back unchanged.
+            out = self.llm_body(input_ids=input_ids, past_key_values=kv_caches, use_cache=use_cache)
+            # cast to the translator's dtype (handles a bf16 LLM output vs fp32 proj, and autocast)
+            h = self.input_proj(out.last_hidden_state.to(self.input_proj.weight.dtype))
+            h = h + self.translator(self.translator_norm(h))
+            if use_cache:
+                return h, out.past_key_values
+            return h
+
         projected = self.wte(input_ids)
 
         if hasattr(self, 'pos_encoding'):

@@ -1887,6 +1887,15 @@ def load_model(args, device='cuda'):
             config.voice_prelude_config.prenet_dropout = args.voice_prenet_dropout
         if getattr(args, 'voice_cfg_text_dropout_prob', 0.0) > 0.0:
             config.voice_cfg_enabled = True  # create the null_text_embed param (CFG)
+        if getattr(args, 'text_encoder_model', None):
+            # Single gate: swap the from-scratch text prelude/coda for a pretrained LLM body +
+            # translators + the LLM's LM head. None (default) leaves the model byte-identical.
+            config.text_encoder = {
+                "model": args.text_encoder_model,
+                "freeze": not getattr(args, 'text_encoder_unfreeze', False),
+                "translator_hidden_mult": getattr(args, 'text_encoder_translator_mult', 2.0),
+                "vocab_size": getattr(args, 'text_encoder_vocab_size', None),
+            }
         if getattr(args, 'voice_gen_query_mode', None):
             # Gen-query voice synthesis: creates voice_gen_queries + voice_coda_prev_proj
             # params (world_model.py __init__). Removes the AR crutch from the shared trunk.
@@ -2497,6 +2506,22 @@ def add_cli_args(subparsers):
                                  "flag the coda sees ONLY the text-driven trunk output, so there is "
                                  "no neighbor-extrapolation crutch anywhere. Pair with "
                                  "--voice_coda_type mlp for the truly crutch-free path.")
+    sub_parser.add_argument("--text_encoder_model", type=str, default=None,
+                            help="SINGLE GATE for the pretrained-LLM text path. An HF model id "
+                                 "(e.g. HuggingFaceTB/SmolLM2-135M) swaps the from-scratch text "
+                                 "prelude/coda for that LLM's body (encoder) + MLP translators + "
+                                 "its LM head. None (default) = current from-scratch path, byte-"
+                                 "identical. NOTE: the LLM owns its tokenizer, so text data must be "
+                                 "re-tokenized with it (fold into the clean-data re-preprocess).")
+    sub_parser.add_argument("--text_encoder_unfreeze", action="store_true",
+                            help="Fine-tune the pretrained LLM (default: frozen). Use a low LR; "
+                                 "differential-LR wiring is a follow-up -- frozen is the tested path.")
+    sub_parser.add_argument("--text_encoder_translator_mult", type=float, default=2.0,
+                            help="Hidden width multiple for the prelude/coda MLP translators "
+                                 "(hidden = trunk_d_model * mult).")
+    sub_parser.add_argument("--text_encoder_vocab_size", type=int, default=None,
+                            help="Resize the LLM embed/head to this vocab (to fit added special "
+                                 "tokens, e.g. BOV/EOV/placeholders). None = the LLM's native vocab.")
     sub_parser.add_argument("--voice_coda_type", type=str, default=None,
                             choices=["transformer", "mlp"],
                             help="Voice coda body: 'transformer' (causal self-attention stack, "
