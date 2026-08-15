@@ -398,18 +398,25 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         # Load VAE encoder
         self.vae_encoder = None
         self._encode_fn = None
-        # Generation-only (SDXL-out) datasets: during image SYNTHESIS the world model
-        # replaces the image latents with learned gen queries, so it never reads them.
-        # --skip_vae stores captions + tokens + a dummy latent SHAPE only (no VAE load,
-        # no image decode, no GPU); the world dataset synthesizes zeros of that shape on
-        # read. Shape mirrors a LiteVAE f8/12ch encode so it's drop-in for the prelude.
-        self._skip_vae = bool(getattr(args, "skip_vae", False))
+        # Image storage mode, selected by --vae_config:
+        #   none (default) => lean: captions + tokens + a dummy latent SHAPE only. During
+        #     image SYNTHESIS the world model replaces image latents with learned gen
+        #     queries, so it never reads them; the world dataset synthesizes zeros of this
+        #     shape on read (drop-in for the prelude — mirrors a LiteVAE f8/12ch encode).
+        #     No VAE load, no image decode, no GPU.
+        #   raw     => raw image pixel tensors (e.g. training an image VAE from pixels).
+        #   litevae => pretrained LiteVAE latents (input/transcription arm).
+        #   <name>  => an internal VAE config (with --vae_checkpoint_path).
+        vc = args.vae_config
         self._dummy_latent_shape = (12, args.image_size // 8, args.image_size // 8)
+        self._skip_vae = vc in (None, "none", "skip")
 
         if self._skip_vae:
-            print(f"  --skip_vae: captions+tokens only, dummy latent shape {self._dummy_latent_shape} "
-                  f"(no VAE, no image decode, no GPU)")
-        elif args.vae_config in PRETRAINED_IMAGE_VAES:
+            print(f"  vae_config=none (lean): captions+tokens only, dummy latent shape "
+                  f"{self._dummy_latent_shape} (no VAE, no image decode, no GPU)")
+        elif vc == "raw":
+            print("  vae_config=raw: storing raw image pixel tensors (no VAE)")
+        elif vc in PRETRAINED_IMAGE_VAES:
             # Pretrained external VAE (e.g. LiteVAE)
             print(f"Loading pretrained image VAE: {args.vae_config}...")
             litevae_model = _load_litevae(args.vae_config, device=device)
@@ -447,7 +454,9 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
             self._encode_fn = _internal_encode
 
         else:
-            print("No VAE checkpoint specified - will save raw images as tensors")
+            raise ValueError(
+                f"unknown --vae_config '{vc}'. Use: none (lean, default) | raw | litevae | "
+                f"an internal VAE config name together with --vae_checkpoint_path.")
 
         self.image_size = (args.image_size, args.image_size)
         print(f"  Image size: {self.image_size}")
@@ -491,14 +500,19 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
 
     @classmethod
     def add_cli_args(cls, subparsers):
-        sub_parser = subparsers.add_parser("image-vae", help="Preprocess image dataset for VAE training")
+        sub_parser = subparsers.add_parser("image", help="Preprocess an image dataset (latents / raw pixels / captions-only)")
 
         # VAE model — set --vae_config to "litevae" for pretrained LiteVAE
         # (auto-downloads from HuggingFace), or an internal config name with --vae_checkpoint_path.
         sub_parser.add_argument("--vae_checkpoint_path", type=str, default=None,
                                 help="Path to internal VAE checkpoint (not needed for pretrained VAEs)")
-        sub_parser.add_argument("--vae_config", type=str, default="default",
-                                help="VAE config name, or 'litevae' for pretrained LiteVAE (auto-downloaded)")
+        sub_parser.add_argument("--vae_config", type=str, default="none",
+                                help="Image storage mode / VAE selector:\n"
+                                     "  none (default) = captions + tokens + a dummy latent SHAPE only "
+                                     "(generation-only world training; no VAE, no image decode, no GPU);\n"
+                                     "  raw            = raw image pixel tensors (e.g. training an image VAE);\n"
+                                     "  litevae        = pretrained LiteVAE latents (auto-downloaded; input/transcription arm);\n"
+                                     "  <name>         = an internal VAE config (with --vae_checkpoint_path).")
 
         # Image settings
         sub_parser.add_argument("--image_size", type=int, default=256,
@@ -523,11 +537,6 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         # Filtering
         sub_parser.add_argument("--min_image_size", type=int, default=64,
                                 help="Minimum image dimension (skip smaller images)")
-        sub_parser.add_argument("--skip_vae", action="store_true", default=False,
-                                help="Generation-only (SDXL-out) mode: store captions + tokens + a dummy "
-                                     "latent SHAPE only — no VAE, no image decode, no GPU. The world model "
-                                     "replaces image latents with gen queries during synthesis, so it never "
-                                     "reads them; the dataset synthesizes zeros on read. Requires --text_column.")
         sub_parser.add_argument("--skip_grayscale", action="store_true", default=False,
                                 help="Skip grayscale images")
         sub_parser.add_argument("--exclude_uids", type=str, default=None,

@@ -11,7 +11,6 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from megatransformer.scripts.data.voice.preprocess import VoiceDatasetPreprocessor
-from megatransformer.scripts.data.image.preprocess import ImageDatasetPreprocessor
 from megatransformer.scripts.data.image.vae.preprocess import ImageVAEDatasetPreprocessor
 from megatransformer.scripts.data.text.preprocess import TextDatasetPreprocessor
 from megatransformer.scripts.data.preprocessor import Preprocessor
@@ -19,7 +18,6 @@ from megatransformer.scripts.data.preprocessor import Preprocessor
 
 preprocessor_clss: list[type[Preprocessor]] = [
     VoiceDatasetPreprocessor,
-    ImageDatasetPreprocessor,
     ImageVAEDatasetPreprocessor,
     TextDatasetPreprocessor,
 ]
@@ -195,13 +193,11 @@ def get_preprocessor(command: str, args, dataset, output_dir, shard_fields, batc
     if command == "voice":
         return VoiceDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     elif command == "image":
-        return ImageDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
-    elif command == "image-vae":
         return ImageVAEDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     elif command == "text":
         return TextDatasetPreprocessor(args, dataset, output_dir, shard_fields, batch_accumulators, stats, device=device)
     else:
-        raise ValueError(f"Unknown command: {command}. Available: voice, image, image-vae, text")
+        raise ValueError(f"Unknown command: {command}. Available: voice, image, text")
 
 
 def main():
@@ -448,13 +444,6 @@ def main():
     print(f"  Time: {elapsed/60:.1f} minutes")
     print(f"  Speed: {stats['saved']/elapsed:.1f} samples/sec")
 
-    # Image preprocessing: surface the download failure breakdown so 100%-fail
-    # runs don't look like a mystery ("all 420k skipped as download_failed").
-    try:
-        from megatransformer.scripts.data.image.preprocess import print_download_error_summary
-        print_download_error_summary()
-    except ImportError:
-        pass
     print(f"  Shards: {shard_fields['shard_idx']}")
     print(f"  Output: {output_dir}")
 
