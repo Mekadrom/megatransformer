@@ -1194,9 +1194,17 @@ class WorldModelTrainer(CommonTrainer):
         model = self.model
         groups = {}
 
-        # Text embedding
-        groups["text_embedding"] = model.text_feature_extractor
-        groups["text_embedding/wte"] = model.text_feature_extractor.wte
+        # Text prelude. From-scratch mode has a wte + prelude blocks; pretrained-LLM mode has a
+        # frozen body plus the trainable extension (special_embed) + input_proj + translator MLP.
+        tfe = model.text_feature_extractor
+        groups["text_embedding"] = tfe
+        if hasattr(tfe, 'wte'):
+            groups["text_embedding/wte"] = tfe.wte
+        for attr, tag in [("special_embed", "text_prelude/special_embed"),
+                          ("input_proj", "text_prelude/input_proj"),
+                          ("translator", "text_prelude/translator")]:
+            if hasattr(tfe, attr) and getattr(tfe, attr) is not None:
+                groups[tag] = getattr(tfe, attr)
 
         # Preludes: coarse + per-layer
         for prefix, extractor in [
@@ -1243,8 +1251,13 @@ class WorldModelTrainer(CommonTrainer):
                         groups[f"{prefix}/layer{i}/attn"] = block.self_attn
                     if hasattr(block, 'ffn'):
                         groups[f"{prefix}/layer{i}/ffn"] = block.ffn
-            if hasattr(generator, 'lm_head'):
+            if getattr(generator, 'lm_head', None) is not None:
                 groups[f"{prefix}/lm_head"] = generator.lm_head
+            # Pretrained-LLM text coda: trainable translator + control-token head.
+            if hasattr(generator, 'out_translator'):
+                groups[f"{prefix}/out_translator"] = generator.out_translator
+            if getattr(generator, 'special_head', None) is not None:
+                groups[f"{prefix}/special_head"] = generator.special_head
             if hasattr(generator, 'feature_projection'):
                 groups[f"{prefix}/feature_proj"] = generator.feature_projection
             if hasattr(generator, 'unpatchify'):
@@ -1835,7 +1848,7 @@ class WorldModelTrainer(CommonTrainer):
               f"voice={self.include_voice}, image={self.include_image}")
         tied = getattr(model.config, 'tie_word_embeddings', False)
         print(f"Precomputed latents: {self.precomputed_latents}")
-        if tied:
+        if tied and hasattr(model.text_feature_extractor, 'wte'):
             tied_params = sum(p.numel() for p in model.text_feature_extractor.wte.parameters())
             print(f"Tied word embeddings: True ({tied_params:,} params shared)")
         print(f"Loss weights: text={self.text_loss_weight}, audio={self.audio_latent_loss_weight}, "
