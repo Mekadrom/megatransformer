@@ -12,14 +12,7 @@ from matplotlib import pyplot as plt
 from megatransformer.scripts.train.visualization_callback import VisualizationCallback
 from megatransformer.utils import metrics
 from megatransformer.utils import visualization
-from megatransformer.utils.constants import (
-    BOA_TOKEN_ID, EOA_TOKEN_ID,
-    BOV_TOKEN_ID, EOV_TOKEN_ID,
-    BOI_TOKEN_ID, EOI_TOKEN_ID,
-    AUDIO_PLACEHOLDER_TOKEN_ID,
-    VOICE_PLACEHOLDER_TOKEN_ID,
-    IMAGE_PLACEHOLDER_TOKEN_ID,
-)
+from megatransformer.utils import constants
 
 
 class WorldModelVisualizationCallback(VisualizationCallback):
@@ -55,6 +48,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         include_tasks: Optional[list[str]] = None,
         voice_token_budget: Optional[int] = None,
         audio_token_budget: Optional[int] = None,
+        special_token_base: int = constants.SPECIAL_TOKEN_BASE,
+        tokenizer_name: str = "mistralai/Mistral-7B-v0.1",
     ):
         # How many content frames generate() may emit before force-closing with EO*.
         # None => keep generate()'s own default, which is a hardcoded 209 (SIVE
@@ -66,6 +61,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         # transcription or cross-modal examples. None = no restriction (all tasks).
         self.include_modes = set(include_modes) if include_modes else {"text", "audio", "voice", "image"}
         self.include_tasks = set(include_tasks) if include_tasks else None
+        # Control-token ids + text vocab boundary for THIS model (base 32000 Mistral default, or the
+        # pretrained LLM's native vocab). Used to inject BO*/EO*/placeholder tokens into generation
+        # prompts and to strip control tokens when decoding -- must match the model + the data.
+        self._sp = constants.special_token_ids(special_token_base)
+        self._special_base = int(special_token_base)
+        self._tokenizer_name = tokenizer_name
         self.tokenizer = tokenizer
         self.vocoder = vocoder
         self.image_vae_decoder = image_vae_decoder
@@ -135,7 +136,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             return
         try:
             from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+            self.tokenizer = AutoTokenizer.from_pretrained(self._tokenizer_name)
         except Exception as e:
             print(f"Warning: Could not load tokenizer: {e}")
 
@@ -144,8 +145,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         self._ensure_tokenizer()
         if self.tokenizer is None:
             return f"[token_ids: {token_ids.tolist()[:20]}...]"
-        # Filter out media tokens (>= 32000)
-        text_ids = [t for t in token_ids.tolist() if t < 32000]
+        # Filter out control tokens (>= the text-vocab boundary for this model)
+        text_ids = [t for t in token_ids.tolist() if t < self._special_base]
         return self.tokenizer.decode(text_ids, skip_special_tokens=True)
 
     def _get_eval_samples(self, eval_dataset, collator, n: int,
@@ -418,9 +419,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             return
         ids = gen_ids[0].tolist()  # batch 0
         modality_tokens = {
-            "BOV": BOV_TOKEN_ID, "EOV": EOV_TOKEN_ID,
-            "BOI": BOI_TOKEN_ID, "EOI": EOI_TOKEN_ID,
-            "BOA": BOA_TOKEN_ID, "EOA": EOA_TOKEN_ID,
+            "BOV": self._sp.BOV, "EOV": self._sp.EOV,
+            "BOI": self._sp.BOI, "EOI": self._sp.EOI,
+            "BOA": self._sp.BOA, "EOA": self._sp.EOA,
         }
         for name, tid in modality_tokens.items():
             if tid in ids:
@@ -558,12 +559,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         # --- Forward pass (mirrors compute_loss logic) ---
-        from megatransformer.utils.constants import (
-            AUDIO_PLACEHOLDER_TOKEN_ID as APH,
-            VOICE_PLACEHOLDER_TOKEN_ID as VPH,
-            IMAGE_PLACEHOLDER_TOKEN_ID as IPH,
-        )
-        placeholder_ids = {APH, VPH, IPH}
+        placeholder_ids = {self._sp.AUDIO_PLACEHOLDER, self._sp.VOICE_PLACEHOLDER, self._sp.IMAGE_PLACEHOLDER}
 
         text_input_ids = batch.get("text_token_ids")
         text_targets = None
@@ -855,12 +851,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             self._train_gen_image_indices = image_indices
             print(f"[gen_debug] Found {len(voice_indices)} unique voice, {len(image_indices)} unique image")
 
-        from megatransformer.utils.constants import (
-            BOV_TOKEN_ID, EOV_TOKEN_ID,
-            BOI_TOKEN_ID, EOI_TOKEN_ID,
-            VOICE_PLACEHOLDER_TOKEN_ID as VPH,
-            IMAGE_PLACEHOLDER_TOKEN_ID as IPH,
-        )
 
         # Force synthesis direction
         prev_direction = getattr(collator, 'force_direction', None)
@@ -872,7 +862,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 sample = train_dataset[idx]
                 voice_batch = collator([sample])
                 text_ids = voice_batch["text_token_ids"][0]
-                bov_positions = (text_ids == BOV_TOKEN_ID).nonzero(as_tuple=True)[0]
+                bov_positions = (text_ids == self._sp.BOV).nonzero(as_tuple=True)[0]
                 if len(bov_positions) == 0:
                     continue
 
@@ -953,7 +943,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 image_batch = collator([sample])
                 print(f"[gen_debug] image batch keys: {sorted(image_batch.keys())}")
                 text_ids = image_batch["text_token_ids"][0]
-                boi_positions = (text_ids == BOI_TOKEN_ID).nonzero(as_tuple=True)[0]
+                boi_positions = (text_ids == self._sp.BOI).nonzero(as_tuple=True)[0]
                 print(f"[gen_debug] BOI positions: {boi_positions.tolist()}, text_ids shape: {text_ids.shape}")
                 if len(boi_positions) == 0:
                     print(f"[gen_debug] No BOI found, skipping")
@@ -1031,12 +1021,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             return
         print(f"[transcription_debug] voice_indices={self._train_gen_voice_indices}, image_indices={self._train_gen_image_indices}")
 
-        from megatransformer.utils.constants import (
-            BOV_TOKEN_ID, EOV_TOKEN_ID,
-            BOI_TOKEN_ID, EOI_TOKEN_ID,
-            VOICE_PLACEHOLDER_TOKEN_ID as VPH,
-            IMAGE_PLACEHOLDER_TOKEN_ID as IPH,
-        )
 
         # Voice transcription
         for i, idx in enumerate(self._train_gen_voice_indices):
@@ -1050,7 +1034,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 # The prelude processes the voice, it gets interleaved, then the
                 # model generates text after EOV.
                 prompt = torch.tensor(
-                    [[BOV_TOKEN_ID, VPH, EOV_TOKEN_ID]],
+                    [[self._sp.BOV, self._sp.VOICE_PLACEHOLDER, self._sp.EOV]],
                     dtype=torch.long, device=device,
                 )
                 voice_input = voice_features.unsqueeze(0).unsqueeze(0).to(device)
@@ -1101,7 +1085,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
                 # Build description prompt: [BOI] [IMAGE_PH] [EOI]
                 prompt = torch.tensor(
-                    [[BOI_TOKEN_ID, IPH, EOI_TOKEN_ID]],
+                    [[self._sp.BOI, self._sp.IMAGE_PLACEHOLDER, self._sp.EOI]],
                     dtype=torch.long, device=device,
                 )
                 image_input = image_data.unsqueeze(0).unsqueeze(0).to(device)
@@ -1162,12 +1146,6 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if not hasattr(self, '_train_gen_voice_indices') or not hasattr(self, '_train_gen_image_indices'):
             return
 
-        from megatransformer.utils.constants import (
-            BOV_TOKEN_ID, EOV_TOKEN_ID,
-            BOI_TOKEN_ID, EOI_TOKEN_ID,
-            VOICE_PLACEHOLDER_TOKEN_ID as VPH,
-            IMAGE_PLACEHOLDER_TOKEN_ID as IPH,
-        )
 
         # Voice→Voice: provide voice input, generate a second voice clip
         for i, idx in enumerate(self._train_gen_voice_indices):
@@ -1179,7 +1157,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
                 # Prompt: [BOV] [VOICE_PH] [EOV] [BOV]
                 prompt = torch.tensor(
-                    [[BOV_TOKEN_ID, VPH, EOV_TOKEN_ID, BOV_TOKEN_ID]],
+                    [[self._sp.BOV, self._sp.VOICE_PLACEHOLDER, self._sp.EOV, self._sp.BOV]],
                     dtype=torch.long, device=device,
                 )
                 voice_input = voice_features.unsqueeze(0).unsqueeze(0).to(device)
@@ -1240,7 +1218,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
                 # Prompt: [BOI] [IMAGE_PH] [EOI] [BOI]
                 prompt = torch.tensor(
-                    [[BOI_TOKEN_ID, IPH, EOI_TOKEN_ID, BOI_TOKEN_ID]],
+                    [[self._sp.BOI, self._sp.IMAGE_PLACEHOLDER, self._sp.EOI, self._sp.BOI]],
                     dtype=torch.long, device=device,
                 )
                 image_input = image_data.unsqueeze(0).unsqueeze(0).to(device)
@@ -1360,7 +1338,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 continue
 
             max_new = 512
-            prompt = self._encode_static_prompt(str(prompt_text)[:500], [BOV_TOKEN_ID], max_new, device)
+            prompt = self._encode_static_prompt(str(prompt_text)[:500], [self._sp.BOV], max_new, device)
 
             outputs = self._generate(model, 
                 text_input_ids=prompt,
@@ -1500,7 +1478,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 text_length = text_length.item()
 
             # Build prompt: [BOV] [VOICE_PLACEHOLDER] [EOV]
-            prompt_tokens = [BOV_TOKEN_ID, VOICE_PLACEHOLDER_TOKEN_ID, EOV_TOKEN_ID]
+            prompt_tokens = [self._sp.BOV, self._sp.VOICE_PLACEHOLDER, self._sp.EOV]
             prompt = self._build_prompt_ids(prompt_tokens, device)
 
             voice_inputs, voice_lengths = self._prepare_voice_for_generate(sample, device)
@@ -1553,7 +1531,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 continue
 
             max_new = 512
-            prompt = self._encode_static_prompt(str(prompt_text)[:500], [BOI_TOKEN_ID], max_new, device)
+            prompt = self._encode_static_prompt(str(prompt_text)[:500], [self._sp.BOI], max_new, device)
 
             outputs = self._generate(model, 
                 text_input_ids=prompt,
@@ -1624,7 +1602,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 text_length = text_length.item()
 
             # Build prompt: [BOI] [IMAGE_PLACEHOLDER] [EOI]
-            prompt_tokens = [BOI_TOKEN_ID, IMAGE_PLACEHOLDER_TOKEN_ID, EOI_TOKEN_ID]
+            prompt_tokens = [self._sp.BOI, self._sp.IMAGE_PLACEHOLDER, self._sp.EOI]
             prompt = self._build_prompt_ids(prompt_tokens, device)
 
             image_inputs = self._prepare_image_for_generate(sample, device)
@@ -1671,8 +1649,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         for i, sample in enumerate(samples):
             # Build prompt: [BOV] [VOICE_PLACEHOLDER] [EOV] [BOI]
             prompt_tokens = [
-                BOV_TOKEN_ID, VOICE_PLACEHOLDER_TOKEN_ID, EOV_TOKEN_ID,
-                BOI_TOKEN_ID,
+                self._sp.BOV, self._sp.VOICE_PLACEHOLDER, self._sp.EOV,
+                self._sp.BOI,
             ]
             prompt = self._build_prompt_ids(prompt_tokens, device)
 
@@ -1722,8 +1700,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         for i, sample in enumerate(samples):
             # Build prompt: [BOI] [IMAGE_PLACEHOLDER] [EOI] [BOV]
             prompt_tokens = [
-                BOI_TOKEN_ID, IMAGE_PLACEHOLDER_TOKEN_ID, EOI_TOKEN_ID,
-                BOV_TOKEN_ID,
+                self._sp.BOI, self._sp.IMAGE_PLACEHOLDER, self._sp.EOI,
+                self._sp.BOV,
             ]
             prompt = self._build_prompt_ids(prompt_tokens, device)
 

@@ -20,7 +20,7 @@ from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.scripts.data.world.data_collator import MultimodalDataCollator
 from megatransformer.scripts.data.world.dataset import MultimodalShardedDataset
 from megatransformer.scripts.train.world.visualization_callback import WorldModelVisualizationCallback
-from megatransformer.utils import metrics, model_loading_utils
+from megatransformer.utils import metrics, model_loading_utils, constants
 
 
 @dataclass
@@ -51,6 +51,9 @@ def parse_args():
     # Required
     p.add_argument("--checkpoint_path", type=str, required=True, help="Path to checkpoint directory")
     p.add_argument("--config", type=str, default="small_sum_dit", help="World model config name")
+    p.add_argument("--text_encoder_model", type=str, default=None,
+                   help="Pretrained-LLM text encoder id (e.g. HuggingFaceTB/SmolLM2-135M). Must match "
+                        "the checkpoint; sets special_token_base to the LLM vocab and eos to its native eos.")
     p.add_argument("--log_dir", type=str, required=True, help="TensorBoard log output directory")
 
     # Dataset
@@ -184,10 +187,11 @@ def load_world_model(args, device):
         overrides["n_image_gen_positions"] = args.n_image_gen_positions
 
     config_name = args.config
+    _text_enc = getattr(args, "text_encoder_model", None)
     _voice_over = (getattr(args, "voice_codebook_path", None)
                    or getattr(args, "voice_feature_channels", None)
                    or getattr(args, "voice_predict_f0", False))
-    if args.iteration_norm is not None or args.share_block_weights or _voice_over:
+    if args.iteration_norm is not None or args.share_block_weights or _voice_over or _text_enc:
         import copy
         from megatransformer.config.world.world_model import WORLD_MODEL_CONFIGS
         config = copy.deepcopy(WORLD_MODEL_CONFIGS[args.config])
@@ -210,6 +214,23 @@ def load_world_model(args, device):
             config.voice_coda_config.feature_channels = vfc
         if getattr(args, "voice_predict_f0", False):
             config.voice_coda_config.predict_f0 = True
+        if _text_enc:
+            # Pretrained-LLM text encoder: rebuild the same config training used so the loaded
+            # architecture (frozen LLM body + translators + special extension) matches the ckpt.
+            from transformers import AutoConfig, AutoTokenizer
+            _llm_cfg = AutoConfig.from_pretrained(_text_enc)
+            _eos = _llm_cfg.eos_token_id
+            if _eos is None:
+                _eos = AutoTokenizer.from_pretrained(_text_enc).eos_token_id
+            config.special_token_base = int(_llm_cfg.vocab_size)
+            config.eos_token_id = int(_eos)
+            config.__post_init__()
+            config.text_encoder = {
+                "model": _text_enc,
+                "freeze": True,
+                "translator_hidden_mult": 2.0,
+                "n_special_tokens": constants.N_SPECIAL_TOKENS,
+            }
         for k, v in overrides.items():
             setattr(config, k, v)
         WORLD_MODEL_CONFIGS[config_name + "_eval"] = config
@@ -339,23 +360,25 @@ def main():
         voice_eov_id = None
     # Control-token base + eos come from the loaded model's config (authoritative): default
     # (Mistral 32000 / eos 2) or the pretrained LLM's native vocab/eos. Must match the data.
-    from megatransformer.utils import constants as _constants
     collator = MultimodalDataCollator(
         max_seq_len=args.max_seq_len,
         max_waveforms=int(args.voice_max_seconds * args.voice_sample_rate),
         max_mel_spec_frames=voice_max_frames,
         max_sive_feature_frames=math.ceil(voice_max_frames / args.sive_total_stride),
         voice_eov_id=voice_eov_id,
-        special_token_base=getattr(model.config, "special_token_base", _constants.SPECIAL_TOKEN_BASE),
-        eos_token_id=getattr(model.config, "eos_token_id", _constants.EOS_TOKEN_ID),
+        special_token_base=getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE),
+        eos_token_id=getattr(model.config, "eos_token_id", constants.EOS_TOKEN_ID),
     )
 
     # Decoders
     vocoder, image_vae_decoder, voice_smg_decoder, static_speaker_embedding = load_decoders(args)
 
-    # Visualization callback
+    # Visualization callback. Control-token base + tokenizer must match the model, else the
+    # text->voice prompts inject base-32000 BO* ids the pretrained model never sees.
     callback = WorldModelVisualizationCallback(
         tokenizer=None,
+        special_token_base=getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE),
+        tokenizer_name=(getattr(args, "text_encoder_model", None) or "mistralai/Mistral-7B-v0.1"),
         vocoder=vocoder,
         image_vae_decoder=image_vae_decoder,
         voice_smg_decoder=voice_smg_decoder,

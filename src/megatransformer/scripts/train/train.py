@@ -501,8 +501,21 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             except Exception as e:
                 print(f"Warning: Failed to load static speaker embedding: {e}")
 
+        # Control-token base + tokenizer must match the model. Pretrained-LLM mode: base = the
+        # LLM's native vocab and the callback tokenizes/decodes prompts with the LLM's own
+        # tokenizer; default leaves Mistral 32000. Without this the callback injects base-32000
+        # BO*/placeholder ids the pretrained model never sees, so generate() emits no media.
+        from megatransformer.utils import constants as _constants
+        _viz_base = _constants.SPECIAL_TOKEN_BASE
+        _viz_tokenizer = "mistralai/Mistral-7B-v0.1"
+        if getattr(args, "text_encoder_model", None):
+            from transformers import AutoConfig
+            _viz_base = int(AutoConfig.from_pretrained(args.text_encoder_model).vocab_size)
+            _viz_tokenizer = args.text_encoder_model
         callback = WorldModelVisualizationCallback(
             tokenizer=None,  # Will be set up in callback if needed
+            special_token_base=_viz_base,
+            tokenizer_name=_viz_tokenizer,
             vocoder=vocoder,
             image_vae_decoder=image_vae_decoder,
             voice_smg_decoder=voice_smg_decoder,
