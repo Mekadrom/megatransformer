@@ -257,3 +257,43 @@ class DiffusionBridgeImageDecoderConfig:
 
     def to_json_string(self) -> str:
         return json.dumps(self.to_dict(), indent=2)
+
+
+@dataclass
+class SDXLAdapterConfig:
+    """Configuration for the SDXL conditioning adapter (frozen-SDXL image path).
+
+    Selected by the world model when `image_coda_config` is this type (existing
+    ImageDecoderConfig / DiffusionBridgeImageDecoderConfig configs are untouched,
+    so this is fully backwards compatible). Instead of predicting an image latent,
+    the adapter maps the trunk's K image gen-query outputs to the conditioning a
+    frozen SDXL UNet consumes: a 77x2048 sequence (CLIP ViT-L 768 + OpenCLIP bigG
+    1280, concatenated) plus a 1280-dim bigG pooled embedding. K is decoupled from
+    the fixed 77 by cross-attention. See model/image/sdxl_adapter.py.
+    """
+
+    # Trunk hidden size (input gen-query dim). Must match the recurrent d_model.
+    d_model: int = 768
+    # Adapter internal width.
+    adapter_dim: int = 768
+    n_heads: int = 12
+    n_layers: int = 2          # self-attn layers over the K gen queries
+    n_cross_layers: int = 2    # cross-attn layers (77 slots attend the K queries)
+    dropout: float = 0.0
+
+    # SDXL conditioning target shapes (fixed by SDXL; don't change).
+    seq_len: int = 77
+    seq_dim: int = 2048        # CLIP-L(768) + bigG(1280)
+    pool_dim: int = 1280       # bigG pooled
+
+    # Loss: MSE regression + InfoNCE discriminability. The tolerance probe showed
+    # SDXL tolerates random error but not semantic bias, so the contrastive term
+    # keeps predictions in the right basin. Set contrastive_weight=0 for pure MSE.
+    contrastive_weight: float = 1.0
+    contrastive_temp: float = 0.07
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    def to_json_string(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)

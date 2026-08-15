@@ -18,9 +18,11 @@ from megatransformer.model.text.generator import TextCodaClassifierWithLoss
 from megatransformer.config.image.decoder import (
     DiffusionBridgeImageDecoderConfig,
     ImageDecoderConfig,
+    SDXLAdapterConfig,
 )
 from megatransformer.model.image.decoder import ImageDecoder
 from megatransformer.model.image.diffusion_decoder import DiffusionBridgeImageDecoder
+from megatransformer.model.image.sdxl_adapter import SDXLConditioningAdapter
 from megatransformer.model.world.kv_cache import RecurrentKVCache
 from megatransformer.model.world.recurrent import MegatransformerRecurrentBlock
 from megatransformer.model.world.token_alignment import (
@@ -128,12 +130,15 @@ class MegaTransformerWorldModel(nn.Module):
         if config.image_coda_config is not None and "image" in self.include_modes:
             if isinstance(config.image_coda_config, DiffusionBridgeImageDecoderConfig):
                 self.image_generator = DiffusionBridgeImageDecoder(config.image_coda_config)
+            elif isinstance(config.image_coda_config, SDXLAdapterConfig):
+                # Frozen-SDXL path: predict CLIP conditioning instead of a latent.
+                self.image_generator = SDXLConditioningAdapter(config.image_coda_config)
             elif isinstance(config.image_coda_config, ImageDecoderConfig):
                 self.image_generator = ImageDecoder(config.image_coda_config)
             else:
                 raise TypeError(
                     f"Unknown image_coda_config type: {type(config.image_coda_config).__name__}. "
-                    f"Expected ImageDecoderConfig or DiffusionBridgeImageDecoderConfig."
+                    f"Expected ImageDecoderConfig, DiffusionBridgeImageDecoderConfig, or SDXLAdapterConfig."
                 )
             # Normalize recurrent output before the decoder to prevent
             # activation growth from saturating the decoder's attention.
@@ -291,6 +296,10 @@ class MegaTransformerWorldModel(nn.Module):
         # Image inputs
         image_inputs: Optional[torch.Tensor] = None,
         image_latent_labels: Optional[torch.Tensor] = None,
+        # SDXL-adapter targets (frozen-SDXL path only; ignored by DiT/direct decoders).
+        # CLIP conditioning of the caption: sequence (B, 77, 2048) + pooled (B, 1280).
+        image_clip_seq_labels: Optional[torch.Tensor] = None,
+        image_clip_pooled_labels: Optional[torch.Tensor] = None,
         # Text targets
         text_targets: Optional[torch.Tensor] = None,
         # Mode flags
@@ -669,21 +678,34 @@ class MegaTransformerWorldModel(nn.Module):
         # (flow matching). We propagate whichever loss keys the decoder produces.
         if image_batch is not None and hasattr(self, 'image_generator') and self.image_generator is not None:
             cross_input = self.image_coda_input_norm(image_batch)
-            cross_outputs = self.image_generator(
-                encoder_hidden_states=cross_input,
-                latent_labels=image_latent_labels,
-            )
-            if "image_latent_preds" in cross_outputs:
-                outputs["image_latent_preds"] = cross_outputs["image_latent_preds"]
-            # Direct decoder pre-computes L1/MSE losses on the latent preds.
-            if "image_latent_l1_loss" in cross_outputs:
-                outputs["image_l1_loss"] = cross_outputs["image_latent_l1_loss"]
-                outputs["image_mse_loss"] = cross_outputs["image_latent_mse_loss"]
-            # Diffusion decoder computes a flow-matching loss internally.
-            if "image_diffusion_loss" in cross_outputs:
-                outputs["image_diffusion_loss"] = cross_outputs["image_diffusion_loss"]
-            if "image_diffusion_loss_raw" in cross_outputs:
-                outputs["image_diffusion_loss_raw"] = cross_outputs["image_diffusion_loss_raw"]
+            if isinstance(self.image_generator, SDXLConditioningAdapter):
+                # Frozen-SDXL path: predict CLIP conditioning; regress to caption CLIP.
+                cross_outputs = self.image_generator(
+                    encoder_hidden_states=cross_input,
+                    clip_seq_labels=image_clip_seq_labels,
+                    clip_pooled_labels=image_clip_pooled_labels,
+                )
+                outputs["image_clip_seq_pred"] = cross_outputs["image_clip_seq_pred"]
+                outputs["image_clip_pooled_pred"] = cross_outputs["image_clip_pooled_pred"]
+                if "image_clip_loss" in cross_outputs:
+                    outputs["image_clip_loss"] = cross_outputs["image_clip_loss"]
+                    outputs["image_clip_mse_loss"] = cross_outputs["image_clip_mse_loss"]
+            else:
+                cross_outputs = self.image_generator(
+                    encoder_hidden_states=cross_input,
+                    latent_labels=image_latent_labels,
+                )
+                if "image_latent_preds" in cross_outputs:
+                    outputs["image_latent_preds"] = cross_outputs["image_latent_preds"]
+                # Direct decoder pre-computes L1/MSE losses on the latent preds.
+                if "image_latent_l1_loss" in cross_outputs:
+                    outputs["image_l1_loss"] = cross_outputs["image_latent_l1_loss"]
+                    outputs["image_mse_loss"] = cross_outputs["image_latent_mse_loss"]
+                # Diffusion decoder computes a flow-matching loss internally.
+                if "image_diffusion_loss" in cross_outputs:
+                    outputs["image_diffusion_loss"] = cross_outputs["image_diffusion_loss"]
+                if "image_diffusion_loss_raw" in cross_outputs:
+                    outputs["image_diffusion_loss_raw"] = cross_outputs["image_diffusion_loss_raw"]
 
         return outputs
 
