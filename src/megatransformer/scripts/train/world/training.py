@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
+from megatransformer.model.image.sdxl_adapter import SDXLConditioningAdapter
 from megatransformer.scripts.train.trainer import CommonTrainer
 from megatransformer.utils import model_loading_utils, megatransformer_utils, metrics, constants
 
@@ -88,6 +89,8 @@ class WorldModelTrainer(CommonTrainer):
         audio_latent_loss_weight: float = 1.0,
         voice_latent_loss_weight: float = 1.0,
         image_latent_loss_weight: float = 1.0,
+        # SDXL-adapter path only: weight on the CLIP-conditioning regression loss.
+        image_clip_loss_weight: float = 1.0,
         # Variance-matching aux loss weights (per modality). Penalizes
         # collapsed predictions whose std doesn't match the label std.
         # See WorldModelTrainer._compute_modality_recon_loss for details.
@@ -207,6 +210,8 @@ class WorldModelTrainer(CommonTrainer):
         self.audio_latent_loss_weight = audio_latent_loss_weight
         self.voice_latent_loss_weight = voice_latent_loss_weight
         self.image_latent_loss_weight = image_latent_loss_weight
+        self.image_clip_loss_weight = image_clip_loss_weight
+        self._sdxl_text_encoder = None  # lazy: SDXL CLIP text encoders for adapter targets
 
         self.audio_var_loss_weight = audio_var_loss_weight
         self.voice_var_loss_weight = voice_var_loss_weight
@@ -715,6 +720,22 @@ class WorldModelTrainer(CommonTrainer):
 
         self._log_precision_once(model)
 
+        # SDXL-adapter path: compute the CLIP(caption) regression targets from the
+        # batch captions (lazy-load the two frozen SDXL CLIP text encoders once).
+        # No-op for DiT/direct decoders (image_generator isn't an SDXLConditioningAdapter).
+        image_clip_seq_labels = None
+        image_clip_pooled_labels = None
+        unwrapped_model = model.module if hasattr(model, "module") else model
+        if (image_inputs is not None
+                and isinstance(getattr(unwrapped_model, "image_generator", None), SDXLConditioningAdapter)):
+            captions = inputs.get("text_texts")
+            if captions is not None:
+                if self._sdxl_text_encoder is None:
+                    from megatransformer.utils.sdxl_text_encoder import SDXLTextTargetEncoder
+                    dev = next(unwrapped_model.parameters()).device
+                    self._sdxl_text_encoder = SDXLTextTargetEncoder(device=dev, dtype=torch.float16)
+                image_clip_seq_labels, image_clip_pooled_labels = self._sdxl_text_encoder.encode(captions)
+
         # Enable per-iteration stat tracking at logging steps. Training only: the stats are
         # logged under train/ and collecting them costs ~6 GPU syncs per recurrent
         # iteration (~192 per step), so paying that on eval batches bought nothing.
@@ -749,6 +770,8 @@ class WorldModelTrainer(CommonTrainer):
             voice_lengths=voice_lengths,
             image_inputs=image_inputs,
             image_latent_labels=image_latent_labels,
+            image_clip_seq_labels=image_clip_seq_labels,
+            image_clip_pooled_labels=image_clip_pooled_labels,
             precomputed_latents=self.precomputed_latents,
             decode_outputs=False,
             is_synthesis=is_synthesis,
@@ -1082,6 +1105,16 @@ class WorldModelTrainer(CommonTrainer):
             #      (computed inside the decoder via flow matching).
             #   2) ImageDecoder returns `image_latent_preds` and we compute the
             #      whitened L1+MSE + variance-matching aux loss from it.
+            # SDXL-adapter mode: CLIP-conditioning regression loss (MSE + InfoNCE),
+            # computed inside the adapter (synthesis-masked). Predicts conditioning,
+            # not a latent, so the diffusion/direct branches below don't fire.
+            image_clip_loss_t = outputs.get("image_clip_loss")
+            if image_clip_loss_t is not None:
+                total_loss = total_loss + self.image_clip_loss_weight * image_clip_loss_t
+                loss_components["image_clip_loss"] = image_clip_loss_t.detach()
+                if "image_clip_mse_loss" in outputs:
+                    loss_components["image_clip_mse_loss"] = outputs["image_clip_mse_loss"]
+
             image_diffusion_loss_t = outputs.get("image_diffusion_loss")
             if image_diffusion_loss_t is not None:
                 # Diffusion bridge mode: trust the decoder's loss directly.
@@ -2124,6 +2157,7 @@ def create_trainer(
         audio_latent_loss_weight=args.audio_latent_loss_weight,
         voice_latent_loss_weight=args.voice_latent_loss_weight,
         image_latent_loss_weight=getattr(args, 'image_latent_loss_weight', 1.0),
+        image_clip_loss_weight=getattr(args, 'image_clip_loss_weight', 1.0),
         audio_var_loss_weight=getattr(args, 'audio_var_loss_weight', 1.0),
         voice_var_loss_weight=getattr(args, 'voice_var_loss_weight', 1.0),
         image_var_loss_weight=getattr(args, 'image_var_loss_weight', 1.0),
@@ -2226,6 +2260,9 @@ def add_cli_args(subparsers):
                             help="Emphasis multiplier for voice loss (whitened L1+MSE + var-match)")
     sub_parser.add_argument("--image_latent_loss_weight", type=float, default=1.0,
                             help="Emphasis multiplier for image loss (whitened L1+MSE + var-match)")
+    sub_parser.add_argument("--image_clip_loss_weight", type=float, default=1.0,
+                            help="Emphasis multiplier for the SDXL-adapter CLIP-conditioning "
+                                 "regression loss (only used when image_coda_config is SDXLAdapterConfig)")
 
     # Variance-matching auxiliary loss weights (per modality). The aux loss
     # penalizes (std(preds)/std(labels) - 1), preventing collapse to a constant

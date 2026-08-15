@@ -69,6 +69,7 @@ class SDXLConditioningAdapter(nn.Module):
         encoder_hidden_states,          # (B, K, d_model) trunk image gen-query outputs
         clip_seq_labels=None,           # (B, 77, 2048) CLIP sequence target
         clip_pooled_labels=None,        # (B, 1280) CLIP pooled target
+        sample_mask=None,               # (B,) bool: rows to include in the loss (synthesis only)
         latent_labels=None,             # accepted + ignored (shared generator call signature)
         **kw,
     ):
@@ -84,11 +85,20 @@ class SDXLConditioningAdapter(nn.Module):
             "image_clip_pooled_pred": pool_pred,
         }
         if clip_seq_labels is not None and clip_pooled_labels is not None:
-            mse = F.mse_loss(seq_pred, clip_seq_labels) + F.mse_loss(pool_pred, clip_pooled_labels)
+            sp, pp, sl, pl = seq_pred, pool_pred, clip_seq_labels, clip_pooled_labels
+            # Restrict the loss to the flagged rows (transcription rows carry an INPUT
+            # image, not a gen target, and must not regress to CLIP(caption)). Guard on
+            # a matching length so a misaligned mask is ignored rather than silently wrong.
+            if sample_mask is not None and sample_mask.shape[0] == seq_pred.shape[0]:
+                m = sample_mask.bool()
+                if int(m.sum()) == 0:
+                    return out                          # no synthesis rows this batch
+                sp, pp, sl, pl = seq_pred[m], pool_pred[m], clip_seq_labels[m], clip_pooled_labels[m]
+            mse = F.mse_loss(sp, sl) + F.mse_loss(pp, pl)
             loss = mse
-            if self.contrastive_weight > 0:
-                contrast = (_info_nce(pool_pred, clip_pooled_labels, self.contrastive_temp)
-                            + _info_nce(seq_pred.mean(1), clip_seq_labels.mean(1), self.contrastive_temp))
+            if self.contrastive_weight > 0 and sp.shape[0] >= 2:   # InfoNCE needs >=2 rows
+                contrast = (_info_nce(pp, pl, self.contrastive_temp)
+                            + _info_nce(sp.mean(1), sl.mean(1), self.contrastive_temp))
                 loss = loss + self.contrastive_weight * contrast
             out["image_clip_loss"] = loss
             out["image_clip_mse_loss"] = mse.detach()

@@ -12,6 +12,7 @@ from megatransformer.config.common import MegaTransformerBlockConfig
 from megatransformer.config.image.decoder import (
     DiffusionBridgeImageDecoderConfig,
     ImageDecoderConfig,
+    SDXLAdapterConfig,
 )
 from megatransformer.config.image.feature_extractor import ImageVAEPreludeFeatureExtractorConfig
 from megatransformer.config.text.feature_extractor import TextPreludeFeatureExtractorConfig
@@ -186,7 +187,7 @@ class MegaTransformerWorldModelConfig:
     #     attractor of the direct path.
     # None disables image generation entirely. The world model dispatches on
     # the actual config type to instantiate the right decoder class.
-    image_coda_config: Optional[Union[ImageDecoderConfig, DiffusionBridgeImageDecoderConfig]] = None
+    image_coda_config: Optional[Union[ImageDecoderConfig, DiffusionBridgeImageDecoderConfig, SDXLAdapterConfig]] = None
 
     # Scale embeddings by sqrt(d_model) before recurrent block (Huginn-style)
     scale_embeddings: bool = False
@@ -486,3 +487,23 @@ WORLD_MODEL_CONFIGS = {
 # only — existing checkpoints have 6 distinct blocks baked into their weights.
 WORLD_MODEL_CONFIGS["small_sum_recd4"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum"])
 WORLD_MODEL_CONFIGS["small_sum_recd4"].recurrent_block_config.n_recurrent_blocks = 4
+
+
+# ── Frozen-SDXL image path: swap the DiT image coda for the SDXL conditioning
+# adapter (predicts CLIP conditioning instead of a latent). The adapter is
+# prelude-agnostic — it consumes the trunk's image gen-query outputs — so this
+# composes with EITHER text prelude:
+#   - from-scratch prelude:  text_encoder=None (inherited from small_sum below)
+#   - SmolLM2 prelude:        set .text_encoder to the SAME dict your SmolLM2 runs
+#     use (e.g. {"model": "HuggingFaceTB/SmolLM2-135M", "freeze": True, ...}) plus
+#     the matching special_token_base/eos — must match how the data was tokenized.
+# Only the image_coda_config changes here; everything else stays in sync with small_sum.
+WORLD_MODEL_CONFIGS["small_sum_sdxl"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum"])
+WORLD_MODEL_CONFIGS["small_sum_sdxl"].image_coda_config = SDXLAdapterConfig(
+    d_model=768,          # match the recurrent/trunk d_model (small_sum uses 768)
+    adapter_dim=768,
+    n_heads=12,
+    n_layers=2,
+    n_cross_layers=2,
+    contrastive_weight=1.0,
+)

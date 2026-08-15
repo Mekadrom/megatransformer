@@ -684,6 +684,7 @@ class MegaTransformerWorldModel(nn.Module):
                     encoder_hidden_states=cross_input,
                     clip_seq_labels=image_clip_seq_labels,
                     clip_pooled_labels=image_clip_pooled_labels,
+                    sample_mask=is_synthesis,
                 )
                 outputs["image_clip_seq_pred"] = cross_outputs["image_clip_seq_pred"]
                 outputs["image_clip_pooled_pred"] = cross_outputs["image_clip_pooled_pred"]
