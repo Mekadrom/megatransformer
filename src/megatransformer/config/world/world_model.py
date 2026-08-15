@@ -20,6 +20,8 @@ from megatransformer.utils.constants import (
     AUDIO_PLACEHOLDER_TOKEN_ID,
     VOICE_PLACEHOLDER_TOKEN_ID,
     IMAGE_PLACEHOLDER_TOKEN_ID,
+    EOS_TOKEN_ID,
+    special_token_ids,
 )
 
 
@@ -136,6 +138,14 @@ class MegaTransformerWorldModelConfig:
     # extension (tied special_embed/special_head) for control tokens (BOV/EOV/placeholders) at
     # ids >= native_vocab -- frozen-LLM-safe, no resize. Gated: non-users load unchanged.
     text_encoder: Optional[dict] = None
+    # Base id for the 9 control tokens (BOA..IMAGE_PLACEHOLDER at base+0..8). = the real vocab
+    # size: 32000 (Mistral, default) or the pretrained LLM's native vocab (set automatically in
+    # pretrained mode). MUST match the base the data was tokenized with.
+    special_token_base: int = 32_000
+    # End-of-sequence id used to terminate text generation. Native to the vocab: 2 for the
+    # Mistral tokenizer (default), or the pretrained LLM's native eos (set automatically in
+    # pretrained mode). NOT one of the 9 control tokens.
+    eos_token_id: int = EOS_TOKEN_ID
 
     # Feature extractor configs
     text_prelude_config: TextPreludeFeatureExtractorConfig = dataclasses.field(
@@ -217,6 +227,21 @@ class MegaTransformerWorldModelConfig:
     # (each ~O(1/sqrt(n_blocks)) via depth-scaled residual init) compete on
     # equal footing from the first layer.
     image_gen_query_init_std: float = 3.0
+
+    def __post_init__(self):
+        # Single source of truth for the control-token base: derive the interleaver's
+        # placeholder ids from special_token_base so the collator, model, and interleaver
+        # never disagree. With the default base (32000) these resolve to the same values
+        # as the module-level constants -> byte-identical to prior behavior.
+        sp = special_token_ids(self.special_token_base)
+        tic = self.token_interleaver_config
+        # None means "modality disabled" -- preserve it; only remap live ids.
+        if tic.audio_placeholder_token_id is not None:
+            tic.audio_placeholder_token_id = sp.AUDIO_PLACEHOLDER
+        if tic.voice_placeholder_token_id is not None:
+            tic.voice_placeholder_token_id = sp.VOICE_PLACEHOLDER
+        if tic.image_placeholder_token_id is not None:
+            tic.image_placeholder_token_id = sp.IMAGE_PLACEHOLDER
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)

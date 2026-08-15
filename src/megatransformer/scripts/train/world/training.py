@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.scripts.train.trainer import CommonTrainer
-from megatransformer.utils import model_loading_utils, megatransformer_utils, metrics
+from megatransformer.utils import model_loading_utils, megatransformer_utils, metrics, constants
 
 
 # Target value for text positions the CE must not supervise (batch padding). Cannot be 0:
@@ -265,8 +265,16 @@ class WorldModelTrainer(CommonTrainer):
         # loss on a [0, 1] scale where 1 = uniform baseline, 0 = perfect.
         # Makes the text loss commensurable with whitened image/voice/audio.
         model_for_config = self.model.module if hasattr(self.model, 'module') else self.model
+        # Control-token ids for THIS model's base (32000 default / native LLM vocab in pretrained
+        # mode). Used to strip placeholders when building text targets (below); must match the data.
+        self._sp = constants.special_token_ids(
+            getattr(model_for_config.config, 'special_token_base', constants.SPECIAL_TOKEN_BASE))
         try:
-            vocab_size = model_for_config.config.text_prelude_config.vocab_size
+            if getattr(model_for_config.config, 'text_encoder', None) is not None:
+                # Pretrained mode: the text head spans the LLM's native vocab + the 9 control tokens.
+                vocab_size = model_for_config.config.special_token_base + constants.N_SPECIAL_TOKENS
+            else:
+                vocab_size = model_for_config.config.text_prelude_config.vocab_size
         except AttributeError:
             vocab_size = None
         self.log_vocab_size = math.log(vocab_size) if vocab_size and vocab_size > 1 else 1.0
@@ -553,12 +561,7 @@ class WorldModelTrainer(CommonTrainer):
             return torch.tensor(0.0, device=next(model.parameters()).device, requires_grad=True)
         text_targets = None
         if text_input_ids is not None and self.include_text:
-            from megatransformer.utils.constants import (
-                AUDIO_PLACEHOLDER_TOKEN_ID,
-                VOICE_PLACEHOLDER_TOKEN_ID,
-                IMAGE_PLACEHOLDER_TOKEN_ID,
-            )
-            placeholder_ids = {AUDIO_PLACEHOLDER_TOKEN_ID, VOICE_PLACEHOLDER_TOKEN_ID, IMAGE_PLACEHOLDER_TOKEN_ID}
+            placeholder_ids = {self._sp.AUDIO_PLACEHOLDER, self._sp.VOICE_PLACEHOLDER, self._sp.IMAGE_PLACEHOLDER}
 
             # The model sees text_input_ids[:, :-1] as input (standard causal shift).
             # The interleaver removes placeholder positions, so the text coda
@@ -1890,11 +1893,24 @@ def load_model(args, device='cuda'):
         if getattr(args, 'text_encoder_model', None):
             # Single gate: swap the from-scratch text prelude/coda for a pretrained LLM body +
             # translators + the LLM's LM head. None (default) leaves the model byte-identical.
+            # The 9 control tokens live at ids >= the LLM's native vocab (the special_embed/head
+            # extension), so special_token_base MUST equal the LLM's vocab_size and n_special_tokens
+            # is fixed at 9 (the collator always injects all 9). eos becomes the LLM's native eos.
+            from transformers import AutoConfig
+            _llm_cfg = AutoConfig.from_pretrained(args.text_encoder_model)
+            native_vocab = int(_llm_cfg.vocab_size)
+            native_eos = _llm_cfg.eos_token_id
+            if native_eos is None:
+                from transformers import AutoTokenizer
+                native_eos = AutoTokenizer.from_pretrained(args.text_encoder_model).eos_token_id
+            config.special_token_base = native_vocab
+            config.eos_token_id = int(native_eos)
+            config.__post_init__()  # re-derive interleaver placeholder ids for the new base
             config.text_encoder = {
                 "model": args.text_encoder_model,
                 "freeze": not getattr(args, 'text_encoder_unfreeze', False),
                 "translator_hidden_mult": getattr(args, 'text_encoder_translator_mult', 2.0),
-                "n_special_tokens": getattr(args, 'text_encoder_n_special_tokens', 0),
+                "n_special_tokens": constants.N_SPECIAL_TOKENS,
             }
         if getattr(args, 'voice_gen_query_mode', None):
             # Gen-query voice synthesis: creates voice_gen_queries + voice_coda_prev_proj

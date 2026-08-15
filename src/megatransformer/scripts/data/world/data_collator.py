@@ -4,15 +4,7 @@ from typing import Optional
 import torch
 
 from megatransformer.scripts.data.data_collator import DataCollator
-from megatransformer.utils.constants import (
-    BOA_TOKEN_ID, EOA_TOKEN_ID,
-    BOV_TOKEN_ID, EOV_TOKEN_ID,
-    BOI_TOKEN_ID, EOI_TOKEN_ID,
-    AUDIO_PLACEHOLDER_TOKEN_ID,
-    VOICE_PLACEHOLDER_TOKEN_ID,
-    IMAGE_PLACEHOLDER_TOKEN_ID,
-    EOS_TOKEN_ID,
-)
+from megatransformer.utils import constants
 from megatransformer.utils.megatransformer_utils import pad_and_mask, trim
 
 
@@ -49,6 +41,11 @@ class MultimodalDataCollator(DataCollator):
         # no terminal token inserted (backward compatible; the stop head governs).
         voice_eov_id: Optional[int] = None,
         audio_eov_id: Optional[int] = None,
+        # Base id for the 9 control tokens + the native eos id. Default (32000 / 2) = Mistral;
+        # in pretrained-LLM mode training.py passes the LLM's native vocab size + native eos so
+        # the injected boundary/placeholder/eos tokens match the model and the tokenized data.
+        special_token_base: int = constants.SPECIAL_TOKEN_BASE,
+        eos_token_id: int = constants.EOS_TOKEN_ID,
     ):
         self.max_seq_len = max_seq_len
         self.max_waveforms = max_waveforms
@@ -56,6 +53,8 @@ class MultimodalDataCollator(DataCollator):
         self.max_sive_feature_frames = max_sive_feature_frames
         self.voice_eov_id = voice_eov_id
         self.audio_eov_id = audio_eov_id
+        self._sp = constants.special_token_ids(special_token_base)
+        self._eos = eos_token_id
         self.force_direction = None  # Set to "synthesis" or "transcription" to override random direction
 
     def __call__(self, examples: list[dict]) -> dict[str, torch.Tensor]:
@@ -111,7 +110,7 @@ class MultimodalDataCollator(DataCollator):
         """
         # Trim text to actual length (strips any preprocessor padding)
         text_tokens = text_token_ids[:text_length]
-        eos = torch.tensor([EOS_TOKEN_ID], dtype=text_tokens.dtype)
+        eos = torch.tensor([self._eos], dtype=text_tokens.dtype)
 
         # Only append EOS when the text wasn't truncated — truncated samples
         # were cut off mid-content and didn't genuinely end.
@@ -127,17 +126,17 @@ class MultimodalDataCollator(DataCollator):
         media_blocks = []
         if has_audio:
             media_blocks.append(torch.tensor(
-                [BOA_TOKEN_ID, AUDIO_PLACEHOLDER_TOKEN_ID, EOA_TOKEN_ID],
+                [self._sp.BOA, self._sp.AUDIO_PLACEHOLDER, self._sp.EOA],
                 dtype=text_tokens.dtype,
             ))
         if has_voice:
             media_blocks.append(torch.tensor(
-                [BOV_TOKEN_ID, VOICE_PLACEHOLDER_TOKEN_ID, EOV_TOKEN_ID],
+                [self._sp.BOV, self._sp.VOICE_PLACEHOLDER, self._sp.EOV],
                 dtype=text_tokens.dtype,
             ))
         if has_image:
             media_blocks.append(torch.tensor(
-                [BOI_TOKEN_ID, IMAGE_PLACEHOLDER_TOKEN_ID, EOI_TOKEN_ID],
+                [self._sp.BOI, self._sp.IMAGE_PLACEHOLDER, self._sp.EOI],
                 dtype=text_tokens.dtype,
             ))
 

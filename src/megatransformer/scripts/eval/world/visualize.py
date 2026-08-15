@@ -337,12 +337,17 @@ def main():
         voice_eov_id = int(load_codebook(_cbp).shape[0])
     else:
         voice_eov_id = None
+    # Control-token base + eos come from the loaded model's config (authoritative): default
+    # (Mistral 32000 / eos 2) or the pretrained LLM's native vocab/eos. Must match the data.
+    from megatransformer.utils import constants as _constants
     collator = MultimodalDataCollator(
         max_seq_len=args.max_seq_len,
         max_waveforms=int(args.voice_max_seconds * args.voice_sample_rate),
         max_mel_spec_frames=voice_max_frames,
         max_sive_feature_frames=math.ceil(voice_max_frames / args.sive_total_stride),
         voice_eov_id=voice_eov_id,
+        special_token_base=getattr(model.config, "special_token_base", _constants.SPECIAL_TOKEN_BASE),
+        eos_token_id=getattr(model.config, "eos_token_id", _constants.EOS_TOKEN_ID),
     )
 
     # Decoders

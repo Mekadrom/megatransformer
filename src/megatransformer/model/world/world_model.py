@@ -60,6 +60,12 @@ class MegaTransformerWorldModel(nn.Module):
         self.config = config
         self.include_modes = set(config.include_modes)
 
+        # Control-token ids resolved for this config's base (32000 default / native LLM vocab in
+        # pretrained mode). Use self._sp.<NAME> everywhere instead of the module-level constants so
+        # a base swap threads through the model. self._eos is the native (not control) eos id.
+        self._sp = constants.special_token_ids(getattr(config, "special_token_base", constants.SPECIAL_TOKEN_BASE))
+        self._eos = getattr(config, "eos_token_id", constants.EOS_TOKEN_ID)
+
         # Feature extractors — text is always required. text_encoder (single gate, default None)
         # swaps the from-scratch prelude for a pretrained-LLM body + translator; None is unchanged.
         _text_encoder = getattr(config, "text_encoder", None)
@@ -1022,11 +1028,11 @@ class MegaTransformerWorldModel(nn.Module):
         # so the first generated hidden states are accumulated correctly.
         for b in range(batch_size):
             last_token = text_input_ids[b, -1].item()
-            if last_token == constants.BOA_TOKEN_ID:
+            if last_token == self._sp.BOA:
                 current_modality[b] = "audio"
-            elif last_token == constants.BOV_TOKEN_ID:
+            elif last_token == self._sp.BOV:
                 current_modality[b] = "voice"
-            elif last_token == constants.BOI_TOKEN_ID:
+            elif last_token == self._sp.BOI:
                 current_modality[b] = "image"
 
         # Process the prompt through the text coda with KV caching so
@@ -1156,13 +1162,13 @@ class MegaTransformerWorldModel(nn.Module):
                 # Text mode: embed via text prelude with KV caching so the
                 # prelude's causal self-attention sees all previous text tokens.
                 else:
-                    if token_id == constants.BOA_TOKEN_ID:
+                    if token_id == self._sp.BOA:
                         current_modality[b] = "audio"
                         just_entered_streaming[b] = "audio"
-                    elif token_id == constants.BOV_TOKEN_ID:
+                    elif token_id == self._sp.BOV:
                         current_modality[b] = "voice"
                         just_entered_streaming[b] = "voice"
-                    elif token_id == constants.BOI_TOKEN_ID:
+                    elif token_id == self._sp.BOI:
                         current_modality[b] = "image"
                         # No flag — image is single-shot and resets current_modality
                         # in the same iter, so the shared text_coda call below
@@ -1261,13 +1267,13 @@ class MegaTransformerWorldModel(nn.Module):
                         # EOA's causal attention in iter N+1 sees APH between
                         # BOA and EOA (matching training [..., BOA, APH, EOA]).
                         _, text_prelude_kv_caches = self.text_feature_extractor(
-                            torch.tensor([[constants.AUDIO_PLACEHOLDER_TOKEN_ID]], device=device),
+                            torch.tensor([[self._sp.AUDIO_PLACEHOLDER]], device=device),
                             kv_caches=text_prelude_kv_caches,
                             position_offset=text_prelude_position_offset,
                             use_cache=True,
                         )
                         text_prelude_position_offset += 1
-                        forced_next_token[b] = constants.EOA_TOKEN_ID
+                        forced_next_token[b] = self._sp.EOA
                         just_finalized_streaming[b] = "audio"
 
                 elif current_modality[b] == "voice":
@@ -1426,13 +1432,13 @@ class MegaTransformerWorldModel(nn.Module):
                         # EOV's causal attention in iter N+1 sees VPH between
                         # BOV and EOV (matching training [..., BOV, VPH, EOV]).
                         _, text_prelude_kv_caches = self.text_feature_extractor(
-                            torch.tensor([[constants.VOICE_PLACEHOLDER_TOKEN_ID]], device=device),
+                            torch.tensor([[self._sp.VOICE_PLACEHOLDER]], device=device),
                             kv_caches=text_prelude_kv_caches,
                             position_offset=text_prelude_position_offset,
                             use_cache=True,
                         )
                         text_prelude_position_offset += 1
-                        forced_next_token[b] = constants.EOV_TOKEN_ID
+                        forced_next_token[b] = self._sp.EOV
                         just_finalized_streaming[b] = "voice"
 
                 elif current_modality[b] == "image":
@@ -1490,13 +1496,13 @@ class MegaTransformerWorldModel(nn.Module):
                     # embedding is discarded (the interleaver strips it at
                     # training too); we only need it in the causal KV cache.
                     _, text_prelude_kv_caches = self.text_feature_extractor(
-                        torch.tensor([[constants.IMAGE_PLACEHOLDER_TOKEN_ID]], device=device),
+                        torch.tensor([[self._sp.IMAGE_PLACEHOLDER]], device=device),
                         kv_caches=text_prelude_kv_caches,
                         position_offset=text_prelude_position_offset,
                         use_cache=True,
                     )
                     text_prelude_position_offset += 1
-                    forced_next_token[b] = constants.EOI_TOKEN_ID
+                    forced_next_token[b] = self._sp.EOI
 
             # Voice/audio ENTRY: run text_coda once on BO*'s current_hidden to
             # add BO* to the text coda's KV cache, matching training (where the
@@ -1548,7 +1554,7 @@ class MegaTransformerWorldModel(nn.Module):
             if not any_media:
                 if skip_shared_coda:
                     # Finalizing iter: emit forced EO* directly, no sampling.
-                    forced_ids = [forced_next_token[b] if forced_next_token[b] is not None else constants.EOS_TOKEN_ID for b in range(batch_size)]
+                    forced_ids = [forced_next_token[b] if forced_next_token[b] is not None else self._eos for b in range(batch_size)]
                     next_token_ids = torch.tensor(forced_ids, device=device)
                     for b in range(batch_size):
                         generated_tokens[b].append(next_token_ids[b].item())
@@ -1570,7 +1576,7 @@ class MegaTransformerWorldModel(nn.Module):
             if not any_media:
                 all_done = True
                 for b in range(batch_size):
-                    if next_token_ids[b].item() == constants.EOS_TOKEN_ID:
+                    if next_token_ids[b].item() == self._eos:
                         finished[b] = True
                     if not finished[b]:
                         all_done = False

@@ -163,6 +163,21 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
         if getattr(args, "voice_codebook_path", None):
             from megatransformer.utils.codebook import load_codebook
             voice_eov_id = int(load_codebook(args.voice_codebook_path).shape[0])
+        # Control-token base + eos must match the model. Pretrained-LLM mode: the 9 control tokens
+        # sit at ids >= the LLM's native vocab, and eos is the LLM's native eos (mirrors the config
+        # threading in world/training.py). Default (no text encoder) leaves Mistral 32000 / eos 2.
+        from megatransformer.utils import constants
+        special_token_base = constants.SPECIAL_TOKEN_BASE
+        eos_token_id = constants.EOS_TOKEN_ID
+        if getattr(args, "text_encoder_model", None):
+            from transformers import AutoConfig
+            _llm_cfg = AutoConfig.from_pretrained(args.text_encoder_model)
+            special_token_base = int(_llm_cfg.vocab_size)
+            _eos = _llm_cfg.eos_token_id
+            if _eos is None:
+                from transformers import AutoTokenizer
+                _eos = AutoTokenizer.from_pretrained(args.text_encoder_model).eos_token_id
+            eos_token_id = int(_eos)
         collator = MultimodalDataCollator(
             max_seq_len=args.max_seq_len,
             max_waveforms=int(args.voice_max_seconds * args.voice_sample_rate),
@@ -170,6 +185,8 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
             # Same derivation the generation budget uses — see media_frame_budget().
             max_sive_feature_frames=media_frame_budget(args, "voice"),
             voice_eov_id=voice_eov_id,
+            special_token_base=special_token_base,
+            eos_token_id=eos_token_id,
         )
     return collator
 
