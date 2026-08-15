@@ -198,6 +198,13 @@ class MegaTransformerWorldModel(nn.Module):
         # LLM mode: there is no `wte` (the LLM owns its embeddings, already tied internally).
         if getattr(config, 'tie_word_embeddings', False) and _text_encoder is None:
             self.text_generator.lm_head.weight = self.text_feature_extractor.wte.weight
+        elif _text_encoder is not None:
+            # Pretrained-LLM mode: the coda SHARES the FE's (tied) LM head — one embed/head weight,
+            # no duplicate, tie survives an unfreeze. And tie the trainable control-token extension
+            # (special_embed <-> special_head), mirroring the LLM's own embed/head tie.
+            self.text_generator.lm_head = self.text_feature_extractor.lm_head
+            if getattr(self.text_feature_extractor, "special_embed", None) is not None:
+                self.text_generator.special_head.weight = self.text_feature_extractor.special_embed.weight
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Enable gradient checkpointing on all sub-modules that support it."""

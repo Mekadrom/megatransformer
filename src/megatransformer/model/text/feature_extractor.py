@@ -40,19 +40,29 @@ class TextPreludeFeatureExtractor(nn.Module):
         # is unchanged; the LLM's HF KV cache rides through the same kv_caches slot.
         self._pretrained = text_encoder is not None
         if self._pretrained:
-            from transformers import AutoModel
+            from transformers import AutoModelForCausalLM
             from megatransformer.model.norms import create_norm as _cn
-            # fp32 at init to match the rest of the model; --bf16 autocast handles training.
-            llm = AutoModel.from_pretrained(text_encoder["model"], dtype=torch.float32)
-            tgt_vocab = text_encoder.get("vocab_size", None)
-            if tgt_vocab and tgt_vocab != llm.config.vocab_size:
-                llm.resize_token_embeddings(tgt_vocab)  # room for added special tokens
+            # Load the full causal LM ONCE (fp32 at init; --bf16 autocast handles training). Keep
+            # its body (encoder) AND its tied LM head — the text coda references this same head,
+            # so there is one embed/head weight (no duplicate) and the tie survives an unfreeze.
+            llm = AutoModelForCausalLM.from_pretrained(text_encoder["model"], dtype=torch.float32)
+            self.llm_body = llm.model                     # transformer body (encoder)
+            self.lm_head = llm.get_output_embeddings()    # tied head; coda references this
+            self.llm_native_vocab = int(llm.config.vocab_size)
+            llm_d = int(llm.config.hidden_size)
+            del llm
             if text_encoder.get("freeze", True):
-                for p in llm.parameters():
+                for p in self.llm_body.parameters():
                     p.requires_grad = False
-                llm.eval()
-            self.llm_body = llm
-            llm_d = llm.config.hidden_size
+                for p in self.lm_head.parameters():
+                    p.requires_grad = False
+                self.llm_body.eval()
+            # Trainable vocab-EXTENSION for the multimodal control tokens (BOV/EOV/placeholders):
+            # a small embedding at ids >= native_vocab, spliced into inputs_embeds. Frozen-LLM-safe
+            # (soft-prompt style); its weight is tied to the coda's special_head by world_model.
+            self.n_special = int(text_encoder.get("n_special_tokens", 0))
+            if self.n_special > 0:
+                self.special_embed = nn.Embedding(self.n_special, llm_d)
             trunk_d = config.d_model
             hidden = max(1, int(trunk_d * text_encoder.get("translator_hidden_mult", 2.0)))
             self.input_proj = nn.Linear(llm_d, trunk_d)
@@ -117,10 +127,21 @@ class TextPreludeFeatureExtractor(nn.Module):
             If use_cache=True, returns (hidden_states, new_kv_caches) tuple.
         """
         if self._pretrained:
-            # LLM body handles positions/causality internally via its HF cache; position_offset
-            # is ignored (the cache length determines the position). kv_caches carries the HF
-            # Cache object opaquely, which world_model.py threads back unchanged.
-            out = self.llm_body(input_ids=input_ids, past_key_values=kv_caches, use_cache=use_cache)
+            # LLM body handles positions/causality internally via its HF cache; position_offset is
+            # ignored (cache length gives position). kv_caches carries the HF Cache opaquely.
+            if self.n_special > 0:
+                # Control-token ids (>= native vocab) go through the trainable special_embed,
+                # everything else through the frozen LLM embedding; splice into inputs_embeds.
+                normal_ids = input_ids.clamp(max=self.llm_native_vocab - 1)
+                embeds = self.llm_body.get_input_embeddings()(normal_ids)
+                mask = input_ids >= self.llm_native_vocab
+                if mask.any():
+                    se = self.special_embed(input_ids[mask] - self.llm_native_vocab)
+                    embeds = embeds.clone()
+                    embeds[mask] = se.to(embeds.dtype)
+                out = self.llm_body(inputs_embeds=embeds, past_key_values=kv_caches, use_cache=use_cache)
+            else:
+                out = self.llm_body(input_ids=input_ids, past_key_values=kv_caches, use_cache=use_cache)
             # cast to the translator's dtype (handles a bf16 LLM output vs fp32 proj, and autocast)
             h = self.input_proj(out.last_hidden_state.to(self.input_proj.weight.dtype))
             h = h + self.translator(self.translator_norm(h))

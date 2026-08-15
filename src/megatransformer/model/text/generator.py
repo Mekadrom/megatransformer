@@ -37,22 +37,22 @@ class TextCodaClassifierWithLoss(nn.Module):
         # coda is STATELESS here (no self-attention/KV cache); forward signature is preserved.
         self._pretrained = text_encoder is not None
         if self._pretrained:
-            from transformers import AutoModelForCausalLM
-            llm = AutoModelForCausalLM.from_pretrained(text_encoder["model"], dtype=torch.float32)
-            tgt_vocab = text_encoder.get("vocab_size", None)
-            if tgt_vocab and tgt_vocab != llm.config.vocab_size:
-                llm.resize_token_embeddings(tgt_vocab)
-            self.lm_head = llm.get_output_embeddings()  # keep only the head; body is GC'd
-            if text_encoder.get("freeze", True):
-                for p in self.lm_head.parameters():
-                    p.requires_grad = False
-            llm_d = llm.config.hidden_size
+            from transformers import AutoConfig
+            # No LLM weights here: llm_d comes from the config, and the LM head is SHARED from the
+            # feature extractor (assigned by world_model) so the pretrained embed/head tie holds.
+            llm_cfg = AutoConfig.from_pretrained(text_encoder["model"])
+            llm_d = int(llm_cfg.hidden_size)
             trunk_d = coda_config.d_model
             hidden = max(1, int(trunk_d * text_encoder.get("translator_hidden_mult", 2.0)))
             self.out_translator_norm = create_norm(trunk_d, config.input_norm_type, config.norm_epsilon)
             self.out_translator = nn.Sequential(
                 nn.Linear(trunk_d, hidden), nn.GELU(), nn.Linear(hidden, llm_d))
-            del llm
+            # Trainable head for the control tokens; its weight is tied to the FE's special_embed
+            # by world_model (embed row == head row, mirroring the LLM's own embed/head tie).
+            self.n_special = int(text_encoder.get("n_special_tokens", 0))
+            if self.n_special > 0:
+                self.special_head = nn.Linear(llm_d, self.n_special, bias=False)
+            self.lm_head = None  # SHARED from the feature extractor, injected by world_model
             self.gradient_checkpointing = False
             return
 
@@ -99,10 +99,13 @@ class TextCodaClassifierWithLoss(nn.Module):
             dict with "logits" and optionally "text_classification_loss" and "kv_caches".
         """
         if self._pretrained:
-            # Stateless: residual-MLP translator (trunk d_model -> LLM d_model) then the
-            # pretrained LM head. No coda self-attention -> kv_caches passes through untouched.
-            h = self.out_translator(self.out_translator_norm(x))
-            logits = self.lm_head(h.to(self.lm_head.weight.dtype))
+            # Stateless: residual-MLP translator (trunk d_model -> LLM d_model), then the SHARED
+            # (tied) LM head over the native vocab, concatenated with the trainable special_head
+            # over the control tokens. No coda self-attention -> kv_caches passes through.
+            h = self.out_translator(self.out_translator_norm(x)).to(self.lm_head.weight.dtype)
+            logits = self.lm_head(h)
+            if self.n_special > 0:
+                logits = torch.cat([logits, self.special_head(h)], dim=-1)
             cap = getattr(self.config, 'lm_head_logit_cap', None)
             if cap is not None:
                 logits = cap * torch.tanh(logits / cap)

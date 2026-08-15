@@ -129,11 +129,12 @@ class MegaTransformerWorldModelConfig:
     # SINGLE GATE for the pretrained-LLM text encoder. None (default) => the from-scratch
     # {wte + prelude transformer} path, byte-identical to current behavior. A dict opts in:
     #   {"model": "HuggingFaceTB/SmolLM2-135M", "freeze": True,
-    #    "translator_hidden_mult": 2.0, "vocab_size": None}
+    #    "translator_hidden_mult": 2.0, "n_special_tokens": 0}
     # When set, the text prelude wraps the pretrained LLM body (+ input projection + MLP
-    # translator) and the text coda becomes (MLP translator + the pretrained LM head). The
-    # LLM owns the vocab/tokenizer; "vocab_size" optionally resizes its embed/head to fit
-    # added special tokens. Gated so non-users have zero extra params and load unchanged.
+    # translator) and the text coda becomes (MLP translator + the SHARED pretrained LM head).
+    # The LLM owns its native vocab/tokenizer (frozen); "n_special_tokens" adds a small TRAINABLE
+    # extension (tied special_embed/special_head) for control tokens (BOV/EOV/placeholders) at
+    # ids >= native_vocab -- frozen-LLM-safe, no resize. Gated: non-users load unchanged.
     text_encoder: Optional[dict] = None
 
     # Feature extractor configs

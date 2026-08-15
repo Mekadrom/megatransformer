@@ -1894,7 +1894,7 @@ def load_model(args, device='cuda'):
                 "model": args.text_encoder_model,
                 "freeze": not getattr(args, 'text_encoder_unfreeze', False),
                 "translator_hidden_mult": getattr(args, 'text_encoder_translator_mult', 2.0),
-                "vocab_size": getattr(args, 'text_encoder_vocab_size', None),
+                "n_special_tokens": getattr(args, 'text_encoder_n_special_tokens', 0),
             }
         if getattr(args, 'voice_gen_query_mode', None):
             # Gen-query voice synthesis: creates voice_gen_queries + voice_coda_prev_proj
@@ -2519,9 +2519,10 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--text_encoder_translator_mult", type=float, default=2.0,
                             help="Hidden width multiple for the prelude/coda MLP translators "
                                  "(hidden = trunk_d_model * mult).")
-    sub_parser.add_argument("--text_encoder_vocab_size", type=int, default=None,
-                            help="Resize the LLM embed/head to this vocab (to fit added special "
-                                 "tokens, e.g. BOV/EOV/placeholders). None = the LLM's native vocab.")
+    sub_parser.add_argument("--text_encoder_n_special_tokens", type=int, default=0,
+                            help="Size of the TRAINABLE control-token extension (tied special_embed/"
+                                 "special_head) for BOV/EOV/placeholders etc., appended at ids >= the "
+                                 "LLM's native vocab. Frozen-LLM-safe (soft-prompt style). 0 = none.")
     sub_parser.add_argument("--voice_coda_type", type=str, default=None,
                             choices=["transformer", "mlp"],
                             help="Voice coda body: 'transformer' (causal self-attention stack, "
