@@ -406,11 +406,15 @@ class MultimodalShardedDataset(Dataset):
         shard = self._load_shard(mod, shard_idx)
 
         sample = {}
-        # Support both raw image shards ("images") and precomputed latent shards ("latents")
+        # Support raw image shards ("images"), precomputed latent shards ("latents"),
+        # and generation-only --skip_vae shards (no image data; synthesize a zero latent
+        # of the recorded shape — the world model replaces it with gen queries at synthesis).
         if "latents" in shard:
             sample["image"] = shard["latents"][local_idx]
         elif "images" in shard:
             sample["image"] = shard["images"][local_idx]
+        elif "dummy_latent_shape" in shard:
+            sample["image"] = torch.zeros(tuple(shard["dummy_latent_shape"]), dtype=torch.float32)
 
         # Extract caption text and token IDs if available
         if "token_ids" in shard:

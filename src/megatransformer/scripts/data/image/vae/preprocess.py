@@ -398,8 +398,18 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         # Load VAE encoder
         self.vae_encoder = None
         self._encode_fn = None
+        # Generation-only (SDXL-out) datasets: during image SYNTHESIS the world model
+        # replaces the image latents with learned gen queries, so it never reads them.
+        # --skip_vae stores captions + tokens + a dummy latent SHAPE only (no VAE load,
+        # no image decode, no GPU); the world dataset synthesizes zeros of that shape on
+        # read. Shape mirrors a LiteVAE f8/12ch encode so it's drop-in for the prelude.
+        self._skip_vae = bool(getattr(args, "skip_vae", False))
+        self._dummy_latent_shape = (12, args.image_size // 8, args.image_size // 8)
 
-        if args.vae_config in PRETRAINED_IMAGE_VAES:
+        if self._skip_vae:
+            print(f"  --skip_vae: captions+tokens only, dummy latent shape {self._dummy_latent_shape} "
+                  f"(no VAE, no image decode, no GPU)")
+        elif args.vae_config in PRETRAINED_IMAGE_VAES:
             # Pretrained external VAE (e.g. LiteVAE)
             print(f"Loading pretrained image VAE: {args.vae_config}...")
             litevae_model = _load_litevae(args.vae_config, device=device)
@@ -469,6 +479,7 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
             'shard_text_attention_mask': [],  # Attention mask [B, seq_len]
             'shard_raw_text': [],  # Raw text strings
             # Tokenized text fields
+            'shard_dummy_count': 0,  # --skip_vae: sample count (no latents stored)
             'shard_token_ids': [],  # Tokenized text [N, T]
             'shard_text_lengths': [],  # Token counts [N]
         })
@@ -512,6 +523,11 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         # Filtering
         sub_parser.add_argument("--min_image_size", type=int, default=64,
                                 help="Minimum image dimension (skip smaller images)")
+        sub_parser.add_argument("--skip_vae", action="store_true", default=False,
+                                help="Generation-only (SDXL-out) mode: store captions + tokens + a dummy "
+                                     "latent SHAPE only — no VAE, no image decode, no GPU. The world model "
+                                     "replaces image latents with gen queries during synthesis, so it never "
+                                     "reads them; the dataset synthesizes zeros on read. Requires --text_column.")
         sub_parser.add_argument("--skip_grayscale", action="store_true", default=False,
                                 help="Skip grayscale images")
         sub_parser.add_argument("--exclude_uids", type=str, default=None,
@@ -594,10 +610,20 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         return None
 
     def flush_shard(self):
-        if not self.shard_fields['shard_latents'] and not self.shard_fields['shard_images']:
+        if self._skip_vae:
+            if self.shard_fields['shard_dummy_count'] == 0:
+                return
+        elif not self.shard_fields['shard_latents'] and not self.shard_fields['shard_images']:
             return
 
-        if self.vae_encoder is not None:
+        if self._skip_vae:
+            # No image data: store only the sample count + the latent shape the world
+            # dataset should synthesize (as zeros) on read.
+            shard_data = {
+                "num_samples": self.shard_fields['shard_dummy_count'],
+                "dummy_latent_shape": list(self._dummy_latent_shape),
+            }
+        elif self.vae_encoder is not None:
             # Save VAE latents
             shard_data = {
                 "latents": torch.cat(self.shard_fields['shard_latents'], dim=0),
@@ -632,8 +658,9 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
                 shard_data["token_ids"] = torch.stack(padded, dim=0)
                 shard_data["text_lengths"] = torch.stack(self.shard_fields['shard_text_lengths'], dim=0)
 
-        # Catch accumulator-lifecycle bugs before they go to disk.
-        validate_shard_alignment(shard_data, shard_data["num_samples"])
+        # Catch accumulator-lifecycle bugs before they go to disk. dummy_latent_shape
+        # is per-shard metadata (a 3-elem list), not a per-sample field.
+        validate_shard_alignment(shard_data, shard_data["num_samples"], ignore_keys={"dummy_latent_shape"})
 
         shard_path = os.path.join(self.output_dir, f"shard_{self.shard_fields['shard_idx']:06d}.pt")
         torch.save(shard_data, shard_path)
@@ -641,6 +668,7 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
         print(f"  Saved shard {self.shard_fields['shard_idx']} ({shard_data['num_samples']} samples)")
 
         # Reset shard fields
+        self.shard_fields['shard_dummy_count'] = 0
         self.shard_fields['shard_images'] = []
         self.shard_fields['shard_latents'] = []
         self.shard_fields['shard_mu'] = []
@@ -689,7 +717,10 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
             return
 
         try:
-            if self.batch_processor is not None:
+            if self._skip_vae:
+                # No encode: just count the samples (dummy latents synthesized on read).
+                self.shard_fields['shard_dummy_count'] += len(self.batch_accumulators['batch_images'])
+            elif self.batch_processor is not None:
                 # Process through VAE
                 result = self.batch_processor.process_batch(self.batch_accumulators['batch_images'])
 
@@ -733,7 +764,9 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
             self.stats_accumulator["saved"] += len(self.batch_accumulators['batch_images'])
 
             # Flush shard if full
-            if self.vae_encoder is not None:
+            if self._skip_vae:
+                current_size = self.shard_fields['shard_dummy_count']
+            elif self.vae_encoder is not None:
                 current_size = sum(l.shape[0] for l in self.shard_fields['shard_latents'])
             else:
                 current_size = sum(i.shape[0] for i in self.shard_fields['shard_images'])
@@ -793,6 +826,22 @@ class ImageVAEDatasetPreprocessor(Preprocessor):
             if uid is not None and str(uid) in self.exclude_uids:
                 self.stats_accumulator["skipped"]["excluded_uid"] += 1
                 return False
+
+        # --skip_vae: caption + dummy latent only. No image decode/encode (generation
+        # never reads the latent), so this path is caption-driven and needs a text column.
+        if self._skip_vae:
+            if not self.text_column:
+                raise ValueError("--skip_vae requires --text_column (captions are the only stored signal)")
+            texts = self._extract_texts_from_example(example)
+            if not texts:
+                self.stats_accumulator["skipped"]["missing_text"] += 1
+                return False
+            for caption in texts:
+                self.batch_accumulators['batch_texts'].append(caption)
+                self.batch_accumulators['batch_images'].append(None)  # count placeholder
+                if len(self.batch_accumulators['batch_texts']) >= self.args.gpu_batch_size:
+                    self.process_and_accumulate()
+            return True
 
         # Load image
         image = self._load_image_from_example(example)

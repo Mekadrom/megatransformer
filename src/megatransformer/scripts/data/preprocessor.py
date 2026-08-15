@@ -1,22 +1,24 @@
 import abc
 
 
-def validate_shard_alignment(shard_data: dict, num_samples: int) -> None:
+def validate_shard_alignment(shard_data: dict, num_samples: int, ignore_keys=None) -> None:
     """Assert every per-sample field in `shard_data` has first-dim length
     equal to `num_samples`.
 
     Per-sample fields are: tensors with `ndim >= 1` (compared via `shape[0]`)
-    and lists/tuples (compared via `len()`). Scalar values, dicts, and the
-    `num_samples` key itself are ignored as metadata.
+    and lists/tuples (compared via `len()`). Scalar values, dicts, the
+    `num_samples` key, and any key in `ignore_keys` are ignored as metadata
+    (e.g. a per-shard `dummy_latent_shape` list that is NOT per-sample).
 
     Raises RuntimeError listing every mismatched field. Intended to be called
     right before `torch.save` in each preprocessor's flush_shard so an
     accumulator-lifecycle bug fails loudly on the first shard write rather
     than after the dataset is on disk.
     """
+    ignore = {"num_samples"} | (set(ignore_keys) if ignore_keys else set())
     mismatches = []
     for k, v in shard_data.items():
-        if k == "num_samples":
+        if k in ignore:
             continue
         if hasattr(v, "shape") and hasattr(v, "ndim") and v.ndim >= 1:
             if v.shape[0] != num_samples:
