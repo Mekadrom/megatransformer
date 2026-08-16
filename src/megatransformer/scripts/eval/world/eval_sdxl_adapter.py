@@ -38,6 +38,9 @@ def parse_args():
     p.add_argument("--gen_steps", type=int, default=25)
     p.add_argument("--guidance", type=float, default=7.0)
     p.add_argument("--bf16", action="store_true")
+    p.add_argument("--text_encoder_model", type=str, default=None,
+                   help="Pretrained text spine (e.g. HuggingFaceTB/SmolLM2-135M) — MUST match how "
+                        "the checkpoint was trained, or the prelude weights won't load.")
     p.add_argument("--tie_word_embeddings", action="store_true")
     p.add_argument("--output_dir", type=str, default="eval_output/sdxl_adapter_eval")
     p.add_argument("--log_dir", type=str, default=None)
@@ -64,6 +67,24 @@ def main():
     overrides = {"include_modes": include_modes}
     if args.tie_word_embeddings:
         overrides["tie_word_embeddings"] = True
+    if args.text_encoder_model:
+        # Mirror training: pretrained-LLM spine -> special_token_base=native vocab, native eos,
+        # + the text_encoder dict. from_config reconstructs the dataclass (re-running __post_init__),
+        # so the interleaver placeholder ids are re-derived for the new base.
+        from transformers import AutoConfig, AutoTokenizer
+        from megatransformer.utils import constants
+        _llm = AutoConfig.from_pretrained(args.text_encoder_model)
+        _eos = _llm.eos_token_id
+        if _eos is None:
+            _eos = AutoTokenizer.from_pretrained(args.text_encoder_model).eos_token_id
+        overrides["special_token_base"] = int(_llm.vocab_size)
+        overrides["eos_token_id"] = int(_eos)
+        overrides["text_encoder"] = {
+            "model": args.text_encoder_model,
+            "freeze": True,
+            "translator_hidden_mult": 2.0,
+            "n_special_tokens": constants.N_SPECIAL_TOKENS,
+        }
     model = model_loading_utils.load_model(
         MegaTransformerWorldModel, args.config,
         checkpoint_path=args.checkpoint_path, overrides=overrides, device=device)
@@ -84,7 +105,13 @@ def main():
     text_dir = resolve(args.cache_dir, "val") if "text" in include_modes else None
     dataset = MultimodalShardedDataset(text_shard_dir=text_dir, image_shard_dir=image_dir,
                                        cache_size=8, max_samples=args.max_samples)
-    collator = MultimodalDataCollator()
+    # special_token_base/eos MUST match the model (49152 for SmolLM2) so the injected
+    # IMAGE_PLACEHOLDER id matches what the interleaver scans for.
+    _mcfg = model.module.config if hasattr(model, "module") else model.config
+    collator = MultimodalDataCollator(
+        special_token_base=getattr(_mcfg, "special_token_base", 32000),
+        eos_token_id=getattr(_mcfg, "eos_token_id", 2),
+    )
     collator.force_direction = "synthesis"
 
     # ── SDXL ──
