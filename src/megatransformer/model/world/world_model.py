@@ -977,6 +977,9 @@ class MegaTransformerWorldModel(nn.Module):
         completed_audio: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         completed_voice: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         completed_image: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+        # SDXL-adapter path: (seq 77x2048, pooled 1280) CLIP conditioning per generated image,
+        # surfaced for the caller to render via frozen SDXL (generate() can't render itself).
+        completed_image_cond: List[List[tuple]] = [[] for _ in range(batch_size)]
         # Recurrent iterations actually performed per generated image (one list per
         # batch item, one entry per image block).
         image_recurrent_iterations: List[List[int]] = [[] for _ in range(batch_size)]
@@ -1519,10 +1522,14 @@ class MegaTransformerWorldModel(nn.Module):
                         if "image_latent_preds" in cross_out:
                             image_pred = cross_out["image_latent_preds"].squeeze(0)  # (C, H, W)
                         else:
-                            # SDXL adapter: predicts CLIP conditioning, not a latent —
-                            # the in-model generate() can't render (SDXL isn't loaded).
-                            # Image rendering is done by scripts/eval/world/eval_sdxl_adapter.py.
+                            # SDXL adapter: predicts CLIP conditioning, not a latent. generate()
+                            # can't render (SDXL isn't loaded), but we SURFACE the conditioning so
+                            # a caller (chat UI / eval_sdxl_adapter.py) can render it via frozen SDXL.
                             image_pred = None
+                            completed_image_cond[b].append((
+                                cross_out["image_clip_seq_pred"].squeeze(0).detach(),     # (77, 2048)
+                                cross_out["image_clip_pooled_pred"].squeeze(0).detach(),  # (1280,)
+                            ))
                     else:
                         image_pred = None
 
@@ -1692,6 +1699,10 @@ class MegaTransformerWorldModel(nn.Module):
             outputs["image_latent_preds"] = stacked  # (batch, max_n, C, H, W)
             outputs["image_counts"] = counts  # (batch,)
             # No lengths needed for images since spatial dims are fixed
+
+        # SDXL-adapter path: per-image (seq, pooled) CLIP conditioning for the caller to render.
+        if any(len(c) > 0 for c in completed_image_cond):
+            outputs["image_clip_cond"] = completed_image_cond  # List[List[(seq 77x2048, pooled 1280)]]
 
         # Per-image recurrent iteration counts (list-of-list; one entry per
         # completed image per batch item). Empty list if no images generated.

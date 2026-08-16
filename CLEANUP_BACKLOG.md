@@ -19,19 +19,30 @@ Engineering cleanups, deferred wiring, and missing tests — distinct from
   generation. *Deferred — the dummy hack works & is tested; do deliberately + smoke-test.*
   Touches: `world_model.forward` image branch, `data_collator.py`, `dataset.py`, preprocess.
 
-- [ ] **End-to-end smoke test of the SDXL-adapter training path.** Steps 1–4 (CLIP-target
-  loss, weight, preset, eval) are unit-tested in isolation but never run through the full
-  trainer. Run `train world --config small_sum_sdxl --include_modes text,image` for a few
-  hundred steps on a small slice; confirm `image_clip_loss` appears and drops. **Do this
-  before any real SDXL-adapter run.**
+- [x] **End-to-end smoke test of the SDXL-adapter training path.** DONE — `world_image_sdxl_smoke_0`
+  (300 steps) ran clean: `small_sum_sdxl` + `--text_encoder_model SmolLM2` compose, `image_clip_loss`
+  flows, no OOM. Surfaced + fixed the DiT-assuming in-loop viz (commit a8b485a).
 
-- [ ] **Validate `eval_sdxl_adapter.py` against a real trained checkpoint.** It compiles,
-  but the synthesis-forward → SDXL-render → CLIPScore path has only been reasoned through,
-  not executed on a trained model. Shake out once the smoke run produces a checkpoint.
+- [x] **Validate `eval_sdxl_adapter.py` against a real trained checkpoint.** DONE — ran vs
+  checkpoint-300 (commit 5d42fd5 added `--text_encoder_model` + collator special_token_base).
+  End-to-end pass: target CLIP 0.417, generated 0.048 (near-random at 300 steps, expected).
 
 - [ ] **Add `diffusers` + `accelerate` to the uv `training` dependency group** once SDXL is
   committed to. Currently transient (`uv pip install`), so `uv sync` would drop them.
   Touches: `pyproject.toml`, `uv.lock`, `requirements.txt`.
+
+- [x] **Update `multimodal_chat.py` (Gradio) for the SDXL-adapter image path.** DONE.
+  (a) `--text_encoder_model` added — builds the same overrides as `eval_sdxl_adapter.py`
+  (special_token_base=native vocab, native eos, text_encoder dict) and loads the SmolLM2
+  tokenizer; (b) control-token ids re-derived from the loaded model's `special_token_base`
+  via `constants.special_token_ids()` (`sp`/`placeholder_triplet` threaded through
+  `parse_prompt`/`render_generated_text`/`on_submit`), replacing the 32000-hardcoded imports;
+  (c) `generate()` already surfaces `outputs["image_clip_cond"]` (List[List[(seq 77x2048,
+  pooled 1280)]]) — the chat now loads a frozen SDXL pipe (fp16-fix VAE) when the image
+  generator is an `SDXLConditioningAdapter` and renders the predicted conditioning via
+  `render_sdxl_cond` instead of LiteVAE-decoding a latent. New args: `--sdxl_model`,
+  `--sdxl_gen_steps`, `--sdxl_guidance`. Text/voice/audio arms untouched; DiT/LiteVAE path
+  preserved as the `elif` fallback. py_compile clean; not yet run against a live checkpoint.
 
 ## Lower priority / conditional
 

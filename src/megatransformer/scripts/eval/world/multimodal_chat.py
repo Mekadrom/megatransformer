@@ -35,22 +35,19 @@ from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.utils import model_loading_utils
 from megatransformer.utils.audio_utils import SharedWindowBuffer, extract_mels
-from megatransformer.utils.constants import (
-    BOA_TOKEN_ID, EOA_TOKEN_ID, AUDIO_PLACEHOLDER_TOKEN_ID,
-    BOV_TOKEN_ID, EOV_TOKEN_ID, VOICE_PLACEHOLDER_TOKEN_ID,
-    BOI_TOKEN_ID, EOI_TOKEN_ID, IMAGE_PLACEHOLDER_TOKEN_ID,
-)
+from megatransformer.utils import constants
 
 IMAGE_EXTS = {"png", "jpg", "jpeg", "webp", "bmp", "gif"}
 AUDIO_EXTS = {"wav", "mp3", "flac", "ogg", "m4a", "opus"}
 
-PLACEHOLDER_TRIPLET = {
-    "voice": (BOV_TOKEN_ID, VOICE_PLACEHOLDER_TOKEN_ID, EOV_TOKEN_ID),
-    "audio": (BOA_TOKEN_ID, AUDIO_PLACEHOLDER_TOKEN_ID, EOA_TOKEN_ID),
-    "image": (BOI_TOKEN_ID, IMAGE_PLACEHOLDER_TOKEN_ID, EOI_TOKEN_ID),
-}
 
-BO_BY_MODALITY = {"voice": BOV_TOKEN_ID, "audio": BOA_TOKEN_ID, "image": BOI_TOKEN_ID}
+def _placeholder_triplet(sp) -> dict:
+    """BO*/PH/EO* id triplets for a resolved SpecialTokenIds (`sp`)."""
+    return {
+        "voice": (sp.BOV, sp.VOICE_PLACEHOLDER, sp.EOV),
+        "audio": (sp.BOA, sp.AUDIO_PLACEHOLDER, sp.EOA),
+        "image": (sp.BOI, sp.IMAGE_PLACEHOLDER, sp.EOI),
+    }
 
 
 def parse_args():
@@ -61,6 +58,22 @@ def parse_args():
     p.add_argument("--include_modes", type=str, default="text,voice,image")
     p.add_argument("--tie_word_embeddings", action="store_true")
     p.add_argument("--bf16", action="store_true")
+    p.add_argument("--text_encoder_model", type=str, default=None,
+                   help="Pretrained text spine (e.g. HuggingFaceTB/SmolLM2-135M) — MUST match how the "
+                        "checkpoint was trained, or the prelude weights won't load. Also switches the "
+                        "control-token base (special_token_base) to the LLM's native vocab size so "
+                        "the interleaver's BO*/PH/EO* ids line up with the trained checkpoint.")
+
+    # SDXL image decoder (for the SDXL-adapter image path). When the loaded
+    # model's image_generator is an SDXLConditioningAdapter, generate() returns
+    # predicted CLIP conditioning (77x2048 seq + 1280 pooled) rather than a
+    # latent, and we render pixels here with a frozen SDXL pipeline.
+    p.add_argument("--sdxl_model", type=str, default="stabilityai/stable-diffusion-xl-base-1.0",
+                   help="SDXL base model for rendering the adapter's predicted conditioning.")
+    p.add_argument("--sdxl_gen_steps", type=int, default=25,
+                   help="SDXL diffusion steps (adapter path). UI 'image diffusion steps' overrides if >0.")
+    p.add_argument("--sdxl_guidance", type=float, default=7.0,
+                   help="SDXL classifier-free guidance scale (adapter path).")
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top_p", type=float, default=0.9)
@@ -189,7 +202,7 @@ def render_file_list(state: dict) -> str:
     return "\n".join(lines)
 
 
-def parse_prompt(msg_text: str, state: dict, tokenizer) -> tuple[list[int], list[tuple[str, torch.Tensor]]]:
+def parse_prompt(msg_text: str, state: dict, tokenizer, placeholder_triplet: dict) -> tuple[list[int], list[tuple[str, torch.Tensor]]]:
     """
     Split the message on @ref tokens. For each valid ref, emit the modality
     triplet; otherwise tokenize as text. Returns (token_ids, media_sequence)
@@ -205,7 +218,7 @@ def parse_prompt(msg_text: str, state: dict, tokenizer) -> tuple[list[int], list
             # Strip trailing punctuation that isn't part of the filename
             ref = re.sub(r"[.,!?;:]+$", "", ref) if "." not in ref else ref
             if ref in state:
-                bo, ph, eo = PLACEHOLDER_TRIPLET[state[ref]["type"]]
+                bo, ph, eo = placeholder_triplet[state[ref]["type"]]
                 token_ids.extend([bo, ph, eo])
                 media_sequence.append((state[ref]["type"], state[ref]["tensor"]))
                 first_text = False  # any prior tokens means we're past the BOS position
@@ -237,6 +250,7 @@ def stack_media(media_list: list[torch.Tensor], pad_time_dim: bool, device: str,
 def render_generated_text(
     token_ids: list[int],
     tokenizer,
+    sp,
     real_image_count: int = 0,
     real_voice_count: int = 0,
     real_audio_count: int = 0,
@@ -252,15 +266,15 @@ def render_generated_text(
     """
     emitted = {"image": 0, "voice": 0, "audio": 0}
     caps = {"image": real_image_count, "voice": real_voice_count, "audio": real_audio_count}
-    eo_to_label = {EOI_TOKEN_ID: "image", EOV_TOKEN_ID: "voice", EOA_TOKEN_ID: "audio"}
-    bo_ids = {BOI_TOKEN_ID, BOV_TOKEN_ID, BOA_TOKEN_ID}
+    eo_to_label = {sp.EOI: "image", sp.EOV: "voice", sp.EOA: "audio"}
+    bo_ids = {sp.BOI, sp.BOV, sp.BOA}
     chunks: list[str] = []
     buf: list[int] = []
 
     def flush():
         if not buf:
             return
-        text_ids = [t for t in buf if t < 32000 and t != 0]
+        text_ids = [t for t in buf if t < sp.base and t != 0]
         if text_ids:
             chunks.append(tokenizer.decode(text_ids, skip_special_tokens=True))
         buf.clear()
@@ -345,7 +359,11 @@ def main():
     dtype = torch.bfloat16 if args.bf16 else torch.float32
 
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+    # Text tokenizer MUST match the trained spine: SmolLM2 (49152 vocab) when a
+    # pretrained text encoder is used, else the historical Mistral tokenizer.
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.text_encoder_model if args.text_encoder_model else "mistralai/Mistral-7B-v0.1"
+    )
     shared_window_buffer = SharedWindowBuffer()
 
     print(f"Loading world model from {args.checkpoint_path}...")
@@ -353,12 +371,40 @@ def main():
     overrides = {"include_modes": include_modes}
     if args.tie_word_embeddings:
         overrides["tie_word_embeddings"] = True
+    if args.text_encoder_model:
+        # Mirror training/eval_sdxl_adapter: a pretrained-LLM spine sets
+        # special_token_base=native vocab, native eos, + the text_encoder dict.
+        # from_config re-runs __post_init__ so the interleaver placeholder ids
+        # are re-derived for the new base (BOI/EOI/IPH at base+4/+5/+8).
+        from transformers import AutoConfig
+        _llm = AutoConfig.from_pretrained(args.text_encoder_model)
+        _eos = _llm.eos_token_id
+        if _eos is None:
+            _eos = tokenizer.eos_token_id
+        overrides["special_token_base"] = int(_llm.vocab_size)
+        overrides["eos_token_id"] = int(_eos)
+        overrides["text_encoder"] = {
+            "model": args.text_encoder_model,
+            "freeze": True,
+            "translator_hidden_mult": 2.0,
+            "n_special_tokens": constants.N_SPECIAL_TOKENS,
+        }
     model = model_loading_utils.load_model(
         MegaTransformerWorldModel, args.config,
         checkpoint_path=args.checkpoint_path,
         overrides=overrides, device=device,
     )
     model.eval()
+
+    # Resolve control-token ids from the loaded model's actual base, so BO*/PH/EO*
+    # match the checkpoint (32000 for Mistral, 49152 for SmolLM2). Everything that
+    # emits/detects these ids downstream uses `sp` / `placeholder_triplet`.
+    _mcfg = model.module.config if hasattr(model, "module") else model.config
+    special_token_base = int(getattr(_mcfg, "special_token_base", constants.SPECIAL_TOKEN_BASE))
+    sp = constants.special_token_ids(special_token_base)
+    placeholder_triplet = _placeholder_triplet(sp)
+    print(f"special_token_base={special_token_base} "
+          f"(BOI={sp.BOI}, IPH={sp.IMAGE_PLACEHOLDER}, EOI={sp.EOI})")
 
     # Apply DiT latent scaling overrides if provided. Mirrors
     # scripts/train/world/training.py:1019-1038 so the same training CLI values
@@ -405,6 +451,36 @@ def main():
         from megatransformer.scripts.data.image.vae.preprocess import _load_litevae
         litevae = _load_litevae("litevae", device=device)
         litevae.eval()
+
+    # SDXL-adapter image path: if the model predicts CLIP conditioning (not a
+    # latent), load a frozen SDXL pipeline to render pixels. fp16-safe VAE —
+    # SDXL's stock VAE decodes to black/NaN in fp16.
+    from megatransformer.model.world.world_model import SDXLConditioningAdapter
+    sdxl_pipe = None
+    sdxl_neg = None
+    if isinstance(getattr(model, "image_generator", None), SDXLConditioningAdapter):
+        print(f"Image generator is SDXLConditioningAdapter — loading SDXL ({args.sdxl_model})...")
+        from diffusers import StableDiffusionXLPipeline, AutoencoderKL
+        _sdxl_vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
+        sdxl_pipe = StableDiffusionXLPipeline.from_pretrained(
+            args.sdxl_model, vae=_sdxl_vae, torch_dtype=torch.float16, use_safetensors=True).to(device)
+        sdxl_pipe.set_progress_bar_config(disable=True)
+        _neg_pe, _, _neg_pp, _ = sdxl_pipe.encode_prompt(
+            prompt="", device=device, num_images_per_prompt=1, do_classifier_free_guidance=False)
+        sdxl_neg = (_neg_pe, _neg_pp)
+
+    @torch.no_grad()
+    def render_sdxl_cond(seq: torch.Tensor, pool: torch.Tensor, steps: int, seed: int) -> Image.Image:
+        """Render the adapter's predicted conditioning (seq 77x2048, pooled 1280) via frozen SDXL."""
+        g = torch.Generator(device=device).manual_seed(int(seed))
+        neg_pe, neg_pp = sdxl_neg
+        return sdxl_pipe(
+            prompt_embeds=seq.unsqueeze(0).half(),
+            pooled_prompt_embeds=pool.unsqueeze(0).half(),
+            negative_prompt_embeds=neg_pe.half(),
+            negative_pooled_prompt_embeds=neg_pp.half(),
+            num_inference_steps=int(steps), guidance_scale=args.sdxl_guidance,
+            height=1024, width=1024, generator=g).images[0]
 
     smg_decoder = None
     if args.voice_smg_checkpoint_path:
@@ -537,16 +613,16 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(seed_in))
 
-        token_ids, media_sequence = parse_prompt(msg_text, state, tokenizer)
+        token_ids, media_sequence = parse_prompt(msg_text, state, tokenizer, placeholder_triplet)
 
         # Optional trailing BO* "nudge" for text→media — the model can still
         # emit multiple media blocks autoregressively regardless of this.
         if gen_hint == "voice":
-            token_ids.append(BOV_TOKEN_ID)
+            token_ids.append(sp.BOV)
         elif gen_hint == "image":
-            token_ids.append(BOI_TOKEN_ID)
+            token_ids.append(sp.BOI)
         elif gen_hint == "audio":
-            token_ids.append(BOA_TOKEN_ID)
+            token_ids.append(sp.BOA)
 
         voice_tensors = [t for m, t in media_sequence if m == "voice"]
         audio_tensors = [t for m, t in media_sequence if m == "audio"]
@@ -613,14 +689,14 @@ def main():
         gen_ids = outputs.get("generated_token_ids")
         if gen_ids is not None:
             gen_tokens = gen_ids[0].tolist()
-            gen_text = render_generated_text(gen_tokens, tokenizer, real_img, real_voice, real_audio)
+            gen_text = render_generated_text(gen_tokens, tokenizer, sp, real_img, real_voice, real_audio)
             # Compare stream-observed EO* count vs real count to surface
             # spurious sampling by the text coda (a known artifact for
             # undertrained checkpoints that haven't learned to never emit
             # these reserved tokens as regular vocab entries).
-            eoi_count = sum(1 for t in gen_tokens if t == EOI_TOKEN_ID)
-            eov_count = sum(1 for t in gen_tokens if t == EOV_TOKEN_ID)
-            eoa_count = sum(1 for t in gen_tokens if t == EOA_TOKEN_ID)
+            eoi_count = sum(1 for t in gen_tokens if t == sp.EOI)
+            eov_count = sum(1 for t in gen_tokens if t == sp.EOV)
+            eoa_count = sum(1 for t in gen_tokens if t == sp.EOA)
             spurious = (eoi_count - real_img) + (eov_count - real_voice) + (eoa_count - real_audio)
             status_lines.append(
                 f"Token stream: {eoi_count} EOI / {eov_count} EOV / {eoa_count} EOA "
@@ -632,7 +708,28 @@ def main():
         image_preds = outputs.get("image_latent_preds")
         image_counts = outputs.get("image_counts")
         image_iters_per_item = outputs.get("image_recurrent_iterations") or []
-        if image_preds is not None and image_counts is not None:
+        # SDXL-adapter path: generate() returns predicted CLIP conditioning
+        # (image_clip_cond = List[List[(seq 77x2048, pooled 1280)]]) rather than
+        # a latent; render pixels here with the frozen SDXL pipeline.
+        image_clip_cond = outputs.get("image_clip_cond")
+        if sdxl_pipe is not None and image_clip_cond is not None and image_clip_cond[0]:
+            conds = image_clip_cond[0]
+            sdxl_steps = image_num_steps if image_num_steps is not None else args.sdxl_gen_steps
+            base_seed = int(seed_in) if (seed_in is not None and int(seed_in) >= 0) else 1000
+            status_lines.append(f"image_clip_cond: {len(conds)} image(s); SDXL steps={sdxl_steps}, "
+                                f"guidance={args.sdxl_guidance}")
+            if image_iters_per_item and image_iters_per_item[0]:
+                iters_str = ", ".join(str(i) for i in image_iters_per_item[0])
+                status_lines.append(f"Image recurrent iterations per block: [{iters_str}]")
+            for k, (seq_pred, pool_pred) in enumerate(conds):
+                try:
+                    img = render_sdxl_cond(seq_pred.float(), pool_pred.float(), sdxl_steps, base_seed + k)
+                    gallery_images.append((img, f"image {k + 1}"))
+                except Exception as e:
+                    status_lines.append(f"Image {k + 1} SDXL render failed "
+                                        f"(seq={tuple(seq_pred.shape)}): {type(e).__name__}: {e}")
+            status_lines.append(f"Rendered {len(gallery_images)}/{len(conds)} image(s) via SDXL")
+        elif image_preds is not None and image_counts is not None:
             n_img = int(image_counts[0].item())
             status_lines.append(f"image_latent_preds: shape={tuple(image_preds.shape) if image_preds.numel() else 'empty'}, counts[0]={n_img}")
             if image_iters_per_item and image_iters_per_item[0]:
