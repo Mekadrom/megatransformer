@@ -82,6 +82,8 @@ training = [
     "scikit-learn",
     "psutil",
     "requests",
+    "diffusers>=0.39",   # frozen SDXL / Z-Image-Turbo image decoders (adapter render + eval)
+    "bitsandbytes",      # 4-bit Qwen3-4B target encoder for the Z-Image adapter (fits alongside training)
 ]
 dev = [
     "pytest",

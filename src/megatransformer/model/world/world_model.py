@@ -19,10 +19,12 @@ from megatransformer.config.image.decoder import (
     DiffusionBridgeImageDecoderConfig,
     ImageDecoderConfig,
     SDXLAdapterConfig,
+    ZImageAdapterConfig,
 )
 from megatransformer.model.image.decoder import ImageDecoder
 from megatransformer.model.image.diffusion_decoder import DiffusionBridgeImageDecoder
 from megatransformer.model.image.sdxl_adapter import SDXLConditioningAdapter
+from megatransformer.model.image.zimage_adapter import ZImageConditioningAdapter
 from megatransformer.model.world.kv_cache import RecurrentKVCache
 from megatransformer.model.world.recurrent import MegatransformerRecurrentBlock
 from megatransformer.model.world.token_alignment import (
@@ -133,12 +135,16 @@ class MegaTransformerWorldModel(nn.Module):
             elif isinstance(config.image_coda_config, SDXLAdapterConfig):
                 # Frozen-SDXL path: predict CLIP conditioning instead of a latent.
                 self.image_generator = SDXLConditioningAdapter(config.image_coda_config)
+            elif isinstance(config.image_coda_config, ZImageAdapterConfig):
+                # Frozen Z-Image-Turbo path: predict Qwen3-4B conditioning instead of a latent.
+                self.image_generator = ZImageConditioningAdapter(config.image_coda_config)
             elif isinstance(config.image_coda_config, ImageDecoderConfig):
                 self.image_generator = ImageDecoder(config.image_coda_config)
             else:
                 raise TypeError(
                     f"Unknown image_coda_config type: {type(config.image_coda_config).__name__}. "
-                    f"Expected ImageDecoderConfig, DiffusionBridgeImageDecoderConfig, or SDXLAdapterConfig."
+                    f"Expected ImageDecoderConfig, DiffusionBridgeImageDecoderConfig, "
+                    f"SDXLAdapterConfig, or ZImageAdapterConfig."
                 )
             # Normalize recurrent output before the decoder to prevent
             # activation growth from saturating the decoder's attention.
@@ -300,6 +306,7 @@ class MegaTransformerWorldModel(nn.Module):
         # CLIP conditioning of the caption: sequence (B, 77, 2048) + pooled (B, 1280).
         image_clip_seq_labels: Optional[torch.Tensor] = None,
         image_clip_pooled_labels: Optional[torch.Tensor] = None,
+        image_cond_labels: Optional[torch.Tensor] = None,
         # Text targets
         text_targets: Optional[torch.Tensor] = None,
         # Mode flags
@@ -688,6 +695,18 @@ class MegaTransformerWorldModel(nn.Module):
                 )
                 outputs["image_clip_seq_pred"] = cross_outputs["image_clip_seq_pred"]
                 outputs["image_clip_pooled_pred"] = cross_outputs["image_clip_pooled_pred"]
+                if "image_clip_loss" in cross_outputs:
+                    outputs["image_clip_loss"] = cross_outputs["image_clip_loss"]
+                    outputs["image_clip_mse_loss"] = cross_outputs["image_clip_mse_loss"]
+            elif isinstance(self.image_generator, ZImageConditioningAdapter):
+                # Frozen Z-Image path: predict Qwen3-4B conditioning; regress to the
+                # resampled caption target. No pooled vector. Shares the image_clip_* keys.
+                cross_outputs = self.image_generator(
+                    encoder_hidden_states=cross_input,
+                    cond_labels=image_cond_labels,
+                    sample_mask=is_synthesis,
+                )
+                outputs["image_clip_seq_pred"] = cross_outputs["image_clip_seq_pred"]
                 if "image_clip_loss" in cross_outputs:
                     outputs["image_clip_loss"] = cross_outputs["image_clip_loss"]
                     outputs["image_clip_mse_loss"] = cross_outputs["image_clip_mse_loss"]
@@ -1545,9 +1564,12 @@ class MegaTransformerWorldModel(nn.Module):
                             # can't render (SDXL isn't loaded), but we SURFACE the conditioning so
                             # a caller (chat UI / eval_sdxl_adapter.py) can render it via frozen SDXL.
                             image_pred = None
+                            # pooled is None for the Z-Image adapter (Qwen3 has no pooled vector);
+                            # SDXL provides a (1280,) pooled. Surface (seq, pooled|None) either way.
+                            _pooled = cross_out.get("image_clip_pooled_pred")
                             completed_image_cond[b].append((
-                                cross_out["image_clip_seq_pred"].squeeze(0).detach(),     # (77, 2048)
-                                cross_out["image_clip_pooled_pred"].squeeze(0).detach(),  # (1280,)
+                                cross_out["image_clip_seq_pred"].squeeze(0).detach(),  # (seq_len, seq_dim)
+                                _pooled.squeeze(0).detach() if _pooled is not None else None,
                             ))
                     else:
                         image_pred = None

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.model.image.sdxl_adapter import SDXLConditioningAdapter
+from megatransformer.model.image.zimage_adapter import ZImageConditioningAdapter
 from megatransformer.scripts.train.trainer import CommonTrainer
 from megatransformer.utils import model_loading_utils, megatransformer_utils, metrics, constants
 
@@ -212,6 +213,7 @@ class WorldModelTrainer(CommonTrainer):
         self.image_latent_loss_weight = image_latent_loss_weight
         self.image_clip_loss_weight = image_clip_loss_weight
         self._sdxl_text_encoder = None  # lazy: SDXL CLIP text encoders for adapter targets
+        self._zimage_text_encoder = None  # lazy: Qwen3-4B (4-bit) for Z-Image adapter targets
 
         self.audio_var_loss_weight = audio_var_loss_weight
         self.voice_var_loss_weight = voice_var_loss_weight
@@ -736,6 +738,27 @@ class WorldModelTrainer(CommonTrainer):
                     self._sdxl_text_encoder = SDXLTextTargetEncoder(device=dev, dtype=torch.float16)
                 image_clip_seq_labels, image_clip_pooled_labels = self._sdxl_text_encoder.encode(captions)
 
+        # Z-Image-adapter path: compute the Qwen3-4B(caption) regression targets
+        # (resampled to seq_len), lazy-loading the frozen 4-bit Qwen3 encoder once.
+        # No-op unless image_generator is a ZImageConditioningAdapter.
+        image_cond_labels = None
+        if (image_inputs is not None
+                and isinstance(getattr(unwrapped_model, "image_generator", None), ZImageConditioningAdapter)):
+            captions = inputs.get("text_texts")
+            if captions is not None:
+                if self._zimage_text_encoder is None:
+                    from megatransformer.utils.zimage_text_encoder import Qwen3TextTargetEncoder
+                    dev = next(unwrapped_model.parameters()).device
+                    icfg = unwrapped_model.image_generator.config
+                    self._zimage_text_encoder = Qwen3TextTargetEncoder(
+                        model_name=getattr(icfg, "target_model", "Tongyi-MAI/Z-Image-Turbo"),
+                        seq_len=getattr(icfg, "seq_len", 64),
+                        device=dev,
+                        max_length=getattr(icfg, "target_max_length", 512),
+                        load_in_4bit=getattr(icfg, "target_load_in_4bit", True),
+                    )
+                image_cond_labels = self._zimage_text_encoder.encode(captions)
+
         # Enable per-iteration stat tracking at logging steps. Training only: the stats are
         # logged under train/ and collecting them costs ~6 GPU syncs per recurrent
         # iteration (~192 per step), so paying that on eval batches bought nothing.
@@ -772,6 +795,7 @@ class WorldModelTrainer(CommonTrainer):
             image_latent_labels=image_latent_labels,
             image_clip_seq_labels=image_clip_seq_labels,
             image_clip_pooled_labels=image_clip_pooled_labels,
+            image_cond_labels=image_cond_labels,
             precomputed_latents=self.precomputed_latents,
             decode_outputs=False,
             is_synthesis=is_synthesis,

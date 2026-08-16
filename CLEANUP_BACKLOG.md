@@ -27,9 +27,11 @@ Engineering cleanups, deferred wiring, and missing tests — distinct from
   checkpoint-300 (commit 5d42fd5 added `--text_encoder_model` + collator special_token_base).
   End-to-end pass: target CLIP 0.417, generated 0.048 (near-random at 300 steps, expected).
 
-- [ ] **Add `diffusers` + `accelerate` to the uv `training` dependency group** once SDXL is
-  committed to. Currently transient (`uv pip install`), so `uv sync` would drop them.
-  Touches: `pyproject.toml`, `uv.lock`, `requirements.txt`.
+- [x] **Add `diffusers` (+ `bitsandbytes`) to the uv `training` dependency group.** DONE —
+  `diffusers>=0.39` and `bitsandbytes` (4-bit Qwen3-4B target encoder) added to the training
+  group in `pyproject.toml`. `accelerate` was already present. NOTE: not yet `uv sync`'d /
+  `uv.lock`+`requirements.txt` not regenerated (avoided disturbing a live training env) —
+  do `uv sync` before the first Z-Image run.
 
 - [x] **Update `multimodal_chat.py` (Gradio) for the SDXL-adapter image path.** DONE.
   (a) `--text_encoder_model` added — builds the same overrides as `eval_sdxl_adapter.py`

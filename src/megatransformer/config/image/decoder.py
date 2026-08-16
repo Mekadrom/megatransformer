@@ -295,5 +295,49 @@ class SDXLAdapterConfig:
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 
+
+@dataclass
+class ZImageAdapterConfig:
+    """Configuration for the Z-Image conditioning adapter (frozen Z-Image-Turbo path).
+
+    Selected by the world model when `image_coda_config` is this type (existing
+    ImageDecoderConfig / DiffusionBridgeImageDecoderConfig / SDXLAdapterConfig configs
+    are untouched, so this is fully backwards compatible). Instead of predicting an
+    image latent, the adapter maps the trunk's K image gen-query outputs to the Qwen3-4B
+    text conditioning Z-Image's S3-DiT cross-attends over: a fixed seq_len x 2560
+    sequence (Qwen3-4B penultimate hidden states, resampled to seq_len). No pooled
+    vector (Z-Image has none). See model/image/zimage_adapter.py and
+    utils/zimage_text_encoder.py.
+    """
+
+    # Trunk hidden size (input gen-query dim). Must match the recurrent d_model.
+    d_model: int = 768
+    # Adapter internal width.
+    adapter_dim: int = 768
+    n_heads: int = 12
+    n_layers: int = 2          # self-attn layers over the K gen queries
+    n_cross_layers: int = 2    # cross-attn layers (seq_len slots attend the K queries)
+    dropout: float = 0.0
+
+    # Z-Image conditioning target shapes.
+    seq_len: int = 64          # K conditioning tokens the adapter emits (Z-Image cross-
+                               # attends over any count, so K is free; the trainer
+                               # resamples the variable-length Qwen3 target to this K)
+    seq_dim: int = 2560        # Qwen3-4B hidden size
+
+    # BASELINE = pure MSE (contrastive_weight=0). The loss-engineering tiers (whitened
+    # MSE, manifold/InfoNCE, through-DiT flow-matching) are deferred; see project memory.
+    contrastive_weight: float = 0.0
+    contrastive_temp: float = 0.07
+
+    # Target encoder (Z-Image's frozen Qwen3-4B), used by the world trainer to build
+    # regression targets. 4-bit keeps it ~2.5GB so it fits alongside training.
+    target_model: str = "Tongyi-MAI/Z-Image-Turbo"
+    target_max_length: int = 512
+    target_load_in_4bit: bool = True
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
     def to_json_string(self) -> str:
         return json.dumps(self.to_dict(), indent=2)

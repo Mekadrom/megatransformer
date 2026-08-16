@@ -13,6 +13,7 @@ from megatransformer.config.image.decoder import (
     DiffusionBridgeImageDecoderConfig,
     ImageDecoderConfig,
     SDXLAdapterConfig,
+    ZImageAdapterConfig,
 )
 from megatransformer.config.image.feature_extractor import ImageVAEPreludeFeatureExtractorConfig
 from megatransformer.config.text.feature_extractor import TextPreludeFeatureExtractorConfig
@@ -187,7 +188,7 @@ class MegaTransformerWorldModelConfig:
     #     attractor of the direct path.
     # None disables image generation entirely. The world model dispatches on
     # the actual config type to instantiate the right decoder class.
-    image_coda_config: Optional[Union[ImageDecoderConfig, DiffusionBridgeImageDecoderConfig, SDXLAdapterConfig]] = None
+    image_coda_config: Optional[Union[ImageDecoderConfig, DiffusionBridgeImageDecoderConfig, SDXLAdapterConfig, ZImageAdapterConfig]] = None
 
     # Scale embeddings by sqrt(d_model) before recurrent block (Huginn-style)
     scale_embeddings: bool = False
@@ -506,4 +507,18 @@ WORLD_MODEL_CONFIGS["small_sum_sdxl"].image_coda_config = SDXLAdapterConfig(
     n_layers=2,
     n_cross_layers=2,
     contrastive_weight=1.0,
+)
+
+# Frozen Z-Image-Turbo path: predict Qwen3-4B conditioning instead of CLIP. Only the
+# image_coda_config changes; everything else stays in sync with small_sum. BASELINE =
+# pure MSE (contrastive_weight=0) to measure the naive target before any loss tricks.
+WORLD_MODEL_CONFIGS["small_sum_zimage"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum"])
+WORLD_MODEL_CONFIGS["small_sum_zimage"].image_coda_config = ZImageAdapterConfig(
+    d_model=768,          # match the recurrent/trunk d_model (small_sum uses 768)
+    adapter_dim=768,
+    n_heads=12,
+    n_layers=2,
+    n_cross_layers=2,
+    seq_len=64,
+    contrastive_weight=0.0,
 )
