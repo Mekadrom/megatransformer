@@ -1532,10 +1532,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         pipe = None
         try:
             torch.cuda.empty_cache()
-            from diffusers import StableDiffusionXLPipeline
+            from diffusers import StableDiffusionXLPipeline, AutoencoderKL
             print("  [viz] IMAGE_EVAL_RENDER_SDXL=1: loading SDXL for in-loop render...")
+            _vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
             pipe = StableDiffusionXLPipeline.from_pretrained(
-                "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16,
+                "stabilityai/stable-diffusion-xl-base-1.0", vae=_vae, torch_dtype=torch.float16,
                 use_safetensors=True).to(device)
             pipe.set_progress_bar_config(disable=True)
             neg_pe, _, neg_pp, _ = pipe.encode_prompt(prompt="", device=device,

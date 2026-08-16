@@ -114,9 +114,11 @@ def main():
     )
     collator.force_direction = "synthesis"
 
-    # ── SDXL ──
-    from diffusers import StableDiffusionXLPipeline
-    pipe = StableDiffusionXLPipeline.from_pretrained(args.sdxl_model, torch_dtype=torch.float16, use_safetensors=True).to(device)
+    # ── SDXL ── (fp16-safe VAE: SDXL's stock VAE can decode to black/NaN in fp16)
+    from diffusers import StableDiffusionXLPipeline, AutoencoderKL
+    _vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
+    pipe = StableDiffusionXLPipeline.from_pretrained(
+        args.sdxl_model, vae=_vae, torch_dtype=torch.float16, use_safetensors=True).to(device)
     pipe.set_progress_bar_config(disable=True)
     neg_pe, _, neg_pp, _ = pipe.encode_prompt(prompt="", device=device, num_images_per_prompt=1, do_classifier_free_guidance=False)
 
