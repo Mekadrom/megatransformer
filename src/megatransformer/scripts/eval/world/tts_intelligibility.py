@@ -81,6 +81,9 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.8, help="Text sampling temperature")
     p.add_argument("--voice_temperature", type=float, default=0.0, help="Voice latent sampling (0=deterministic mu)")
     p.add_argument("--voice_variance_floor", type=float, default=0.0)
+    p.add_argument("--voice_min_frames", type=int, default=0,
+                   help="Forbid EOV until this many content frames emitted (0=off). Diagnostic: does "
+                        "forcing longer generation fill deletions with correct words, or just babble?")
     # ASR / WER
     p.add_argument("--whisper_model", default="base")
     p.add_argument("--vocoder_sample_rate", type=int, default=16000,
@@ -156,7 +159,8 @@ def main():
         with autocast(device, dtype=dtype, enabled=args.bf16):
             outputs = model.generate(text_input_ids=prompt, max_new_tokens=args.max_new_tokens,
                                      temperature=args.temperature, voice_temperature=args.voice_temperature,
-                                     voice_variance_floor=args.voice_variance_floor)
+                                     voice_variance_floor=args.voice_variance_floor,
+                                     voice_min_frames=args.voice_min_frames)
         vp = outputs.get("voice_latent_preds")
         if vp is None or vp.numel() == 0:
             n_no_voice += 1

@@ -858,6 +858,11 @@ class MegaTransformerWorldModel(nn.Module):
         # sampling (anti-collapse mitigation).
         voice_temperature: float = 0.0,
         voice_variance_floor: float = 0.0,
+        # Decode-time EOV suppression: forbid the EOV token (discrete path) until at least this
+        # many content frames have been emitted for a sequence. 0 (default) => no suppression,
+        # byte-identical to prior behavior (training-viz generate() never sets this). A diagnostic
+        # lever to test whether "under-speaking" is the model quitting early vs already-drifted.
+        voice_min_frames: int = 0,
         # Pre-encoded media for transcription / cross-modal tasks
         audio_inputs: Optional[torch.Tensor] = None,
         audio_lengths: Optional[torch.Tensor] = None,
@@ -1361,6 +1366,13 @@ class MegaTransformerWorldModel(nn.Module):
                             # back to the prelude and handed to the SMG, so generation
                             # stays on the same manifold the SMG was trained on.
                             logits = unit_logits[0, -1]  # (K+1,) -- includes the EOV token
+                            # Decode-time EOV suppression: forbid the terminal token until at least
+                            # voice_min_frames content frames have been emitted for this sequence
+                            # (len(trace) = frames so far, since EOV would have stopped it earlier).
+                            # Default 0 => never triggers => unchanged behavior.
+                            if voice_min_frames > 0 and len(voice_unit_id_trace[b]) < voice_min_frames:
+                                logits = logits.clone()
+                                logits[self.voice_codebook.shape[0]] = float("-inf")
                             if voice_temperature > 0.0:
                                 probs = torch.softmax(logits.float() / voice_temperature, dim=-1)
                                 unit_id = torch.multinomial(probs, 1)[0]
