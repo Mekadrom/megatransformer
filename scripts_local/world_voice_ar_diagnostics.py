@@ -50,13 +50,15 @@ def build_args(a):
         use_memorization_dataset=False, max_samples=None, num_eval_samples=a.n,
         tie_word_embeddings=False, share_block_weights=False,
         gen_query_mode=None, n_image_gen_positions=None, iteration_norm=None,
+        text_encoder_model=getattr(a, "text_encoder_model", None),
     )
 
 
-def make_collator(K):
+def make_collator(K, special_token_base=constants.SPECIAL_TOKEN_BASE):
     return MultimodalDataCollator(
         max_seq_len=1024, max_waveforms=160000, max_mel_spec_frames=625,
         max_sive_feature_frames=209, voice_eov_id=K,
+        special_token_base=special_token_base,
     )
 
 
@@ -87,7 +89,11 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
     idxs = list(range(min(n, len(dataset))))
     tot = {"real_hits": 0, "shuf_hits": 0, "content": 0, "ce_real": 0.0, "ce_n": 0,
            "eov_hits": 0, "eov_tot": 0,
-           "early_real": 0, "early_shuf": 0, "early_content": 0}
+           "early_real": 0, "early_shuf": 0, "early_content": 0,
+           # Top-k membership (real text): is the TRUE unit in the model's top-k? Far less
+           # entropy-sensitive than top-1 -- disentangles "conditioning is weak" from "the target
+           # is one-to-many so top-1 is capped but the right unit is right there in the top few".
+           "real_top5": 0, "real_top10": 0, "early_top5": 0, "early_top10": 0}
     for s in range(0, len(idxs), bs):
         samples = [dataset[i] for i in idxs[s:s + bs]]
         samples = [x for x in samples if any(k.startswith("voice_") for k in x)]
@@ -119,6 +125,13 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
         tot["real_hits"] += (pr[content] == t[content]).sum().item()
         tot["shuf_hits"] += (ps[content] == t[content]).sum().item()
         tot["content"] += int(content.sum().item())
+        # Top-k membership on real text (compute top-10 once, derive top-5 from it).
+        top10 = lr.topk(10, dim=-1).indices                  # (Bc, Tc, 10)
+        tmatch = (top10 == t.unsqueeze(-1))
+        hit10 = tmatch.any(-1)
+        hit5 = tmatch[..., :5].any(-1)
+        tot["real_top5"] += int(hit5[content].sum().item())
+        tot["real_top10"] += int(hit10[content].sum().item())
         # Early-frame (text-dominant) region: first early_k voice positions.
         early = content.clone()
         early[:, early_k:] = False
@@ -126,6 +139,8 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
             tot["early_real"] += (pr[early] == t[early]).sum().item()
             tot["early_shuf"] += (ps[early] == t[early]).sum().item()
             tot["early_content"] += int(early.sum().item())
+            tot["early_top5"] += int(hit5[early].sum().item())
+            tot["early_top10"] += int(hit10[early].sum().item())
         ce = F.cross_entropy(lr.reshape(Bc * Tc, V), t.reshape(Bc * Tc), ignore_index=-100)
         tot["ce_real"] += ce.item() * Bc
         tot["ce_n"] += Bc
@@ -138,11 +153,15 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
     ce_real = tot["ce_real"] / max(tot["ce_n"], 1)
     e_real = tot["early_real"] / max(tot["early_content"], 1)
     e_shuf = tot["early_shuf"] / max(tot["early_content"], 1)
+    cc = max(tot["content"], 1)
+    ec = max(tot["early_content"], 1)
     return {
         "acc_real": acc_real, "acc_shuf": acc_shuf, "text_delta": acc_real - acc_shuf,
         "ce_real": ce_real, "ppl_real": math.exp(ce_real),
         "eov_acc": tot["eov_hits"] / max(tot["eov_tot"], 1), "content_positions": tot["content"],
         "early_acc_real": e_real, "early_acc_shuf": e_shuf, "early_text_delta": e_real - e_shuf,
+        "top5_real": tot["real_top5"] / cc, "top10_real": tot["real_top10"] / cc,
+        "early_top5_real": tot["early_top5"] / ec, "early_top10_real": tot["early_top10"] / ec,
     }
 
 
@@ -186,7 +205,8 @@ def seq_degeneration(seqs, K):
 
 
 @torch.no_grad()
-def run_generation(model, dataset, collator, device, gen_n, K, budget=209):
+def run_generation(model, dataset, collator, device, gen_n, K, budget=209,
+                   bov_id=constants.BOV_TOKEN_ID):
     """Free-running generation from text prompts; return generated + GT unit sequences + EOV info.
 
     Also collects per-sample prompt TEXT length (tokens before BOV) so the caller can correlate
@@ -202,7 +222,7 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget=209):
             continue
         b = collator([s])
         text = b["text_token_ids"][0]
-        bov = (text == constants.BOV_TOKEN_ID).nonzero(as_tuple=True)[0]
+        bov = (text == bov_id).nonzero(as_tuple=True)[0]
         if len(bov) == 0:
             continue
         prompt_lens.append(int(bov[0].item()))   # text tokens before BOV = transcript length proxy
@@ -251,6 +271,9 @@ def main():
     ap.add_argument("--cache_dir", required=True, help="voice base dir (has /val)")
     ap.add_argument("--codebook", required=True)
     ap.add_argument("--config", default="small_sum")
+    ap.add_argument("--text_encoder_model", default=None,
+                    help="Pretrained-LLM text encoder id (e.g. HuggingFaceTB/SmolLM2-135M) if the "
+                         "checkpoint was trained with one; must match, else the load state-mismatches.")
     ap.add_argument("--n", type=int, default=256, help="TF/ablation val utterances")
     ap.add_argument("--bs", type=int, default=16, help="TF/ablation batch size (lower to avoid OOM "
                     "when sharing a GPU with a training run)")
@@ -283,9 +306,13 @@ def main():
     model.set_voice_codebook(codebook)
     model.to(device).eval()
 
+    # Control-token base from the loaded model (32000 default / native LLM vocab in pretrained
+    # mode). The collator must inject the placeholder/BOV ids at the SAME base the model detects.
+    sp_base = getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE)
+    sp = constants.special_token_ids(sp_base)
     eval_dataset = load_dataset(args, "val")
-    collator = make_collator(K)
-    print(f"val: {len(eval_dataset)} | K={K}", flush=True)
+    collator = make_collator(K, special_token_base=sp_base)
+    print(f"val: {len(eval_dataset)} | K={K} | special_token_base={sp_base}", flush=True)
 
     alpha_label = ("1.0 (inference regime, full voice attention)" if a.voice_attn_alpha is None
                    else f"{a.voice_attn_alpha} (1:1 with training at this step)")
@@ -294,7 +321,7 @@ def main():
                              voice_attn_alpha=a.voice_attn_alpha)
     if not a.skip_generation:
         print("2/3 free-running generation ...", flush=True)
-        gen, gt, eov_fired, budget_hit, prompt_lens = run_generation(model, eval_dataset, collator, device, a.gen_n, K)
+        gen, gt, eov_fired, budget_hit, prompt_lens = run_generation(model, eval_dataset, collator, device, a.gen_n, K, bov_id=sp.BOV)
         print("3/3 degeneration stats ...", flush=True)
         gen_deg = seq_degeneration(gen, K)
         gt_deg = seq_degeneration(gt, K)
@@ -311,12 +338,22 @@ def main():
     lines.append("## 1. Teacher-forced unit prediction (held-out) vs n-gram ceiling\n")
     lines.append("| metric | value |\n|---|---|")
     lines.append(f"| acc_real (content top-1) | {tf['acc_real']:.4f} |")
+    lines.append(f"| top-5 (content, real) | {tf['top5_real']:.4f} |")
+    lines.append(f"| top-10 (content, real) | {tf['top10_real']:.4f} |")
+    lines.append(f"| early top-1 (real) | {tf['early_acc_real']:.4f} |")
+    lines.append(f"| early top-5 (real) | {tf['early_top5_real']:.4f} |")
+    lines.append(f"| early top-10 (real) | {tf['early_top10_real']:.4f} |")
     lines.append(f"| ppl_real | {tf['ppl_real']:.2f} |")
     lines.append(f"| ce_real (nats) | {tf['ce_real']:.4f} |")
     lines.append(f"| eov_position_acc | {tf['eov_acc']:.4f} |")
     lines.append(f"| — n-gram ceiling (ref) | {a.ngram_ceiling:.4f} |")
     lines.append(f"| — n-gram asymptote (ref) | {a.asymptote:.4f} |")
     lines.append(f"| — repeat crutch (ref) | {a.repeat:.4f} |")
+    # Top-k vs top-1: a large top-1->top-k lift on real text means the TRUE unit is in the
+    # model's top few -- the top-1 ceiling is target entropy (one-to-many), not a conditioning wall.
+    lines.append(f"\n**top-1 {tf['acc_real']:.3f} -> top-5 {tf['top5_real']:.3f} -> top-10 "
+                 f"{tf['top10_real']:.3f}** (all-position). A big lift => the top-1 ceiling is "
+                 f"target multimodality, not a conditioning/capability wall.\n")
     verdict = ("ABOVE asymptote — uses more than local statistics" if tf['acc_real'] > a.asymptote
                else "ABOVE ceiling — likely using text/long-range" if tf['acc_real'] > a.ngram_ceiling
                else "between crutch and ceiling — local-statistics regime" if tf['acc_real'] > a.repeat
