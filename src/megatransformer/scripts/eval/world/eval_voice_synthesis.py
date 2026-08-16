@@ -116,6 +116,23 @@ def load_world_model(args, device):
         overrides["voice_prelude_config"] = prelude_cfg
         overrides["voice_coda_config"] = coda_cfg
 
+    # Pretrained-LLM text encoder: match the trained architecture (frozen LLM body + translators +
+    # special extension). from_config reconstructs the config, so __post_init__ re-derives the
+    # interleaver placeholder ids from the overridden special_token_base.
+    if getattr(args, "text_encoder_model", None):
+        from transformers import AutoConfig, AutoTokenizer
+        from megatransformer.utils import constants
+        _llm_cfg = AutoConfig.from_pretrained(args.text_encoder_model)
+        _eos = _llm_cfg.eos_token_id
+        if _eos is None:
+            _eos = AutoTokenizer.from_pretrained(args.text_encoder_model).eos_token_id
+        overrides["special_token_base"] = int(_llm_cfg.vocab_size)
+        overrides["eos_token_id"] = int(_eos)
+        overrides["text_encoder"] = {
+            "model": args.text_encoder_model, "freeze": True,
+            "translator_hidden_mult": 2.0, "n_special_tokens": constants.N_SPECIAL_TOKENS,
+        }
+
     model = model_loading_utils.load_model(
         MegaTransformerWorldModel, args.config,
         checkpoint_path=args.checkpoint_path,

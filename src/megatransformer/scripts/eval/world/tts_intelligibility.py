@@ -19,12 +19,12 @@ stochastic intelligibility.
 """
 import argparse, json, os, re
 import numpy as np
+import soxr
 import torch
 from torch.amp import autocast
 
 from transformers import AutoTokenizer
 from megatransformer.utils import model_loading_utils
-from megatransformer.utils.constants import BOV_TOKEN_ID
 from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
 from megatransformer.scripts.eval.world.eval_voice_synthesis import (
     load_world_model, decode_sive_to_mel, mel_to_waveform, encode_static_prompt,
@@ -43,6 +43,9 @@ def parse_args():
     # world model
     p.add_argument("--checkpoint_path", required=True)
     p.add_argument("--config", required=True)
+    p.add_argument("--text_encoder_model", default=None,
+                   help="Pretrained-LLM text encoder id (e.g. HuggingFaceTB/SmolLM2-135M) if the "
+                        "checkpoint used one; sets base + uses that tokenizer for prompts/refs.")
     p.add_argument("--include_modes", default="text,voice")
     p.add_argument("--tie_word_embeddings", action="store_true")
     p.add_argument("--bf16", action="store_true")
@@ -51,10 +54,22 @@ def parse_args():
     p.add_argument("--voice_cache_dir", required=True)
     p.add_argument("--max_samples", type=int, default=200)
     p.add_argument("--seed", type=int, default=7)
+    # Data-parallel sharding: run N workers on the same (or different) GPU, each taking a
+    # disjoint stripe of the SAME seed-selected index set. AR generation is latency-bound at
+    # batch 1, so the GPU sits idle — N concurrent workers fill it. Merge the per-shard JSONs after.
+    p.add_argument("--num_shards", type=int, default=1)
+    p.add_argument("--shard_id", type=int, default=0)
+    # Discrete-voice (Mimi unit) path — needed to rebuild the trained voice config before load.
+    p.add_argument("--voice_codebook_path", default=None,
+                   help="Mimi codebook .pt; routes generation through the discrete unit path (K+1 unit head).")
+    p.add_argument("--voice_feature_channels", type=int, default=None)
+    p.add_argument("--voice_predict_f0", action="store_true")
     # SMG + vocoder + target voice
     p.add_argument("--voice_smg_checkpoint_path", required=True)
     p.add_argument("--voice_smg_config", default="medium_decoder_only_1d_3x")
     p.add_argument("--voice_smg_sive_encoder_dim", type=int, default=256)
+    p.add_argument("--voice_smg_speaker_embedding_dim", type=int, default=None,
+                   help="SMG speaker-embedding dim (wavlm=768, ecapa=192). Must match the SMG checkpoint.")
     p.add_argument("--vocoder_config", default="hifigan")
     p.add_argument("--vocoder_checkpoint_path", default=None)
     p.add_argument("--mel_hop_length", type=int, default=256,
@@ -68,6 +83,9 @@ def parse_args():
     p.add_argument("--voice_variance_floor", type=float, default=0.0)
     # ASR / WER
     p.add_argument("--whisper_model", default="base")
+    p.add_argument("--vocoder_sample_rate", type=int, default=16000,
+                   help="Actual output rate of the vocoder (vocos=24000, hifigan=16000). Audio is "
+                        "resampled to 16000 for Whisper, which assumes a 16 kHz array.")
     p.add_argument("--sample_rate", type=int, default=16000)
     p.add_argument("--output_dir", default="eval_outputs/tts_intelligibility_0")
     p.add_argument("--save_worst", type=int, default=8, help="Save the K worst-WER wavs for inspection")
@@ -81,12 +99,24 @@ def main():
     dtype = torch.bfloat16 if args.bf16 else torch.float32
     os.makedirs(args.output_dir, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+    # Tokenizer + control-token base must match the checkpoint. Pretrained mode: the LLM's own
+    # tokenizer + its native vocab as base; else Mistral 32000.
+    tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_model or "mistralai/Mistral-7B-v0.1")
 
     print(f"Loading world model {args.config} @ {args.checkpoint_path} ...")
     model = load_world_model(args, device).to(device).eval()
+    from megatransformer.utils import constants
+    sp_base = getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE)
+    sp = constants.special_token_ids(sp_base)
 
     smg_overrides = {"sive_encoder_dim": args.voice_smg_sive_encoder_dim} if args.voice_smg_sive_encoder_dim else {}
+    if args.voice_smg_speaker_embedding_dim:
+        smg_overrides["speaker_embedding_dim"] = args.voice_smg_speaker_embedding_dim
+    # A mimi/discrete SMG inits its unit-embedding from codebook centroids (learned_centroid);
+    # from_config requires them even though inference decodes continuous centroid frames.
+    if args.voice_codebook_path:
+        from megatransformer.utils.codebook import load_codebook
+        smg_overrides["unit_embed_centroids"] = load_codebook(args.voice_codebook_path)
     from megatransformer.model.smg.smg import SMG
     smg = model_loading_utils.load_model(SMG, args.voice_smg_config, checkpoint_path=args.voice_smg_checkpoint_path,
                                          strict=False, overrides=smg_overrides).to(device).eval()
@@ -105,6 +135,9 @@ def main():
 
     ds = VoiceShardedDataset(args.voice_cache_dir, columns=["features", "speaker_embeddings", "text", "token_ids", "text_lengths"])
     idxs = sorted(np.random.RandomState(args.seed).choice(len(ds), min(args.max_samples, len(ds)), replace=False).tolist())
+    if args.num_shards > 1:
+        idxs = idxs[args.shard_id::args.num_shards]  # disjoint stripe for this worker
+        print(f"shard {args.shard_id}/{args.num_shards}: {len(idxs)} utterances")
 
     rows, n_no_voice = [], 0
     for k, i in enumerate(idxs):
@@ -115,11 +148,11 @@ def main():
         ref = str(ref or "").strip()
         if not ref and s.get("token_ids") is not None:  # fall back to detokenizing
             tl = int(s.get("text_length", len(s["token_ids"])))
-            ref = tokenizer.decode([t for t in s["token_ids"][:tl].tolist() if 0 < t < 32000], skip_special_tokens=True)
+            ref = tokenizer.decode([t for t in s["token_ids"][:tl].tolist() if 0 < t < sp_base], skip_special_tokens=True)
         if not ref:
             continue
 
-        prompt = encode_static_prompt(ref[:500], [BOV_TOKEN_ID], tokenizer, args.max_new_tokens, 1024, device)
+        prompt = encode_static_prompt(ref[:500], [sp.BOV], tokenizer, args.max_new_tokens, 1024, device)
         with autocast(device, dtype=dtype, enabled=args.bf16):
             outputs = model.generate(text_input_ids=prompt, max_new_tokens=args.max_new_tokens,
                                      temperature=args.temperature, voice_temperature=args.voice_temperature,
@@ -133,11 +166,18 @@ def main():
         spk = static_spk if static_spk is not None else s.get("speaker_embedding")
         if spk is None:
             continue
-        mel = decode_sive_to_mel(smg, vp[0, 0], spk)  # (n_mels, T)
+        # This SMG reads the world model's speaker-normalized F0 contour (voice_f0_preds), not
+        # prosody from the content features — pass it through or the contour SMG errors.
+        f0p = outputs.get("voice_f0_preds")
+        f0c = f0p[0, 0] if f0p is not None and f0p.numel() > 0 else None
+        mel = decode_sive_to_mel(smg, vp[0, 0], spk, f0_contour=f0c)  # (n_mels, T)
         wav = np.asarray(render_vocoder_audio(vocoder, mel.unsqueeze(0),
                          mel_hop_length=args.mel_hop_length, vocoder_hop_length=_voc_hop),
                          dtype=np.float32).reshape(-1)
-        hyp = asr.transcribe(wav, language="en", fp16=False).get("text", "")
+        # Whisper assumes a 16 kHz numpy array; resample if the vocoder runs at another rate
+        # (vocos here is 24 kHz — feeding it raw would pitch/speed the audio and garble ASR).
+        wav16 = wav if args.vocoder_sample_rate == 16000 else soxr.resample(wav, args.vocoder_sample_rate, 16000)
+        hyp = asr.transcribe(np.ascontiguousarray(wav16, dtype=np.float32), language="en", fp16=False).get("text", "")
 
         r, h = normalize_text(ref), normalize_text(hyp)
         w = float(jiwer_wer(r, h)) if r else float("nan")
