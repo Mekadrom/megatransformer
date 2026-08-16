@@ -70,8 +70,8 @@ def parse_args():
     # latent, and we render pixels here with a frozen SDXL pipeline.
     p.add_argument("--sdxl_model", type=str, default="stabilityai/stable-diffusion-xl-base-1.0",
                    help="SDXL base model for rendering the adapter's predicted conditioning.")
-    p.add_argument("--sdxl_gen_steps", type=int, default=25,
-                   help="SDXL diffusion steps (adapter path). UI 'image diffusion steps' overrides if >0.")
+    p.add_argument("--sdxl_gen_steps", type=int, default=30,
+                   help="SDXL diffusion steps (adapter path, DPM++ 2M Karras). UI 'image diffusion steps' overrides if >0.")
     p.add_argument("--sdxl_guidance", type=float, default=7.0,
                    help="SDXL classifier-free guidance scale (adapter path).")
     p.add_argument("--max_new_tokens", type=int, default=512)
@@ -460,10 +460,13 @@ def main():
     sdxl_neg = None
     if isinstance(getattr(model, "image_generator", None), SDXLConditioningAdapter):
         print(f"Image generator is SDXLConditioningAdapter — loading SDXL ({args.sdxl_model})...")
-        from diffusers import StableDiffusionXLPipeline, AutoencoderKL
+        from diffusers import StableDiffusionXLPipeline, AutoencoderKL, DPMSolverMultistepScheduler
         _sdxl_vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
         sdxl_pipe = StableDiffusionXLPipeline.from_pretrained(
             args.sdxl_model, vae=_sdxl_vae, torch_dtype=torch.float16, use_safetensors=True).to(device)
+        # DPM++ 2M Karras is the project default (crisper than stock Euler at equal steps).
+        sdxl_pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            sdxl_pipe.scheduler.config, use_karras_sigmas=True)
         sdxl_pipe.set_progress_bar_config(disable=True)
         _neg_pe, _, _neg_pp, _ = sdxl_pipe.encode_prompt(
             prompt="", device=device, num_images_per_prompt=1, do_classifier_free_guidance=False)

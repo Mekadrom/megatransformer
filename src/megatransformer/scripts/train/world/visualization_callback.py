@@ -1532,12 +1532,14 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         pipe = None
         try:
             torch.cuda.empty_cache()
-            from diffusers import StableDiffusionXLPipeline, AutoencoderKL
+            from diffusers import StableDiffusionXLPipeline, AutoencoderKL, DPMSolverMultistepScheduler
             print("  [viz] IMAGE_EVAL_RENDER_SDXL=1: loading SDXL for in-loop render...")
             _vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
             pipe = StableDiffusionXLPipeline.from_pretrained(
                 "stabilityai/stable-diffusion-xl-base-1.0", vae=_vae, torch_dtype=torch.float16,
                 use_safetensors=True).to(device)
+            # DPM++ 2M Karras: project-default SDXL sampler (crisper than stock Euler).
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config, use_karras_sigmas=True)
             pipe.set_progress_bar_config(disable=True)
             neg_pe, _, neg_pp, _ = pipe.encode_prompt(prompt="", device=device,
                                                       num_images_per_prompt=1, do_classifier_free_guidance=False)

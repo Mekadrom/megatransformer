@@ -35,7 +35,7 @@ def parse_args():
     p.add_argument("--cache_dir", type=str, default=None)
     p.add_argument("--max_samples", type=int, default=8)
     p.add_argument("--sdxl_model", type=str, default="stabilityai/stable-diffusion-xl-base-1.0")
-    p.add_argument("--gen_steps", type=int, default=25)
+    p.add_argument("--gen_steps", type=int, default=30)
     p.add_argument("--guidance", type=float, default=7.0)
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--text_encoder_model", type=str, default=None,
@@ -115,10 +115,13 @@ def main():
     collator.force_direction = "synthesis"
 
     # ── SDXL ── (fp16-safe VAE: SDXL's stock VAE can decode to black/NaN in fp16)
-    from diffusers import StableDiffusionXLPipeline, AutoencoderKL
+    from diffusers import StableDiffusionXLPipeline, AutoencoderKL, DPMSolverMultistepScheduler
     _vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
     pipe = StableDiffusionXLPipeline.from_pretrained(
         args.sdxl_model, vae=_vae, torch_dtype=torch.float16, use_safetensors=True).to(device)
+    # DPM++ 2M Karras: consistently crisper than the stock Euler at equal steps
+    # (validated GT A/B: +0.007 CLIPScore, sharper edges) — the project default.
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config, use_karras_sigmas=True)
     pipe.set_progress_bar_config(disable=True)
     neg_pe, _, neg_pp, _ = pipe.encode_prompt(prompt="", device=device, num_images_per_prompt=1, do_classifier_free_guidance=False)
 
