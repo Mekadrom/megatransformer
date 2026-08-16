@@ -1519,6 +1519,70 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         except Exception:
             return False
 
+    def _render_sdxl_adapter(self, model, eval_dataset, collator, device, global_step, tag):
+        """Opt-in in-loop image viz for the SDXL adapter (IMAGE_EVAL_RENDER_SDXL=1).
+
+        Loads the FULL SDXL pipeline (~5GB UNet + VAE + gen activations) *alongside* the
+        resident training state (optimizer/grads/master weights — HF doesn't offload them
+        at eval). May OOM; that's the point of the flag. The pipe is loaded and FREED each
+        eval so it never permanently starves training memory, and OOM is caught so the run
+        survives and falls back to the sidecar (eval_sdxl_adapter.py).
+        """
+        import numpy as np
+        pipe = None
+        try:
+            torch.cuda.empty_cache()
+            from diffusers import StableDiffusionXLPipeline
+            print("  [viz] IMAGE_EVAL_RENDER_SDXL=1: loading SDXL for in-loop render...")
+            pipe = StableDiffusionXLPipeline.from_pretrained(
+                "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16,
+                use_safetensors=True).to(device)
+            pipe.set_progress_bar_config(disable=True)
+            neg_pe, _, neg_pp, _ = pipe.encode_prompt(prompt="", device=device,
+                                                      num_images_per_prompt=1, do_classifier_free_guidance=False)
+            n = min(self.num_eval_samples, 4)
+            samples = self._get_eval_samples(eval_dataset, collator, n, requires_image=True)
+            unwrapped = model.module if hasattr(model, "module") else model
+
+            def _render(seq, pool, seed):
+                g = torch.Generator(device=device).manual_seed(seed)
+                return pipe(prompt_embeds=seq.half(), pooled_prompt_embeds=pool.half(),
+                            negative_prompt_embeds=neg_pe.half(), negative_pooled_prompt_embeds=neg_pp.half(),
+                            num_inference_steps=20, guidance_scale=7.0, height=1024, width=1024,
+                            generator=g).images[0]
+
+            def _chw(pil):
+                return np.asarray(pil).astype(np.float32).transpose(2, 0, 1) / 255.0
+
+            for i, sample in enumerate(samples):
+                batch = collator([sample])
+                caption = (batch.get("text_texts") or [""])[0] or ""
+                with torch.no_grad():
+                    out = unwrapped(text_input_ids=batch["text_token_ids"].to(device),
+                                    image_inputs=batch["image_images"].unsqueeze(1).to(device),
+                                    precomputed_latents=True,
+                                    is_synthesis=batch["is_synthesis"].to(device),
+                                    decode_outputs=False)
+                    seq, pool = out.get("image_clip_seq_pred"), out.get("image_clip_pooled_pred")
+                    if seq is None:
+                        continue
+                    seq_t, _, pool_t, _ = pipe.encode_prompt(prompt=caption, device=device,
+                                                             num_images_per_prompt=1, do_classifier_free_guidance=False)
+                    gen = _render(seq[:1], pool[:1], 1000 + i)
+                    tgt = _render(seq_t, pool_t, 1000 + i)
+                metrics.log_image(f"{tag}/image/{i}/generated", _chw(gen), global_step, context={"prompt": caption[:500]})
+                metrics.log_image(f"{tag}/image/{i}/target", _chw(tgt), global_step, context={"prompt": caption[:500]})
+            metrics.flush()
+            print(f"  [viz] in-loop SDXL render OK ({n} samples).")
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"  [viz] in-loop SDXL render OOM'd (training state + SDXL exceed VRAM): "
+                  f"{str(e)[:100]}. Use the sidecar (eval_sdxl_adapter.py) instead.")
+        except Exception as e:
+            print(f"  [viz] in-loop SDXL render failed: {type(e).__name__}: {str(e)[:150]}")
+        finally:
+            del pipe
+            torch.cuda.empty_cache()
+
     def _scenario_text_to_image(self, model, eval_dataset, collator, device, global_step):
         """Scenario 4: Text -> Image synthesis using dataset captions.
 
@@ -1528,8 +1592,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         tag = "text_to_image"
 
         if self._image_gen_is_adapter(model):
-            print("  [viz] image gen = SDXL adapter (CLIP conditioning, no in-loop render); "
-                  "use scripts/eval/world/eval_sdxl_adapter.py for image viz. Skipping.")
+            import os
+            if os.environ.get("IMAGE_EVAL_RENDER_SDXL"):
+                self._render_sdxl_adapter(model, eval_dataset, collator, device, global_step, tag)
+            else:
+                print("  [viz] image gen = SDXL adapter (CLIP conditioning); skipping in-loop render. "
+                      "Set IMAGE_EVAL_RENDER_SDXL=1 to render via SDXL in-loop, or use eval_sdxl_adapter.py.")
             return
 
         samples = self._get_eval_samples(
