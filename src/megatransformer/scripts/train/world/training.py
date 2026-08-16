@@ -1,4 +1,5 @@
 import math
+import time
 from typing import Optional
 
 import torch
@@ -92,6 +93,11 @@ class WorldModelTrainer(CommonTrainer):
         image_latent_loss_weight: float = 1.0,
         # SDXL-adapter path only: weight on the CLIP-conditioning regression loss.
         image_clip_loss_weight: float = 1.0,
+        # Z-Image-adapter path: put the Qwen3-4B target encoder on a SEPARATE device
+        # (e.g. "cuda:1") to free the training GPU's memory + compute. Optionally load
+        # it bf16 there (faster than 4-bit; only fits with headroom).
+        image_target_device: Optional[str] = None,
+        image_target_bf16: bool = False,
         # Variance-matching aux loss weights (per modality). Penalizes
         # collapsed predictions whose std doesn't match the label std.
         # See WorldModelTrainer._compute_modality_recon_loss for details.
@@ -213,7 +219,9 @@ class WorldModelTrainer(CommonTrainer):
         self.image_latent_loss_weight = image_latent_loss_weight
         self.image_clip_loss_weight = image_clip_loss_weight
         self._sdxl_text_encoder = None  # lazy: SDXL CLIP text encoders for adapter targets
-        self._zimage_text_encoder = None  # lazy: Qwen3-4B (4-bit) for Z-Image adapter targets
+        self._zimage_text_encoder = None  # lazy: Qwen3-4B for Z-Image adapter targets
+        self.image_target_device = image_target_device
+        self.image_target_bf16 = image_target_bf16
 
         self.audio_var_loss_weight = audio_var_loss_weight
         self.voice_var_loss_weight = voice_var_loss_weight
@@ -746,18 +754,29 @@ class WorldModelTrainer(CommonTrainer):
                 and isinstance(getattr(unwrapped_model, "image_generator", None), ZImageConditioningAdapter)):
             captions = inputs.get("text_texts")
             if captions is not None:
+                model_device = next(unwrapped_model.parameters()).device
                 if self._zimage_text_encoder is None:
                     from megatransformer.utils.zimage_text_encoder import Qwen3TextTargetEncoder
-                    dev = next(unwrapped_model.parameters()).device
                     icfg = unwrapped_model.image_generator.config
+                    # Target encoder can live on a separate GPU (--image_target_device) to
+                    # free the training card's memory + compute; bf16 there if it has headroom.
+                    tgt_device = self.image_target_device or str(model_device)
+                    load_4bit = getattr(icfg, "target_load_in_4bit", True) and not self.image_target_bf16
                     self._zimage_text_encoder = Qwen3TextTargetEncoder(
                         model_name=getattr(icfg, "target_model", "Tongyi-MAI/Z-Image-Turbo"),
                         seq_len=getattr(icfg, "seq_len", 64),
-                        device=dev,
+                        device=tgt_device,
                         max_length=getattr(icfg, "target_max_length", 512),
-                        load_in_4bit=getattr(icfg, "target_load_in_4bit", True),
+                        load_in_4bit=load_4bit,
                     )
-                image_cond_labels = self._zimage_text_encoder.encode(captions)
+                    print(f"[Qwen3TextTargetEncoder] device={tgt_device} "
+                          f"precision={'4bit' if load_4bit else 'bf16'}", flush=True)
+                _t0 = time.perf_counter()
+                # Encoder may be on a different device; targets move back to the training card.
+                image_cond_labels = self._zimage_text_encoder.encode(captions).to(model_device)
+                if model.training and global_step % self.args.logging_steps == 0:
+                    metrics.log_scalar("train/target_encoder_ms",
+                                       (time.perf_counter() - _t0) * 1000.0, global_step, skip_zero=False)
 
         # Enable per-iteration stat tracking at logging steps. Training only: the stats are
         # logged under train/ and collecting them costs ~6 GPU syncs per recurrent
@@ -2182,6 +2201,8 @@ def create_trainer(
         voice_latent_loss_weight=args.voice_latent_loss_weight,
         image_latent_loss_weight=getattr(args, 'image_latent_loss_weight', 1.0),
         image_clip_loss_weight=getattr(args, 'image_clip_loss_weight', 1.0),
+        image_target_device=getattr(args, 'image_target_device', None),
+        image_target_bf16=getattr(args, 'image_target_bf16', False),
         audio_var_loss_weight=getattr(args, 'audio_var_loss_weight', 1.0),
         voice_var_loss_weight=getattr(args, 'voice_var_loss_weight', 1.0),
         image_var_loss_weight=getattr(args, 'image_var_loss_weight', 1.0),
@@ -2285,8 +2306,18 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--image_latent_loss_weight", type=float, default=1.0,
                             help="Emphasis multiplier for image loss (whitened L1+MSE + var-match)")
     sub_parser.add_argument("--image_clip_loss_weight", type=float, default=1.0,
-                            help="Emphasis multiplier for the SDXL-adapter CLIP-conditioning "
-                                 "regression loss (only used when image_coda_config is SDXLAdapterConfig)")
+                            help="Emphasis multiplier for the SDXL/Z-Image adapter conditioning "
+                                 "regression loss (used when image_coda_config is an adapter config)")
+    sub_parser.add_argument("--image_target_device", type=str, default=None,
+                            help="Z-Image adapter: device for the Qwen3-4B target encoder, e.g. "
+                                 "'cuda:1'. Frees the training GPU's memory+compute. Launch with the "
+                                 "training GPU FIRST in CUDA_VISIBLE_DEVICES (it becomes cuda:0) and "
+                                 "the target GPU second (cuda:1); the Trainer is forced single-GPU so "
+                                 "it won't DataParallel-wrap the model.")
+    sub_parser.add_argument("--image_target_bf16", action="store_true",
+                            help="Z-Image adapter: load the Qwen3-4B target encoder in bf16 (~8GB, "
+                                 "faster than 4-bit) instead of 4-bit. Use with a dedicated "
+                                 "--image_target_device that has headroom.")
 
     # Variance-matching auxiliary loss weights (per modality). The aux loss
     # penalizes (std(preds)/std(labels) - 1), preventing collapse to a constant

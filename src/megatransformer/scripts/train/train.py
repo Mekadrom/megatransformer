@@ -87,7 +87,7 @@ def get_training_args(args, run_dir) -> TrainingArguments:
     os.environ["TENSORBOARD_LOGGING_DIR"] = run_dir
     backend = getattr(args, 'metrics_backend', 'tensorboard')
     report_to = backend if backend in ("tensorboard", "wandb") else "none"
-    return TrainingArguments(
+    ta = TrainingArguments(
         output_dir=run_dir,
         lr_scheduler_type=args.lr_scheduler_type,
         learning_rate=args.learning_rate,
@@ -124,6 +124,13 @@ def get_training_args(args, run_dir) -> TrainingArguments:
         dataloader_persistent_workers=args.dataloader_num_workers > 0,
         dataloader_prefetch_factor=6 if args.dataloader_num_workers > 0 else None,
     )
+    # If the Z-Image target encoder lives on a separate (2nd visible) GPU, keep the
+    # Trainer single-GPU so it doesn't nn.DataParallel-wrap the world model across both
+    # cards (the training model stays on cuda:0; the target encoder sits on cuda:1).
+    if getattr(args, "image_target_device", None) and not args.use_deepspeed:
+        _ = ta.device  # force _setup_devices (model -> first visible GPU)
+        ta._n_gpu = 1
+    return ta
 
 
 def media_frame_budget(args, prefix: str) -> int:
