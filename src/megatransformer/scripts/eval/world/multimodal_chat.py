@@ -74,6 +74,12 @@ def parse_args():
                    help="SDXL diffusion steps (adapter path, DPM++ 2M Karras). UI 'image diffusion steps' overrides if >0.")
     p.add_argument("--sdxl_guidance", type=float, default=7.0,
                    help="SDXL classifier-free guidance scale (adapter path).")
+    # Z-Image adapter (ZImageConditioningAdapter): renders predicted Qwen3 conditioning
+    # (seq, 2560; no pooled) via frozen Z-Image-Turbo. 8 NFEs, guidance 0 (Turbo).
+    p.add_argument("--zimage_model", type=str, default="Tongyi-MAI/Z-Image-Turbo",
+                   help="Z-Image-Turbo model for rendering the adapter's predicted conditioning.")
+    p.add_argument("--zimage_gen_steps", type=int, default=8,
+                   help="Z-Image diffusion steps (Turbo=8). UI 'image diffusion steps' overrides if >0.")
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top_p", type=float, default=0.9)
@@ -485,6 +491,26 @@ def main():
             num_inference_steps=int(steps), guidance_scale=args.sdxl_guidance,
             height=1024, width=1024, generator=g).images[0]
 
+    # Z-Image-adapter path: if the model predicts Qwen3 conditioning (not CLIP/latent),
+    # load frozen Z-Image-Turbo. Only one of sdxl_pipe / zimage_pipe is ever non-None.
+    from megatransformer.model.world.world_model import ZImageConditioningAdapter
+    zimage_pipe = None
+    if isinstance(getattr(model, "image_generator", None), ZImageConditioningAdapter):
+        print(f"Image generator is ZImageConditioningAdapter — loading Z-Image ({args.zimage_model})...")
+        from diffusers import ZImagePipeline
+        zimage_pipe = ZImagePipeline.from_pretrained(args.zimage_model, torch_dtype=torch.bfloat16)
+        zimage_pipe.enable_model_cpu_offload()  # ~20GB stack; offload to coexist with the world model
+        zimage_pipe.set_progress_bar_config(disable=True)
+
+    @torch.no_grad()
+    def render_zimage_cond(seq: torch.Tensor, steps: int, seed: int) -> Image.Image:
+        """Render the adapter's predicted Qwen3 conditioning (seq, 2560) via frozen Z-Image (8-step, no CFG)."""
+        g = torch.Generator(device=device).manual_seed(int(seed))
+        return zimage_pipe(
+            prompt_embeds=[seq.to(torch.bfloat16)],
+            num_inference_steps=int(steps), guidance_scale=0.0,
+            height=1024, width=1024, generator=g).images[0]
+
     smg_decoder = None
     if args.voice_smg_checkpoint_path:
         print(f"Loading voice SMG ({args.voice_smg_config})...")
@@ -732,6 +758,23 @@ def main():
                     status_lines.append(f"Image {k + 1} SDXL render failed "
                                         f"(seq={tuple(seq_pred.shape)}): {type(e).__name__}: {e}")
             status_lines.append(f"Rendered {len(gallery_images)}/{len(conds)} image(s) via SDXL")
+        elif zimage_pipe is not None and image_clip_cond is not None and image_clip_cond[0]:
+            # Z-Image-adapter path: image_clip_cond = List[List[(seq 2560, None)]] (no pooled).
+            conds = image_clip_cond[0]
+            z_steps = image_num_steps if image_num_steps is not None else args.zimage_gen_steps
+            base_seed = int(seed_in) if (seed_in is not None and int(seed_in) >= 0) else 1000
+            status_lines.append(f"image_clip_cond: {len(conds)} image(s); Z-Image steps={z_steps}, guidance=0")
+            if image_iters_per_item and image_iters_per_item[0]:
+                iters_str = ", ".join(str(i) for i in image_iters_per_item[0])
+                status_lines.append(f"Image recurrent iterations per block: [{iters_str}]")
+            for k, (seq_pred, _pooled) in enumerate(conds):
+                try:
+                    img = render_zimage_cond(seq_pred.float(), z_steps, base_seed + k)
+                    gallery_images.append((img, f"image {k + 1}"))
+                except Exception as e:
+                    status_lines.append(f"Image {k + 1} Z-Image render failed "
+                                        f"(seq={tuple(seq_pred.shape)}): {type(e).__name__}: {e}")
+            status_lines.append(f"Rendered {len(gallery_images)}/{len(conds)} image(s) via Z-Image")
         elif image_preds is not None and image_counts is not None:
             n_img = int(image_counts[0].item())
             status_lines.append(f"image_latent_preds: shape={tuple(image_preds.shape) if image_preds.numel() else 'empty'}, counts[0]={n_img}")
