@@ -145,7 +145,7 @@ def main():
         return float((im @ tx.T).item())
 
     # ── loop ──
-    grid, sc_gen, sc_tgt = [], [], []
+    grid, caps, sc_gen, sc_tgt = [], [], [], []
     n = 0
     for i in range(len(dataset)):
         batch = collator([dataset[i]])
@@ -168,7 +168,7 @@ def main():
         tgt = sdxl_render(seq_true.float(), pool_true.float(), 1000 + n)
         sg, st = clipscore(gen, caption), clipscore(tgt, caption)
         sc_gen.append(sg); sc_tgt.append(st)
-        grid.append([tgt, gen])
+        grid.append([tgt, gen]); caps.append(caption)
         print(f"[{n}] CLIP target={st:.3f} generated={sg:.3f} | {caption[:50]}", flush=True)
         n += 1
         if n >= args.max_samples:
@@ -195,13 +195,20 @@ def main():
         from megatransformer.utils import metrics as _m
         step = args.step if args.step is not None else infer_step_from_checkpoint(args.checkpoint_path)
         init_eval_metrics(args.log_dir, args.checkpoint_path)
-        log_eval_scalars({"eval/sdxl_adapter_clip_generated": st_.mean(sc_gen),
-                          "eval/sdxl_adapter_clip_target": st_.mean(sc_tgt)}, step)
+        # Log under text_to_image/* to match the in-loop viz scenario's tag convention,
+        # so the standalone eval's panels land in the same TB group.
+        log_eval_scalars({"text_to_image/clipscore_generated": st_.mean(sc_gen),
+                          "text_to_image/clipscore_target": st_.mean(sc_tgt)}, step)
         logger = _m.get_logger()
         if logger is not None:
+            def _chw(pil):  # HWC uint8 -> CHW float [0,1] (SummaryWriter.add_image expects CHW)
+                return np.asarray(pil).astype(np.float32).transpose(2, 0, 1) / 255.0
             for r, (tgt, gen) in enumerate(grid):
-                _m.log_image(f"eval/sdxl_adapter/{r}/target", np.asarray(tgt), step)
-                _m.log_image(f"eval/sdxl_adapter/{r}/generated", np.asarray(gen), step)
+                cap = caps[r][:500] if r < len(caps) else ""
+                _m.log_image(f"text_to_image/image/{r}/generated", _chw(gen), step,
+                             context={"prompt": cap})
+                _m.log_image(f"text_to_image/image/{r}/target", _chw(tgt), step,
+                             context={"prompt": cap})
             _m.flush()
 
 
