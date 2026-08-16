@@ -1508,6 +1508,17 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 outputs, sample, model, device, tag, i, global_step,
             )
 
+    def _image_gen_is_adapter(self, model):
+        """True if the image generator is the SDXL conditioning adapter (predicts CLIP
+        conditioning, not a latent — so in-loop image viz can't render it; that's done
+        by scripts/eval/world/eval_sdxl_adapter.py)."""
+        m = model.module if hasattr(model, "module") else model
+        try:
+            from megatransformer.model.image.sdxl_adapter import SDXLConditioningAdapter
+            return isinstance(getattr(m, "image_generator", None), SDXLConditioningAdapter)
+        except Exception:
+            return False
+
     def _scenario_text_to_image(self, model, eval_dataset, collator, device, global_step):
         """Scenario 4: Text -> Image synthesis using dataset captions.
 
@@ -1515,6 +1526,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         target image matches the text the model is conditioned on.
         """
         tag = "text_to_image"
+
+        if self._image_gen_is_adapter(model):
+            print("  [viz] image gen = SDXL adapter (CLIP conditioning, no in-loop render); "
+                  "use scripts/eval/world/eval_sdxl_adapter.py for image viz. Skipping.")
+            return
 
         samples = self._get_eval_samples(
             eval_dataset, collator, self.num_eval_samples, requires_image=True

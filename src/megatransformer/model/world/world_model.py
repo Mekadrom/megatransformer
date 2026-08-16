@@ -1516,7 +1516,13 @@ class MegaTransformerWorldModel(nn.Module):
                             encoder_hidden_states=cross_input,
                             **gen_kwargs,
                         )
-                        image_pred = cross_out["image_latent_preds"].squeeze(0)  # (C, H, W)
+                        if "image_latent_preds" in cross_out:
+                            image_pred = cross_out["image_latent_preds"].squeeze(0)  # (C, H, W)
+                        else:
+                            # SDXL adapter: predicts CLIP conditioning, not a latent —
+                            # the in-model generate() can't render (SDXL isn't loaded).
+                            # Image rendering is done by scripts/eval/world/eval_sdxl_adapter.py.
+                            image_pred = None
                     else:
                         image_pred = None
 
