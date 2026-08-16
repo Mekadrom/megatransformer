@@ -863,6 +863,12 @@ class MegaTransformerWorldModel(nn.Module):
         # byte-identical to prior behavior (training-viz generate() never sets this). A diagnostic
         # lever to test whether "under-speaking" is the model quitting early vs already-drifted.
         voice_min_frames: int = 0,
+        # Truncated sampling for the discrete voice unit head (only active when voice_temperature > 0).
+        # top_k keeps the k highest-prob units; top_p (nucleus) keeps the smallest set whose cumulative
+        # prob >= p. Both None/0 (default) => untruncated temperature sampling = prior behavior. These cut
+        # the low-prob tail pure-temperature sampling can draw (wrong units) -- the standard AR-coherence fix.
+        voice_top_k: Optional[int] = None,
+        voice_top_p: Optional[float] = None,
         # Pre-encoded media for transcription / cross-modal tasks
         audio_inputs: Optional[torch.Tensor] = None,
         audio_lengths: Optional[torch.Tensor] = None,
@@ -1377,7 +1383,20 @@ class MegaTransformerWorldModel(nn.Module):
                                 logits = logits.clone()
                                 logits[self.voice_codebook.shape[0]] = float("-inf")
                             if voice_temperature > 0.0:
-                                probs = torch.softmax(logits.float() / voice_temperature, dim=-1)
+                                filt = logits.float() / voice_temperature
+                                # top-k: keep the k highest logits, mask the rest.
+                                if voice_top_k is not None and voice_top_k > 0 and voice_top_k < filt.numel():
+                                    kth = torch.topk(filt, voice_top_k).values[-1]
+                                    filt = filt.masked_fill(filt < kth, float("-inf"))
+                                # top-p (nucleus): keep the smallest prefix whose cumulative prob >= p.
+                                if voice_top_p is not None and 0.0 < voice_top_p < 1.0:
+                                    sorted_logits, sorted_idx = torch.sort(filt, descending=True)
+                                    cum = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                                    remove = cum > voice_top_p
+                                    remove[..., 1:] = remove[..., :-1].clone()  # keep the first token crossing p
+                                    remove[..., 0] = False
+                                    filt = filt.masked_fill(remove.scatter(0, sorted_idx, remove), float("-inf"))
+                                probs = torch.softmax(filt, dim=-1)
                                 unit_id = torch.multinomial(probs, 1)[0]
                             else:
                                 unit_id = logits.argmax(-1)

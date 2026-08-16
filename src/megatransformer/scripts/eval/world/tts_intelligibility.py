@@ -81,6 +81,9 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.8, help="Text sampling temperature")
     p.add_argument("--voice_temperature", type=float, default=0.0, help="Voice latent sampling (0=deterministic mu)")
     p.add_argument("--voice_variance_floor", type=float, default=0.0)
+    p.add_argument("--voice_top_k", type=int, default=None, help="Truncated unit sampling: keep top-k units (temp>0 only)")
+    p.add_argument("--voice_top_p", type=float, default=None, help="Nucleus unit sampling: keep cumprob<=p (temp>0 only)")
+    p.add_argument("--save_first", type=int, default=0, help="Also save the first N wavs (by index order) for A/B listening")
     p.add_argument("--voice_min_frames", type=int, default=0,
                    help="Forbid EOV until this many content frames emitted (0=off). Diagnostic: does "
                         "forcing longer generation fill deletions with correct words, or just babble?")
@@ -160,7 +163,8 @@ def main():
             outputs = model.generate(text_input_ids=prompt, max_new_tokens=args.max_new_tokens,
                                      temperature=args.temperature, voice_temperature=args.voice_temperature,
                                      voice_variance_floor=args.voice_variance_floor,
-                                     voice_min_frames=args.voice_min_frames)
+                                     voice_min_frames=args.voice_min_frames,
+                                     voice_top_k=args.voice_top_k, voice_top_p=args.voice_top_p)
         vp = outputs.get("voice_latent_preds")
         if vp is None or vp.numel() == 0:
             n_no_voice += 1
@@ -202,13 +206,23 @@ def main():
         print(f"  CER  mean={cers.mean():.3f}  median={np.median(cers):.3f}")
         print(f"  %% samples WER<=0.2 (intelligible): {(wers <= 0.2).mean()*100:.1f}%")
 
-    # save worst K wavs + report
+    # save worst K wavs + report. Saved at the vocoder's actual rate (wav is the vocoder output,
+    # not the 16k-for-Whisper resample) so playback pitch/speed is correct.
     import torchaudio
+    _wav_sr = args.vocoder_sample_rate
     rd = os.path.join(args.output_dir, "worst"); os.makedirs(rd, exist_ok=True)
     worst = sorted([x for x in gen if "wav" in x], key=lambda x: -x["wer"])[:args.save_worst]
     for j, x in enumerate(worst):
         torchaudio.save(os.path.join(rd, f"worst{j}_wer{x['wer']:.2f}_idx{x['idx']}.wav"),
-                        torch.from_numpy(x["wav"]).reshape(1, -1), args.sample_rate)
+                        torch.from_numpy(x["wav"]).reshape(1, -1), _wav_sr)
+    # save the first N wavs (by index order) for cross-setting A/B listening (same utterances each run).
+    if args.save_first > 0:
+        fd = os.path.join(args.output_dir, "first"); os.makedirs(fd, exist_ok=True)
+        first = sorted([x for x in gen if "wav" in x], key=lambda x: x["idx"])[:args.save_first]
+        for x in first:
+            torchaudio.save(os.path.join(fd, f"idx{x['idx']}_wer{x['wer']:.2f}.wav"),
+                            torch.from_numpy(x["wav"]).reshape(1, -1), _wav_sr)
+        print(f"Saved first {len(first)} wavs -> {fd}")
     report = {"checkpoint": args.checkpoint_path, "n": len(rows), "coverage": coverage,
               "wer_mean": float(wers.mean()) if len(gen) else None, "wer_median": float(np.median(wers)) if len(gen) else None,
               "cer_mean": float(cers.mean()) if len(gen) else None, "voice_temperature": args.voice_temperature,
