@@ -159,6 +159,9 @@ class WorldModelTrainer(CommonTrainer):
         voice_early_text_weight_frames: int = 0,
         voice_prenet_dropout_ramp_steps: int = 0,
         voice_prenet_dropout_start_step: int = 0,
+        voice_distill_teacher=None,
+        voice_distill_weight: float = 0.0,
+        voice_distill_temperature: float = 1.0,
         # Modality flags
         include_text: bool = True,
         include_audio: bool = True,
@@ -270,6 +273,11 @@ class WorldModelTrainer(CommonTrainer):
         self.voice_early_text_weight_frames = voice_early_text_weight_frames
         self.voice_prenet_dropout_ramp_steps = voice_prenet_dropout_ramp_steps
         self.voice_prenet_dropout_start_step = voice_prenet_dropout_start_step
+        # Frozen distillation teacher (not a submodule: it must never be optimized, saved,
+        # or wrapped by the accelerator).
+        object.__setattr__(self, "voice_distill_teacher", voice_distill_teacher)
+        self.voice_distill_weight = voice_distill_weight
+        self.voice_distill_temperature = max(1e-3, voice_distill_temperature)
         self._voice_prenet_ramp_enabled = (voice_prenet_dropout > 0.0 and voice_prenet_dropout_ramp_steps > 0)
         # Both attack the teacher-forcing crutch; stacking them confounds the ablation and
         # the curriculum is the stronger, decisive lever, so it REPLACES scheduled sampling.
@@ -1008,6 +1016,39 @@ class WorldModelTrainer(CommonTrainer):
                 total_loss = total_loss + self.voice_latent_loss_weight * unit_loss_norm
                 loss_components["voice_unit_ce_loss_raw"] = unit_loss_raw.detach()
                 loss_components["voice_unit_ce_loss_norm"] = unit_loss_norm.detach()
+
+                # --- KL distillation from the frozen CosyVoice 2 speech LM ----------------
+                # Hard-label CE collapses a ONE-TO-MANY target (the teacher's predictive
+                # entropy on this data is ~4.02 nats) onto a single id. The teacher's soft
+                # distribution carries the "which continuations are plausible" structure that
+                # CE discards -- and free-running diagnostics show the student is already
+                # on-manifold and well-formed, failing ONLY at text->content binding, which is
+                # exactly what this transfers.
+                teacher = getattr(self, "voice_distill_teacher", None)
+                if teacher is not None and self.voice_distill_weight > 0:
+                    texts = inputs.get("voice_texts")
+                    lens = inputs.get("voice_feature_lengths")
+                    if texts is not None and lens is not None:
+                        lens = lens.reshape(lens.shape[0], -1)[:, 0] if lens.dim() > 1 else lens
+                        t_logits, t_mask = teacher(texts, voice_unit_ids, lens, T)
+                        t_mask = t_mask & (tgt != -100)          # never supervise pad/transcription
+                        if bool(t_mask.any()):
+                            temp = self.voice_distill_temperature
+                            s_logp = F.log_softmax(
+                                voice_unit_logits[t_mask][:, :teacher.student_vocab].float() / temp, dim=-1)
+                            t_prob = F.softmax(t_logits[t_mask].to(s_logp.device) / temp, dim=-1)
+                            # forward KL(teacher || student): mode-covering, the standard KD
+                            # direction. T^2 keeps the gradient scale temperature-independent.
+                            kl = F.kl_div(s_logp, t_prob, reduction="batchmean") * (temp ** 2)
+                            total_loss = total_loss + self.voice_distill_weight * kl
+                            loss_components["voice_distill_kl"] = kl.detach()
+                            with torch.no_grad():
+                                t_acc = (t_logits[t_mask].argmax(-1) == tgt[t_mask]).float().mean()
+                                agree = (t_logits[t_mask].argmax(-1)
+                                         == voice_unit_logits[t_mask][:, :teacher.student_vocab].argmax(-1)
+                                         ).float().mean()
+                                loss_components["voice_distill_teacher_acc"] = t_acc.detach()
+                                loss_components["voice_distill_agreement"] = agree.detach()
                 with torch.no_grad():
                     valid = tgt != -100
                     acc = (voice_unit_logits.argmax(-1)[valid] == tgt[valid]).float().mean()
@@ -2222,6 +2263,36 @@ def load_model(args, device='cuda'):
     return model
 
 
+def _build_distill_teacher(args):
+    """Frozen CosyVoice 2 speech LM for KL distillation, or None when disabled.
+
+    A load failure is downgraded to a warning so a bad path can't kill a training run --
+    but it prints loudly, because silently training without the teacher while believing
+    otherwise would invalidate the run.
+    """
+    model_dir = getattr(args, "voice_cosyvoice2_distill_model_dir", None)
+    if not model_dir or getattr(args, "voice_distill_weight", 0.0) <= 0:
+        return None
+    try:
+        from megatransformer.model.voice.cosyvoice2_teacher import CosyVoice2Teacher
+        dev = getattr(args, "voice_distill_device", None) or "cuda"
+        dtype = torch.bfloat16 if getattr(args, "voice_distill_bf16", True) else torch.float32
+        t = CosyVoice2Teacher.from_pretrained(
+            model_dir,
+            runtime_dir=getattr(args, "voice_cosyvoice2_runtime_dir", None),
+            device=dev, dtype=dtype,
+        )
+        n = sum(p.numel() for p in t.parameters()) / 1e6
+        print(f"[distill] CosyVoice 2 teacher loaded ({n:.1f}M, {dtype}, {dev}); "
+              f"weight={args.voice_distill_weight} T={getattr(args, 'voice_distill_temperature', 1.0)}",
+              flush=True)
+        return t
+    except Exception as e:
+        print(f"WARNING: failed to load the distillation teacher ({type(e).__name__}: {e}) "
+              f"-- TRAINING WILL PROCEED WITHOUT DISTILLATION.", flush=True)
+        return None
+
+
 def create_trainer(
     args,
     model,
@@ -2277,6 +2348,9 @@ def create_trainer(
         voice_early_text_weight_frames=getattr(args, 'voice_early_text_weight_frames', 0),
         voice_prenet_dropout_ramp_steps=getattr(args, 'voice_prenet_dropout_ramp_steps', 0),
         voice_prenet_dropout_start_step=getattr(args, 'voice_prenet_dropout_start_step', 0),
+        voice_distill_teacher=_build_distill_teacher(args),
+        voice_distill_weight=getattr(args, 'voice_distill_weight', 0.0),
+        voice_distill_temperature=getattr(args, 'voice_distill_temperature', 1.0),
         include_text="text" in include_modes,
         include_audio="audio" in include_modes,
         include_voice="voice" in include_modes,
@@ -2564,6 +2638,24 @@ def add_cli_args(subparsers):
                             help="Maximum token sequence length for text")
 
     # Visualization callback dependencies
+    sub_parser.add_argument("--voice_cosyvoice2_distill_model_dir", type=str, default=None,
+                            help="CosyVoice2-0.5B snapshot dir for KL DISTILLATION. Runs the frozen "
+                                 "Qwen2-0.5B speech LM teacher-forced in the training loop and adds "
+                                 "KL(teacher || student) on the voice unit logits. Needs "
+                                 "--voice_distill_weight > 0 to take effect.")
+    sub_parser.add_argument("--voice_distill_weight", type=float, default=0.0,
+                            help="Weight on the distillation KL term (0 = off). The CE term is "
+                                 "unchanged, so this ADDS soft-target supervision on top of it.")
+    sub_parser.add_argument("--voice_distill_temperature", type=float, default=1.0,
+                            help="Softmax temperature for both sides of the KL. >1 flattens the "
+                                 "teacher and transfers more of its low-probability structure "
+                                 "(the point, given ~4 nats of predictive entropy). Loss is scaled "
+                                 "by T^2 so gradient magnitude stays temperature-independent.")
+    sub_parser.add_argument("--voice_distill_device", type=str, default=None,
+                            help="Device for the frozen teacher (default: same as training). It is "
+                                 "~0.5B; in bf16 that is ~1GB plus activations.")
+    sub_parser.add_argument("--voice_distill_fp32", dest="voice_distill_bf16", action="store_false",
+                            default=True, help="Run the teacher in fp32 instead of bf16 (2x memory).")
     sub_parser.add_argument("--voice_cosyvoice2_model_dir", type=str, default=None,
                             help="CosyVoice2-0.5B snapshot dir. Loads the FROZEN flow+HiFT decoder "
                                  "so eval viz renders 24kHz audio from the voice coda's unit ids. "
