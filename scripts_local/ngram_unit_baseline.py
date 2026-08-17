@@ -111,17 +111,24 @@ def build_counts(sequences, max_n):
     return counts
 
 
-def eval_order(counts, sequences, n, K):
-    """Backed-off order-n model: top-1 acc (with backoff), seen-only acc, coverage, ppl, ce_norm."""
+def eval_order(counts, sequences, n, K, stat_cache=None):
+    """Backed-off order-n model: top-1 acc (with backoff), seen-only acc, coverage, ppl, ce_norm.
+
+    stat_cache memoizes the per-CONTEXT reductions (argmax + total count), which are position-
+    independent. Without it the unigram context -- one Counter with ~K entries -- is re-scanned
+    at EVERY held-out position (K * n_positions ~ 8e9 Python ops at K=6561), which dominates the
+    whole script. Pass one dict across all orders; keys are (order, ctx) so they never collide."""
     hits = seen_hits = seen = total = 0
     ce = 0.0
     logK = math.log(K)
+    cache = stat_cache if stat_cache is not None else {}
     for seq in sequences:
         for t in range(len(seq)):
             actual = seq[t]
             total += 1
             dist = None
             full_seen = False
+            key = None
             for o in range(n, 0, -1):               # backoff n -> n-1 -> ... -> 1
                 if t < o - 1:
                     continue
@@ -129,15 +136,19 @@ def eval_order(counts, sequences, n, K):
                 d = counts[o].get(ctx)
                 if d:
                     dist = d
+                    key = (o, ctx)
                     if o == n:
                         full_seen = True
                     break
             if dist is None:                        # unseen even as unigram (shouldn't happen)
                 ce += logK
                 continue
-            tot = sum(dist.values())
-            # top-1 (argmax; deterministic tie-break by lowest id)
-            best = min(dist.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+            hit = cache.get(key)
+            if hit is None:
+                # top-1 (argmax; deterministic tie-break by lowest id) + context total
+                hit = (min(dist.items(), key=lambda kv: (-kv[1], kv[0]))[0], sum(dist.values()))
+                cache[key] = hit
+            best, tot = hit
             if best == actual:
                 hits += 1
             # add-1 smoothed prob of the actual unit
@@ -203,16 +214,22 @@ def main():
     print(hdr); print("-" * len(hdr))
     print(f"{'repeat u[t-1]':<16}{rep_acc:>9.4f}{'-':>11}{'-':>10}{'-':>9}{'-':>9}")
     best_top1 = 0.0
+    last_seen_only = 0.0
+    stat_cache = {}
     for n in range(1, args.max_n + 1):
-        r = eval_order(counts, held, n, K)
+        r = eval_order(counts, held, n, K, stat_cache=stat_cache)
         name = "unigram" if n == 1 else f"{n}-gram"
         print(f"{name:<16}{r['top1']:>9.4f}{r['seen_only_top1']:>11.4f}"
-              f"{r['coverage']:>10.4f}{r['ppl']:>9.2f}{r['ce_norm']:>9.4f}")
+              f"{r['coverage']:>10.4f}{r['ppl']:>9.2f}{r['ce_norm']:>9.4f}", flush=True)
         best_top1 = max(best_top1, r["top1"])
+        last_seen_only = r["seen_only_top1"]      # highest order reached = the asymptote
 
     print("\n" + "=" * 60)
     print(f"TEXT-FREE CEILING (best n-gram top-1): {best_top1:.4f}")
+    print(f"ASYMPTOTE (order-{args.max_n} seen-only top-1) : {last_seen_only:.4f}")
     print(f"AR-crutch (repeat) baseline          : {rep_acc:.4f}")
+    # Copy-paste line for the TB overlay runs (scripts_local/write_baseline_runs.py).
+    print(f"\n  --repeat {rep_acc:.4f} --ngram_ceiling {best_top1:.4f} --asymptote {last_seen_only:.4f}")
     print("Compare voice_unit_accuracy: below ceiling = still warming up;")
     print("at ceiling = doing n-gram stats (text ignored); above = using text.")
 

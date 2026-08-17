@@ -39,11 +39,16 @@ from megatransformer.utils.codebook import load_codebook
 from megatransformer.utils import constants
 
 
-def build_args(a):
-    """A Namespace satisfying visualize.load_world_model + load_dataset for this run shape."""
+def build_args(a, feature_channels):
+    """A Namespace satisfying visualize.load_world_model + load_dataset for this run shape.
+
+    feature_channels is DERIVED from the codebook's dim (the dataset builds voice features as
+    centroids[unit_ids], so they are always the codebook width): 256 for Mimi cb0, 512 for
+    CosyVoice 2. Never hardcode it -- a mismatch silently state-mismatches the load."""
     return Namespace(
         config=a.config, checkpoint_path=a.checkpoint_path,
-        voice_codebook_path=a.codebook, voice_feature_channels=256, voice_predict_f0=True,
+        voice_codebook_path=a.codebook, voice_feature_channels=feature_channels,
+        voice_predict_f0=a.voice_predict_f0,
         include_modes="voice", include_tasks="voice_synthesis",
         cache_dir=None, text_cache_dir=None, audio_cache_dir=None,
         voice_cache_dir=a.cache_dir, image_cache_dir=None,
@@ -54,10 +59,10 @@ def build_args(a):
     )
 
 
-def make_collator(K, special_token_base=constants.SPECIAL_TOKEN_BASE):
+def make_collator(K, max_frames, special_token_base=constants.SPECIAL_TOKEN_BASE):
     return MultimodalDataCollator(
         max_seq_len=1024, max_waveforms=160000, max_mel_spec_frames=625,
-        max_sive_feature_frames=209, voice_eov_id=K,
+        max_sive_feature_frames=max_frames, voice_eov_id=K,
         special_token_base=special_token_base,
     )
 
@@ -205,7 +210,7 @@ def seq_degeneration(seqs, K):
 
 
 @torch.no_grad()
-def run_generation(model, dataset, collator, device, gen_n, K, budget=209,
+def run_generation(model, dataset, collator, device, gen_n, K, budget,
                    bov_id=constants.BOV_TOKEN_ID):
     """Free-running generation from text prompts; return generated + GT unit sequences + EOV info.
 
@@ -271,6 +276,15 @@ def main():
     ap.add_argument("--cache_dir", required=True, help="voice base dir (has /val)")
     ap.add_argument("--codebook", required=True)
     ap.add_argument("--config", default="small_sum")
+    ap.add_argument("--voice_max_frames", type=int, default=209,
+                    help="Voice frame budget = the run's voice_max_frames (collator cap AND the "
+                         "generation budget). Mimi cb0 @12.5Hz = 209; CosyVoice 2 @25Hz = 250 "
+                         "(=voice_max_seconds*sr//voice_hop_length). Must match the training run.")
+    ap.add_argument("--voice_predict_f0", dest="voice_predict_f0", action="store_true", default=True,
+                    help="Checkpoint has the F0 prediction head (Mimi runs). Default on.")
+    ap.add_argument("--no_voice_predict_f0", dest="voice_predict_f0", action="store_false",
+                    help="Checkpoint has NO F0 head (CosyVoice 2 runs — prosody lives in the token "
+                         "+ frozen decoder, so the run trains without --voice_predict_f0).")
     ap.add_argument("--text_encoder_model", default=None,
                     help="Pretrained-LLM text encoder id (e.g. HuggingFaceTB/SmolLM2-135M) if the "
                          "checkpoint was trained with one; must match, else the load state-mismatches.")
@@ -298,8 +312,8 @@ def main():
 
     device = a.device
     codebook = load_codebook(a.codebook)
-    K = int(codebook.shape[0])
-    args = build_args(a)
+    K, D = int(codebook.shape[0]), int(codebook.shape[1])
+    args = build_args(a, D)
 
     print(f"Loading {a.checkpoint_path} ...", flush=True)
     model = load_world_model(args, device)
@@ -311,8 +325,10 @@ def main():
     sp_base = getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE)
     sp = constants.special_token_ids(sp_base)
     eval_dataset = load_dataset(args, "val")
-    collator = make_collator(K, special_token_base=sp_base)
-    print(f"val: {len(eval_dataset)} | K={K} | special_token_base={sp_base}", flush=True)
+    collator = make_collator(K, a.voice_max_frames, special_token_base=sp_base)
+    print(f"val: {len(eval_dataset)} | K={K} | feature_channels={D} | "
+          f"voice_max_frames={a.voice_max_frames} | predict_f0={a.voice_predict_f0} | "
+          f"special_token_base={sp_base}", flush=True)
 
     alpha_label = ("1.0 (inference regime, full voice attention)" if a.voice_attn_alpha is None
                    else f"{a.voice_attn_alpha} (1:1 with training at this step)")
@@ -321,7 +337,9 @@ def main():
                              voice_attn_alpha=a.voice_attn_alpha)
     if not a.skip_generation:
         print("2/3 free-running generation ...", flush=True)
-        gen, gt, eov_fired, budget_hit, prompt_lens = run_generation(model, eval_dataset, collator, device, a.gen_n, K, bov_id=sp.BOV)
+        gen, gt, eov_fired, budget_hit, prompt_lens = run_generation(
+            model, eval_dataset, collator, device, a.gen_n, K,
+            budget=a.voice_max_frames, bov_id=sp.BOV)
         print("3/3 degeneration stats ...", flush=True)
         gen_deg = seq_degeneration(gen, K)
         gt_deg = seq_degeneration(gt, K)
