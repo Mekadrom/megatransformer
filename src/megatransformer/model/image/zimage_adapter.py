@@ -62,6 +62,27 @@ class ZImageConditioningAdapter(nn.Module):
         nn.init.normal_(self.seq_head.weight, std=0.02)
         nn.init.zeros_(self.seq_head.bias)
 
+        # Tier-0 whitening: regress in a per-dim z-scored Qwen3 space. Centering removes
+        # the massive near-constant outlier dims (LLM "massive activations"), scaling
+        # equalizes each dim's loss contribution -> attacks the MSE-mean mode-collapse.
+        # Stats (mean/std over the target distribution) are injected by the trainer via
+        # set_whiten_stats and persist as buffers (so eval/chat de-whiten from the ckpt).
+        # Identity (mean 0, std 1) by default = no-op. The head outputs WHITENED space when
+        # on; the surfaced image_clip_seq_pred is de-whitened back to Qwen3 space.
+        self.whiten = bool(getattr(config, "whiten_target", False))
+        self.register_buffer("whiten_mean", torch.zeros(config.seq_dim))
+        self.register_buffer("whiten_std", torch.ones(config.seq_dim))
+
+    def set_whiten_stats(self, mean, std, eps: float = 1e-6):
+        """Load per-dim Qwen3 target mean/std into the whitening buffers and enable it."""
+        m = torch.as_tensor(mean, dtype=self.whiten_mean.dtype).flatten()
+        s = torch.as_tensor(std, dtype=self.whiten_std.dtype).flatten().clamp_min(eps)
+        assert m.numel() == self.whiten_mean.numel(), \
+            f"whiten mean size {m.numel()} != seq_dim {self.whiten_mean.numel()}"
+        self.whiten_mean.copy_(m.to(self.whiten_mean.device))
+        self.whiten_std.copy_(s.to(self.whiten_std.device))
+        self.whiten = True
+
     def forward(
         self,
         encoder_hidden_states,          # (B, K_in, d_model) trunk image gen-query outputs
@@ -74,20 +95,31 @@ class ZImageConditioningAdapter(nn.Module):
         x = self.self_enc(x)
         q = self.out_queries.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, seq_len, d)
         q = self.cross_dec(q, x)                         # seq_len slots attend the K_in queries
-        seq_pred = self.seq_head(self.seq_norm(q))       # (B, seq_len, 2560)
+        seq_pred = self.seq_head(self.seq_norm(q))       # (B, seq_len, seq_dim); WHITENED space if self.whiten
 
+        # Surface the prediction in Qwen3 space: de-whiten the head output when whitening
+        # is on (identity otherwise). generate()/eval/chat render this directly.
+        if self.whiten:
+            mean = self.whiten_mean.view(1, 1, -1)
+            std = self.whiten_std.view(1, 1, -1)
+            out_seq = seq_pred * std + mean
+        else:
+            out_seq = seq_pred
         # Reuse the "image_clip_*" output keys so the world model / trainer / generate()
         # plumbing is shared with the SDXL adapter; pooled is None (Z-Image has none).
-        out = {"image_clip_seq_pred": seq_pred, "image_clip_pooled_pred": None}
+        out = {"image_clip_seq_pred": out_seq, "image_clip_pooled_pred": None}
         if cond_labels is not None:
-            sp, sl = seq_pred, cond_labels
+            # Loss in the SAME space as seq_pred: whiten the target when enabled.
+            target = ((cond_labels - self.whiten_mean.view(1, 1, -1)) / self.whiten_std.view(1, 1, -1)
+                      if self.whiten else cond_labels)
+            sp, sl = seq_pred, target
             # Restrict the loss to flagged rows (transcription rows carry an INPUT image,
             # not a gen target). Guard on matching length so a bad mask is ignored.
             if sample_mask is not None and sample_mask.shape[0] == seq_pred.shape[0]:
                 m = sample_mask.bool()
                 if int(m.sum()) == 0:
                     return out                            # no synthesis rows this batch
-                sp, sl = seq_pred[m], cond_labels[m]
+                sp, sl = seq_pred[m], target[m]
             sl = sl.to(sp.dtype)
             mse = F.mse_loss(sp, sl)
             loss = mse

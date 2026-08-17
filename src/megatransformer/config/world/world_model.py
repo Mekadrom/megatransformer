@@ -522,3 +522,9 @@ WORLD_MODEL_CONFIGS["small_sum_zimage"].image_coda_config = ZImageAdapterConfig(
     seq_len=64,
     contrastive_weight=0.0,
 )
+
+# Tier-0 whitened-MSE variant: identical to small_sum_zimage but regresses in per-dim
+# z-scored Qwen3 space (needs --image_whiten_stats_path at train time; eval/chat use this
+# same config so the adapter de-whitens from the checkpoint buffers).
+WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"].image_coda_config.whiten_target = True

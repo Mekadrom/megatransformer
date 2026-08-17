@@ -98,6 +98,11 @@ class WorldModelTrainer(CommonTrainer):
         # it bf16 there (faster than 4-bit; only fits with headroom).
         image_target_device: Optional[str] = None,
         image_target_bf16: bool = False,
+        # Tier-0 whitened MSE (Z-Image adapter): per-dim Qwen3 mean/std stats file to
+        # inject into the adapter's whitening buffers (compute via
+        # scripts_local/compute_qwen_whiten_stats.py). Requires the small_sum_zimage_whiten
+        # config (whiten_target=True). None = naive (un-whitened) MSE.
+        image_whiten_stats_path: Optional[str] = None,
         # Variance-matching aux loss weights (per modality). Penalizes
         # collapsed predictions whose std doesn't match the label std.
         # See WorldModelTrainer._compute_modality_recon_loss for details.
@@ -222,6 +227,8 @@ class WorldModelTrainer(CommonTrainer):
         self._zimage_text_encoder = None  # lazy: Qwen3-4B for Z-Image adapter targets
         self.image_target_device = image_target_device
         self.image_target_bf16 = image_target_bf16
+        self.image_whiten_stats_path = image_whiten_stats_path
+        self._whiten_injected = False
 
         self.audio_var_loss_weight = audio_var_loss_weight
         self.voice_var_loss_weight = voice_var_loss_weight
@@ -752,6 +759,14 @@ class WorldModelTrainer(CommonTrainer):
         image_cond_labels = None
         if (image_inputs is not None
                 and isinstance(getattr(unwrapped_model, "image_generator", None), ZImageConditioningAdapter)):
+            # Tier-0: inject per-dim Qwen3 whitening stats into the adapter ONCE, before the
+            # first forward. Persists as buffers -> in the checkpoint (eval/chat de-whiten).
+            if self.image_whiten_stats_path and not self._whiten_injected:
+                _st = torch.load(self.image_whiten_stats_path, map_location="cpu")
+                unwrapped_model.image_generator.set_whiten_stats(_st["mean"], _st["std"])
+                self._whiten_injected = True
+                print(f"[whiten] injected Qwen3 stats from {self.image_whiten_stats_path} "
+                      f"-> Z-Image adapter (whiten={unwrapped_model.image_generator.whiten})", flush=True)
             captions = inputs.get("text_texts")
             if captions is not None:
                 model_device = next(unwrapped_model.parameters()).device
@@ -2203,6 +2218,7 @@ def create_trainer(
         image_clip_loss_weight=getattr(args, 'image_clip_loss_weight', 1.0),
         image_target_device=getattr(args, 'image_target_device', None),
         image_target_bf16=getattr(args, 'image_target_bf16', False),
+        image_whiten_stats_path=getattr(args, 'image_whiten_stats_path', None),
         audio_var_loss_weight=getattr(args, 'audio_var_loss_weight', 1.0),
         voice_var_loss_weight=getattr(args, 'voice_var_loss_weight', 1.0),
         image_var_loss_weight=getattr(args, 'image_var_loss_weight', 1.0),
@@ -2318,6 +2334,11 @@ def add_cli_args(subparsers):
                             help="Z-Image adapter: load the Qwen3-4B target encoder in bf16 (~8GB, "
                                  "faster than 4-bit) instead of 4-bit. Use with a dedicated "
                                  "--image_target_device that has headroom.")
+    sub_parser.add_argument("--image_whiten_stats_path", type=str, default=None,
+                            help="Z-Image adapter Tier-0 whitened MSE: path to a .pt with per-dim "
+                                 "{mean,std} of the Qwen3 target (from compute_qwen_whiten_stats.py). "
+                                 "Injected into the adapter's whitening buffers. Requires "
+                                 "--config small_sum_zimage_whiten.")
 
     # Variance-matching auxiliary loss weights (per modality). The aux loss
     # penalizes (std(preds)/std(labels) - 1), preventing collapse to a constant
@@ -2499,6 +2520,17 @@ def add_cli_args(subparsers):
                             help="Maximum token sequence length for text")
 
     # Visualization callback dependencies
+    sub_parser.add_argument("--voice_cosyvoice2_model_dir", type=str, default=None,
+                            help="CosyVoice2-0.5B snapshot dir. Loads the FROZEN flow+HiFT decoder "
+                                 "so eval viz renders 24kHz audio from the voice coda's unit ids. "
+                                 "Use INSTEAD OF --voice_smg_checkpoint_path/--vocoder on a "
+                                 "CosyVoice 2 run (the SMG decodes Mimi's codebook, not this one).")
+    sub_parser.add_argument("--voice_cosyvoice2_runtime_dir", type=str, default=None,
+                            help="CosyVoice checkout providing the `cosyvoice` package + cv_extra "
+                                 "(default: $COSYVOICE_RUNTIME, else ~/dev/projects/cosyvoice-runtime)")
+    sub_parser.add_argument("--voice_cosyvoice2_device", type=str, default="cpu",
+                            help="Device for the frozen CosyVoice 2 decoder (default cpu, so the "
+                                 "133M of frozen weights don't take VRAM from training)")
     sub_parser.add_argument("--vocoder_checkpoint_path", type=str, default=None,
                             help="Path to vocoder checkpoint for visualization")
     sub_parser.add_argument("--vocoder_config", type=str, default=None,

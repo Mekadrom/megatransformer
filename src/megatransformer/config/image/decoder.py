@@ -330,6 +330,13 @@ class ZImageAdapterConfig:
     contrastive_weight: float = 0.0
     contrastive_temp: float = 0.07
 
+    # Tier-0 whitened MSE: regress in per-dim z-scored Qwen3 space (removes massive
+    # constant dims + equalizes per-dim loss -> attacks MSE-mean collapse). Stats are
+    # injected by the trainer (--image_whiten_stats_path) into adapter buffers that
+    # persist in the checkpoint; eval/chat must construct with whiten_target=True to
+    # de-whiten. Off = naive baseline.
+    whiten_target: bool = False
+
     # Target encoder (Z-Image's frozen Qwen3-4B), used by the world trainer to build
     # regression targets. 4-bit keeps it ~2.5GB so it fits alongside training.
     target_model: str = "Tongyi-MAI/Z-Image-Turbo"
