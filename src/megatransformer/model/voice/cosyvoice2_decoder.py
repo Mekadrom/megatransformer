@@ -21,14 +21,41 @@ The `cosyvoice` package is not pip-installed; it lives in a checkout (default
 ~/dev/projects/cosyvoice-runtime, override with $COSYVOICE_RUNTIME) whose `cv_extra`
 directory holds `--no-deps` support packages. See that repo's README.md.
 """
+import logging
 import os
 import sys
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
 
 
 DEFAULT_RUNTIME_DIR = os.path.expanduser("~/dev/projects/cosyvoice-runtime")
+
+
+@contextmanager
+def _preserve_root_logging():
+    """Undo CosyVoice's global logging hijack.
+
+    cosyvoice/utils/file_utils.py runs `logging.basicConfig(level=logging.DEBUG)` at MODULE
+    IMPORT TIME, which flips the ROOT logger to DEBUG for the whole process. In a training
+    run that turns on httpx/httpcore/urllib3 debug spam for every subsequent HTTP call and
+    buries the training log. Snapshot the root logger's level and handlers, and restore them
+    once CosyVoice is imported.
+    """
+    root = logging.getLogger()
+    level, handlers = root.level, list(root.handlers)
+    noisy = {n: logging.getLogger(n).level
+             for n in ("httpx", "httpcore", "urllib3", "filelock", "fsspec", "matplotlib")}
+    try:
+        yield
+    finally:
+        root.setLevel(level)
+        for h in list(root.handlers):
+            if h not in handlers:      # drop any handler basicConfig installed
+                root.removeHandler(h)
+        for n, lv in noisy.items():
+            logging.getLogger(n).setLevel(lv)
 
 
 def _ensure_importable(runtime_dir: str):
@@ -89,8 +116,11 @@ class CosyVoice2Decoder(torch.nn.Module):
     def from_pretrained(cls, model_dir: str, runtime_dir: Optional[str] = None,
                         device: str = "cpu", dtype: torch.dtype = torch.float32):
         runtime_dir = runtime_dir or os.environ.get("COSYVOICE_RUNTIME", DEFAULT_RUNTIME_DIR)
-        _ensure_importable(runtime_dir)
-        configs = _load_configs_without_llm(model_dir)
+        # Everything that imports cosyvoice goes inside the guard — the yaml load is what
+        # pulls in cosyvoice.utils.file_utils and its root-logger basicConfig(DEBUG).
+        with _preserve_root_logging():
+            _ensure_importable(runtime_dir)
+            configs = _load_configs_without_llm(model_dir)
         flow, hift = configs["flow"], configs["hift"]
         flow.load_state_dict(torch.load(os.path.join(model_dir, "flow.pt"),
                                         map_location="cpu", weights_only=False), strict=True)
