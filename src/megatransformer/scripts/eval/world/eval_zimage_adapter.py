@@ -38,6 +38,11 @@ def parse_args():
     p.add_argument("--include_modes", type=str, default="text,image")
     p.add_argument("--cache_dir", type=str, default=None)
     p.add_argument("--max_samples", type=int, default=8)
+    p.add_argument("--train_cache_dir", type=str, default=None,
+                   help="ALSO eval on TRAIN samples, logged under train_data/ (the training viz's "
+                        "train_data path is latent-based and empty for the adapter). Lets you inspect "
+                        "the ACTUAL training captions + their target/generated renders for data issues.")
+    p.add_argument("--train_max_samples", type=int, default=8)
     p.add_argument("--zimage_model", type=str, default="Tongyi-MAI/Z-Image-Turbo")
     p.add_argument("--gen_steps", type=int, default=8)          # Turbo
     p.add_argument("--guidance", type=float, default=0.0)       # Turbo: no CFG
@@ -160,66 +165,86 @@ def main():
         tx = F.normalize(cm.encode_text(ctok([txt[:77]]).to(device)), dim=-1)
         return float((im @ tx.T).item())
 
-    # ── loop ──
-    grid, caps, sc_gen, sc_tgt = [], [], [], []
-    n = 0
-    for i in range(len(dataset)):
-        batch = collator([dataset[i]])
-        if "image_images" not in batch or "is_synthesis" not in batch:
-            continue
-        caption = (batch.get("text_texts") or [""])[0] or ""
-        text_input_ids = batch["text_token_ids"].to(device)
-        image_inputs = batch["image_images"].unsqueeze(1).to(device)
-        is_synth = batch["is_synthesis"].to(device)
-        with torch.no_grad():
-            with torch.amp.autocast(device, dtype=dtype, enabled=args.bf16):
-                out = model(text_input_ids=text_input_ids, image_inputs=image_inputs,
-                            precomputed_latents=True, is_synthesis=is_synth, decode_outputs=False)
-        seq_pred = out.get("image_clip_seq_pred")
-        if seq_pred is None:
-            continue
-        gen = zimage_render(seq_pred[0].float(), 1000 + n)
-        tgt = zimage_render(target_cond(caption).float(), 1000 + n)
-        sg, st = clipscore(gen, caption), clipscore(tgt, caption)
-        sc_gen.append(sg); sc_tgt.append(st)
-        grid.append([tgt, gen]); caps.append(caption)
-        print(f"[{n}] CLIP target={st:.3f} generated={sg:.3f} | {caption[:50]}", flush=True)
-        n += 1
-        if n >= args.max_samples:
-            break
-
-    if not grid:
-        raise SystemExit("no image-synthesis samples produced conditioning; check the dataset/config")
-
-    thumb = 320
-    canvas = Image.new("RGB", (2 * thumb, len(grid) * thumb), (20, 20, 20))
-    for r, (tgt, gen) in enumerate(grid):
-        canvas.paste(tgt.resize((thumb, thumb)), (0, r * thumb))
-        canvas.paste(gen.resize((thumb, thumb)), (thumb, r * thumb))
-    montage_path = os.path.join(args.output_dir, "montage_target_vs_generated.png")
-    canvas.save(montage_path)
-
+    # ── metrics init (once; shared by val + train splits) ──
     import statistics as st_
-    print(f"\nmean CLIPScore: target={st_.mean(sc_tgt):.3f}  generated={st_.mean(sc_gen):.3f}")
-    print(f"montage: {montage_path}  (left=target Z-Image(true caption), right=generated Z-Image(adapter pred))")
-
-    # TB
+    from megatransformer.scripts.eval.world.eval_utils import infer_step_from_checkpoint, init_eval_metrics, log_eval_scalars
+    from megatransformer.utils import metrics as _m
+    step = args.step if args.step is not None else infer_step_from_checkpoint(args.checkpoint_path)
     if args.log_dir:
-        from megatransformer.scripts.eval.world.eval_utils import infer_step_from_checkpoint, init_eval_metrics, log_eval_scalars
-        from megatransformer.utils import metrics as _m
-        step = args.step if args.step is not None else infer_step_from_checkpoint(args.checkpoint_path)
         init_eval_metrics(args.log_dir, args.checkpoint_path)
-        log_eval_scalars({"text_to_image/clipscore_generated": st_.mean(sc_gen),
-                          "text_to_image/clipscore_target": st_.mean(sc_tgt)}, step)
-        logger = _m.get_logger()
-        if logger is not None:
-            def _chw(pil):
-                return np.asarray(pil).astype(np.float32).transpose(2, 0, 1) / 255.0
-            for r, (tgt, gen) in enumerate(grid):
-                cap = caps[r][:500] if r < len(caps) else ""
-                _m.log_image(f"text_to_image/image/{r}/generated", _chw(gen), step, context={"prompt": cap})
-                _m.log_image(f"text_to_image/image/{r}/target", _chw(tgt), step, context={"prompt": cap})
-            _m.flush()
+
+    def _chw(pil):
+        return np.asarray(pil).astype(np.float32).transpose(2, 0, 1) / 255.0
+
+    def eval_split(ds, tag, montage_name, max_samples):
+        """Render generated-vs-target for up to max_samples of `ds`; save a montage + log
+        images/captions/CLIPScore under `tag` (e.g. 'text_to_image' for val,
+        'train_data/text_to_image' for train). Prints per-sample + mean; returns the means."""
+        grid, caps, sc_gen, sc_tgt = [], [], [], []
+        n = 0
+        for i in range(len(ds)):
+            batch = collator([ds[i]])
+            if "image_images" not in batch or "is_synthesis" not in batch:
+                continue
+            caption = (batch.get("text_texts") or [""])[0] or ""
+            text_input_ids = batch["text_token_ids"].to(device)
+            image_inputs = batch["image_images"].unsqueeze(1).to(device)
+            is_synth = batch["is_synthesis"].to(device)
+            with torch.no_grad():
+                with torch.amp.autocast(device, dtype=dtype, enabled=args.bf16):
+                    out = model(text_input_ids=text_input_ids, image_inputs=image_inputs,
+                                precomputed_latents=True, is_synthesis=is_synth, decode_outputs=False)
+            seq_pred = out.get("image_clip_seq_pred")
+            if seq_pred is None:
+                continue
+            gen = zimage_render(seq_pred[0].float(), 1000 + n)
+            tgt = zimage_render(target_cond(caption).float(), 1000 + n)
+            sg, st = clipscore(gen, caption), clipscore(tgt, caption)
+            sc_gen.append(sg); sc_tgt.append(st)
+            grid.append([tgt, gen]); caps.append(caption)
+            print(f"[{tag} {n}] CLIP target={st:.3f} generated={sg:.3f} | {caption[:50]}", flush=True)
+            n += 1
+            if n >= max_samples:
+                break
+        if not grid:
+            print(f"[{tag}] no image-synthesis samples produced conditioning; skipping")
+            return None
+
+        thumb = 320
+        canvas = Image.new("RGB", (2 * thumb, len(grid) * thumb), (20, 20, 20))
+        for r, (tgt, gen) in enumerate(grid):
+            canvas.paste(tgt.resize((thumb, thumb)), (0, r * thumb))
+            canvas.paste(gen.resize((thumb, thumb)), (thumb, r * thumb))
+        montage_path = os.path.join(args.output_dir, montage_name)
+        canvas.save(montage_path)
+        mg, mt = st_.mean(sc_gen), st_.mean(sc_tgt)
+        print(f"[{tag}] mean CLIPScore: target={mt:.3f}  generated={mg:.3f}  montage: {montage_path}", flush=True)
+
+        if args.log_dir:
+            log_eval_scalars({f"{tag}/clipscore_generated": mg, f"{tag}/clipscore_target": mt}, step)
+            logger = _m.get_logger()
+            if logger is not None:
+                for r, (tgt, gen) in enumerate(grid):
+                    cap = caps[r][:500] if r < len(caps) else ""
+                    # context={"prompt": cap} logs the caption as a sibling tag -> the actual
+                    # training caption is visible alongside each render (data diagnosis).
+                    _m.log_image(f"{tag}/image/{r}/generated", _chw(gen), step, context={"prompt": cap})
+                    _m.log_image(f"{tag}/image/{r}/target", _chw(tgt), step, context={"prompt": cap})
+                _m.flush()
+        return mg, mt
+
+    # ── val (always) ──
+    if eval_split(dataset, "text_to_image", "montage_target_vs_generated.png", args.max_samples) is None:
+        raise SystemExit("no val image-synthesis samples produced conditioning; check the dataset/config")
+
+    # ── train (optional): inspect the ACTUAL training captions + renders under train_data/ ──
+    if args.train_cache_dir:
+        tr_img = resolve(args.train_cache_dir, "train") if "image" in include_modes else None
+        tr_txt = resolve(args.train_cache_dir, "train") if "text" in include_modes else None
+        train_ds = MultimodalShardedDataset(text_shard_dir=tr_txt, image_shard_dir=tr_img,
+                                             cache_size=8, max_samples=args.train_max_samples)
+        eval_split(train_ds, "train_data/text_to_image", "montage_train_target_vs_generated.png",
+                   args.train_max_samples)
 
 
 if __name__ == "__main__":
