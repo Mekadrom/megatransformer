@@ -360,6 +360,24 @@ class ZImageAdapterConfig:
     # eval trends stay comparable).
     output_gain: float = 1.0
 
+    # ── TIER-3: flow-matching sampler instead of a point estimate ──────────────────────
+    # An MSE point head is structurally under-dispersed (shrinks toward the conditional mean
+    # by 1-R^2) and the frozen DiT renders that hedge as bland/generic; output_gain patches
+    # it with a global scalar, but the OPTIMAL gain varies per caption (sparse scenes ~1.2,
+    # dense ~1.8). This replaces the estimate with a rectified-flow sampler over the whitened
+    # conditioning, conditioned on the Q-Former context: samples land on-manifold at full
+    # dispersion per-caption, no gain to tune. See model/image/cond_flow_head.py.
+    # Warm-start from a whitened regression checkpoint: the Q-Former loads, the head is fresh.
+    flow_head: bool = False
+    flow_dim: int = 512                    # head width (~29M params at these defaults)
+    flow_heads: int = 8
+    flow_layers: int = 4
+    flow_steps: int = 8                    # Euler steps at inference (compute <-> fidelity)
+    flow_time_sampling: str = "logit_normal"   # "logit_normal" (SD3) or "uniform"
+    # Small auxiliary weight on the point head so seq_pred stays a comparable diagnostic
+    # (alpha / R^2 / retrieval) against the T0/T1 regression runs. 0 = pure sampler.
+    flow_aux_mse_weight: float = 0.1
+
     # Target encoder (Z-Image's frozen Qwen3-4B), used by the world trainer to build
     # regression targets. 4-bit keeps it ~2.5GB so it fits alongside training.
     target_model: str = "Tongyi-MAI/Z-Image-Turbo"

@@ -1237,6 +1237,10 @@ class WorldModelTrainer(CommonTrainer):
                 if "image_contrastive_negatives" in outputs:
                     # Memory-queue depth actually used this step (warms up to queue_size).
                     loss_components["image_contrastive_negatives"] = outputs["image_contrastive_negatives"]
+                if "image_flow_loss" in outputs:
+                    # T3: the rectified-flow objective (the actual training signal when the
+                    # adapter has a flow head; image_clip_mse_loss is then only the aux head).
+                    loss_components["image_flow_loss"] = outputs["image_flow_loss"]
 
             image_diffusion_loss_t = outputs.get("image_diffusion_loss")
             if image_diffusion_loss_t is not None:

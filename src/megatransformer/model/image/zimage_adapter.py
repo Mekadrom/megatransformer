@@ -122,6 +122,25 @@ class ZImageConditioningAdapter(nn.Module):
         # point estimate is forced into. Touches only the surfaced prediction, never the loss.
         self.output_gain = float(getattr(config, "output_gain", 1.0))
 
+        # TIER-3: replace the point estimate with a flow-matching SAMPLER over the whitened
+        # conditioning. An MSE point head is structurally under-dispersed (shrinks by 1-R^2)
+        # and the frozen DiT renders that as bland; a sampler lands on-manifold at full
+        # dispersion per-caption, with no global gain to tune. The Q-Former output is the
+        # conditioning context; seq_head is kept as a cheap monitoring/aux point estimate
+        # (flow_aux_mse_weight) so alpha/R^2 stay measurable against the regression runs.
+        self.flow_head = None
+        if bool(getattr(config, "flow_head", False)):
+            from megatransformer.model.image.cond_flow_head import CondFlowHead
+            self.flow_head = CondFlowHead(
+                seq_dim=config.seq_dim, ctx_dim=d,
+                dim=int(getattr(config, "flow_dim", 512)),
+                n_heads=int(getattr(config, "flow_heads", 8)),
+                n_layers=int(getattr(config, "flow_layers", 4)),
+                dropout=config.dropout,
+                steps=int(getattr(config, "flow_steps", 8)),
+                time_sampling=getattr(config, "flow_time_sampling", "logit_normal"))
+        self.flow_aux_mse_weight = float(getattr(config, "flow_aux_mse_weight", 0.1))
+
     def set_whiten_stats(self, mean, std, eps: float = 1e-6):
         """Load per-dim Qwen3 target mean/std into the whitening buffers and enable it."""
         m = torch.as_tensor(mean, dtype=self.whiten_mean.dtype).flatten()
@@ -182,6 +201,18 @@ class ZImageConditioningAdapter(nn.Module):
         q = self.cross_dec(q, x)                         # seq_len slots attend the K_in queries
         seq_pred = self.seq_head(self.seq_norm(q))       # (B, seq_len, seq_dim); WHITENED space if self.whiten
 
+        # WHAT GETS SURFACED (in whitened space):
+        #   flow head + no labels (inference) -> INTEGRATE FROM NOISE. Full-dispersion,
+        #     on-manifold, per-caption -- the whole point of T3.
+        #   otherwise -> the point head (also used during training, where surfacing the
+        #     cheap regression keeps the alpha/R^2 diagnostics comparable to the T0/T1 runs
+        #     and avoids paying `steps` extra head passes on every training forward).
+        if self.flow_head is not None and cond_labels is None:
+            seq_surf = self.flow_head.sample(q, seq_pred.shape[1],
+                                             generator=kw.get("flow_generator"))
+        else:
+            seq_surf = seq_pred
+
         # Surface the prediction in Qwen3 space: de-whiten the head output when whitening
         # is on (identity otherwise). generate()/eval/chat render this directly.
         if self.whiten:
@@ -189,14 +220,14 @@ class ZImageConditioningAdapter(nn.Module):
             std = self.whiten_std.view(1, 1, -1)
             # output_gain scales in WHITENED space (target mean 0), i.e. it scales the
             # deviation from the target mean and leaves the mean itself alone.
-            out_seq = (seq_pred * self.output_gain) * std + mean
+            out_seq = (seq_surf * self.output_gain) * std + mean
         else:
             if self.output_gain != 1.0:
                 raise ValueError(
                     "output_gain requires whiten_target: without whitening the prediction is in "
                     "raw Qwen3 space, where scaling would also blow up the massive near-constant "
                     "dims (|mean| up to 1013) instead of scaling the deviation from the mean.")
-            out_seq = seq_pred
+            out_seq = seq_surf
         # Reuse the "image_clip_*" output keys so the world model / trainer / generate()
         # plumbing is shared with the SDXL adapter; pooled is None (Z-Image has none).
         out = {"image_clip_seq_pred": out_seq, "image_clip_pooled_pred": None}
@@ -204,17 +235,26 @@ class ZImageConditioningAdapter(nn.Module):
             # Loss in the SAME space as seq_pred: whiten the target when enabled.
             target = ((cond_labels - self.whiten_mean.view(1, 1, -1)) / self.whiten_std.view(1, 1, -1)
                       if self.whiten else cond_labels)
-            sp, sl = seq_pred, target
+            sp, sl, ctx = seq_pred, target, q
             # Restrict the loss to flagged rows (transcription rows carry an INPUT image,
             # not a gen target). Guard on matching length so a bad mask is ignored.
             if sample_mask is not None and sample_mask.shape[0] == seq_pred.shape[0]:
                 m = sample_mask.bool()
                 if int(m.sum()) == 0:
                     return out                            # no synthesis rows this batch
-                sp, sl = seq_pred[m], target[m]
+                sp, sl, ctx = seq_pred[m], target[m], q[m]
             sl = sl.to(sp.dtype)
             mse = F.mse_loss(sp, sl)
-            loss = mse
+            if self.flow_head is not None:
+                # T3: the flow-matching objective IS the training signal. The point-head MSE
+                # is kept only as a small auxiliary so seq_pred stays a usable diagnostic
+                # (alpha / R^2 / retrieval) against the regression runs -- set the weight to
+                # 0 to train a pure sampler.
+                flow = self.flow_head.loss(sl, ctx)
+                loss = flow + self.flow_aux_mse_weight * mse
+                out["image_flow_loss"] = flow.detach()
+            else:
+                loss = mse
             if self.contrastive_weight > 0 and sp.shape[0] >= 2:   # Tier-1: needs >=2 rows
                 tgt_pool = sl.mean(1)                              # (B, seq_dim), loss space
                 neg = self._queue_negatives()

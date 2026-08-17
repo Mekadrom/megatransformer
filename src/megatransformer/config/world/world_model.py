@@ -543,3 +543,11 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1"].image_coda_config.contrastive_
 # config still loads t1 checkpoints (and vice versa).
 WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1q"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1q"].image_coda_config.contrastive_queue_size = 4096
+
+# Tier-3: whitened flow-matching SAMPLER over the Qwen3 conditioning (no InfoNCE -- T1 was
+# measured to improve retrieval only, +0.003 R^2, render flat). Fixes the under-dispersion that
+# a point loss is structurally forced into, per-caption, instead of patching it with a global
+# output_gain. Warm-start from a whitened regression checkpoint (--resume_from_checkpoint
+# <whiten or t1q ckpt> --fresh_schedule): the Q-Former/trunk load, the flow head starts fresh.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3"].image_coda_config.flow_head = True
