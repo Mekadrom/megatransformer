@@ -718,6 +718,8 @@ class MegaTransformerWorldModel(nn.Module):
                     outputs["image_clip_mse_loss"] = cross_outputs["image_clip_mse_loss"]
                 if "image_contrastive_loss" in cross_outputs:
                     outputs["image_contrastive_loss"] = cross_outputs["image_contrastive_loss"]
+                if "image_contrastive_negatives" in cross_outputs:
+                    outputs["image_contrastive_negatives"] = cross_outputs["image_contrastive_negatives"]
             else:
                 cross_outputs = self.image_generator(
                     encoder_hidden_states=cross_input,
