@@ -1509,13 +1509,16 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             )
 
     def _image_gen_is_adapter(self, model):
-        """True if the image generator is the SDXL conditioning adapter (predicts CLIP
-        conditioning, not a latent — so in-loop image viz can't render it; that's done
-        by scripts/eval/world/eval_sdxl_adapter.py)."""
+        """True if the image generator is a conditioning ADAPTER (SDXL or Z-Image): it
+        predicts frozen-decoder conditioning, not a latent, so the in-loop latent viz can't
+        render it (and its 'target' is a dummy placeholder latent -> solid black). Rendering
+        is done by the sidecars scripts/eval/world/eval_{sdxl,zimage}_adapter.py."""
         m = model.module if hasattr(model, "module") else model
+        gen = getattr(m, "image_generator", None)
         try:
             from megatransformer.model.image.sdxl_adapter import SDXLConditioningAdapter
-            return isinstance(getattr(m, "image_generator", None), SDXLConditioningAdapter)
+            from megatransformer.model.image.zimage_adapter import ZImageConditioningAdapter
+            return isinstance(gen, (SDXLConditioningAdapter, ZImageConditioningAdapter))
         except Exception:
             return False
 
@@ -1596,11 +1599,18 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
         if self._image_gen_is_adapter(model):
             import os
-            if os.environ.get("IMAGE_EVAL_RENDER_SDXL"):
+            m = model.module if hasattr(model, "module") else model
+            from megatransformer.model.image.sdxl_adapter import SDXLConditioningAdapter
+            is_sdxl = isinstance(getattr(m, "image_generator", None), SDXLConditioningAdapter)
+            # In-loop render is SDXL-only + opt-in (loading the pipe alongside training may
+            # OOM). Z-Image has no in-loop path (20GB) -> always skip; use the sidecar.
+            if is_sdxl and os.environ.get("IMAGE_EVAL_RENDER_SDXL"):
                 self._render_sdxl_adapter(model, eval_dataset, collator, device, global_step, tag)
             else:
-                print("  [viz] image gen = SDXL adapter (CLIP conditioning); skipping in-loop render. "
-                      "Set IMAGE_EVAL_RENDER_SDXL=1 to render via SDXL in-loop, or use eval_sdxl_adapter.py.")
+                print("  [viz] image gen = conditioning adapter (SDXL/Z-Image); skipping in-loop "
+                      "render (its latent target is a dummy placeholder -> black). Use the sidecar "
+                      "eval_sdxl_adapter.py / eval_zimage_adapter.py; SDXL also supports "
+                      "IMAGE_EVAL_RENDER_SDXL=1.")
             return
 
         samples = self._get_eval_samples(
