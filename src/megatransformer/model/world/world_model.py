@@ -572,7 +572,7 @@ class MegaTransformerWorldModel(nn.Module):
         )
 
         # Main Transformer (Recurrent Block)
-        recurrent_output, _, _, _, iteration_stats = self.recurrent_block(
+        recurrent_output, _, recurrent_num_iters, recurrent_kls, iteration_stats = self.recurrent_block(
             interleaved_tokens,
             attention_mask=attn_mask,  # True for attend, False for padding
             additive_attn_bias=trunk_voice_bias,
@@ -602,6 +602,12 @@ class MegaTransformerWorldModel(nn.Module):
 
         # Generators/Codas
         outputs = {}
+
+        # Recurrent-depth telemetry (scalar total iterations = when all tokens converged;
+        # kl_per_iteration = mean-over-tokens KL curve). Surfaced so evals can inspect the
+        # EFFECTIVE refinement depth per example (KL early-exit floor), not just the cap.
+        outputs["recurrent_num_iterations"] = recurrent_num_iters
+        outputs["recurrent_kl_per_iteration"] = recurrent_kls
 
         if iteration_stats is not None:
             outputs["iteration_stats"] = iteration_stats

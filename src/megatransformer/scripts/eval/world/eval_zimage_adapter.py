@@ -206,6 +206,14 @@ def main():
         from transformers import AutoTokenizer
         _text_tok = AutoTokenizer.from_pretrained(args.text_encoder_model)
 
+    def _iter_info(out):
+        """(num_iterations, kl_per_iteration) from a forward — effective recurrent depth.
+        num_iters = when ALL tokens converged (KL early-exit) or the cap; kl = mean-over-token
+        KL curve. Eval forward is image-synthesis (short caption + ~64 gen queries dominate)."""
+        ni = out.get("recurrent_num_iterations")
+        kl = out.get("recurrent_kl_per_iteration") or []
+        return (int(ni) if ni is not None else -1), [float(x) for x in kl]
+
     @torch.no_grad()
     def seq_pred_for_prompt(prompt):
         ids = _text_tok(prompt, add_special_tokens=False).input_ids
@@ -217,11 +225,14 @@ def main():
             out = model(text_input_ids=text_input_ids, image_inputs=image_inputs,
                         precomputed_latents=True, is_synthesis=is_synth, decode_outputs=False)
         sp = out.get("image_clip_seq_pred")
-        return sp[0].float() if sp is not None else None
+        if sp is None:
+            return None, None, None
+        ni, kl = _iter_info(out)
+        return sp[0].float(), ni, kl
 
     @torch.no_grad()
     def items_from_dataset(ds, max_samples):
-        """-> list of (caption, seq_pred) for up to max_samples image-synthesis samples."""
+        """-> list of (caption, seq_pred, num_iters, kl_curve) for up to max_samples samples."""
         items, n = [], 0
         for i in range(len(ds)):
             batch = collator([ds[i]])
@@ -236,7 +247,8 @@ def main():
             sp = out.get("image_clip_seq_pred")
             if sp is None:
                 continue
-            items.append((caption, sp[0].float()))
+            ni, kl = _iter_info(out)
+            items.append((caption, sp[0].float(), ni, kl))
             n += 1
             if n >= max_samples:
                 break
@@ -245,9 +257,9 @@ def main():
     def items_from_prompts(prompts):
         out = []
         for p in prompts:
-            sp = seq_pred_for_prompt(p)
+            sp, ni, kl = seq_pred_for_prompt(p)
             if sp is not None:
-                out.append((p, sp))
+                out.append((p, sp, ni, kl))
         return out
 
     # ── targets are deterministic (caption -> fixed render); render ONCE per (log_dir, prompt
@@ -270,20 +282,27 @@ def main():
         if not items:
             print(f"[{tag}] no samples produced conditioning; skipping")
             return None
-        key = tag + ":" + hashlib.md5("|".join(c for c, _ in items).encode()).hexdigest()[:8]
+        key = tag + ":" + hashlib.md5("|".join(it[0] for it in items).encode()).hexdigest()[:8]
         skip_t = _skip_targets(key)
-        grid, caps, sc_gen, sc_tgt = [], [], [], []
-        for n, (caption, seq_pred) in enumerate(items):
+        grid, caps, sc_gen, sc_tgt, iters_list = [], [], [], [], []
+        for n, (caption, seq_pred, num_iters, kl_curve) in enumerate(items):
             gen = zimage_render(seq_pred, 1000 + n)
-            sg = clipscore(gen, caption); sc_gen.append(sg)
+            sg = clipscore(gen, caption); sc_gen.append(sg); iters_list.append(num_iters)
+            # KL "elbow": first iteration whose mean-token KL falls below 10% of the initial
+            # = the EFFECTIVE refinement depth (where the thought vector stops changing).
+            elbow = num_iters
+            if kl_curve and kl_curve[0]:
+                thr = 0.1 * abs(kl_curve[0])
+                elbow = next((j + 1 for j, k in enumerate(kl_curve) if abs(k) <= thr), num_iters)
+            klr = (f" iters={num_iters} elbow~{elbow} kl0={kl_curve[0]:.2g} klN={kl_curve[-1]:.2g}"
+                   if kl_curve else f" iters={num_iters}")
             if skip_t:
                 grid.append([gen])
-                print(f"[{tag} {n}] CLIP generated={sg:.3f} (target skipped) | {caption[:50]}", flush=True)
+                print(f"[{tag} {n}] gen={sg:.3f}{klr} | {caption[:42]}", flush=True)
             else:
                 tgt = zimage_render(target_cond(caption).float(), 1000 + n)
-                stv = clipscore(tgt, caption); sc_tgt.append(stv)
-                grid.append([tgt, gen])
-                print(f"[{tag} {n}] CLIP target={stv:.3f} generated={sg:.3f} | {caption[:50]}", flush=True)
+                stv = clipscore(tgt, caption); sc_tgt.append(stv); grid.append([tgt, gen])
+                print(f"[{tag} {n}] tgt={stv:.3f} gen={sg:.3f}{klr} | {caption[:42]}", flush=True)
             caps.append(caption)
 
         thumb, ncol = 320, (1 if skip_t else 2)
@@ -294,13 +313,18 @@ def main():
         montage_path = os.path.join(args.output_dir, montage_name)
         canvas.save(montage_path)
         mg = st_.mean(sc_gen)
+        valid_it = [x for x in iters_list if x >= 0]
+        miters = st_.mean(valid_it) if valid_it else -1
         tail = f"  target={st_.mean(sc_tgt):.3f}" if sc_tgt else "  (targets skipped)"
-        print(f"[{tag}] mean CLIPScore generated={mg:.3f}{tail}  montage: {montage_path}", flush=True)
+        print(f"[{tag}] mean CLIPScore generated={mg:.3f}{tail}  mean recurrent iters={miters:.1f}"
+              f"  montage: {montage_path}", flush=True)
 
         if args.log_dir:
-            scal = {f"{tag}/clipscore_generated": mg}
+            scal = {f"{tag}/clipscore_generated": mg, f"{tag}/recurrent_iters_mean": float(miters)}
             if sc_tgt:
                 scal[f"{tag}/clipscore_target"] = st_.mean(sc_tgt)
+            for r, ni in enumerate(iters_list):
+                scal[f"{tag}/recurrent_iters/{r}"] = float(ni)
             log_eval_scalars(scal, step)
             logger = _m.get_logger()
             if logger is not None:
