@@ -2091,27 +2091,38 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if ids.numel() == 0:
             return
 
-        spk = None
+        gt_spk = None
         for key in ("voice_speaker_embeddings", "voice_speaker_embedding"):
             v = sample.get(key)
             if v is not None:
-                spk = v.reshape(-1)
+                gt_spk = v.reshape(-1)
                 break
-        spk = self._resolve_static_speaker(spk) if spk is None else spk
-        if spk is None:
+        # Dual-speaker render, mirroring the SMG path: the sample's OWN speaker, plus a PINNED
+        # static reference voice. The static render is the control for speaker drift — with
+        # embedding-only conditioning the frozen decoder falls back toward its own (lower-
+        # pitched) prior whenever the units are off-manifold, so a wandering GT render with a
+        # STABLE static render means the units are at fault, not the embedding. Both feed the
+        # decoder identical units, so any difference between them is speaker conditioning alone.
+        static_spk = self._resolve_static_speaker(gt_spk)
+        renders = [("", gt_spk)] if gt_spk is not None else []
+        if static_spk is not None and (gt_spk is None or static_spk is not gt_spk):
+            renders.append(("_static_speaker", static_spk))
+        if not renders:
             return
 
-        try:
-            wav = self.voice_cosyvoice2_decoder.decode(ids, spk)
-        except Exception as e:
-            print(f"Warning: CosyVoice 2 decode failed for {tag_prefix}: {type(e).__name__}: {e}")
-            return
-        if wav is None or wav.numel() == 0:
-            return
         sr = self.voice_cosyvoice2_decoder.sample_rate
-        metrics.log_audio(f"{tag_prefix}_audio", wav, global_step, sr, context={
-            "units": f"{ids.numel()} units -> {wav.numel()/sr:.2f}s @ {sr}Hz",
-        })
+        for suffix, spk in renders:
+            try:
+                wav = self.voice_cosyvoice2_decoder.decode(ids, spk)
+            except Exception as e:
+                print(f"Warning: CosyVoice 2 decode failed for {tag_prefix}{suffix}: "
+                      f"{type(e).__name__}: {e}")
+                continue
+            if wav is None or wav.numel() == 0:
+                continue
+            metrics.log_audio(f"{tag_prefix}{suffix}_audio", wav, global_step, sr, context={
+                "units": f"{ids.numel()} units -> {wav.numel()/sr:.2f}s @ {sr}Hz",
+            })
 
     @staticmethod
     def _batch_voice_length(batch, i):
