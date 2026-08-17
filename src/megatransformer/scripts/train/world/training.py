@@ -103,6 +103,9 @@ class WorldModelTrainer(CommonTrainer):
         # scripts_local/compute_qwen_whiten_stats.py). Requires the small_sum_zimage_whiten
         # config (whiten_target=True). None = naive (un-whitened) MSE.
         image_whiten_stats_path: Optional[str] = None,
+        # Tier-1 InfoNCE ramp: linearly ramp the Z-Image adapter's contrastive_weight from 0
+        # to its config max over this many steps (measured from the phase start).
+        image_contrastive_ramp_steps: int = 2000,
         # Variance-matching aux loss weights (per modality). Penalizes
         # collapsed predictions whose std doesn't match the label std.
         # See WorldModelTrainer._compute_modality_recon_loss for details.
@@ -229,6 +232,8 @@ class WorldModelTrainer(CommonTrainer):
         self.image_target_bf16 = image_target_bf16
         self.image_whiten_stats_path = image_whiten_stats_path
         self._whiten_injected = False
+        self.image_contrastive_ramp_steps = int(image_contrastive_ramp_steps)
+        self._image_contrastive_phase_start = None
 
         self.audio_var_loss_weight = audio_var_loss_weight
         self.voice_var_loss_weight = voice_var_loss_weight
@@ -767,6 +772,19 @@ class WorldModelTrainer(CommonTrainer):
                 self._whiten_injected = True
                 print(f"[whiten] injected Qwen3 stats from {self.image_whiten_stats_path} "
                       f"-> Z-Image adapter (whiten={unwrapped_model.image_generator.whiten})", flush=True)
+            # Tier-1: ramp the adapter's InfoNCE weight from 0 -> config max over ramp_steps
+            # (phase-relative, so a --fresh_schedule warm-start ramps from the phase start).
+            _gen = unwrapped_model.image_generator
+            _cmax = float(getattr(_gen.config, "contrastive_weight", 0.0))
+            if _cmax > 0:
+                if self._image_contrastive_phase_start is None:
+                    self._image_contrastive_phase_start = global_step
+                _frac = min(1.0, max(0, global_step - self._image_contrastive_phase_start)
+                            / max(1, self.image_contrastive_ramp_steps))
+                _gen.contrastive_weight = _cmax * _frac
+                if model.training and global_step % self.args.logging_steps == 0:
+                    metrics.log_scalar("train/image_contrastive_weight", _gen.contrastive_weight,
+                                       global_step, skip_zero=False)
             captions = inputs.get("text_texts")
             if captions is not None:
                 model_device = next(unwrapped_model.parameters()).device
@@ -1172,6 +1190,8 @@ class WorldModelTrainer(CommonTrainer):
                 loss_components["image_clip_loss"] = image_clip_loss_t.detach()
                 if "image_clip_mse_loss" in outputs:
                     loss_components["image_clip_mse_loss"] = outputs["image_clip_mse_loss"]
+                if "image_contrastive_loss" in outputs:
+                    loss_components["image_contrastive_loss"] = outputs["image_contrastive_loss"]
 
             image_diffusion_loss_t = outputs.get("image_diffusion_loss")
             if image_diffusion_loss_t is not None:
@@ -2219,6 +2239,7 @@ def create_trainer(
         image_target_device=getattr(args, 'image_target_device', None),
         image_target_bf16=getattr(args, 'image_target_bf16', False),
         image_whiten_stats_path=getattr(args, 'image_whiten_stats_path', None),
+        image_contrastive_ramp_steps=getattr(args, 'image_contrastive_ramp_steps', 2000),
         audio_var_loss_weight=getattr(args, 'audio_var_loss_weight', 1.0),
         voice_var_loss_weight=getattr(args, 'voice_var_loss_weight', 1.0),
         image_var_loss_weight=getattr(args, 'image_var_loss_weight', 1.0),
@@ -2339,6 +2360,10 @@ def add_cli_args(subparsers):
                                  "{mean,std} of the Qwen3 target (from compute_qwen_whiten_stats.py). "
                                  "Injected into the adapter's whitening buffers. Requires "
                                  "--config small_sum_zimage_whiten.")
+    sub_parser.add_argument("--image_contrastive_ramp_steps", type=int, default=2000,
+                            help="Z-Image adapter Tier-1: ramp the InfoNCE weight 0->config max over "
+                                 "this many steps from the phase start (use small_sum_zimage_whiten_t1, "
+                                 "warm-started via --resume_from_checkpoint <ckpt> --fresh_schedule).")
 
     # Variance-matching auxiliary loss weights (per modality). The aux loss
     # penalizes (std(preds)/std(labels) - 1), preventing collapse to a constant

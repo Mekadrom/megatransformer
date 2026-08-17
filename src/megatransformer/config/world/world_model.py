@@ -528,3 +528,9 @@ WORLD_MODEL_CONFIGS["small_sum_zimage"].image_coda_config = ZImageAdapterConfig(
 # same config so the adapter de-whitens from the checkpoint buffers).
 WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"].image_coda_config.whiten_target = True
+
+# Tier-1: whitened MSE + InfoNCE discriminability (ramped). Warm-start this from a whitened
+# checkpoint (--resume_from_checkpoint <ckpt> --fresh_schedule); the projection head loads
+# fresh (strict=False). contrastive_weight here is the RAMP TARGET (--image_contrastive_ramp_steps).
+WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1"].image_coda_config.contrastive_weight = 0.2

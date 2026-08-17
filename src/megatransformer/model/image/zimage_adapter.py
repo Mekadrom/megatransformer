@@ -62,6 +62,13 @@ class ZImageConditioningAdapter(nn.Module):
         nn.init.normal_(self.seq_head.weight, std=0.02)
         nn.init.zeros_(self.seq_head.bias)
 
+        # Tier-1 InfoNCE projection head (dormant unless contrastive_weight>0). Contrast the
+        # mean-pooled conditioning in a LEARNED space — raw cosine on LM features is
+        # near-saturated (0.999+ even for wrong captions), so it can't separate them.
+        pdim = int(getattr(config, "contrastive_proj_dim", 256))
+        self.contrastive_proj = nn.Sequential(
+            nn.Linear(config.seq_dim, pdim), nn.GELU(), nn.Linear(pdim, pdim))
+
         # Tier-0 whitening: regress in a per-dim z-scored Qwen3 space. Centering removes
         # the massive near-constant outlier dims (LLM "massive activations"), scaling
         # equalizes each dim's loss contribution -> attacks the MSE-mean mode-collapse.
@@ -123,9 +130,11 @@ class ZImageConditioningAdapter(nn.Module):
             sl = sl.to(sp.dtype)
             mse = F.mse_loss(sp, sl)
             loss = mse
-            if self.contrastive_weight > 0 and sp.shape[0] >= 2:   # dormant at baseline
-                loss = loss + self.contrastive_weight * _info_nce(
-                    sp.mean(1), sl.mean(1), self.contrastive_temp)
+            if self.contrastive_weight > 0 and sp.shape[0] >= 2:   # Tier-1: needs >=2 rows
+                nce = _info_nce(self.contrastive_proj(sp.mean(1)),
+                                self.contrastive_proj(sl.mean(1)), self.contrastive_temp)
+                loss = loss + self.contrastive_weight * nce
+                out["image_contrastive_loss"] = nce.detach()
             out["image_clip_loss"] = loss
             out["image_clip_mse_loss"] = mse.detach()
         return out

@@ -325,10 +325,13 @@ class ZImageAdapterConfig:
                                # resamples the variable-length Qwen3 target to this K)
     seq_dim: int = 2560        # Qwen3-4B hidden size
 
-    # BASELINE = pure MSE (contrastive_weight=0). The loss-engineering tiers (whitened
-    # MSE, manifold/InfoNCE, through-DiT flow-matching) are deferred; see project memory.
-    contrastive_weight: float = 0.0
+    # BASELINE = pure MSE (contrastive_weight=0). Tier-1 discriminability = InfoNCE (via a
+    # learned projection head — raw cosine on LM features is weak) between predicted and
+    # target conditioning, pushing different captions to distinct outputs (anti-interference).
+    # The trainer RAMPS this weight from 0 over --image_contrastive_ramp_steps.
+    contrastive_weight: float = 0.0        # max InfoNCE weight (0 = off)
     contrastive_temp: float = 0.07
+    contrastive_proj_dim: int = 256        # InfoNCE projection-head width
 
     # Tier-0 whitened MSE: regress in per-dim z-scored Qwen3 space (removes massive
     # constant dims + equalizes per-dim loss -> attacks MSE-mean collapse). Stats are
