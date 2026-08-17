@@ -252,7 +252,9 @@ def main():
         os.path.join(args.output_dir, f"gain_sweep_{args.gain_mode}.png"))
     mg = float(np.mean(gt))
     means = {g: float(np.mean(v)) for g, v in scores.items()}
-    base = means[gains[0]]
+    # Baseline at gain 1.0 (as-trained) when it was swept, NOT gains[0] -- a sweep that
+    # starts below 1.0 would otherwise report every gain as an improvement over the worst.
+    base = means.get(1.0, means[gains[0]])
     print(f"\n  == SDXL gain sweep (mode={args.gain_mode}) ==")
     for g in gains:
         print(f"    gain {g:>5.2f}: CLIPScore {means[g]:.4f}   "
