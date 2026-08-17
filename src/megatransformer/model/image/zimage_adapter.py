@@ -26,13 +26,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _info_nce(pred, tgt, temp):
-    """Symmetric InfoNCE: pred_i must be closer to tgt_i than to tgt_j (j!=i)."""
+def _info_nce(pred, tgt, temp, neg=None):
+    """Symmetric InfoNCE: pred_i must be closer to tgt_i than to tgt_j (j!=i).
+
+    `neg` (N, D), if given, are EXTRA negatives (a memory queue of past targets) appended
+    to the pred->tgt direction only, making that direction a (B+N)-way discrimination
+    instead of B-way. The tgt->pred direction stays in-batch: there is no queue of past
+    PREDICTIONS because those go stale as the model trains (the targets do not — they come
+    from a frozen encoder).
+    """
     p = F.normalize(pred, dim=-1)
     t = F.normalize(tgt, dim=-1)
+    b = p.shape[0]
     logits = p @ t.T / temp
-    labels = torch.arange(p.shape[0], device=p.device)
-    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+    labels = torch.arange(b, device=p.device)
+    if neg is not None and neg.shape[0] > 0:
+        logits = torch.cat([logits, p @ F.normalize(neg, dim=-1).T / temp], dim=1)
+    return 0.5 * (F.cross_entropy(logits, labels)
+                  + F.cross_entropy(logits[:, :b].T, labels))
 
 
 class ZImageConditioningAdapter(nn.Module):
@@ -69,6 +80,32 @@ class ZImageConditioningAdapter(nn.Module):
         self.contrastive_proj = nn.Sequential(
             nn.Linear(config.seq_dim, pdim), nn.GELU(), nn.Linear(pdim, pdim))
 
+        # MoCo-style memory queue of past TARGET conditioning (pooled, in loss space).
+        # In-batch InfoNCE is only a batch_size-way task -- at batch 8 that is solved to
+        # ~0 loss almost immediately and contributes no gradient. The queue raises it to a
+        # (B + queue_size)-way task, which is where contrastive objectives actually bite.
+        #
+        # Unlike MoCo there is NO momentum encoder and the stored vectors are NOT
+        # pre-projected: the targets come from a FROZEN Qwen3, so raw target features never
+        # go stale, and re-projecting the whole queue through the CURRENT head each step
+        # gives exactly-consistent (zero-lag) negatives. Gradient is allowed to flow through
+        # the queue's projection -- that is what teaches the head to spread targets apart,
+        # and it cannot degenerate because a queued vector is drawn from the same
+        # distribution as the positives (it WAS a positive on an earlier step).
+        #
+        # Non-persistent: kept out of the checkpoint (42MB at 4096x2560) since it is a
+        # transient training artifact and refills in queue_size/batch_size steps.
+        self.contrastive_queue_size = int(getattr(config, "contrastive_queue_size", 0))
+        if self.contrastive_queue_size > 0:
+            self.register_buffer(
+                "contrastive_queue",
+                torch.zeros(self.contrastive_queue_size, config.seq_dim),
+                persistent=False)
+            self.register_buffer("contrastive_queue_ptr", torch.zeros((), dtype=torch.long),
+                                 persistent=False)
+            self.register_buffer("contrastive_queue_fill", torch.zeros((), dtype=torch.long),
+                                 persistent=False)
+
         # Tier-0 whitening: regress in a per-dim z-scored Qwen3 space. Centering removes
         # the massive near-constant outlier dims (LLM "massive activations"), scaling
         # equalizes each dim's loss contribution -> attacks the MSE-mean mode-collapse.
@@ -89,6 +126,42 @@ class ZImageConditioningAdapter(nn.Module):
         self.whiten_mean.copy_(m.to(self.whiten_mean.device))
         self.whiten_std.copy_(s.to(self.whiten_std.device))
         self.whiten = True
+
+    def _queue_negatives(self):
+        """Filled slice of the target memory queue, or None if disabled/empty.
+
+        CLONED, not a view: _enqueue writes into the buffer in place during the same
+        forward, which would otherwise bump the version of the exact tensor the projection
+        head consumed and make backward fail ("modified by an inplace operation").
+        """
+        if self.contrastive_queue_size <= 0:
+            return None
+        fill = int(self.contrastive_queue_fill)
+        return self.contrastive_queue[:fill].clone() if fill > 0 else None
+
+    @torch.no_grad()
+    def _enqueue(self, vecs):
+        """Ring-buffer write of pooled target vectors (B, seq_dim) into the memory queue."""
+        if self.contrastive_queue_size <= 0:
+            return
+        q = self.contrastive_queue
+        v = vecs.detach().to(q.dtype).to(q.device)
+        n, cap = v.shape[0], q.shape[0]
+        if n >= cap:                                   # batch alone overfills: keep the tail
+            q.copy_(v[-cap:])
+            self.contrastive_queue_ptr.zero_()
+            self.contrastive_queue_fill.fill_(cap)
+            return
+        ptr = int(self.contrastive_queue_ptr)
+        end = ptr + n
+        if end <= cap:
+            q[ptr:end] = v
+        else:                                          # wrap
+            head = cap - ptr
+            q[ptr:] = v[:head]
+            q[:end - cap] = v[head:]
+        self.contrastive_queue_ptr.fill_(end % cap)
+        self.contrastive_queue_fill.fill_(min(cap, int(self.contrastive_queue_fill) + n))
 
     def forward(
         self,
@@ -131,10 +204,21 @@ class ZImageConditioningAdapter(nn.Module):
             mse = F.mse_loss(sp, sl)
             loss = mse
             if self.contrastive_weight > 0 and sp.shape[0] >= 2:   # Tier-1: needs >=2 rows
-                nce = _info_nce(self.contrastive_proj(sp.mean(1)),
-                                self.contrastive_proj(sl.mean(1)), self.contrastive_temp)
+                tgt_pool = sl.mean(1)                              # (B, seq_dim), loss space
+                neg = self._queue_negatives()
+                nce = _info_nce(
+                    self.contrastive_proj(sp.mean(1)),
+                    self.contrastive_proj(tgt_pool),
+                    self.contrastive_temp,
+                    neg=self.contrastive_proj(neg.to(sp.dtype)) if neg is not None else None)
                 loss = loss + self.contrastive_weight * nce
                 out["image_contrastive_loss"] = nce.detach()
+                out["image_contrastive_negatives"] = torch.as_tensor(
+                    float(0 if neg is None else neg.shape[0]), device=sp.device)
+                # Enqueue AFTER the loss so the current batch's own targets are never in
+                # its own negative set (they are already the in-batch negatives).
+                if self.training:
+                    self._enqueue(tgt_pool)
             out["image_clip_loss"] = loss
             out["image_clip_mse_loss"] = mse.detach()
         return out

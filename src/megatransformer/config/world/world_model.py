@@ -534,3 +534,12 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"].image_coda_config.whiten_target =
 # fresh (strict=False). contrastive_weight here is the RAMP TARGET (--image_contrastive_ramp_steps).
 WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1"].image_coda_config.contrastive_weight = 0.2
+
+# Tier-1q: same, plus a 4096-entry memory queue of past Qwen3 targets. Plain in-batch
+# InfoNCE at batch_size 8 is an 8-way task that the adapter solves to ~0.009 (chance =
+# ln 8 = 2.08) within a few hundred steps, so the term contributes essentially no
+# gradient; the queue makes it 4104-way (chance = ln 4104 = 8.3) and keeps it hard for
+# the whole run. Queue is non-persistent, so checkpoints stay the same size and this
+# config still loads t1 checkpoints (and vice versa).
+WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1q"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1q"].image_coda_config.contrastive_queue_size = 4096

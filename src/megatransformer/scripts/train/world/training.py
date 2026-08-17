@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.model.image.sdxl_adapter import SDXLConditioningAdapter
 from megatransformer.model.image.zimage_adapter import ZImageConditioningAdapter
+from megatransformer.config.image.decoder import ZImageAdapterConfig
 from megatransformer.scripts.train.trainer import CommonTrainer
 from megatransformer.utils import model_loading_utils, megatransformer_utils, metrics, constants
 
@@ -1192,6 +1193,9 @@ class WorldModelTrainer(CommonTrainer):
                     loss_components["image_clip_mse_loss"] = outputs["image_clip_mse_loss"]
                 if "image_contrastive_loss" in outputs:
                     loss_components["image_contrastive_loss"] = outputs["image_contrastive_loss"]
+                if "image_contrastive_negatives" in outputs:
+                    # Memory-queue depth actually used this step (warms up to queue_size).
+                    loss_components["image_contrastive_negatives"] = outputs["image_contrastive_negatives"]
 
             image_diffusion_loss_t = outputs.get("image_diffusion_loss")
             if image_diffusion_loss_t is not None:
@@ -2000,6 +2004,7 @@ def load_model(args, device='cuda'):
                       getattr(args, 'voice_predict_f0', False) or
                       getattr(args, 'voice_cfg_text_dropout_prob', 0.0) > 0.0 or
                       getattr(args, 'mean_thinking_steps', None) is not None or
+                      getattr(args, 'image_contrastive_queue_size', None) is not None or
                       getattr(args, 'voice_stochastic_output', False))
     if needs_override:
         import copy
@@ -2057,6 +2062,13 @@ def load_model(args, device='cuda'):
             # (recurrent.py:161-173), so patching it onto a built model would leave the
             # weights initialized for the old depth.
             config.recurrent_block_config.mean_thinking_steps = args.mean_thinking_steps
+        if getattr(args, 'image_contrastive_queue_size', None) is not None:
+            # Z-Image adapter InfoNCE memory queue. Pre-construction: it allocates a
+            # (queue_size, seq_dim) buffer in the adapter's __init__.
+            if not isinstance(config.image_coda_config, ZImageAdapterConfig):
+                raise SystemExit("--image_contrastive_queue_size requires a Z-Image adapter config "
+                                 f"(got {type(config.image_coda_config).__name__}).")
+            config.image_coda_config.contrastive_queue_size = int(args.image_contrastive_queue_size)
         if getattr(args, 'voice_predict_f0', False):
             config.voice_coda_config.predict_f0 = True
         if getattr(args, 'voice_dedup', False):
@@ -2364,6 +2376,13 @@ def add_cli_args(subparsers):
                             help="Z-Image adapter Tier-1: ramp the InfoNCE weight 0->config max over "
                                  "this many steps from the phase start (use small_sum_zimage_whiten_t1, "
                                  "warm-started via --resume_from_checkpoint <ckpt> --fresh_schedule).")
+    sub_parser.add_argument("--image_contrastive_queue_size", type=int, default=None,
+                            help="Z-Image adapter Tier-1: size of the MoCo-style memory queue of past "
+                                 "Qwen3 targets used as extra InfoNCE negatives (overrides the config; "
+                                 "0 = in-batch only). In-batch InfoNCE at batch_size 8 is an 8-way task "
+                                 "that saturates near 0 and stops producing gradient; a 4096 queue makes "
+                                 "it 4104-way. Non-persistent buffer, so checkpoints are unaffected. "
+                                 "Preset small_sum_zimage_whiten_t1q already sets 4096.")
 
     # Variance-matching auxiliary loss weights (per modality). The aux loss
     # penalizes (std(preds)/std(labels) - 1), preventing collapse to a constant

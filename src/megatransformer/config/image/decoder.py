@@ -332,6 +332,12 @@ class ZImageAdapterConfig:
     contrastive_weight: float = 0.0        # max InfoNCE weight (0 = off)
     contrastive_temp: float = 0.07
     contrastive_proj_dim: int = 256        # InfoNCE projection-head width
+    # MoCo-style memory queue of past targets (0 = in-batch negatives only). In-batch
+    # InfoNCE at batch_size 8 is an 8-way task that saturates near 0 loss within a few
+    # hundred steps and stops producing gradient; the queue makes it (B+queue_size)-way.
+    # No momentum encoder is needed here because the targets come from a FROZEN encoder.
+    # Non-persistent buffer (not checkpointed); refills in queue_size/batch_size steps.
+    contrastive_queue_size: int = 0
 
     # Tier-0 whitened MSE: regress in per-dim z-scored Qwen3 space (removes massive
     # constant dims + equalizes per-dim loss -> attacks MSE-mean collapse). Stats are
