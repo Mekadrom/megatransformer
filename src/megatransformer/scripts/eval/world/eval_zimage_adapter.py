@@ -30,6 +30,12 @@ import os
 import torch
 import torch.nn.functional as F
 
+# Standing diverse probe set (committed) — the DEFAULT eval prompts for the Z-Image adapter
+# (outlandish / atmospheric / non-human / object, better than random COCO captions for
+# tracking the collapse->breakout). Override with --prompts_file <other>, or pass
+# --prompts_file "" to fall back to val dataset captions (--cache_dir).
+_DEFAULT_PROMPTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zimage_probe_prompts.txt")
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -43,10 +49,10 @@ def parse_args():
                         "train_data path is latent-based and empty for the adapter). Lets you inspect "
                         "the ACTUAL training captions + their target/generated renders for data issues.")
     p.add_argument("--train_max_samples", type=int, default=8)
-    p.add_argument("--prompts_file", type=str, default=None,
-                   help="Eval on CUSTOM prompts (one per line) instead of val dataset captions — for "
-                        "diverse/outlandish probes (landscapes, surreal, non-human). Requires "
-                        "--text_encoder_model; builds [caption]+[BOI,IPH,EOI]+eos synthesis inputs.")
+    p.add_argument("--prompts_file", type=str, default=_DEFAULT_PROMPTS_FILE,
+                   help="Prompts (one per line) to eval, built as [prompt]+[BOI,IPH,EOI]+eos synthesis "
+                        "inputs (requires --text_encoder_model). DEFAULT = the committed diverse probe "
+                        "set (zimage_probe_prompts.txt). Pass \"\" to use val dataset captions instead.")
     p.add_argument("--skip_targets", action="store_true",
                    help="Never render/log target images (generated only). Targets are deterministic.")
     p.add_argument("--force_targets", action="store_true",
@@ -116,10 +122,13 @@ def main():
             if os.path.isdir(c):
                 return c
         return None
-    image_dir = resolve(args.cache_dir, "val") if "image" in include_modes else None
-    text_dir = resolve(args.cache_dir, "val") if "text" in include_modes else None
-    dataset = MultimodalShardedDataset(text_shard_dir=text_dir, image_shard_dir=image_dir,
-                                       cache_size=8, max_samples=args.max_samples)
+    # val-caption dataset is only needed when NOT probing custom prompts.
+    dataset = None
+    if not args.prompts_file:
+        image_dir = resolve(args.cache_dir, "val") if "image" in include_modes else None
+        text_dir = resolve(args.cache_dir, "val") if "text" in include_modes else None
+        dataset = MultimodalShardedDataset(text_shard_dir=text_dir, image_shard_dir=image_dir,
+                                           cache_size=8, max_samples=args.max_samples)
     _mcfg = model.module.config if hasattr(model, "module") else model.config
     collator = MultimodalDataCollator(
         special_token_base=getattr(_mcfg, "special_token_base", 32000),
