@@ -346,6 +346,20 @@ class ZImageAdapterConfig:
     # de-whiten. Off = naive baseline.
     whiten_target: bool = False
 
+    # INFERENCE-ONLY dispersion correction. An MSE-optimal point estimate is necessarily
+    # shrunk toward the target mean by the fraction of variance it cannot explain (measured:
+    # alpha 0.745 vs R^2 0.738 -- the conditional-mean signature), and the frozen DiT reads
+    # that under-dispersion as a washed-out, generic scene. Scaling the WHITENED prediction
+    # by ~1/alpha before de-whitening makes the whitened MSE strictly WORSE and the render
+    # measurably BETTER: on the diverse probe, gain 1.34 took CLIPScore 0.2873 -> 0.3025
+    # against a 0.3448 GT ceiling (~26% of the remaining gap, no retraining). Broad optimum
+    # 1.15-1.55, collapses by 2.1. Estimate it as 1/alpha on held-out captions with
+    # scripts_local/zimage_shrinkage_probe.py -- use the VAL alpha, not an OOD probe's.
+    # Applies ONLY to the surfaced prediction, never to the training loss (which is computed
+    # in whitened space before this). Requires whiten_target. 1.0 = off (default, so recorded
+    # eval trends stay comparable).
+    output_gain: float = 1.0
+
     # Target encoder (Z-Image's frozen Qwen3-4B), used by the world trainer to build
     # regression targets. 4-bit keeps it ~2.5GB so it fits alongside training.
     target_model: str = "Tongyi-MAI/Z-Image-Turbo"

@@ -72,6 +72,11 @@ def parse_args():
                    help="ALSO render pred / pred-rescaled-by-1/alpha / target through Z-Image and "
                         "CLIPScore them. The arbiter: does undoing the shrinkage fix the image?")
     p.add_argument("--render_n", type=int, default=8)
+    p.add_argument("--gain_sweep", type=str, default=None,
+                   help="With --render: comma-separated whitened-space output gains to sweep "
+                        "(e.g. '1.0,1.2,1.35,1.5,1.75,2.0'). 1/alpha exactly undoes the shrinkage, "
+                        "but the DiT's preferred dispersion is an empirical question -- this finds "
+                        "the CLIPScore-optimal gain. Saves a montage (rows=prompts, cols=gains+GT).")
     p.add_argument("--gen_steps", type=int, default=8)
     p.add_argument("--guidance", type=float, default=0.0)
     p.add_argument("--zimage_model", type=str, default="Tongyi-MAI/Z-Image-Turbo")
@@ -301,6 +306,43 @@ def main():
             return float(F.cosine_similarity(F.normalize(i, dim=-1), F.normalize(x, dim=-1)).item())
 
         n = min(args.render_n, N)
+
+        if args.gain_sweep:
+            # Sweep the whitened-space output gain. The training loss is MINIMIZED at g=1
+            # by construction, so any g>1 that scores better is direct evidence of the
+            # proxy gap (the DiT wants dispersion more than it wants L2 accuracy).
+            gains = [float(g) for g in args.gain_sweep.split(",") if g.strip()]
+            scores = {g: [] for g in gains}
+            gt_scores, rows = [], []
+            for i in range(n):
+                imgs = []
+                for g in gains:
+                    seq = (Pw[i] * g) * w_std + w_mean
+                    im = render(seq)
+                    scores[g].append(score(im, captions[i]))
+                    imgs.append(im)
+                gt_im = render(T[i])
+                gt_scores.append(score(gt_im, captions[i]))
+                imgs.append(gt_im)
+                rows.append(np.concatenate([np.asarray(im.resize((320, 320))) for im in imgs], 1))
+                print(f"  [{i}] " + "  ".join(f"g{g}={scores[g][-1]:.3f}" for g in gains)
+                      + f"  gt={gt_scores[-1]:.3f} | {captions[i][:50]}", flush=True)
+            Image.fromarray(np.concatenate(rows, 0)).save(
+                os.path.join(args.output_dir, "gain_sweep.png"))
+            mg = float(np.mean(gt_scores))
+            means = {g: float(np.mean(v)) for g, v in scores.items()}
+            best = max(means, key=means.get)
+            print(f"\n  == gain sweep (cols: {gains} + GT) ==")
+            for g in gains:
+                closed = 100 * (means[g] - means[gains[0]]) / max(mg - means[gains[0]], 1e-9)
+                print(f"    gain {g:>5}: CLIPScore {means[g]:.4f}   ({closed:+.1f}% of the gap closed)")
+            print(f"    GT ceiling : {mg:.4f}")
+            print(f"    -> BEST gain = {best} (1/alpha = {1/max(alpha,1e-6):.3f})\n", flush=True)
+            res.update({"gain_sweep": means, "gain_sweep_best": best, "clip_target": mg})
+            with open(os.path.join(args.output_dir, "shrinkage.json"), "w") as f:
+                json.dump(res, f, indent=2)
+            return
+
         rows, s_raw, s_fix, s_gt = [], [], [], []
         for i in range(n):
             # rescale in WHITENED space by 1/alpha, then de-whiten back to Qwen3 space

@@ -60,6 +60,8 @@ def parse_args():
     p.add_argument("--zimage_model", type=str, default="Tongyi-MAI/Z-Image-Turbo")
     p.add_argument("--gen_steps", type=int, default=8)          # Turbo
     p.add_argument("--guidance", type=float, default=0.0)       # Turbo: no CFG
+    p.add_argument("--output_gain", type=float, default=1.0,
+                   help="Z-Image adapter: inference-only dispersion gain on the whitened prediction. An MSE-trained point estimate is shrunk toward the target mean by 1-R^2, which the DiT renders as washed-out/generic; ~1/alpha undoes it. Measured best ~1.2-1.5 (gain 1.34: CLIPScore 0.287->0.303 vs 0.345 GT). Estimate per-checkpoint with scripts_local/zimage_shrinkage_probe.py. 1.0 = off.")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--text_encoder_model", type=str, default=None,
                    help="Pretrained text spine (e.g. HuggingFaceTB/SmolLM2-135M) — MUST match how "
@@ -113,6 +115,10 @@ def main():
         raise SystemExit(f"--config {args.config} does not use the Z-Image adapter "
                          f"(image_generator is {type(getattr(model,'image_generator',None)).__name__})")
     seq_len = int(model.image_generator.config.seq_len)
+    if args.output_gain != 1.0:
+        model.image_generator.output_gain = args.output_gain
+        print(f"[zimage] output_gain={args.output_gain} (dispersion correction on the "
+              f"whitened prediction; whiten={model.image_generator.whiten})", flush=True)
 
     # ── val data (force image-synthesis direction) ──
     def resolve(d, s):

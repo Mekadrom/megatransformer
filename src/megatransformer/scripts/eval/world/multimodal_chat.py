@@ -78,6 +78,8 @@ def parse_args():
     # (seq, 2560; no pooled) via frozen Z-Image-Turbo. 8 NFEs, guidance 0 (Turbo).
     p.add_argument("--zimage_model", type=str, default="Tongyi-MAI/Z-Image-Turbo",
                    help="Z-Image-Turbo model for rendering the adapter's predicted conditioning.")
+    p.add_argument("--zimage_output_gain", type=float, default=1.0,
+                   help="Z-Image adapter: inference-only dispersion gain on the whitened prediction. An MSE-trained point estimate is shrunk toward the target mean by 1-R^2, which the DiT renders as washed-out/generic; ~1/alpha undoes it. Measured best ~1.2-1.5 (gain 1.34: CLIPScore 0.287->0.303 vs 0.345 GT). Estimate per-checkpoint with scripts_local/zimage_shrinkage_probe.py. 1.0 = off.")
     p.add_argument("--zimage_gen_steps", type=int, default=8,
                    help="Z-Image diffusion steps (Turbo=8). UI 'image diffusion steps' overrides if >0.")
     p.add_argument("--max_new_tokens", type=int, default=512)
@@ -501,6 +503,9 @@ def main():
         zimage_pipe = ZImagePipeline.from_pretrained(args.zimage_model, torch_dtype=torch.bfloat16)
         zimage_pipe.enable_model_cpu_offload()  # ~20GB stack; offload to coexist with the world model
         zimage_pipe.set_progress_bar_config(disable=True)
+        if args.zimage_output_gain != 1.0:
+            model.image_generator.output_gain = args.zimage_output_gain
+            print(f"[zimage] output_gain={args.zimage_output_gain} (dispersion correction)")
 
     @torch.no_grad()
     def render_zimage_cond(seq: torch.Tensor, steps: int, seed: int) -> Image.Image:

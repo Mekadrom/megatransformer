@@ -117,6 +117,11 @@ class ZImageConditioningAdapter(nn.Module):
         self.register_buffer("whiten_mean", torch.zeros(config.seq_dim))
         self.register_buffer("whiten_std", torch.ones(config.seq_dim))
 
+        # Inference-only dispersion correction (see ZImageAdapterConfig.output_gain): scales
+        # the WHITENED prediction before de-whitening, undoing the shrinkage an MSE-optimal
+        # point estimate is forced into. Touches only the surfaced prediction, never the loss.
+        self.output_gain = float(getattr(config, "output_gain", 1.0))
+
     def set_whiten_stats(self, mean, std, eps: float = 1e-6):
         """Load per-dim Qwen3 target mean/std into the whitening buffers and enable it."""
         m = torch.as_tensor(mean, dtype=self.whiten_mean.dtype).flatten()
@@ -182,8 +187,15 @@ class ZImageConditioningAdapter(nn.Module):
         if self.whiten:
             mean = self.whiten_mean.view(1, 1, -1)
             std = self.whiten_std.view(1, 1, -1)
-            out_seq = seq_pred * std + mean
+            # output_gain scales in WHITENED space (target mean 0), i.e. it scales the
+            # deviation from the target mean and leaves the mean itself alone.
+            out_seq = (seq_pred * self.output_gain) * std + mean
         else:
+            if self.output_gain != 1.0:
+                raise ValueError(
+                    "output_gain requires whiten_target: without whitening the prediction is in "
+                    "raw Qwen3 space, where scaling would also blow up the massive near-constant "
+                    "dims (|mean| up to 1013) instead of scaling the deviation from the mean.")
             out_seq = seq_pred
         # Reuse the "image_clip_*" output keys so the world model / trainer / generate()
         # plumbing is shared with the SDXL adapter; pooled is None (Z-Image has none).
