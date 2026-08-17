@@ -35,6 +35,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         vocoder: Optional[torch.nn.Module] = None,
         image_vae_decoder: Optional[torch.nn.Module] = None,
         voice_smg_decoder: Optional[torch.nn.Module] = None,
+        voice_cosyvoice2_decoder: Optional[torch.nn.Module] = None,
         static_speaker_embedding: Optional[torch.Tensor] = None,
         num_eval_samples: int = 4,
         step_offset: int = 0,
@@ -71,11 +72,16 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         self.vocoder = vocoder
         self.image_vae_decoder = image_vae_decoder
         self.voice_smg_decoder = voice_smg_decoder
+        # Frozen CosyVoice 2 flow+HiFT. When present it TAKES PRECEDENCE over the SMG path:
+        # a CosyVoice 2 run's voice coda emits unit ids over CosyVoice's codebook, which the
+        # SMG (trained on Mimi cb0 latents) cannot decode.
+        self.voice_cosyvoice2_decoder = voice_cosyvoice2_decoder
         self.static_speaker_embedding = static_speaker_embedding
         # Lazily pinned in _resolve_static_speaker when no explicit static embedding was
         # given, so the TTS renders still have a voice that is constant across evals.
         self._pinned_speaker = None
         self._warned_no_smg = False
+        self._warned_no_units = False
         self.num_eval_samples = num_eval_samples
         self.step_offset = step_offset if step_offset is not None else 0
         # Voice sampling for TB eval renders. Only bites when the model was trained with
@@ -685,11 +691,23 @@ class WorldModelVisualizationCallback(VisualizationCallback):
 
                 # Decode predicted voice to audio if SMG available
                 sample = samples[i] if i < len(samples) else {}
-                self._log_audio_with_smg(pred_lat, sample, global_step, f"{tag}/voice/{i}/pred")
+                # Teacher-forced, so the discrete prediction is the unit head's argmax at each
+                # position. Trim to the utterance's true length: past it the inputs are padding,
+                # so those "predictions" are noise that the decoder would render as babble.
+                self._log_audio_with_smg(
+                    pred_lat, sample, global_step, f"{tag}/voice/{i}/pred",
+                    unit_ids=self._generated_unit_ids(outputs, idx=i),
+                    unit_length=self._batch_voice_length(batch, i),
+                )
 
             # Also decode target voice for comparison (first sample only)
             if len(samples) > 0:
-                self._log_audio_with_smg(voice_labels[0], samples[0], global_step, f"{tag}/voice/0/target")
+                self._log_audio_with_smg(
+                    voice_labels[0], samples[0], global_step, f"{tag}/voice/0/target",
+                    unit_ids=(batch.get("voice_unit_ids")[0]
+                              if batch.get("voice_unit_ids") is not None else None),
+                    unit_length=self._batch_voice_length(batch, 0),
+                )
 
         # --- Log audio reconstruction quality ---
         audio_preds = outputs.get("audio_latent_preds")
@@ -922,14 +940,25 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                             tgt_lat[..., :Tc].flatten().to(pred_lat.device).unsqueeze(0),
                         ).item()
                         metrics.log_scalar(f"{tag}/{i}/voice_cosine_sim", cos, global_step)
-                        self._log_audio_with_smg(tgt_lat, sample, global_step, f"{tag}/voice/{i}/target")
+                        # Cached target units are 0-PADDED to the batch's frame count and 0 is a
+                        # legal unit, so the length must come from voice_feature_lengths or the
+                        # decoder renders the padding as breathy non-speech.
+                        tgt_units = voice_batch.get("voice_unit_ids")
+                        self._log_audio_with_smg(
+                            tgt_lat, sample, global_step, f"{tag}/voice/{i}/target",
+                            unit_ids=(tgt_units[0] if tgt_units is not None else None),
+                            unit_length=self._batch_voice_length(voice_batch, 0),
+                        )
 
                     # Generated audio must render the world model's PREDICTED F0 contour, not
                     # the sample's GT contour — that's the prosody the AR test is judging.
                     gen_f0 = outputs.get("voice_f0_preds")
+                    # Free-running trace: already exact (EOV stripped by generate()), so NO
+                    # length trim — its length IS the signal this scenario exists to show.
                     self._log_audio_with_smg(
                         pred_lat, sample, global_step, f"{tag}/voice/{i}/generated",
                         f0_contour=(gen_f0[0, 0] if gen_f0 is not None and gen_f0.numel() > 0 else None),
+                        unit_ids=self._generated_unit_ids(outputs),
                     )
             except Exception as e:
                 print(f"Warning: Train generation (voice) failed for sample {i}: {e}")
@@ -1365,6 +1394,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 self._log_audio_with_smg(
                     pred_latent, sample, global_step, f"{tag}/{i}",
                     f0_contour=(f0_p[0, 0] if f0_p is not None and f0_p.numel() > 0 else None),
+                    unit_ids=self._generated_unit_ids(outputs),
                 )
 
             # Log target voice for comparison
@@ -1375,6 +1405,15 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     self._latent_to_image(target_features),
                     global_step,
                 )
+                # Ground-truth audio: on the discrete path the cache stores the units directly,
+                # so the target render is the frozen decoder's own reconstruction = the ceiling
+                # this run's generated audio is being listened to against. CosyVoice-only —
+                # the SMG path never logged a target here and stays byte-identical.
+                if self.voice_cosyvoice2_decoder is not None:
+                    self._log_audio_with_cosyvoice2(
+                        sample.get("voice_unit_ids"), sample, global_step, f"{tag}/{i}/target",
+                        length=sample.get("voice_feature_length"),   # cached units are 0-padded
+                    )
 
             voice_preds = outputs.get("voice_latent_preds")
             gen_latent = voice_preds[0, 0] if voice_preds is not None and voice_preds.numel() > 0 else None
@@ -1994,8 +2033,109 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         # provisional until the pool fills (first eval only): the latest seen
         return self._speaker_pool[-1] if getattr(self, "_speaker_pool", None) else None
 
-    def _log_audio_with_smg(self, pred_latent, sample, global_step, tag_prefix, f0_contour=None):
-        """Run dual-speaker SMG decoding: ground-truth speaker + static speaker."""
+    @staticmethod
+    def _generated_unit_ids(outputs, idx: int = 0):
+        """Content unit ids for sample `idx` of a generate() OR teacher-forced call, or None.
+
+        Prefers `voice_unit_id_trace` (what generation actually emitted, EOV already stripped
+        by generate()). Falls back to argmax over `voice_unit_logits` for teacher-forced
+        outputs. Never derives ids from voice_latent_preds: that is the regression head, a
+        sibling of the unit classifier, not the model's discrete prediction.
+        """
+        trace = outputs.get("voice_unit_id_trace")
+        if trace:
+            seq = trace[idx] if isinstance(trace[0], (list, tuple)) else trace
+            if len(seq) > 0:
+                return torch.tensor([int(x) for x in seq], dtype=torch.long)
+        logits = outputs.get("voice_unit_logits")
+        if logits is not None and logits.numel() > 0 and idx < logits.shape[0]:
+            return logits[idx].argmax(-1).reshape(-1).detach().cpu()
+        return None
+
+    def _log_audio_with_cosyvoice2(self, unit_ids, sample, global_step, tag_prefix, length=None):
+        """Decode CosyVoice 2 content unit ids -> 24 kHz audio with the frozen flow+HiFT.
+
+        Unlike the SMG path this consumes the voice coda's CLASSIFIER output (unit ids), not
+        the regression head's latent -- on a discrete run those are sibling heads and the
+        latent is not what the model is judged on. Callers must therefore pass unit_ids
+        explicitly; we never fall back to the sample's GROUND-TRUTH units, which would
+        silently log target audio under a `pred` tag.
+        """
+        if unit_ids is None:
+            if not self._warned_no_units:
+                self._warned_no_units = True
+                print(f"[viz] WARNING: CosyVoice 2 decoder loaded but no unit ids were passed to "
+                      f"{tag_prefix} — skipping audio for this render (NOT falling back to the "
+                      f"latent or to ground-truth units).", flush=True)
+            return
+        ids = unit_ids.reshape(-1)
+        # TRIM TO THE VALID LENGTH FIRST. Cached unit_ids are padded to the shard's max frame
+        # count with ZERO, and 0 is a legal CosyVoice unit -- so value-based filtering alone
+        # cannot see the padding, and the decoder renders it as breathy repeated non-speech
+        # tacked onto the end. The true length lives in the scalar voice_feature_length.
+        # NOT defaulted from the sample: generated ids (voice_unit_id_trace) are already exact,
+        # and trimming them to the GT length would destroy the free-running-length signal.
+        # Callers passing CACHED units must pass the length explicitly.
+        if length is not None:
+            n = int(length.item() if hasattr(length, "item") else length)
+            if 0 < n < ids.numel():
+                ids = ids[:n]
+        # Then strip EOV / negative padding / out-of-codebook ids. The bound is the CODEBOOK
+        # size (input_embedding rows = 6561), NOT flow.input_size — that is the feature width
+        # (512) and would silently discard almost every unit.
+        emb = getattr(self.voice_cosyvoice2_decoder.flow, "input_embedding", None)
+        vocab = int(emb.weight.shape[0]) if emb is not None else None
+        ids = ids[ids >= 0]
+        if vocab:
+            ids = ids[ids < vocab]
+        if ids.numel() == 0:
+            return
+
+        spk = None
+        for key in ("voice_speaker_embeddings", "voice_speaker_embedding"):
+            v = sample.get(key)
+            if v is not None:
+                spk = v.reshape(-1)
+                break
+        spk = self._resolve_static_speaker(spk) if spk is None else spk
+        if spk is None:
+            return
+
+        try:
+            wav = self.voice_cosyvoice2_decoder.decode(ids, spk)
+        except Exception as e:
+            print(f"Warning: CosyVoice 2 decode failed for {tag_prefix}: {type(e).__name__}: {e}")
+            return
+        if wav is None or wav.numel() == 0:
+            return
+        sr = self.voice_cosyvoice2_decoder.sample_rate
+        metrics.log_audio(f"{tag_prefix}_audio", wav, global_step, sr, context={
+            "units": f"{ids.numel()} units -> {wav.numel()/sr:.2f}s @ {sr}Hz",
+        })
+
+    @staticmethod
+    def _batch_voice_length(batch, i):
+        """Valid voice frame count for row i of a collated batch, or None."""
+        lens = batch.get("voice_feature_lengths") if isinstance(batch, dict) else None
+        if lens is None or i >= len(lens):
+            return None
+        v = lens[i]
+        # Collated lengths can be per-span (shape (n_spans,)); the voice path here is single-span.
+        return int(v.reshape(-1)[0].item()) if hasattr(v, "reshape") else int(v)
+
+    def _log_audio_with_smg(self, pred_latent, sample, global_step, tag_prefix, f0_contour=None,
+                            unit_ids=None, unit_length=None):
+        """Run dual-speaker SMG decoding: ground-truth speaker + static speaker.
+
+        On a CosyVoice 2 run the frozen flow+HiFT replaces the SMG entirely and consumes
+        `unit_ids` instead of the latent (see _log_audio_with_cosyvoice2). `unit_length` trims
+        PADDED unit sources (cached targets, teacher-forced argmax over a padded batch); leave
+        it None for a free-running trace, which is already exact.
+        """
+        if self.voice_cosyvoice2_decoder is not None:
+            self._log_audio_with_cosyvoice2(unit_ids, sample, global_step, tag_prefix,
+                                            length=unit_length)
+            return
         if self.voice_smg_decoder is None:
             if not self._warned_no_smg:
                 self._warned_no_smg = True

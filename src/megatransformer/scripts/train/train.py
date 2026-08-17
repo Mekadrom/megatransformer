@@ -498,6 +498,26 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             except Exception as e:
                 print(f"Warning: Failed to load voice SMG decoder for world model visualization: {e}")
 
+        # Frozen CosyVoice 2 flow+HiFT: decodes the voice coda's UNIT IDS straight to 24 kHz.
+        # Replaces the SMG+vocoder pair on a CosyVoice 2 run (the SMG is Mimi-codebook-specific).
+        # Loaded on CPU by default so it never competes with training for VRAM; the decode is a
+        # handful of eval renders per eval step.
+        voice_cosyvoice2_decoder = None
+        if getattr(args, 'voice_cosyvoice2_model_dir', None):
+            try:
+                from megatransformer.model.voice.cosyvoice2_decoder import CosyVoice2Decoder
+                voice_cosyvoice2_decoder = CosyVoice2Decoder.from_pretrained(
+                    args.voice_cosyvoice2_model_dir,
+                    runtime_dir=getattr(args, 'voice_cosyvoice2_runtime_dir', None),
+                    device=getattr(args, 'voice_cosyvoice2_device', 'cpu'),
+                )
+                print(f"Loaded frozen CosyVoice 2 decoder (flow+hift) from "
+                      f"{args.voice_cosyvoice2_model_dir} @ {voice_cosyvoice2_decoder.sample_rate} Hz "
+                      f"on {getattr(args, 'voice_cosyvoice2_device', 'cpu')}", flush=True)
+            except Exception as e:
+                print(f"Warning: Failed to load CosyVoice 2 decoder for world model visualization: "
+                      f"{type(e).__name__}: {e} -- NO TTS AUDIO WILL BE LOGGED.")
+
         static_speaker_embedding = None
         if getattr(args, 'static_speaker_embedding_path', None):
             try:
@@ -526,6 +546,7 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             vocoder=vocoder,
             image_vae_decoder=image_vae_decoder,
             voice_smg_decoder=voice_smg_decoder,
+            voice_cosyvoice2_decoder=voice_cosyvoice2_decoder,
             static_speaker_embedding=static_speaker_embedding,
             num_eval_samples=getattr(args, 'num_eval_samples', 4),
             step_offset=args.start_step,
