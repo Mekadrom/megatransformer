@@ -119,7 +119,12 @@ class CosyVoice2Teacher(nn.Module):
             n_text = int(ids.shape[1])
             # +1 EOV position; clip so we never index past the student's tensor
             span = min(L + 1, max_positions)
-            speech = unit_ids[b, :L].to(dev).long().clamp_(0, 6560).unsqueeze(0)
+            # OUT-OF-PLACE clamp. `.to(dev).long()` are no-ops when the batch tensor is
+            # already long/on-device, so an in-place clamp_ would mutate the caller's
+            # voice_unit_ids -- which the CE loss still needs for ITS backward (targets are
+            # required to compute the gradient w.r.t. logits), tripping autograd's version
+            # check. Being inside no_grad does not protect against this.
+            speech = unit_ids[b, :L].to(device=dev, dtype=torch.long).clamp(0, 6560).unsqueeze(0)
             seq = torch.cat([sos.to(dt), embed(ids).to(dt), task.to(dt),
                              self.lm.speech_embedding(speech).to(dt)], dim=1)
             rows.append(seq[0])
