@@ -176,6 +176,7 @@ class WorldModelTrainer(CommonTrainer):
         # get this LR instead of args.learning_rate. Useful when the DiT path
         # is the destabilizing module and a lower LR keeps training on-rails.
         lr_dit: Optional[float] = None,
+        lr_flow: Optional[float] = None,
         # Differential LR schedule (opt-in): give the DiT param group a different
         # LR *schedule* from the trunk/main group. HF's single scheduler otherwise
         # applies the SAME decay curve to every group, so a cosine --lr_scheduler_type
@@ -210,6 +211,7 @@ class WorldModelTrainer(CommonTrainer):
         super().__init__(*args, **kwargs)
 
         self.lr_dit = lr_dit
+        self.lr_flow = lr_flow
         self.differential_lr_schedule = differential_lr_schedule
         self.lr_dit_schedule = lr_dit_schedule
         self.lr_trunk_schedule = lr_trunk_schedule
@@ -1717,7 +1719,17 @@ class WorldModelTrainer(CommonTrainer):
             # Match both plain and DDP/DeepSpeed-wrapped param names.
             return ".image_generator." in f".{name}" or name.startswith("image_generator.")
 
+        def is_flow(name: str) -> bool:
+            # T3 flow head only. It is a FRESH module bolted onto an already-converged
+            # adapter, so it wants a from-scratch LR (~1e-4) while the warm-started
+            # Q-Former beside it must stay slow -- and both live under image_generator.*,
+            # so lr_dit alone cannot separate them.
+            return ".image_generator.flow_head." in f".{name}"
+
+        _lr_flow = self.lr_flow if self.lr_flow is not None else self.lr_dit
         groups = {
+            "flow_decay": {"params": [], "weight_decay": self.args.weight_decay, "lr": _lr_flow},
+            "flow_no_decay": {"params": [], "weight_decay": 0.0, "lr": _lr_flow},
             "dit_decay": {"params": [], "weight_decay": self.args.weight_decay, "lr": self.lr_dit},
             "dit_no_decay": {"params": [], "weight_decay": 0.0, "lr": self.lr_dit},
             "main_decay": {"params": [], "weight_decay": self.args.weight_decay, "lr": self.args.learning_rate},
@@ -1727,9 +1739,12 @@ class WorldModelTrainer(CommonTrainer):
         for n, p in opt_model.named_parameters():
             if not p.requires_grad:
                 continue
-            in_dit = is_dit(n)
+            in_flow = is_flow(n)
+            in_dit = is_dit(n) and not in_flow          # flow head is checked first
             in_decay = n in decay_parameters
             key = (
+                "flow_decay" if in_flow and in_decay else
+                "flow_no_decay" if in_flow else
                 "dit_decay" if in_dit and in_decay else
                 "dit_no_decay" if in_dit else
                 "main_decay" if in_decay else
@@ -1741,7 +1756,8 @@ class WorldModelTrainer(CommonTrainer):
         optimizer_grouped_parameters = [g for _, g in group_items]
         # Parallel tags aligned to optimizer.param_groups order, so create_scheduler
         # can hand each group its own LR-schedule lambda (DiT vs trunk/main).
-        self._lr_group_tags = ["dit" if name.startswith("dit") else "main" for name, _ in group_items]
+        self._lr_group_tags = ["dit" if name.startswith(("dit", "flow")) else "main"
+                               for name, _ in group_items]
 
         optimizer_cls, optimizer_kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(self.args, opt_model)
         # The 'lr' baked into each group takes precedence, but optimizer_kwargs
@@ -1750,11 +1766,14 @@ class WorldModelTrainer(CommonTrainer):
 
         # Print a summary so the user can verify routing.
         if self.args.local_rank in (-1, 0):
+            flow_params = sum(p.numel() for g in ("flow_decay", "flow_no_decay") for p in groups[g]["params"])
             dit_params = sum(p.numel() for g in ("dit_decay", "dit_no_decay") for p in groups[g]["params"])
             main_params = sum(p.numel() for g in ("main_decay", "main_no_decay") for p in groups[g]["params"])
             print(
                 f"[create_optimizer] DiT LR split enabled:\n"
                 f"  DiT params  (image_generator.*): {dit_params:,} @ lr={self.lr_dit}\n"
+                + (f"  Flow params (flow_head.*):       {flow_params:,} @ lr={_lr_flow}\n" if flow_params else "")
+                +
                 f"  Main params (everything else):   {main_params:,} @ lr={self.args.learning_rate}"
             )
 
@@ -2362,6 +2381,7 @@ def create_trainer(
         precomputed_latents=args.precomputed_latents,
         text_label_smoothing=args.text_label_smoothing,
         lr_dit=getattr(args, 'lr_dit', None),
+        lr_flow=getattr(args, 'lr_flow', None),
         differential_lr_schedule=getattr(args, 'differential_lr_schedule', False),
         lr_dit_schedule=getattr(args, 'lr_dit_schedule', 'constant'),
         lr_trunk_schedule=getattr(args, 'lr_trunk_schedule', 'cosine'),
@@ -2454,6 +2474,13 @@ def add_cli_args(subparsers):
                             help="Z-Image adapter Tier-1: ramp the InfoNCE weight 0->config max over "
                                  "this many steps from the phase start (use small_sum_zimage_whiten_t1, "
                                  "warm-started via --resume_from_checkpoint <ckpt> --fresh_schedule).")
+    sub_parser.add_argument("--lr_flow", type=float, default=None,
+                            help="Override LR for the T3 flow head (image_generator.flow_head.*) "
+                                 "separately from --lr_dit. The flow head is FRESH while the rest of "
+                                 "the adapter is warm-started, so it wants a from-scratch rate "
+                                 "(~1e-4) while the Q-Former beside it stays slow; both live under "
+                                 "image_generator.*, so --lr_dit alone cannot separate them. "
+                                 "Defaults to --lr_dit. Follows the DiT LR schedule.")
     sub_parser.add_argument("--image_contrastive_queue_size", type=int, default=None,
                             help="Z-Image adapter Tier-1: size of the MoCo-style memory queue of past "
                                  "Qwen3 targets used as extra InfoNCE negatives (overrides the config; "

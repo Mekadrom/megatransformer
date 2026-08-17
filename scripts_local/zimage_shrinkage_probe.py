@@ -63,6 +63,8 @@ def parse_args():
     p.add_argument("--max_samples", type=int, default=128)
     p.add_argument("--prompts_file", type=str, default=None,
                    help="Use these captions instead of the dataset (one per line).")
+    p.add_argument("--flow_bypass", action="store_true",
+                   help="Bypass the T3 flow head and surface the auxiliary POINT head instead. Diagnostic: if point-head renders are healthy while sampled ones are not, the shared Q-Former/trunk is intact and only the flow head is undertrained/broken; if BOTH are bad, the fresh head's gradients damaged the warm-started trunk.")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--target_device", type=str, default=None,
@@ -123,6 +125,9 @@ def main():
         print("[warn] adapter has whitening OFF; stats below are in raw Qwen3 space, where the "
               "555x per-dim std spread makes alpha dominated by a few massive dims.", flush=True)
     w_mean = gen.whiten_mean.detach().float().cpu()      # (2560,)
+    if getattr(args, "flow_bypass", False) and getattr(model.image_generator, "flow_head", None) is not None:
+        model.image_generator.flow_head = None
+        print("[t3] flow head BYPASSED -> surfacing the auxiliary point head", flush=True)
     w_std = gen.whiten_std.detach().float().cpu()
 
     _mcfg = model.module.config if hasattr(model, "module") else model.config
