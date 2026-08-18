@@ -377,6 +377,17 @@ class ZImageAdapterConfig:
     # Small auxiliary weight on the point head so seq_pred stays a comparable diagnostic
     # (alpha / R^2 / retrieval) against the T0/T1 regression runs. 0 = pure sampler.
     flow_aux_mse_weight: float = 0.1
+    # Classifier-free guidance. Training drops the context to a learned null with this
+    # probability so the head also learns the UNCONDITIONAL field; sampling then extrapolates
+    # v = v_uncond + w*(v_cond - v_uncond). This is the principled form of output_gain: it
+    # pushes away from the model's own unconditional prediction per-sample and per-timestep
+    # instead of scaling deviation-from-the-mean by one global constant. Needed because a
+    # sampler's MEAN draw loses to a conditional-mean point estimate on CLIPScore (measured
+    # 0.251 vs 0.287) even while best-of-6 wins (0.319) -- guidance is the knob on that axis.
+    # NOTE: a checkpoint trained with cfg_dropout=0 has an untrained null, so guidance only
+    # works after training WITH dropout.
+    flow_cfg_dropout: float = 0.1
+    flow_guidance: float = 1.0             # inference w; 1.0 = off (single forward per step)
 
     # Target encoder (Z-Image's frozen Qwen3-4B), used by the world trainer to build
     # regression targets. 4-bit keeps it ~2.5GB so it fits alongside training.

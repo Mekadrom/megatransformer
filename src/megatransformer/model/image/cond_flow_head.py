@@ -80,11 +80,24 @@ class CondFlowHead(nn.Module):
     """Flow-matching sampler for a (B, seq_len, seq_dim) conditioning target."""
 
     def __init__(self, seq_dim, ctx_dim, dim=512, n_heads=8, n_layers=4,
-                 mlp_ratio=4.0, dropout=0.0, steps=8, time_sampling="logit_normal"):
+                 mlp_ratio=4.0, dropout=0.0, steps=8, time_sampling="logit_normal",
+                 cfg_dropout=0.0, guidance=1.0):
         super().__init__()
         self.seq_dim = seq_dim
         self.steps = int(steps)
         self.time_sampling = time_sampling
+        # Classifier-free guidance. Training drops the context to a LEARNED null with
+        # probability cfg_dropout, so the head learns the unconditional field alongside the
+        # conditional one. Sampling then extrapolates away from the unconditional:
+        #     v = v_uncond + w * (v_cond - v_uncond)
+        # This is the principled version of the global `output_gain` hack: instead of scaling
+        # deviation-from-the-target-mean by one constant, it pushes away from the model's OWN
+        # unconditional prediction, per-sample and per-timestep. w=1 is plain conditional
+        # sampling (no guidance, single forward); w>1 trades diversity for fidelity, which is
+        # exactly the axis where a sampler loses to a conditional-mean point estimate.
+        self.cfg_dropout = float(cfg_dropout)
+        self.guidance = float(guidance)
+        self.null_ctx = nn.Parameter(torch.zeros(1, 1, ctx_dim))
         self.x_in = nn.Linear(seq_dim, dim)
         self.ctx_in = nn.Linear(ctx_dim, dim)
         self.t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
@@ -117,9 +130,16 @@ class CondFlowHead(nn.Module):
         # velocity field is hardest and most of the sample quality is decided.
         return torch.sigmoid(torch.randn(b, device=device, dtype=dtype))
 
+    def _null(self, ctx):
+        return self.null_ctx.to(ctx.dtype).expand_as(ctx)
+
     def loss(self, target, ctx):
         """Rectified-flow MSE. target (B,K,seq_dim) in the SAME space the head samples in."""
         b = target.shape[0]
+        if self.cfg_dropout > 0 and self.training:
+            # Per-ROW context dropout -> the head learns p(x) as well as p(x|ctx).
+            drop = (torch.rand(b, device=ctx.device) < self.cfg_dropout).view(-1, 1, 1)
+            ctx = torch.where(drop, self._null(ctx), ctx)
         t = self._sample_t(b, target.device, torch.float32).to(target.dtype)
         noise = torch.randn_like(target)
         tv = t.view(-1, 1, 1)
@@ -127,14 +147,27 @@ class CondFlowHead(nn.Module):
         return F.mse_loss(self.velocity(x_t, t, ctx), target - noise)
 
     @torch.no_grad()
-    def sample(self, ctx, seq_len, steps=None, generator=None):
-        """Integrate from noise to a sample. Euler; `steps` trades compute for fidelity."""
+    def sample(self, ctx, seq_len, steps=None, generator=None, guidance=None):
+        """Integrate from noise to a sample. Euler; `steps` trades compute for fidelity.
+
+        guidance w > 1 applies classifier-free guidance (2x cost per step, batched into a
+        single forward). w=1 (default) is plain conditional sampling.
+        """
         steps = int(steps or self.steps)
+        w = float(self.guidance if guidance is None else guidance)
         b = ctx.shape[0]
         dev, dt_ = ctx.device, ctx.dtype
         x = torch.randn(b, seq_len, self.seq_dim, device=dev, dtype=dt_, generator=generator)
         dt = 1.0 / steps
+        use_cfg = abs(w - 1.0) > 1e-6
+        ctx_pair = torch.cat([ctx, self._null(ctx)], 0) if use_cfg else ctx
         for k in range(steps):
-            t = torch.full((b,), k * dt, device=dev, dtype=dt_)
-            x = x + dt * self.velocity(x, t, ctx)
+            if use_cfg:
+                t = torch.full((2 * b,), k * dt, device=dev, dtype=dt_)
+                v_c, v_u = self.velocity(torch.cat([x, x], 0), t, ctx_pair).chunk(2, dim=0)
+                v = v_u + w * (v_c - v_u)
+            else:
+                t = torch.full((b,), k * dt, device=dev, dtype=dt_)
+                v = self.velocity(x, t, ctx)
+            x = x + dt * v
         return x

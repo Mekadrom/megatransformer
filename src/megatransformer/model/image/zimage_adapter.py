@@ -138,7 +138,9 @@ class ZImageConditioningAdapter(nn.Module):
                 n_layers=int(getattr(config, "flow_layers", 4)),
                 dropout=config.dropout,
                 steps=int(getattr(config, "flow_steps", 8)),
-                time_sampling=getattr(config, "flow_time_sampling", "logit_normal"))
+                time_sampling=getattr(config, "flow_time_sampling", "logit_normal"),
+                cfg_dropout=float(getattr(config, "flow_cfg_dropout", 0.0)),
+                guidance=float(getattr(config, "flow_guidance", 1.0)))
         self.flow_aux_mse_weight = float(getattr(config, "flow_aux_mse_weight", 0.1))
 
     def set_whiten_stats(self, mean, std, eps: float = 1e-6):

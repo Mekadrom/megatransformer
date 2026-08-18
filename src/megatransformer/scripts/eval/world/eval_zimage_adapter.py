@@ -68,6 +68,11 @@ def parse_args():
                         "progress -- N>1 reports mean/std/best-of-N and renders all N side by side. "
                         "Noise is SEEDED from --flow_seed_base, so sample k uses the same noise at "
                         "every checkpoint and differences are attributable to the model.")
+    p.add_argument("--flow_guidance", type=float, default=None,
+                   help="T3 classifier-free guidance weight w. v = v_uncond + w*(v_cond - v_uncond). "
+                        "1.0 = off. >1 trades diversity for fidelity (2x sampling cost). Only "
+                        "meaningful for checkpoints TRAINED with flow_cfg_dropout > 0 -- otherwise "
+                        "the null context is untrained and guidance extrapolates from noise.")
     p.add_argument("--flow_seed_base", type=int, default=4242,
                    help="Base seed for T3 flow sampling; sample k of prompt n uses base + 1000*k.")
     p.add_argument("--flow_bypass", action="store_true",
@@ -125,6 +130,9 @@ def main():
         raise SystemExit(f"--config {args.config} does not use the Z-Image adapter "
                          f"(image_generator is {type(getattr(model,'image_generator',None)).__name__})")
     seq_len = int(model.image_generator.config.seq_len)
+    if args.flow_guidance is not None and getattr(model.image_generator, "flow_head", None) is not None:
+        model.image_generator.flow_head.guidance = float(args.flow_guidance)
+        print(f"[t3] classifier-free guidance w={args.flow_guidance}", flush=True)
     if getattr(args, "flow_bypass", False) and getattr(model.image_generator, "flow_head", None) is not None:
         model.image_generator.flow_head = None
         print("[t3] flow head BYPASSED -> surfacing the auxiliary point head", flush=True)
@@ -284,9 +292,11 @@ def main():
         return items
 
     def items_from_prompts(prompts):
+        # Seeded even at n_samples=1: an unseeded draw makes every checkpoint use different
+        # noise, so single-draw trends mix training progress with sampling variance.
         out = []
         for p in prompts:
-            sp, ni, kl = seq_pred_for_prompt(p)
+            sp, ni, kl = seq_pred_for_prompt(p, seed=args.flow_seed_base)
             if sp is not None:
                 out.append((p, sp, ni, kl))
         return out
