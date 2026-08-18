@@ -39,6 +39,28 @@ from megatransformer.utils.codebook import load_codebook
 from megatransformer.utils import constants
 
 
+def bootstrap_delta_ci(per_utt, iters=10000, seed=0, alpha=0.05):
+    """95% CI on (real-shuf)/n, resampling UTTERANCES. per_utt: [(real_hits, shuf_hits, n)].
+
+    At n=256 the CI on early_text_delta is ~+-0.012 — wider than the step-to-step moves we
+    were reading as trends. Report the interval so that stops happening.
+    """
+    import random as _rnd
+    rng = _rnd.Random(seed)
+    m = len(per_utt)
+    if m == 0:
+        return float("nan"), float("nan")
+    samples = []
+    for _ in range(iters):
+        r = sh = c = 0
+        for _ in range(m):
+            x, y, k = per_utt[rng.randrange(m)]
+            r += x; sh += y; c += k
+        samples.append((r - sh) / max(c, 1))
+    samples.sort()
+    return samples[int(alpha / 2 * iters)], samples[int((1 - alpha / 2) * iters)]
+
+
 def build_args(a, feature_channels):
     """A Namespace satisfying visualize.load_world_model + load_dataset for this run shape.
 
@@ -99,6 +121,7 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
            # entropy-sensitive than top-1 -- disentangles "conditioning is weak" from "the target
            # is one-to-many so top-1 is capped but the right unit is right there in the top few".
            "real_top5": 0, "real_top10": 0, "early_top5": 0, "early_top10": 0}
+    per_utt_all, per_utt_early = [], []
     for s in range(0, len(idxs), bs):
         samples = [dataset[i] for i in idxs[s:s + bs]]
         samples = [x for x in samples if any(k.startswith("voice_") for k in x)]
@@ -138,8 +161,19 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
         tot["real_top5"] += int(hit5[content].sum().item())
         tot["real_top10"] += int(hit10[content].sum().item())
         # Early-frame (text-dominant) region: first early_k voice positions.
+        # per-utterance tallies for the bootstrap CI
+        hit_r = (pr == t) & content
+        hit_s = (ps == t) & content
         early = content.clone()
         early[:, early_k:] = False
+        for _b in range(Bc):
+            _n = int(content[_b].sum().item())
+            if _n:
+                per_utt_all.append((int(hit_r[_b].sum().item()), int(hit_s[_b].sum().item()), _n))
+            _e = int(early[_b].sum().item())
+            if _e:
+                per_utt_early.append((int((hit_r[_b] & early[_b]).sum().item()),
+                                      int((hit_s[_b] & early[_b]).sum().item()), _e))
         if early.any():
             tot["early_real"] += (pr[early] == t[early]).sum().item()
             tot["early_shuf"] += (ps[early] == t[early]).sum().item()
@@ -160,7 +194,11 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
     e_shuf = tot["early_shuf"] / max(tot["early_content"], 1)
     cc = max(tot["content"], 1)
     ec = max(tot["early_content"], 1)
+    all_lo, all_hi = bootstrap_delta_ci(per_utt_all)
+    early_lo, early_hi = bootstrap_delta_ci(per_utt_early)
     return {
+        "n_utt": len(per_utt_all),
+        "text_delta_ci": (all_lo, all_hi), "early_text_delta_ci": (early_lo, early_hi),
         "acc_real": acc_real, "acc_shuf": acc_shuf, "text_delta": acc_real - acc_shuf,
         "ce_real": ce_real, "ppl_real": math.exp(ce_real),
         "eov_acc": tot["eov_hits"] / max(tot["eov_tot"], 1), "content_positions": tot["content"],
@@ -288,7 +326,7 @@ def main():
     ap.add_argument("--text_encoder_model", default=None,
                     help="Pretrained-LLM text encoder id (e.g. HuggingFaceTB/SmolLM2-135M) if the "
                          "checkpoint was trained with one; must match, else the load state-mismatches.")
-    ap.add_argument("--n", type=int, default=256, help="TF/ablation val utterances")
+    ap.add_argument("--n", type=int, default=1024, help="TF/ablation val utterances (n=256 gives a ~+-0.012 CI on early_text_delta — too wide; do not go lower)")
     ap.add_argument("--bs", type=int, default=16, help="TF/ablation batch size (lower to avoid OOM "
                     "when sharing a GPU with a training run)")
     ap.add_argument("--gen_n", type=int, default=32, help="free-running generations")
@@ -382,10 +420,18 @@ def main():
     lines.append("| metric | value |\n|---|---|")
     lines.append(f"| acc_real (all positions) | {tf['acc_real']:.4f} |")
     lines.append(f"| acc_shuffled_text (all) | {tf['acc_shuf']:.4f} |")
-    lines.append(f"| text_delta (all positions) | {tf['text_delta']:+.4f} |")
+    lines.append(f"| text_delta (all positions) | {tf['text_delta']:+.4f} "
+                 f"[{tf['text_delta_ci'][0]:+.4f}, {tf['text_delta_ci'][1]:+.4f}] |")
     lines.append(f"| early_acc_real (first frames) | {tf['early_acc_real']:.4f} |")
     lines.append(f"| early_acc_shuffled | {tf['early_acc_shuf']:.4f} |")
-    lines.append(f"| **early_text_delta (clean text signal)** | **{tf['early_text_delta']:+.4f}** |")
+    lines.append(f"| **early_text_delta (clean text signal)** | **{tf['early_text_delta']:+.4f}** "
+                 f"95% CI [{tf['early_text_delta_ci'][0]:+.4f}, {tf['early_text_delta_ci'][1]:+.4f}] |")
+    # CosyVoice2 teacher on this same cache (n=1024): the CEILING for this metric.
+    lines.append(f"| — TEACHER early_text_delta (ceiling) | +0.0538 [+0.0480, +0.0597] |")
+    lines.append(f"| — TEACHER text_delta all-pos (ceiling) | +0.0594 [+0.0576, +0.0612] |")
+    lines.append(f"| — TEACHER acc_real (ceiling) | 0.1283 |")
+    _tr = tf['text_delta'] / max(tf['acc_real'], 1e-9)
+    lines.append(f"| **text-attributed fraction** (delta/acc_real) | **{_tr:.3f}** vs teacher 0.463 |")
     lines.append("\nAll-position delta is confounded: teacher-forced voice history is redundant "
                  "with the text, so it understates text's role. The **early_text_delta** (first "
                  f"frames, little/no voice history) is the clean signal.\n")

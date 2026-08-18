@@ -70,8 +70,10 @@ def main():
     ap.add_argument("--latest", action="store_true", help="use the newest step both arms reached")
     ap.add_argument("--tol", type=int, default=1200, help="checkpoint-matching tolerance")
     ap.add_argument("--device", default="cuda:3")
-    ap.add_argument("--n", type=int, default=256)
-    ap.add_argument("--bs", type=int, default=8, help="keep small — shares a GPU with training")
+    ap.add_argument("--n", type=int, default=1024,
+                    help="At n=256 the 95%% CI on early_text_delta is ~+-0.012 — wider than the "
+                         "moves we were interpreting. 1024 gives ~+-0.006. Do not go lower.")
+    ap.add_argument("--bs", type=int, default=8, help="keep small — may share a GPU with training")
     ap.add_argument("--out_dir", default="eval_output/world_tts_cosy_ab")
     ap.add_argument("--dry_run", action="store_true")
     a = ap.parse_args()
