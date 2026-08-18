@@ -62,6 +62,14 @@ def parse_args():
     p.add_argument("--guidance", type=float, default=0.0)       # Turbo: no CFG
     p.add_argument("--output_gain", type=float, default=1.0,
                    help="Z-Image adapter: inference-only dispersion gain on the whitened prediction. An MSE-trained point estimate is shrunk toward the target mean by 1-R^2, which the DiT renders as washed-out/generic; ~1/alpha undoes it. Measured best ~1.2-1.5 (gain 1.34: CLIPScore 0.287->0.303 vs 0.345 GT). Estimate per-checkpoint with scripts_local/zimage_shrinkage_probe.py. 1.0 = off.")
+    p.add_argument("--n_samples", type=int, default=1,
+                   help="T3 only: draw N flow samples per prompt instead of 1. The head emits a "
+                        "DISTRIBUTION, so a single draw conflates sampling variance with training "
+                        "progress -- N>1 reports mean/std/best-of-N and renders all N side by side. "
+                        "Noise is SEEDED from --flow_seed_base, so sample k uses the same noise at "
+                        "every checkpoint and differences are attributable to the model.")
+    p.add_argument("--flow_seed_base", type=int, default=4242,
+                   help="Base seed for T3 flow sampling; sample k of prompt n uses base + 1000*k.")
     p.add_argument("--flow_bypass", action="store_true",
                    help="Bypass the T3 flow head and surface the auxiliary POINT head instead. Diagnostic: if point-head renders are healthy while sampled ones are not, the shared Q-Former/trunk is intact and only the flow head is undertrained/broken; if BOTH are bad, the fresh head's gradients damaged the warm-started trunk.")
     p.add_argument("--bf16", action="store_true")
@@ -225,8 +233,18 @@ def main():
         kl = out.get("recurrent_kl_per_iteration") or []
         return (int(ni) if ni is not None else -1), [float(x) for x in kl]
 
+    _adapter = model.image_generator
+
+    def _set_flow_seed(seed):
+        """Pin the flow head's sampling noise so the SAME draw is compared across checkpoints."""
+        if getattr(_adapter, "flow_head", None) is not None and seed is not None:
+            g = torch.Generator(device=device)
+            g.manual_seed(int(seed))
+            _adapter.flow_generator = g
+
     @torch.no_grad()
-    def seq_pred_for_prompt(prompt):
+    def seq_pred_for_prompt(prompt, seed=None):
+        _set_flow_seed(seed)
         ids = _text_tok(prompt, add_special_tokens=False).input_ids
         seq = ids + [_sptok.BOI, _sptok.IMAGE_PLACEHOLDER, _sptok.EOI, _eos]
         text_input_ids = torch.tensor([seq], dtype=torch.long, device=device)
@@ -288,6 +306,65 @@ def main():
             except Exception:
                 return False
         return False
+
+    def render_and_log_multi(prompts, tag, montage_name, n_samples):
+        """T3 multi-sample mode: N seeded draws per prompt -> mean / std / best-of-N.
+
+        Judging a stochastic head by ONE draw per checkpoint conflates sampling variance with
+        training progress (a detail present at 19k and absent at 20k may be one model sampling
+        twice, not two models). Seeded noise makes draw k identical across checkpoints, so the
+        spread WITHIN a checkpoint measures the conditional's entropy and the change in the mean
+        ACROSS checkpoints measures learning.
+        """
+        rows, per_prompt, sc_tgt = [], [], []
+        key = tag + ":" + hashlib.md5("|".join(prompts).encode()).hexdigest()[:8]
+        skip_t = _skip_targets(key)
+        for n, prompt in enumerate(prompts):
+            imgs, scores = [], []
+            for k in range(n_samples):
+                sp, _, _ = seq_pred_for_prompt(prompt, seed=args.flow_seed_base + 1000 * k)
+                if sp is None:
+                    continue
+                im = zimage_render(sp, 1000 + n)
+                imgs.append(im); scores.append(clipscore(im, prompt))
+            if not scores:
+                continue
+            row = list(imgs)
+            if not skip_t:
+                tgt = zimage_render(target_cond(prompt).float(), 1000 + n)
+                sc_tgt.append(clipscore(tgt, prompt))
+                row = [tgt] + row
+            rows.append(row)
+            mu = st_.mean(scores)
+            sd = st_.pstdev(scores) if len(scores) > 1 else 0.0
+            per_prompt.append((prompt, mu, sd, max(scores), min(scores)))
+            print(f"[{tag} {n}] mean={mu:.3f} sd={sd:.3f} best={max(scores):.3f} "
+                  f"worst={min(scores):.3f} | {prompt[:44]}", flush=True)
+        if not rows:
+            print(f"[{tag}] no samples produced conditioning; skipping")
+            return None
+        thumb, ncol = 288, max(len(r) for r in rows)
+        canvas = Image.new("RGB", (ncol * thumb, len(rows) * thumb), (20, 20, 20))
+        for r, row in enumerate(rows):
+            for c, im in enumerate(row):
+                canvas.paste(im.resize((thumb, thumb)), (c * thumb, r * thumb))
+        montage_path = os.path.join(args.output_dir, montage_name)
+        canvas.save(montage_path)
+        mean_mu = st_.mean([p[1] for p in per_prompt])
+        mean_sd = st_.mean([p[2] for p in per_prompt])
+        mean_best = st_.mean([p[3] for p in per_prompt])
+        tail = f"  target={st_.mean(sc_tgt):.3f}" if sc_tgt else "  (targets skipped)"
+        print(f"[{tag}] N={n_samples} mean CLIPScore generated={mean_mu:.3f} "
+              f"(within-prompt sd={mean_sd:.3f})  best-of-N={mean_best:.3f}{tail}"
+              f"  montage: {montage_path}", flush=True)
+        if args.log_dir:
+            scal = {f"{tag}/clipscore_generated": mean_mu,
+                    f"{tag}/clipscore_sample_sd": mean_sd,
+                    f"{tag}/clipscore_best_of_n": mean_best}
+            if sc_tgt:
+                scal[f"{tag}/clipscore_target"] = st_.mean(sc_tgt)
+            log_eval_scalars(scal, step)
+        return mean_mu
 
     def render_and_log(items, tag, montage_name):
         if not items:
@@ -357,11 +434,22 @@ def main():
         with open(args.prompts_file) as f:
             prompts = [ln.strip() for ln in f if ln.strip()]
         print(f"custom prompts: {len(prompts)} from {args.prompts_file}", flush=True)
-        val_items = items_from_prompts(prompts)
     else:
-        val_items = items_from_dataset(dataset, args.max_samples)
-    if render_and_log(val_items, "text_to_image", "montage_target_vs_generated.png") is None:
-        raise SystemExit("no image-synthesis samples produced conditioning; check the dataset/config/prompts")
+        prompts = None
+
+    if args.n_samples > 1:
+        if getattr(model.image_generator, "flow_head", None) is None:
+            raise SystemExit("--n_samples > 1 needs a T3 flow head (the point head is deterministic)")
+        if prompts is None:
+            prompts = [c for c, _, _, _ in items_from_dataset(dataset, args.max_samples)]
+        if render_and_log_multi(prompts, "text_to_image",
+                                "montage_samples.png", args.n_samples) is None:
+            raise SystemExit("no image-synthesis samples produced conditioning; check dataset/config/prompts")
+    else:
+        val_items = items_from_prompts(prompts) if prompts is not None \
+            else items_from_dataset(dataset, args.max_samples)
+        if render_and_log(val_items, "text_to_image", "montage_target_vs_generated.png") is None:
+            raise SystemExit("no image-synthesis samples produced conditioning; check the dataset/config/prompts")
 
     # ── train (optional): the ACTUAL training captions + renders under train_data/ ──
     if args.train_cache_dir:

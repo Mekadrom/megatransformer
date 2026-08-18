@@ -208,8 +208,13 @@ class ZImageConditioningAdapter(nn.Module):
         #     cheap regression keeps the alpha/R^2 diagnostics comparable to the T0/T1 runs
         #     and avoids paying `steps` extra head passes on every training forward).
         if self.flow_head is not None and cond_labels is None:
-            seq_surf = self.flow_head.sample(q, seq_pred.shape[1],
-                                             generator=kw.get("flow_generator"))
+            # Seeded sampling matters for EVAL COMPARABILITY: the head emits a DISTRIBUTION, so
+            # an unseeded draw makes checkpoint-to-checkpoint differences a mix of training
+            # progress and sampling noise. Setting `.flow_generator` pins the noise so the same
+            # draw is compared across checkpoints; leave it None for genuinely random samples.
+            seq_surf = self.flow_head.sample(
+                q, seq_pred.shape[1],
+                generator=kw.get("flow_generator", getattr(self, "flow_generator", None)))
         else:
             seq_surf = seq_pred
 
