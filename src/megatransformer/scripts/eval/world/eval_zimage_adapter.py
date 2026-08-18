@@ -326,15 +326,17 @@ def main():
         spread WITHIN a checkpoint measures the conditional's entropy and the change in the mean
         ACROSS checkpoints measures learning.
         """
-        rows, per_prompt, sc_tgt = [], [], []
+        rows, per_prompt, sc_tgt, iters_list = [], [], [], []
         key = tag + ":" + hashlib.md5("|".join(prompts).encode()).hexdigest()[:8]
         skip_t = _skip_targets(key)
         for n, prompt in enumerate(prompts):
             imgs, scores = [], []
             for k in range(n_samples):
-                sp, _, _ = seq_pred_for_prompt(prompt, seed=args.flow_seed_base + 1000 * k)
+                sp, ni, _ = seq_pred_for_prompt(prompt, seed=args.flow_seed_base + 1000 * k)
                 if sp is None:
                     continue
+                if k == 0:
+                    iters_list.append(ni)
                 im = zimage_render(sp, 1000 + n)
                 imgs.append(im); scores.append(clipscore(im, prompt))
             if not scores:
@@ -373,7 +375,28 @@ def main():
                     f"{tag}/clipscore_best_of_n": mean_best}
             if sc_tgt:
                 scal[f"{tag}/clipscore_target"] = st_.mean(sc_tgt)
+            for r, (_, mu, sd, bst, wst) in enumerate(per_prompt):
+                scal[f"{tag}/sample_sd/{r}"] = sd
+                scal[f"{tag}/best_of_n/{r}"] = bst
+            for r, ni in enumerate(iters_list):
+                scal[f"{tag}/recurrent_iters/{r}"] = float(ni)
             log_eval_scalars(scal, step)
+            # Log EVERY draw as its own image tag, so the step slider shows the sample
+            # spread per prompt (sample0/sample1/...) instead of a single unlabelled draw.
+            # Without this the multi-sample path wrote scalars only and the renders lived
+            # nowhere but the on-disk montage.
+            logger = _m.get_logger()
+            if logger is not None:
+                off = 0 if skip_t else 1
+                for r, row in enumerate(rows):
+                    cap = per_prompt[r][0][:500]
+                    for k in range(len(row) - off):
+                        _m.log_image(f"{tag}/image/{r}/sample{k}", _chw(row[off + k]), step,
+                                     context={"prompt": cap})
+                    if not skip_t:
+                        _m.log_image(f"{tag}/image/{r}/target", _chw(row[0]), step,
+                                     context={"prompt": cap})
+                _m.flush()
         return mean_mu
 
     def render_and_log(items, tag, montage_name):
