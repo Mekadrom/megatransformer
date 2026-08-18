@@ -68,6 +68,10 @@ def parse_args():
                         "progress -- N>1 reports mean/std/best-of-N and renders all N side by side. "
                         "Noise is SEEDED from --flow_seed_base, so sample k uses the same noise at "
                         "every checkpoint and differences are attributable to the model.")
+    p.add_argument("--tag_suffix", type=str, default="",
+                   help="Appended to the TB tag root (e.g. '_w3' -> text_to_image_w3/...). Lets one "
+                        "run log several eval variants (e.g. unguided vs guided) per checkpoint "
+                        "without them overwriting each other's scalars and images.")
     p.add_argument("--flow_guidance", type=float, default=None,
                    help="T3 classifier-free guidance weight w. v = v_uncond + w*(v_cond - v_uncond). "
                         "1.0 = off. >1 trades diversity for fidelity (2x sampling cost). Only "
@@ -475,13 +479,14 @@ def main():
             raise SystemExit("--n_samples > 1 needs a T3 flow head (the point head is deterministic)")
         if prompts is None:
             prompts = [c for c, _, _, _ in items_from_dataset(dataset, args.max_samples)]
-        if render_and_log_multi(prompts, "text_to_image",
+        if render_and_log_multi(prompts, "text_to_image" + args.tag_suffix,
                                 "montage_samples.png", args.n_samples) is None:
             raise SystemExit("no image-synthesis samples produced conditioning; check dataset/config/prompts")
     else:
         val_items = items_from_prompts(prompts) if prompts is not None \
             else items_from_dataset(dataset, args.max_samples)
-        if render_and_log(val_items, "text_to_image", "montage_target_vs_generated.png") is None:
+        if render_and_log(val_items, "text_to_image" + args.tag_suffix,
+                          "montage_target_vs_generated.png") is None:
             raise SystemExit("no image-synthesis samples produced conditioning; check the dataset/config/prompts")
 
     # ── train (optional): the ACTUAL training captions + renders under train_data/ ──

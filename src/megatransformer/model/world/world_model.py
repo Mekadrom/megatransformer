@@ -900,6 +900,10 @@ class MegaTransformerWorldModel(nn.Module):
         # the low-prob tail pure-temperature sampling can draw (wrong units) -- the standard AR-coherence fix.
         voice_top_k: Optional[int] = None,
         voice_top_p: Optional[float] = None,
+        # Repetition-aware sampling (CosyVoice 2's ras_sampling defaults: win 10, tau_r 0.1).
+        # Off by default so existing behaviour is byte-identical unless asked for.
+        voice_ras_win: int = 0,
+        voice_ras_tau: float = 0.1,
         # Pre-encoded media for transcription / cross-modal tasks
         audio_inputs: Optional[torch.Tensor] = None,
         audio_lengths: Optional[torch.Tensor] = None,
@@ -1431,6 +1435,27 @@ class MegaTransformerWorldModel(nn.Module):
                                 unit_id = torch.multinomial(probs, 1)[0]
                             else:
                                 unit_id = logits.argmax(-1)
+                            # REPETITION-AWARE SAMPLING (RAS), after CosyVoice 2's own decoder
+                            # (cosyvoice/utils/common.py:ras_sampling). Free-running measurement
+                            # at 44k: adj_repeat 0.103 (3.4x GT) and longest_run 56 -- the model
+                            # loops, while the teacher's RAS decoding sits BELOW GT at 0.0070.
+                            # If the chosen id already occurred within the last `win` emitted
+                            # units at a rate >= tau_r, ban it and resample from the rest.
+                            # NOTE the EOV id is exempt: banning it would worsen the very
+                            # over-length problem this is meant to fix (EOV fires 10/32 at 44k).
+                            if voice_ras_win > 0 and voice_ras_tau > 0.0:
+                                eov_id = self.voice_codebook.shape[0]
+                                recent = voice_unit_id_trace[b][-voice_ras_win:]
+                                if recent and int(unit_id) != eov_id:
+                                    rep = sum(1 for u in recent if u == int(unit_id))
+                                    if rep >= voice_ras_win * voice_ras_tau:
+                                        banned = logits.float().clone()
+                                        banned[int(unit_id)] = float("-inf")
+                                        if voice_min_frames > 0 and len(voice_unit_id_trace[b]) < voice_min_frames:
+                                            banned[eov_id] = float("-inf")
+                                        p2 = torch.softmax(banned, dim=-1)
+                                        if bool(torch.isfinite(p2).all()) and float(p2.sum()) > 0:
+                                            unit_id = torch.multinomial(p2, 1)[0]
                             voice_unit_id_trace[b].append(int(unit_id))
                             # EOV token: the terminal unit (id == codebook size; the codebook
                             # has no row there). It is the discrete-vocab replacement for the
