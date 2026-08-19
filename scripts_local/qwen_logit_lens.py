@@ -162,9 +162,15 @@ def main():
         print("  keywords: " + "  ".join(line))
         report.append((c, gt_str, pr_str))
 
+    # JSON, not a line-oriented text file: decoded strings CONTAIN literal newlines (the
+    # tokenizer emits "\n" tokens), so a "GT: <text>" line format silently truncates every
+    # entry at its first embedded newline and any downstream comparison reads near-empty text.
+    import json as _json
+    with open(os.path.join(args.output_dir, "decoded.json"), "w") as f:
+        _json.dump([{"prompt": c, "gt": g_, "ours": p_} for c, g_, p_ in report], f, indent=2)
     with open(os.path.join(args.output_dir, "decoded.txt"), "w") as f:
-        for c, g_, p_ in report:
-            f.write(f"PROMPT: {c}\nGT  : {g_}\nOURS: {p_}\n\n")
+        for c, g_, p_ in report:   # human-readable only; newlines escaped so it stays line-safe
+            f.write(f"PROMPT: {c}\nGT  : {g_!r}\nOURS: {p_!r}\n\n")
     print(f"\nwrote {args.output_dir}/decoded.txt", flush=True)
 
 
