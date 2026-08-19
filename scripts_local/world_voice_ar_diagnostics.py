@@ -249,7 +249,7 @@ def seq_degeneration(seqs, K):
 
 @torch.no_grad()
 def run_generation(model, dataset, collator, device, gen_n, K, budget,
-                   bov_id=constants.BOV_TOKEN_ID):
+                   bov_id=constants.BOV_TOKEN_ID, ras_win=0, ras_tau=0.1):
     """Free-running generation from text prompts; return generated + GT unit sequences + EOV info.
 
     Also collects per-sample prompt TEXT length (tokens before BOV) so the caller can correlate
@@ -272,6 +272,7 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
         prompt = text[:bov[0].item() + 1].unsqueeze(0).to(device)
         out = model.generate(text_input_ids=prompt, max_new_tokens=512,
                              voice_token_budget=budget, voice_temperature=1.0,
+                             voice_ras_win=ras_win, voice_ras_tau=ras_tau,
                              decode_outputs=False)
         trace = out.get("voice_unit_id_trace", [[]])[0]
         if trace and trace[-1] == K:            # EOV fired -> strip it
@@ -343,6 +344,12 @@ def main():
                          "but during NAR that is OOD (the model never trained with history) and "
                          "acc collapses, so it is NOT the model's real conditioning. Generation "
                          "(section 3) always runs at alpha=1 (generate() has no alpha hook).")
+    ap.add_argument("--voice_ras_win", type=int, default=0,
+                    help="Repetition-aware sampling window (CosyVoice 2 uses 10). If the sampled "
+                         "unit occurred >= win*tau times in the last `win` emitted units, ban it and "
+                         "resample. 0 = off. EOV is exempt from the ban.")
+    ap.add_argument("--voice_ras_tau", type=float, default=0.1,
+                    help="RAS repetition threshold (CosyVoice 2 uses 0.1 => any repeat within the window)")
     ap.add_argument("--skip_generation", action="store_true",
                     help="Skip the free-running generation section (always alpha=1, slow). Use for "
                          "an alpha-sweep where only the TF/ablation numbers vary with alpha.")
@@ -377,7 +384,8 @@ def main():
         print("2/3 free-running generation ...", flush=True)
         gen, gt, eov_fired, budget_hit, prompt_lens = run_generation(
             model, eval_dataset, collator, device, a.gen_n, K,
-            budget=a.voice_max_frames, bov_id=sp.BOV)
+            budget=a.voice_max_frames, bov_id=sp.BOV,
+            ras_win=a.voice_ras_win, ras_tau=a.voice_ras_tau)
         print("3/3 degeneration stats ...", flush=True)
         gen_deg = seq_degeneration(gen, K)
         gt_deg = seq_degeneration(gt, K)
