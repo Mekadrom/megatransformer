@@ -54,6 +54,35 @@ class Qwen3TextTargetEncoder:
             p.requires_grad_(False)
 
     @torch.no_grad()
+    def encode_native(self, captions, max_len=128):
+        """Targets at their NATIVE length -- no resample. -> (B, Lmax, 2560) float32, (B, Lmax) bool.
+
+        The AR head emits one token per real Qwen3 token, so it needs the true sequence and a
+        mask rather than the K-slot interpolation `encode` performs. Lmax is the longest real
+        length in the batch, clipped to max_len.
+        """
+        caps = [c if isinstance(c, str) else "" for c in captions]
+        prompts = [self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": c}], tokenize=False,
+            add_generation_prompt=True, enable_thinking=True) for c in caps]
+        t = self.tokenizer(prompts, padding="longest", truncation=True,
+                           max_length=min(self.max_length, max_len), return_tensors="pt")
+        ids = t.input_ids.to(self.device)
+        attn = t.attention_mask.to(self.device)
+        hs = self.model(input_ids=ids, attention_mask=attn,
+                        output_hidden_states=True).hidden_states[-2]        # (B, T, 2560)
+        return hs.float(), attn.bool()
+
+    @torch.no_grad()
+    def caption_length(self, caption, max_len=128):
+        """Real token count for a caption under the same chat template -- the AR sample length.
+        Deterministic from the CAPTION, so inference needs no length head and no stop token."""
+        s = self.tokenizer.apply_chat_template([{"role": "user", "content": caption}],
+                                               tokenize=False, add_generation_prompt=True,
+                                               enable_thinking=True)
+        return min(len(self.tokenizer(s).input_ids), max_len)
+
+    @torch.no_grad()
     def encode(self, captions):
         """captions: list[str] (len B; None entries -> ""). Returns (B, K, 2560) float32."""
         caps = [c if isinstance(c, str) else "" for c in captions]

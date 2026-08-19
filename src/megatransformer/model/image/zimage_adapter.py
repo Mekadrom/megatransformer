@@ -143,6 +143,27 @@ class ZImageConditioningAdapter(nn.Module):
                 guidance=float(getattr(config, "flow_guidance", 1.0)))
         self.flow_aux_mse_weight = float(getattr(config, "flow_aux_mse_weight", 0.1))
 
+        # T4: autoregressive per-token flow over the conditioning (ar_cond_flow_head.py).
+        # Mutually exclusive with the parallel flow head. Targets arrive at NATIVE length with
+        # a mask (no K-slot resample); the sample length comes from the caption's tokenization.
+        self.ar_flow_head = None
+        if bool(getattr(config, "ar_flow_head", False)):
+            if getattr(self, "flow_head", None) is not None:
+                raise ValueError("set either flow_head or ar_flow_head, not both")
+            from megatransformer.model.image.ar_cond_flow_head import ARCondFlowHead
+            self.ar_flow_head = ARCondFlowHead(
+                seq_dim=config.seq_dim, ctx_dim=d,
+                dim=int(getattr(config, "ar_dim", 512)),
+                n_heads=int(getattr(config, "ar_heads", 8)),
+                n_layers=int(getattr(config, "ar_layers", 4)),
+                flow_layers=int(getattr(config, "ar_flow_layers", 3)),
+                max_len=int(getattr(config, "ar_max_len", 128)),
+                dropout=config.dropout,
+                steps=int(getattr(config, "flow_steps", 8)),
+                time_sampling=getattr(config, "flow_time_sampling", "logit_normal"),
+                cfg_dropout=float(getattr(config, "flow_cfg_dropout", 0.0)),
+                guidance=float(getattr(config, "flow_guidance", 1.0)))
+
     def set_whiten_stats(self, mean, std, eps: float = 1e-6):
         """Load per-dim Qwen3 target mean/std into the whitening buffers and enable it."""
         m = torch.as_tensor(mean, dtype=self.whiten_mean.dtype).flatten()
@@ -209,7 +230,13 @@ class ZImageConditioningAdapter(nn.Module):
         #   otherwise -> the point head (also used during training, where surfacing the
         #     cheap regression keeps the alpha/R^2 diagnostics comparable to the T0/T1 runs
         #     and avoids paying `steps` extra head passes on every training forward).
-        if self.flow_head is not None and cond_labels is None:
+        if self.ar_flow_head is not None and cond_labels is None:
+            # AR inference: emit exactly L tokens, L deterministic from the caption's Qwen3
+            # tokenization (callers pass cond_length); no stop token, no length head.
+            seq_surf = self.ar_flow_head.sample(
+                q, int(kw.get("cond_length") or seq_pred.shape[1]),
+                generator=kw.get("flow_generator", getattr(self, "flow_generator", None)))
+        elif self.flow_head is not None and cond_labels is None:
             # Seeded sampling matters for EVAL COMPARABILITY: the head emits a DISTRIBUTION, so
             # an unseeded draw makes checkpoint-to-checkpoint differences a mix of training
             # progress and sampling noise. Setting `.flow_generator` pins the noise so the same
@@ -251,6 +278,18 @@ class ZImageConditioningAdapter(nn.Module):
                     return out                            # no synthesis rows this batch
                 sp, sl, ctx = seq_pred[m], target[m], q[m]
             sl = sl.to(sp.dtype)
+            if self.ar_flow_head is not None:
+                # T4: native-length masked AR flow. There is no comparable point-head MSE here
+                # (seq_pred is a fixed-K estimate while the target is variable-length), so the
+                # flow loss is the whole signal.
+                cmask = kw.get("cond_mask")
+                if cmask is not None and sample_mask is not None and \
+                        cmask.shape[0] == sample_mask.shape[0]:
+                    cmask = cmask[sample_mask.bool()]
+                flow = self.ar_flow_head.loss(sl, ctx, mask=cmask)
+                out["image_clip_loss"] = flow
+                out["image_flow_loss"] = flow.detach()
+                return out
             mse = F.mse_loss(sp, sl)
             if self.flow_head is not None:
                 # T3: the flow-matching objective IS the training signal. The point-head MSE

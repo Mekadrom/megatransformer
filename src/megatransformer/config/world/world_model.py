@@ -558,3 +558,11 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_whiten_t1q"].image_coda_config.contrastive
 # <whiten or t1q ckpt> --fresh_schedule): the Q-Former/trunk load, the flow head starts fresh.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3"].image_coda_config.flow_head = True
+
+# T4: AUTOREGRESSIVE conditioning with a per-token flow head (native length, no resample).
+# Same whitening + CFG dropout as T3; the parallel flow head is replaced by the AR one, so
+# the image arm factorises its output the way the text and voice arms do -- one mechanism
+# from the shared trunk. NOTE: the K=64 resample this removes was measured to cost ~0.0004
+# CLIPScore, so this is an architectural-uniformity change, not a fix for a measured gap.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"].image_coda_config.ar_flow_head = True

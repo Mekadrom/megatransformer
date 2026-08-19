@@ -254,6 +254,15 @@ def main():
             g.manual_seed(int(seed))
             _adapter.flow_generator = g
 
+    def _ar_length(prompt):
+        """T4 AR: emit exactly as many conditioning tokens as Qwen3 would produce for this
+        caption. Deterministic from the caption, so no stop token / length head is needed."""
+        if getattr(_adapter, "ar_flow_head", None) is None:
+            return None
+        return len(pipe.tokenizer(pipe.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False,
+            add_generation_prompt=True, enable_thinking=True)).input_ids)
+
     @torch.no_grad()
     def seq_pred_for_prompt(prompt, seed=None):
         _set_flow_seed(seed)
@@ -264,7 +273,8 @@ def main():
         is_synth = torch.tensor([True], device=device)
         with torch.amp.autocast(device, dtype=dtype, enabled=args.bf16):
             out = model(text_input_ids=text_input_ids, image_inputs=image_inputs,
-                        precomputed_latents=True, is_synthesis=is_synth, decode_outputs=False)
+                        precomputed_latents=True, is_synthesis=is_synth, decode_outputs=False,
+                        cond_length=_ar_length(prompt))
         sp = out.get("image_clip_seq_pred")
         if sp is None:
             return None, None, None

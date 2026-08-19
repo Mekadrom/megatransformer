@@ -386,6 +386,20 @@ class ZImageAdapterConfig:
     # 0.251 vs 0.287) even while best-of-6 wins (0.319) -- guidance is the knob on that axis.
     # NOTE: a checkpoint trained with cfg_dropout=0 has an untrained null, so guidance only
     # works after training WITH dropout.
+    # ── T4: AUTOREGRESSIVE conditioning (per-token flow), MAR-style ────────────────────
+    # Emits one conditioning token at a time, each sampled by its own rectified-flow ODE
+    # conditioned on the tokens already emitted -- the same factorisation the text and voice
+    # arms use, so one mechanism serves every modality from the shared trunk. Needs NO
+    # resample (native length) and no stop token (length is deterministic from the caption's
+    # Qwen3 tokenization). Costs SEQUENTIAL inference: L x flow_steps instead of flow_steps.
+    # NOTE the measured context: the K=64 resample this replaces was shown to cost ~0.0004
+    # CLIPScore, so the motivation here is architectural uniformity, not a metric gap.
+    ar_flow_head: bool = False
+    ar_dim: int = 512
+    ar_heads: int = 8
+    ar_layers: int = 4            # causal backbone depth
+    ar_flow_layers: int = 3       # per-token velocity MLP depth
+    ar_max_len: int = 128         # positional table + target truncation
     flow_cfg_dropout: float = 0.1
     flow_guidance: float = 1.0             # inference w; 1.0 = off (single forward per step)
 

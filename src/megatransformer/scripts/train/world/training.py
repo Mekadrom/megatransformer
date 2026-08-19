@@ -773,6 +773,7 @@ class WorldModelTrainer(CommonTrainer):
         # (resampled to seq_len), lazy-loading the frozen 4-bit Qwen3 encoder once.
         # No-op unless image_generator is a ZImageConditioningAdapter.
         image_cond_labels = None
+        image_cond_mask = None
         if (image_inputs is not None
                 and isinstance(getattr(unwrapped_model, "image_generator", None), ZImageConditioningAdapter)):
             # Tier-0: inject per-dim Qwen3 whitening stats into the adapter ONCE, before the
@@ -817,7 +818,15 @@ class WorldModelTrainer(CommonTrainer):
                           f"precision={'4bit' if load_4bit else 'bf16'}", flush=True)
                 _t0 = time.perf_counter()
                 # Encoder may be on a different device; targets move back to the training card.
-                image_cond_labels = self._zimage_text_encoder.encode(captions).to(model_device)
+                if getattr(unwrapped_model.image_generator, "ar_flow_head", None) is not None:
+                    # T4 AR: NATIVE length + mask (no K-slot resample). The AR head emits one
+                    # token per real Qwen3 token, so the target must keep its true length.
+                    image_cond_labels, image_cond_mask = self._zimage_text_encoder.encode_native(
+                        captions, max_len=int(getattr(icfg, "ar_max_len", 128)))
+                    image_cond_labels = image_cond_labels.to(model_device)
+                    image_cond_mask = image_cond_mask.to(model_device)
+                else:
+                    image_cond_labels = self._zimage_text_encoder.encode(captions).to(model_device)
                 if model.training and global_step % self.args.logging_steps == 0:
                     metrics.log_scalar("train/target_encoder_ms",
                                        (time.perf_counter() - _t0) * 1000.0, global_step, skip_zero=False)
@@ -859,6 +868,7 @@ class WorldModelTrainer(CommonTrainer):
             image_clip_seq_labels=image_clip_seq_labels,
             image_clip_pooled_labels=image_clip_pooled_labels,
             image_cond_labels=image_cond_labels,
+            image_cond_mask=image_cond_mask,
             precomputed_latents=self.precomputed_latents,
             decode_outputs=False,
             is_synthesis=is_synthesis,

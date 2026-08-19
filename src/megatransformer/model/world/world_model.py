@@ -322,6 +322,12 @@ class MegaTransformerWorldModel(nn.Module):
         image_clip_seq_labels: Optional[torch.Tensor] = None,
         image_clip_pooled_labels: Optional[torch.Tensor] = None,
         image_cond_labels: Optional[torch.Tensor] = None,
+        # T4 AR: (B, L) bool mask of real Qwen3 tokens, since native-length targets are
+        # right-padded per batch. None for the fixed-K parallel head.
+        image_cond_mask: Optional[torch.Tensor] = None,
+        # T4 AR inference: how many conditioning tokens to emit (from the caption's
+        # tokenization). None -> the adapter falls back to its fixed K.
+        cond_length: Optional[int] = None,
         # Text targets
         text_targets: Optional[torch.Tensor] = None,
         # Mode flags
@@ -726,12 +732,17 @@ class MegaTransformerWorldModel(nn.Module):
                 cross_outputs = self.image_generator(
                     encoder_hidden_states=cross_input,
                     cond_labels=image_cond_labels,
+                    cond_mask=image_cond_mask,
+                    cond_length=cond_length,
                     sample_mask=is_synthesis,
                 )
                 outputs["image_clip_seq_pred"] = cross_outputs["image_clip_seq_pred"]
                 if "image_clip_loss" in cross_outputs:
                     outputs["image_clip_loss"] = cross_outputs["image_clip_loss"]
-                    outputs["image_clip_mse_loss"] = cross_outputs["image_clip_mse_loss"]
+                    # T4 AR emits no point-head MSE (its target is variable-length), so this
+                    # key is conditional rather than assumed present.
+                    if "image_clip_mse_loss" in cross_outputs:
+                        outputs["image_clip_mse_loss"] = cross_outputs["image_clip_mse_loss"]
                 if "image_contrastive_loss" in cross_outputs:
                     outputs["image_contrastive_loss"] = cross_outputs["image_contrastive_loss"]
                 if "image_contrastive_negatives" in cross_outputs:
