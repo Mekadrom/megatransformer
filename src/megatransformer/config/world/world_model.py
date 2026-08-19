@@ -147,6 +147,9 @@ class MegaTransformerWorldModelConfig:
     # tokens is ~6). Only the ratio matters: it turns the text<->voice relationship from a
     # scaling (which RoPE cannot express) into a near-zero relative distance (which it can).
     mrope_voice_rate: float = 6.0
+    # Which stream absorbs the rate: "voice" (voice t/rate — fractional sub-unit spacing for
+    # the generated stream) or "text" (text j*rate — both streams stay integer-spaced).
+    mrope_scale_side: str = "voice"
     special_token_base: int = 32_000
     # End-of-sequence id used to terminate text generation. Native to the vocab: 2 for the
     # Mistral tokenizer (default), or the pretrained LLM's native eos (set automatically in

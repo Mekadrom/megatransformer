@@ -300,7 +300,8 @@ class MegaTransformerWorldModel(nn.Module):
             return None
         from megatransformer.model.world.token_alignment import build_mrope_position_ids
         return build_mrope_position_ids(
-            modality_map, voice_rate=float(getattr(self.config, "mrope_voice_rate", 6.0)))
+            modality_map, voice_rate=float(getattr(self.config, "mrope_voice_rate", 6.0)),
+            scale_side=str(getattr(self.config, "mrope_scale_side", "voice")))
 
     def forward(
         self,
@@ -1302,6 +1303,7 @@ class MegaTransformerWorldModel(nn.Module):
             step_pids = None
             if mrope_global_next is not None:
                 rate = float(getattr(self.config, "mrope_voice_rate", 6.0))
+                _side = str(getattr(self.config, "mrope_scale_side", "voice"))
                 rows = []
                 for b in range(next_hidden.shape[0]):
                     # current_modality[b] is the stream this token belongs to (None => text)
@@ -1311,7 +1313,10 @@ class MegaTransformerWorldModel(nn.Module):
                         _mrope_was_media[b] = is_media_b
                     rows.append([mrope_global_next[b], mrope_local_next[b]])
                     mrope_global_next[b] += 1.0
-                    mrope_local_next[b] += (1.0 / max(rate, 1e-3)) if is_media_b else 1.0
+                    if _side == "text":
+                        mrope_local_next[b] += 1.0 if is_media_b else max(rate, 1e-3)
+                    else:
+                        mrope_local_next[b] += (1.0 / max(rate, 1e-3)) if is_media_b else 1.0
                 step_pids = torch.tensor(rows, dtype=torch.float32,
                                          device=next_hidden.device).unsqueeze(1)  # (B,1,2)
             # Process through recurrent block with KV cache

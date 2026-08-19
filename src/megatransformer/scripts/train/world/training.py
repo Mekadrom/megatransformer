@@ -2086,6 +2086,7 @@ def load_model(args, device='cuda'):
             # existing per-stream RoPE.
             config.recurrent_block_config.block_config.use_mrope = True
             config.mrope_voice_rate = float(getattr(args, 'mrope_voice_rate', 6.0))
+            config.mrope_scale_side = str(getattr(args, 'mrope_scale_side', 'voice'))
         if getattr(args, 'voice_prenet_dropout', 0.0) and args.voice_prenet_dropout > 0.0:
             config.voice_prelude_config.prenet_dropout = args.voice_prenet_dropout
         if getattr(args, 'voice_cfg_text_dropout_prob', 0.0) > 0.0:
@@ -2676,6 +2677,12 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--mrope_voice_rate", type=float, default=6.0,
                             help="Nominal voice frames per text token for M-RoPE's local clock "
                                  "(25Hz speech vs SmolLM2 tokens is ~6). Only the ratio matters.")
+    sub_parser.add_argument("--mrope_scale_side", type=str, default="voice", choices=["voice", "text"],
+                            help="Which stream absorbs the frame rate on M-RoPE's local axis. "
+                                 "'voice' (default) = voice t/rate, which leaves the 250-position "
+                                 "generated stream at FRACTIONAL sub-unit spacing — a regime RoPE "
+                                 "is essentially never used in. 'text' = text j*rate, same "
+                                 "alignment property with both streams integer-spaced.")
     sub_parser.add_argument("--share_block_weights", action="store_true", default=False,
                             help="Share weights across all recurrent blocks (deeper 1-block)")
     sub_parser.add_argument("--iteration_norm", type=str, default=None,

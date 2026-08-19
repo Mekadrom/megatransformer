@@ -509,7 +509,8 @@ class TokenUninterleaver(nn.Module):
         return out[:, :max_len].contiguous()
 
 
-def build_mrope_position_ids(modality_map: torch.Tensor, voice_rate: float = 6.0) -> torch.Tensor:
+def build_mrope_position_ids(modality_map: torch.Tensor, voice_rate: float = 6.0,
+                             scale_side: str = "voice") -> torch.Tensor:
     """Per-token (GLOBAL, LOCAL) coordinates for M-RoPE, from the interleaved modality map.
 
     GLOBAL: strictly increasing over non-pad positions. This is what keeps multiple media
@@ -525,6 +526,15 @@ def build_mrope_position_ids(modality_map: torch.Tensor, voice_rate: float = 6.0
     RoPE's locality bias can act. Under the current single global axis that pair is separated
     by L_text + 0.83*t — large, growing with t, and different for every utterance, which is
     why only one attention head (block 0 head 4) manages to align at all.
+
+    scale_side picks WHICH stream absorbs the rate, and the two are different RoPE regimes:
+      "voice" — text j, voice t/rate. Aligned pairs at ~0, but voice frames end up at
+                FRACTIONAL sub-unit spacing (1/6 apart), which is a regime RoPE is
+                essentially never used in, for the 250-position stream being generated.
+      "text"  — text j*rate, voice t. Same alignment property, but both streams stay at
+                INTEGER spacing; text simply strides by `rate`. High-frequency aliasing at
+                stride 6 is ordinary RoPE behaviour (its fast dims alias constantly at normal
+                lengths and the slow dims disambiguate).
 
     Returns: (batch, seq_len, 2) float — [..., 0] global, [..., 1] local.
     """
@@ -545,5 +555,9 @@ def build_mrope_position_ids(modality_map: torch.Tensor, voice_rate: float = 6.0
     seg_start = torch.cummax(torch.where(change, idx, torch.zeros_like(idx)), dim=1).values
     within = (idx - seg_start).float()
     is_media = (modality_map != MODALITY_TEXT) & valid
-    l = torch.where(is_media, within / max(voice_rate, 1e-3), within)
+    r = max(voice_rate, 1e-3)
+    if scale_side == "text":
+        l = torch.where(is_media, within, within * r)
+    else:
+        l = torch.where(is_media, within / r, within)
     return torch.stack([g, l], dim=-1)
