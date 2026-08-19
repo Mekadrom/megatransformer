@@ -821,8 +821,12 @@ class WorldModelTrainer(CommonTrainer):
                 if getattr(unwrapped_model.image_generator, "ar_flow_head", None) is not None:
                     # T4 AR: NATIVE length + mask (no K-slot resample). The AR head emits one
                     # token per real Qwen3 token, so the target must keep its true length.
+                    # NB: read the config off the adapter, NOT the local `icfg` -- that is only
+                    # bound inside the lazy encoder-construction branch above, so it is undefined
+                    # on every step after the first (UnboundLocalError).
+                    _icfg = unwrapped_model.image_generator.config
                     image_cond_labels, image_cond_mask = self._zimage_text_encoder.encode_native(
-                        captions, max_len=int(getattr(icfg, "ar_max_len", 128)))
+                        captions, max_len=int(getattr(_icfg, "ar_max_len", 128)))
                     image_cond_labels = image_cond_labels.to(model_device)
                     image_cond_mask = image_cond_mask.to(model_device)
                 else:
