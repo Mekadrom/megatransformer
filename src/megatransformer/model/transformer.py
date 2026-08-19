@@ -160,8 +160,11 @@ class MegaTransformerAttention(nn.Module):
                 from rotary_embedding_torch import apply_rotary_emb
                 g = position_ids[..., 0].to(queries.device).float()
                 l = position_ids[..., 1].to(queries.device).float()
-                fg = torch.stack([self.rotary_global(g[b]) for b in range(g.shape[0])]).unsqueeze(1)
-                fl = torch.stack([self.rotary_local(l[b]) for b in range(l.shape[0])]).unsqueeze(1)
+                # RotaryEmbedding accepts BATCHED positions ((N, t) -> (N, t, dim)) and matches
+                # the per-row result exactly, so this must not be a Python loop: it runs once
+                # per attention call, i.e. ~n_blocks * n_iterations times per forward.
+                fg = self.rotary_global(g).unsqueeze(1)     # (N, 1, t, half)
+                fl = self.rotary_local(l).unsqueeze(1)
                 queries = apply_rotary_emb(fg, queries, start_index=0)
                 keys = apply_rotary_emb(fg, keys, start_index=0)
                 queries = apply_rotary_emb(fl, queries, start_index=self._mrope_half)

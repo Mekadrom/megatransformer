@@ -538,13 +538,11 @@ def build_mrope_position_ids(modality_map: torch.Tensor, voice_rate: float = 6.0
     change[:, 1:] = modality_map[:, 1:] != modality_map[:, :-1]
     seg_id = change.long().cumsum(dim=1)                       # (B, S) segment index
     idx = torch.arange(S, device=dev).unsqueeze(0).expand(B, S)
-    # start index of each segment, broadcast back to its positions
-    seg_start = torch.zeros_like(idx)
-    for b in range(B):
-        starts = torch.zeros(int(seg_id[b].max()) + 2, dtype=torch.long, device=dev)
-        first = torch.where(change[b])[0]
-        starts[seg_id[b][first]] = first
-        seg_start[b] = starts[seg_id[b]]
+    # start index of each segment, broadcast back to its positions. cummax over
+    # "index where a segment starts, else 0" gives the most recent start at every position --
+    # vectorized on purpose: the previous per-batch loop called .max() per row, and each of
+    # those is a GPU->CPU sync in what would be the training hot path.
+    seg_start = torch.cummax(torch.where(change, idx, torch.zeros_like(idx)), dim=1).values
     within = (idx - seg_start).float()
     is_media = (modality_map != MODALITY_TEXT) & valid
     l = torch.where(is_media, within / max(voice_rate, 1e-3), within)
