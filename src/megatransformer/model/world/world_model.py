@@ -288,6 +288,20 @@ class MegaTransformerWorldModel(nn.Module):
         """
         self.voice_codebook = None if centroids is None else centroids.float()
 
+    def _mrope_ids(self, modality_map):
+        """(batch, seq, 2) global+local coordinates for M-RoPE, or None when it is off.
+
+        Only the TRUNK gets these: it is the one module that sees text and media together,
+        and therefore the only place a text<->voice coordinate can exist. The preludes and
+        codas already carry clean per-stream RoPE (voice-local 0..T) and are unchanged.
+        """
+        blk = getattr(getattr(self.config, "recurrent_block_config", None), "block_config", None)
+        if modality_map is None or not bool(getattr(blk, "use_mrope", False)):
+            return None
+        from megatransformer.model.world.token_alignment import build_mrope_position_ids
+        return build_mrope_position_ids(
+            modality_map, voice_rate=float(getattr(self.config, "mrope_voice_rate", 6.0)))
+
     def forward(
         self,
         text_input_ids: torch.Tensor,
@@ -576,6 +590,7 @@ class MegaTransformerWorldModel(nn.Module):
             interleaved_tokens,
             attention_mask=attn_mask,  # True for attend, False for padding
             additive_attn_bias=trunk_voice_bias,
+            position_ids=self._mrope_ids(modality_map),
         )
 
         # print("\tInputs to uninterleaver:")
@@ -1085,6 +1100,28 @@ class MegaTransformerWorldModel(nn.Module):
         recurrent_iteration_counts: List[int] = []
         recurrent_kl_final: List[float] = []  # final KL per token (convergence measure)
 
+        # M-RoPE coordinates for the prompt. Generation MUST use the same coordinate system
+        # training used, or the trunk sees positions it was never trained on — the exact
+        # train/inference mismatch class this codebase has been bitten by before.
+        # A TEXT-ONLY prompt yields modality_map=None from _encode_prompt, which would make
+        # _mrope_ids return None and silently disengage M-RoPE at inference while training
+        # used it — a train/inference coordinate mismatch. Synthesize an all-text map instead.
+        _blk_cfg = getattr(getattr(self.config, "recurrent_block_config", None), "block_config", None)
+        _mm = prompt_modality_map
+        if _mm is None and bool(getattr(_blk_cfg, "use_mrope", False)):
+            from megatransformer.model.world.token_alignment import MODALITY_TEXT
+            _mm = torch.full(prompt_hidden.shape[:2], MODALITY_TEXT,
+                             dtype=torch.long, device=prompt_hidden.device)
+        mrope_on = self._mrope_ids(_mm) is not None
+        mrope_local_next = None
+        if mrope_on:
+            _pids = self._mrope_ids(_mm)
+            # per-batch running counters for the incremental steps below
+            mrope_global_next = [float(_pids[b, :, 0].max().item()) + 1.0 for b in range(_pids.shape[0])]
+            mrope_local_next = [float(_pids[b, -1, 1].item()) + 1.0 for b in range(_pids.shape[0])]
+            _mrope_was_media = [False for _ in range(_pids.shape[0])]
+        else:
+            _pids, mrope_global_next, _mrope_was_media = None, None, None
         current_hidden, kv_cache, prompt_iters, prompt_kls, _ = self.recurrent_block(
             prompt_hidden * self.embed_scale,
             attention_mask=prompt_attn_mask,
@@ -1092,6 +1129,7 @@ class MegaTransformerWorldModel(nn.Module):
             position_offset=0,
             use_cache=True,
             share_kv_cache=share_kv_cache,
+            position_ids=_pids,
         )
 
         position_offset = prompt_hidden.shape[1]
@@ -1258,6 +1296,24 @@ class MegaTransformerWorldModel(nn.Module):
             # Stack embeddings for all batch items: (batch, 1, d_model)
             next_hidden = torch.stack(next_hidden_list, dim=0)
 
+            # M-RoPE ids for THIS step: global advances by 1 for every token; local advances
+            # by 1 for a text token and by 1/rate for a media frame, and RESTARTS when the
+            # modality changes (matching build_mrope_position_ids on the training path).
+            step_pids = None
+            if mrope_global_next is not None:
+                rate = float(getattr(self.config, "mrope_voice_rate", 6.0))
+                rows = []
+                for b in range(next_hidden.shape[0]):
+                    # current_modality[b] is the stream this token belongs to (None => text)
+                    is_media_b = current_modality[b] in ("audio", "voice", "image")
+                    if is_media_b != _mrope_was_media[b]:
+                        mrope_local_next[b] = 0.0        # modality changed -> restart local
+                        _mrope_was_media[b] = is_media_b
+                    rows.append([mrope_global_next[b], mrope_local_next[b]])
+                    mrope_global_next[b] += 1.0
+                    mrope_local_next[b] += (1.0 / max(rate, 1e-3)) if is_media_b else 1.0
+                step_pids = torch.tensor(rows, dtype=torch.float32,
+                                         device=next_hidden.device).unsqueeze(1)  # (B,1,2)
             # Process through recurrent block with KV cache
             current_hidden, kv_cache, n_iters, kl_trace, _ = self.recurrent_block(
                 next_hidden * self.embed_scale,
@@ -1266,6 +1322,7 @@ class MegaTransformerWorldModel(nn.Module):
                 position_offset=position_offset,
                 use_cache=True,
                 share_kv_cache=share_kv_cache,
+                position_ids=step_pids,
             )
             recurrent_iteration_counts.append(n_iters)
             recurrent_kl_final.append(kl_trace[-1] if kl_trace else 0.0)

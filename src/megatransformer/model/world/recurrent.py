@@ -136,6 +136,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         share_kv_cache: bool,
         _extend_mask_fn=None,
         additive_attn_bias: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run one full recurrent iteration through all blocks sequentially.
 
@@ -155,6 +156,7 @@ class MegatransformerRecurrentBlock(nn.Module):
             if self.gradient_checkpointing and self.training and not use_cache:
                 h, updated_cache = torch_checkpoint(
                     block, h, mask, None, iter_cache, position_offset, use_cache, additive_attn_bias,
+                    position_ids,
                     use_reentrant=False,
                 )
             else:
@@ -165,6 +167,7 @@ class MegatransformerRecurrentBlock(nn.Module):
                     position_offset=position_offset,
                     use_cache=use_cache,
                     additive_attn_bias=additive_attn_bias,
+                    position_ids=position_ids,
                 )
 
             if use_cache and updated_cache is not None and kv_cache is not None:
@@ -305,6 +308,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         share_kv_cache: bool = False,
         max_iterations_override: Optional[int] = None,
         additive_attn_bias: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache], int, List[float]]:
         """
         Forward pass through recurrent block with optional KV caching.
@@ -393,6 +397,7 @@ class MegatransformerRecurrentBlock(nn.Module):
                         attention_mask, new_kv_cache, position_offset,
                         use_cache, share_kv_cache, _extend_mask_for_cache,
                         additive_attn_bias=additive_attn_bias,
+                        position_ids=position_ids,
                     )
 
                     kl_per_token = None
@@ -435,6 +440,7 @@ class MegatransformerRecurrentBlock(nn.Module):
                     attention_mask, new_kv_cache, position_offset,
                     use_cache, share_kv_cache, _extend_mask_for_cache,
                     additive_attn_bias=additive_attn_bias,
+                    position_ids=position_ids,
                 )
 
                 kl_per_token = None
@@ -465,6 +471,7 @@ class MegatransformerRecurrentBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         max_iterations: Optional[int] = None,
         share_kv_cache: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, RecurrentKVCache, int]:
         """
         Single generation step with KV caching.
@@ -504,6 +511,7 @@ class MegatransformerRecurrentBlock(nn.Module):
                 attention_mask, kv_cache, position_offset,
                 use_cache=True, share_kv_cache=share_kv_cache,
                 _extend_mask_fn=_extend_mask_for_cache,
+                position_ids=position_ids,
             )
 
             # Check exit criteria

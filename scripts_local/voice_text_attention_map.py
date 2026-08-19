@@ -37,6 +37,10 @@ ap.add_argument("--voice_predict_f0", dest="voice_predict_f0", action="store_tru
 ap.add_argument("--n", type=int, default=3)
 ap.add_argument("--device", default="cuda:2")
 ap.add_argument("--out_dir", default="eval_output/world_tts_attention_maps")
+ap.add_argument("--per_head", action="store_true",
+                help="Report per (block/iteration, head) sharpness instead of the head-average. "
+                     "The average can hide ONE sharp aligner head under many diffuse ones — a "
+                     "different diagnosis (signal diluted downstream) than 'no head aligns'.")
 a = ap.parse_args()
 
 cb = load_codebook(a.codebook); K, D = int(cb.shape[0]), int(cb.shape[1])
@@ -97,6 +101,35 @@ for i in range(len(ds)):
         print("no attention captured — the manual path did not run"); break
     S = max(x.shape[-1] for x in CAP)
     full = [x for x in CAP if x.shape[-1] == S]
+    if a.per_head:
+        import math as _m
+        stats = []
+        v_hi_ = min(p_idx + T_v, S)
+        vp_ = torch.arange(p_idx, v_hi_); tp_ = torch.arange(0, min(p_idx, S))
+        if len(vp_) < 10 or len(tp_) < 3:
+            continue
+        uni = _m.log(len(tp_))
+        for ci, cap_t in enumerate(full):
+            for h in range(cap_t.shape[1]):
+                sub_h = cap_t[0, h][vp_][:, tp_]
+                rn = sub_h / sub_h.sum(-1, keepdim=True).clamp_min(1e-9)
+                e = float(-(rn * (rn + 1e-9).log()).sum(-1).mean())
+                am_ = sub_h.argmax(-1).float(); ix = torch.arange(len(am_)).float()
+                c = float(((am_ - am_.mean()) * (ix - ix.mean())).sum() /
+                          (am_.std().clamp_min(1e-6) * ix.std().clamp_min(1e-6) * len(am_)))
+                stats.append((e, c, ci, h))
+        stats.sort()
+        print(f"\n  utt {i}: uniform entropy {uni:.3f} nats over {len(tp_)} text tokens")
+        print(f"  {'rank':>4} {'entropy':>8} {'ent/uni':>8} {'corr':>7}  (capture, head)")
+        for r, (e, c, ci, h) in enumerate(stats[:6]):
+            print(f"  {r:>4} {e:>8.3f} {e/uni:>8.3f} {c:>+7.3f}  ({ci}, {h})")
+        e_all = sum(x[0] for x in stats) / len(stats)
+        print(f"  mean over {len(stats)} (capture,head) pairs: entropy {e_all:.3f} "
+              f"({e_all/uni:.3f} of uniform)")
+        done += 1
+        if done >= a.n:
+            break
+        continue
     A = torch.stack([x[0].mean(0) for x in full]).mean(0)      # avg heads + all blocks/iters
     # interleaved layout: text [0, p_idx) | voice [p_idx, p_idx+T_v) | trailing text
     v_hi = min(p_idx + T_v, S)

@@ -59,8 +59,17 @@ class MegaTransformerAttention(nn.Module):
                 self.heads_activation = activation_type()
 
         self.rotary_embedding = None
+        self.use_mrope = bool(getattr(config, "use_mrope", False))
+        self.rotary_global = self.rotary_local = None
         if bool(config.use_rotary_embedding):
             self.rotary_embedding = RotaryEmbedding(dim=config.rotary_embedding_dim, learned_freq=config.rotary_embedding_learnable)
+            if self.use_mrope:
+                # Split the rotary dims in half: [0, half) rotated by GLOBAL positions,
+                # [half, 2*half) by LOCAL positions. Same RoPE, two coordinate systems.
+                half = config.rotary_embedding_dim // 2
+                self._mrope_half = half
+                self.rotary_global = RotaryEmbedding(dim=half, learned_freq=config.rotary_embedding_learnable)
+                self.rotary_local = RotaryEmbedding(dim=half, learned_freq=config.rotary_embedding_learnable)
 
         if bool(config.use_alibi_bias):
             self.register_buffer('alibi_bias', create_alibi_bias(n_heads=config.n_heads, maxlen=config.max_position_embeddings))
@@ -95,6 +104,7 @@ class MegaTransformerAttention(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         additive_attn_bias: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         """
         Forward pass with optional KV caching for efficient generation.
@@ -143,9 +153,23 @@ class MegaTransformerAttention(nn.Module):
 
         # Apply RoPE with position offset for correct positions during generation
         if self.rotary_embedding is not None:
-            # rotate_queries_or_keys supports offset parameter for cached generation
-            queries = self.rotary_embedding.rotate_queries_or_keys(queries, offset=position_offset)
-            keys = self.rotary_embedding.rotate_queries_or_keys(keys, offset=position_offset)
+            if self.use_mrope and position_ids is not None:
+                # M-RoPE: explicit per-token GLOBAL and LOCAL coordinates. position_ids is
+                # (N, t, 2) = [:, :, 0] global, [:, :, 1] local (local may be fractional --
+                # a voice frame sits at frame_index / rate on the text's clock).
+                from rotary_embedding_torch import apply_rotary_emb
+                g = position_ids[..., 0].to(queries.device).float()
+                l = position_ids[..., 1].to(queries.device).float()
+                fg = torch.stack([self.rotary_global(g[b]) for b in range(g.shape[0])]).unsqueeze(1)
+                fl = torch.stack([self.rotary_local(l[b]) for b in range(l.shape[0])]).unsqueeze(1)
+                queries = apply_rotary_emb(fg, queries, start_index=0)
+                keys = apply_rotary_emb(fg, keys, start_index=0)
+                queries = apply_rotary_emb(fl, queries, start_index=self._mrope_half)
+                keys = apply_rotary_emb(fl, keys, start_index=self._mrope_half)
+            else:
+                # rotate_queries_or_keys supports offset parameter for cached generation
+                queries = self.rotary_embedding.rotate_queries_or_keys(queries, offset=position_offset)
+                keys = self.rotary_embedding.rotate_queries_or_keys(keys, offset=position_offset)
 
         # Handle KV cache
         new_kv_cache = None
@@ -486,6 +510,7 @@ class MegaTransformerEncoderBlock(nn.Module):
         position_offset: int = 0,
         use_cache: bool = False,
         additive_attn_bias: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         """
         Forward pass with optional KV caching.
@@ -517,6 +542,7 @@ class MegaTransformerEncoderBlock(nn.Module):
             position_offset=position_offset,
             use_cache=use_cache,
             additive_attn_bias=additive_attn_bias,
+            position_ids=position_ids,
         )
 
         hidden_states = hidden_states + attn_output

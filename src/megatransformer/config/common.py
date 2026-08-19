@@ -22,6 +22,14 @@ class MegaTransformerBlockConfig:
     rotary_embedding_learnable: bool = False
     use_grok_scaled_attn: bool = False
     use_alibi_bias: bool = False
+    # M-RoPE: split the rotary dims into a GLOBAL half (strictly increasing across the whole
+    # interleaved sequence — disambiguates voice_0 from voice_1 in multi-example sequences)
+    # and a LOCAL half (index within the current same-modality segment, with voice scaled by
+    # 1/mrope_voice_rate). The local axis puts an aligned (text token j, voice frame t) pair at
+    # relative distance ~0, which is what RoPE's locality bias can actually exploit — today the
+    # text->voice offset is L_text + 0.83*t, i.e. large, growing, and utterance-dependent.
+    # Same rotary mechanism, different position integers.
+    use_mrope: bool = False
     max_position_embeddings: int = 1024
     hidden_dropout_prob: float = 0.1
     attention_probs_dropout_prob: float = 0.1

@@ -507,3 +507,45 @@ class TokenUninterleaver(nn.Module):
         out = tokens.new_zeros(B, max_len + 1, d)
         out.scatter_(1, target.unsqueeze(-1).expand(-1, -1, d), tokens)
         return out[:, :max_len].contiguous()
+
+
+def build_mrope_position_ids(modality_map: torch.Tensor, voice_rate: float = 6.0) -> torch.Tensor:
+    """Per-token (GLOBAL, LOCAL) coordinates for M-RoPE, from the interleaved modality map.
+
+    GLOBAL: strictly increasing over non-pad positions. This is what keeps multiple media
+    examples distinguishable — in `<text> <voice_0> <text> <voice_1> <text>` the two voice
+    segments would otherwise collide on the local axis (voice_0 frame 5 and voice_1 frame 5
+    are positionally identical), so voice->voice attention could not tell them apart and a
+    "compare the two samples" finetune would have no positional handle.
+
+    LOCAL: index WITHIN the current contiguous same-modality segment, and for media segments
+    scaled by 1/voice_rate. That is the point of the whole exercise: RoPE encodes position
+    DIFFERENCES, not ratios, so putting a voice frame at frame_index/rate on the text's clock
+    makes an aligned (text token j, voice frame t) pair sit at relative distance ~0, where
+    RoPE's locality bias can act. Under the current single global axis that pair is separated
+    by L_text + 0.83*t — large, growing with t, and different for every utterance, which is
+    why only one attention head (block 0 head 4) manages to align at all.
+
+    Returns: (batch, seq_len, 2) float — [..., 0] global, [..., 1] local.
+    """
+    B, S = modality_map.shape
+    dev = modality_map.device
+    valid = modality_map != MODALITY_PAD
+    # GLOBAL: running count of valid positions (pad contributes nothing).
+    g = (valid.long().cumsum(dim=1) - 1).clamp(min=0).float()
+    # LOCAL: restart at each modality change; media positions advance by 1/voice_rate.
+    change = torch.ones_like(modality_map, dtype=torch.bool)
+    change[:, 1:] = modality_map[:, 1:] != modality_map[:, :-1]
+    seg_id = change.long().cumsum(dim=1)                       # (B, S) segment index
+    idx = torch.arange(S, device=dev).unsqueeze(0).expand(B, S)
+    # start index of each segment, broadcast back to its positions
+    seg_start = torch.zeros_like(idx)
+    for b in range(B):
+        starts = torch.zeros(int(seg_id[b].max()) + 2, dtype=torch.long, device=dev)
+        first = torch.where(change[b])[0]
+        starts[seg_id[b][first]] = first
+        seg_start[b] = starts[seg_id[b]]
+    within = (idx - seg_start).float()
+    is_media = (modality_map != MODALITY_TEXT) & valid
+    l = torch.where(is_media, within / max(voice_rate, 1e-3), within)
+    return torch.stack([g, l], dim=-1)
