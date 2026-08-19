@@ -1730,11 +1730,13 @@ class WorldModelTrainer(CommonTrainer):
             return ".image_generator." in f".{name}" or name.startswith("image_generator.")
 
         def is_flow(name: str) -> bool:
-            # T3 flow head only. It is a FRESH module bolted onto an already-converged
-            # adapter, so it wants a from-scratch LR (~1e-4) while the warm-started
-            # Q-Former beside it must stay slow -- and both live under image_generator.*,
-            # so lr_dit alone cannot separate them.
-            return ".image_generator.flow_head." in f".{name}"
+            # The generative head (T3 parallel `flow_head` OR T4 autoregressive
+            # `ar_flow_head`). Either is a FRESH module bolted onto an already-converged
+            # adapter, so it wants a from-scratch LR (~1e-4) while the warm-started Q-Former
+            # beside it must stay slow -- and both live under image_generator.*, so lr_dit
+            # alone cannot separate them.
+            n = f".{name}"
+            return ".image_generator.flow_head." in n or ".image_generator.ar_flow_head." in n
 
         _lr_flow = self.lr_flow if self.lr_flow is not None else self.lr_dit
         groups = {
