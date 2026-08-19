@@ -143,6 +143,10 @@ class MegaTransformerWorldModelConfig:
     # Base id for the 9 control tokens (BOA..IMAGE_PLACEHOLDER at base+0..8). = the real vocab
     # size: 32000 (Mistral, default) or the pretrained LLM's native vocab (set automatically in
     # pretrained mode). MUST match the base the data was tokenized with.
+    # Nominal voice frames per text token for M-RoPE's LOCAL clock (25Hz speech vs SmolLM2
+    # tokens is ~6). Only the ratio matters: it turns the text<->voice relationship from a
+    # scaling (which RoPE cannot express) into a near-zero relative distance (which it can).
+    mrope_voice_rate: float = 6.0
     special_token_base: int = 32_000
     # End-of-sequence id used to terminate text generation. Native to the vocab: 2 for the
     # Mistral tokenizer (default), or the pretrained LLM's native eos (set automatically in

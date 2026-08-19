@@ -2069,7 +2069,8 @@ def load_model(args, device='cuda'):
                       getattr(args, 'voice_cfg_text_dropout_prob', 0.0) > 0.0 or
                       getattr(args, 'mean_thinking_steps', None) is not None or
                       getattr(args, 'image_contrastive_queue_size', None) is not None or
-                      getattr(args, 'voice_stochastic_output', False))
+                      getattr(args, 'voice_stochastic_output', False) or
+                      getattr(args, 'use_mrope', False))
     if needs_override:
         import copy
         from megatransformer.config.world.world_model import WORLD_MODEL_CONFIGS
@@ -2079,6 +2080,12 @@ def load_model(args, device='cuda'):
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if getattr(args, 'share_block_weights', False):
             config.recurrent_block_config.share_block_weights = True
+        if getattr(args, 'use_mrope', False):
+            # Only the TRUNK: it is the one module that sees text and media together, so it
+            # is the only place a text<->voice coordinate can live. Preludes/codas keep their
+            # existing per-stream RoPE.
+            config.recurrent_block_config.block_config.use_mrope = True
+            config.mrope_voice_rate = float(getattr(args, 'mrope_voice_rate', 6.0))
         if getattr(args, 'voice_prenet_dropout', 0.0) and args.voice_prenet_dropout > 0.0:
             config.voice_prelude_config.prenet_dropout = args.voice_prenet_dropout
         if getattr(args, 'voice_cfg_text_dropout_prob', 0.0) > 0.0:
@@ -2658,6 +2665,17 @@ def add_cli_args(subparsers):
                             help="Override recurrent block xavier init gain (default: 0.02)")
     sub_parser.add_argument("--projection_init_gain", type=float, default=None,
                             help="Override projection xavier init gain (default: use config, typically 1.0)")
+    sub_parser.add_argument("--use_mrope", action="store_true", default=False,
+                            help="M-RoPE in the recurrent trunk: split the rotary dims into a "
+                                 "GLOBAL axis (increasing across the whole interleaved sequence, "
+                                 "so multiple media examples stay distinguishable) and a LOCAL "
+                                 "axis (index within the current same-modality segment, media "
+                                 "scaled by 1/--mrope_voice_rate). Puts an aligned (text token, "
+                                 "voice frame) pair at relative distance ~0 instead of "
+                                 "L_text + 0.83*t. Same RoPE, different position integers.")
+    sub_parser.add_argument("--mrope_voice_rate", type=float, default=6.0,
+                            help="Nominal voice frames per text token for M-RoPE's local clock "
+                                 "(25Hz speech vs SmolLM2 tokens is ~6). Only the ratio matters.")
     sub_parser.add_argument("--share_block_weights", action="store_true", default=False,
                             help="Share weights across all recurrent blocks (deeper 1-block)")
     sub_parser.add_argument("--iteration_norm", type=str, default=None,
