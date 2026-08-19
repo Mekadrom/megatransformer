@@ -45,6 +45,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         voice_hop_length: int = 256,
         voice_temperature: float = 0.6,
         voice_variance_floor: float = 0.0,
+        voice_ras_win: int = 0,
+        voice_ras_tau: float = 0.1,
         include_modes: Optional[list[str]] = None,
         include_tasks: Optional[list[str]] = None,
         voice_token_budget: Optional[int] = None,
@@ -88,6 +90,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         # --voice_stochastic_output (heteroscedastic coda) — else logvar is None and generate()
         # ignores it (deterministic mu). 0 = deterministic; ~0.5-0.7 = moderate stochasticity.
         self.voice_temperature = voice_temperature
+        self.voice_ras_win = int(voice_ras_win or 0)
+        self.voice_ras_tau = float(voice_ras_tau)
         self.voice_variance_floor = voice_variance_floor
         self.voice_sample_rate = voice_sample_rate
         self.voice_n_mels = voice_n_mels
@@ -202,6 +206,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             kwargs.setdefault("voice_token_budget", self.voice_token_budget)
         if self.audio_token_budget is not None:
             kwargs.setdefault("audio_token_budget", self.audio_token_budget)
+        # Repetition-aware sampling for the RENDERS only — this changes nothing about
+        # training, just what the eval audio sounds like. Measured at distill@44k:
+        # adj_repeat 0.1034 -> 0.0071 (teacher 0.0070) and longest_run 56 -> 7, i.e. it
+        # removes the repeated-frame artifacts that otherwise mask everything else by ear.
+        if self.voice_ras_win:
+            kwargs.setdefault("voice_ras_win", self.voice_ras_win)
+            kwargs.setdefault("voice_ras_tau", self.voice_ras_tau)
         return model.generate(**kwargs)
 
     def _scenario_enabled(self, required_modes: set, satisfying_tasks: set) -> bool:

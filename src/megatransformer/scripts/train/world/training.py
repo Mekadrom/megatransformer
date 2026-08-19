@@ -2687,6 +2687,13 @@ def add_cli_args(subparsers):
                             help="Maximum token sequence length for text")
 
     # Visualization callback dependencies
+    sub_parser.add_argument("--viz_voice_ras_win", type=int, default=0,
+                            help="Repetition-aware sampling window for EVAL RENDERS only (10 = the "
+                                 "CosyVoice 2 value). Does not affect training or any metric — it "
+                                 "only changes what the logged audio sounds like. Measured: "
+                                 "adj_repeat 0.103 -> 0.007, longest_run 56 -> 7.")
+    sub_parser.add_argument("--viz_voice_ras_tau", type=float, default=0.1,
+                            help="RAS repetition threshold for eval renders.")
     sub_parser.add_argument("--voice_cosyvoice2_distill_model_dir", type=str, default=None,
                             help="CosyVoice2-0.5B snapshot dir for KL DISTILLATION. Runs the frozen "
                                  "Qwen2-0.5B speech LM teacher-forced in the training loop and adds "

@@ -555,6 +555,8 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             voice_n_fft=getattr(args, 'voice_n_fft', 1024),
             voice_hop_length=getattr(args, 'voice_hop_length', 256),
             voice_temperature=getattr(args, 'viz_voice_temperature', 0.6),
+            voice_ras_win=getattr(args, 'viz_voice_ras_win', 0),
+            voice_ras_tau=getattr(args, 'viz_voice_ras_tau', 0.1),
             voice_variance_floor=getattr(args, 'viz_voice_variance_floor', 0.0),
             voice_token_budget=(args.voice_token_budget if getattr(args, 'voice_token_budget', None)
                                 else media_frame_budget(args, "voice")),
