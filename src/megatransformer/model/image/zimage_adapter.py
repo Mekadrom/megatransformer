@@ -203,6 +203,16 @@ class ZImageConditioningAdapter(nn.Module):
                          w=1), so the raw projection lands well under-dispersed -- the exact
                          failure mode this arm of the project keeps rediscovering.
         """
+        head = self.flow_head if self.flow_head is not None else self.ar_flow_head
+        if bool(getattr(head, "x_skip", False)):
+            # The basis below is the column space of `out.weight` -- precisely the subspace
+            # flow_x_skip exists to escape. Projecting an x_skip checkpoint onto it would DELETE
+            # the skip's full-rank noise cancellation, i.e. undo the fix. flow_project is for
+            # legacy heads that cannot remove their own noise.
+            raise ValueError(
+                "--flow_project is for heads WITHOUT flow_x_skip. This checkpoint has the skip, "
+                "which already removes the leak during sampling; projecting onto out.weight's "
+                "range would discard exactly that correction.")
         Q = self._flow_out_basis()
         xf = x.float()
         p = (xf @ Q) @ Q.T
