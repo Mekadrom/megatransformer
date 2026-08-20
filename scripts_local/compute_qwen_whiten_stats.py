@@ -6,10 +6,11 @@ and accumulates per-dim (2560) mean/std over all tokens. Saves {mean, std} to a 
 --image_whiten_stats_path. Run ONCE; the stats are a fixed property of the Qwen3 target
 space (independent of the adapter's weights).
 
-Usage:
-    CUDA_VISIBLE_DEVICES=3 python scripts_local/compute_qwen_whiten_stats.py \
-        --cache_dir ./cached_datasets/Mekadrom/image_gen_captions_only/train \
-        --n_samples 8192 --seq_len 64 --output ./cached_datasets/qwen_whiten_stats_k64.pt
+Usage (K-slot resample, T0-T3):
+    CUDA_VISIBLE_DEVICES=3 python scripts_local/compute_qwen_whiten_stats.py --cache_dir ./cached_datasets/Mekadrom/image_gen_captions_only/train --n_samples 8192 --seq_len 64 --output ./cached_datasets/qwen_whiten_stats_k64.pt
+
+Usage (NATIVE length, T5 -- --native, real tokens only):
+    CUDA_VISIBLE_DEVICES=3 python scripts_local/compute_qwen_whiten_stats.py --cache_dir ./cached_datasets/Mekadrom/image_gen_captions_only/train --n_samples 8192 --seq_len 128 --native --output ./cached_datasets/qwen_whiten_stats_native.pt
 """
 import argparse
 import os
@@ -26,6 +27,12 @@ def parse_args():
     p.add_argument("--output", type=str, required=True)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--no_4bit", action="store_true", help="load Qwen3 bf16 instead of 4-bit")
+    p.add_argument("--native", action="store_true",
+                   help="accumulate over NATIVE-length targets (real tokens only, masked) "
+                        "instead of the K-slot resample. Use for the T5 native-length head: "
+                        "F.interpolate averages neighbouring hidden states, which SHRINKS "
+                        "per-dim variance, so k64 stats would leave native targets whitened to "
+                        "slightly above unit std.")
     return p.parse_args()
 
 
@@ -66,7 +73,12 @@ def main():
     total_sq = torch.zeros(2560, dtype=torch.float64)
     count = 0
     for i in range(0, len(caps), args.batch_size):
-        t = enc.encode(caps[i:i + args.batch_size]).reshape(-1, 2560).double().cpu()  # (B*K, 2560)
+        batch = caps[i:i + args.batch_size]
+        if args.native:
+            hs, m = enc.encode_native(batch, max_len=args.seq_len)
+            t = hs[m.bool()].reshape(-1, 2560).double().cpu()      # real tokens only
+        else:
+            t = enc.encode(batch).reshape(-1, 2560).double().cpu()  # (B*K, 2560)
         total += t.sum(0)
         total_sq += (t * t).sum(0)
         count += t.shape[0]
@@ -79,7 +91,8 @@ def main():
     mean_f = mean.float(); std_f = std.float()
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
     torch.save({"mean": mean_f, "std": std_f, "n_tokens": count,
-                "n_captions": len(caps), "seq_len": args.seq_len}, args.output)
+                "n_captions": len(caps), "seq_len": args.seq_len,
+                "native": bool(args.native)}, args.output)
     print(f"\nsaved {args.output}")
     print(f"tokens={count}  per-dim std: min={std_f.min():.3f} median={std_f.median():.3f} "
           f"max={std_f.max():.3f}  (max/median = {float(std_f.max()/std_f.median()):.1f}x -> whitening lever)")

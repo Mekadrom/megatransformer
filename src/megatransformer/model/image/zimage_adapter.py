@@ -140,8 +140,18 @@ class ZImageConditioningAdapter(nn.Module):
                 steps=int(getattr(config, "flow_steps", 8)),
                 time_sampling=getattr(config, "flow_time_sampling", "logit_normal"),
                 cfg_dropout=float(getattr(config, "flow_cfg_dropout", 0.0)),
-                guidance=float(getattr(config, "flow_guidance", 1.0)))
+                guidance=float(getattr(config, "flow_guidance", 1.0)),
+                max_len=int(getattr(config, "flow_max_len", 128)),
+                pos_embed=bool(getattr(config, "flow_pos_embed", False)))
         self.flow_aux_mse_weight = float(getattr(config, "flow_aux_mse_weight", 0.1))
+        # T5: run the PARALLEL head at the caption's native Qwen3 length instead of resampling
+        # the target to K slots. Same one-shot sampler as T3 (no sequential inference), just
+        # without the K=64 interpolation -- so ~2/3 of the supervised slots stop being linear
+        # blends of neighbouring hidden states. The Q-Former context stays at a fixed seq_len
+        # slots; only the OUTPUT length becomes native, exactly as in the AR head.
+        self.flow_native_length = bool(getattr(config, "flow_native_length", False))
+        if self.flow_native_length and self.flow_head is None:
+            raise ValueError("flow_native_length requires flow_head")
 
         # T4: autoregressive per-token flow over the conditioning (ar_cond_flow_head.py).
         # Mutually exclusive with the parallel flow head. Targets arrive at NATIVE length with
@@ -236,6 +246,12 @@ class ZImageConditioningAdapter(nn.Module):
             seq_surf = self.ar_flow_head.sample(
                 q, int(kw.get("cond_length") or seq_pred.shape[1]),
                 generator=kw.get("flow_generator", getattr(self, "flow_generator", None)))
+        elif self.flow_head is not None and self.flow_native_length and cond_labels is None:
+            # Native length: emit exactly as many slots as Qwen3 would produce for this caption
+            # (deterministic from the caption, same as the AR path -- no stop token needed).
+            seq_surf = self.flow_head.sample(
+                q, int(kw.get("cond_length") or seq_pred.shape[1]),
+                generator=kw.get("flow_generator", getattr(self, "flow_generator", None)))
         elif self.flow_head is not None and cond_labels is None:
             # Seeded sampling matters for EVAL COMPARABILITY: the head emits a DISTRIBUTION, so
             # an unseeded draw makes checkpoint-to-checkpoint differences a mix of training
@@ -287,6 +303,18 @@ class ZImageConditioningAdapter(nn.Module):
                         cmask.shape[0] == sample_mask.shape[0]:
                     cmask = cmask[sample_mask.bool()]
                 flow = self.ar_flow_head.loss(sl, ctx, mask=cmask)
+                out["image_clip_loss"] = flow
+                out["image_flow_loss"] = flow.detach()
+                return out
+            if self.flow_head is not None and self.flow_native_length:
+                # As in the AR branch there is no comparable point-head MSE here: seq_pred is a
+                # fixed-K estimate while the target is variable-length, so the flow loss is the
+                # whole signal.
+                cmask = kw.get("cond_mask")
+                if cmask is not None and sample_mask is not None and \
+                        cmask.shape[0] == sample_mask.shape[0]:
+                    cmask = cmask[sample_mask.bool()]
+                flow = self.flow_head.loss(sl, ctx, mask=cmask)
                 out["image_clip_loss"] = flow
                 out["image_flow_loss"] = flow.detach()
                 return out

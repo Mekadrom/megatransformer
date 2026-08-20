@@ -262,9 +262,11 @@ def main():
             _adapter.flow_generator = g
 
     def _ar_length(prompt):
-        """T4 AR: emit exactly as many conditioning tokens as Qwen3 would produce for this
-        caption. Deterministic from the caption, so no stop token / length head is needed."""
-        if getattr(_adapter, "ar_flow_head", None) is None:
+        """Native-length heads (T4 AR and T5 parallel): emit exactly as many conditioning tokens
+        as Qwen3 would produce for this caption. Deterministic from the caption, so no stop
+        token / length head is needed. Fixed-K heads (T3) return None and keep seq_len."""
+        if (getattr(_adapter, "ar_flow_head", None) is None
+                and not bool(getattr(_adapter, "flow_native_length", False))):
             return None
         return len(pipe.tokenizer(pipe.tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}], tokenize=False,

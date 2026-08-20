@@ -818,15 +818,22 @@ class WorldModelTrainer(CommonTrainer):
                           f"precision={'4bit' if load_4bit else 'bf16'}", flush=True)
                 _t0 = time.perf_counter()
                 # Encoder may be on a different device; targets move back to the training card.
-                if getattr(unwrapped_model.image_generator, "ar_flow_head", None) is not None:
-                    # T4 AR: NATIVE length + mask (no K-slot resample). The AR head emits one
-                    # token per real Qwen3 token, so the target must keep its true length.
+                _gen = unwrapped_model.image_generator
+                _native = (getattr(_gen, "ar_flow_head", None) is not None
+                           or bool(getattr(_gen, "flow_native_length", False)))
+                if _native:
+                    # NATIVE length + mask (no K-slot resample), for BOTH the T4 AR head and the
+                    # T5 native parallel head: each emits one slot per real Qwen3 token, so the
+                    # target must keep its true length.
                     # NB: read the config off the adapter, NOT the local `icfg` -- that is only
                     # bound inside the lazy encoder-construction branch above, so it is undefined
                     # on every step after the first (UnboundLocalError).
-                    _icfg = unwrapped_model.image_generator.config
+                    _icfg = _gen.config
+                    _mx = int(getattr(_icfg, "ar_max_len", 128)
+                              if getattr(_gen, "ar_flow_head", None) is not None
+                              else getattr(_icfg, "flow_max_len", 128))
                     image_cond_labels, image_cond_mask = self._zimage_text_encoder.encode_native(
-                        captions, max_len=int(getattr(_icfg, "ar_max_len", 128)))
+                        captions, max_len=_mx)
                     image_cond_labels = image_cond_labels.to(model_device)
                     image_cond_mask = image_cond_mask.to(model_device)
                 else:

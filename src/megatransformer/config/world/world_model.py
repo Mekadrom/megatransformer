@@ -566,3 +566,20 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3"].image_coda_config.flow_head = True
 # CLIPScore, so this is an architectural-uniformity change, not a fix for a measured gap.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"].image_coda_config.ar_flow_head = True
+
+# T5: T3's PARALLEL head at NATIVE length. T4 bundled two changes -- autoregressive
+# factorisation AND native length -- and lost decisively (w=3 plateau ~0.248 vs T3's 0.344),
+# which indicts the factorisation, not the length handling. This keeps the winning parallel
+# sampler and drops only the K=64 resample, so ~2/3 of the supervised slots stop being linear
+# blends of neighbouring Qwen3 states. Inference stays one-shot (no sequential decode).
+# Warm-start from a T3 checkpoint: trunk/Q-Former/flow head all load, since the head's shape is
+# unchanged -- only how many slots it is asked for.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native"].image_coda_config.flow_native_length = True
+WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native"].image_coda_config.flow_aux_mse_weight = 0.0
+
+# T5 + slot positions. Separate preset so "native length" and "the slots get an identity" are
+# ablatable independently -- without pos_embed the head is permutation-equivariant and emits an
+# unordered set (which is how T3 works today).
+WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_pos"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_pos"].image_coda_config.flow_pos_embed = True

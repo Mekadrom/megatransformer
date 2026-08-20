@@ -394,6 +394,22 @@ class ZImageAdapterConfig:
     # Qwen3 tokenization). Costs SEQUENTIAL inference: L x flow_steps instead of flow_steps.
     # NOTE the measured context: the K=64 resample this replaces was shown to cost ~0.0004
     # CLIPScore, so the motivation here is architectural uniformity, not a metric gap.
+    # T5: the PARALLEL head at NATIVE length -- same one-shot sampler as T3, but the target
+    # keeps its true Qwen3 length instead of being F.interpolate'd to K=64. Motivation is the
+    # part of T4's premise that survives its result: at K=64 with captions of ~18-23 tokens,
+    # roughly 2/3 of the supervised slots are linear BLENDS of neighbouring hidden states, so
+    # the head spends most of its loss fitting interpolation artefacts. This keeps the parallel
+    # factorisation (which beat AR 0.344 vs ~0.248) and drops only the resample.
+    # NOTE the K=64 resample was measured to cost ~0.0004 CLIPScore on the TARGET side; that
+    # measured how well a resampled target RENDERS, not how hard it is to LEARN, which is the
+    # open question this tests.
+    flow_native_length: bool = False
+    flow_max_len: int = 128       # positional table / target truncation, as ar_max_len
+    # Give the output slots an identity. OFF reproduces T3 exactly: the parallel head is then
+    # permutation-equivariant over its slots (verified 6e-08) and emits an unordered SET, which
+    # is what reached 0.344. Ablate this separately from flow_native_length.
+    flow_pos_embed: bool = False
+
     ar_flow_head: bool = False
     ar_dim: int = 512
     ar_heads: int = 8

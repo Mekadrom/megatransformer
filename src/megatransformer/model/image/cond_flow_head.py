@@ -81,7 +81,7 @@ class CondFlowHead(nn.Module):
 
     def __init__(self, seq_dim, ctx_dim, dim=512, n_heads=8, n_layers=4,
                  mlp_ratio=4.0, dropout=0.0, steps=8, time_sampling="logit_normal",
-                 cfg_dropout=0.0, guidance=1.0):
+                 cfg_dropout=0.0, guidance=1.0, max_len=128, pos_embed=False):
         super().__init__()
         self.seq_dim = seq_dim
         self.steps = int(steps)
@@ -107,6 +107,17 @@ class CondFlowHead(nn.Module):
         self.out_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.out_ada = nn.Linear(dim, 2 * dim)
         self.out = nn.Linear(dim, seq_dim)
+        # NATIVE LENGTH + POSITIONS. Without `pos` this head is EXACTLY permutation-equivariant
+        # over its output slots (verified: max|v(Px) - Pv(x)| = 6e-08) -- nothing distinguishes
+        # slot i from slot j, so it emits an unordered SET and the slot order is decided by the
+        # noise. That is fine for Z-Image, whose cross-attention is largely order-insensitive
+        # and whose Qwen3 targets are causal (each state identifies its own position), and it is
+        # how T3 reached 0.344. Once the output length VARIES, though, giving the slots an
+        # identity is a real (and separately ablatable) lever, so it is a flag, not a default.
+        self.pos = None
+        if pos_embed:
+            self.pos = nn.Parameter(torch.zeros(1, int(max_len), dim))
+            nn.init.normal_(self.pos, std=0.02)
         # Zero-init the final projection + its modulation: v_theta starts at 0, so the initial
         # ODE is the identity map from noise. Standard DiT practice; avoids a violent first step.
         for m in (self.out_ada, self.out):
@@ -117,6 +128,10 @@ class CondFlowHead(nn.Module):
         """v_theta(x_t, t, ctx). x_t (B,K,seq_dim); t (B,) in [0,1]; ctx (B,M,ctx_dim)."""
         temb = self.t_mlp(timestep_embedding(t, self.t_dim).to(x_t.dtype))
         h = self.x_in(x_t)
+        if self.pos is not None:
+            if x_t.shape[1] > self.pos.shape[1]:
+                raise ValueError(f"seq_len {x_t.shape[1]} exceeds max_len {self.pos.shape[1]}")
+            h = h + self.pos[:, :x_t.shape[1]].to(h.dtype)
         c = self.ctx_in(ctx)
         for blk in self.blocks:
             h = blk(h, c, temb)
@@ -133,8 +148,13 @@ class CondFlowHead(nn.Module):
     def _null(self, ctx):
         return self.null_ctx.to(ctx.dtype).expand_as(ctx)
 
-    def loss(self, target, ctx):
-        """Rectified-flow MSE. target (B,K,seq_dim) in the SAME space the head samples in."""
+    def loss(self, target, ctx, mask=None):
+        """Rectified-flow MSE. target (B,K,seq_dim) in the SAME space the head samples in.
+
+        mask (B,K) bool marks REAL tokens when the target arrives at its native length; padded
+        positions carry no target and must not be supervised or they pull the head toward
+        whatever the padding happens to be.
+        """
         b = target.shape[0]
         if self.cfg_dropout > 0 and self.training:
             # Per-ROW context dropout -> the head learns p(x) as well as p(x|ctx).
@@ -144,7 +164,12 @@ class CondFlowHead(nn.Module):
         noise = torch.randn_like(target)
         tv = t.view(-1, 1, 1)
         x_t = (1 - tv) * noise + tv * target
-        return F.mse_loss(self.velocity(x_t, t, ctx), target - noise)
+        v = self.velocity(x_t, t, ctx)
+        if mask is None:
+            return F.mse_loss(v, target - noise)
+        err = (v - (target - noise)) ** 2
+        m = mask.to(err.dtype).unsqueeze(-1)
+        return (err * m).sum() / (m.sum() * target.shape[-1]).clamp_min(1.0)
 
     @torch.no_grad()
     def sample(self, ctx, seq_len, steps=None, generator=None, guidance=None):
