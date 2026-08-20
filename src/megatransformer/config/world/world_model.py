@@ -583,3 +583,14 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native"].image_coda_config.flow_aux_mse
 # unordered set (which is how T3 works today).
 WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_pos"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_pos"].image_coda_config.flow_pos_embed = True
+
+# T3 + the x_t skip that closes the rank-limited-output noise leak. This is a FIX to T3's head,
+# not a new tier: same parallel sampler, same K=64 targets, same everything -- plus the full-rank
+# -x_t/(1-t) term the rectified-flow interpolant actually calls for. Zero-init, so it warm-starts
+# from t3_2 bit-identically and learns the skip from there.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"].image_coda_config.flow_x_skip = True
+
+# T5 (native length) + the same skip -- the two independent fixes composed.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_xskip"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_xskip"].image_coda_config.flow_x_skip = True

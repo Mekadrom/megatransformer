@@ -81,7 +81,7 @@ class CondFlowHead(nn.Module):
 
     def __init__(self, seq_dim, ctx_dim, dim=512, n_heads=8, n_layers=4,
                  mlp_ratio=4.0, dropout=0.0, steps=8, time_sampling="logit_normal",
-                 cfg_dropout=0.0, guidance=1.0, max_len=128, pos_embed=False):
+                 cfg_dropout=0.0, guidance=1.0, max_len=128, pos_embed=False, x_skip=False):
         super().__init__()
         self.seq_dim = seq_dim
         self.steps = int(steps)
@@ -114,6 +114,37 @@ class CondFlowHead(nn.Module):
         # and whose Qwen3 targets are causal (each state identifies its own position), and it is
         # how T3 reached 0.344. Once the output length VARIES, though, giving the slots an
         # identity is a real (and separately ablatable) lever, so it is a flag, not a default.
+        # ── THE NOISE LEAK, AND WHY A SKIP FIXES IT ────────────────────────────────────────
+        # `out` is Linear(dim -> seq_dim) with dim << seq_dim, so every velocity this head can
+        # predict lies in a dim-dimensional subspace of the seq_dim-dimensional target space.
+        # Euler integration only ADDS velocities to the initial noise, so the noise component
+        # orthogonal to that subspace survives to the output completely untouched. MEASURED on
+        # t3_2/ckpt-20000 with real contexts: 58.8% of the emitted energy at w=1, 42.6% at w=3,
+        # and the projected-out signal is only 0.539 whitened std -- i.e. the head was reaching
+        # plausible total dispersion by SUMMING under-dispersed content with unremovable noise,
+        # not by producing dispersed content. Widening `dim` to seq_dim is the brute-force fix;
+        # non-linearity is NOT a fix (the image of a dim-dimensional input is still a
+        # dim-dimensional surface, and `x_in` has already discarded the noise this would need
+        # to see).
+        #
+        # The cheap, grounded fix comes straight from the interpolant. With
+        # x_t = (1-t)*noise + t*x1, the true velocity is
+        #     u = x1 - noise = (x1 - x_t) / (1 - t)
+        # so the full-rank part is just SUBTRACTING THE INPUT. A learned per-dim, time-conditioned
+        # coefficient on x_t supplies exactly that and reaches all seq_dim directions, because the
+        # product a(t) * x_t is an elementwise (diagonal) map, not a rank-dim projection.
+        # ZERO-INIT so the head is bit-identical to a no-skip head at init and warm-starts from an
+        # existing T3 checkpoint; unlike a zero-init output projection this still receives
+        # gradient immediately (dL/da = dL/dv * x_t), so it is not subject to the dead-start trap.
+        # Under CFG the skip term is IDENTICAL for the conditional and unconditional streams, so
+        # it cancels in (v_c - v_u) and is applied exactly ONCE -- guidance amplifies only the
+        # learned content while noise removal stays at its proper strength.
+        self.x_skip = bool(x_skip)
+        if self.x_skip:
+            self.skip_ada = nn.Linear(dim, seq_dim)
+            nn.init.zeros_(self.skip_ada.weight)
+            nn.init.zeros_(self.skip_ada.bias)
+
         self.pos = None
         if pos_embed:
             self.pos = nn.Parameter(torch.zeros(1, int(max_len), dim))
@@ -136,7 +167,10 @@ class CondFlowHead(nn.Module):
         for blk in self.blocks:
             h = blk(h, c, temb)
         shift, scale = self.out_ada(temb).chunk(2, dim=-1)
-        return self.out(_modulate(self.out_norm(h), shift, scale))
+        v = self.out(_modulate(self.out_norm(h), shift, scale))
+        if self.x_skip:
+            v = v + self.skip_ada(temb).unsqueeze(1) * x_t
+        return v
 
     def _sample_t(self, b, device, dtype):
         if self.time_sampling == "uniform":

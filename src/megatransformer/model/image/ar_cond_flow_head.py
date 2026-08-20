@@ -63,7 +63,7 @@ class _ARBlock(nn.Module):
 class _FlowMLP(nn.Module):
     """Per-token velocity net: AdaLN-modulated residual MLP conditioned on z_t and tau."""
 
-    def __init__(self, seq_dim, cond_dim, dim, n_layers):
+    def __init__(self, seq_dim, cond_dim, dim, n_layers, x_skip=False):
         super().__init__()
         self.x_in = nn.Linear(seq_dim, dim)
         self.c_in = nn.Linear(cond_dim, dim)
@@ -81,6 +81,14 @@ class _FlowMLP(nn.Module):
         self.out = nn.Linear(dim, seq_dim)
         for m in (self.out_ada, self.out):
             nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+        # Same rank-limited-output leak as CondFlowHead (see the long note there): `out` is
+        # Linear(dim -> seq_dim), so the initial noise orthogonal to its column space survives
+        # the per-token ODE untouched. The skip supplies the full-rank -x_t/(1-t) term the
+        # interpolant actually calls for. Conditioned on c (context + timestep), zero-init.
+        self.x_skip = bool(x_skip)
+        if self.x_skip:
+            self.skip_ada = nn.Linear(dim, seq_dim)
+            nn.init.zeros_(self.skip_ada.weight); nn.init.zeros_(self.skip_ada.bias)
 
     def forward(self, x_t, tau, z):
         """x_t (N, seq_dim); tau (N,); z (N, cond_dim) -> velocity (N, seq_dim)."""
@@ -90,13 +98,16 @@ class _FlowMLP(nn.Module):
             sh, sc, g = ada(c).chunk(3, dim=-1)
             h = h + g * mlp(norm(h) * (1 + sc) + sh)
         sh, sc = self.out_ada(c).chunk(2, dim=-1)
-        return self.out(self.out_norm(h) * (1 + sc) + sh)
+        v = self.out(self.out_norm(h) * (1 + sc) + sh)
+        if self.x_skip:
+            v = v + self.skip_ada(c) * x_t
+        return v
 
 
 class ARCondFlowHead(nn.Module):
     def __init__(self, seq_dim, ctx_dim, dim=512, n_heads=8, n_layers=4, flow_layers=3,
                  max_len=128, dropout=0.0, steps=8, time_sampling="logit_normal",
-                 cfg_dropout=0.0, guidance=1.0):
+                 cfg_dropout=0.0, guidance=1.0, x_skip=False):
         super().__init__()
         self.seq_dim, self.dim = seq_dim, dim
         self.steps = int(steps)
@@ -113,7 +124,7 @@ class ARCondFlowHead(nn.Module):
         self.null_ctx = nn.Parameter(torch.zeros(1, 1, ctx_dim))
         self.blocks = nn.ModuleList([_ARBlock(dim, n_heads, dropout=dropout) for _ in range(n_layers)])
         self.out_norm = nn.LayerNorm(dim)
-        self.flow = _FlowMLP(seq_dim, dim, dim, flow_layers)
+        self.flow = _FlowMLP(seq_dim, dim, dim, flow_layers, x_skip=x_skip)
 
     def _null(self, ctx):
         return self.null_ctx.to(ctx.dtype).expand_as(ctx)

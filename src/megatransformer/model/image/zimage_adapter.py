@@ -142,13 +142,15 @@ class ZImageConditioningAdapter(nn.Module):
                 cfg_dropout=float(getattr(config, "flow_cfg_dropout", 0.0)),
                 guidance=float(getattr(config, "flow_guidance", 1.0)),
                 max_len=int(getattr(config, "flow_max_len", 128)),
-                pos_embed=bool(getattr(config, "flow_pos_embed", False)))
+                pos_embed=bool(getattr(config, "flow_pos_embed", False)),
+                x_skip=bool(getattr(config, "flow_x_skip", False)))
         self.flow_aux_mse_weight = float(getattr(config, "flow_aux_mse_weight", 0.1))
         # T5: run the PARALLEL head at the caption's native Qwen3 length instead of resampling
         # the target to K slots. Same one-shot sampler as T3 (no sequential inference), just
         # without the K=64 interpolation -- so ~2/3 of the supervised slots stop being linear
         # blends of neighbouring hidden states. The Q-Former context stays at a fixed seq_len
         # slots; only the OUTPUT length becomes native, exactly as in the AR head.
+        self.flow_project = None          # None | "proj" | "renorm"; set at INFERENCE only
         self.flow_native_length = bool(getattr(config, "flow_native_length", False))
         if self.flow_native_length and self.flow_head is None:
             raise ValueError("flow_native_length requires flow_head")
@@ -172,7 +174,41 @@ class ZImageConditioningAdapter(nn.Module):
                 steps=int(getattr(config, "flow_steps", 8)),
                 time_sampling=getattr(config, "flow_time_sampling", "logit_normal"),
                 cfg_dropout=float(getattr(config, "flow_cfg_dropout", 0.0)),
-                guidance=float(getattr(config, "flow_guidance", 1.0)))
+                guidance=float(getattr(config, "flow_guidance", 1.0)),
+                x_skip=bool(getattr(config, "flow_x_skip", False)))
+
+    def _flow_out_basis(self):
+        """Orthonormal basis of the flow head's REACHABLE output subspace, cached.
+
+        `out` is Linear(flow_dim -> seq_dim) with flow_dim << seq_dim, so every velocity the head
+        can predict lies in the (at most flow_dim-dimensional) column space of out.weight. Euler
+        integration only ever ADDS velocities to the initial noise, so the noise component
+        orthogonal to this subspace reaches the output untouched -- measured at 59% of the emitted
+        energy at w=1 and 43% at w=3 on t3_2. This basis lets inference project that leak away.
+        """
+        head = self.flow_head if self.flow_head is not None else self.ar_flow_head
+        W = (head.out if self.flow_head is not None else head.flow.out).weight
+        key = (W.data_ptr(), W.shape, W.device)
+        if getattr(self, "_flow_basis_key", None) != key:
+            Q, _ = torch.linalg.qr(W.detach().float())
+            self._flow_basis_key, self._flow_basis = key, Q
+        return self._flow_basis
+
+    def _project_flow_output(self, x):
+        """Drop the component of a flow sample that the head could never have written.
+
+        mode "proj"   -- hard projection onto the reachable subspace.
+        mode "renorm" -- project, then rescale to UNIT per-dim std. Whitened targets have std 1
+                         by construction, and projection removes most of the energy (~59% at
+                         w=1), so the raw projection lands well under-dispersed -- the exact
+                         failure mode this arm of the project keeps rediscovering.
+        """
+        Q = self._flow_out_basis()
+        xf = x.float()
+        p = (xf @ Q) @ Q.T
+        if self.flow_project == "renorm":
+            p = p / p.std().clamp_min(1e-6)
+        return p.to(x.dtype)
 
     def set_whiten_stats(self, mean, std, eps: float = 1e-6):
         """Load per-dim Qwen3 target mean/std into the whitening buffers and enable it."""
@@ -262,6 +298,11 @@ class ZImageConditioningAdapter(nn.Module):
                 generator=kw.get("flow_generator", getattr(self, "flow_generator", None)))
         else:
             seq_surf = seq_pred
+        # Inference-time leak removal. Only meaningful for a SAMPLED output (the point head is
+        # not rank-limited this way), so it is gated on cond_labels being absent.
+        if getattr(self, "flow_project", None) and cond_labels is None \
+                and (self.flow_head is not None or self.ar_flow_head is not None):
+            seq_surf = self._project_flow_output(seq_surf)
 
         # Surface the prediction in Qwen3 space: de-whiten the head output when whitening
         # is on (identity otherwise). generate()/eval/chat render this directly.

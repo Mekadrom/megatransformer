@@ -403,6 +403,24 @@ class ZImageAdapterConfig:
     # NOTE the K=64 resample was measured to cost ~0.0004 CLIPScore on the TARGET side; that
     # measured how well a resampled target RENDERS, not how hard it is to LEARN, which is the
     # open question this tests.
+    # ⭐ THE NOISE LEAK FIX. `out` is Linear(flow_dim -> seq_dim) with flow_dim << seq_dim, so
+    # every predictable velocity lies in a flow_dim-dim subspace and Euler integration leaves the
+    # ORTHOGONAL component of the initial noise untouched all the way to the output. MEASURED on
+    # t3_2/ckpt-20000, real contexts, 8 probe prompts: 58.8% of emitted energy at w=1, 42.6% at
+    # w=3 -- and with the noise projected out the learned content is only 0.539 whitened std, so
+    # the head was reaching plausible dispersion by summing under-dispersed content with noise.
+    # That also gives a mechanism for "guidance is the whole win": CFG cannot remove the leak,
+    # it just scales the learned part up, taking the noise share 59% -> 43%.
+    # The fix is the interpolant's own algebra: x_t = (1-t)*noise + t*x1 gives
+    # u = (x1 - x_t)/(1-t), so the full-rank part is SUBTRACTING THE INPUT. A learned per-dim,
+    # time-conditioned coefficient on x_t supplies it (elementwise, hence full rank -- unlike a
+    # rank-flow_dim projection). Zero-init, so a head with this ON is bit-identical to one with
+    # it OFF at init and warm-starts from any existing T3/T4 checkpoint.
+    # NOTE non-linearity in `out` is NOT a fix: the image of a flow_dim-dim input is still a
+    # flow_dim-dim surface, and `x_in` (Linear(seq_dim -> flow_dim)) has already discarded the
+    # noise directions such a layer would need to see.
+    flow_x_skip: bool = False
+
     flow_native_length: bool = False
     flow_max_len: int = 128       # positional table / target truncation, as ar_max_len
     # Give the output slots an identity. OFF reproduces T3 exactly: the parallel head is then

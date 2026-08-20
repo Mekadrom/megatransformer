@@ -62,6 +62,15 @@ def parse_args():
     p.add_argument("--guidance", type=float, default=0.0)       # Turbo: no CFG
     p.add_argument("--output_gain", type=float, default=1.0,
                    help="Z-Image adapter: inference-only dispersion gain on the whitened prediction. An MSE-trained point estimate is shrunk toward the target mean by 1-R^2, which the DiT renders as washed-out/generic; ~1/alpha undoes it. Measured best ~1.2-1.5 (gain 1.34: CLIPScore 0.287->0.303 vs 0.345 GT). Estimate per-checkpoint with scripts_local/zimage_shrinkage_probe.py. 1.0 = off.")
+    p.add_argument("--flow_project", choices=["none", "proj", "renorm"], default="none",
+                   help="Flow heads only: drop the component of the sample that the head could "
+                        "never have written. out is Linear(flow_dim -> seq_dim) with "
+                        "flow_dim << seq_dim, so velocities live in a flow_dim-dim subspace and "
+                        "the initial noise ORTHOGONAL to it survives the ODE untouched "
+                        "(measured 59% of emitted energy at w=1, 43% at w=3 on t3_2). "
+                        "'proj' = hard projection; 'renorm' = project then rescale to unit "
+                        "per-dim std (whitened targets are unit by construction, and the raw "
+                        "projection lands under-dispersed). Inference-only, no retraining.")
     p.add_argument("--n_samples", type=int, default=1,
                    help="T3 only: draw N flow samples per prompt instead of 1. The head emits a "
                         "DISTRIBUTION, so a single draw conflates sampling variance with training "
@@ -146,6 +155,12 @@ def main():
         model.image_generator.flow_head = None
         model.image_generator.ar_flow_head = None
         print("[t3] flow head BYPASSED -> surfacing the auxiliary point head", flush=True)
+    if args.flow_project != "none":
+        if _gen_head(model) is None:
+            raise SystemExit("--flow_project needs a flow head (T3/T4/T5)")
+        model.image_generator.flow_project = args.flow_project
+        print(f"[flow] projecting samples onto the head's reachable subspace "
+              f"(mode={args.flow_project})", flush=True)
     if args.output_gain != 1.0:
         model.image_generator.output_gain = args.output_gain
         print(f"[zimage] output_gain={args.output_gain} (dispersion correction on the "
