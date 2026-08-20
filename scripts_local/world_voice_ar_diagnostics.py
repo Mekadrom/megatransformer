@@ -61,6 +61,31 @@ def bootstrap_delta_ci(per_utt, iters=10000, seed=0, alpha=0.05):
     return samples[int(alpha / 2 * iters)], samples[int((1 - alpha / 2) * iters)]
 
 
+def text_horizon(buckets, threshold=0.01):
+    """Frame index where text_delta decays below `threshold` — the CORRECT HORIZON.
+
+    The ear reports a good onset that "falls off quickly", and the buckets show text_delta
+    roughly HALVING every 8 frames. A taller first bucket is not the same as a wider one:
+    improving onset conditioning raises delta at frames 0-8, while actually getting better at
+    speech means holding delta FURTHER IN. This collapses the decay curve to one trackable
+    number so that distinction is visible across checkpoints.
+
+    Linear interpolation between bucket midpoints; returns inf if delta never drops below
+    threshold, 0.0 if it starts below it.
+    """
+    pts = [((b["lo"] + min(b["hi"], 256)) / 2.0, b["delta"]) for b in buckets]
+    if not pts:
+        return float("nan")
+    if pts[0][1] < threshold:
+        return 0.0
+    for (x0, d0), (x1, d1) in zip(pts, pts[1:]):
+        if d1 < threshold <= d0:
+            if d0 == d1:
+                return x1
+            return x0 + (x1 - x0) * (d0 - threshold) / (d0 - d1)
+    return float("inf")
+
+
 def build_args(a, feature_channels):
     """A Namespace satisfying visualize.load_world_model + load_dataset for this run shape.
 
@@ -122,6 +147,13 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
            # is one-to-many so top-1 is capped but the right unit is right there in the top few".
            "real_top5": 0, "real_top10": 0, "early_top5": 0, "early_top10": 0}
     per_utt_all, per_utt_early = [], []
+    # POSITION-RESOLVED decay. The ear reports "onset is very good, falls off quickly" — a
+    # correct horizon of a few words that then collapses. early_text_delta only sees frames
+    # 0-8 and everything past that is averaged into one number, so neither can show the decay
+    # curve or whether the horizon GROWS with training. Buckets are frame ranges at 25Hz
+    # (~6 frames/word), so bucket edges are roughly 1.3, 2.6, 5, 10, 21, 42 words in.
+    BUCKETS = [(0, 8), (8, 16), (16, 32), (32, 64), (64, 128), (128, 10**9)]
+    bstats = {b: {"real": 0, "shuf": 0, "n": 0} for b in BUCKETS}
     for s in range(0, len(idxs), bs):
         samples = [dataset[i] for i in idxs[s:s + bs]]
         samples = [x for x in samples if any(k.startswith("voice_") for k in x)]
@@ -180,6 +212,13 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
             tot["early_content"] += int(early.sum().item())
             tot["early_top5"] += int(hit5[early].sum().item())
             tot["early_top10"] += int(hit10[early].sum().item())
+        pos_ix = torch.arange(Tc, device=t.device).unsqueeze(0).expand(Bc, Tc)
+        for lo, hi in BUCKETS:
+            m = content & (pos_ix >= lo) & (pos_ix < hi)
+            if m.any():
+                bstats[(lo, hi)]["real"] += int((pr[m] == t[m]).sum().item())
+                bstats[(lo, hi)]["shuf"] += int((ps[m] == t[m]).sum().item())
+                bstats[(lo, hi)]["n"] += int(m.sum().item())
         ce = F.cross_entropy(lr.reshape(Bc * Tc, V), t.reshape(Bc * Tc), ignore_index=-100)
         tot["ce_real"] += ce.item() * Bc
         tot["ce_n"] += Bc
@@ -203,6 +242,11 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
         "ce_real": ce_real, "ppl_real": math.exp(ce_real),
         "eov_acc": tot["eov_hits"] / max(tot["eov_tot"], 1), "content_positions": tot["content"],
         "early_acc_real": e_real, "early_acc_shuf": e_shuf, "early_text_delta": e_real - e_shuf,
+        "buckets": [{"lo": lo, "hi": hi, "n": v["n"],
+                     "acc_real": v["real"] / max(v["n"], 1),
+                     "acc_shuf": v["shuf"] / max(v["n"], 1),
+                     "delta": (v["real"] - v["shuf"]) / max(v["n"], 1)}
+                    for (lo, hi), v in bstats.items() if v["n"] > 0],
         "top5_real": tot["real_top5"] / cc, "top10_real": tot["real_top10"] / cc,
         "early_top5_real": tot["early_top5"] / ec, "early_top10_real": tot["early_top10"] / ec,
     }
@@ -423,6 +467,21 @@ def main():
                else "between crutch and ceiling — local-statistics regime" if tf['acc_real'] > a.repeat
                else "at/below repeat crutch — not yet learned")
     lines.append(f"\n**acc_real vs baselines: {verdict}.**\n")
+
+    lines.append("## 1b. Position-resolved decay (does the correct horizon grow?)\n")
+    lines.append("| frames | ~words in | n | acc_real | acc_shuf | text_delta |\n|---|---|---|---|---|---|")
+    for b in tf.get("buckets", []):
+        hi = "+" if b["hi"] > 10**8 else str(b["hi"])
+        lines.append(f"| {b['lo']}-{hi} | {b['lo']/6:.0f}-{'' if hi=='+' else f'{int(hi)/6:.0f}'} | "
+                     f"{b['n']} | {b['acc_real']:.4f} | {b['acc_shuf']:.4f} | {b['delta']:+.4f} |")
+    _h = text_horizon(tf.get("buckets", []))
+    _hw = "never drops" if _h == float("inf") else f"{_h:.1f} frames (~{_h/6:.1f} words)"
+    lines.append(f"\n**TEXT HORIZON (delta < 0.01): {_hw}** — the single trackable number. "
+                 f"A rising early_text_delta with a FLAT horizon means the onset is getting "
+                 f"taller, not the model getting better at speech.\n")
+    lines.append("\nThe ear reports a correct ONSET that falls off. If the model is improving, the "
+                 "delta should hold further into the utterance over training — a GROWING horizon — "
+                 "rather than the onset bucket simply getting taller.\n")
 
     lines.append("## 2. Text ablation (real vs shuffled transcript)\n")
     lines.append("| metric | value |\n|---|---|")
