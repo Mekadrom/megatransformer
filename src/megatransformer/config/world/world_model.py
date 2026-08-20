@@ -594,3 +594,16 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"].image_coda_config.flow_x_skip =
 # T5 (native length) + the same skip -- the two independent fixes composed.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_xskip"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_xskip"].image_coda_config.flow_x_skip = True
+
+# T5 native + xskip + SLOT POSITIONS. Measured 2026-08-20: the native+xskip arm renders coherent
+# COMPOSITION but overlays structured, semantically empty blob texture -- the off-manifold
+# signature, not the bland/under-dispersed one (its whitened std is 0.856, under-dispersed, which
+# on its own predicts BLANDNESS; the blobs are something else).
+# Suspected cause: without `pos` the parallel head is exactly permutation-equivariant -- it emits
+# an unordered SET. At K=64 that survived because the target was ~20 real Qwen3 states smoothly
+# interpolated into 64 redundant slots, so order washed out. At NATIVE length every token is
+# distinct and load-bearing, and Qwen3 states are CAUSAL (token j encodes everything up to j), so
+# a set with no positional identity cannot reliably form a valid ordered prefix sequence.
+# => native length and slot identity are NOT independent knobs; this preset couples them.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_pos_xskip"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_xskip"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_pos_xskip"].image_coda_config.flow_pos_embed = True
