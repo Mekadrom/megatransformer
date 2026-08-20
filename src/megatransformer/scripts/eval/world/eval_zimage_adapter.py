@@ -134,11 +134,17 @@ def main():
         raise SystemExit(f"--config {args.config} does not use the Z-Image adapter "
                          f"(image_generator is {type(getattr(model,'image_generator',None)).__name__})")
     seq_len = int(model.image_generator.config.seq_len)
-    if args.flow_guidance is not None and getattr(model.image_generator, "flow_head", None) is not None:
-        model.image_generator.flow_head.guidance = float(args.flow_guidance)
-        print(f"[t3] classifier-free guidance w={args.flow_guidance}", flush=True)
-    if getattr(args, "flow_bypass", False) and getattr(model.image_generator, "flow_head", None) is not None:
+    def _gen_head(m):
+        """The generative head, whichever kind: T3 parallel `flow_head` or T4 `ar_flow_head`."""
+        return (getattr(m.image_generator, "flow_head", None)
+                or getattr(m.image_generator, "ar_flow_head", None))
+
+    if args.flow_guidance is not None and _gen_head(model) is not None:
+        _gen_head(model).guidance = float(args.flow_guidance)
+        print(f"[flow] classifier-free guidance w={args.flow_guidance}", flush=True)
+    if getattr(args, "flow_bypass", False) and _gen_head(model) is not None:
         model.image_generator.flow_head = None
+        model.image_generator.ar_flow_head = None
         print("[t3] flow head BYPASSED -> surfacing the auxiliary point head", flush=True)
     if args.output_gain != 1.0:
         model.image_generator.output_gain = args.output_gain
@@ -249,7 +255,8 @@ def main():
 
     def _set_flow_seed(seed):
         """Pin the flow head's sampling noise so the SAME draw is compared across checkpoints."""
-        if getattr(_adapter, "flow_head", None) is not None and seed is not None:
+        if seed is not None and (getattr(_adapter, "flow_head", None) is not None
+                                 or getattr(_adapter, "ar_flow_head", None) is not None):
             g = torch.Generator(device=device)
             g.manual_seed(int(seed))
             _adapter.flow_generator = g
@@ -485,8 +492,9 @@ def main():
         prompts = None
 
     if args.n_samples > 1:
-        if getattr(model.image_generator, "flow_head", None) is None:
-            raise SystemExit("--n_samples > 1 needs a T3 flow head (the point head is deterministic)")
+        if _gen_head(model) is None:
+            raise SystemExit("--n_samples > 1 needs a generative head (flow_head or ar_flow_head); "
+                             "the point head is deterministic so extra draws would be identical")
         if prompts is None:
             prompts = [c for c, _, _, _ in items_from_dataset(dataset, args.max_samples)]
         if render_and_log_multi(prompts, "text_to_image" + args.tag_suffix,
