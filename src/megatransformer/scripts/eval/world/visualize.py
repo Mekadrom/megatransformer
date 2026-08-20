@@ -191,7 +191,9 @@ def load_world_model(args, device):
     _voice_over = (getattr(args, "voice_codebook_path", None)
                    or getattr(args, "voice_feature_channels", None)
                    or getattr(args, "voice_predict_f0", False))
-    if args.iteration_norm is not None or args.share_block_weights or _voice_over or _text_enc:
+    _mrope = (model_loading_utils.detect_world_mrope(args.checkpoint_path)
+              if getattr(args, "checkpoint_path", None) else False)
+    if args.iteration_norm is not None or args.share_block_weights or _voice_over or _text_enc or _mrope:
         import copy
         from megatransformer.config.world.world_model import WORLD_MODEL_CONFIGS
         config = copy.deepcopy(WORLD_MODEL_CONFIGS[args.config])
@@ -199,6 +201,25 @@ def load_world_model(args, device):
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if args.share_block_weights:
             config.recurrent_block_config.share_block_weights = True
+        if _mrope and str(getattr(args, "mrope_scale_side", None)) == "off":
+            print("  [ablation] M-RoPE checkpoint being evaluated with M-RoPE DISABLED "
+                  "(single-axis RoPE) -- numbers are NOT comparable to a matched-geometry read")
+            _mrope = False
+        if _mrope:
+            # Detected from the weights (rotary_global/local exist only under M-RoPE).
+            # Mirrors training.py: the TRUNK only -- preludes/codas keep single-axis RoPE.
+            side = getattr(args, "mrope_scale_side", None)
+            if side is None:
+                raise ValueError(
+                    f"{args.checkpoint_path} was trained with M-RoPE, but --mrope_scale_side "
+                    "was not supplied. It carries no weights, so it cannot be detected, and "
+                    "guessing it evaluates the checkpoint under the wrong coordinate system. "
+                    "Pass 'text' or 'voice' (matching the training CLI).")
+            config.recurrent_block_config.block_config.use_mrope = True
+            config.mrope_voice_rate = float(getattr(args, "mrope_voice_rate", None) or 6.0)
+            config.mrope_scale_side = str(side)
+            print(f"  Detected M-RoPE in checkpoint -> use_mrope=True, "
+                  f"scale_side={config.mrope_scale_side}, rate={config.mrope_voice_rate}")
         # VQ-voice: re-apply the training-time voice config so the loaded architecture
         # matches the checkpoint (no config.json to recover it from).
         cbp = getattr(args, "voice_codebook_path", None)

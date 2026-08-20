@@ -81,7 +81,8 @@ class CondFlowHead(nn.Module):
 
     def __init__(self, seq_dim, ctx_dim, dim=512, n_heads=8, n_layers=4,
                  mlp_ratio=4.0, dropout=0.0, steps=8, time_sampling="logit_normal",
-                 cfg_dropout=0.0, guidance=1.0, max_len=128, pos_embed=False, x_skip=False):
+                 cfg_dropout=0.0, guidance=1.0, max_len=128, pos_embed=False, x_skip=False,
+                 x1_pred=False, x1_sigma_min=0.02):
         super().__init__()
         self.seq_dim = seq_dim
         self.steps = int(steps)
@@ -139,6 +140,20 @@ class CondFlowHead(nn.Module):
         # Under CFG the skip term is IDENTICAL for the conditional and unconditional streams, so
         # it cancels in (v_c - v_u) and is applied exactly ONCE -- guidance amplifies only the
         # learned content while noise removal stays at its proper strength.
+        # ── x1-PREDICTION: the FULLY grounded version of the skip ─────────────────────────
+        # The learned skip above is a half-measure. Measured on the trained ws_xskip_0 head, the
+        # coefficient it learns tracks the analytic -1/(1-t) early (-0.89 vs -1.00 at t=0) but
+        # DIVERGES late, even going POSITIVE at t=0.875 where the exact value is -8. Compounded
+        # over 8 Euler steps, 44.8% of the initial noise still survives (vs 100% with no skip).
+        # Gradient descent will not discover a near-singular coefficient that is only safe when
+        # applied exactly, so stop learning it: have the head predict x1 and DERIVE the velocity
+        #     v = (x1_hat - x_t) / (1 - t)
+        # which subtracts x_t analytically, at full rank, with the singular factor exact rather
+        # than approximated. Integrated exactly this lands on x1_hat with the noise fully gone.
+        # `x1_sigma_min` clamps 1-t away from 0 so the final Euler step cannot blow up.
+        # NOTE this SUPERSEDES x_skip; setting both is refused in the adapter.
+        self.x1_pred = bool(x1_pred)
+        self.x1_sigma_min = float(x1_sigma_min)
         self.x_skip = bool(x_skip)
         if self.x_skip:
             self.skip_ada = nn.Linear(dim, seq_dim)
@@ -167,10 +182,14 @@ class CondFlowHead(nn.Module):
         for blk in self.blocks:
             h = blk(h, c, temb)
         shift, scale = self.out_ada(temb).chunk(2, dim=-1)
-        v = self.out(_modulate(self.out_norm(h), shift, scale))
+        raw = self.out(_modulate(self.out_norm(h), shift, scale))
+        if self.x1_pred:
+            # `raw` IS x1_hat; the -x_t term is analytic and full-rank.
+            denom = (1.0 - t).clamp_min(self.x1_sigma_min).view(-1, 1, 1).to(raw.dtype)
+            return (raw - x_t) / denom
         if self.x_skip:
-            v = v + self.skip_ada(temb).unsqueeze(1) * x_t
-        return v
+            raw = raw + self.skip_ada(temb).unsqueeze(1) * x_t
+        return raw
 
     def _sample_t(self, b, device, dtype):
         if self.time_sampling == "uniform":

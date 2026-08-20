@@ -420,6 +420,14 @@ class ZImageAdapterConfig:
     # flow_dim-dim surface, and `x_in` (Linear(seq_dim -> flow_dim)) has already discarded the
     # noise directions such a layer would need to see.
     flow_x_skip: bool = False
+    # x1-PREDICTION -- the fully grounded form of the same fix, and it SUPERSEDES flow_x_skip.
+    # Measured on the trained xskip head: the LEARNED skip coefficient tracks the analytic
+    # -1/(1-t) early but diverges late (even positive at t=0.875 where exact is -8), leaving
+    # 44.8% of the initial noise alive after 8 Euler steps. Predicting x1 and deriving
+    # v = (x1_hat - x_t)/(1-t) applies that subtraction ANALYTICALLY at full rank, so the noise
+    # goes to ~0 by construction instead of being partially cancelled by a learned approximation.
+    flow_x1_pred: bool = False
+    flow_x1_sigma_min: float = 0.02   # clamps 1-t so the final Euler step cannot blow up
 
     flow_native_length: bool = False
     flow_max_len: int = 128       # positional table / target truncation, as ar_max_len

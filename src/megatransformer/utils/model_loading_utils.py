@@ -82,6 +82,27 @@ def detect_sive_variant(checkpoint_path: str) -> dict:
     return out
 
 
+def detect_world_mrope(checkpoint_path: str) -> bool:
+    """True if a world-model checkpoint was trained with M-RoPE on the recurrent trunk.
+
+    Same failure class as detect_sive_variant: load_model runs with strict=False, so an
+    M-RoPE checkpoint loaded into a use_mrope=False model silently DROPS its
+    rotary_global/rotary_local buffers and runs the trunk on single-axis RoPE with
+    sequential positions -- a different attention geometry than it was trained under, with
+    no error and confident-looking numbers. The eval scripts have no training CLI to
+    inherit the flag from, so detect it from the weights instead of trusting a flag.
+
+    Only use_mrope is recoverable: mrope_voice_rate / mrope_scale_side are pure config with
+    no tensors of their own, so callers must supply those (see visualize.load_world_model).
+    """
+    try:
+        sd = _sive_state_dict(checkpoint_path)
+    except Exception as e:
+        print(f"  [warn] could not probe checkpoint for M-RoPE ({e}); assuming off")
+        return False
+    return any(k.endswith("rotary_global.freqs") for k in sd)
+
+
 def load_model(
     model_cls,
     config_name: str,

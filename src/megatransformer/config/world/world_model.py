@@ -607,3 +607,12 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_xskip"].image_coda_config.flow_x
 # => native length and slot identity are NOT independent knobs; this preset couples them.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_pos_xskip"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_xskip"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_pos_xskip"].image_coda_config.flow_pos_embed = True
+
+# T3 + x1-PREDICTION: the fully grounded form of the noise-leak fix. Same parallel head, same K=64
+# resampled targets (which BEAT native length by 0.045), same CFG -- only the velocity
+# parameterisation changes: predict x1, derive v = (x1_hat - x_t)/(1-t). The learned x_skip left
+# 44.8% of the initial noise alive because gradient descent will not find a near-singular
+# coefficient; this applies it analytically. Warm-starts from t3_2 or from a t3_xskip checkpoint
+# (skip_ada is simply unused).
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred"].image_coda_config.flow_x1_pred = True

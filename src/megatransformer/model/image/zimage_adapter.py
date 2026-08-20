@@ -143,13 +143,19 @@ class ZImageConditioningAdapter(nn.Module):
                 guidance=float(getattr(config, "flow_guidance", 1.0)),
                 max_len=int(getattr(config, "flow_max_len", 128)),
                 pos_embed=bool(getattr(config, "flow_pos_embed", False)),
-                x_skip=bool(getattr(config, "flow_x_skip", False)))
+                x_skip=bool(getattr(config, "flow_x_skip", False)),
+                x1_pred=bool(getattr(config, "flow_x1_pred", False)),
+                x1_sigma_min=float(getattr(config, "flow_x1_sigma_min", 0.02)))
         self.flow_aux_mse_weight = float(getattr(config, "flow_aux_mse_weight", 0.1))
         # T5: run the PARALLEL head at the caption's native Qwen3 length instead of resampling
         # the target to K slots. Same one-shot sampler as T3 (no sequential inference), just
         # without the K=64 interpolation -- so ~2/3 of the supervised slots stop being linear
         # blends of neighbouring hidden states. The Q-Former context stays at a fixed seq_len
         # slots; only the OUTPUT length becomes native, exactly as in the AR head.
+        if bool(getattr(config, "flow_x1_pred", False)) and bool(getattr(config, "flow_x_skip", False)):
+            raise ValueError("flow_x1_pred SUPERSEDES flow_x_skip -- set one, not both: x1 "
+                             "prediction already subtracts x_t analytically, so a learned skip "
+                             "on top would double-count it")
         self.flow_project = None          # None | "proj" | "renorm"; set at INFERENCE only
         self.flow_native_length = bool(getattr(config, "flow_native_length", False))
         if self.flow_native_length and self.flow_head is None:
