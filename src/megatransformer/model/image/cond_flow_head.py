@@ -82,7 +82,7 @@ class CondFlowHead(nn.Module):
     def __init__(self, seq_dim, ctx_dim, dim=512, n_heads=8, n_layers=4,
                  mlp_ratio=4.0, dropout=0.0, steps=8, time_sampling="logit_normal",
                  cfg_dropout=0.0, guidance=1.0, max_len=128, pos_embed=False, x_skip=False,
-                 x1_pred=False, x1_sigma_min=0.02):
+                 x1_pred=False, x1_sigma_min=0.02, loss_weighting="none", min_snr_gamma=5.0):
         super().__init__()
         self.seq_dim = seq_dim
         self.steps = int(steps)
@@ -154,6 +154,18 @@ class CondFlowHead(nn.Module):
         # NOTE this SUPERSEDES x_skip; setting both is refused in the adapter.
         self.x1_pred = bool(x1_pred)
         self.x1_sigma_min = float(x1_sigma_min)
+        # ── LOSS WEIGHTING ────────────────────────────────────────────────────────────────
+        # Plain velocity prediction is beautifully conditioned: |grad out.weight| is FLAT across
+        # t (measured 0.094 at every t). x1-prediction is NOT, because dv/draw = 1/(1-t), so the
+        # gradient on the output layer blows up late: 3x at t=0.5, 76x at t=0.9, 1887x at t=0.98.
+        # With max_grad_norm clipping, the ~1.4% of logit-normal samples above t=0.9 then clip
+        # hard and dominate the update direction. Min-SNR-gamma (Hang et al. 2023) caps the
+        # effective weight at high SNR and restores a flat profile; for rectified flow
+        # SNR(t) = t^2/(1-t)^2. gamma=5 is the paper's default.
+        # NOTE this is only needed WITH x1_pred -- plain velocity prediction does not have the
+        # pathology, so leave it "none" there to keep the objective identical to the T3 baseline.
+        self.loss_weighting = str(loss_weighting)
+        self.min_snr_gamma = float(min_snr_gamma)
         self.x_skip = bool(x_skip)
         if self.x_skip:
             self.skip_ada = nn.Linear(dim, seq_dim)
@@ -218,9 +230,17 @@ class CondFlowHead(nn.Module):
         tv = t.view(-1, 1, 1)
         x_t = (1 - tv) * noise + tv * target
         v = self.velocity(x_t, t, ctx)
-        if mask is None:
-            return F.mse_loss(v, target - noise)
         err = (v - (target - noise)) ** 2
+        if self.loss_weighting == "min_snr":
+            om = (1 - t).clamp_min(self.x1_sigma_min)
+            snr = (t / om) ** 2
+            err = err * (snr.clamp(max=self.min_snr_gamma) / snr).view(-1, 1, 1).to(err.dtype)
+        elif self.loss_weighting == "x1":
+            # exactly cancels dv/draw = 1/(1-t) -> a uniform MSE in x1 space
+            om = (1 - t).clamp_min(self.x1_sigma_min)
+            err = err * (om ** 2).view(-1, 1, 1).to(err.dtype)
+        if mask is None:
+            return err.mean()
         m = mask.to(err.dtype).unsqueeze(-1)
         return (err * m).sum() / (m.sum() * target.shape[-1]).clamp_min(1.0)
 

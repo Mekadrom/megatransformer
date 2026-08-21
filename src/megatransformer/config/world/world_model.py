@@ -616,3 +616,6 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native_pos_xskip"].image_coda_config.fl
 # (skip_ada is simply unused).
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred"].image_coda_config.flow_x1_pred = True
+# Min-SNR weighting is NOT optional here: without it the ~1.4% of logit-normal samples above
+# t=0.9 carry 76-1887x the gradient and, under max_grad_norm clipping, dominate the update.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred"].image_coda_config.flow_loss_weighting = "min_snr"

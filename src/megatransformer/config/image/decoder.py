@@ -428,6 +428,13 @@ class ZImageAdapterConfig:
     # goes to ~0 by construction instead of being partially cancelled by a learned approximation.
     flow_x1_pred: bool = False
     flow_x1_sigma_min: float = 0.02   # clamps 1-t so the final Euler step cannot blow up
+    # Loss weighting. REQUIRED with flow_x1_pred: dv/draw = 1/(1-t) makes the gradient on the
+    # output layer blow up late (measured 3x at t=0.5, 76x at t=0.9, 1887x at t=0.98, against a
+    # perfectly FLAT profile for plain velocity prediction). "min_snr" = Min-SNR-gamma
+    # (Hang et al. 2023), SNR(t)=t^2/(1-t)^2 for rectified flow; "x1" exactly cancels the factor
+    # for a uniform MSE in x1 space; "none" leaves the objective identical to the T3 baseline.
+    flow_loss_weighting: str = "none"      # "none" | "min_snr" | "x1"
+    flow_min_snr_gamma: float = 5.0
 
     flow_native_length: bool = False
     flow_max_len: int = 128       # positional table / target truncation, as ar_max_len
