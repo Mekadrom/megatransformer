@@ -103,7 +103,25 @@ def build_args(a, feature_channels):
         tie_word_embeddings=False, share_block_weights=False,
         gen_query_mode=None, n_image_gen_positions=None, iteration_norm=None,
         text_encoder_model=getattr(a, "text_encoder_model", None),
+        # M-RoPE: use_mrope is auto-detected from the checkpoint by load_world_model, but
+        # scale_side/rate carry no weights, so they must be passed through (a wrong side
+        # evaluates the trunk under the wrong coordinate system). See add_mrope_args.
+        mrope_scale_side=getattr(a, "mrope_scale_side", None),
+        mrope_voice_rate=getattr(a, "mrope_voice_rate", None),
     )
+
+
+def add_mrope_args(ap):
+    """M-RoPE eval flags. Required for an M-RoPE checkpoint; ignored for any other."""
+    ap.add_argument("--mrope_scale_side", default=None, choices=["voice", "text", "off"],
+                    help="REQUIRED for an M-RoPE checkpoint (it has no weights to detect it "
+                         "from): which stream absorbs the frame rate, matching the training CLI. "
+                         "'off' DELIBERATELY evaluates an M-RoPE checkpoint under single-axis "
+                         "RoPE -- the protocol every pre-fix diagnostic accidentally used; only "
+                         "useful for measuring how much that mismatch cost.")
+    ap.add_argument("--mrope_voice_rate", type=float, default=None,
+                    help="M-RoPE frame rate (default 6.0, matching training)")
+    return ap
 
 
 def make_collator(K, max_frames, special_token_base=constants.SPECIAL_TOKEN_BASE):
@@ -293,7 +311,8 @@ def seq_degeneration(seqs, K):
 
 @torch.no_grad()
 def run_generation(model, dataset, collator, device, gen_n, K, budget,
-                   bov_id=constants.BOV_TOKEN_ID, ras_win=0, ras_tau=0.1):
+                   bov_id=constants.BOV_TOKEN_ID, ras_win=0, ras_tau=0.1,
+                   voice_temp=0.6, top_k=None, top_p=None):
     """Free-running generation from text prompts; return generated + GT unit sequences + EOV info.
 
     Also collects per-sample prompt TEXT length (tokens before BOV) so the caller can correlate
@@ -315,7 +334,7 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
         prompt_lens.append(int(bov[0].item()))   # text tokens before BOV = transcript length proxy
         prompt = text[:bov[0].item() + 1].unsqueeze(0).to(device)
         out = model.generate(text_input_ids=prompt, max_new_tokens=512,
-                             voice_token_budget=budget, voice_temperature=1.0,
+                             voice_token_budget=budget, voice_temperature=voice_temp, voice_top_k=top_k, voice_top_p=top_p,
                              voice_ras_win=ras_win, voice_ras_tau=ras_tau,
                              decode_outputs=False)
         trace = out.get("voice_unit_id_trace", [[]])[0]
@@ -388,6 +407,10 @@ def main():
                          "but during NAR that is OOD (the model never trained with history) and "
                          "acc collapses, so it is NOT the model's real conditioning. Generation "
                          "(section 3) always runs at alpha=1 (generate() has no alpha hook).")
+    ap.add_argument("--voice_temperature", type=float, default=0.6,
+                    help="voice unit sampling temperature. Default 0.6 MATCHES THE TRAINING-TIME VIZ (train.py: viz_voice_temperature=0.6), i.e. the TensorBoard renders the ear has been judging. These scripts previously HARDCODED 1.0, which samples far into the 6561-way tail and is audibly less coherent than the model's actual operating point -- so every free-running number they produced described the wrong regime.")
+    ap.add_argument("--voice_top_k", type=int, default=None, help="top-k truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0.")
+    ap.add_argument("--voice_top_p", type=float, default=None, help="top-p / nucleus truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0. The natural middle ground: T=0.6 mode-collapses into repetition loops, T=1.0 draws tail noise -- nucleus cuts the tail without sharpening into a loop.")
     ap.add_argument("--voice_ras_win", type=int, default=0,
                     help="Repetition-aware sampling window (CosyVoice 2 uses 10). If the sampled "
                          "unit occurred >= win*tau times in the last `win` emitted units, ban it and "
@@ -397,6 +420,7 @@ def main():
     ap.add_argument("--skip_generation", action="store_true",
                     help="Skip the free-running generation section (always alpha=1, slow). Use for "
                          "an alpha-sweep where only the TF/ablation numbers vary with alpha.")
+    add_mrope_args(ap)
     a = ap.parse_args()
 
     device = a.device
@@ -429,7 +453,8 @@ def main():
         gen, gt, eov_fired, budget_hit, prompt_lens = run_generation(
             model, eval_dataset, collator, device, a.gen_n, K,
             budget=a.voice_max_frames, bov_id=sp.BOV,
-            ras_win=a.voice_ras_win, ras_tau=a.voice_ras_tau)
+            ras_win=a.voice_ras_win, ras_tau=a.voice_ras_tau,
+            voice_temp=a.voice_temperature, top_k=a.voice_top_k, top_p=a.voice_top_p)
         print("3/3 degeneration stats ...", flush=True)
         gen_deg = seq_degeneration(gen, K)
         gt_deg = seq_degeneration(gt, K)
@@ -442,6 +467,10 @@ def main():
     lines.append(f"# World voice-AR diagnostics — step {a.step}\n")
     lines.append(f"checkpoint: `{a.checkpoint_path}`  |  val n(TF)={a.n}  gen_n={a.gen_n}  K={K}\n")
     lines.append(f"TF/ablation voice_attn_alpha = **{alpha_label}**  |  generation always alpha=1.\n")
+    lines.append(f"generation sampling: **voice_temperature={a.voice_temperature}**"
+                 f"{' (matches the training-time viz)' if a.voice_temperature == 0.6 else ''}"
+                 f"  |  RAS win={a.voice_ras_win}. Section 3 ONLY -- sections 1/1b/2 are "
+                 f"teacher-forced and temperature-independent.\n")
 
     lines.append("## 1. Teacher-forced unit prediction (held-out) vs n-gram ceiling\n")
     lines.append("| metric | value |\n|---|---|")

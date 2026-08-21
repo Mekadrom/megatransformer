@@ -10,7 +10,7 @@ import argparse, os, sys, json
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from world_voice_ar_diagnostics import build_args, make_collator
+from world_voice_ar_diagnostics import build_args, make_collator, add_mrope_args
 from megatransformer.scripts.eval.world.visualize import load_world_model, load_dataset
 from megatransformer.utils.codebook import load_codebook
 from megatransformer.utils import constants
@@ -31,7 +31,13 @@ ap.add_argument("--ras_win", type=int, default=10)
 ap.add_argument("--ras_tau", type=float, default=0.1)
 ap.add_argument("--device", default="cuda:2")
 ap.add_argument("--out_dir", required=True)
+ap.add_argument("--voice_temperature", type=float, default=0.6,
+                help="voice unit sampling temperature. Default 0.6 MATCHES THE TRAINING-TIME VIZ (train.py: viz_voice_temperature=0.6), i.e. the TensorBoard renders the ear has been judging. These scripts previously HARDCODED 1.0, which samples far into the 6561-way tail and is audibly less coherent than the model's actual operating point -- so every free-running number they produced described the wrong regime.")
+ap.add_argument("--voice_top_k", type=int, default=None, help="top-k truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0.")
+ap.add_argument("--voice_top_p", type=float, default=None, help="top-p / nucleus truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0. The natural middle ground: T=0.6 mode-collapses into repetition loops, T=1.0 draws tail noise -- nucleus cuts the tail without sharpening into a loop.")
+add_mrope_args(ap)
 a = ap.parse_args()
+voice_temp = a.voice_temperature
 
 a.n_probe = a.n
 cb = load_codebook(a.codebook)
@@ -72,7 +78,7 @@ for i in range(len(ds)):
     for tag, win in (("ras", a.ras_win), ("plain", 0)):
         with torch.no_grad():
             out = model.generate(text_input_ids=prompt, max_new_tokens=512,
-                                 voice_token_budget=a.voice_max_frames, voice_temperature=1.0,
+                                 voice_token_budget=a.voice_max_frames, voice_temperature=voice_temp, voice_top_k=a.voice_top_k, voice_top_p=a.voice_top_p,
                                  voice_ras_win=win, voice_ras_tau=a.ras_tau, decode_outputs=False)
         tr = out.get("voice_unit_id_trace", [[]])[0]
         tr = [int(x) for x in tr if 0 <= int(x) < K]

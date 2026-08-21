@@ -22,7 +22,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from world_voice_ar_diagnostics import (build_args, make_collator, run_tf_and_ablation,
-                                        text_horizon)
+                                        text_horizon, add_mrope_args)
 from megatransformer.scripts.eval.world.visualize import load_world_model, load_dataset
 from megatransformer.utils.codebook import load_codebook
 from megatransformer.utils import constants
@@ -42,6 +42,7 @@ ap.add_argument("--bs", type=int, default=8)
 ap.add_argument("--threshold", type=float, default=0.01)
 ap.add_argument("--device", default="cuda:3")
 ap.add_argument("--out_dir", default="eval_output/world_tts_horizon")
+add_mrope_args(ap)
 a = ap.parse_args()
 
 avail = sorted(int(m.group(1)) for d in glob.glob(os.path.join(a.run_dir, "checkpoint-*"))

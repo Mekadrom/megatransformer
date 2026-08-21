@@ -15,7 +15,7 @@ import argparse, os, sys, json, random
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from world_voice_ar_diagnostics import build_args, make_collator, run_tf_and_ablation
+from world_voice_ar_diagnostics import build_args, make_collator, run_tf_and_ablation, add_mrope_args
 from megatransformer.scripts.eval.world.visualize import load_world_model, load_dataset
 from megatransformer.utils.codebook import load_codebook
 from megatransformer.utils import constants
@@ -36,6 +36,7 @@ ap.add_argument("--head", type=int, default=4, help="the sharp aligner head")
 ap.add_argument("--n_random", type=int, default=3, help="control heads to ablate for comparison")
 ap.add_argument("--device", default="cuda:2")
 ap.add_argument("--out_dir", default="eval_output/world_tts_head_ablation")
+add_mrope_args(ap)
 a = ap.parse_args()
 
 cb = load_codebook(a.codebook); K, D = int(cb.shape[0]), int(cb.shape[1])

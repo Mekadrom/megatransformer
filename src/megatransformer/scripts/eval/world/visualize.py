@@ -193,7 +193,11 @@ def load_world_model(args, device):
                    or getattr(args, "voice_predict_f0", False))
     _mrope = (model_loading_utils.detect_world_mrope(args.checkpoint_path)
               if getattr(args, "checkpoint_path", None) else False)
-    if args.iteration_norm is not None or args.share_block_weights or _voice_over or _text_enc or _mrope:
+    _nar = bool(getattr(args, "voice_nar", False)) or (
+        model_loading_utils.detect_world_nar(args.checkpoint_path)
+        if getattr(args, "checkpoint_path", None) else False)
+    if (args.iteration_norm is not None or args.share_block_weights or _voice_over
+            or _text_enc or _mrope or _nar):
         import copy
         from megatransformer.config.world.world_model import WORLD_MODEL_CONFIGS
         config = copy.deepcopy(WORLD_MODEL_CONFIGS[args.config])
@@ -201,6 +205,13 @@ def load_world_model(args, device):
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if args.share_block_weights:
             config.recurrent_block_config.share_block_weights = True
+        if _nar:
+            # Both halves, or the head is silently crippled: the MASK parameter AND the
+            # bidirectional coda (a causal coda cannot see units revealed to its right).
+            config.voice_nar = True
+            config.voice_coda_config.coda_config.causal = False
+            print(f"  NAR voice ({'--voice_nar' if getattr(args, 'voice_nar', False) else 'detected in checkpoint'})"
+                  " -> voice_nar=True, coda bidirectional")
         if _mrope and str(getattr(args, "mrope_scale_side", None)) == "off":
             print("  [ablation] M-RoPE checkpoint being evaluated with M-RoPE DISABLED "
                   "(single-axis RoPE) -- numbers are NOT comparable to a matched-geometry read")
@@ -250,7 +261,9 @@ def load_world_model(args, device):
                 "model": _text_enc,
                 "freeze": True,
                 "translator_hidden_mult": 2.0,
-                "n_special_tokens": constants.N_SPECIAL_TOKENS,
+                "n_special_tokens": (model_loading_utils.detect_n_special_tokens(
+                                         args.checkpoint_path)
+                                     or constants.N_SPECIAL_TOKENS),
             }
         for k, v in overrides.items():
             setattr(config, k, v)

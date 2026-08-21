@@ -20,7 +20,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from world_voice_ar_diagnostics import build_args, make_collator
+from world_voice_ar_diagnostics import build_args, make_collator, add_mrope_args
 from megatransformer.scripts.eval.world.visualize import load_world_model, load_dataset
 from megatransformer.utils.codebook import load_codebook
 from megatransformer.utils import constants
@@ -41,6 +41,7 @@ ap.add_argument("--per_head", action="store_true",
                 help="Report per (block/iteration, head) sharpness instead of the head-average. "
                      "The average can hide ONE sharp aligner head under many diffuse ones — a "
                      "different diagnosis (signal diluted downstream) than 'no head aligns'.")
+add_mrope_args(ap)
 a = ap.parse_args()
 
 cb = load_codebook(a.codebook); K, D = int(cb.shape[0]), int(cb.shape[1])

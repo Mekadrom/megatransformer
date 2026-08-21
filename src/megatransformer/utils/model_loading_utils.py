@@ -103,6 +103,39 @@ def detect_world_mrope(checkpoint_path: str) -> bool:
     return any(k.endswith("rotary_global.freqs") for k in sd)
 
 
+def detect_world_nar(checkpoint_path: str) -> bool:
+    """True if a world-model checkpoint was trained with masked-parallel (NAR) voice.
+
+    Same failure class as detect_world_mrope: strict=False means a NAR checkpoint loaded
+    into a voice_nar=False model silently drops voice_mask_feature AND keeps a causal coda,
+    so the head can no longer see revealed units to its right -- it would decode as a
+    left-to-right infiller and report confident nonsense.
+    """
+    try:
+        sd = _sive_state_dict(checkpoint_path)
+    except Exception as e:
+        print(f"  [warn] could not probe checkpoint for NAR ({e}); assuming off")
+        return False
+    return any(k.endswith("voice_mask_feature") for k in sd)
+
+
+def detect_n_special_tokens(checkpoint_path: str) -> Optional[int]:
+    """Row count of the trainable control-token extension, or None if absent.
+
+    special_embed is a MODEL SHAPE (9 by default, 41 with the NAR duration buckets), and
+    load_model runs strict=False -- so a duration-token checkpoint loaded into a 9-row model
+    silently drops EVERY control embedding, not just the new rows, and BOV/EOV come back
+    randomly initialized with no error. Read it off the weights instead of a flag.
+    """
+    try:
+        sd = _sive_state_dict(checkpoint_path)
+    except Exception as e:
+        print(f"  [warn] could not probe checkpoint for special-token count ({e})")
+        return None
+    key = next((k for k in sd if k.endswith("special_embed.weight")), None)
+    return int(sd[key].shape[0]) if key is not None else None
+
+
 def load_model(
     model_cls,
     config_name: str,
