@@ -35,6 +35,24 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# ── ACCELERATOR SELECTION ────────────────────────────────────────────────────
+# The torch family cannot be avoided by omitting it from [dependencies]: speechbrain,
+# torchcrepe and rotary-embedding-torch all require torch UNCONDITIONALLY, so uv must
+# resolve it even with --no-default-groups. Which WHEEL it resolves is decided by
+# [tool.uv.sources] below, keyed on which of these extras is selected.
+#   uv sync --extra cu124   -> CUDA 12.4 build (the training boxes; default via `training`)
+#   uv sync --extra rocm    -> ROCm build (inference-only boxes; no nvidia-* wheels)
+#   uv sync --extra cpu     -> CPU-only build
+# Exactly one may be selected; they are declared conflicting in [tool.uv].
+# Floors matter: unconstrained, the ROCm fork drifted to torch 2.0.1 / torchvision 0.15.2
+# (an ancient pair the index has no wheel for on this platform). Each floor is the newest
+# coherent set that index actually publishes.
+cu124 = ["torch>=2.6", "torchaudio>=2.6", "torchvision>=0.21"]
+rocm  = ["torch>=2.5,<2.6", "torchaudio>=2.5,<2.6", "torchvision>=0.20,<0.21",
+         "pytorch-triton-rocm"]   # ROCm-only transitive dep of torch; the index is
+                                  # explicit=true, so it must be mapped or uv looks on PyPI
+cpu   = ["torch>=2.6", "torchaudio>=2.6", "torchvision>=0.21"]
+
 # Image VAE (LiteVAE) preprocessing + image-synthesis eval. Not needed for the
 # voice/SMG/world path. torchvision here resolves from the cu124 index too.
 # NOTE: image-VAE preprocessing also needs `olvae` (open-litevae), which is a
@@ -43,7 +61,8 @@ dependencies = [
 # OUT of the deps so a fresh node without that checkout can `uv sync` (a local
 # path source is validated even when the extra is unselected, which breaks sync).
 image = [
-    "torchvision",
+    # torchvision is supplied by the accelerator extra (cu124/rocm/cpu) so its wheel
+    # matches torch's; listing it here too would let the two disagree.
     "pillow",
     "lpips",
     "open-clip-torch",
@@ -101,15 +120,46 @@ default-groups = ["training", "dev", "deepspeed"]
 # practice) works fine on numpy 2. Override it so the lock matches the numpy-2.x env we run.
 override-dependencies = ["numpy>=2"]
 
+# Exactly one accelerator extra may be active; uv resolves a separate branch per extra.
+conflicts = [[{ extra = "cu124" }, { extra = "rocm" }, { extra = "cpu" }]]
+
 [[tool.uv.index]]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.2"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-torchaudio = { index = "pytorch-cu124" }
-torchvision = { index = "pytorch-cu124" }
+# Keyed on the accelerator extra so the same lock serves CUDA, ROCm and CPU nodes.
+# WITHOUT the extra keys these were unconditional, which is why `uv sync
+# --no-default-groups` still dragged in nvidia-cublas-cu12 et al on a ROCm box:
+# torch is a TRANSITIVE requirement (speechbrain / torchcrepe /
+# rotary-embedding-torch), so omitting it from [dependencies] does not avoid it.
+torch = [
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-rocm",  extra = "rocm" },
+    { index = "pytorch-cpu",   extra = "cpu" },
+]
+torchaudio = [
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-rocm",  extra = "rocm" },
+    { index = "pytorch-cpu",   extra = "cpu" },
+]
+torchvision = [
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-rocm",  extra = "rocm" },
+    { index = "pytorch-cpu",   extra = "cpu" },
+]
+pytorch-triton-rocm = { index = "pytorch-rocm", extra = "rocm" }
 # open-litevae (olvae) is intentionally NOT declared here: it's a local,
 # manually-packaged checkout, and a path source is validated on every `uv sync`
 # even on nodes that don't have it (breaking sync). Install it manually where

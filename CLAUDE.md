@@ -212,12 +212,29 @@ Runs are logged to `runs/<run_name>/` (metrics + checkpoints). Backend is select
 
 - Python 3.10, CUDA 12.4. Managed with **[uv](https://docs.astral.sh/uv/)** — it
   provisions its own Python 3.10 and a `.venv`; no system/conda Python needed.
-- Setup: `uv sync` (core + `training` group = torch cu124 + everything to train).
+- Setup: **`uv sync --extra cu124`** (core + `training` group + the CUDA 12.4 torch build).
   Add `--extra demo` (gradio) or `--extra image` (LiteVAE, needs `../open-litevae`).
+- **The accelerator is an EXTRA — one of `cu124` / `rocm` / `cpu` must be selected.** A bare
+  `uv sync` no longer pins the CUDA wheels: torch has no unconditional source, so it would fall
+  back to PyPI. uv 0.11.7 has no `default-extras`, so either pass `--extra cu124` every time or
+  export `UV_EXTRA=cu124` on the training nodes.
+  - CUDA training node: `uv sync --extra cu124 --extra image`
+  - ROCm inference node: `uv sync --no-default-groups --inexact --extra rocm --extra demo --extra image`
+  - CPU-only: `uv sync --no-default-groups --inexact --extra cpu`
+  ⚠️ **Core deps are NOT torch-free**, despite the comment in `pyproject.toml` implying it:
+  `speechbrain`, `torchcrepe` and `rotary-embedding-torch` all require torch UNCONDITIONALLY, so
+  `--no-default-groups` alone never avoided pulling the `nvidia-*` cu12 wheels. That is why the
+  accelerator had to become an extra rather than being left to the `training` group.
+  Each branch also needs a version FLOOR (unconstrained, the ROCm fork resolved torch 2.0.1 /
+  torchvision 0.15.2, a pair with no wheel for the platform), and `pytorch-triton-rocm` needs an
+  explicit `[tool.uv.sources]` mapping because the index is `explicit = true`.
 - Run commands with `uv run`, e.g. `uv run python -m megatransformer.scripts.train.train ...`
   (or `source .venv/bin/activate` once, then plain `python -m ...`).
-- `uv.lock` is the source of truth (committed). `requirements.txt` is a generated
-  pip fallback (`uv export`) with the cu124 index URL — regenerate after dep changes.
+- `uv.lock` is the source of truth (committed) and now carries ALL THREE accelerator branches,
+  so one lock serves CUDA, ROCm and CPU nodes. `requirements.txt` is a generated pip fallback
+  (`uv export`) with the cu124 index URL — CUDA-only, regenerate after dep changes.
+- ⚠️ **Claude should not run `uv` commands** (`uv sync`, `uv lock`, `uv add`, ...). Hand the exact
+  command over instead; the user runs it. Dependency state is theirs to change.
 - **Dependency layout** (`pyproject.toml`): core `[project.dependencies]` are the
   unpinned, torch-free libs a downstream consumer needs (the ComfyUI SMG-inference
   nodes `pip install megatransformer` and use their own torch — torch/torchaudio
