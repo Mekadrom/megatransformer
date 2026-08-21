@@ -2331,6 +2331,7 @@ demo = [
     { name = "gradio" },
 ]
 image = [
+    { name = "diffusers" },
     { name = "lpips" },
     { name = "omegaconf" },
     { name = "open-clip-torch" },
@@ -2380,6 +2381,7 @@ training = [
 
 [package.metadata]
 requires-dist = [
+    { name = "diffusers", marker = "extra == 'image'", specifier = ">=0.39" },
     { name = "gradio", marker = "extra == 'demo'" },
     { name = "huggingface-hub" },
     { name = "librosa" },
