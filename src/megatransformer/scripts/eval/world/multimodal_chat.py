@@ -80,6 +80,20 @@ def parse_args():
                    help="Z-Image-Turbo model for rendering the adapter's predicted conditioning.")
     p.add_argument("--zimage_output_gain", type=float, default=1.0,
                    help="Z-Image adapter: inference-only dispersion gain on the whitened prediction. An MSE-trained point estimate is shrunk toward the target mean by 1-R^2, which the DiT renders as washed-out/generic; ~1/alpha undoes it. Measured best ~1.2-1.5 (gain 1.34: CLIPScore 0.287->0.303 vs 0.345 GT). Estimate per-checkpoint with scripts_local/zimage_shrinkage_probe.py. 1.0 = off.")
+    # ── generative-head (T3/T4/T5 family) controls ──────────────────────────────────────
+    # A flow-head checkpoint SAMPLES its conditioning instead of regressing a point, and
+    # essentially all of its quality comes from classifier-free guidance: measured on the same
+    # 8-prompt probe, unguided 0.287 vs w=3 0.359 against a 0.368 GT ceiling -- i.e. an unguided
+    # flow head only ties the gain-corrected POINT head. Without this flag the demo rendered every
+    # T3-family checkpoint at the head's default guidance of 1.0, i.e. unguided.
+    p.add_argument("--flow_guidance", type=float, default=None,
+                   help="CFG scale for a generative conditioning head (T3 flow_head / T4 ar_flow_head). "
+                        "Measured operating point is 3.0; 1.0 = off. Ignored on point-head checkpoints. "
+                        "Default None = 3.0 when a flow head is present, else untouched.")
+    p.add_argument("--flow_seed", type=int, default=None,
+                   help="Seed the conditioning sampler so a generation is reproducible. The head "
+                        "emits a DISTRIBUTION, so draws differ; without this a result you liked "
+                        "cannot be recovered. None = fresh random draw each time.")
     p.add_argument("--zimage_gen_steps", type=int, default=8,
                    help="Z-Image diffusion steps (Turbo=8). UI 'image diffusion steps' overrides if >0.")
     p.add_argument("--max_new_tokens", type=int, default=512)
@@ -503,9 +517,27 @@ def main():
         zimage_pipe = ZImagePipeline.from_pretrained(args.zimage_model, torch_dtype=torch.bfloat16)
         zimage_pipe.enable_model_cpu_offload()  # ~20GB stack; offload to coexist with the world model
         zimage_pipe.set_progress_bar_config(disable=True)
+        _gen_head = (getattr(model.image_generator, "flow_head", None)
+                     or getattr(model.image_generator, "ar_flow_head", None))
         if args.zimage_output_gain != 1.0:
+            if _gen_head is not None:
+                raise SystemExit(
+                    "--zimage_output_gain is a POINT-head correction (it undoes MSE shrinkage by "
+                    "1/alpha). This checkpoint has a generative head, which already samples at full "
+                    "dispersion -- applying both double-corrects. Use --flow_guidance instead.")
             model.image_generator.output_gain = args.zimage_output_gain
             print(f"[zimage] output_gain={args.zimage_output_gain} (dispersion correction)")
+        if _gen_head is not None:
+            w = 3.0 if args.flow_guidance is None else float(args.flow_guidance)
+            _gen_head.guidance = w
+            print(f"[zimage] generative head detected ({type(_gen_head).__name__}); "
+                  f"flow_guidance={w}" + ("  (default; unguided would cost ~0.07 CLIPScore)"
+                                          if args.flow_guidance is None else ""))
+            if args.flow_seed is not None:
+                model.image_generator.flow_generator = torch.Generator(device=device).manual_seed(int(args.flow_seed))
+                print(f"[zimage] flow_seed={args.flow_seed} (reproducible draws)")
+        elif args.flow_guidance is not None:
+            print("[zimage] --flow_guidance ignored: this checkpoint has no generative head")
 
     @torch.no_grad()
     def render_zimage_cond(seq: torch.Tensor, steps: int, seed: int) -> Image.Image:
