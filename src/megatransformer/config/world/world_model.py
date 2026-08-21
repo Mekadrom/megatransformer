@@ -640,3 +640,11 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred_x1w"].image_coda_config.flow_los
 # debt that made the native-length warm-start uninterpretable.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_trunkctx"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_trunkctx"].image_coda_config.flow_ctx = "trunk"
+
+# xskip + explicit DISPERSION MATCHING. The best arm so far (xskip) still emits under-dispersed
+# content and leans on both leftover noise and CFG to make up for it; this makes the spread an
+# objective instead. Weight 0.5 with a small anti-collapse barrier: the term is dimensionless and
+# ~1 at full collapse, so it is comparable in scale to the flow loss itself.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_var"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_var"].image_coda_config.flow_var_loss_weight = 0.5
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_var"].image_coda_config.flow_var_barrier_weight = 0.1

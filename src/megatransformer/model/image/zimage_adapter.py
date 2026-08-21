@@ -147,7 +147,10 @@ class ZImageConditioningAdapter(nn.Module):
                 x1_pred=bool(getattr(config, "flow_x1_pred", False)),
                 x1_sigma_min=float(getattr(config, "flow_x1_sigma_min", 0.02)),
                 loss_weighting=str(getattr(config, "flow_loss_weighting", "none")),
-                min_snr_gamma=float(getattr(config, "flow_min_snr_gamma", 5.0)))
+                min_snr_gamma=float(getattr(config, "flow_min_snr_gamma", 5.0)),
+                var_loss_weight=float(getattr(config, "flow_var_loss_weight", 0.0)),
+                var_barrier_weight=float(getattr(config, "flow_var_barrier_weight", 0.0)),
+                var_steps=int(getattr(config, "flow_var_steps", 4)))
         self.flow_aux_mse_weight = float(getattr(config, "flow_aux_mse_weight", 0.1))
         # T5: run the PARALLEL head at the caption's native Qwen3 length instead of resampling
         # the target to K slots. Same one-shot sampler as T3 (no sequential inference), just

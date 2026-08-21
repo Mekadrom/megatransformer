@@ -440,6 +440,15 @@ class ZImageAdapterConfig:
     # self_enc + cross_dec are 33.1M params = 49% of the adapter, and cross_dec's stated purpose
     # (decoupling K input queries from output length) is UNUSED at the shipped sizes: 64 -> 64.
     flow_ctx: str = "qformer"              # "qformer" | "trunk"
+    # DISPERSION MATCHING on a SAMPLED draw: |std(draw)/std(target) - 1|, plus an optional
+    # -log(ratio) anti-collapse barrier. Same form as the trainer's modality var-loss, which is
+    # wired only to the LATENT image path and never reaches this adapter.
+    # Motivation is measured, not speculative: the head's learned content sits at 0.539 whitened
+    # std against a 1.000 target and a 0.956 rank ceiling, and the noise leak had been supplying
+    # the difference -- which is why removing the leak completely made renders WORSE.
+    flow_var_loss_weight: float = 0.0
+    flow_var_barrier_weight: float = 0.0
+    flow_var_steps: int = 4                # Euler steps for the dispersion draw (cheap, unguided)
     flow_min_snr_gamma: float = 5.0
 
     flow_native_length: bool = False

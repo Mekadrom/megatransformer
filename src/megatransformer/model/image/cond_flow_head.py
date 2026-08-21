@@ -82,7 +82,8 @@ class CondFlowHead(nn.Module):
     def __init__(self, seq_dim, ctx_dim, dim=512, n_heads=8, n_layers=4,
                  mlp_ratio=4.0, dropout=0.0, steps=8, time_sampling="logit_normal",
                  cfg_dropout=0.0, guidance=1.0, max_len=128, pos_embed=False, x_skip=False,
-                 x1_pred=False, x1_sigma_min=0.02, loss_weighting="none", min_snr_gamma=5.0):
+                 x1_pred=False, x1_sigma_min=0.02, loss_weighting="none", min_snr_gamma=5.0,
+                 var_loss_weight=0.0, var_barrier_weight=0.0, var_steps=4):
         super().__init__()
         self.seq_dim = seq_dim
         self.steps = int(steps)
@@ -166,6 +167,27 @@ class CondFlowHead(nn.Module):
         # pathology, so leave it "none" there to keep the objective identical to the T3 baseline.
         self.loss_weighting = str(loss_weighting)
         self.min_snr_gamma = float(min_snr_gamma)
+        # ── DISPERSION MATCHING ───────────────────────────────────────────────────────────
+        # MEASURED: this head under-produces dispersion badly. Project the unremovable noise out
+        # of t3_2's output and the LEARNED content is only 0.539 whitened std against a target of
+        # 1.000 -- and against a rank-512 STRUCTURAL ceiling of sqrt(0.914) = 0.956, so capacity
+        # is not the constraint. The noise leak had been silently making up the difference, which
+        # is why removing it completely (x1_pred, 0.2% residual) made renders WORSE, not better:
+        #   control (leak ~76%)      w=3 0.356    x_skip (leak ~67%) w=3 0.359
+        #   x1_pred (leak 0.2%)      w=3 0.351, and w=1 0.224 vs control's 0.277
+        # So make dispersion an explicit OBJECTIVE instead of an artifact of leftover noise.
+        # Same form as the trainer's existing modality var-loss (which is wired only to the LATENT
+        # image path and never reaches this adapter): |std(pred)/std(target) - 1|, dimensionless,
+        # 0 when matched, 1 at full collapse, symmetric in both directions; plus an optional
+        # -log(ratio) barrier whose gradient blows up as the model approaches collapse.
+        # ⚠️ It must be measured on a SAMPLED draw, not on the velocity or the implied x1: at low
+        # t the correct conditional-mean estimate IS shrunk (at t=0 the head knows only E[x1|ctx]),
+        # so penalising shrinkage there would just train overconfidence. What the decoder actually
+        # consumes is the end of the ODE, so that is what gets matched -- unguided, because the
+        # point is to stop needing CFG to paper over under-dispersion.
+        self.var_loss_weight = float(var_loss_weight)
+        self.var_barrier_weight = float(var_barrier_weight)
+        self.var_steps = int(var_steps)
         self.x_skip = bool(x_skip)
         if self.x_skip:
             self.skip_ada = nn.Linear(dim, seq_dim)
@@ -240,9 +262,31 @@ class CondFlowHead(nn.Module):
             om = (1 - t).clamp_min(self.x1_sigma_min)
             err = err * (om ** 2).view(-1, 1, 1).to(err.dtype)
         if mask is None:
-            return err.mean()
-        m = mask.to(err.dtype).unsqueeze(-1)
-        return (err * m).sum() / (m.sum() * target.shape[-1]).clamp_min(1.0)
+            base = err.mean()
+        else:
+            m = mask.to(err.dtype).unsqueeze(-1)
+            base = (err * m).sum() / (m.sum() * target.shape[-1]).clamp_min(1.0)
+        if (self.var_loss_weight > 0 or self.var_barrier_weight > 0) and self.training:
+            draw = self._sample_grad(ctx, target.shape[1], self.var_steps)
+            ratio = draw.std() / target.std().clamp_min(1e-6)
+            if self.var_loss_weight > 0:
+                base = base + self.var_loss_weight * (ratio - 1.0).abs()
+            if self.var_barrier_weight > 0:
+                base = base + self.var_barrier_weight * (-torch.log(ratio.clamp_min(1e-6))).clamp_min(0.0)
+        return base
+
+    def _sample_grad(self, ctx, seq_len, steps):
+        """Plain conditional sampling WITH gradient, for the dispersion term only.
+
+        Deliberately unguided (w=1) and few-step: the target is that the head's own draws carry
+        the right spread, not that CFG-inflated draws do.
+        """
+        x = torch.randn(ctx.shape[0], seq_len, self.seq_dim, device=ctx.device, dtype=ctx.dtype)
+        dt = 1.0 / steps
+        for k in range(steps):
+            t = torch.full((ctx.shape[0],), k * dt, device=ctx.device, dtype=ctx.dtype)
+            x = x + dt * self.velocity(x, t, ctx)
+        return x
 
     @torch.no_grad()
     def sample(self, ctx, seq_len, steps=None, generator=None, guidance=None):
