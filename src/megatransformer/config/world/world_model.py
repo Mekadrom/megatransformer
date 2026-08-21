@@ -627,3 +627,11 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred"].image_coda_config.flow_loss_we
 # the late-t emphasis entirely rather than capping it.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred_x1w"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred_x1w"].image_coda_config.flow_loss_weighting = "x1"
+
+# Q-FORMER ABLATION: condition the flow head on the trunk states directly. Tests whether
+# cross_dec (18.9M params) is earning its keep on a conditioning path already suspected of being
+# over-constricted, or is a redundant second cross-attention in front of the head's own.
+# ⚠️ TEST FROM SCRATCH: a warm start inherits a trunk co-adapted to HAVING a Q-Former, the same
+# debt that made the native-length warm-start uninterpretable.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_trunkctx"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_trunkctx"].image_coda_config.flow_ctx = "trunk"

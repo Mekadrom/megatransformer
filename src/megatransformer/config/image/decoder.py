@@ -434,6 +434,12 @@ class ZImageAdapterConfig:
     # (Hang et al. 2023), SNR(t)=t^2/(1-t)^2 for rectified flow; "x1" exactly cancels the factor
     # for a uniform MSE in x1 space; "none" leaves the objective identical to the T3 baseline.
     flow_loss_weighting: str = "none"      # "none" | "min_snr" | "x1"
+    # What conditions the GENERATIVE head. "qformer" = cross_dec's output (as shipped);
+    # "trunk" = the self_enc'd trunk states directly, bypassing cross_dec for the head only
+    # (seq_pred still uses the Q-Former, so the aux point head is unchanged).
+    # self_enc + cross_dec are 33.1M params = 49% of the adapter, and cross_dec's stated purpose
+    # (decoupling K input queries from output length) is UNUSED at the shipped sizes: 64 -> 64.
+    flow_ctx: str = "qformer"              # "qformer" | "trunk"
     flow_min_snr_gamma: float = 5.0
 
     flow_native_length: bool = False

@@ -158,6 +158,9 @@ class ZImageConditioningAdapter(nn.Module):
             raise ValueError("flow_x1_pred SUPERSEDES flow_x_skip -- set one, not both: x1 "
                              "prediction already subtracts x_t analytically, so a learned skip "
                              "on top would double-count it")
+        self.flow_ctx = str(getattr(config, "flow_ctx", "qformer"))
+        if self.flow_ctx not in ("qformer", "trunk"):
+            raise ValueError(f"flow_ctx must be 'qformer' or 'trunk', got {self.flow_ctx!r}")
         self.flow_project = None          # None | "proj" | "renorm"; set at INFERENCE only
         self.flow_native_length = bool(getattr(config, "flow_native_length", False))
         if self.flow_native_length and self.flow_head is None:
@@ -287,6 +290,20 @@ class ZImageConditioningAdapter(nn.Module):
         q = self.out_queries.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, seq_len, d)
         q = self.cross_dec(q, x)                         # seq_len slots attend the K_in queries
         seq_pred = self.seq_head(self.seq_norm(q))       # (B, seq_len, seq_dim); WHITENED space if self.whiten
+        # WHAT THE GENERATIVE HEAD IS CONDITIONED ON. Default "qformer" = the cross_dec output q,
+        # as shipped. "trunk" hands it `x` instead -- the self_enc'd trunk states -- bypassing
+        # cross_dec entirely for the head (seq_pred still uses q, so the aux point head is
+        # unaffected and the ablation stays single-variable).
+        # WHY THIS IS WORTH ABLATING: self_enc + cross_dec are 33.1M params, 49% of the adapter,
+        # and cross_dec's stated purpose -- decoupling K input queries from the output length --
+        # is UNUSED at the shipped sizes (image_gen_queries 64 -> out_queries 64, an
+        # identity-shaped map). It is also the same primitive the flow head already applies:
+        # learned queries cross-attending to trunk states, which _FlowBlock does at every block
+        # of every Euler step. So it may be a redundant bottleneck on a conditioning path that is
+        # already long and narrow (text -> trunk -> 64 positions -> Q-Former -> head).
+        # NOTE at NATIVE length cross_dec would finally do real K->L work, so this question can
+        # have different answers at K=64 and at native length.
+        head_ctx = x if getattr(self, "flow_ctx", "qformer") == "trunk" else q
 
         # WHAT GETS SURFACED (in whitened space):
         #   flow head + no labels (inference) -> INTEGRATE FROM NOISE. Full-dispersion,
@@ -298,13 +315,13 @@ class ZImageConditioningAdapter(nn.Module):
             # AR inference: emit exactly L tokens, L deterministic from the caption's Qwen3
             # tokenization (callers pass cond_length); no stop token, no length head.
             seq_surf = self.ar_flow_head.sample(
-                q, int(kw.get("cond_length") or seq_pred.shape[1]),
+                head_ctx, int(kw.get("cond_length") or seq_pred.shape[1]),
                 generator=kw.get("flow_generator", getattr(self, "flow_generator", None)))
         elif self.flow_head is not None and self.flow_native_length and cond_labels is None:
             # Native length: emit exactly as many slots as Qwen3 would produce for this caption
             # (deterministic from the caption, same as the AR path -- no stop token needed).
             seq_surf = self.flow_head.sample(
-                q, int(kw.get("cond_length") or seq_pred.shape[1]),
+                head_ctx, int(kw.get("cond_length") or seq_pred.shape[1]),
                 generator=kw.get("flow_generator", getattr(self, "flow_generator", None)))
         elif self.flow_head is not None and cond_labels is None:
             # Seeded sampling matters for EVAL COMPARABILITY: the head emits a DISTRIBUTION, so
@@ -312,7 +329,7 @@ class ZImageConditioningAdapter(nn.Module):
             # progress and sampling noise. Setting `.flow_generator` pins the noise so the same
             # draw is compared across checkpoints; leave it None for genuinely random samples.
             seq_surf = self.flow_head.sample(
-                q, seq_pred.shape[1],
+                head_ctx, seq_pred.shape[1],
                 generator=kw.get("flow_generator", getattr(self, "flow_generator", None)))
         else:
             seq_surf = seq_pred
@@ -344,14 +361,14 @@ class ZImageConditioningAdapter(nn.Module):
             # Loss in the SAME space as seq_pred: whiten the target when enabled.
             target = ((cond_labels - self.whiten_mean.view(1, 1, -1)) / self.whiten_std.view(1, 1, -1)
                       if self.whiten else cond_labels)
-            sp, sl, ctx = seq_pred, target, q
+            sp, sl, ctx = seq_pred, target, head_ctx
             # Restrict the loss to flagged rows (transcription rows carry an INPUT image,
             # not a gen target). Guard on matching length so a bad mask is ignored.
             if sample_mask is not None and sample_mask.shape[0] == seq_pred.shape[0]:
                 m = sample_mask.bool()
                 if int(m.sum()) == 0:
                     return out                            # no synthesis rows this batch
-                sp, sl, ctx = seq_pred[m], target[m], q[m]
+                sp, sl, ctx = seq_pred[m], target[m], head_ctx[m]
             sl = sl.to(sp.dtype)
             if self.ar_flow_head is not None:
                 # T4: native-length masked AR flow. There is no comparable point-head MSE here
