@@ -357,7 +357,8 @@ def seq_degeneration(seqs, K):
 @torch.no_grad()
 def run_generation(model, dataset, collator, device, gen_n, K, budget,
                    bov_id=constants.BOV_TOKEN_ID, ras_win=0, ras_tau=0.1,
-                   voice_temp=0.6, top_k=None, top_p=None):
+                   voice_temp=0.6, top_k=None, top_p=None, nar_rounds=16,
+                   nar_choice_temp=1.0):
     """Free-running generation from text prompts; return generated + GT unit sequences + EOV info.
 
     Also collects per-sample prompt TEXT length (tokens before BOV) so the caller can correlate
@@ -378,10 +379,19 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
             continue
         prompt_lens.append(int(bov[0].item()))   # text tokens before BOV = transcript length proxy
         prompt = text[:bov[0].item() + 1].unsqueeze(0).to(device)
-        out = model.generate(text_input_ids=prompt, max_new_tokens=512,
-                             voice_token_budget=budget, voice_temperature=voice_temp, voice_top_k=top_k, voice_top_p=top_p,
-                             voice_ras_win=ras_win, voice_ras_tau=ras_tau,
-                             decode_outputs=False)
+        if getattr(model, "voice_mask_feature", None) is not None:
+            # NAR: masked-parallel decode. The AR loop would step a bidirectional head one
+            # frame at a time, which measures a procedure the model is never used under.
+            _ids, _ = model.generate_voice_nar_from_prompt(
+                prompt, n_rounds=nar_rounds, temperature=voice_temp,
+                fallback_frames=budget, choice_temperature=nar_choice_temp)
+            out = {"voice_unit_id_trace": [_ids]}
+        else:
+            out = model.generate(text_input_ids=prompt, max_new_tokens=512,
+                                 voice_token_budget=budget, voice_temperature=voice_temp,
+                                 voice_top_k=top_k, voice_top_p=top_p,
+                                 voice_ras_win=ras_win, voice_ras_tau=ras_tau,
+                                 decode_outputs=False)
         trace = out.get("voice_unit_id_trace", [[]])[0]
         if trace and trace[-1] == K:            # EOV fired -> strip it
             eov_fired += 1
@@ -452,6 +462,12 @@ def main():
                          "but during NAR that is OOD (the model never trained with history) and "
                          "acc collapses, so it is NOT the model's real conditioning. Generation "
                          "(section 3) always runs at alpha=1 (generate() has no alpha hook).")
+    ap.add_argument("--nar_choice_temperature", type=float, default=1.0,
+                    help="Gumbel noise on MaskGIT confidence (annealed). 0 = greedy "
+                         "reveal, which self-reinforces the repetition mode.")
+    ap.add_argument("--nar_rounds", type=int, default=16,
+                    help="MaskGIT refinement rounds for the free-running section on a NAR "
+                         "checkpoint (ignored for AR).")
     ap.add_argument("--nar_mask_ratio", type=float, default=None,
                     help="REQUIRED for a masked-parallel (NAR) checkpoint. Fraction of voice "
                          "frames replaced by the learned MASK feature; all TF/ablation metrics "
@@ -523,7 +539,8 @@ def main():
             model, eval_dataset, collator, device, a.gen_n, K,
             budget=a.voice_max_frames, bov_id=sp.BOV,
             ras_win=a.voice_ras_win, ras_tau=a.voice_ras_tau,
-            voice_temp=a.voice_temperature, top_k=a.voice_top_k, top_p=a.voice_top_p)
+            voice_temp=a.voice_temperature, top_k=a.voice_top_k, top_p=a.voice_top_p,
+            nar_rounds=a.nar_rounds, nar_choice_temp=a.nar_choice_temperature)
         print("3/3 degeneration stats ...", flush=True)
         gen_deg = seq_degeneration(gen, K)
         gt_deg = seq_degeneration(gt, K)

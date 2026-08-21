@@ -33,6 +33,12 @@ ap.add_argument("--device", default="cuda:2")
 ap.add_argument("--out_dir", required=True)
 ap.add_argument("--voice_temperature", type=float, default=0.6,
                 help="voice unit sampling temperature. Default 0.6 MATCHES THE TRAINING-TIME VIZ (train.py: viz_voice_temperature=0.6), i.e. the TensorBoard renders the ear has been judging. These scripts previously HARDCODED 1.0, which samples far into the 6561-way tail and is audibly less coherent than the model's actual operating point -- so every free-running number they produced described the wrong regime.")
+ap.add_argument("--nar_choice_temperature", type=float, default=1.0,
+                help="Gumbel noise on MaskGIT confidence, annealed to 0 over the "
+                     "rounds. 0 = pure greedy reveal, which self-reinforces the "
+                     "repetition mode (measured 2.7x worse at 16 rounds than at 1).")
+ap.add_argument("--nar_rounds", type=int, default=16,
+                help="MaskGIT refinement rounds for a NAR checkpoint (ignored for AR).")
 ap.add_argument("--voice_top_k", type=int, default=None, help="top-k truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0.")
 ap.add_argument("--voice_top_p", type=float, default=None, help="top-p / nucleus truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0. The natural middle ground: T=0.6 mode-collapses into repetition loops, T=1.0 draws tail noise -- nucleus cuts the tail without sharpening into a loop.")
 add_mrope_args(ap)
@@ -48,6 +54,7 @@ model.set_voice_codebook(cb)
 model.to(a.device).eval()
 sp_base = getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE)
 sp = constants.special_token_ids(sp_base)
+_IS_NAR = getattr(model, "voice_mask_feature", None) is not None
 ds = load_dataset(args, "val")
 coll = make_collator(K, a.voice_max_frames, special_token_base=sp_base)
 coll.force_direction = "synthesis"
@@ -77,9 +84,17 @@ for i in range(len(ds)):
 
     for tag, win in (("ras", a.ras_win), ("plain", 0)):
         with torch.no_grad():
-            out = model.generate(text_input_ids=prompt, max_new_tokens=512,
-                                 voice_token_budget=a.voice_max_frames, voice_temperature=voice_temp, voice_top_k=a.voice_top_k, voice_top_p=a.voice_top_p,
-                                 voice_ras_win=win, voice_ras_tau=a.ras_tau, decode_outputs=False)
+            if _IS_NAR:
+                _ids, _ = model.generate_voice_nar_from_prompt(
+                    prompt, n_rounds=a.nar_rounds, temperature=voice_temp, sp=sp,
+                choice_temperature=a.nar_choice_temperature,
+                    fallback_frames=a.voice_max_frames)
+                out = {"voice_unit_id_trace": [_ids]}
+            else:
+                out = model.generate(text_input_ids=prompt, max_new_tokens=512,
+                                     voice_token_budget=a.voice_max_frames, voice_temperature=voice_temp,
+                                     voice_top_k=a.voice_top_k, voice_top_p=a.voice_top_p,
+                                     voice_ras_win=win, voice_ras_tau=a.ras_tau, decode_outputs=False)
         tr = out.get("voice_unit_id_trace", [[]])[0]
         tr = [int(x) for x in tr if 0 <= int(x) < K]
         row[f"{tag}_frames"] = len(tr)

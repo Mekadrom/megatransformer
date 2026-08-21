@@ -234,8 +234,59 @@ class MegaTransformerWorldModel(nn.Module):
                 self.text_generator.special_head.weight = self.text_feature_extractor.special_embed.weight
 
     @torch.no_grad()
+    def generate_voice_nar_from_prompt(self, text_input_ids, n_rounds: int = 16,
+                                       temperature: float = 1.0, sp=None,
+                                       fallback_frames: int = 250,
+                                       choice_temperature: float = 1.0,
+                                       force_bucket: Optional[int] = None):
+        """Full NAR voice synthesis from a prompt ENDING AT BOV. Returns (unit_ids, bucket).
+
+        Shared by the training-time viz, the WER eval, the renders and the AR-diagnostics
+        generation section, so they cannot drift apart -- the block length must be decided the
+        same way everywhere or the numbers stop describing the same procedure.
+
+        Two steps, because no voice position exists until the length is known:
+          1. one forward over the prompt to read the next-token distribution, restricted to the
+             DUR_* ids, and take the duration bucket;
+          2. allocate from that bucket (upper edge + margin, so errors are one-sided) and run
+             the MaskGIT sampler. EOV trims whatever is over-allocated.
+        """
+        from megatransformer.utils import constants as _C
+        if sp is None:
+            sp = _C.special_token_ids(getattr(self.config, "special_token_base",
+                                              _C.SPECIAL_TOKEN_BASE))
+        dur_lo = sp.base + 9
+        dur_hi = dur_lo + _C.N_DURATION_BUCKETS
+        bucket = None
+        out = self(text_input_ids=text_input_ids, decode_outputs=False)
+        logits = out.get("logits")
+        # A model without the duration-token extension has a shorter head; fall back rather
+        # than index off the end.
+        if logits is not None and logits.shape[-1] >= dur_hi:
+            bucket = int(torch.argmax(logits[0, -1, dur_lo:dur_hi]).item())
+        # force_bucket: CAUSAL test of the duration mechanism. Substituting another
+        # utterance's bucket answers whether the token actually CONTROLS length, or whether
+        # length is being driven by something else and the token merely correlates with it.
+        if force_bucket is not None:
+            bucket = int(force_bucket)
+        n_frames = (_C.duration_bucket_alloc(bucket) if bucket is not None
+                    else int(fallback_frames))
+        tail = [sp.VOICE_PLACEHOLDER, sp.EOV]
+        if bucket is not None:
+            tail = [dur_lo + bucket] + tail
+        full = torch.cat([
+            text_input_ids,
+            torch.tensor([tail], dtype=text_input_ids.dtype, device=text_input_ids.device),
+        ], dim=1)
+        ids = self.generate_voice_nar(full, n_frames=n_frames, n_rounds=n_rounds,
+                                      temperature=temperature,
+                                      choice_temperature=choice_temperature)[0]
+        return ids, bucket
+
+    @torch.no_grad()
     def generate_voice_nar(self, text_input_ids, n_frames, n_rounds: int = 16,
-                           temperature: float = 1.0, eov_id: Optional[int] = None):
+                           temperature: float = 1.0, eov_id: Optional[int] = None,
+                           choice_temperature: float = 1.0):
         """Masked-parallel (MaskGIT) voice decoding. Returns per-batch unit id lists.
 
         Built on forward(), NOT on generate(): every position is decoded in parallel, so
@@ -289,6 +340,17 @@ class MegaTransformerWorldModel(nn.Module):
             # Already-revealed positions keep their id and are treated as maximally confident
             # so the top-k below never evicts a committed token.
             samp = torch.where(known, ids, samp)
+            # CONFIDENCE NOISE (MaskGIT's, and not optional in practice). Revealing strictly by
+            # probability commits to the MODE first -- which for this model is repetition -- and
+            # every later round re-conditions on those commitments, so the mode reinforces
+            # itself. Measured without it at 23k: K=16 scored 2.7x WORSE than K=1 (truncated LCS
+            # 0.0246 vs 0.0668, paired CI [+0.027,+0.058]) and hyp/ref collapsed 0.95 -> 0.37.
+            # Gumbel noise on the log-confidence, annealed to 0 over the rounds, keeps the early
+            # commitments diverse while letting the final rounds be decisive.
+            if choice_temperature > 0.0:
+                _g = -torch.log(-torch.log(torch.rand_like(conf).clamp_min(1e-9)).clamp_min(1e-9))
+                _ann = float(choice_temperature) * (1.0 - (r + 1) / float(max(1, n_rounds)))
+                conf = torch.log(conf.clamp_min(1e-9)) + _ann * _g
             conf = torch.where(known, torch.full_like(conf, float("inf")), conf)
 
             # Cosine reveal: few commitments early (when context is thin), many late.

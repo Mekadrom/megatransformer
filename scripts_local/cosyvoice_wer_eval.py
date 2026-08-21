@@ -50,6 +50,17 @@ ap.add_argument("--device", default="cuda:3")
 ap.add_argument("--out_dir", default="eval_output/world_tts_wer")
 ap.add_argument("--voice_temperature", type=float, default=0.6,
                 help="voice unit sampling temperature. Default 0.6 MATCHES THE TRAINING-TIME VIZ (train.py: viz_voice_temperature=0.6), i.e. the TensorBoard renders the ear has been judging. These scripts previously HARDCODED 1.0, which samples far into the 6561-way tail and is audibly less coherent than the model's actual operating point -- so every free-running number they produced described the wrong regime.")
+ap.add_argument("--duration_shuffle", action="store_true", default=False,
+                help="NAR causal probe: overwrite each utterance's predicted duration bucket "
+                     "with ANOTHER utterance's. If generated length follows the substituted "
+                     "bucket, the token controls length; if it does not, length is being driven "
+                     "by something else and the correlation is incidental.")
+ap.add_argument("--nar_choice_temperature", type=float, default=1.0,
+                help="Gumbel noise on MaskGIT confidence, annealed to 0 over the "
+                     "rounds. 0 = pure greedy reveal, which self-reinforces the "
+                     "repetition mode (measured 2.7x worse at 16 rounds than at 1).")
+ap.add_argument("--nar_rounds", type=int, default=16,
+                help="MaskGIT refinement rounds for a NAR checkpoint (ignored for AR).")
 ap.add_argument("--voice_top_k", type=int, default=None, help="top-k truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0.")
 ap.add_argument("--voice_top_p", type=float, default=None, help="top-p / nucleus truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0. The natural middle ground: T=0.6 mode-collapses into repetition loops, T=1.0 draws tail noise -- nucleus cuts the tail without sharpening into a loop.")
 add_mrope_args(ap)
@@ -62,6 +73,8 @@ model = load_world_model(args, a.device); model.set_voice_codebook(cb)
 model.to(a.device).eval()
 sp_base = getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE)
 sp = constants.special_token_ids(sp_base)
+_IS_NAR = getattr(model, "voice_mask_feature", None) is not None
+print(f"decode path: {'NAR masked-parallel' if _IS_NAR else 'AR'}", flush=True)
 ds = load_dataset(args, "val")
 coll = make_collator(K, a.voice_max_frames, special_token_base=sp_base); coll.force_direction = "synthesis"
 dec = CosyVoice2Decoder.from_pretrained(a.cosyvoice_dir, device=a.device)
@@ -97,13 +110,36 @@ for i in range(len(ds)):
         continue
     prompt = text[:bov[0].item() + 1].unsqueeze(0).to(a.device)
     with torch.no_grad():
-        out = model.generate(text_input_ids=prompt, max_new_tokens=512,
-                             voice_token_budget=a.voice_max_frames, voice_temperature=voice_temp, voice_top_k=a.voice_top_k, voice_top_p=a.voice_top_p,
-                             voice_ras_win=a.ras_win, voice_ras_tau=a.ras_tau,
-                             decode_outputs=False)
+        if _IS_NAR:
+            # A NAR checkpoint decodes by masked refinement; running the AR loop on it would
+            # step a bidirectional head one frame at a time and measure nothing real.
+            _fb = None
+            if a.duration_shuffle:
+                from megatransformer.utils import constants as _C
+                # Deterministic derangement-ish: use the bucket of the utterance 7 ahead.
+                _other = (int(rows[-7]["ref_frames"]) if len(rows) >= 7
+                          else int(s["voice_feature_length"]))
+                _fb = _C.duration_bucket(_other)
+                row_forced = _fb
+            _ids, _ = model.generate_voice_nar_from_prompt(
+                prompt, n_rounds=a.nar_rounds, temperature=voice_temp, sp=sp,
+                choice_temperature=a.nar_choice_temperature,
+                fallback_frames=a.voice_max_frames, force_bucket=_fb)
+            out = {"voice_unit_id_trace": [_ids]}
+        else:
+            out = model.generate(text_input_ids=prompt, max_new_tokens=512,
+                                 voice_token_budget=a.voice_max_frames, voice_temperature=voice_temp,
+                                 voice_top_k=a.voice_top_k, voice_top_p=a.voice_top_p,
+                                 voice_ras_win=a.ras_win, voice_ras_tau=a.ras_tau,
+                                 decode_outputs=False)
     tr = [int(x) for x in out.get("voice_unit_id_trace", [[]])[0] if 0 <= int(x) < K]
     L_ref = int(s["voice_feature_length"])
     row = {"idx": i, "ref": ref, "gen_frames": len(tr), "ref_frames": L_ref}
+    if a.duration_shuffle and _IS_NAR:
+        from megatransformer.utils import constants as _C2
+        row["forced_bucket"] = row_forced
+        row["forced_frames"] = _C2.duration_bucket_frames(row_forced)
+        row["true_bucket"] = _C2.duration_bucket(L_ref)
     if tr:
         w = dec.decode(torch.tensor(tr), spk)
         if w is not None:
