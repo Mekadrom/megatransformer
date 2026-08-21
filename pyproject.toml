@@ -61,6 +61,7 @@ cpu   = ["torch>=2.6", "torchaudio>=2.6", "torchvision>=0.21"]
 # OUT of the deps so a fresh node without that checkout can `uv sync` (a local
 # path source is validated even when the extra is unselected, which breaks sync).
 image = [
+    "accelerate>=0.17",   # eval_zimage_adapter offloads the Z-Image stack
     # torchvision is supplied by the accelerator extra (cu124/rocm/cpu) so its wheel
     # matches torch's; listing it here too would let the two disagree.
     # diffusers is ALSO in the `training` group, but it belongs here too: rendering the
@@ -76,6 +77,10 @@ image = [
 ]
 # Gradio eval demos (voice_clone, etc.).
 demo = [
+    # accelerate: the Z-Image render path calls enable_model_cpu_offload(), which needs
+    # accelerate>=0.17. It was previously only in the `training` group, so a demo-only
+    # install crashed at pipeline setup.
+    "accelerate>=0.17",
     "gradio",
 ]
 

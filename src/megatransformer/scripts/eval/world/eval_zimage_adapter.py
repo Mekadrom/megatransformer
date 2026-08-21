@@ -58,6 +58,15 @@ def parse_args():
     p.add_argument("--force_targets", action="store_true",
                    help="Always render targets, ignoring the 'already done' marker.")
     p.add_argument("--zimage_model", type=str, default="Tongyi-MAI/Z-Image-Turbo")
+    # Offload is a DISCRETE-GPU optimisation: it keeps the ~20GB Z-Image stack on the host and
+    # pages modules to the device on demand so the world model can coexist in limited VRAM. On
+    # UNIFIED-MEMORY hardware (Ryzen AI, Apple silicon) host and device are the SAME physical
+    # memory, so it buys nothing and costs transfer overhead. It also needs accelerate>=0.17,
+    # which used to be declared only in the `training` group -- a demo-only install crashed here.
+    p.add_argument("--zimage_offload", choices=["auto", "on", "off"], default="auto",
+                   help="Z-Image CPU offload. 'auto' = offload if accelerate is present, else "
+                        "load straight to the device. 'off' skips it -- the right choice on "
+                        "unified-memory systems. 'on' requires accelerate and errors if missing.")
     p.add_argument("--gen_steps", type=int, default=8)          # Turbo
     p.add_argument("--guidance", type=float, default=0.0)       # Turbo: no CFG
     p.add_argument("--output_gain", type=float, default=1.0,
@@ -67,7 +76,7 @@ def parse_args():
                         "never have written. out is Linear(flow_dim -> seq_dim) with "
                         "flow_dim << seq_dim, so velocities live in a flow_dim-dim subspace and "
                         "the initial noise ORTHOGONAL to it survives the ODE untouched "
-                        "(measured 59% of emitted energy at w=1, 43% at w=3 on t3_2). "
+                        "(measured 59%% of emitted energy at w=1, 43%% at w=3 on t3_2). "
                         "'proj' = hard projection; 'renorm' = project then rescale to unit "
                         "per-dim std (whitened targets are unit by construction, and the raw "
                         "projection lands under-dispersed). Inference-only, no retraining.")
@@ -191,7 +200,21 @@ def main():
     # ── Z-Image ── (offload so the ~20GB stack fits with the world model + CLIP scorer)
     from diffusers import ZImagePipeline
     pipe = ZImagePipeline.from_pretrained(args.zimage_model, torch_dtype=torch.bfloat16)
-    pipe.enable_model_cpu_offload()
+    _has_accel = True
+    try:
+        import accelerate  # noqa: F401
+    except ImportError:
+        _has_accel = False
+    _mode = getattr(args, "zimage_offload", "auto")
+    if _mode == "on" and not _has_accel:
+        raise SystemExit("--zimage_offload on requires accelerate>=0.17 "
+                         "(install the `demo` or `image` extra), or pass --zimage_offload off")
+    if _mode == "off" or not _has_accel:
+        why = "--zimage_offload off" if _mode == "off" else "accelerate not installed"
+        print(f"[zimage] no CPU offload ({why}); loading pipeline onto {device}", flush=True)
+        pipe = pipe.to(device)
+    else:
+        pipe.enable_model_cpu_offload()
     pipe.set_progress_bar_config(disable=True)
 
     @torch.no_grad()

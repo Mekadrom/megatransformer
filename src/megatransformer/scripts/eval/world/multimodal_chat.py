@@ -94,6 +94,15 @@ def parse_args():
                    help="Seed the conditioning sampler so a generation is reproducible. The head "
                         "emits a DISTRIBUTION, so draws differ; without this a result you liked "
                         "cannot be recovered. None = fresh random draw each time.")
+    # Offload is a DISCRETE-GPU optimisation: it keeps the ~20GB Z-Image stack on the host and
+    # pages modules to the device on demand so the world model can coexist in limited VRAM. On
+    # UNIFIED-MEMORY hardware (Ryzen AI, Apple silicon) host and device are the SAME physical
+    # memory, so it buys nothing and costs transfer overhead. It also needs accelerate>=0.17,
+    # which used to be declared only in the `training` group -- a demo-only install crashed here.
+    p.add_argument("--zimage_offload", choices=["auto", "on", "off"], default="auto",
+                   help="Z-Image CPU offload. 'auto' = offload if accelerate is present, else "
+                        "load straight to the device. 'off' skips it -- the right choice on "
+                        "unified-memory systems. 'on' requires accelerate and errors if missing.")
     p.add_argument("--zimage_gen_steps", type=int, default=8,
                    help="Z-Image diffusion steps (Turbo=8). UI 'image diffusion steps' overrides if >0.")
     p.add_argument("--max_new_tokens", type=int, default=512)
@@ -515,7 +524,21 @@ def main():
         print(f"Image generator is ZImageConditioningAdapter — loading Z-Image ({args.zimage_model})...")
         from diffusers import ZImagePipeline
         zimage_pipe = ZImagePipeline.from_pretrained(args.zimage_model, torch_dtype=torch.bfloat16)
-        zimage_pipe.enable_model_cpu_offload()  # ~20GB stack; offload to coexist with the world model
+        _has_accel = True
+        try:
+            import accelerate  # noqa: F401
+        except ImportError:
+            _has_accel = False
+        _mode = getattr(args, "zimage_offload", "auto")
+        if _mode == "on" and not _has_accel:
+            raise SystemExit("--zimage_offload on requires accelerate>=0.17 "
+                             "(install the `demo` or `image` extra), or pass --zimage_offload off")
+        if _mode == "off" or not _has_accel:
+            why = "--zimage_offload off" if _mode == "off" else "accelerate not installed"
+            print(f"[zimage] no CPU offload ({why}); loading pipeline onto {device}", flush=True)
+            zimage_pipe = zimage_pipe.to(device)
+        else:
+            zimage_pipe.enable_model_cpu_offload()
         zimage_pipe.set_progress_bar_config(disable=True)
         _gen_head = (getattr(model.image_generator, "flow_head", None)
                      or getattr(model.image_generator, "ar_flow_head", None))
