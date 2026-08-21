@@ -63,6 +63,11 @@ cpu   = ["torch>=2.6", "torchaudio>=2.6", "torchvision>=0.21"]
 image = [
     # torchvision is supplied by the accelerator extra (cu124/rocm/cpu) so its wheel
     # matches torch's; listing it here too would let the two disagree.
+    # diffusers is ALSO in the `training` group, but it belongs here too: rendering the
+    # adapter's predicted conditioning through frozen SDXL / Z-Image IS image-synthesis eval,
+    # and an inference-only node syncing with --no-default-groups otherwise gets everything
+    # except the one import multimodal_chat needs (ModuleNotFoundError: diffusers).
+    "diffusers>=0.39",
     "pillow",
     "lpips",
     "open-clip-torch",
