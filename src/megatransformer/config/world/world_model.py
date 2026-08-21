@@ -619,3 +619,11 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred"].image_coda_config.flow_x1_pred
 # Min-SNR weighting is NOT optional here: without it the ~1.4% of logit-normal samples above
 # t=0.9 carry 76-1887x the gradient and, under max_grad_norm clipping, dominate the update.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred"].image_coda_config.flow_loss_weighting = "min_snr"
+
+# Same, but with the FLATTER weighting: multiply by (1-t)^2, i.e. a uniform MSE in x1 space.
+# Offline gradient profile across t: velocity ~1x, x1+min_snr ~7x, x1+x1-space ~1.1x. In the
+# min_snr run, clipping (max_grad_norm 1.0) peaked at 60% of steps around 500-1000 before decaying
+# to 0% by step 1500 -- so the mid-schedule third trained under truncated updates. This removes
+# the late-t emphasis entirely rather than capping it.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred_x1w"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred_x1w"].image_coda_config.flow_loss_weighting = "x1"
