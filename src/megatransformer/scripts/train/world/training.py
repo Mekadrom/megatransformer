@@ -200,6 +200,8 @@ class WorldModelTrainer(CommonTrainer):
         mask_text_loss_in_synthesis: bool = False,
         emit_duration_token: bool = False,
         voice_nar: bool = False,
+        voice_nar_mask_schedule: str = "cosine",
+        voice_nar_mask_ratio_min: float = 0.85,
         # Group within-modality samples by shard when shuffling. Default
         # True. Set False to reproduce the legacy uniform shuffle order
         # when resuming a checkpoint from a pre-shard-aware run.
@@ -224,6 +226,8 @@ class WorldModelTrainer(CommonTrainer):
         self.mask_text_loss_in_synthesis = mask_text_loss_in_synthesis
         self.emit_duration_token = bool(emit_duration_token)
         self.voice_nar = bool(voice_nar)
+        self.voice_nar_mask_schedule = str(voice_nar_mask_schedule)
+        self.voice_nar_mask_ratio_min = float(voice_nar_mask_ratio_min)
         self.shard_aware_sampler = shard_aware_sampler
         self.bucket_by_length = bucket_by_length
         self.bucket_mega_factor = bucket_mega_factor
@@ -1649,7 +1653,30 @@ class WorldModelTrainer(CommonTrainer):
         b, n, C, t = voice_inputs.shape
         dev = voice_inputs.device
         u = torch.rand(b, n, 1, 1, device=dev)
-        ratio = torch.cos(u * (math.pi / 2))                       # (b, n, 1, 1) in (0, 1]
+        # MASK-RATIO DISTRIBUTION.
+        #
+        # "cosine" is MaskGIT's, and it is wrong for this task in two ways. It puts most of its
+        # mass at moderate ratios, where the utterance is largely reconstructable from
+        # neighbouring units -- so the objective is mostly solvable WITHOUT reading the text,
+        # and the gradient pressure toward text conditioning is weak. Measured at 23k: revealing
+        # 25% of frames raised accuracy 5x (0.0169 -> 0.0860) while text_delta FELL
+        # (+0.0037 -> +0.0025), i.e. the model learned bidirectional inpainting instead of
+        # reading. Second, inference STARTS fully masked, so r~1 is the condition that
+        # determines the first commitments and anchors every later round -- and it is exactly
+        # the condition cosine trains least.
+        #
+        # "high" samples r ~ U[nar_mask_ratio_min, 1.0] (default 0.85), which removes the
+        # shortcut and aligns training with the operating point.
+        # "linear" is uniform over [min, 1] with min defaulting to 0 -- the neutral control, so
+        # that "high beats cosine" can be separated from "anything but cosine beats cosine".
+        _sched = getattr(self, "voice_nar_mask_schedule", "cosine")
+        _lo = float(getattr(self, "voice_nar_mask_ratio_min", 0.85))
+        if _sched == "high":
+            ratio = _lo + (1.0 - _lo) * u                          # U[ratio_min, 1]
+        elif _sched == "linear":
+            ratio = u                                              # U[0, 1] -- ignores ratio_min
+        else:
+            ratio = torch.cos(u * (math.pi / 2))                   # (b, n, 1, 1) in (0, 1]
         masked = torch.rand(b, n, 1, t, device=dev) < ratio
         # Synthesis rows only: in transcription the voice IS the input being read, so masking
         # it is damage rather than signal.
@@ -2582,6 +2609,8 @@ def create_trainer(
         mask_text_loss_in_synthesis=getattr(args, 'mask_text_loss_in_synthesis', False),
         emit_duration_token=getattr(args, 'voice_nar_duration_token', False),
         voice_nar=getattr(args, 'voice_nar', False),
+        voice_nar_mask_schedule=getattr(args, 'voice_nar_mask_schedule', 'cosine'),
+        voice_nar_mask_ratio_min=getattr(args, 'voice_nar_mask_ratio_min', 0.85),
         shard_aware_sampler=getattr(args, 'shard_aware_sampler', True),
         bucket_by_length=getattr(args, 'bucket_by_length', False),
         bucket_mega_factor=getattr(args, 'bucket_mega_factor', 25),
@@ -3071,6 +3100,22 @@ def add_cli_args(subparsers):
                                  "measured AR failure: greedy decoding puts 96% adjacent repeats, "
                                  "i.e. the conditional mode is 'repeat the previous unit' -- a loop "
                                  "that is structurally impossible without an AR feedback path.")
+    sub_parser.add_argument("--voice_nar_mask_schedule", type=str, default="cosine",
+                            choices=["cosine", "high", "linear"],
+                            help="Distribution of the NAR mask ratio. 'cosine' is MaskGIT's and "
+                                 "concentrates mass at moderate ratios, where the utterance is "
+                                 "largely reconstructable from neighbouring units -- measured at "
+                                 "23k, that produced inpainting rather than text reading "
+                                 "(revealing 25%% of frames raised accuracy 5x while text_delta "
+                                 "FELL). 'high' samples U[--voice_nar_mask_ratio_min, 1], removing "
+                                 "the shortcut and matching inference, which starts fully masked. "
+                                 "'linear' is U[0,1], the neutral uniform control.")
+    sub_parser.add_argument("--voice_nar_mask_ratio_min", type=float, default=0.85,
+                            help="Lower bound for the 'high' and 'linear' mask schedules.")
+    sub_parser.add_argument("--voice_nar_choice_temperature", type=float, default=1.0,
+                            help="Gumbel noise on MaskGIT confidence at eval-render time, "
+                                 "annealed to 0 over the rounds. 0 = greedy reveal, which "
+                                 "self-reinforces the repetition mode.")
     sub_parser.add_argument("--voice_nar_rounds", type=int, default=16,
                             help="MaskGIT refinement rounds at generation. Decoding cost is K "
                                  "forward passes REGARDLESS of length, unlike AR's one-per-frame. "
