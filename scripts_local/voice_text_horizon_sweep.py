@@ -42,6 +42,8 @@ ap.add_argument("--bs", type=int, default=8)
 ap.add_argument("--threshold", type=float, default=0.01)
 ap.add_argument("--device", default="cuda:3")
 ap.add_argument("--out_dir", default="eval_output/world_tts_horizon")
+ap.add_argument("--nar_mask_ratio", type=float, default=None,
+                help="Required for a NAR checkpoint; see world_voice_ar_diagnostics.")
 add_mrope_args(ap)
 a = ap.parse_args()
 
@@ -66,7 +68,7 @@ for st in steps:
     sp_base = getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE)
     ds = load_dataset(args, "val")
     coll = make_collator(K, a.voice_max_frames, special_token_base=sp_base)
-    r = run_tf_and_ablation(model, ds, coll, a.device, a.n, K, bs=a.bs)
+    r = run_tf_and_ablation(model, ds, coll, a.device, a.n, K, bs=a.bs, nar_mask_ratio=a.nar_mask_ratio)
     h = text_horizon(r.get("buckets", []), a.threshold)
     rows.append({"step": st, "horizon_frames": h, "horizon_words": h / 6 if h != float("inf") else None,
                  "early_text_delta": r["early_text_delta"], "early_ci": r["early_text_delta_ci"],

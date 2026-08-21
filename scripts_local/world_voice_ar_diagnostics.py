@@ -149,13 +149,37 @@ def tf_unit_stats(model, logits, tgt, K):
 
 
 @torch.no_grad()
-def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8, voice_attn_alpha=None):
+def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8,
+                        voice_attn_alpha=None, nar_mask_ratio=None, nar_seed=0):
     """Teacher-forced forward with real vs batch-shuffled text; aggregate content accuracy.
 
     early_k: also track accuracy on the FIRST early_k voice frames separately. There the
     shifted-TF input carries little/no voice history, so text is the dominant (at frame 0,
     the ONLY) predictive signal -- the cleanest place to see whether text is used, since it
-    isn't confounded by voice-history redundancy the way the all-position delta is."""
+    isn't confounded by voice-history redundancy the way the all-position delta is.
+
+    nar_mask_ratio: REQUIRED for a masked-parallel (NAR) checkpoint, meaningless otherwise.
+    Without it this probe hands the model the FULL ground-truth voice as input, which for a
+    NAR model is mask-ratio 0 -- a condition it can satisfy by copying its input. Accuracy
+    then approaches 1.0 and text_delta collapses toward 0, which reads exactly like "text
+    conditioning died" when it only means the probe asked a degenerate question. With a ratio
+    set, that fraction of frames is replaced by the model's learned MASK feature and EVERY
+    metric below is computed on masked positions only -- the training condition, and the one
+    inference actually visits.
+
+    The ratio is the NAR analogue of AR's early/late split: r=1.0 (no voice context, text is
+    the only signal) corresponds to AR's early frames, r->0 (context available) to its late
+    ones. So text_delta at r=1.0 is the clean text signal here, and early_text_delta -- which
+    assumes a left-to-right history that a masked model does not have -- is not meaningful."""
+    # Guard here rather than in one caller, so head_ablation_probe / voice_text_horizon_sweep
+    # and anything else built on this function inherit it automatically.
+    if getattr(model, "voice_mask_feature", None) is not None and nar_mask_ratio is None:
+        raise SystemExit(
+            "NAR (masked-parallel) checkpoint probed without nar_mask_ratio.\n"
+            "  At mask-ratio 0 the model is handed the full ground-truth voice and can satisfy\n"
+            "  the task by COPYING: accuracy -> ~1.0, text_delta -> ~0, which reads as collapsed\n"
+            "  conditioning but is a degenerate question. Pass --nar_mask_ratio (1.0 = text alone,\n"
+            "  0.5 = mid-refinement).")
     idxs = list(range(min(n, len(dataset))))
     tot = {"real_hits": 0, "shuf_hits": 0, "content": 0, "ce_real": 0.0, "ce_n": 0,
            "eov_hits": 0, "eov_tot": 0,
@@ -181,6 +205,21 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
         b = collator(samples)
         text = b["text_token_ids"].to(device)
         vin = b["voice_features"].unsqueeze(1).to(device)
+        nar_masked = None
+        if nar_mask_ratio is not None:
+            _mf = getattr(model, "voice_mask_feature", None)
+            if _mf is None:
+                raise RuntimeError(
+                    "--nar_mask_ratio given but the model has no voice_mask_feature; this is "
+                    "not a NAR checkpoint (or it was loaded without voice_nar).")
+            _g = torch.Generator(device="cpu").manual_seed(nar_seed + s)
+            _bb, _nn, _cc, _tt = vin.shape
+            # Same mask for the real-text and shuffled-text forwards, so the ablation is
+            # paired: any difference is the text, not a different corruption.
+            nar_masked = (torch.rand(_bb, _nn, 1, _tt, generator=_g) < float(nar_mask_ratio)
+                          ).to(device)
+            vin = torch.where(nar_masked, _mf.view(1, 1, _cc, 1).to(vin.dtype), vin)
+            nar_masked = nar_masked.squeeze(2).reshape(_bb * _nn, _tt)
         vlen = b["voice_feature_lengths"].unsqueeze(1).to(device)
         vlbl = b["voice_features"].to(device)
         tgt = b["voice_unit_ids"].to(device)
@@ -199,6 +238,12 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
         if t.shape[1] < Tc:
             t = F.pad(t, (0, Tc - t.shape[1]), value=-100)
         content = (t >= 0) & (t < K)
+        if nar_masked is not None:
+            # Score ONLY masked positions: a revealed frame is an input the model was handed,
+            # and counting it measures copying rather than prediction.
+            _m = nar_masked[:, :Tc]
+            if _m.shape[0] == content.shape[0]:
+                content = content & _m.to(content.device)
         pr, ps = lr.argmax(-1), ls.argmax(-1)
         tot["real_hits"] += (pr[content] == t[content]).sum().item()
         tot["shuf_hits"] += (ps[content] == t[content]).sum().item()
@@ -407,6 +452,15 @@ def main():
                          "but during NAR that is OOD (the model never trained with history) and "
                          "acc collapses, so it is NOT the model's real conditioning. Generation "
                          "(section 3) always runs at alpha=1 (generate() has no alpha hook).")
+    ap.add_argument("--nar_mask_ratio", type=float, default=None,
+                    help="REQUIRED for a masked-parallel (NAR) checkpoint. Fraction of voice "
+                         "frames replaced by the learned MASK feature; all TF/ablation metrics "
+                         "are then computed on masked positions ONLY. Without it the probe hands "
+                         "the model the full ground-truth voice, which a NAR model can satisfy by "
+                         "copying -- accuracy goes to ~1.0 and text_delta to ~0, which looks like "
+                         "collapsed conditioning but is a degenerate question. 1.0 = generate from "
+                         "text alone (the inference starting condition, and the NAR analogue of "
+                         "AR's early frames); 0.5 = mid-refinement.")
     ap.add_argument("--voice_temperature", type=float, default=0.6,
                     help="voice unit sampling temperature. Default 0.6 MATCHES THE TRAINING-TIME VIZ (train.py: viz_voice_temperature=0.6), i.e. the TensorBoard renders the ear has been judging. These scripts previously HARDCODED 1.0, which samples far into the 6561-way tail and is audibly less coherent than the model's actual operating point -- so every free-running number they produced described the wrong regime.")
     ap.add_argument("--voice_top_k", type=int, default=None, help="top-k truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0.")
@@ -446,8 +500,23 @@ def main():
     alpha_label = ("1.0 (inference regime, full voice attention)" if a.voice_attn_alpha is None
                    else f"{a.voice_attn_alpha} (1:1 with training at this step)")
     print(f"1/3 teacher-forced + text ablation (voice_attn_alpha={alpha_label}) ...", flush=True)
+    # Guard, not a default: probing a NAR checkpoint at mask-ratio 0 asks it to copy its own
+    # input and yields ~1.0 accuracy with ~0 text_delta -- a confident, wrong "conditioning
+    # collapsed" verdict. Same discipline as --mrope_scale_side: fail loudly instead.
+    _is_nar = getattr(model, "voice_mask_feature", None) is not None
+    if _is_nar and a.nar_mask_ratio is None:
+        raise SystemExit(
+            "This is a NAR (masked-parallel) checkpoint, so --nar_mask_ratio is required.\n"
+            "  Without it the probe hands the model the full ground-truth voice, which it can\n"
+            "  satisfy by copying -- the numbers look catastrophic for reasons that have nothing\n"
+            "  to do with the model. Use 1.0 (text alone; the inference starting condition) and\n"
+            "  0.5 (mid-refinement); early_text_delta is NOT meaningful for a masked model.")
+    if a.nar_mask_ratio is not None and not _is_nar:
+        raise SystemExit("--nar_mask_ratio given but this checkpoint has no MASK feature "
+                         "(not a NAR model, or loaded without voice_nar).")
     tf = run_tf_and_ablation(model, eval_dataset, collator, device, a.n, K, bs=a.bs,
-                             voice_attn_alpha=a.voice_attn_alpha)
+                             voice_attn_alpha=a.voice_attn_alpha,
+                             nar_mask_ratio=a.nar_mask_ratio)
     if not a.skip_generation:
         print("2/3 free-running generation ...", flush=True)
         gen, gt, eov_fired, budget_hit, prompt_lens = run_generation(
@@ -467,6 +536,11 @@ def main():
     lines.append(f"# World voice-AR diagnostics — step {a.step}\n")
     lines.append(f"checkpoint: `{a.checkpoint_path}`  |  val n(TF)={a.n}  gen_n={a.gen_n}  K={K}\n")
     lines.append(f"TF/ablation voice_attn_alpha = **{alpha_label}**  |  generation always alpha=1.\n")
+    if a.nar_mask_ratio is not None:
+        lines.append(f"**NAR probe: mask_ratio={a.nar_mask_ratio}** -- every TF/ablation number "
+                     f"below is on MASKED positions only. early_* rows are not meaningful for a "
+                     f"masked model (no left-to-right history); read text_delta at ratio 1.0 as "
+                     f"the clean text signal instead.\n")
     lines.append(f"generation sampling: **voice_temperature={a.voice_temperature}**"
                  f"{' (matches the training-time viz)' if a.voice_temperature == 0.6 else ''}"
                  f"  |  RAS win={a.voice_ras_win}. Section 3 ONLY -- sections 1/1b/2 are "

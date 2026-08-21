@@ -36,6 +36,8 @@ ap.add_argument("--head", type=int, default=4, help="the sharp aligner head")
 ap.add_argument("--n_random", type=int, default=3, help="control heads to ablate for comparison")
 ap.add_argument("--device", default="cuda:2")
 ap.add_argument("--out_dir", default="eval_output/world_tts_head_ablation")
+ap.add_argument("--nar_mask_ratio", type=float, default=None,
+                help="Required for a NAR checkpoint; see world_voice_ar_diagnostics.")
 add_mrope_args(ap)
 a = ap.parse_args()
 
@@ -56,7 +58,7 @@ print(f"block {a.block}: {n_heads} heads x d_v {d_v}; o_proj {tuple(W.shape)}", 
 
 
 def measure(tag):
-    r = run_tf_and_ablation(model, ds, coll, a.device, a.n, K, bs=a.bs)
+    r = run_tf_and_ablation(model, ds, coll, a.device, a.n, K, bs=a.bs, nar_mask_ratio=a.nar_mask_ratio)
     print(f"  {tag:22s} acc_real {r['acc_real']:.4f}  early_delta {r['early_text_delta']:+.4f}  "
           f"ppl {r['ppl_real']:.1f}", flush=True)
     return {"tag": tag, "acc_real": r["acc_real"], "early_text_delta": r["early_text_delta"],
