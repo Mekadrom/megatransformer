@@ -85,6 +85,16 @@ class MegaTransformerWorldModel(nn.Module):
         if getattr(config, "voice_cfg_enabled", False):
             self.null_text_embed = nn.Parameter(torch.zeros(config.text_prelude_config.d_model))
 
+        # NAR voice: the learned [MASK] token, in VOICE FEATURE space (it substitutes for a
+        # codebook centroid in voice_inputs, upstream of the prelude, so it must live in the
+        # same space the prelude consumes). Small random rather than zeros -- padded regions
+        # are already zeros, and a MASK indistinguishable from padding would teach the model
+        # that "unknown" and "past the end" are the same state.
+        # GATED, so a non-NAR checkpoint gets no extra parameter.
+        if getattr(config, "voice_nar", False):
+            self.voice_mask_feature = nn.Parameter(
+                torch.randn(config.voice_prelude_config.feature_channels) * 0.02)
+
         # Modality-specific preludes (only instantiate if included)
         self.audio_feature_extractor = (
             VoiceSIVEPreludeFeatureExtractor(config.audio_prelude_config)
@@ -222,6 +232,85 @@ class MegaTransformerWorldModel(nn.Module):
             self.text_generator.lm_head = self.text_feature_extractor.lm_head
             if getattr(self.text_feature_extractor, "special_embed", None) is not None:
                 self.text_generator.special_head.weight = self.text_feature_extractor.special_embed.weight
+
+    @torch.no_grad()
+    def generate_voice_nar(self, text_input_ids, n_frames, n_rounds: int = 16,
+                           temperature: float = 1.0, eov_id: Optional[int] = None):
+        """Masked-parallel (MaskGIT) voice decoding. Returns per-batch unit id lists.
+
+        Built on forward(), NOT on generate(): every position is decoded in parallel, so
+        there is no AR loop, no KV cache, and none of the cache-parity rules that govern the
+        autoregressive path apply. K forward passes total, independent of n_frames.
+
+        Each round samples every still-masked position, keeps the highest-confidence ones
+        (cosine reveal schedule), and re-masks the rest. Confidence-ordered revelation is what
+        makes this approximate the joint: the model commits first to the positions it is sure
+        about, and later rounds condition on them. Decoding in one round (n_rounds=1) samples
+        independent per-position marginals instead, which is a useful sanity check -- it
+        should sound obviously worse.
+
+        text_input_ids must already contain the [BOV (DUR_k) VOICE_PH EOV] block, as the
+        collator lays it out, so the interleaver knows where the voice goes.
+        """
+        assert getattr(self.config, "voice_nar", False), \
+            "generate_voice_nar requires a model built with voice_nar=True (it needs the MASK feature)"
+        dev = next(self.parameters()).device
+        text_input_ids = text_input_ids.to(dev)
+        B = text_input_ids.shape[0]
+        cb = self.voice_codebook.to(dev)
+        K, C = int(cb.shape[0]), int(cb.shape[1])
+        eov = K if eov_id is None else int(eov_id)
+
+        mask_feat = self.voice_mask_feature.to(dev)
+        ids = torch.zeros(B, n_frames, dtype=torch.long, device=dev)
+        known = torch.zeros(B, n_frames, dtype=torch.bool, device=dev)
+        # (B, 1) not (B,): the prelude/interleaver treat voice as (batch, n_segments, ...) and
+        # index lengths per SEGMENT, so a flat (B,) collapses to a 0-dim tensor on indexing.
+        lengths = torch.full((B, 1), n_frames, dtype=torch.long, device=dev)
+        is_synth = torch.ones(B, dtype=torch.bool, device=dev)
+
+        def _inputs():
+            feats = mask_feat.view(1, 1, C).expand(B, n_frames, C).clone()
+            if bool(known.any()):
+                feats[known] = cb[ids[known].clamp(max=K - 1)].to(feats.dtype)
+            return feats.permute(0, 2, 1).unsqueeze(1)          # (B, 1, C, T)
+
+        for r in range(max(1, n_rounds)):
+            out = self(text_input_ids=text_input_ids, voice_inputs=_inputs(),
+                       voice_lengths=lengths, precomputed_latents=True,
+                       decode_outputs=False, is_synthesis=is_synth)
+            logits = out.get("voice_unit_logits")
+            if logits is None:
+                raise RuntimeError("model produced no voice_unit_logits; is the unit head built?")
+            logits = logits.reshape(B, -1, logits.shape[-1])[:, :n_frames]
+            probs = torch.softmax(logits.float() / max(1e-3, temperature), dim=-1)
+            samp = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).reshape(B, n_frames)
+            conf = probs.gather(-1, samp.unsqueeze(-1)).squeeze(-1)
+            # Already-revealed positions keep their id and are treated as maximally confident
+            # so the top-k below never evicts a committed token.
+            samp = torch.where(known, ids, samp)
+            conf = torch.where(known, torch.full_like(conf, float("inf")), conf)
+
+            # Cosine reveal: few commitments early (when context is thin), many late.
+            frac = 1.0 - math.cos(math.pi * (r + 1) / (2 * max(1, n_rounds)))
+            n_keep = n_frames if r == max(1, n_rounds) - 1 else int(math.ceil(n_frames * frac))
+            n_keep = max(1, min(n_frames, n_keep))
+            keep_idx = conf.topk(n_keep, dim=-1).indices
+            new_known = torch.zeros_like(known)
+            new_known.scatter_(1, keep_idx, True)
+            ids = torch.where(new_known, samp, ids)
+            known = known | new_known
+            if bool(known.all()):
+                break
+
+        # Truncate each row at its first EOV (the block is sized from a duration bucket, which
+        # deliberately over-allocates -- see constants.duration_bucket_alloc).
+        outs = []
+        for b in range(B):
+            row = ids[b].tolist()
+            cut = next((i for i, u in enumerate(row) if u == eov), len(row))
+            outs.append([int(u) for u in row[:cut]])
+        return outs
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Enable gradient checkpointing on all sub-modules that support it."""
@@ -921,6 +1010,12 @@ class MegaTransformerWorldModel(nn.Module):
         # byte-identical to prior behavior (training-viz generate() never sets this). A diagnostic
         # lever to test whether "under-speaking" is the model quitting early vs already-drifted.
         voice_min_frames: int = 0,
+        # ORACLE LENGTH (duration upper-bound experiment): force the voice segment to be
+        # EXACTLY this many frames -- EOV is banned before it and the segment is cut at it.
+        # None (default) => untouched behavior. Per-call scalar, so callers generating one
+        # utterance at a time can pass that utterance's ground-truth frame count and ask
+        # "what would perfect duration prediction be worth?" without training anything.
+        voice_exact_frames: Optional[int] = None,
         # Truncated sampling for the discrete voice unit head (only active when voice_temperature > 0).
         # top_k keeps the k highest-prob units; top_p (nucleus) keeps the smallest set whose cumulative
         # prob >= p. Both None/0 (default) => untruncated temperature sampling = prior behavior. These cut
@@ -1059,6 +1154,19 @@ class MegaTransformerWorldModel(nn.Module):
         # rising but < 0 → distribution-shift; crosses 0 late → positional bias).
         voice_stop_logit_trace: List[List[float]] = [[] for _ in range(batch_size)]
         voice_unit_id_trace: List[List[int]] = [[] for _ in range(batch_size)]
+        # SEGMENT BOUNDARIES within that trace.
+        #
+        # voice_unit_id_trace is allocated once and never reset, while the token budget is
+        # checked against voice_sequences[b], which IS reset when a segment ends. So a
+        # generation that emits EOV and then opens a SECOND voice segment appends both to
+        # one flat trace while the budget restarts -- which is how 250-budget runs produced
+        # 361/465/500-"frame" traces. Callers that scored the trace as a single utterance
+        # were transcribing two concatenated utterances.
+        # Recording the boundaries fixes the MEASUREMENT without changing generation: the
+        # flat trace stays exactly as before for existing callers, and anyone who wants one
+        # utterance takes segments[b][0].
+        voice_unit_id_segments: List[List[List[int]]] = [[] for _ in range(batch_size)]
+        voice_seg_start: List[int] = [0 for _ in range(batch_size)]
         voice_f0_seq: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         completed_voice_f0: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         # Per-segment durations on the deduped path (empty otherwise). Each loop step is a
@@ -1483,11 +1591,16 @@ class MegaTransformerWorldModel(nn.Module):
                             # back to the prelude and handed to the SMG, so generation
                             # stays on the same manifold the SMG was trained on.
                             logits = unit_logits[0, -1]  # (K+1,) -- includes the EOV token
-                            # Decode-time EOV suppression: forbid the terminal token until at least
-                            # voice_min_frames content frames have been emitted for this sequence
-                            # (len(trace) = frames so far, since EOV would have stopped it earlier).
-                            # Default 0 => never triggers => unchanged behavior.
-                            if voice_min_frames > 0 and len(voice_unit_id_trace[b]) < voice_min_frames:
+                            # Decode-time EOV suppression: forbid the terminal token until at
+                            # least `_floor` content frames have been emitted IN THIS SEGMENT
+                            # (voice_min_frames, or voice_exact_frames for the oracle).
+                            # Both default to 0/None => never triggers => unchanged behavior.
+                            # The count is segment-relative because the budget below is too;
+                            # this previously counted the whole cumulative trace, so the two
+                            # length controls disagreed across a segment boundary.
+                            _seg_len = len(voice_unit_id_trace[b]) - voice_seg_start[b]
+                            _floor = max(int(voice_min_frames or 0), int(voice_exact_frames or 0))
+                            if _floor > 0 and _seg_len < _floor:
                                 logits = logits.clone()
                                 logits[self.voice_codebook.shape[0]] = float("-inf")
                             if voice_temperature > 0.0:
@@ -1524,7 +1637,7 @@ class MegaTransformerWorldModel(nn.Module):
                                     if rep >= voice_ras_win * voice_ras_tau:
                                         banned = logits.float().clone()
                                         banned[int(unit_id)] = float("-inf")
-                                        if voice_min_frames > 0 and len(voice_unit_id_trace[b]) < voice_min_frames:
+                                        if _floor > 0 and _seg_len < _floor:
                                             banned[eov_id] = float("-inf")
                                         p2 = torch.softmax(banned, dim=-1)
                                         if bool(torch.isfinite(p2).all()) and float(p2.sum()) > 0:
@@ -1593,8 +1706,13 @@ class MegaTransformerWorldModel(nn.Module):
                     else:
                         voice_sequences[b].append(current_hidden[b])
 
-                    # Stop on predicted stop or hard budget
-                    if should_stop_voice or len(voice_sequences[b]) >= voice_token_budget:
+                    # Stop on predicted stop, hard budget, or the oracle-length cut.
+                    _cut = (voice_exact_frames is not None
+                            and (len(voice_unit_id_trace[b]) - voice_seg_start[b]) >= int(voice_exact_frames))
+                    if should_stop_voice or _cut or len(voice_sequences[b]) >= voice_token_budget:
+                        if len(voice_unit_id_trace[b]) > voice_seg_start[b]:
+                            voice_unit_id_segments[b].append(voice_unit_id_trace[b][voice_seg_start[b]:])
+                            voice_seg_start[b] = len(voice_unit_id_trace[b])
                         current_modality[b] = None
                         # `and voice_sequences[b]`: EOV can fire on the FIRST step (an
                         # undertrained model), leaving no frames -- _finalize_voice would
@@ -1798,6 +1916,9 @@ class MegaTransformerWorldModel(nn.Module):
                 if f0 is not None:
                     completed_voice_f0[b].append(f0)
                 voice_sequences[b], voice_f0_seq[b], voice_duration_seq[b] = [], [], []
+            if len(voice_unit_id_trace[b]) > voice_seg_start[b]:
+                voice_unit_id_segments[b].append(voice_unit_id_trace[b][voice_seg_start[b]:])
+                voice_seg_start[b] = len(voice_unit_id_trace[b])
             if audio_sequences[b] and self.audio_generator is not None:
                 completed_audio[b].append(torch.cat(audio_sequences[b], dim=-1))
                 audio_sequences[b] = []
@@ -1864,6 +1985,9 @@ class MegaTransformerWorldModel(nn.Module):
         # batch item. Empty list when no voice/audio was generated.
         outputs["voice_stop_logit_trace"] = voice_stop_logit_trace
         outputs["voice_unit_id_trace"] = voice_unit_id_trace
+        # Same units, split at segment boundaries. Score segments[b][0] to measure ONE
+        # utterance; the flat trace above may span several.
+        outputs["voice_unit_id_segments"] = voice_unit_id_segments
         # Padded like voice_latent_preds (same helper, same time_dim) so the contour lines
         # up frame-for-frame with the units it belongs to.
         #

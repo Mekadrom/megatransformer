@@ -44,6 +44,8 @@ class MultimodalShardedDataset(Dataset):
         voice_dedup: bool = False,
         max_samples: int = None,
         include_tasks: list[str] = None,
+        data_fraction: float = 1.0,
+        data_subset_seed: int = 0,
     ):
         """
         Args:
@@ -155,6 +157,32 @@ class MultimodalShardedDataset(Dataset):
         # Cap dataset length for overfitting experiments
         if max_samples is not None and max_samples > 0:
             self.total_samples = min(self.total_samples, max_samples)
+
+        # DATA-SCALING SUBSET: keep a seeded RANDOM fraction of the corpus.
+        #
+        # Distinct from max_samples, which is a PREFIX cap (the first N in shard order).
+        # For a data-scaling slope a prefix is the wrong tool: shards are written in corpus
+        # order, so on LibriTTS-R the first 25% is a particular set of speakers/chapters and
+        # the experiment would confound "less data" with "narrower speaker distribution".
+        # A seeded random subset varies quantity while leaving the speaker distribution
+        # (in expectation) unchanged, which is the comparison the slope needs.
+        #
+        # The chosen indices are SORTED, not shuffled: ordering is the sampler's job, and
+        # keeping them monotone preserves the shard locality ShardAwareSampler relies on
+        # (a shuffled subset would thrash the LRU shard cache).
+        #
+        # NOTE the map is built against the ANCHOR modality (the longest one, which sets
+        # total_samples); shorter modalities still wrap by modulo as usual. For the
+        # single-modality runs this is aimed at, anchor == the only corpus.
+        self._subset_map = None
+        if data_fraction is not None and 0.0 < data_fraction < 1.0:
+            import random as _rnd
+            base = self.total_samples // n_tasks
+            keep = max(1, int(round(base * data_fraction)))
+            self._subset_map = sorted(_rnd.Random(data_subset_seed).sample(range(base), keep))
+            self.total_samples = keep * n_tasks
+            print(f"[MultimodalShardedDataset] data_fraction={data_fraction} seed={data_subset_seed}"
+                  f" -> {keep:,} of {base:,} unique samples per task")
 
         modality_summary = ", ".join(
             f"{name}: {m['total_samples']:,} samples / {len(m['shard_files'])} shards"
@@ -477,6 +505,9 @@ class MultimodalShardedDataset(Dataset):
         task_idx = idx % n_tasks
         task_name, modality_name, direction = tasks[task_idx]
         within_task_idx = idx // n_tasks
+        if self._subset_map is not None:
+            # Remap into the seeded random subset (see data_fraction in __init__).
+            within_task_idx = self._subset_map[within_task_idx % len(self._subset_map)]
 
         sample = {"_modality": modality_name, "_task": task_name, "_direction": direction}
         source = self._source_for_task(modality_name, direction)

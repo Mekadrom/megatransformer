@@ -8,6 +8,15 @@ from megatransformer.utils import constants
 from megatransformer.utils.megatransformer_utils import pad_and_mask, trim
 
 
+def _as_int(v):
+    """voice_feature_length arrives as an int OR a 0-d/1-elem tensor depending on the shard."""
+    if v is None:
+        return None
+    if isinstance(v, torch.Tensor):
+        return int(v.reshape(-1)[0].item()) if v.numel() else None
+    return int(v)
+
+
 class MultimodalDataCollator(DataCollator):
     """
     Data collator for multimodal training that combines text, audio, voice, and image samples.
@@ -46,6 +55,10 @@ class MultimodalDataCollator(DataCollator):
         # the injected boundary/placeholder/eos tokens match the model and the tokenized data.
         special_token_base: int = constants.SPECIAL_TOKEN_BASE,
         eos_token_id: int = constants.EOS_TOKEN_ID,
+        # NAR voice: emit a DUR_* bucket token between BOV and the voice placeholder, so the
+        # decoder knows its block length before masked refinement starts. Off => the AR
+        # layout is byte-identical.
+        emit_duration_token: bool = False,
     ):
         self.max_seq_len = max_seq_len
         self.max_waveforms = max_waveforms
@@ -55,6 +68,7 @@ class MultimodalDataCollator(DataCollator):
         self.audio_eov_id = audio_eov_id
         self._sp = constants.special_token_ids(special_token_base)
         self._eos = eos_token_id
+        self.emit_duration_token = bool(emit_duration_token)
         self.force_direction = None  # Set to "synthesis" or "transcription" to override random direction
 
     def __call__(self, examples: list[dict]) -> dict[str, torch.Tensor]:
@@ -99,6 +113,7 @@ class MultimodalDataCollator(DataCollator):
         has_voice: bool,
         has_image: bool,
         force_direction: str = None,  # None=random, "synthesis", "transcription"
+        voice_frames: Optional[int] = None,
     ) -> torch.Tensor:
         """Build a token sequence with boundary and placeholder tokens injected.
 
@@ -122,6 +137,17 @@ class MultimodalDataCollator(DataCollator):
                 return text_tokens, False
             return torch.cat([text_tokens, eos]), False
 
+        # Direction is chosen BEFORE the blocks are built: under NAR the voice block carries
+        # a duration token, and that token only makes sense in the SYNTHESIS direction (in
+        # transcription the voice is an INPUT whose length is already known, so there is
+        # nothing to predict and emitting it would train a head on a free variable).
+        if force_direction == "synthesis":
+            is_synthesis = True
+        elif force_direction == "transcription":
+            is_synthesis = False
+        else:
+            is_synthesis = random.random() < 0.5
+
         # Build media token blocks in fixed order: audio, voice, image
         media_blocks = []
         if has_audio:
@@ -130,10 +156,17 @@ class MultimodalDataCollator(DataCollator):
                 dtype=text_tokens.dtype,
             ))
         if has_voice:
-            media_blocks.append(torch.tensor(
-                [self._sp.BOV, self._sp.VOICE_PLACEHOLDER, self._sp.EOV],
-                dtype=text_tokens.dtype,
-            ))
+            # NAR: [BOV] [DUR_k] [VOICE_PH] [EOV]. The duration token sits between BOV and the
+            # placeholder so that at generation the model emits it from the BOV hidden state --
+            # the last position with full causal multimodal context and the last one before
+            # gen queries must be allocated. AR layout ([BOV][VOICE_PH][EOV]) is unchanged
+            # when the flag is off.
+            _voice_block = [self._sp.BOV]
+            if self.emit_duration_token and is_synthesis and voice_frames:
+                _voice_block.append(
+                    self._sp.base + 9 + constants.duration_bucket(int(voice_frames)))
+            _voice_block += [self._sp.VOICE_PLACEHOLDER, self._sp.EOV]
+            media_blocks.append(torch.tensor(_voice_block, dtype=text_tokens.dtype))
         if has_image:
             media_blocks.append(torch.tensor(
                 [self._sp.BOI, self._sp.IMAGE_PLACEHOLDER, self._sp.EOI],
@@ -142,13 +175,6 @@ class MultimodalDataCollator(DataCollator):
 
         media_sequence = torch.cat(media_blocks)
 
-        # Choose direction: synthesis or transcription
-        if force_direction == "synthesis":
-            is_synthesis = True
-        elif force_direction == "transcription":
-            is_synthesis = False
-        else:
-            is_synthesis = random.random() < 0.5
         if is_synthesis:
             # Synthesis: [text] [media] [EOS]
             return torch.cat([text_tokens, media_sequence, eos]), is_synthesis
@@ -184,6 +210,7 @@ class MultimodalDataCollator(DataCollator):
                 has_voice=has_voice,
                 has_image=has_image,
                 force_direction=direction,
+                voice_frames=_as_int(ex.get("voice_feature_length")),
             )
 
             all_token_ids.append(injected)
@@ -238,6 +265,7 @@ class MultimodalDataCollator(DataCollator):
                 has_voice=per_sample_has_voice[i],
                 has_image=per_sample_has_image[i],
                 force_direction=force_direction,
+                voice_frames=_as_int(ex.get("voice_feature_length")),
             )
 
             all_token_ids.append(injected)

@@ -116,6 +116,11 @@ class MegaTransformerWorldModelConfig:
     # of pre-CFG checkpoints (optimizer-state param-group size mismatch). The trainer sets this
     # True when --voice_cfg_text_dropout_prob > 0.
     voice_cfg_enabled: bool = False
+    # NAR (masked-parallel) voice synthesis. Builds the learned MASK feature the trainer
+    # substitutes for masked frames; the coda must ALSO be made bidirectional
+    # (voice_coda_config.coda_config.causal = False) or the head cannot see revealed units
+    # to its right, which is the whole point of masked-parallel decoding.
+    voice_nar: bool = False
 
     # Voice generation-query mode. None = the AR crutch (shifted-TF prelude output feeds the
     # recurrent trunk). "learned" = the trunk's SYNTHESIS voice input is a learned positional

@@ -194,6 +194,7 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
             voice_eov_id=voice_eov_id,
             special_token_base=special_token_base,
             eos_token_id=eos_token_id,
+            emit_duration_token=getattr(args, "voice_nar_duration_token", False),
         )
     return collator
 
@@ -355,6 +356,9 @@ def get_dataset(command: str, args, split: str):
                 cache_size=args.shard_cache_size,
                 max_samples=max_samples,
                 include_tasks=include_tasks,
+                # Data-scaling slope: seeded RANDOM fraction of the corpus (not a prefix).
+                data_fraction=getattr(args, "data_fraction", 1.0),
+                data_subset_seed=getattr(args, "data_subset_seed", 0),
                 # Same codebook the SMG was trained with. Snaps voice features to centroids
                 # on the fly and emits unit_ids as the coda's cross-entropy target.
                 voice_codebook=getattr(args, "voice_codebook_path", None),
@@ -556,6 +560,7 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             voice_hop_length=getattr(args, 'voice_hop_length', 256),
             voice_temperature=getattr(args, 'viz_voice_temperature', 0.6),
             voice_ras_win=getattr(args, 'viz_voice_ras_win', 0),
+            voice_nar_rounds=getattr(args, 'voice_nar_rounds', 16),
             voice_ras_tau=getattr(args, 'viz_voice_ras_tau', 0.1),
             voice_variance_floor=getattr(args, 'viz_voice_variance_floor', 0.0),
             voice_token_budget=(args.voice_token_budget if getattr(args, 'voice_token_budget', None)

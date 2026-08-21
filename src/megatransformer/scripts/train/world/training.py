@@ -138,6 +138,8 @@ class WorldModelTrainer(CommonTrainer):
         voice_duration_loss_weight: float = 1.0,
         voice_scheduled_sampling_prob: float = 0.0,
         voice_scheduled_sampling_ramp_steps: int = 10000,
+        voice_onpolicy_distill: bool = False,
+        voice_onpolicy_temperature: float = 0.8,
         # NAR→AR voice-attention curriculum (Variant B). Down-scales voice→voice
         # attention in the prelude + recurrent trunk + coda by a schedulable alpha,
         # starving the voice-history crutch so the text pathway is forced to carry
@@ -196,6 +198,8 @@ class WorldModelTrainer(CommonTrainer):
         # multimodal LMs (Flamingo, GIT, BLIP) is True — applying text loss
         # during synthesis competes with the generation objective.
         mask_text_loss_in_synthesis: bool = False,
+        emit_duration_token: bool = False,
+        voice_nar: bool = False,
         # Group within-modality samples by shard when shuffling. Default
         # True. Set False to reproduce the legacy uniform shuffle order
         # when resuming a checkpoint from a pre-shard-aware run.
@@ -218,6 +222,8 @@ class WorldModelTrainer(CommonTrainer):
         self.lr_min_ratio = lr_min_ratio
         self.lr_wsd_decay_frac = lr_wsd_decay_frac
         self.mask_text_loss_in_synthesis = mask_text_loss_in_synthesis
+        self.emit_duration_token = bool(emit_duration_token)
+        self.voice_nar = bool(voice_nar)
         self.shard_aware_sampler = shard_aware_sampler
         self.bucket_by_length = bucket_by_length
         self.bucket_mega_factor = bucket_mega_factor
@@ -257,6 +263,17 @@ class WorldModelTrainer(CommonTrainer):
         self.voice_duration_loss_weight = voice_duration_loss_weight
         self.voice_scheduled_sampling_prob = voice_scheduled_sampling_prob
         self.voice_scheduled_sampling_ramp_steps = voice_scheduled_sampling_ramp_steps
+        self.voice_onpolicy_distill = bool(voice_onpolicy_distill)
+        self.voice_onpolicy_temperature = float(voice_onpolicy_temperature)
+        if self.voice_onpolicy_distill and voice_scheduled_sampling_prob <= 0.0:
+            raise ValueError(
+                "--voice_onpolicy_distill needs --voice_scheduled_sampling_prob > 0: the "
+                "on-policy states come from the scheduled-sampling substitution. With prob 0 "
+                "the student is fed pure ground truth and the flag would silently no-op.")
+        if self.voice_onpolicy_distill and voice_distill_weight <= 0.0:
+            raise ValueError(
+                "--voice_onpolicy_distill needs --voice_distill_weight > 0; it changes WHICH "
+                "history the teacher scores, and does nothing without a distillation term.")
 
         # NAR→AR voice-attention curriculum (Variant B).
         self.voice_ar_attn_mask_steps = voice_ar_attn_mask_steps
@@ -598,7 +615,11 @@ class WorldModelTrainer(CommonTrainer):
             # Return zero loss to skip this batch gracefully
             return torch.tensor(0.0, device=next(model.parameters()).device, requires_grad=True)
         text_targets = None
-        if text_input_ids is not None and self.include_text:
+        # `or self.emit_duration_token`: a voice-only run has include_text=False, so text
+        # targets are never built -- and the NAR duration token lives in the TEXT stream, so
+        # it would receive no gradient at all. Caught by a smoke run: nar_mask_frac logged
+        # correctly while voice_duration_acc never appeared, i.e. the head was silently dead.
+        if text_input_ids is not None and (self.include_text or self.emit_duration_token):
             placeholder_ids = {self._sp.AUDIO_PLACEHOLDER, self._sp.VOICE_PLACEHOLDER, self._sp.IMAGE_PLACEHOLDER}
 
             # The model sees text_input_ids[:, :-1] as input (standard causal shift).
@@ -850,10 +871,19 @@ class WorldModelTrainer(CommonTrainer):
         if should_log and hasattr(model_for_stats, 'recurrent_block'):
             model_for_stats.recurrent_block.track_iteration_stats = True
 
+        # NAR masking replaces scheduled sampling: both corrupt the voice input, but SS
+        # simulates AR exposure bias while this IS the NAR training objective.
+        nar_mask = None
+        if self.voice_nar and voice_inputs is not None:
+            voice_inputs, nar_mask = self._apply_nar_masking(
+                model, voice_inputs, voice_lengths, is_synthesis, global_step)
+
         ss_prob = self._scheduled_sampling_prob(global_step) if model.training else 0.0
+        onpolicy_unit_ids = None
         if ss_prob > 0.0 and voice_inputs is not None and is_synthesis is not None and bool(is_synthesis.any()):
-            voice_inputs = self._apply_scheduled_sampling(
+            voice_inputs, onpolicy_unit_ids = self._apply_scheduled_sampling(
                 model, ss_prob, text_input_ids, voice_inputs, voice_lengths, is_synthesis, global_step,
+                voice_unit_ids=inputs.get("voice_unit_ids"),
             )
 
         # NAR→AR curriculum: voice→voice attention scale at this step (None => off).
@@ -949,6 +979,22 @@ class WorldModelTrainer(CommonTrainer):
             self.mask_text_loss_in_synthesis
             and task_type in ("image_synthesis", "voice_synthesis")
         )
+        # DURATION-TOKEN EXEMPTION. --mask_text_loss_in_synthesis skips the ENTIRE text loss
+        # on synthesis examples, which is right for the transcript (it is conditioning, not a
+        # target) but would give the DUR_* token zero gradient -- so the model would emit a
+        # never-learned bucket at generation while training loss looked perfectly healthy.
+        # This is the same silent-failure shape as the M-RoPE eval flag, so it is an explicit
+        # re-target rather than a quiet special case: keep the loss, mask every target that is
+        # NOT a duration bucket.
+        duration_only = False
+        if skip_text_loss and self.emit_duration_token and text_targets is not None:
+            _lo = self._sp.base + 9
+            _hi = _lo + constants.N_DURATION_BUCKETS
+            _keep = (text_targets >= _lo) & (text_targets < _hi)
+            if bool(_keep.any()):
+                text_targets = text_targets.masked_fill(~_keep, -100)
+                skip_text_loss = False
+                duration_only = True
         logits = outputs.get("logits")
         if logits is not None and text_targets is not None and not skip_text_loss:
             B, T, V = logits.size()
@@ -969,6 +1015,17 @@ class WorldModelTrainer(CommonTrainer):
             # Per-task text loss so we can see transcription vs continuation
             # independently. Same value, just logged under a task-specific key.
             loss_components[f"text_loss_norm/{task_type}"] = text_loss_norm.detach()
+            if duration_only:
+                with torch.no_grad():
+                    _m = text_targets.reshape(-1) != -100
+                    if bool(_m.any()):
+                        _pred = logits.reshape(-1, V)[_m].argmax(-1)
+                        _tgt = text_targets.reshape(-1)[_m]
+                        loss_components["voice_duration_acc"] = (_pred == _tgt).float().mean().detach()
+                        # off-by-one counts as near-miss: buckets are 7.5% wide, so an adjacent
+                        # bucket is a ~7% length error and effectively correct once EOV trims.
+                        loss_components["voice_duration_acc_pm1"] = (
+                            (_pred - _tgt).abs() <= 1).float().mean().detach()
 
         # Audio: whitened L1+MSE + variance-matching aux loss (masked by feature lengths)
         audio_latent_preds = outputs.get("audio_latent_preds")
@@ -997,6 +1054,11 @@ class WorldModelTrainer(CommonTrainer):
             used_unit_loss = True
             B, T, K = voice_unit_logits.shape
             tgt = voice_unit_ids[:, :T].to(voice_unit_logits.device).long()  # -100 = padding
+            if nar_mask is not None and nar_mask.shape[0] == tgt.shape[0]:
+                # MaskGIT: supervise ONLY masked positions. Scoring revealed ones rewards
+                # copying an input the model was handed -- the trivial solution, and at low
+                # mask ratios it swamps the gradient from the positions that matter.
+                tgt = tgt.masked_fill(~nar_mask[:, :tgt.shape[1]].to(tgt.device), -100)
             if tgt.shape[1] < T:  # logits can outrun targets by the shifted-input frame
                 tgt = torch.nn.functional.pad(tgt, (0, T - tgt.shape[1]), value=-100)
             # SYNTHESIS-ONLY supervision. In transcription the voice is INPUT and the
@@ -1053,7 +1115,21 @@ class WorldModelTrainer(CommonTrainer):
                     lens = inputs.get("voice_feature_lengths")
                     if texts is not None and lens is not None:
                         lens = lens.reshape(lens.shape[0], -1)[:, 0] if lens.dim() > 1 else lens
-                        t_logits, t_mask = teacher(texts, voice_unit_ids, lens, T)
+                        # ON-POLICY: condition the teacher on the SAME (partly self-generated)
+                        # history the student was fed. Off-policy KD only ever supervises states
+                        # reachable from a perfect prefix -- which is exactly where this model is
+                        # already near-teacher (early_text_delta +0.050 vs +0.054). Its failure is
+                        # off that manifold: once it drifts it loops, and nothing in a GT-only
+                        # objective ever tells it how to come back. CE targets stay GROUND TRUTH,
+                        # so the signal is "predict the true continuation from where you actually
+                        # are", which is the recovery behavior free-running needs.
+                        distill_ids = voice_unit_ids
+                        if self.voice_onpolicy_distill and onpolicy_unit_ids is not None:
+                            distill_ids = onpolicy_unit_ids
+                            loss_components["voice_distill_onpolicy_frac"] = (
+                                (onpolicy_unit_ids != voice_unit_ids.to(onpolicy_unit_ids.device)
+                                 ).float().mean().detach())
+                        t_logits, t_mask = teacher(texts, distill_ids, lens, T)
                         t_mask = t_mask & (tgt != -100)          # never supervise pad/transcription
                         if bool(t_mask.any()):
                             temp = self.voice_distill_temperature
@@ -1549,9 +1625,51 @@ class WorldModelTrainer(CommonTrainer):
         ramp = max(1, self.voice_scheduled_sampling_ramp_steps)
         return self.voice_scheduled_sampling_prob * min(1.0, global_step / ramp)
 
+    def _apply_nar_masking(self, model, voice_inputs, voice_lengths, is_synthesis, global_step):
+        """MaskGIT-style corruption of the voice INPUT, for masked-parallel (NAR) training.
+
+        Replaces a random subset of frames with a learned MASK feature and returns the mask so
+        the caller can restrict the unit loss to those positions. The ratio is drawn from
+        `r = cos(pi*u/2), u~U(0,1)` (the MaskGIT schedule), which covers the whole range the
+        iterative decoder walks through: r near 1 is "generate from text alone", r near 0 is
+        "repair one token given the rest", and inference visits both.
+
+        WHY A CAUSAL TRUNK IS STILL FINE: trunk_hidden[t'] encodes every unit revealed at
+        positions <= t', so a BIDIRECTIONAL coda attending over all trunk hidden states sees
+        every revealed unit, including ones to its right. That is why NAR needs
+        --voice_coda_bidirectional rather than a second unit-injection path into the coda.
+        """
+        if voice_inputs is None or is_synthesis is None or not bool(is_synthesis.any()):
+            return voice_inputs, None
+        unwrapped = model.module if hasattr(model, "module") else model
+        mask_feat = getattr(unwrapped, "voice_mask_feature", None)
+        if mask_feat is None:
+            return voice_inputs, None
+
+        b, n, C, t = voice_inputs.shape
+        dev = voice_inputs.device
+        u = torch.rand(b, n, 1, 1, device=dev)
+        ratio = torch.cos(u * (math.pi / 2))                       # (b, n, 1, 1) in (0, 1]
+        masked = torch.rand(b, n, 1, t, device=dev) < ratio
+        # Synthesis rows only: in transcription the voice IS the input being read, so masking
+        # it is damage rather than signal.
+        masked = masked & is_synthesis.view(b, 1, 1, 1).to(torch.bool)
+        # Never mask padding -- no target there, and it would dilute the loss denominator.
+        if voice_lengths is not None:
+            lens = voice_lengths.reshape(b, -1)[:, 0] if voice_lengths.dim() > 1 else voice_lengths
+            idx = torch.arange(t, device=dev).view(1, 1, 1, t)
+            masked = masked & (idx < lens.view(b, 1, 1, 1).to(dev))
+        mixed = torch.where(masked, mask_feat.view(1, 1, C, 1).to(voice_inputs.dtype), voice_inputs)
+
+        if global_step % self.args.logging_steps == 0:
+            metrics.log_scalar("train/nar_mask_frac", masked.float().mean().item(), global_step,
+                               skip_zero=False)
+        return mixed, masked.squeeze(2).reshape(b * n, t)
+
     @torch.no_grad()
     def _apply_scheduled_sampling(
         self, model, ss_prob, text_input_ids, voice_inputs, voice_lengths, is_synthesis, global_step,
+        voice_unit_ids=None,
     ):
         """Replace a fraction of the teacher-forced frames with the model's own predictions.
 
@@ -1586,7 +1704,17 @@ class WorldModelTrainer(CommonTrainer):
         codebook = getattr(unwrapped, "voice_codebook", None)
         unit_logits = tf_out.get("voice_unit_logits")            # (num_seg, T, K+1)
         if unit_logits is not None and codebook is not None:
-            ids = unit_logits.argmax(-1)                          # (num_seg, T), in [0, K]
+            # SAMPLE rather than argmax when a temperature is set. Greedy decoding at 44k
+            # gives 96% adjacent repeats, i.e. the argmax IS "repeat the previous unit" --
+            # substituting that trains recovery from a state the sampler never visits.
+            # Sampling at the deployment temperature substitutes states the model actually
+            # reaches. 0.0 keeps the old argmax behavior.
+            _t = float(getattr(self, "voice_onpolicy_temperature", 0.0) or 0.0)
+            if _t > 0.0:
+                _p = torch.softmax(unit_logits.float() / _t, dim=-1)
+                ids = torch.multinomial(_p.reshape(-1, _p.shape[-1]), 1).reshape(unit_logits.shape[:-1])
+            else:
+                ids = unit_logits.argmax(-1)                      # (num_seg, T), in [0, K]
             # The unit head is K+1-way (EOV = id K), but the codebook has only K rows, so an
             # argmax of EOV would index out of bounds (device-side assert). EOV is a terminator
             # with no centroid; clamp it to a valid code for this SS INPUT substitution (rare,
@@ -1620,9 +1748,30 @@ class WorldModelTrainer(CommonTrainer):
         use_pred = use_pred & synth
         mixed = torch.where(use_pred, preds.detach().to(voice_inputs.dtype), voice_inputs)
 
+        # ON-POLICY DISTILLATION needs the ids the student was actually fed, not the GT ids:
+        # scoring the teacher on GT while the student saw a corrupted history asks "what
+        # follows the TRUE prefix" when the student is standing somewhere else. Returning
+        # the mixed ids lets the teacher be scored on the SAME history -- "what would the
+        # teacher do from where you are", which is the whole point of going on-policy.
+        mixed_ids = None
+        if voice_unit_ids is not None and unit_logits is not None and codebook is not None:
+            gt = voice_unit_ids.to(ids.device).long()
+            n_pos = min(gt.shape[-1], ids.shape[-1])
+            if gt.reshape(-1, gt.shape[-1]).shape[0] == ids.shape[0]:
+                gt_f = gt.reshape(-1, gt.shape[-1])[:, :n_pos]
+                sel = use_pred.reshape(ids.shape[0], -1)[:, :n_pos]
+                # `gt_f >= 0` preserves -100 padding, which both the CE target and the
+                # teacher mask key off; substituting there would supervise pad positions.
+                mixed_ids = torch.where(sel & (gt_f >= 0), ids[:, :n_pos], gt_f)
+                mixed_ids = mixed_ids.reshape(gt.shape[0], -1) if gt.dim() == 2 else mixed_ids
+            elif not getattr(self, "_warned_onpolicy_shape", False):
+                self._warned_onpolicy_shape = True
+                print(f"[onpolicy_distill] disabled: unit ids {tuple(gt.shape)} do not line up "
+                      f"with logits {tuple(ids.shape)}; teacher stays on ground truth", flush=True)
+
         if global_step % self.args.logging_steps == 0:
             metrics.log_scalar("train/scheduled_sampling_prob", ss_prob, global_step, skip_zero=False)
-        return mixed
+        return mixed, mixed_ids
 
     def _log_precision_once(self, model):
         """Report the ACTIVE compute precision, probed from INSIDE the model's forward.
@@ -2114,6 +2263,12 @@ def load_model(args, device='cuda'):
             config.voice_prelude_config.prenet_dropout = args.voice_prenet_dropout
         if getattr(args, 'voice_cfg_text_dropout_prob', 0.0) > 0.0:
             config.voice_cfg_enabled = True  # create the null_text_embed param (CFG)
+        if getattr(args, 'voice_nar', False):
+            # Masked-parallel voice. Two coupled changes: the MASK parameter, and a
+            # BIDIRECTIONAL coda -- with a causal coda, position t cannot see units revealed
+            # to its right and iterative refinement degenerates to left-to-right infilling.
+            config.voice_nar = True
+            config.voice_coda_config.coda_config.causal = False
         if getattr(args, 'text_encoder_model', None):
             # Single gate: swap the from-scratch text prelude/coda for a pretrained LLM body +
             # translators + the LLM's LM head. None (default) leaves the model byte-identical.
@@ -2134,7 +2289,11 @@ def load_model(args, device='cuda'):
                 "model": args.text_encoder_model,
                 "freeze": not getattr(args, 'text_encoder_unfreeze', False),
                 "translator_hidden_mult": getattr(args, 'text_encoder_translator_mult', 2.0),
-                "n_special_tokens": constants.N_SPECIAL_TOKENS,
+                # Opt-in only: the duration buckets add 32 rows to special_embed/special_head,
+                # which is a MODEL SHAPE. A run that does not ask for them keeps 9.
+                "n_special_tokens": (constants.N_SPECIAL_TOKENS_WITH_DURATION
+                                     if getattr(args, 'voice_nar_duration_token', False)
+                                     else constants.N_SPECIAL_TOKENS),
             }
         if getattr(args, 'voice_gen_query_mode', None):
             # Gen-query voice synthesis: creates voice_gen_queries + voice_coda_prev_proj
@@ -2405,6 +2564,8 @@ def create_trainer(
         voice_distill_teacher=_build_distill_teacher(args),
         voice_distill_weight=getattr(args, 'voice_distill_weight', 0.0),
         voice_distill_temperature=getattr(args, 'voice_distill_temperature', 1.0),
+        voice_onpolicy_distill=getattr(args, 'voice_onpolicy_distill', False),
+        voice_onpolicy_temperature=getattr(args, 'voice_onpolicy_temperature', 0.8),
         include_text="text" in include_modes,
         include_audio="audio" in include_modes,
         include_voice="voice" in include_modes,
@@ -2419,6 +2580,8 @@ def create_trainer(
         lr_min_ratio=getattr(args, 'lr_min_ratio', 0.1),
         lr_wsd_decay_frac=getattr(args, 'lr_wsd_decay_frac', 0.2),
         mask_text_loss_in_synthesis=getattr(args, 'mask_text_loss_in_synthesis', False),
+        emit_duration_token=getattr(args, 'voice_nar_duration_token', False),
+        voice_nar=getattr(args, 'voice_nar', False),
         shard_aware_sampler=getattr(args, 'shard_aware_sampler', True),
         bucket_by_length=getattr(args, 'bucket_by_length', False),
         bucket_mega_factor=getattr(args, 'bucket_mega_factor', 25),
@@ -2660,6 +2823,17 @@ def add_cli_args(subparsers):
                             help="Media inputs are raw (mel specs / images), not VAE latents")
 
     # Dataset limiting (for overfitting experiments)
+    sub_parser.add_argument("--data_fraction", type=float, default=1.0,
+                            help="Train on a seeded RANDOM fraction of the corpus (1.0 = all). "
+                                 "For data-scaling experiments: at matched steps, a smaller "
+                                 "fraction sees each sample proportionally more often, so the "
+                                 "comparison isolates DATA QUANTITY at fixed compute. Unlike "
+                                 "--max_samples (a prefix cap, i.e. the first N in shard order "
+                                 "= a biased speaker subset), this preserves the speaker "
+                                 "distribution in expectation.")
+    sub_parser.add_argument("--data_subset_seed", type=int, default=0,
+                            help="Seed for --data_fraction. Vary it to check that a slope is not "
+                                 "an artifact of one particular subset draw.")
     sub_parser.add_argument("--max_samples", type=int, default=None,
                             help="Cap dataset size to N samples (for overfitting/memorization experiments)")
     sub_parser.add_argument("--use_memorization_dataset", action="store_true", default=False,
@@ -2888,6 +3062,43 @@ def add_cli_args(subparsers):
                                  "its LM head. None (default) = current from-scratch path, byte-"
                                  "identical. NOTE: the LLM owns its tokenizer, so text data must be "
                                  "re-tokenized with it (fold into the clean-data re-preprocess).")
+    sub_parser.add_argument("--voice_nar", action="store_true", default=False,
+                            help="Masked-parallel (NAR) voice synthesis instead of autoregressive. "
+                                 "Trains a MaskGIT objective: a cosine-sampled fraction of voice "
+                                 "frames is replaced by a learned MASK feature and the unit loss is "
+                                 "restricted to those positions. Makes the voice coda BIDIRECTIONAL "
+                                 "so the head sees revealed units on both sides. Motivated by the "
+                                 "measured AR failure: greedy decoding puts 96% adjacent repeats, "
+                                 "i.e. the conditional mode is 'repeat the previous unit' -- a loop "
+                                 "that is structurally impossible without an AR feedback path.")
+    sub_parser.add_argument("--voice_nar_rounds", type=int, default=16,
+                            help="MaskGIT refinement rounds at generation. Decoding cost is K "
+                                 "forward passes REGARDLESS of length, unlike AR's one-per-frame. "
+                                 "K=1 samples independent per-position marginals and should sound "
+                                 "obviously worse -- a useful check that the head is modelling the "
+                                 "joint rather than the marginals.")
+    sub_parser.add_argument("--voice_nar_duration_token", action="store_true", default=False,
+                            help="NAR voice: emit a DUR_* bucket token between BOV and the voice "
+                                 "placeholder, predicted from the BOV hidden state (the last "
+                                 "position with full causal multimodal context, and the last one "
+                                 "before gen queries must be allocated). 32 log-spaced buckets "
+                                 "over [25,250] frames, measured from the training cache. Rides "
+                                 "the existing trainable special_embed/special_head extension, so "
+                                 "the frozen LLM is untouched. Automatically exempts the token "
+                                 "from --mask_text_loss_in_synthesis, which would otherwise give "
+                                 "it zero gradient while training loss looked healthy.")
+    sub_parser.add_argument("--voice_onpolicy_distill", action="store_true", default=False,
+                            help="Score the distillation teacher on the model's OWN "
+                                 "(scheduled-sampling-substituted) unit history instead of the "
+                                 "ground truth. Off-policy KD only supervises states reachable "
+                                 "from a perfect prefix -- where this model is already near the "
+                                 "teacher. Its failure is off that manifold. Requires "
+                                 "--voice_scheduled_sampling_prob > 0 and --voice_distill_weight > 0.")
+    sub_parser.add_argument("--voice_onpolicy_temperature", type=float, default=0.8,
+                            help="Temperature for sampling the substituted units (0 = argmax, the "
+                                 "old behavior). Argmax substitutes the MODE, which greedy decoding "
+                                 "shows is 'repeat the previous unit' -- a state the sampler never "
+                                 "visits. 0.8 matches the measured best decode point.")
     sub_parser.add_argument("--text_encoder_unfreeze", action="store_true",
                             help="Fine-tune the pretrained LLM (default: frozen). Use a low LR; "
                                  "differential-LR wiring is a follow-up -- frozen is the tested path.")

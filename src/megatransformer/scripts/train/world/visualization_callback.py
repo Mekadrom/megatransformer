@@ -46,6 +46,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         voice_temperature: float = 0.6,
         voice_variance_floor: float = 0.0,
         voice_ras_win: int = 0,
+        voice_nar_rounds: int = 16,
         voice_ras_tau: float = 0.1,
         include_modes: Optional[list[str]] = None,
         include_tasks: Optional[list[str]] = None,
@@ -91,6 +92,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         # ignores it (deterministic mu). 0 = deterministic; ~0.5-0.7 = moderate stochasticity.
         self.voice_temperature = voice_temperature
         self.voice_ras_win = int(voice_ras_win or 0)
+        self.voice_nar_rounds = int(voice_nar_rounds or 16)
         self.voice_ras_tau = float(voice_ras_tau)
         self.voice_variance_floor = voice_variance_floor
         self.voice_sample_rate = voice_sample_rate
@@ -195,6 +197,50 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 break
         return samples
 
+    def _nar_voice_generate(self, model, text_input_ids, device):
+        """Masked-parallel voice render for a NAR model, shaped like a generate() output.
+
+        The AR generate() path is meaningless for a NAR checkpoint -- it would decode one
+        frame at a time from a bidirectional head that was trained to see both sides -- so the
+        eval renders would be garbage while looking fine. Route them here instead.
+
+        Two steps, because the block length must be known before any voice position exists:
+          1. one forward over the prompt (which ends at BOV) to read the next-token
+             distribution, restricted to the DUR_* ids, and sample the duration bucket;
+          2. allocate that many frames and run the MaskGIT sampler.
+        """
+        unwrapped = model.module if hasattr(model, "module") else model
+        sp = self._sp
+        dur_lo = sp.base + 9
+        dur_hi = dur_lo + constants.N_DURATION_BUCKETS
+        with torch.no_grad():
+            out = unwrapped(text_input_ids=text_input_ids, decode_outputs=False)
+            logits = out.get("logits")
+            if logits is None:
+                return {}
+            # Restrict to duration tokens: at this point in the sequence nothing else is a
+            # legal continuation, and an untrained model would otherwise emit ordinary text.
+            dur_logits = logits[0, -1, dur_lo:dur_hi]
+            bucket = int(torch.argmax(dur_logits).item())
+        n_frames = constants.duration_bucket_alloc(bucket)
+        full = torch.cat([
+            text_input_ids,
+            torch.tensor([[dur_lo + bucket, sp.VOICE_PLACEHOLDER, sp.EOV]],
+                         dtype=text_input_ids.dtype, device=text_input_ids.device),
+        ], dim=1)
+        ids = unwrapped.generate_voice_nar(
+            full, n_frames=n_frames, n_rounds=self.voice_nar_rounds,
+            temperature=max(1e-3, self.voice_temperature or 1.0))[0]
+        if not ids:
+            return {"voice_unit_id_trace": [[]], "voice_duration_bucket": bucket}
+        cb = unwrapped.voice_codebook.to(device)
+        feats = cb[torch.tensor(ids, device=device).clamp(max=cb.shape[0] - 1)]
+        return {
+            "voice_latent_preds": feats.permute(1, 0).unsqueeze(0).unsqueeze(0),  # (1,1,C,T)
+            "voice_unit_id_trace": [ids],
+            "voice_duration_bucket": bucket,
+        }
+
     def _generate(self, model, **kwargs):
         """self._generate(model, ) with THIS run's media budgets applied.
 
@@ -213,6 +259,20 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if self.voice_ras_win:
             kwargs.setdefault("voice_ras_win", self.voice_ras_win)
             kwargs.setdefault("voice_ras_tau", self.voice_ras_tau)
+        # NAR checkpoints decode by masked refinement, not autoregression. Gate on a prompt
+        # that ENDS at BOV (that is what the voice-synthesis scenarios build) so image/text
+        # scenarios are untouched.
+        unwrapped = model.module if hasattr(model, "module") else model
+        if getattr(getattr(unwrapped, "config", None), "voice_nar", False):
+            tii = kwargs.get("text_input_ids")
+            if (tii is not None and tii.shape[0] == 1 and tii.shape[1] > 0
+                    and int(tii[0, -1].item()) == self._sp.BOV
+                    and kwargs.get("voice_inputs") is None):
+                try:
+                    return self._nar_voice_generate(model, tii, tii.device)
+                except Exception as e:
+                    print(f"Warning: NAR voice render failed ({e}); no voice this step")
+                    return {}
         return model.generate(**kwargs)
 
     def _scenario_enabled(self, required_modes: set, satisfying_tasks: set) -> bool:
