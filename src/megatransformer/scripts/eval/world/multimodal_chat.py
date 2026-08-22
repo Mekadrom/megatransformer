@@ -1063,16 +1063,22 @@ def main():
                     label="Generated text (with [image N] / [voice N] / [audio N] markers in position)",
                     lines=5,
                 )
-                # Sized to show a 1024x1024 render at NATIVE resolution. Both settings are
-                # required: at columns=3 each cell is ~1/3 of the column width (this sits in a
-                # scale=3 column, so ~460px on a 1920px window) and the image is downscaled no
-                # matter how tall the box is. columns=1 gives it the full width; height leaves
-                # 1024 for the image plus room for the caption strip. object_fit="contain"
-                # letterboxes rather than cropping, so non-square renders still fit.
-                # Trade-off, deliberate: multiple images now stack vertically and scroll.
-                # preview=True keeps click-to-enlarge for inspecting detail.
-                out_gallery = gr.Gallery(label="Generated images", columns=1,
-                                         height=1100, object_fit="contain", preview=True)
+                # Show a 1024x1024 render at NATIVE resolution -- no larger, no smaller.
+                # Three settings, each fixing a different way this goes wrong:
+                #   columns=1      at columns=3 each cell is ~1/3 of the enclosing scale=3
+                #                  column (~460px on a 1920px window), so the render is
+                #                  downscaled by WIDTH no matter how tall the box is.
+                #   scale-down     "contain" fits the box in BOTH directions, which ENLARGES
+                #                  a 1024 image when the container is bigger -- on a 1440p
+                #                  screen it grew to fill the viewport. "scale-down" is
+                #                  contain-but-never-upscale, so 1024 renders at 1024.
+                #   preview=False  the preview pane sizes to its own content and ignores
+                #                  `height`. allow_preview defaults True, so clicking an
+                #                  image still opens it enlarged.
+                # height is 1024 plus room for the caption strip. Multiple images stack and
+                # scroll -- inherent to native size, and preferable to silent downscaling.
+                out_gallery = gr.Gallery(label="Generated images", columns=1, height=1040,
+                                         object_fit="scale-down", preview=False)
                 out_audio_files = gr.Files(label="Generated voice clips (.wav)")
 
             with gr.Column(scale=1):
