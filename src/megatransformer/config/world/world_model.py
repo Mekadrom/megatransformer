@@ -648,6 +648,17 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3_x1pred_x1w"].image_coda_config.flow_los
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_trunkctx"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_trunkctx"].image_coda_config.flow_ctx = "trunk"
 
+# cross_dec DROPPED OUTRIGHT -- the real "is the Q-Former necessary" arm.
+# `_trunkctx` above does NOT answer that: zimage_adapter.py runs cross_dec unconditionally and
+# seq_pred always reads its output, so there the Q-Former is still built, still executed and
+# still trained by the 0.1 aux MSE; only the FLOW HEAD's context changes. Here the module and
+# its out_queries are never constructed, so they are gone from every forward and every gradient
+# path, and the aux point head reads the self_enc'd trunk states instead (so alpha / R^2 /
+# retrieval diagnostics still work). Valid because n_image_gen_positions == seq_len == 64, which
+# makes cross_dec's K -> seq_len remap identity-shaped anyway; the adapter raises if they differ.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec"].image_coda_config.use_cross_dec = False
+
 # xskip + explicit DISPERSION MATCHING. The best arm so far (xskip) still emits under-dispersed
 # content and leans on both leftover noise and CFG to make up for it; this makes the spread an
 # objective instead. Weight 0.5 with a small anti-collapse barrier: the term is dimensionless and

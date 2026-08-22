@@ -60,11 +60,21 @@ class ZImageConditioningAdapter(nn.Module):
             activation="gelu", batch_first=True, norm_first=True)
         self.self_enc = nn.TransformerEncoder(enc, config.n_layers)
 
-        self.out_queries = nn.Parameter(torch.randn(config.seq_len, d) * 0.02)
-        dec = nn.TransformerDecoderLayer(
-            d, config.n_heads, d * 4, dropout=config.dropout,
-            activation="gelu", batch_first=True, norm_first=True)
-        self.cross_dec = nn.TransformerDecoder(dec, config.n_cross_layers)
+        # cross_dec (the Q-Former) is optional. use_cross_dec=False drops it and out_queries
+        # ENTIRELY -- no params, no compute, no gradient path -- and the aux point head then
+        # reads the self_enc'd trunk states. Contrast flow_ctx="trunk", which only reroutes the
+        # flow head and leaves cross_dec built, executed and trained via seq_pred.
+        self.use_cross_dec = bool(getattr(config, "use_cross_dec", True))
+        self.seq_len = int(config.seq_len)
+        if self.use_cross_dec:
+            self.out_queries = nn.Parameter(torch.randn(config.seq_len, d) * 0.02)
+            dec = nn.TransformerDecoderLayer(
+                d, config.n_heads, d * 4, dropout=config.dropout,
+                activation="gelu", batch_first=True, norm_first=True)
+            self.cross_dec = nn.TransformerDecoder(dec, config.n_cross_layers)
+        else:
+            self.out_queries = None
+            self.cross_dec = None
 
         self.seq_norm = nn.LayerNorm(d)
         self.seq_head = nn.Linear(d, config.seq_dim)
@@ -290,8 +300,18 @@ class ZImageConditioningAdapter(nn.Module):
     ):
         x = self.in_proj(encoder_hidden_states)          # (B, K_in, d)
         x = self.self_enc(x)
-        q = self.out_queries.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, seq_len, d)
-        q = self.cross_dec(q, x)                         # seq_len slots attend the K_in queries
+        if self.use_cross_dec:
+            q = self.out_queries.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, seq_len, d)
+            q = self.cross_dec(q, x)                     # seq_len slots attend the K_in queries
+        else:
+            # cross_dec DROPPED: the trunk states are the conditioning directly. Only valid when
+            # K_in == seq_len, because cross_dec is the sole K -> seq_len remap.
+            if x.shape[1] != self.seq_len:
+                raise ValueError(
+                    f"use_cross_dec=False needs K_in == seq_len, got K_in={x.shape[1]} vs "
+                    f"seq_len={self.seq_len}. cross_dec is the only module that remaps K to "
+                    f"seq_len; drop it only when n_image_gen_positions == seq_len.")
+            q = x
         seq_pred = self.seq_head(self.seq_norm(q))       # (B, seq_len, seq_dim); WHITENED space if self.whiten
         # WHAT THE GENERATIVE HEAD IS CONDITIONED ON. Default "qformer" = the cross_dec output q,
         # as shipped. "trunk" hands it `x` instead -- the self_enc'd trunk states -- bypassing

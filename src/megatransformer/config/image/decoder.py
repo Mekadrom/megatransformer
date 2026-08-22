@@ -440,6 +440,14 @@ class ZImageAdapterConfig:
     # self_enc + cross_dec are 33.1M params = 49% of the adapter, and cross_dec's stated purpose
     # (decoupling K input queries from output length) is UNUSED at the shipped sizes: 64 -> 64.
     flow_ctx: str = "qformer"              # "qformer" | "trunk"
+    # Build the Q-Former (cross_dec) at all. False DROPS it entirely: the module is never
+    # constructed, so its params and compute are gone from every path -- unlike flow_ctx="trunk",
+    # which only changes what the FLOW HEAD reads while cross_dec is still executed and still
+    # trained by the aux MSE (seq_pred reads its output). With this False the aux point head
+    # reads the self_enc'd trunk states directly, so alpha/R^2/retrieval diagnostics survive.
+    # Requires K_in == seq_len, since cross_dec is the only thing that can remap K -> seq_len;
+    # at the shipped sizes both are 64, so that map is identity-shaped anyway.
+    use_cross_dec: bool = True
     # DISPERSION MATCHING on a SAMPLED draw: |std(draw)/std(target) - 1|, plus an optional
     # -log(ratio) anti-collapse barrier. Same form as the trainer's modality var-loss, which is
     # wired only to the LATENT image path and never reaches this adapter.
