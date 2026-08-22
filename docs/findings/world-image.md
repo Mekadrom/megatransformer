@@ -244,17 +244,29 @@ the `whiten_0` baseline at 20k (that run has every checkpoint 1000–20000 on di
 is a POINT head, so there is no matched-w comparison against it — it is flow-arm-at-some-w vs
 point-head-at-no-guidance, which is exactly why the w=3-vs-4.5 choice is not cosmetic.
 
-### Both from-scratch arms PEAK at 0.205 and then decline while training loss does not
-Replicated across two independent runs, offset by the ~2k steps that separates them:
+### ~~Both from-scratch arms PEAK at 0.205 and then decline~~ — WITHDRAWN 2026-08-22, same day
+**The next checkpoint falsified this.** `t3_xskip` went 0.205 @ 11k -> 0.148 -> 0.128 -> **0.197
+@ 14k**. It recovered; there was no decline, just the +-0.05 per-checkpoint oscillation already
+documented in the eval-protocol entry above. `trunkctx`'s 0.205 -> 0.187 -> 0.151 is the same
+oscillation and should not be read as a trend either.
 
-| | peak | +1k | +2k |
-|---|---|---|---|
-| `t3_xskip` | **0.205** @ 11k | 0.148 | 0.128 |
-| `trunkctx` | **0.205** @ 13k | 0.187 | 0.151 |
+**How this got recorded:** three consecutive down-steps on one arm, then three on the other,
+looked like replication across independent runs. It was the SAME 8-prompt variance twice. The
+protocol entry above says not to read adjacent pairs; three points in a row is not enough more
+to overturn it, and "it replicated" is not independent evidence when both arms share a probe
+this small. Keeping the original claim per the RETRACTED convention.
 
-Training loss over the same windows shows NO corresponding degradation: `t3_xskip` IMPROVED
-(mean ~0.99 over 10.6k-12.3k -> ~0.86 over 12.8k-13.2k) and `trunkctx` is flat (~1.07 over
-13.8k-15.2k). Loss down, render down.
+The loss observation below still stands on its own and is what made the story attractive:
+
+| | peak | +1k | +2k | +3k |
+|---|---|---|---|---|
+| `t3_xskip` | 0.205 @ 11k | 0.148 | 0.128 | **0.197** |
+| `trunkctx` | 0.205 @ 13k | 0.187 | 0.151 | — |
+
+Training loss over the same windows shows no corresponding degradation: `t3_xskip` mean ~0.99
+over 10.6k-12.3k -> ~0.86 over 12.8k-13.2k, `trunkctx` flat ~1.07 over 13.8k-15.2k. With the
+decline withdrawn this is no longer evidence of anything — flat loss against oscillating render
+is exactly what you expect when the render metric is the noisy one.
 
 Two independent arms peaking at the same value and declining the same way is much harder to
 attribute to the 8-prompt probe's variance than a single arm's dip was — though note it is still
@@ -266,10 +278,10 @@ disagree; the DiT wants dispersion over L2), appearing here as a function of TRA
 flow objective rewards an increasingly conditional-mean-like prediction, which a frozen decoder
 renders blander. See the dispersion entry in `cross-modal.md` if it has been promoted there.
 
-⚠️ **Consequences for the 20k comparison:** by 20k both arms may be well past peak, so a
-matched-step reading at 20k could compare two degraded checkpoints and understate both. Compare
-PEAK-to-peak as well as step-to-step, and do not prune old checkpoints — for `t3_xskip` the best
-checkpoint so far is 11000, not the latest.
+⚠️ **What survives the withdrawal:** do not prune old checkpoints, and quote the BEST
+checkpoint alongside the latest — not because the arms are degrading, but because per-checkpoint
+variance is +-0.05 and any single reading is a coin flip. For the 20k comparison, take several
+checkpoints per arm and compare distributions, not endpoints.
 
 ### Late recurrent iterations now DECAY conditioning (new at 11k, absent at 10k)
 `cond/const` peaks 0.0472 at iteration 2, holds ~0.046 through iteration 18, then falls to 0.0327 by
