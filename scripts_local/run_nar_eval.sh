@@ -24,7 +24,7 @@ CB=$CACHE/val/cosyvoice2_codebook.pt
 CV2=/mnt/nasbro/cache/hf_home/hub/models--FunAudioLLM--CosyVoice2-0.5B/snapshots/eec1ae6c79877dbd9379285cf8789c9e0879293d
 RUN=runs/world/world_tts_cosyvoice2_smollm2_nar_0
 CKPT=$RUN/checkpoint-$STEP
-OUT=scripts_local/eval_output/world_tts_nar_${STEP}
+OUT=eval_output/world_tts_nar_${STEP}
 LOGS=$OUT/logs
 mkdir -p "$LOGS"
 

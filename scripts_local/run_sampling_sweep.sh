@@ -16,7 +16,7 @@ CACHE=./cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2
 CB=$CACHE/val/cosyvoice2_codebook.pt
 CV2=/mnt/nasbro/cache/hf_home/hub/models--FunAudioLLM--CosyVoice2-0.5B/snapshots/eec1ae6c79877dbd9379285cf8789c9e0879293d
 CKPT=runs/world/world_tts_cosyvoice2_smollm2_mrope_scale_text_0/checkpoint-44000
-OUT=scripts_local/eval_output/world_tts_mrope44k/sampling_sweep
+OUT=eval_output/world_tts_mrope44k/sampling_sweep
 LOGS=$OUT/logs
 mkdir -p "$LOGS"
 

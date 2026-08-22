@@ -334,6 +334,7 @@ class MegaTransformerWorldModel(nn.Module):
         # index lengths per SEGMENT, so a flat (B,) collapses to a 0-dim tensor on indexing.
         lengths = torch.full((B, 1), n_frames, dtype=torch.long, device=dev)
         is_synth = torch.ones(B, dtype=torch.bool, device=dev)
+        round_entropy: List[float] = []
 
         def _inputs():
             feats = mask_feat.view(1, 1, C).expand(B, n_frames, C).clone()
@@ -349,6 +350,14 @@ class MegaTransformerWorldModel(nn.Module):
             if logits is None:
                 raise RuntimeError("model produced no voice_unit_logits; is the unit head built?")
             logits = logits.reshape(B, -1, logits.shape[-1])[:, :n_frames]
+            # Mean raw entropy over the positions still undecided this round. Falling across
+            # rounds = the model growing certain as it conditions on its own commitments.
+            with torch.no_grad():
+                _pe = torch.softmax(logits.float(), dim=-1)
+                _ent = -(_pe.clamp_min(1e-12).log2() * _pe).sum(-1)      # (B, T)
+                _open = ~known
+                round_entropy.append(float(_ent[_open].mean().item()) if bool(_open.any())
+                                     else float("nan"))
             probs = torch.softmax(logits.float() / max(1e-3, temperature), dim=-1)
             samp = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).reshape(B, n_frames)
             conf = probs.gather(-1, samp.unsqueeze(-1)).squeeze(-1)
@@ -398,6 +407,7 @@ class MegaTransformerWorldModel(nn.Module):
             if bool(known.all()):
                 break
 
+        self.last_nar_round_entropy = round_entropy      # bits per refinement round
         # Truncate each row at its first EOV (the block is sized from a duration bucket, which
         # deliberately over-allocates -- see constants.duration_bucket_alloc).
         outs = []
@@ -1279,6 +1289,7 @@ class MegaTransformerWorldModel(nn.Module):
         # Recording the boundaries fixes the MEASUREMENT without changing generation: the
         # flat trace stays exactly as before for existing callers, and anyone who wants one
         # utterance takes segments[b][0].
+        voice_unit_entropy_trace: List[List[float]] = [[] for _ in range(batch_size)]
         voice_unit_id_segments: List[List[List[int]]] = [[] for _ in range(batch_size)]
         voice_seg_start: List[int] = [0 for _ in range(batch_size)]
         voice_f0_seq: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
@@ -1712,6 +1723,15 @@ class MegaTransformerWorldModel(nn.Module):
                             # The count is segment-relative because the budget below is too;
                             # this previously counted the whole cumulative trace, so the two
                             # length controls disagreed across a segment boundary.
+                            # PER-STEP PREDICTIVE ENTROPY during free-running. The separate
+                            # teacher-forced probe measures this with a PERFECT prefix; here the
+                            # prefix is the model's own drifting output, which is the condition
+                            # that actually produces the audio. Raw (untempered) so it is a
+                            # property of the model rather than of the sampler, and directly
+                            # comparable to the probe's raw column.
+                            _pe = torch.softmax(logits.float(), dim=-1)
+                            voice_unit_entropy_trace[b].append(
+                                float(-(_pe.clamp_min(1e-12).log2() * _pe).sum().item()))
                             _seg_len = len(voice_unit_id_trace[b]) - voice_seg_start[b]
                             _floor = max(int(voice_min_frames or 0), int(voice_exact_frames or 0))
                             if _floor > 0 and _seg_len < _floor:
@@ -2102,6 +2122,8 @@ class MegaTransformerWorldModel(nn.Module):
         # Same units, split at segment boundaries. Score segments[b][0] to measure ONE
         # utterance; the flat trace above may span several.
         outputs["voice_unit_id_segments"] = voice_unit_id_segments
+        # Per-step entropy (bits) of the raw unit distribution at each generated frame.
+        outputs["voice_unit_entropy_trace"] = voice_unit_entropy_trace
         # Padded like voice_latent_preds (same helper, same time_dim) so the contour lines
         # up frame-for-frame with the units it belongs to.
         #

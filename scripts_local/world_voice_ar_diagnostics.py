@@ -364,7 +364,7 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
     Also collects per-sample prompt TEXT length (tokens before BOV) so the caller can correlate
     it with generated length -- the clean 'does text drive duration' signal (short prompt ->
     short utterance) independent of whether the CONTENT aligns."""
-    gen_seqs, gt_seqs, prompt_lens = [], [], []
+    gen_seqs, gt_seqs, prompt_lens, ent_traces = [], [], [], []
     eov_fired = budget_hit = 0
     collator.force_direction = "synthesis"
     count = 0
@@ -392,6 +392,11 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
                                  voice_top_k=top_k, voice_top_p=top_p,
                                  voice_ras_win=ras_win, voice_ras_tau=ras_tau,
                                  decode_outputs=False)
+        _ent = out.get("voice_unit_id_entropy_trace") or out.get("voice_unit_entropy_trace")
+        if _ent and _ent[0]:
+            ent_traces.append([float(x) for x in _ent[0]])
+        elif getattr(model, "last_nar_round_entropy", None):
+            ent_traces.append([float(x) for x in model.last_nar_round_entropy])
         trace = out.get("voice_unit_id_trace", [[]])[0]
         if trace and trace[-1] == K:            # EOV fired -> strip it
             eov_fired += 1
@@ -406,7 +411,7 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
         count += 1
         if count >= gen_n:
             break
-    return gen_seqs, gt_seqs, eov_fired, budget_hit, prompt_lens
+    return gen_seqs, gt_seqs, eov_fired, budget_hit, prompt_lens, ent_traces
 
 
 def pearson(xs, ys):
@@ -535,12 +540,25 @@ def main():
                              nar_mask_ratio=a.nar_mask_ratio)
     if not a.skip_generation:
         print("2/3 free-running generation ...", flush=True)
-        gen, gt, eov_fired, budget_hit, prompt_lens = run_generation(
+        gen, gt, eov_fired, budget_hit, prompt_lens, ent_traces = run_generation(
             model, eval_dataset, collator, device, a.gen_n, K,
             budget=a.voice_max_frames, bov_id=sp.BOV,
             ras_win=a.voice_ras_win, ras_tau=a.voice_ras_tau,
             voice_temp=a.voice_temperature, top_k=a.voice_top_k, top_p=a.voice_top_p,
             nar_rounds=a.nar_rounds, nar_choice_temp=a.nar_choice_temperature)
+        if ent_traces:
+            import statistics as _st
+            _all = [e for tr in ent_traces for e in tr]
+            _q = [[] for _ in range(4)]
+            for tr in ent_traces:
+                for i, e in enumerate(tr):
+                    _q[min(3, int(4 * i / max(1, len(tr))))].append(e)
+            _qs = [(_st.mean(x) if x else float("nan")) for x in _q]
+            print(f"  per-step predictive entropy (raw, bits): mean {_st.mean(_all):.3f} | "
+                  f"by quartile of the utterance {_qs[0]:.2f} {_qs[1]:.2f} {_qs[2]:.2f} "
+                  f"{_qs[3]:.2f}", flush=True)
+            tf["freerun_entropy_mean"] = _st.mean(_all)
+            tf["freerun_entropy_quartiles"] = _qs
         print("3/3 degeneration stats ...", flush=True)
         gen_deg = seq_degeneration(gen, K)
         gt_deg = seq_degeneration(gt, K)

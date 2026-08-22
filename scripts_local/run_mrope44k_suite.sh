@@ -19,7 +19,7 @@ CV2=/mnt/nasbro/cache/hf_home/hub/models--FunAudioLLM--CosyVoice2-0.5B/snapshots
 TEXT_RUN=runs/world/world_tts_cosyvoice2_smollm2_mrope_scale_text_0
 VOICE_RUN=runs/world/world_tts_cosyvoice2_smollm2_mrope_0
 DISTILL_RUN=runs/world/world_tts_cosyvoice2_smollm2_distill_0
-OUT=scripts_local/eval_output/world_tts_mrope44k
+OUT=eval_output/world_tts_mrope44k
 LOGS=$OUT/logs
 mkdir -p "$LOGS"
 
