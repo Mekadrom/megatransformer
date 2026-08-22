@@ -1435,8 +1435,25 @@ class MegaTransformerWorldModel(nn.Module):
         for b in range(batch_size):
             generated_tokens[b].append(next_token_ids[b].item())
 
+        # Context capacity of the recurrent trunk. Its causal-mask buffer is sized to
+        # max_position_embeddings at init (transformer.py:86-91) and raises rather than growing,
+        # because rebinding the buffer breaks non-reentrant gradient checkpointing. Generation
+        # must therefore STOP at the limit the way any LM does, not crash into it. This bites
+        # after an image: the image block adds image_token_budget (~64) positions in one jump
+        # below, so a prompt + image + a few hundred text tokens reaches 1024 easily.
+        try:
+            _trunk_limit = int(
+                self.config.recurrent_block_config.block_config.max_position_embeddings)
+        except AttributeError:
+            _trunk_limit = None
+        hit_context_limit = False
+
         # Autoregressive generation loop
         for _ in range(max_new_tokens - 1):
+            if _trunk_limit is not None and position_offset >= _trunk_limit:
+                # the next step would ask for key position _trunk_limit + 1
+                hit_context_limit = True
+                break
             # Check for modality transitions and handle accordingly
             next_hidden_list = []
 
@@ -1907,6 +1924,12 @@ class MegaTransformerWorldModel(nn.Module):
                             1, image_token_budget, d_model,
                             device=device, dtype=current_hidden.dtype,
                         )
+                    # An image consumes image_token_budget trunk positions in a SINGLE
+                    # recurrent call, so the top-of-loop guard cannot catch an overflow here.
+                    # Refuse the image rather than crash; the loop's guard then ends generation.
+                    if _trunk_limit is not None and position_offset + image_token_budget > _trunk_limit:
+                        hit_context_limit = True
+                        break
                     # Run through recurrent block (single pass, all 256 at once)
                     image_hidden, _, image_iters, _, _ = self.recurrent_block(
                         image_input * self.embed_scale,
@@ -1968,6 +1991,13 @@ class MegaTransformerWorldModel(nn.Module):
                     )
                     text_prelude_position_offset += 1
                     forced_next_token[b] = self._sp.EOI
+
+            # The image branch above breaks out of the PER-BATCH loop when an image will not
+            # fit in the trunk's remaining context. Propagate that to the generation loop --
+            # without this the AR loop would retry the same image every step until
+            # max_new_tokens ran out, since position_offset never advances.
+            if hit_context_limit:
+                break
 
             # Voice/audio ENTRY: run text_coda once on BO*'s current_hidden to
             # add BO* to the text coda's KV cache, matching training (where the
@@ -2154,6 +2184,10 @@ class MegaTransformerWorldModel(nn.Module):
             )
             outputs["voice_f0_preds"] = stacked
         outputs["audio_stop_logit_trace"] = audio_stop_logit_trace
+        # True when generation stopped because the trunk ran out of context rather than
+        # because it emitted EOS or exhausted max_new_tokens. Callers should surface this --
+        # silently truncated output is indistinguishable from a model that chose to stop.
+        outputs["hit_context_limit"] = hit_context_limit
 
         return outputs
 
