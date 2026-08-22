@@ -1063,9 +1063,16 @@ def main():
                     label="Generated text (with [image N] / [voice N] / [audio N] markers in position)",
                     lines=5,
                 )
-                # 1024x1024 renders overflow a default-height gallery; cap it and letterbox.
-                out_gallery = gr.Gallery(label="Generated images", columns=3,
-                                         height=420, object_fit="contain", preview=True)
+                # Sized to show a 1024x1024 render at NATIVE resolution. Both settings are
+                # required: at columns=3 each cell is ~1/3 of the column width (this sits in a
+                # scale=3 column, so ~460px on a 1920px window) and the image is downscaled no
+                # matter how tall the box is. columns=1 gives it the full width; height leaves
+                # 1024 for the image plus room for the caption strip. object_fit="contain"
+                # letterboxes rather than cropping, so non-square renders still fit.
+                # Trade-off, deliberate: multiple images now stack vertically and scroll.
+                # preview=True keeps click-to-enlarge for inspecting detail.
+                out_gallery = gr.Gallery(label="Generated images", columns=1,
+                                         height=1100, object_fit="contain", preview=True)
                 out_audio_files = gr.Files(label="Generated voice clips (.wav)")
 
             with gr.Column(scale=1):
