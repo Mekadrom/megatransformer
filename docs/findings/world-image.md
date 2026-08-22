@@ -244,6 +244,33 @@ the `whiten_0` baseline at 20k (that run has every checkpoint 1000–20000 on di
 is a POINT head, so there is no matched-w comparison against it — it is flow-arm-at-some-w vs
 point-head-at-no-guidance, which is exactly why the w=3-vs-4.5 choice is not cosmetic.
 
+### Both from-scratch arms PEAK at 0.205 and then decline while training loss does not
+Replicated across two independent runs, offset by the ~2k steps that separates them:
+
+| | peak | +1k | +2k |
+|---|---|---|---|
+| `t3_xskip` | **0.205** @ 11k | 0.148 | 0.128 |
+| `trunkctx` | **0.205** @ 13k | 0.187 | 0.151 |
+
+Training loss over the same windows shows NO corresponding degradation: `t3_xskip` IMPROVED
+(mean ~0.99 over 10.6k-12.3k -> ~0.86 over 12.8k-13.2k) and `trunkctx` is flat (~1.07 over
+13.8k-15.2k). Loss down, render down.
+
+Two independent arms peaking at the same value and declining the same way is much harder to
+attribute to the 8-prompt probe's variance than a single arm's dip was — though note it is still
+only 2 post-peak checkpoints each, so a shared transient is not excluded. The next two
+checkpoints per arm settle it.
+
+This is the anti-correlation already documented on the GAIN axis (training loss and render
+disagree; the DiT wants dispersion over L2), appearing here as a function of TRAINING TIME: the
+flow objective rewards an increasingly conditional-mean-like prediction, which a frozen decoder
+renders blander. See the dispersion entry in `cross-modal.md` if it has been promoted there.
+
+⚠️ **Consequences for the 20k comparison:** by 20k both arms may be well past peak, so a
+matched-step reading at 20k could compare two degraded checkpoints and understate both. Compare
+PEAK-to-peak as well as step-to-step, and do not prune old checkpoints — for `t3_xskip` the best
+checkpoint so far is 11000, not the latest.
+
 ### Late recurrent iterations now DECAY conditioning (new at 11k, absent at 10k)
 `cond/const` peaks 0.0472 at iteration 2, holds ~0.046 through iteration 18, then falls to 0.0327 by
 iteration 25 (-29%); text positions do the same (1.03 -> 0.57). At 10k the curve was flat to the end.
