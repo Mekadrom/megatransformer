@@ -221,18 +221,35 @@ class MegaTransformerAttention(nn.Module):
             eff_offset = max(T - t, 0)  # query positions relative to key positions
             required_size = max(eff_offset + t, T)
             if required_size > self.causal_mask.shape[-1]:
-                # At training time the buffer is sized for max_position_embeddings and
-                # shouldn't need expansion. Expanding in-place (rebinding the buffer)
-                # breaks gradient checkpointing with use_reentrant=False because the
-                # saved-tensor metadata check can't match the rebound buffer on
-                # recompute. Raise so that the caller either increases
-                # max_position_embeddings or switches to reentrant checkpointing.
-                raise RuntimeError(
-                    f"Causal mask buffer too small: required_size={required_size} > "
-                    f"self.causal_mask.shape[-1]={self.causal_mask.shape[-1]}. "
-                    f"Increase MegaTransformerBlockConfig.max_position_embeddings to "
-                    f"at least {required_size}."
-                )
+                if self.training or torch.is_grad_enabled():
+                    # At training time the buffer is sized for max_position_embeddings and
+                    # shouldn't need expansion. Expanding in-place (rebinding the buffer)
+                    # breaks gradient checkpointing with use_reentrant=False because the
+                    # saved-tensor metadata check can't match the rebound buffer on
+                    # recompute. Raise so that the caller either increases
+                    # max_position_embeddings or switches to reentrant checkpointing.
+                    raise RuntimeError(
+                        f"Causal mask buffer too small: required_size={required_size} > "
+                        f"self.causal_mask.shape[-1]={self.causal_mask.shape[-1]}. "
+                        f"Increase MegaTransformerBlockConfig.max_position_embeddings to "
+                        f"at least {required_size}."
+                    )
+                # INFERENCE: grow instead. required_size tracks the KEY length T, which is
+                # NOT a position count for the recurrent block: its Huginn cache has
+                # cache_budget=16 slots but runs mean_thinking_steps=32 iterations, so every
+                # slot is visited TWICE per token and accumulates two keys per token. T
+                # therefore grows ~2x faster than position_offset, and 512 generated tokens
+                # produce 1024 keys (the observed required_size=1025 crash) at only ~512
+                # real positions. Those extra keys are cached ITERATIONS, not longer
+                # context, so refusing them is wrong -- the mask just has to cover them.
+                # No gradient checkpointing is active here, so rebinding is safe (the buffer
+                # is persistent=False, so it is never part of a checkpoint either).
+                new_size = max(required_size, 2 * self.causal_mask.shape[-1])
+                self.causal_mask = torch.tril(
+                    torch.ones(new_size, new_size,
+                               device=self.causal_mask.device,
+                               dtype=self.causal_mask.dtype)
+                ).view(1, 1, new_size, new_size)
 
             # Slice causal mask for current query/key positions.
             causal_mask_slice = self.causal_mask[:, :, eff_offset:eff_offset + t, :T]

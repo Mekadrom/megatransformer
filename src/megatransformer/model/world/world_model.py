@@ -1435,12 +1435,14 @@ class MegaTransformerWorldModel(nn.Module):
         for b in range(batch_size):
             generated_tokens[b].append(next_token_ids[b].item())
 
-        # Context capacity of the recurrent trunk. Its causal-mask buffer is sized to
-        # max_position_embeddings at init (transformer.py:86-91) and raises rather than growing,
-        # because rebinding the buffer breaks non-reentrant gradient checkpointing. Generation
-        # must therefore STOP at the limit the way any LM does, not crash into it. This bites
-        # after an image: the image block adds image_token_budget (~64) positions in one jump
-        # below, so a prompt + image + a few hundred text tokens reaches 1024 easily.
+        # Context capacity of the recurrent trunk: stop at the TRAINED context length rather
+        # than generating indefinitely past it. This is a quality bound, not a crash guard --
+        # the "Causal mask buffer too small" crash it was originally written for is NOT a
+        # position-count problem and this check cannot catch it. The trunk's Huginn cache has
+        # 16 slots but runs 32 iterations, so each slot takes two keys per token and the KEY
+        # length grows ~2x faster than position_offset (512 tokens -> 1024 keys, while
+        # position_offset is only ~512). That is handled where it belongs, by growing the mask
+        # at inference in transformer.py.
         try:
             _trunk_limit = int(
                 self.config.recurrent_block_config.block_config.max_position_embeddings)
