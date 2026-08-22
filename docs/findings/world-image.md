@@ -264,7 +264,35 @@ shorter than the ~63k the warm-start lineage suggested.
 
 ## OPEN (world-image session)
 
-### Q-Former ablation is tracking EVEN, four gap-closures in
+### The flow head's context MATTERS: Q-Former output beats raw trunk states
+`t3_xskip` (flow head reads the Q-Former output `q`) vs `trunkctx` (reads the self_enc'd trunk
+states `x`). One config field apart, same seed, same schedule.
+
+| | matched step 20k | 4-ckpt window | unguided (w=1) band |
+|---|---|---|---|
+| `t3_xskip` | **0.246** | 0.246 (18k-21k) | 0.156-0.177 |
+| `trunkctx` | 0.175 | 0.195 (20k-23k) | 0.097-0.147 |
+
+The gap grew monotonically across seven windows (0.016 -> 0.025 -> 0.041 -> 0.044 -> 0.051) to
+~2 SE, and `trunkctx` reads lower than `t3_xskip` even when it is 2k steps FURTHER along
+(0.207 @22k vs 0.246 @20k).
+
+⭐ **Mechanism, and it was predicted before the gap appeared:** the raw trunk states hand the flow
+head conditioning at ~4% of a norm-83 constant (see the compression entry). Cross-attention with
+its own learned queries can put whatever it likes in the constant component, so `cross_dec` can act
+as a **learned constant-remover** — which is exactly the advantage this measures. It also explains
+the ~15k-step delay before separation: the flow head can partially compensate on its own first.
+
+⚠️ **Caveats.** Single seed. And this is NOT the "is the Q-Former redundant" result — `cross_dec`
+is built, executed and trained in BOTH arms (see the scope note below); only the flow head's input
+differs. If the constant-remover reading is right, **lever D (normalise at the trunk output) should
+recover most of this for a fraction of 18.9M params**, and `..._nocrossdec` becomes a test of the
+MECHANISM rather than of redundancy.
+
+⚠️ Supersedes this file's earlier "tracking even / cross_dec can be dropped for free" reading,
+which was written at 8k-13k before the arms separated.
+
+### ~~Q-Former ablation is tracking EVEN, four gap-closures in~~ — superseded (see above)
 w=3, from-scratch, matched steps where available:
 
 ⚠️ **The arm name is misleading and so was my description of it.** `zimage_adapter.py:294-295`
