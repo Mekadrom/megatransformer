@@ -852,6 +852,20 @@ class MegaTransformerWorldModel(nn.Module):
                     syn_mask = is_synthesis.bool().to(batch.device)
                     if syn_mask.any():
                         outputs["recurrent_out/image_syn_seq_var"] = batch[syn_mask].var(dim=1).mean()
+                        # ACROSS-PROMPT conditionality at the gen queries. syn_seq_var above is a
+                        # spread ACROSS POSITIONS, which learned per-position queries make large BY
+                        # CONSTRUCTION -- it reads ~0.97 (healthy) even when every position emits
+                        # nearly the same thing regardless of the prompt. This is the quantity that
+                        # actually matters: decompose h = mu + r over the BATCH (mu = the
+                        # prompt-invariant part: learned queries + biases) and report ||r||/||mu||.
+                        # Measured ~0.04 at 10k steps, i.e. the prompt moves the gen-query output by
+                        # ~4% of the constant it rides on. Needs >=2 synthesis samples for a mean.
+                        syn = batch[syn_mask]
+                        if syn.shape[0] >= 2:
+                            mu = syn.mean(dim=0, keepdim=True)
+                            outputs["recurrent_out/image_syn_cond_frac"] = (
+                                (syn - mu).norm(dim=-1).mean()
+                                / mu.norm(dim=-1).mean().clamp_min(1e-9))
                     if (~syn_mask).any():
                         outputs["recurrent_out/image_trans_seq_var"] = batch[~syn_mask].var(dim=1).mean()
                 else:

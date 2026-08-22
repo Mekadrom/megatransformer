@@ -90,6 +90,13 @@ def parse_args():
                    help="Appended to the TB tag root (e.g. '_w3' -> text_to_image_w3/...). Lets one "
                         "run log several eval variants (e.g. unguided vs guided) per checkpoint "
                         "without them overwriting each other's scalars and images.")
+    p.add_argument("--trunk_gain", type=float, default=None,
+                   help="Amplify the PROMPT-CONDITIONAL part of the trunk's image gen-query output "
+                        "by this factor at inference. The gen-query representation is mu + r, where "
+                        "mu is the across-prompt mean (learned queries + biases, norm ~83) and r is "
+                        "the prompt-conditional residual (norm ~3.5, i.e. ~4%%). This feeds "
+                        "mu + gain*r to the head. gain=1.0 is a no-op. Calibrates mu over the "
+                        "prompt list in one extra pass. See scripts_local/trunk_compression_probe.py.")
     p.add_argument("--flow_guidance", type=float, default=None,
                    help="T3 classifier-free guidance weight w. v = v_uncond + w*(v_cond - v_uncond). "
                         "1.0 = off. >1 trades diversity for fidelity (2x sampling cost). Only "
@@ -313,6 +320,10 @@ def main():
     @torch.no_grad()
     def seq_pred_for_prompt(prompt, seed=None):
         _set_flow_seed(seed)
+        if args.trunk_gain is not None:
+            # the thought state inits from noise (like-init, std 0.02). Pin it so that noise is
+            # IDENTICAL across prompts and therefore lands in mu instead of inflating r.
+            torch.manual_seed(12345)
         ids = _text_tok(prompt, add_special_tokens=False).input_ids
         seq = ids + [_sptok.BOI, _sptok.IMAGE_PLACEHOLDER, _sptok.EOI, _eos]
         text_input_ids = torch.tensor([seq], dtype=torch.long, device=device)
@@ -530,6 +541,42 @@ def main():
         print(f"custom prompts: {len(prompts)} from {args.prompts_file}", flush=True)
     else:
         prompts = None
+
+    # ── trunk conditional-gain: mu + gain*r at the image gen-query positions ──
+    if args.trunk_gain is not None:
+        n_gen = int(getattr(model, "_n_image_gen_positions", 0) or 0)
+        if n_gen <= 0:
+            raise SystemExit("--trunk_gain needs image gen queries (n_image_gen_positions)")
+        if prompts is None:
+            prompts = [c for c, _, _, _ in items_from_dataset(dataset, args.max_samples)]
+
+        _cap = {"on": False, "acc": [], "mu": None}
+
+        def _trunk_hook(_m, _i, out):
+            t = out[0] if isinstance(out, tuple) else out
+            if _cap["on"]:
+                _cap["acc"].append(t[:, -n_gen:, :].detach().float().cpu())
+                return out
+            if _cap["mu"] is None:
+                return out
+            mu = _cap["mu"].to(t.device, t.dtype)
+            tail = t[:, -n_gen:, :]
+            t = torch.cat([t[:, :-n_gen, :], mu + args.trunk_gain * (tail - mu)], dim=1)
+            return (t,) + tuple(out[1:]) if isinstance(out, tuple) else t
+
+        _h = model.recurrent_block.register_forward_hook(_trunk_hook)
+        _cap["on"] = True
+        for _p in prompts:
+            seq_pred_for_prompt(_p, seed=0)
+        _cap["on"] = False
+        if not _cap["acc"]:
+            raise SystemExit("--trunk_gain calibration captured nothing from recurrent_block")
+        _cap["mu"] = torch.cat(_cap["acc"]).mean(0, keepdim=True)
+        _r = torch.cat(_cap["acc"])
+        _rel = float((_r - _cap["mu"]).norm(dim=-1).mean() / _cap["mu"].norm(dim=-1).mean())
+        print(f"[trunk_gain] mu over {len(prompts)} prompts; conditional fraction "
+              f"||r||/||mu||={_rel:.4f}; applying gain={args.trunk_gain}", flush=True)
+        _cap["acc"] = []
 
     if args.n_samples > 1:
         if _gen_head(model) is None:
