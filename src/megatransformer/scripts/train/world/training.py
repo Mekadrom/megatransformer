@@ -202,6 +202,9 @@ class WorldModelTrainer(CommonTrainer):
         voice_nar: bool = False,
         voice_nar_mask_schedule: str = "cosine",
         voice_nar_mask_ratio_min: float = 0.85,
+        voice_nar_mask_anneal_steps: int = 0,
+        voice_nar_mask_ratio_floor: float = 0.25,
+        voice_nar_trunk_text_only: bool = False,
         # Group within-modality samples by shard when shuffling. Default
         # True. Set False to reproduce the legacy uniform shuffle order
         # when resuming a checkpoint from a pre-shard-aware run.
@@ -228,6 +231,9 @@ class WorldModelTrainer(CommonTrainer):
         self.voice_nar = bool(voice_nar)
         self.voice_nar_mask_schedule = str(voice_nar_mask_schedule)
         self.voice_nar_mask_ratio_min = float(voice_nar_mask_ratio_min)
+        self.voice_nar_mask_anneal_steps = int(voice_nar_mask_anneal_steps)
+        self.voice_nar_mask_ratio_floor = float(voice_nar_mask_ratio_floor)
+        self.voice_nar_trunk_text_only = bool(voice_nar_trunk_text_only)
         self.shard_aware_sampler = shard_aware_sampler
         self.bucket_by_length = bucket_by_length
         self.bucket_mega_factor = bucket_mega_factor
@@ -877,9 +883,9 @@ class WorldModelTrainer(CommonTrainer):
 
         # NAR masking replaces scheduled sampling: both corrupt the voice input, but SS
         # simulates AR exposure bias while this IS the NAR training objective.
-        nar_mask = None
+        nar_mask, nar_coda_units = None, None
         if self.voice_nar and voice_inputs is not None:
-            voice_inputs, nar_mask = self._apply_nar_masking(
+            voice_inputs, nar_mask, nar_coda_units = self._apply_nar_masking(
                 model, voice_inputs, voice_lengths, is_synthesis, global_step)
 
         ss_prob = self._scheduled_sampling_prob(global_step) if model.training else 0.0
@@ -918,6 +924,7 @@ class WorldModelTrainer(CommonTrainer):
             decode_outputs=False,
             is_synthesis=is_synthesis,
             voice_attn_alpha=voice_attn_alpha,
+            voice_coda_units=nar_coda_units,
             voice_prenet_dropout=voice_prenet_dropout,
             cfg_text_dropout_prob=self.voice_cfg_text_dropout_prob,
         )
@@ -1644,11 +1651,11 @@ class WorldModelTrainer(CommonTrainer):
         --voice_coda_bidirectional rather than a second unit-injection path into the coda.
         """
         if voice_inputs is None or is_synthesis is None or not bool(is_synthesis.any()):
-            return voice_inputs, None
+            return voice_inputs, None, None
         unwrapped = model.module if hasattr(model, "module") else model
         mask_feat = getattr(unwrapped, "voice_mask_feature", None)
         if mask_feat is None:
-            return voice_inputs, None
+            return voice_inputs, None, None
 
         b, n, C, t = voice_inputs.shape
         dev = voice_inputs.device
@@ -1671,6 +1678,26 @@ class WorldModelTrainer(CommonTrainer):
         # that "high beats cosine" can be separated from "anything but cosine beats cosine".
         _sched = getattr(self, "voice_nar_mask_schedule", "cosine")
         _lo = float(getattr(self, "voice_nar_mask_ratio_min", 0.85))
+        # ANNEAL. Start fully masked so text is the ONLY available signal and the text pathway
+        # has to form, then admit context gradually and see whether it SUPPLEMENTS text or
+        # REPLACES it. The failure this addresses is measured: with cosine masking the model
+        # reached AR-level unit accuracy (0.0860 vs 0.0887 at matched step) while deriving 3%
+        # of it from the transcript instead of 31% -- context was the better predictor, so text
+        # was never needed. Removing the shortcut only while the pathway forms is the
+        # coarse->refine pattern, applied to the mask ratio.
+        #
+        # NOTE the honest caveat: gradient descent has no loyalty to features it built earlier,
+        # so if context is still the easier predictor once admitted, the crutch can simply
+        # reassert. The readout is text_delta at r=1.0 across the anneal -- if it decays as the
+        # floor drops, the curriculum did not lock in.
+        _anneal = int(getattr(self, "voice_nar_mask_anneal_steps", 0))
+        if _anneal > 0:
+            _floor = float(getattr(self, "voice_nar_mask_ratio_floor", 0.25))
+            _t = min(1.0, max(0.0, global_step / float(_anneal)))
+            _lo = 1.0 + (_floor - 1.0) * _t          # 1.0 -> floor, linear in step
+            _sched = "high"                           # anneal implies U[_lo, 1]
+            if global_step % self.args.logging_steps == 0:
+                metrics.log_scalar("train/nar_mask_ratio_min", _lo, global_step, skip_zero=False)
         if _sched == "high":
             ratio = _lo + (1.0 - _lo) * u                          # U[ratio_min, 1]
         elif _sched == "linear":
@@ -1688,10 +1715,26 @@ class WorldModelTrainer(CommonTrainer):
             masked = masked & (idx < lens.view(b, 1, 1, 1).to(dev))
         mixed = torch.where(masked, mask_feat.view(1, 1, C, 1).to(voice_inputs.dtype), voice_inputs)
 
+        # TRUNK-TEXT-ONLY: the trunk gets EVERY synthesis frame masked regardless of ratio, so
+        # revealed units cannot reach it; they are handed to the coda separately. Without this,
+        # revealed units enter through the causal prelude and the trunk itself can learn to
+        # lean on local unit context instead of text -- which is where the measured crutch is
+        # (trunk text-attributed fraction 0.220 at r=1.0 vs 0.029 at r=0.25).
+        trunk_in = mixed
+        coda_units = None
+        if getattr(self, "voice_nar_trunk_text_only", False):
+            _synth = is_synthesis.view(b, 1, 1, 1).to(torch.bool).expand_as(masked)
+            if voice_lengths is not None:
+                _synth = _synth & (torch.arange(t, device=dev).view(1, 1, 1, t)
+                                   < lens.view(b, 1, 1, 1).to(dev))
+            trunk_in = torch.where(_synth, mask_feat.view(1, 1, C, 1).to(voice_inputs.dtype),
+                                   voice_inputs)
+            coda_units = mixed
+
         if global_step % self.args.logging_steps == 0:
             metrics.log_scalar("train/nar_mask_frac", masked.float().mean().item(), global_step,
                                skip_zero=False)
-        return mixed, masked.squeeze(2).reshape(b * n, t)
+        return trunk_in, masked.squeeze(2).reshape(b * n, t), coda_units
 
     @torch.no_grad()
     def _apply_scheduled_sampling(
@@ -2296,6 +2339,10 @@ def load_model(args, device='cuda'):
             # to its right and iterative refinement degenerates to left-to-right infilling.
             config.voice_nar = True
             config.voice_coda_config.coda_config.causal = False
+            if getattr(args, 'voice_nar_trunk_text_only', False):
+                # Builds voice_coda_units_proj; without this the injection path silently
+                # does not exist and the flag would be a no-op.
+                config.voice_nar_trunk_text_only = True
         if getattr(args, 'text_encoder_model', None):
             # Single gate: swap the from-scratch text prelude/coda for a pretrained LLM body +
             # translators + the LLM's LM head. None (default) leaves the model byte-identical.
@@ -2611,6 +2658,9 @@ def create_trainer(
         voice_nar=getattr(args, 'voice_nar', False),
         voice_nar_mask_schedule=getattr(args, 'voice_nar_mask_schedule', 'cosine'),
         voice_nar_mask_ratio_min=getattr(args, 'voice_nar_mask_ratio_min', 0.85),
+        voice_nar_mask_anneal_steps=getattr(args, 'voice_nar_mask_anneal_steps', 0),
+        voice_nar_mask_ratio_floor=getattr(args, 'voice_nar_mask_ratio_floor', 0.25),
+        voice_nar_trunk_text_only=getattr(args, 'voice_nar_trunk_text_only', False),
         shard_aware_sampler=getattr(args, 'shard_aware_sampler', True),
         bucket_by_length=getattr(args, 'bucket_by_length', False),
         bucket_mega_factor=getattr(args, 'bucket_mega_factor', 25),
@@ -3110,6 +3160,23 @@ def add_cli_args(subparsers):
                                  "FELL). 'high' samples U[--voice_nar_mask_ratio_min, 1], removing "
                                  "the shortcut and matching inference, which starts fully masked. "
                                  "'linear' is U[0,1], the neutral uniform control.")
+    sub_parser.add_argument("--voice_nar_trunk_text_only", action="store_true", default=False,
+                            help="NAR variant: the trunk sees ONLY the MASK feature at voice "
+                                 "positions and revealed units go straight to the coda, so the "
+                                 "trunk stays text-conditioned and any inpainting shortcut is "
+                                 "confined to the head. Identical to plain --voice_nar at mask "
+                                 "ratio 1.0 (nothing to route); the difference appears once the "
+                                 "anneal admits context.")
+    sub_parser.add_argument("--voice_nar_mask_anneal_steps", type=int, default=0,
+                            help="Anneal the mask floor from 1.0 (fully masked -- text is the "
+                                 "ONLY signal) down to --voice_nar_mask_ratio_floor over this "
+                                 "many steps, sampling U[floor(step), 1]. 0 = off. Forms the text "
+                                 "pathway while no shortcut exists, then admits context. Set it "
+                                 "from where text-only training actually plateaus; watch "
+                                 "text_delta at r=1.0 to see whether the pathway survives the "
+                                 "anneal or the crutch reasserts.")
+    sub_parser.add_argument("--voice_nar_mask_ratio_floor", type=float, default=0.25,
+                            help="Final mask floor for --voice_nar_mask_anneal_steps.")
     sub_parser.add_argument("--voice_nar_mask_ratio_min", type=float, default=0.85,
                             help="Lower bound for the 'high' and 'linear' mask schedules.")
     sub_parser.add_argument("--voice_nar_choice_temperature", type=float, default=1.0,

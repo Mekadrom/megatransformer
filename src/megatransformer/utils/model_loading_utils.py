@@ -119,6 +119,15 @@ def detect_world_nar(checkpoint_path: str) -> bool:
     return any(k.endswith("voice_mask_feature") for k in sd)
 
 
+def detect_world_nar_trunk_text_only(checkpoint_path: str) -> bool:
+    """True if the checkpoint has the direct unit->coda projection (trunk-text-only NAR)."""
+    try:
+        sd = _sive_state_dict(checkpoint_path)
+    except Exception:
+        return False
+    return any(k.endswith("voice_coda_units_proj.weight") for k in sd)
+
+
 def detect_n_special_tokens(checkpoint_path: str) -> Optional[int]:
     """Row count of the trainable control-token extension, or None if absent.
 

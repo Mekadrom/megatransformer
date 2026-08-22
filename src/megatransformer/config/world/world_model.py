@@ -121,6 +121,13 @@ class MegaTransformerWorldModelConfig:
     # (voice_coda_config.coda_config.causal = False) or the head cannot see revealed units
     # to its right, which is the whole point of masked-parallel decoding.
     voice_nar: bool = False
+    # NAR variant: the TRUNK sees only the MASK feature at voice positions (never revealed
+    # units), and revealed units are routed straight into the coda instead. Confines any
+    # inpainting shortcut to the head and keeps the trunk conditioned on text alone -- which
+    # is where the measured crutch lives (trunk-level text-attributed fraction fell 0.220 at
+    # r=1.0 to 0.029 at r=0.25 when revealed units reached it through the prelude).
+    # Identical to voice_nar at mask ratio 1.0, since there are no revealed units to route.
+    voice_nar_trunk_text_only: bool = False
 
     # Voice generation-query mode. None = the AR crutch (shifted-TF prelude output feeds the
     # recurrent trunk). "learned" = the trunk's SYNTHESIS voice input is a learned positional

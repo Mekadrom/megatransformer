@@ -210,6 +210,9 @@ def load_world_model(args, device):
             # bidirectional coda (a causal coda cannot see units revealed to its right).
             config.voice_nar = True
             config.voice_coda_config.coda_config.causal = False
+            if model_loading_utils.detect_world_nar_trunk_text_only(args.checkpoint_path):
+                config.voice_nar_trunk_text_only = True
+                print("  ... trunk-text-only variant (direct unit->coda projection)")
             print(f"  NAR voice ({'--voice_nar' if getattr(args, 'voice_nar', False) else 'detected in checkpoint'})"
                   " -> voice_nar=True, coda bidirectional")
         if _mrope and str(getattr(args, "mrope_scale_side", None)) == "off":
