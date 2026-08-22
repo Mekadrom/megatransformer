@@ -44,12 +44,30 @@ class TextCodaClassifierWithLoss(nn.Module):
             llm_d = int(llm_cfg.hidden_size)
             trunk_d = coda_config.d_model
             hidden = max(1, int(trunk_d * text_encoder.get("translator_hidden_mult", 2.0)))
+            self.n_special = int(text_encoder.get("n_special_tokens", 0))
+            # `trainable_head` (opt-in; default False leaves the shared-head path below untouched):
+            # keep the frozen LLM on the INPUT side but give the coda its OWN readout at TRUNK
+            # width. The shared path routes every output distribution through an llm_d bottleneck
+            # AND a frozen basis — logit-matrix rank <= llm_d+1, output directions pinned to the
+            # LLM's token geometry — which is a real ceiling once the trunk is wider than the LLM.
+            # Here one trainable matrix spans native vocab + control tokens, so the control tokens
+            # are native rows rather than a bolted-on `special_head`, and nothing is tied.
+            self.trainable_head = bool(text_encoder.get("trainable_head", False))
             self.out_translator_norm = create_norm(trunk_d, config.input_norm_type, config.norm_epsilon)
+            if self.trainable_head:
+                # Residual at trunk width — the shared path cannot be residual (it changes dim).
+                self.out_translator = nn.Sequential(
+                    nn.Linear(trunk_d, hidden), nn.GELU(), nn.Linear(hidden, trunk_d))
+                self.lm_head = nn.Linear(trunk_d, int(llm_cfg.vocab_size) + self.n_special)
+                # Xavier on both, matching the from-scratch coda's convention (the pretrained
+                # branch returns before _init_weights, so this has to be explicit).
+                self.apply(linear_weight_init(gain=1.0))
+                self.gradient_checkpointing = False
+                return
             self.out_translator = nn.Sequential(
                 nn.Linear(trunk_d, hidden), nn.GELU(), nn.Linear(hidden, llm_d))
             # Trainable head for the control tokens; its weight is tied to the FE's special_embed
             # by world_model (embed row == head row, mirroring the LLM's own embed/head tie).
-            self.n_special = int(text_encoder.get("n_special_tokens", 0))
             if self.n_special > 0:
                 self.special_head = nn.Linear(llm_d, self.n_special, bias=False)
             self.lm_head = None  # SHARED from the feature extractor, injected by world_model
@@ -99,12 +117,17 @@ class TextCodaClassifierWithLoss(nn.Module):
             dict with "logits" and optionally "text_classification_loss" and "kv_caches".
         """
         if self._pretrained:
-            # Stateless: residual-MLP translator (trunk d_model -> LLM d_model), then the SHARED
-            # (tied) LM head over the native vocab, concatenated with the trainable special_head
-            # over the control tokens. No coda self-attention -> kv_caches passes through.
-            h = self.out_translator(self.out_translator_norm(x)).to(self.lm_head.weight.dtype)
+            # Stateless: MLP translator, then a readout. Shared-head mode: translate trunk d_model
+            # -> LLM d_model, apply the SHARED (tied) LM head over the native vocab, concatenate the
+            # trainable special_head over the control tokens. trainable_head mode: stay at trunk
+            # width (residual) and apply one owned head over vocab + control tokens.
+            # No coda self-attention either way -> kv_caches passes through.
+            h = self.out_translator(self.out_translator_norm(x))
+            if self.trainable_head:
+                h = x + h  # residual: trunk width in, trunk width out
+            h = h.to(self.lm_head.weight.dtype)
             logits = self.lm_head(h)
-            if self.n_special > 0:
+            if self.n_special > 0 and not self.trainable_head:
                 logits = torch.cat([logits, self.special_head(h)], dim=-1)
             cap = getattr(self.config, 'lm_head_logit_cap', None)
             if cap is not None:

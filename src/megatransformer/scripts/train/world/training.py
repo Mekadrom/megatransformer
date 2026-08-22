@@ -2363,6 +2363,9 @@ def load_model(args, device='cuda'):
                 "model": args.text_encoder_model,
                 "freeze": not getattr(args, 'text_encoder_unfreeze', False),
                 "translator_hidden_mult": getattr(args, 'text_encoder_translator_mult', 2.0),
+                # Off by default -> the coda shares the LLM's tied head (the tested path for
+                # every existing voice/image run). On -> coda owns a trunk-width readout.
+                "trainable_head": getattr(args, 'text_encoder_trainable_head', False),
                 # Opt-in only: the duration buckets add 32 rows to special_embed/special_head,
                 # which is a MODEL SHAPE. A run that does not ask for them keeps 9.
                 "n_special_tokens": (constants.N_SPECIAL_TOKENS_WITH_DURATION
@@ -3217,6 +3220,13 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--text_encoder_translator_mult", type=float, default=2.0,
                             help="Hidden width multiple for the prelude/coda MLP translators "
                                  "(hidden = trunk_d_model * mult).")
+    sub_parser.add_argument("--text_encoder_trainable_head", action="store_true",
+                            help="Keep the frozen LLM on the INPUT side only: give the text coda its "
+                                 "OWN trainable readout at TRUNK width (vocab + control tokens in one "
+                                 "matrix) instead of sharing the LLM's tied lm_head. Default (off) "
+                                 "shares the head, which pins every output distribution to the LLM's "
+                                 "frozen token geometry and caps logit-matrix rank at llm_d+1. "
+                                 "Costs ~+38M params at trunk_d 768 / vocab 49152.")
     sub_parser.add_argument("--text_encoder_n_special_tokens", type=int, default=0,
                             help="Size of the TRAINABLE control-token extension (tied special_embed/"
                                  "special_head) for BOV/EOV/placeholders etc., appended at ids >= the "

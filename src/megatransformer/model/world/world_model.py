@@ -235,10 +235,13 @@ class MegaTransformerWorldModel(nn.Module):
         # LLM mode: there is no `wte` (the LLM owns its embeddings, already tied internally).
         if getattr(config, 'tie_word_embeddings', False) and _text_encoder is None:
             self.text_generator.lm_head.weight = self.text_feature_extractor.wte.weight
-        elif _text_encoder is not None:
+        elif _text_encoder is not None and not getattr(self.text_generator, "trainable_head", False):
             # Pretrained-LLM mode: the coda SHARES the FE's (tied) LM head — one embed/head weight,
             # no duplicate, tie survives an unfreeze. And tie the trainable control-token extension
             # (special_embed <-> special_head), mirroring the LLM's own embed/head tie.
+            # Skipped under `trainable_head`: there the coda owns a full-width readout of its own,
+            # so there is nothing to share and no special_head to tie (the FE keeps its
+            # special_embed — that is the INPUT side, still needed either way).
             self.text_generator.lm_head = self.text_feature_extractor.lm_head
             if getattr(self.text_feature_extractor, "special_embed", None) is not None:
                 self.text_generator.special_head.weight = self.text_feature_extractor.special_embed.weight
