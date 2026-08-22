@@ -108,8 +108,24 @@ def parse_args():
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top_p", type=float, default=0.9)
-    p.add_argument("--voice_token_budget", type=int, default=209)
-    p.add_argument("--audio_token_budget", type=int, default=209)
+    # 209 = ceil((10*16000//256)/3) -- a SNAPSHOT of the frame math for SIVE @hop256/stride3.
+    # It is wrong for any other frontend: a ContentVec run (@hop320/stride1) needs ~500, and the
+    # stale constant truncated renders to 42% of an utterance while training saw the whole thing.
+    # train.media_frame_budget() is the canonical derivation; None = derive it from the same
+    # hop/stride/seconds args the trainer uses.
+    p.add_argument("--voice_token_budget", type=int, default=None,
+                   help="Voice generation length cap. Default None = derive via media_frame_budget "
+                        "(max_seconds*sample_rate//hop_length, / sive_total_stride).")
+    p.add_argument("--audio_token_budget", type=int, default=None,
+                   help="Audio generation length cap. Default None = derive (see --voice_token_budget).")
+    p.add_argument("--voice_max_seconds", type=float, default=10.0)
+    p.add_argument("--voice_sample_rate", type=int, default=16000)
+    p.add_argument("--voice_hop_length", type=int, default=256)
+    p.add_argument("--audio_max_seconds", type=float, default=10.0)
+    p.add_argument("--audio_sample_rate", type=int, default=16000)
+    p.add_argument("--audio_hop_length", type=int, default=256)
+    p.add_argument("--sive_total_stride", type=int, default=1,
+                   help="Content-frontend total stride (SIVE=3, ContentVec/Mimi=1). Feeds the budget derivation.")
     p.add_argument("--image_iteration_override", type=int, default=None,
                    help="Override recurrent iteration count for image gen query positions (eval-only). "
                         "If unset, uses mean_thinking_steps with KL early-exit.")
@@ -520,7 +536,10 @@ def main():
     # load frozen Z-Image-Turbo. Only one of sdxl_pipe / zimage_pipe is ever non-None.
     from megatransformer.model.world.world_model import ZImageConditioningAdapter
     zimage_pipe = None
-    if isinstance(getattr(model, "image_generator", None), ZImageConditioningAdapter):
+    # Z-Image is a rectified-flow DiT with a fixed FlowMatchEulerDiscreteScheduler and no sampler
+    # argument, so the sampler control is inert on this path (it drives the LiteVAE DiT decoder).
+    _IS_ZIMAGE = isinstance(getattr(model, "image_generator", None), ZImageConditioningAdapter)
+    if _IS_ZIMAGE:
         print(f"Image generator is ZImageConditioningAdapter — loading Z-Image ({args.zimage_model})...")
         from diffusers import ZImagePipeline
         zimage_pipe = ZImagePipeline.from_pretrained(args.zimage_model, torch_dtype=torch.bfloat16)
@@ -681,8 +700,11 @@ def main():
         top_p = float(top_p_in) if top_p_in and top_p_in > 0.0 else None
         top_k = int(top_k_in) if top_k_in and top_k_in > 0 else None
         max_new_tokens = int(max_new_tokens_in) if max_new_tokens_in else args.max_new_tokens
-        voice_budget = int(voice_budget_in) if voice_budget_in else args.voice_token_budget
-        audio_budget = int(audio_budget_in) if audio_budget_in else args.audio_token_budget
+        from megatransformer.scripts.train.train import media_frame_budget
+        _vb = args.voice_token_budget if args.voice_token_budget is not None else media_frame_budget(args, "voice")
+        _ab = args.audio_token_budget if args.audio_token_budget is not None else media_frame_budget(args, "audio")
+        voice_budget = int(voice_budget_in) if voice_budget_in else _vb
+        audio_budget = int(audio_budget_in) if audio_budget_in else _ab
         # 0/negative → "use model default" (mean_thinking_steps + KL early-exit)
         image_iter_override: Optional[int] = None
         if image_iter_override_in is not None and int(image_iter_override_in) > 0:
@@ -697,6 +719,8 @@ def main():
         elif args.image_num_inference_steps is not None and args.image_num_inference_steps > 0:
             image_num_steps = args.image_num_inference_steps
         image_sampler_choice: str = (image_sampler_in or args.image_sampler or "euler").lower()
+        if image_sampler_choice.startswith("n/a"):      # Z-Image placeholder; never reaches the DiT
+            image_sampler_choice = "euler"
         if seed_in is not None and int(seed_in) >= 0:
             torch.manual_seed(int(seed_in))
             if torch.cuda.is_available():
@@ -743,8 +767,18 @@ def main():
             f"max_new_tokens={max_new_tokens}, voice_budget={voice_budget}, "
             f"audio_budget={audio_budget}, seed={int(seed_in) if seed_in is not None and int(seed_in) >= 0 else 'none'}, "
             f"image_iter_override={image_iter_override if image_iter_override is not None else 'off'}, "
-            f"image_sampler={image_sampler_choice}, "
-            f"image_num_inference_steps={image_num_steps if image_num_steps is not None else 'default'}"
+            + (
+                # Z-Image is a RECTIFIED-FLOW DiT: ZImagePipeline hard-declares
+                # FlowMatchEulerDiscreteScheduler and exposes no sampler argument, so the sampler
+                # dropdown controls nothing here (it is for the LiteVAE DiT path). Turbo is also
+                # DISTILLED for 8 steps at guidance 0, so the step box has a narrow useful range.
+                f"image_sampler=n/a (Z-Image: flow-matching Euler, fixed), "
+                f"image_steps={image_num_steps if image_num_steps is not None else args.zimage_gen_steps}"
+                f"{'' if image_num_steps is not None else ' (Turbo design point)'}"
+                if _IS_ZIMAGE else
+                f"image_sampler={image_sampler_choice}, "
+                f"image_num_inference_steps={image_num_steps if image_num_steps is not None else 'default'}"
+            )
         )
 
         with torch.no_grad():
@@ -996,10 +1030,15 @@ def main():
                             precision=0,
                             label="image diffusion steps (0 = decoder default)",
                         )
+                        # inert on the Z-Image path -- greyed out rather than silently ignored
                         image_sampler_dd = gr.Dropdown(
-                            choices=["euler", "heun", "midpoint"],
-                            value=args.image_sampler,
-                            label="image diffusion sampler (heun/midpoint = 2× NFE/step)",
+                            choices=(["n/a (Z-Image: flow-matching Euler, fixed)"] if _IS_ZIMAGE
+                                     else ["euler", "heun", "midpoint"]),
+                            value=("n/a (Z-Image: flow-matching Euler, fixed)" if _IS_ZIMAGE
+                                   else args.image_sampler),
+                            interactive=(not _IS_ZIMAGE),
+                            label=("image sampler — not used by Z-Image" if _IS_ZIMAGE
+                                   else "image diffusion sampler (heun/midpoint = 2× NFE/step)"),
                         )
 
                 status_box = gr.Textbox(label="Status", interactive=False, lines=3)
@@ -1009,7 +1048,9 @@ def main():
                     label="Generated text (with [image N] / [voice N] / [audio N] markers in position)",
                     lines=5,
                 )
-                out_gallery = gr.Gallery(label="Generated images", columns=3, height="auto")
+                # 1024x1024 renders overflow a default-height gallery; cap it and letterbox.
+                out_gallery = gr.Gallery(label="Generated images", columns=3,
+                                         height=420, object_fit="contain", preview=True)
                 out_audio_files = gr.Files(label="Generated voice clips (.wav)")
 
             with gr.Column(scale=1):
