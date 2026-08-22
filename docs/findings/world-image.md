@@ -305,9 +305,37 @@ before drawing any conclusion for the refinement thesis.
   must import 100% of the conditioning through attention.
 - ⚠️ **Relaxing the depth-scaled init** is the obvious lever and should be held back; recurrent
   stability is LR-sensitive in this project and that init exists for a reason.
-- **Diagnostic that picks between them:** attention mass from gen-query positions to text positions.
-  Heavy attention + small write => dilution (init std / norm / depth-init). No attention => routing,
-  and only direct injection fixes it.
+### It is DILUTION, not routing — measured 2026-08-22
+`scripts_local/genquery_text_ablation.py`, ckpt-14000, 8 prompts. Attention weights are not
+recoverable (SDPA never materialises them; rebuilding RoPE-applied q/k by hand is error-prone), so
+this measures the CAUSAL contribution: zero the text prelude's output and see how far the
+gen-query states move.
+
+| measurement | mean ||dh||/||h|| |
+|---|---|
+| gen queries, TEXT ABLATED | **0.201** |
+| gen queries, DIFFERENT PROMPT | 0.112 |
+| text positions, text ablated (sanity) | 1.303 |
+
+Text reaches the gen queries and accounts for ~20% of their norm, and 0.112/0.201 means **~56% of
+that contribution is PROMPT-SPECIFIC** rather than a generic "a prompt exists" signal. So neither
+the routing nor the mapping is broken — the conditioning arrives, at low SNR against the norm-83
+constant.
+
+⭐ **This CUTS lever C (direct text injection into the gen queries).** It targets routing, and
+routing is not what is wrong; it would add a second path for information that already arrives.
+The live levers are the ones aimed at the constant-to-signal ratio: **A (lower
+`image_gen_query_init_std`)** and **D (normalise at the trunk output)**.
+⭐ It also sharpens the Q-Former question: if `cross_dec` is acting as a learned constant-remover
+(cross-attention with its own learned queries can put whatever it likes in the constant component),
+it is doing D implicitly — which would explain the two arms tracking so closely, and predicts
+`trunkctx` takes longer to learn the same subtraction.
+
+⚠️ **Corrects the earlier phrasing "conditioning the trunk never imported".** It imports ~20%, over
+half prompt-specific, and the aux point head extracts R^2 ~= 0.5 from it (`image_clip_mse_loss`
+0.545 against 1.0 for predicting the mean). A 4% MAGNITUDE ratio is not 4% of the information —
+a learned head can amplify a small direction. The accurate claim is low SNR plus a bf16 precision
+tax, and that a SCALAR at the output cannot fix it (the gamma sweep).
 
 ---
 
