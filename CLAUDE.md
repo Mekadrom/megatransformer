@@ -202,6 +202,34 @@ For TensorBoard, context items are logged as sibling tags (`eval/voice/0/mel`, `
 2. **Audio SMG**: SIVE-Mel Generator — deterministic decoder with FiLM-based speaker conditioning, outputs mel spectrograms
 3. **Vocoder**: Mel spectrogram to waveform synthesis (HiFiGAN-based)
 
+## Findings (READ AND WRITE THESE)
+
+`docs/findings/` is the durable, versioned record of what has been measured. **Read the file
+for the direction you are working on before proposing experiments, and write results back to
+it before the session ends.** `eval_output/` is gitignored and gets cleared, `runs/` holds
+scalars without interpretation, and commit messages are searchable but not browsable — so a
+result that lives only in those places is effectively lost.
+
+One file per training direction, named `<source>-<target>` with `world` = the recurrent trunk:
+`world-voice.md` (text->voice, formerly "world-tts"), `world-image.md` (text->image),
+`world-text.md`, `voice-world.md` (transcription), `image-world.md` (captioning), plus
+`cross-modal.md` for principles replicated in more than one direction.
+
+Rules that matter (full conventions in `docs/findings/README.md`):
+- Every entry is **ESTABLISHED**, **OPEN**, or **RETRACTED**.
+- **Never delete a retracted finding.** Strike it, say why it was wrong, keep the date. A
+  wrong conclusion that quietly vanishes is worse than one marked wrong, because the old
+  version is what people remember and nothing contradicts it. This project has already lost
+  time to acting on conclusions that were later invalidated — an eval path that silently
+  disabled M-RoPE, eval scripts sampling at a temperature nobody listens at, and decode
+  comparisons drawn inside their own noise floor.
+- Quote the measurement inline. "Text conditioning is weak" is not a finding; "text-attributed
+  fraction 0.029 vs AR's 0.305 at matched step 23000" is.
+- Note the protocol when it is load-bearing: teacher-forced vs free-running, matched step,
+  seed count, n. Several retractions exist because a protocol detail was wrong and undocumented.
+- A finding belongs to the direction it was measured in. Promote to `cross-modal.md` only
+  after replication in a second direction.
+
 ## Configuration
 
 DeepSpeed configs are in root: `ds_config.json`, `ds_config_zero-*.json`, `ds_config_int8.json`
