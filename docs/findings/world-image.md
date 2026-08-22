@@ -227,27 +227,33 @@ this is same-step, same 8-prompt probe, same harness.
 
 | arm | step | eval MSE | R^2 | CLIPScore |
 |---|---|---|---|---|
-| `whiten_0` — point head, pure MSE w=1.0 | 20000 | **0.275** | **0.725** | **0.266** (deterministic, NO guidance) |
+| `whiten_0` — point head, pure MSE w=1.0 | 20000 | **0.275** | **0.725** | 0.266 unguided / **0.283** +gain |
+| `t3_xskip` — flow | 20000 | 0.297 | 0.703 | **0.246** (w=3) |
 | `trunkctx` — flow | 20000 | 0.307 | 0.693 | 0.175 (w=3) |
-| `t3_xskip` — flow | 18000 | 0.309 | 0.691 | 0.231 (w=3) |
 
 ⭐ **CONDITIONING QUALITY IS ESSENTIALLY MATCHED** (R^2 0.725 vs 0.691-0.693, gap ~0.03). Pure MSE
 at weight 1.0 for 20k steps teaches the trunk barely better than flow-with-0.1-aux does. Same
 result at 14k (0.312 vs 0.337). **So the mean-regression phase is NOT what the warm-start recipe
 buys** -- it is not a better trunk teacher.
 
-⭐⭐ **BUT THE POINT HEAD RENDERS MUCH BETTER**: 0.266 with NO guidance vs 0.175 / 0.231 for flow
-heads WITH w=3 (0.283 for the point head once gain-corrected). Even allowing for `t3_xskip`'s
-rising trajectory (~0.24 projected at 20k), the deterministic regression head is at least matching
-it. The warm-start table above has flow+guidance at 0.359 beating point+gain at 0.283 -- but that
-was ~63k cumulative steps.
+⭐⭐ **RENDER: `t3_xskip` has CAUGHT UP; `trunkctx` has not.** 0.246 (w=3) vs the point head's
+0.266 unguided is a 0.020 gap, well inside this probe's +-0.05 per-checkpoint spread -- a tie.
+Against 0.283 (point + free gain correction) the point head keeps a 0.037 edge, still under one
+SE. `trunkctx` at 0.175 IS clearly behind. And `t3_xskip` is climbing fast (0.211 -> 0.231 ->
+0.231 -> 0.234 -> 0.246 over 16k-20k), so it should pass the point head shortly.
 
-⭐⭐⭐ **THEREFORE the warm-start recipe's value is the FLOW HEAD's slow convergence, not the
-trunk's.** MSE-pretraining skips the long stretch where the flow head underperforms a regression
-head it will eventually beat. Practical consequence: a from-scratch flow run spends its first
-~20k steps in a regime where the architecture under test is STRICTLY WORSE than the baseline it
-is meant to beat. Do not read an architecture verdict from these arms before the flow head has
-caught up; ~63k is the only budget at which the ordering is known to invert.
+⚠️ **This CORRECTS what this entry said an hour earlier**, when it was written from `trunkctx`@20k
+plus `t3_xskip`@18k (0.231): "the point head renders much better" and "a from-scratch flow run
+spends its first ~20k steps STRICTLY WORSE than the baseline". `t3_xskip`@20k falsifies the strong
+form. The claim holds for `trunkctx` only, and reading a 2k-early checkpoint as if it were the
+matched one is exactly the adjacent-step error the protocol entry warns about -- committed here
+while quoting that same entry.
+
+⭐⭐ **What survives: the warm-start recipe's value is the FLOW HEAD's convergence, not the
+trunk's.** Conditioning R^2 is matched throughout, so mean-regression is not a better trunk
+teacher; what MSE-pretraining buys is skipping the stretch where the flow head has not yet caught
+up. That stretch now measures as roughly 20k steps in the `t3_xskip` config -- not indefinite, and
+shorter than the ~63k the warm-start lineage suggested.
 
 ---
 
