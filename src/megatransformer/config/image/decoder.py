@@ -448,6 +448,15 @@ class ZImageAdapterConfig:
     # Requires K_in == seq_len, since cross_dec is the only thing that can remap K -> seq_len;
     # at the shipped sizes both are 64, so that map is identity-shaped anyway.
     use_cross_dec: bool = True
+    # Stop the aux point-head MSE from reaching the shared representation: seq_head is fed a
+    # DETACHED context, so the term trains seq_head only. seq_head is documented as a
+    # diagnostic (alpha / R^2 / retrieval), and while it backprops it is not measuring the
+    # representation so much as partly CREATING the property it reports -- 10% of the gradient
+    # pushes the trunk toward being linearly decodable. Detached it becomes an honest linear
+    # probe, and the weight can then be raised to 1.0 for free since it no longer competes with
+    # the flow loss. Default False = existing behaviour, bit-identical.
+    # No effect at inference (nothing backprops there), so surfaced predictions are unchanged.
+    flow_aux_mse_detach: bool = False
     # DISPERSION MATCHING on a SAMPLED draw: |std(draw)/std(target) - 1|, plus an optional
     # -log(ratio) anti-collapse barrier. Same form as the trainer's modality var-loss, which is
     # wired only to the LATENT image path and never reaches this adapter.

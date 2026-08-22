@@ -162,6 +162,19 @@ class ZImageConditioningAdapter(nn.Module):
                 var_barrier_weight=float(getattr(config, "flow_var_barrier_weight", 0.0)),
                 var_steps=int(getattr(config, "flow_var_steps", 4)))
         self.flow_aux_mse_weight = float(getattr(config, "flow_aux_mse_weight", 0.1))
+        # Detached aux head: the MSE (and only the MSE) trains seq_head, never the trunk.
+        self.flow_aux_mse_detach = bool(getattr(config, "flow_aux_mse_detach", False))
+        if self.flow_aux_mse_detach:
+            if self.flow_head is None:
+                raise ValueError(
+                    "flow_aux_mse_detach=True with no flow head: the point-head MSE is then the "
+                    "ONLY objective, and detaching it would train nothing but seq_head. Use it "
+                    "only on flow (T3+) configs.")
+            if self.contrastive_weight > 0:
+                raise ValueError(
+                    "flow_aux_mse_detach=True with contrastive_weight>0: the Tier-1 InfoNCE term "
+                    "also reads seq_pred, so detaching would silently make it a no-op on the "
+                    "shared representation instead of the representation-shaping loss it is.")
         # T5: run the PARALLEL head at the caption's native Qwen3 length instead of resampling
         # the target to K slots. Same one-shot sampler as T3 (no sequential inference), just
         # without the K=64 interpolation -- so ~2/3 of the supervised slots stop being linear
@@ -312,7 +325,10 @@ class ZImageConditioningAdapter(nn.Module):
                     f"seq_len={self.seq_len}. cross_dec is the only module that remaps K to "
                     f"seq_len; drop it only when n_image_gen_positions == seq_len.")
             q = x
-        seq_pred = self.seq_head(self.seq_norm(q))       # (B, seq_len, seq_dim); WHITENED space if self.whiten
+        # Detach here (not at the loss) so EVERY consumer of seq_pred is off the trunk's graph,
+        # not just the MSE term. No-op at inference.
+        q_for_seq = q.detach() if self.flow_aux_mse_detach else q
+        seq_pred = self.seq_head(self.seq_norm(q_for_seq))  # (B, seq_len, seq_dim); WHITENED space if self.whiten
         # WHAT THE GENERATIVE HEAD IS CONDITIONED ON. Default "qformer" = the cross_dec output q,
         # as shipped. "trunk" hands it `x` instead -- the self_enc'd trunk states -- bypassing
         # cross_dec entirely for the head (seq_pred still uses q, so the aux point head is
