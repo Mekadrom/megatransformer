@@ -242,6 +242,11 @@ Against 0.283 (point + free gain correction) the point head keeps a 0.037 edge, 
 SE. `trunkctx` at 0.175 IS clearly behind. And `t3_xskip` is climbing fast (0.211 -> 0.231 ->
 0.231 -> 0.234 -> 0.246 over 16k-20k), so it should pass the point head shortly.
 
+⭐ **IT DID, at 21k: 0.274** — above the point head's raw 0.266 and at parity with its
+gain-corrected 0.283, at 74% of GT. So the flow head needs ~20k steps to MATCH a regression head
+and ~21k to BEAT it, not the ~63k the warm-start lineage implied. **From-scratch is a viable
+recipe**; warm-starting buys a one-time ~20k head start, not a structural requirement.
+
 ⚠️ **This CORRECTS what this entry said an hour earlier**, when it was written from `trunkctx`@20k
 plus `t3_xskip`@18k (0.231): "the point head renders much better" and "a from-scratch flow run
 spends its first ~20k steps STRICTLY WORSE than the baseline". `t3_xskip`@20k falsifies the strong
