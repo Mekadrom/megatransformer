@@ -228,7 +228,18 @@ pooling rather than the model. Resample to K slots and flatten.
 ### Q-Former ablation is tracking EVEN, four gap-closures in
 w=3, from-scratch, matched steps where available:
 
-| step | t3_xskip | trunkctx (`flow_ctx="trunk"`, no Q-Former) |
+⚠️ **The arm name is misleading and so was my description of it.** `zimage_adapter.py:294-295`
+runs `q = self.cross_dec(q, x)` UNCONDITIONALLY and `seq_pred = self.seq_head(self.seq_norm(q))`
+always reads `q`, whatever `flow_ctx` is. So in `trunkctx` the Q-Former is still present, still
+executed, and still TRAINED -- by the 0.1 aux MSE, whose gradient runs
+seq_head -> cross_dec -> self_enc -> trunk. What is ablated is only whether the FLOW HEAD is
+conditioned on `q` or on the raw trunk states `x`. This arm therefore does NOT answer "can
+cross_dec's 18.9M params be dropped"; that needs `flow_ctx="trunk"` AND
+`flow_aux_mse_weight=0` (or `seq_head` rewired to read `x`). It also gives the two arms' matched
+trajectories a duller explanation than the learned-constant-remover hypothesis: both train the
+same Q-Former on the same auxiliary objective.
+
+| step | t3_xskip | trunkctx (`flow_ctx="trunk"` — flow head only; Q-Former still trained) |
 |---|---|---|
 | 8000 | 0.158 | 0.134 |
 | 10000 | 0.195 | 0.155 |
