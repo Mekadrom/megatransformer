@@ -221,6 +221,34 @@ these minimal pairs hold the token SET fixed, so **mean-pooling over tokens is b
 construction** — a first version pooled and reported a flat 0.119 at every stage, measuring the
 pooling rather than the model. Resample to K slots and flatten.
 
+### MATCHED-STEP 20k: the point head OUT-RENDERS the flow head, at equal conditioning quality
+The comparison the from-scratch runs were held for. `whiten_0` has every checkpoint 1000-20000, so
+this is same-step, same 8-prompt probe, same harness.
+
+| arm | step | eval MSE | R^2 | CLIPScore |
+|---|---|---|---|---|
+| `whiten_0` — point head, pure MSE w=1.0 | 20000 | **0.275** | **0.725** | **0.266** (deterministic, NO guidance) |
+| `trunkctx` — flow | 20000 | 0.307 | 0.693 | 0.175 (w=3) |
+| `t3_xskip` — flow | 18000 | 0.309 | 0.691 | 0.231 (w=3) |
+
+⭐ **CONDITIONING QUALITY IS ESSENTIALLY MATCHED** (R^2 0.725 vs 0.691-0.693, gap ~0.03). Pure MSE
+at weight 1.0 for 20k steps teaches the trunk barely better than flow-with-0.1-aux does. Same
+result at 14k (0.312 vs 0.337). **So the mean-regression phase is NOT what the warm-start recipe
+buys** -- it is not a better trunk teacher.
+
+⭐⭐ **BUT THE POINT HEAD RENDERS MUCH BETTER**: 0.266 with NO guidance vs 0.175 / 0.231 for flow
+heads WITH w=3 (0.283 for the point head once gain-corrected). Even allowing for `t3_xskip`'s
+rising trajectory (~0.24 projected at 20k), the deterministic regression head is at least matching
+it. The warm-start table above has flow+guidance at 0.359 beating point+gain at 0.283 -- but that
+was ~63k cumulative steps.
+
+⭐⭐⭐ **THEREFORE the warm-start recipe's value is the FLOW HEAD's slow convergence, not the
+trunk's.** MSE-pretraining skips the long stretch where the flow head underperforms a regression
+head it will eventually beat. Practical consequence: a from-scratch flow run spends its first
+~20k steps in a regime where the architecture under test is STRICTLY WORSE than the baseline it
+is meant to beat. Do not read an architecture verdict from these arms before the flow head has
+caught up; ~63k is the only budget at which the ordering is known to invert.
+
 ---
 
 ## OPEN (world-image session)
