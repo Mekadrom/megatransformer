@@ -761,20 +761,6 @@ def main():
         except Exception:
             pass
 
-        # Generation stopped because the trunk ran out of context, not because the model
-        # chose to stop. Silently truncated output looks identical to a short answer, and an
-        # image costs ~64 trunk positions in one jump, so this is easy to hit after one.
-        if outputs.get("hit_context_limit"):
-            _lim = getattr(
-                model.config.recurrent_block_config.block_config,
-                "max_position_embeddings", "?")
-            status_lines.append(
-                f"⚠️ Stopped at the trunk's context limit ({_lim} positions), not at EOS — "
-                f"output is TRUNCATED. An image consumes ~{model._n_image_gen_positions or 64} "
-                f"positions, so a long chat plus an image reaches it quickly. Start a new "
-                f"conversation or lower max_new_tokens."
-            )
-
         # Report effective sampling params so repro is obvious.
         status_lines.append(
             f"Sampling: T={temperature:.2f}, top_p={top_p}, top_k={top_k}, "
@@ -815,6 +801,21 @@ def main():
                     image_num_inference_steps=image_num_steps,
                     image_sampler=image_sampler_choice,
                 )
+
+        # Generation stopped because the trunk ran out of context, not because the model
+        # chose to stop. Silently truncated output looks identical to a short answer, and an
+        # image costs ~64 trunk positions in one jump, so this is easy to hit after one.
+        if outputs.get("hit_context_limit"):
+            _lim = getattr(
+                model.config.recurrent_block_config.block_config,
+                "max_position_embeddings", "?")
+            status_lines.append(
+                f"⚠️ Stopped at the trunk's context limit ({_lim} positions), not at EOS — "
+                f"output is TRUNCATED. An image consumes "
+                f"~{getattr(model, '_n_image_gen_positions', None) or 64} positions, so a long "
+                f"chat plus an image reaches it quickly. Start a new conversation or lower "
+                f"max_new_tokens."
+            )
 
         # Authoritative counts from generate() — spurious BO*/EO* sampled by
         # the text coda don't show up here, only completed media blocks do.
