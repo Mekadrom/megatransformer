@@ -94,6 +94,16 @@ class MegaTransformerWorldModel(nn.Module):
         if getattr(config, "voice_nar", False):
             self.voice_mask_feature = nn.Parameter(
                 torch.randn(config.voice_prelude_config.feature_channels) * 0.02)
+        # Direct unit path into the coda, for the trunk-text-only variant. Mirrors
+        # voice_coda_prev_proj: a projection from voice feature space into the coda's width,
+        # added to the coda's input. Zero-init so the model starts from "no unit signal" and
+        # has to learn to use it, rather than being perturbed at step 0.
+        if getattr(config, "voice_nar_trunk_text_only", False):
+            self.voice_coda_units_proj = nn.Linear(
+                config.voice_coda_config.feature_channels,
+                config.voice_coda_config.coda_config.d_model)
+            nn.init.zeros_(self.voice_coda_units_proj.weight)
+            nn.init.zeros_(self.voice_coda_units_proj.bias)
 
         # Modality-specific preludes (only instantiate if included)
         self.audio_feature_extractor = (
@@ -238,7 +248,8 @@ class MegaTransformerWorldModel(nn.Module):
                                        temperature: float = 1.0, sp=None,
                                        fallback_frames: int = 250,
                                        choice_temperature: float = 1.0,
-                                       force_bucket: Optional[int] = None):
+                                       force_bucket: Optional[int] = None,
+                                       reveal: str = "confidence"):
         """Full NAR voice synthesis from a prompt ENDING AT BOV. Returns (unit_ids, bucket).
 
         Shared by the training-time viz, the WER eval, the renders and the AR-diagnostics
@@ -280,13 +291,14 @@ class MegaTransformerWorldModel(nn.Module):
         ], dim=1)
         ids = self.generate_voice_nar(full, n_frames=n_frames, n_rounds=n_rounds,
                                       temperature=temperature,
-                                      choice_temperature=choice_temperature)[0]
+                                      choice_temperature=choice_temperature,
+                                      reveal=reveal)[0]
         return ids, bucket
 
     @torch.no_grad()
     def generate_voice_nar(self, text_input_ids, n_frames, n_rounds: int = 16,
                            temperature: float = 1.0, eov_id: Optional[int] = None,
-                           choice_temperature: float = 1.0):
+                           choice_temperature: float = 1.0, reveal: str = "confidence"):
         """Masked-parallel (MaskGIT) voice decoding. Returns per-batch unit id lists.
 
         Built on forward(), NOT on generate(): every position is decoded in parallel, so
@@ -348,9 +360,27 @@ class MegaTransformerWorldModel(nn.Module):
             # Gumbel noise on the log-confidence, annealed to 0 over the rounds, keeps the early
             # commitments diverse while letting the final rounds be decisive.
             if choice_temperature > 0.0:
-                _g = -torch.log(-torch.log(torch.rand_like(conf).clamp_min(1e-9)).clamp_min(1e-9))
+                # Gumbel(0,1) = -log(-log(u)). Parenthesize the inner negation explicitly:
+                # `-torch.log(x).clamp_min(e)` parses as `-(torch.log(x).clamp_min(e))`, which
+                # clamps a NEGATIVE log up to +e and then takes log of a negative number -> NaN.
+                # That silently turned the reveal order arbitrary instead of noisy-but-ordered,
+                # and made choice_temperature a no-op (NaN does not scale).
+                _u = torch.rand_like(conf).clamp(1e-9, 1.0 - 1e-7)
+                _g = -torch.log((-torch.log(_u)).clamp_min(1e-9))
                 _ann = float(choice_temperature) * (1.0 - (r + 1) / float(max(1, n_rounds)))
                 conf = torch.log(conf.clamp_min(1e-9)) + _ann * _g
+            # REVEAL ORDER. MaskGIT reveals by confidence, which assumes confidence tracks
+            # correctness. For this model it tracks REPETITION -- the mode is "same unit again"
+            # -- so confidence ordering commits to repeats first and then conditions on them.
+            # Measured at 23k (decoding is deterministic here, so these are exact): sequential
+            # reveal 0.0742 truncated LCS vs confidence reveal 0.0320, a 2.3x gap. 'sequential'
+            # grows a left-to-right prefix like AR; 'random' is the unbiased control that
+            # separates "not-confidence is better" from "sequence order specifically is better".
+            if reveal == "sequential":
+                conf = torch.linspace(1.0, 0.0, conf.shape[-1], device=conf.device
+                                      ).unsqueeze(0).expand_as(conf).clone()
+            elif reveal == "random":
+                conf = torch.rand_like(conf)
             conf = torch.where(known, torch.full_like(conf, float("inf")), conf)
 
             # Cosine reveal: few commitments early (when context is thin), many late.
@@ -491,6 +521,9 @@ class MegaTransformerWorldModel(nn.Module):
         # alpha=0 severs voice history (position t sees text + its own shifted-TF frame
         # only); alpha=1 (or None) is the identity — no bias built, fast path preserved.
         voice_attn_alpha: Optional[float] = None,
+        # Trunk-text-only NAR: revealed unit features (B, n, C, T) routed DIRECTLY to the coda,
+        # bypassing the prelude and trunk. None => unchanged behavior.
+        voice_coda_units: Optional[torch.Tensor] = None,
         # NAR→AR prenet curriculum: per-step Tacotron-2 prenet dropout on the AR voice path
         # (shifted teacher forcing). Overrides the prelude config's static prenet_dropout so
         # the trainer can RAMP it; None => use the config value. Attacks the shifted-input
@@ -844,6 +877,22 @@ class MegaTransformerWorldModel(nn.Module):
                 voice_batch.shape[1], voice_attn_alpha, voice_batch.device, voice_batch.dtype,
                 batch_size=voice_batch.shape[0], is_synthesis=is_synthesis,
             )
+            # Trunk-text-only NAR: revealed units bypass the prelude/trunk entirely and are
+            # added here, so the trunk's voice positions carry text-derived content only.
+            if voice_coda_units is not None and getattr(self, "voice_coda_units_proj", None) is not None:
+                _u = voice_coda_units
+                if _u.dim() == 4:                      # (B, n, C, T) -> (B*n, T, C)
+                    _b, _n, _c, _t = _u.shape
+                    _u = _u.permute(0, 1, 3, 2).reshape(_b * _n, _t, _c)
+                _T = min(_u.shape[1], voice_batch.shape[1])
+                if _u.shape[0] == voice_batch.shape[0]:
+                    _add = self.voice_coda_units_proj(_u[:, :_T].to(voice_batch.dtype))
+                    voice_batch = voice_batch.clone()
+                    voice_batch[:, :_T] = voice_batch[:, :_T] + _add
+                elif not getattr(self, "_warned_coda_units", False):
+                    self._warned_coda_units = True
+                    print(f"[nar] coda unit injection skipped: {tuple(_u.shape)} vs "
+                          f"{tuple(voice_batch.shape)}", flush=True)
             voice_outputs = self.voice_generator(
                 voice_batch,
                 latent_labels=voice_latent_labels,

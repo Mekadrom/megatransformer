@@ -50,6 +50,16 @@ ap.add_argument("--device", default="cuda:3")
 ap.add_argument("--out_dir", default="eval_output/world_tts_wer")
 ap.add_argument("--voice_temperature", type=float, default=0.6,
                 help="voice unit sampling temperature. Default 0.6 MATCHES THE TRAINING-TIME VIZ (train.py: viz_voice_temperature=0.6), i.e. the TensorBoard renders the ear has been judging. These scripts previously HARDCODED 1.0, which samples far into the 6561-way tail and is audibly less coherent than the model's actual operating point -- so every free-running number they produced described the wrong regime.")
+ap.add_argument("--nar_reveal", type=str, default="confidence",
+                choices=["confidence", "sequential", "random"],
+                help="Which positions to commit each round. 'confidence' is MaskGIT's and "
+                     "assumes confidence tracks correctness; here it tracks repetition.")
+ap.add_argument("--nar_seed", type=int, default=None,
+                help="Seed the RNG before generation. Decoding is stochastic, so two runs of the "
+                     "SAME config differ -- and the paired bootstrap over utterances does NOT "
+                     "capture that, because it treats each run's generations as fixed. Run one "
+                     "config at several seeds to get the run-to-run floor before believing any "
+                     "difference between configs.")
 ap.add_argument("--duration_shuffle", action="store_true", default=False,
                 help="NAR causal probe: overwrite each utterance's predicted duration bucket "
                      "with ANOTHER utterance's. If generated length follows the substituted "
@@ -79,6 +89,13 @@ ds = load_dataset(args, "val")
 coll = make_collator(K, a.voice_max_frames, special_token_base=sp_base); coll.force_direction = "synthesis"
 dec = CosyVoice2Decoder.from_pretrained(a.cosyvoice_dir, device=a.device)
 sr = dec.sample_rate
+# Seed AFTER the decoder is constructed, not before: loading it perturbs (and apparently
+# fixes) the global RNG, so an earlier torch.manual_seed was being overwritten -- three
+# different --nar_seed values produced byte-identical output, which looked like "decoding is
+# deterministic" when it actually meant "the seed never took".
+if a.nar_seed is not None:
+    torch.manual_seed(a.nar_seed)
+    print(f"seeded generation with {a.nar_seed} (after decoder load)", flush=True)
 os.makedirs(a.out_dir, exist_ok=True)
 
 import whisper, librosa, numpy as np
@@ -123,7 +140,7 @@ for i in range(len(ds)):
                 row_forced = _fb
             _ids, _ = model.generate_voice_nar_from_prompt(
                 prompt, n_rounds=a.nar_rounds, temperature=voice_temp, sp=sp,
-                choice_temperature=a.nar_choice_temperature,
+                choice_temperature=a.nar_choice_temperature, reveal=a.nar_reveal,
                 fallback_frames=a.voice_max_frames, force_bucket=_fb)
             out = {"voice_unit_id_trace": [_ids]}
         else:
