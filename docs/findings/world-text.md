@@ -124,8 +124,23 @@ rank <= llm_d+1 = 577 (vs 769 for a trunk-width head) and pins every output dire
 frozen token geometry. Whether that binds at this scale is unmeasured.
 **Settled by:** frozen prelude + shared head vs frozen prelude + trainable head, same seed,
 same corpus, matched step. Compare in **bits-per-byte**, never nats/token — arms on different
-tokenizers are not comparable per-token, and the trainer's `text_loss_raw / log(vocab_size)`
-normalizes the uniform baseline but not tokenization granularity.
+tokenizers are not comparable per-token, and the trainer's `text_loss_norm = text_loss_raw /
+log(vocab_size)` normalizes the uniform baseline but not tokenization granularity.
+
+**Cost, and whether it is worth paying (2026-08-21).** Both arms need a **SmolLM2-tokenized
+corpus, which does not exist** — the 5.25B tokens on disk are Mistral, pack mode, unrecoverable
+in place. So this ablation is not one flag and two runs; it is one flag, two runs, **and a full
+re-download-and-preprocess pass** over the mixture in `logs/huginn_dataset_mixture.md`. If the
+direction then moves to a Qwen3 teacher, that is a *second* full pass, and the question is
+answered by fiat anyway: a frozen SmolLM2 head cannot emit a 151936-entry vocab, so the
+trainable head becomes mandatory and there is no frozen arm left to compare against.
+
+=> **Worth a corpus pass only if the direction stays on SmolLM2.** Under a Qwen3 teacher, drop
+the comparison; `--text_encoder_trainable_head` is still required, by force rather than by
+evidence. The residual value — a prior on whether readout capacity binds at this scale, which
+bears on whether a 116.7M Qwen3 readout is buying anything — is obtainable more cheaply and
+more relevantly *inside* the Qwen3 setup, as full head vs a low-rank factorized head, on the
+corpus that has to be built regardless.
 
 ### Is there an identity shortcut that makes text-only uninformative?
 Predicted, not measured. In text-only, frozen prelude + frozen shared head form a complete
