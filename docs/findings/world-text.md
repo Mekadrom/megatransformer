@@ -114,6 +114,63 @@ the entire recurrent trunk. Model total would be ~384M, of which ~30% is a reado
 The full logits tensor at batch 8 x seq 1024 is **4.98 GB in fp32** before gradients — a fused
 or chunked linear-cross-entropy is a hard requirement on a 24GB card, not an optimization.
 
+### Z-Image's Qwen3-4B is stock EXCEPT for a pruned final-layer MLP (2026-08-23)
+`Tongyi-MAI/Z-Image-Turbo/text_encoder` vs `Qwen/Qwen3-4B`, tensor-by-tensor over all 398
+tensors / 4.022B params: **396 are bit-identical**. Two differ, both in the last layer (35 of
+0..35), and the modification is structured zeroing, not a finetune:
+
+| tensor | shape | change |
+|---|---|---|
+| `layers.35.mlp.up_proj.weight` | 9728 x 2560 | **5770 / 9728 rows entirely zeroed** (59.3%) |
+| `layers.35.mlp.down_proj.weight` | 2560 x 9728 | **404 / 2560 rows entirely zeroed** (15.8%) |
+
+Every differing element is exactly 0 in the Z-Image copy; `layers.35.mlp.gate_proj` is
+untouched, which is consistent — zeroing a neuron's `up_proj` row forces
+`silu(gate) * up = 0` regardless of gate. Norm ratio matches cosine to 3 decimals
+(86.502/129.345 = 0.6688 vs cos 0.6690), the signature of a projection. Config is stock
+Qwen3-4B (hybrid-instruct, `eos 151645` = `<|im_end|>`, `tie_word_embeddings: true`, no
+separate `lm_head` tensor).
+
+Functional impact, measured on one caption, fp32, CPU:
+
+| readout | Z-Image copy vs stock |
+|---|---|
+| `hidden_states[-2]` (what world-image regresses) | **bit-identical**, max abs diff 0.000e+00 |
+| `hidden_states[-1]` | cos 0.798, max abs diff 36.1 |
+| next-token logits | KL(stock‖zimage) **0.111 nats**, top-10 overlap 8/10, logit cos 0.195 |
+
+=> The pruning sits entirely **outside** the path world-image uses: `hidden_states[-2]` is the
+output of layer 34, which layer 35's MLP cannot affect. That conditioning target is exactly
+stock Qwen3-4B and no world-image result is contaminated.
+
+=> **But this checkpoint is a degraded language model.** A text teacher needs logits, which run
+through layer 35. Distilling from the Z-Image copy would silently distil from a lobotomised
+Qwen3-4B. **Use stock `Qwen/Qwen3-4B` for any text-teacher role** — it is a separate 7.6 GB
+download and is already in `HF_HOME`; reusing the Z-Image copy because it is "already on disk"
+is the trap.
+
+### Logit distillation is basis-free; hidden-state regression is basis-locked (2026-08-23)
+A KL between student and teacher distributions is over **token ids**, so it is invariant to the
+teacher's internal basis. A regression onto `hidden_states[-2]` is a fit to **one checkpoint's
+coordinate system**. Consequences for this project, which does both:
+
+- **world-text (logits):** teacher size is a free choice and a free ablation. Qwen3-0.6B /
+  1.7B / 4B share vocab 151936, so all three can be tried on one corpus, and teachers could
+  even be mixed or ensembled.
+- **world-image (hidden states):** the teacher is not a choice at all — Z-Image was trained
+  against Qwen3-4B conditioning, so the target is dictated by the decoder. Swapping to another
+  Qwen3, *even one with the same `d`*, invalidates every learned adapter weight.
+
+Equal `hidden_size` across the lineage (14B and 32B both d=5120; 1.7B and 30B-A3B both d=2048;
+8B and 235B-A22B both d=4096) does **not** imply a shared or compatible embedding space. Those
+pairs differ in depth and head count (14B is 40L/40H, 32B is 64L/64H), and the
+[Qwen3 report](https://arxiv.org/abs/2505.09388)'s strong-to-weak distillation is a
+**post-training** procedure — off-policy response distillation, then on-policy logit-KL against
+Qwen3-32B / Qwen3-235B-A22B — which constrains output distributions, not representation bases.
+NOT independently verified here: only Qwen3-4B and 0.6B weights are cached locally, so the
+equal-`d` embedding matrices were never compared numerically. Treat "unrelated bases" as the
+architecturally-motivated default, not a measurement.
+
 ---
 
 ## OPEN
