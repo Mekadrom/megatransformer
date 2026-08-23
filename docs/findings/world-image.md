@@ -280,6 +280,17 @@ The gap grew monotonically across seven windows (0.016 -> 0.025 -> 0.041 -> 0.04
 ~2 SE, and `trunkctx` reads lower than `t3_xskip` even when it is 2k steps FURTHER along
 (0.207 @22k vs 0.246 @20k).
 
+⚠️ **DOWNGRADED 2026-08-23 at 60k: the gap is SHRINKING, and is now ~a third of the recorded size.**
+Over the last 8 MATCHED steps (53k-60k): mean **+0.026 at w=3** and **+0.040 at w=1**, versus
++0.071 at 20k. `trunkctx` WON one of the eight (57k, -0.008). Still positive at 7/8, so the
+direction holds — but "the flow head's context matters" now reads as a diminishing convergence-RATE
+advantage rather than a capability wall, which is exactly what the single-seed caveat was for.
+⭐ **The advantage is LARGER UNGUIDED than guided (0.040 vs 0.026)** — consistent with the
+constant-remover story plus the guidance-redundancy pattern seen everywhere else in this file: CFG
+amplifies the conditional component, partially doing for `trunkctx` what `cross_dec` does for
+`t3_xskip`, so the arms look most similar exactly where guidance is strongest. Same shape as the
+gamma-gain result (trunk gain substituted for CFG and added nothing once CFG was on).
+
 ⭐ **Mechanism, and it was predicted before the gap appeared:** the raw trunk states hand the flow
 head conditioning at ~4% of a norm-83 constant (see the compression entry). Cross-attention with
 its own learned queries can put whatever it likes in the constant component, so `cross_dec` can act
