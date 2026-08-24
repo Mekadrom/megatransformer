@@ -421,6 +421,32 @@ Fixed to score the FIRST utterance and to report disjoint-utterance counts; the 
 figures are largely within-block and so probably survive, but **the length statistics above
 are void pending the re-run**.
 
+### ⚠️ `ar_flat_lr_0` is NOT a clean control for `ar_flat_lr_1` (2026-08-24)
+Both exist and they differ in more than the thing under test. Record before anyone
+step-matches them:
+
+| | `_0` | `_1` |
+|---|---|---|
+| start | fresh | fresh |
+| LR | **1e-5 for steps 0-11000, then 1e-4 on resume** | **1e-4 throughout** |
+| `--unmask_eos_in_synthesis` | no | **yes** |
+| everything else | same | same |
+
+So a step-matched `_0` vs `_1` comparison confounds the EOS exemption with a 10x LR
+difference — and `_0`'s own curve has a discontinuity at 11000. **Do not read a text-delta or
+accuracy difference between them as an EOS effect.**
+
+What IS readable, because the mechanism is specific and the expected effect is large:
+- `train/text_loss_norm` must APPEAR in `_1` (it does not exist in `_0` at all). Absent =
+  the flag is inert, same as the two inert-flag bugs found the same day.
+- **Disjoint utterances per prompt within `_1`**, against `_0`'s measured 2.03 (diagnostics,
+  n=32) and 2.75 (viz, n=8) at step 11076. Falling toward 1.0 is the fix working. This is a
+  within-run readout against a documented prior, not a cross-run comparison.
+
+Also note `_1` holds **1e-4 constant with no decay**. The project's from-scratch default is
+7e-5 (1e-4 caused spikes/NaN — but that was with a DiT in the loss, absent here; the 32-sample
+memorization arms ran 1e-4 cleanly). Watch grad_norm early.
+
 ### Why it starts a second utterance: EOS after a media block is never trained (2026-08-24)
 Owner's diagnosis, confirmed in code and pinned by a test. The synthesis layout is
 `[text][BOV][PH][EOV][eos]`, so after placeholder-stripping and the causal shift **the text
