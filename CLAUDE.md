@@ -230,6 +230,9 @@ Rules that matter (full conventions in `docs/findings/README.md`):
 - A finding belongs to the direction it was measured in. Promote to `cross-modal.md` only
   after replication in a second direction.
 
+Active implementation plans live in `docs/plans/`. Read the relevant one before starting work
+it covers — they carry the traps and the decisions already made.
+
 ## Configuration
 
 DeepSpeed configs are in root: `ds_config.json`, `ds_config_zero-*.json`, `ds_config_int8.json`
