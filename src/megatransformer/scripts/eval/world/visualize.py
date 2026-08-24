@@ -242,7 +242,17 @@ def load_world_model(args, device):
             # +1 for the EOV terminal token (must match training: unit head is K+1-way,
             # EOV = class K). Loading with only K would shape-mismatch the checkpoint's
             # unit head and drop the discrete stop mechanism.
-            config.voice_coda_config.unit_vocab_size = int(load_codebook(cbp).shape[0]) + 1
+            #
+            # A BISTREAM checkpoint is K+2 (fill_token = K+1 ends a chunk). Prefer the width
+            # actually stored in the checkpoint over the derived one -- the flag that decided
+            # it lives in the training CLI, which no eval script has.
+            _K = int(load_codebook(cbp).shape[0])
+            _w = (model_loading_utils.detect_voice_unit_vocab_size(args.checkpoint_path)
+                  if getattr(args, "checkpoint_path", None) else None)
+            if _w is not None and _w != _K + 1:
+                print(f"  Detected unit head width {_w} in checkpoint "
+                      f"(K+{_w - _K}){' -> bistream fill_token' if _w == _K + 2 else ''}")
+            config.voice_coda_config.unit_vocab_size = _w if _w is not None else _K + 1
         vfc = getattr(args, "voice_feature_channels", None)
         if vfc:
             config.voice_prelude_config.feature_channels = vfc

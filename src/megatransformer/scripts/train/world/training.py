@@ -199,6 +199,11 @@ class WorldModelTrainer(CommonTrainer):
         # during synthesis competes with the generation objective.
         mask_text_loss_in_synthesis: bool = False,
         emit_duration_token: bool = False,
+        # Bistream: keep the text loss alive on chunk-interleaved rows even when
+        # --mask_text_loss_in_synthesis is set. Required for inner monologue (the model
+        # generating its own transcript); optional for plain bistream TTS, where the
+        # transcript is still fed at inference.
+        bistream_text_loss: bool = False,
         voice_nar: bool = False,
         voice_nar_mask_schedule: str = "cosine",
         voice_nar_mask_ratio_min: float = 0.85,
@@ -228,6 +233,7 @@ class WorldModelTrainer(CommonTrainer):
         self.lr_wsd_decay_frac = lr_wsd_decay_frac
         self.mask_text_loss_in_synthesis = mask_text_loss_in_synthesis
         self.emit_duration_token = bool(emit_duration_token)
+        self.bistream_text_loss = bool(bistream_text_loss)
         self.voice_nar = bool(voice_nar)
         self.voice_nar_mask_schedule = str(voice_nar_mask_schedule)
         self.voice_nar_mask_ratio_min = float(voice_nar_mask_ratio_min)
@@ -723,6 +729,7 @@ class WorldModelTrainer(CommonTrainer):
         voice_lengths = None
         voice_latent_labels = None
         voice_loss_lengths = None  # (B,) raw feature lengths for masked loss
+        voice_chunk_map = None
         if self.include_voice:
             voice_data = inputs.get("voice_features")  # [B, C, T]
             if voice_data is not None:
@@ -733,6 +740,14 @@ class WorldModelTrainer(CommonTrainer):
                 if voice_feat_lengths is not None:
                     voice_lengths = voice_feat_lengths.unsqueeze(1)
                     voice_loss_lengths = voice_feat_lengths  # (B,) for masked loss
+
+                # BISTREAM: (B, M, 3) = (utt_idx, start, length) per voice placeholder. The
+                # collator emits it only when at least one row is chunked, so its absence is
+                # the unistream path and costs nothing.
+                _cs = inputs.get("voice_chunk_starts")
+                if _cs is not None:
+                    voice_chunk_map = torch.stack(
+                        [inputs["voice_chunk_utts"], _cs, inputs["voice_chunk_lengths"]], dim=-1)
 
         # Image inputs: collator provides image_images [B, C, H, W] (raw or latent).
         # World model expects (B, n_images, ...).
@@ -759,6 +774,7 @@ class WorldModelTrainer(CommonTrainer):
                 voice_inputs = None
                 voice_lengths = None
                 voice_latent_labels = None
+                voice_chunk_map = None
             if audio_inputs is not None and audio_inputs.shape[0] != B:
                 audio_inputs = None
                 audio_lengths = None
@@ -914,6 +930,7 @@ class WorldModelTrainer(CommonTrainer):
             audio_lengths=audio_lengths,
             voice_inputs=voice_inputs,
             voice_lengths=voice_lengths,
+            voice_chunk_map=voice_chunk_map,
             image_inputs=image_inputs,
             image_latent_labels=image_latent_labels,
             image_clip_seq_labels=image_clip_seq_labels,
@@ -998,14 +1015,34 @@ class WorldModelTrainer(CommonTrainer):
         # re-target rather than a quiet special case: keep the loss, mask every target that is
         # NOT a duration bucket.
         duration_only = False
-        if skip_text_loss and self.emit_duration_token and text_targets is not None:
-            _lo = self._sp.base + 9
-            _hi = _lo + constants.N_DURATION_BUCKETS
-            _keep = (text_targets >= _lo) & (text_targets < _hi)
+        _dur_keep = None
+        if skip_text_loss and text_targets is not None:
+            _keep = torch.zeros_like(text_targets, dtype=torch.bool)
+            if self.emit_duration_token:
+                _lo = self._sp.base + 9
+                _hi = _lo + constants.N_DURATION_BUCKETS
+                _dur_keep = (text_targets >= _lo) & (text_targets < _hi)
+                _keep |= _dur_keep
+            # BISTREAM TEXT EXEMPTION, same shape of silent failure as the duration one.
+            # Under chunk interleaving the transcript is no longer purely conditioning: the
+            # model has to know when it has said everything the text so far supports, and
+            # under INNER MONOLOGUE it must generate the text chunks itself. With the whole
+            # text loss masked it can never learn to, while training loss looks perfectly
+            # healthy -- so this is an explicit per-ROW re-target, not a quiet special case.
+            # Per row because a batch mixes unistream and bistream samples.
+            if self.bistream_text_loss:
+                _bi = inputs.get("voice_is_bistream")
+                if _bi is not None and _bi.shape[0] == text_targets.shape[0] and bool(_bi.any()):
+                    _keep |= _bi.to(text_targets.device).bool().unsqueeze(1).expand_as(_keep)
             if bool(_keep.any()):
                 text_targets = text_targets.masked_fill(~_keep, -100)
                 skip_text_loss = False
-                duration_only = True
+                # "duration_only" gates the duration ACCURACY metric, which is only
+                # interpretable when duration buckets are the only kept targets. With
+                # bistream text also kept it is computed on its own subset instead.
+                duration_only = _dur_keep is not None
+                if _dur_keep is not None:
+                    _dur_keep = _dur_keep & (text_targets != -100)
         logits = outputs.get("logits")
         if logits is not None and text_targets is not None and not skip_text_loss:
             B, T, V = logits.size()
@@ -1028,7 +1065,11 @@ class WorldModelTrainer(CommonTrainer):
             loss_components[f"text_loss_norm/{task_type}"] = text_loss_norm.detach()
             if duration_only:
                 with torch.no_grad():
-                    _m = text_targets.reshape(-1) != -100
+                    # Restricted to duration positions: with the bistream exemption on, the
+                    # kept targets also include ordinary text, which would silently turn
+                    # "duration accuracy" into "text accuracy".
+                    _m = (_dur_keep[:, :T_min].reshape(-1) if _dur_keep is not None
+                          else (text_targets.reshape(-1) != -100))
                     if bool(_m.any()):
                         _pred = logits.reshape(-1, V)[_m].argmax(-1)
                         _tgt = text_targets.reshape(-1)[_m]
@@ -2413,6 +2454,22 @@ def load_model(args, device='cuda'):
             if not getattr(args, 'voice_predict_f0', False):
                 config.voice_coda_config.predict_f0 = True
                 print("[world] --voice_dedup implies F0: enabling predict_f0", flush=True)
+        _btc = int(getattr(args, "bistream_text_chunk", 0) or 0)
+        _bvc = int(getattr(args, "bistream_voice_chunk", 0) or 0)
+        if bool(_btc) != bool(_bvc):
+            raise SystemExit(
+                "--bistream_text_chunk and --bistream_voice_chunk must be set together "
+                f"(got {_btc} and {_bvc}). One without the other silently disables bistream.")
+        if _btc and not getattr(args, 'voice_codebook_path', None):
+            raise SystemExit(
+                "bistream requires --voice_codebook_path: fill_token is a UNIT id (K+1), so "
+                "there is nothing to derive it from on the continuous path.")
+        if _btc and getattr(args, 'voice_nar', False):
+            raise SystemExit(
+                "bistream is an AR layout and does not compose with --voice_nar. Masked-parallel "
+                "decoding reveals frames in confidence order, which has no notion of 'the text so "
+                "far', so the fill_token target it would learn is meaningless. See "
+                "docs/plans/bistream-inner-monologue.md ('AR, not NAR').")
         codebook_path = getattr(args, 'voice_codebook_path', None)
         if codebook_path:
             from megatransformer.utils.codebook import load_codebook
@@ -2423,8 +2480,14 @@ def load_model(args, device='cuda'):
             # terminal token (class index K): the coda classifies K content units plus one
             # end-of-voice token, which replaces the old stop head. The codebook stays K
             # entries -- EOV has no centroid; generation stops on it before any lookup.
-            config.voice_coda_config.unit_vocab_size = K + 1
-            print(f"[world] discrete voice units ON: K={K} (+1 EOV token) from {codebook_path}", flush=True)
+            # +1 more for bistream's fill_token (id K+1), which terminates a CHUNK as EOV
+            # terminates the UTTERANCE. Two separate tokens by design: "send me more text"
+            # and "I am done speaking" are different events, and collapsing them would make
+            # the end of every chunk look like the end of the utterance.
+            _bi = int(getattr(args, "bistream_text_chunk", 0) or 0) > 0
+            config.voice_coda_config.unit_vocab_size = K + (2 if _bi else 1)
+            print(f"[world] discrete voice units ON: K={K} "
+                  f"(+1 EOV{' +1 fill' if _bi else ''}) from {codebook_path}", flush=True)
         voice_feature_channels = _voice_feature_channels(args)
         if voice_feature_channels is not None:
             # The prelude projects features -> d_model and the coda predicts d_model -> features,
@@ -2658,6 +2721,7 @@ def create_trainer(
         lr_wsd_decay_frac=getattr(args, 'lr_wsd_decay_frac', 0.2),
         mask_text_loss_in_synthesis=getattr(args, 'mask_text_loss_in_synthesis', False),
         emit_duration_token=getattr(args, 'voice_nar_duration_token', False),
+        bistream_text_loss=getattr(args, 'bistream_text_loss', False),
         voice_nar=getattr(args, 'voice_nar', False),
         voice_nar_mask_schedule=getattr(args, 'voice_nar_mask_schedule', 'cosine'),
         voice_nar_mask_ratio_min=getattr(args, 'voice_nar_mask_ratio_min', 0.85),
@@ -3202,6 +3266,35 @@ def add_cli_args(subparsers):
                                  "the frozen LLM is untouched. Automatically exempts the token "
                                  "from --mask_text_loss_in_synthesis, which would otherwise give "
                                  "it zero gradient while training loss looked healthy.")
+    # ------------------------------------------------------------------ bistream
+    sub_parser.add_argument("--bistream_text_chunk", type=int, default=0,
+                            help="BISTREAM chunk interleaving (CosyVoice 2 style): text tokens "
+                                 "per chunk, k. 0 = off (all text then all speech). Turns the "
+                                 "layout into [text 0:k][BOV][PH][EOV][text k:2k][BOV][PH][EOV]... "
+                                 "so the text a frame realizes is ADJACENT instead of hundreds of "
+                                 "positions back, and alignment is roughly monotonic. Needs "
+                                 "--bistream_voice_chunk. Widens the unit head by one for the "
+                                 "chunk terminator (fill_token = K+1), so a bistream checkpoint "
+                                 "is NOT loadable into a unistream model.")
+    sub_parser.add_argument("--bistream_voice_chunk", type=int, default=0,
+                            help="Speech frames per chunk, s. Use 30, NOT CosyVoice 2's 15: theirs "
+                                 "assumes 3 frames/token and our corpus measures 5.9 (n=6102, "
+                                 "median 5.906), so 5:15 would exhaust the text about halfway "
+                                 "through the utterance and leave the back half unaligned.")
+    sub_parser.add_argument("--bistream_prob", type=float, default=0.5,
+                            help="Fraction of ELIGIBLE synthesis samples that go bistream; the rest "
+                                 "stay unistream. 0.5 copies CosyVoice 2, and keeps the unistream "
+                                 "half directly comparable to what is trained today. A sample is "
+                                 "eligible when the chunks before the last one fit "
+                                 "(n_frames > (n_text_chunks-1)*s) -- the exact condition, not "
+                                 "their speech/text ratio gate, which would reject ~half our data.")
+    sub_parser.add_argument("--bistream_text_loss", action="store_true", default=False,
+                            help="Keep the text loss alive on chunk-interleaved rows even under "
+                                 "--mask_text_loss_in_synthesis. REQUIRED for inner monologue (the "
+                                 "model generating its own transcript); optional for bistream TTS, "
+                                 "where the transcript is still fed at inference. Without it the "
+                                 "interleaved text gets zero gradient and the model can never speak "
+                                 "at will -- while training loss looks perfectly healthy.")
     sub_parser.add_argument("--voice_onpolicy_distill", action="store_true", default=False,
                             help="Score the distillation teacher on the model's OWN "
                                  "(scheduled-sampling-substituted) unit history instead of the "

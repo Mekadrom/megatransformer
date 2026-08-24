@@ -128,6 +128,25 @@ def detect_world_nar_trunk_text_only(checkpoint_path: str) -> bool:
     return any(k.endswith("voice_coda_units_proj.weight") for k in sd)
 
 
+def detect_voice_unit_vocab_size(checkpoint_path: str) -> Optional[int]:
+    """Width of the voice coda's unit head, or None if absent.
+
+    K+1 = content units + EOV (unistream). K+2 = ... + fill_token, the chunk terminator that
+    bistream adds. Same strict=False failure class as the detectors above, and worse here:
+    a K+2 checkpoint loaded into a K+1 model drops the ENTIRE unit head (shape mismatch),
+    so generation runs on a randomly initialized classifier and produces confident noise
+    with no error anywhere. Read the width off the weights rather than re-deriving it from
+    a codebook size plus a flag the eval script does not have.
+    """
+    try:
+        sd = _sive_state_dict(checkpoint_path)
+    except Exception as e:
+        print(f"  [warn] could not probe checkpoint for unit-head width ({e})")
+        return None
+    key = next((k for k in sd if k.endswith("unit_head.weight")), None)
+    return int(sd[key].shape[0]) if key is not None else None
+
+
 def detect_n_special_tokens(checkpoint_path: str) -> Optional[int]:
     """Row count of the trainable control-token extension, or None if absent.
 

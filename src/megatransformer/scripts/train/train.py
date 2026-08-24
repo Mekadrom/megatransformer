@@ -195,6 +195,13 @@ def get_data_collator(command: str, args) -> Optional[DataCollator]:
             special_token_base=special_token_base,
             eos_token_id=eos_token_id,
             emit_duration_token=getattr(args, "voice_nar_duration_token", False),
+            bistream_text_chunk=getattr(args, "bistream_text_chunk", 0),
+            bistream_voice_chunk=getattr(args, "bistream_voice_chunk", 0),
+            bistream_prob=getattr(args, "bistream_prob", 0.5),
+            # fill_token = K + 1 (EOV is K). Derived from the same codebook the EOV id comes
+            # from, so the two terminators cannot drift apart.
+            voice_fill_id=(voice_eov_id + 1 if (voice_eov_id is not None
+                           and getattr(args, "bistream_text_chunk", 0) > 0) else None),
         )
     return collator
 

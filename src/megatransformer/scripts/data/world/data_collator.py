@@ -588,6 +588,12 @@ class MultimodalDataCollator(DataCollator):
                 batch[f"{prefix}_chunk_lengths"] = chunk_lengths
                 batch[f"{prefix}_chunk_counts"] = torch.tensor(n_chunks, dtype=torch.long)
                 batch[f"{prefix}_chunk_utts"] = torch.zeros(len(segs), M, dtype=torch.long)
+                # Which rows were actually chunked. The text-loss carve-out is PER ROW (a
+                # batch mixes unistream and bistream samples), and deriving it from
+                # chunk_counts > 1 elsewhere would re-encode the layout rule in a second
+                # place. Emit it once, here.
+                batch[f"{prefix}_is_bistream"] = torch.tensor(
+                    [p is not None and p["chunks"] is not None for p in plans], dtype=torch.bool)
 
         if not discrete and all_features[0] is not None:
             padded, masks = pad_and_mask(all_features, span_lengths)
