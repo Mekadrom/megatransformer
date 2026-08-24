@@ -361,10 +361,26 @@ then nonsense to the cap" artifact already documented for the transcription-inpu
 short generation therefore sounded like a long degenerate one, and the model got the blame.
 Fixed with `_trim_generated_voice` at both sites (voice_to_voice and text_to_voice).
 
-⚠️ This does NOT by itself explain a 20-second render: `--voice_token_budget 250` at 25 Hz
-caps ONE block at 10 s, and the budget is applied per block (`voice_sequences` is cleared at
-each finalize). If renders really are ~20 s, something beyond the padding is also wrong and
-needs measuring, not reasoning about.
+### Over-length renders: the flat unit trace concatenates EVERY voice block (fixed 2026-08-24)
+Owner observation that cracked it: 20-second renders appeared only after the Mimi/SMG ->
+CosyVoice 2 switch; Mimi runs were correctly capped at 10 s. The rate was never wrong — the
+TB context string reads **`437 units -> 17.48s @ 24000Hz`**, i.e. exactly 25.0 Hz. 437 units
+against a 250-frame budget is the whole story.
+
+What happens: the model fails to emit EOV, block 1 runs to the 250-frame budget, finalizes,
+hands back to text, the model samples BOV **again** and speaks a second time. `generate()`
+returns `voice_unit_id_trace` as a FLAT trace across every block, so the render concatenated
+250 + 187 into one 17.5 s clip.
+
+Why the modality switch exposed it: the SMG path renders `voice_latent_preds[0, 0]` —
+utterance 0 alone, therefore capped at the budget. The CosyVoice 2 path renders unit ids and
+took them from the flat trace. **The second block was always being generated; the old render
+simply could not show it.** `_generated_unit_ids` now prefers `voice_unit_id_segments[idx][0]`,
+matching the latent path's utterance-0 convention, so an over-length render is a TERMINATION
+finding again rather than a render artifact.
+
+Two lessons worth carrying: a per-block budget bounds a BLOCK, not a call; and when a
+diagnostic changes at the same time as a component, suspect the diagnostic.
 
 ### Bistream trains and decodes; it ties unistream on memorization, as predicted (2026-08-24)
 `world_voice_memorize32_bistream_0` (identical to the unistream arm plus

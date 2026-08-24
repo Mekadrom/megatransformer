@@ -2149,11 +2149,27 @@ class WorldModelVisualizationCallback(VisualizationCallback):
     def _generated_unit_ids(outputs, idx: int = 0):
         """Content unit ids for sample `idx` of a generate() OR teacher-forced call, or None.
 
-        Prefers `voice_unit_id_trace` (what generation actually emitted, EOV already stripped
-        by generate()). Falls back to argmax over `voice_unit_logits` for teacher-forced
+        Prefers `voice_unit_id_segments[idx][0]` -- the FIRST utterance. Falls back to the flat
+        `voice_unit_id_trace`, then to argmax over `voice_unit_logits` for teacher-forced
         outputs. Never derives ids from voice_latent_preds: that is the regression head, a
         sibling of the unit classifier, not the model's discrete prediction.
+
+        ⚠️ The flat trace spans EVERY voice block the call produced. A model that fails to emit
+        EOV runs one block to the frame budget, finalizes, gets handed back to text, samples
+        BOV again and speaks a second time -- and the flat trace concatenates them, so an
+        N-frame budget renders as a clip of 2N+ frames. Measured 2026-08-24: 437 units ->
+        17.48 s against a 250-frame (10 s) budget.
+
+        This is why the symptom appeared only after the Mimi/SMG -> CosyVoice 2 switch. The SMG
+        path renders `voice_latent_preds[0, 0]`, which is utterance 0 alone and therefore
+        capped at the budget; the CosyVoice 2 path renders unit ids, and took them from the
+        flat trace. The second block was always being generated -- the old render just could
+        not show it. Matching the latent path's convention (utterance 0) makes over-length a
+        TERMINATION finding again instead of a render artifact.
         """
+        segs = outputs.get("voice_unit_id_segments")
+        if segs and idx < len(segs) and segs[idx] and len(segs[idx][0]) > 0:
+            return torch.tensor([int(x) for x in segs[idx][0]], dtype=torch.long)
         trace = outputs.get("voice_unit_id_trace")
         if trace:
             seq = trace[idx] if isinstance(trace[0], (list, tuple)) else trace
