@@ -33,6 +33,7 @@ class MultimodalMemorizationDataset(Dataset):
         voice_columns: list[str] = None,
         cache_size: int = 3,  # ignored, kept for interface compat
         max_samples: int = 32,
+        voice_codebook=None,
     ):
         self.samples = []
         self.modalities_present = set()
@@ -52,6 +53,13 @@ class MultimodalMemorizationDataset(Dataset):
             raise ValueError("At least one shard directory must be provided")
 
         n_modalities = len(dirs)
+        # DISCRETE-UNIT VOICE. This dataset predates the VQ/CosyVoice 2 path: those caches
+        # store `unit_ids` and NO `features` key, and the sharded dataset expands
+        # centroids[unit_ids] on the fly. Without the codebook here, voice samples came back
+        # with no features and no feature_length, and the collator died on int(None).
+        from megatransformer.utils.codebook import load_codebook
+        self.voice_centroids = load_codebook(voice_codebook) if voice_codebook is not None else None
+
         per_modality = max(1, max_samples // n_modalities)
 
         # Load raw samples per modality
@@ -112,6 +120,14 @@ class MultimodalMemorizationDataset(Dataset):
             if "features" in shard:
                 sample["features"] = shard["features"][idx]
                 sample["feature_length"] = shard["feature_lengths"][idx]
+            elif "unit_ids" in shard:
+                # Discrete path: mirror MultimodalShardedDataset._get_voice_sample.
+                unit_ids = shard["unit_ids"][idx]
+                sample["unit_ids"] = unit_ids
+                sample["feature_length"] = shard["feature_lengths"][idx]
+                if self.voice_centroids is not None:
+                    sample["features"] = self.voice_centroids[
+                        unit_ids.clamp(min=0)].transpose(0, 1).contiguous()   # (D, T)
             if "waveforms" in shard:
                 sample["waveform"] = shard["waveforms"][idx]
                 sample["waveform_length"] = shard["waveform_lengths"][idx]
@@ -131,6 +147,12 @@ class MultimodalMemorizationDataset(Dataset):
                 sample["ctc_length"] = shard["ctc_lengths"][idx]
             if "text" in shard:
                 sample["voice_text"] = shard["text"][idx]
+            # The voice shard carries the PAIRED transcript. Without lifting it out, a
+            # voice-only run produces samples with no text_token_ids at all, the collator
+            # skips text entirely, and compute_loss returns zero loss -- training on nothing.
+            if "token_ids" in shard:
+                sample["token_ids"] = shard["token_ids"][idx]
+                sample["text_length"] = shard["text_lengths"][idx]
             return sample
 
         elif modality == "image":
@@ -144,7 +166,11 @@ class MultimodalMemorizationDataset(Dataset):
         return self.total_samples
 
     def __getitem__(self, idx: int) -> dict:
-        sample = {}
+        # _direction/_task matter: the collator reads ex["_direction"], and without it the
+        # synthesis/transcription choice falls back to a 50/50 coin flip, so half a
+        # "text -> voice" memorization run would silently train transcription instead.
+        sample = {"_modality": "voice", "_task": "voice_synthesis", "_direction": "synthesis"} \
+            if "voice" in self.modalities_present else {}
 
         for modality, mod_samples in self._modality_samples.items():
             wrapped_idx = idx % len(mod_samples)
@@ -156,6 +182,13 @@ class MultimodalMemorizationDataset(Dataset):
                 sample.update({f"audio_{k}": v for k, v in mod_sample.items()})
             elif modality == "voice":
                 sample.update({f"voice_{k}": v for k, v in mod_sample.items()})
+                # Mirror MultimodalShardedDataset.__getitem__: promote the voice shard's own
+                # transcript to the text slots the collator looks for.
+                if "token_ids" in mod_sample:
+                    sample["text_token_ids"] = mod_sample["token_ids"]
+                    sample["text_text_length"] = mod_sample["text_length"]
+                if "voice_text" in mod_sample:
+                    sample["text_text"] = mod_sample["voice_text"]
             elif modality == "image":
                 sample.update({f"image_{k}": v for k, v in mod_sample.items()})
 

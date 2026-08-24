@@ -345,6 +345,7 @@ def get_dataset(command: str, args, split: str):
                 voice_shard_dir=voice_dir,
                 image_shard_dir=image_dir,
                 max_samples=max_samples,
+                voice_codebook=getattr(args, "voice_codebook_path", None),
             )
         else:
             dataset = MultimodalShardedDataset(
