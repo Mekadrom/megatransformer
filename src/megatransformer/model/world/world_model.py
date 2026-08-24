@@ -1191,6 +1191,18 @@ class MegaTransformerWorldModel(nn.Module):
         # a chunk's first step emits nothing, hands back to text, and burns the transcript
         # without producing audio).
         voice_min_chunk_frames: int = 0,
+        # EVAL DECODING: ban the media CONTROL tokens from the text sampler -- the three BO*
+        # boundary tokens and the three placeholders. Off by default (a speak-at-will model
+        # must be able to emit BO* to start a media block); ON for eval, where the prompt
+        # already supplies BO* and anything further is a hallucination.
+        #
+        # What it buys: a model that never emits EOV runs its block to the frame budget,
+        # finalizes, is handed back to text, and can then sample BOV AGAIN and speak a second
+        # time. Banning BO* makes that structurally impossible instead of merely unlikely.
+        # The placeholders are banned with them because sampling one is meaningless in any
+        # regime: they are a data-layout artifact the interleaver consumes at training time,
+        # and at generation there is nothing to replace them with.
+        suppress_media_control_tokens: bool = False,
         # Truncated sampling for the discrete voice unit head (only active when voice_temperature > 0).
         # top_k keeps the k highest-prob units; top_p (nucleus) keeps the smallest set whose cumulative
         # prob >= p. Both None/0 (default) => untruncated temperature sampling = prior behavior. These cut
@@ -1458,6 +1470,21 @@ class MegaTransformerWorldModel(nn.Module):
             elif last_token == self._sp.BOI:
                 current_modality[b] = "image"
 
+        _banned_text_ids = None
+        if suppress_media_control_tokens:
+            _banned_text_ids = [self._sp.BOA, self._sp.BOV, self._sp.BOI,
+                                self._sp.AUDIO_PLACEHOLDER, self._sp.VOICE_PLACEHOLDER,
+                                self._sp.IMAGE_PLACEHOLDER]
+
+        def _ban(lg):
+            """-inf the banned ids so they cannot be sampled. EO* is deliberately NOT banned:
+            generate() FORCES it after a media block, and forcing bypasses the sampler."""
+            if not _banned_text_ids:
+                return lg
+            lg = lg.clone()
+            lg[..., _banned_text_ids] = float("-inf")
+            return lg
+
         # Process the prompt through the text coda with KV caching so
         # the coda's self-attention has the complete prompt context.
         #
@@ -1484,7 +1511,7 @@ class MegaTransformerWorldModel(nn.Module):
         all_logits.append(logits.unsqueeze(1))
 
         # Sample first token
-        next_token_ids = self._sample_tokens(logits, temperature, top_k, top_p)
+        next_token_ids = self._sample_tokens(_ban(logits), temperature, top_k, top_p)
 
         for b in range(batch_size):
             generated_tokens[b].append(next_token_ids[b].item())
@@ -2194,7 +2221,7 @@ class MegaTransformerWorldModel(nn.Module):
                     for b in range(batch_size):
                         generated_tokens[b].append(next_token_ids[b].item())
                 else:
-                    sampled = self._sample_tokens(logits, temperature, top_k, top_p)
+                    sampled = self._sample_tokens(_ban(logits), temperature, top_k, top_p)
                     # Override sample with forced EO* for batch items that just
                     # finalized a media block (e.g. image) — this turns EO*
                     # into the actual next token driving iter N+1, so

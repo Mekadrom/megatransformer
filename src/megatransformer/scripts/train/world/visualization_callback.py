@@ -164,6 +164,23 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         }
 
     @staticmethod
+    def _generated_utterance_count(outputs, idx: int = 0) -> int:
+        """Number of DISJOINT utterances generate() produced for sample `idx`.
+
+        This is the `n` dimension: `<text><voice_0><text><voice_1>` is two separate clips, not
+        one long one, and they are logged separately. A count above 1 in a TTS scenario is
+        itself a finding — the model finished an utterance and started another unprompted —
+        so it is surfaced rather than silently collapsed.
+        """
+        segs = outputs.get("voice_unit_id_segments")
+        if segs and idx < len(segs):
+            return len([sg for sg in segs[idx] if len(sg) > 0])
+        counts = outputs.get("voice_counts")
+        if counts is not None and idx < len(counts):
+            return int(counts[idx])
+        return 1
+
+    @staticmethod
     def _trim_generated_voice(outputs, pred_latent, utt: int = 0):
         """Slice a generated utterance to its REAL length.
 
@@ -1503,11 +1520,30 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 # The coda's own speaker-normalized contour when it has an F0 head; None
                 # falls back to the SMG predicting F0 from the units.
                 f0_p = outputs.get("voice_f0_preds")
-                self._log_audio_with_smg(
-                    pred_latent, sample, global_step, f"{tag}/{i}",
-                    f0_contour=(f0_p[0, 0] if f0_p is not None and f0_p.numel() > 0 else None),
-                    unit_ids=self._generated_unit_ids(outputs),
-                )
+                # One render PER UTTERANCE. Utterance 0 keeps the historical tag so its
+                # history is unbroken; extras are suffixed. Concatenating them into one clip
+                # (which the flat unit trace used to do) hid a termination failure as a
+                # 17-second render.
+                n_utt = self._generated_utterance_count(outputs)
+                for u in range(n_utt):
+                    ids_u = self._generated_unit_ids(outputs, utt=u)
+                    if u > 0 and ids_u is None:
+                        continue
+                    lat_u = self._trim_generated_voice(outputs, voice_preds[0, u], utt=u) \
+                        if u < voice_preds.shape[1] else pred_latent
+                    self._log_audio_with_smg(
+                        lat_u, sample, global_step,
+                        f"{tag}/{i}" if u == 0 else f"{tag}/{i}/utt{u}",
+                        f0_contour=(f0_p[0, 0] if u == 0 and f0_p is not None
+                                    and f0_p.numel() > 0 else None),
+                        unit_ids=ids_u,
+                    )
+                if n_utt > 1:
+                    metrics.log_text(
+                        f"{tag}/{i}/utterance_count",
+                        f"{n_utt} disjoint utterances generated from one prompt — the model "
+                        f"ended one and began another unprompted (a termination failure, not "
+                        f"a render artifact).", global_step)
 
             # Log target voice for comparison
             target_features = sample.get("voice_features")
@@ -2146,7 +2182,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         return self._speaker_pool[-1] if getattr(self, "_speaker_pool", None) else None
 
     @staticmethod
-    def _generated_unit_ids(outputs, idx: int = 0):
+    def _generated_unit_ids(outputs, idx: int = 0, utt: int = 0):
         """Content unit ids for sample `idx` of a generate() OR teacher-forced call, or None.
 
         Prefers `voice_unit_id_segments[idx][0]` -- the FIRST utterance. Falls back to the flat
@@ -2168,8 +2204,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         TERMINATION finding again instead of a render artifact.
         """
         segs = outputs.get("voice_unit_id_segments")
-        if segs and idx < len(segs) and segs[idx] and len(segs[idx][0]) > 0:
-            return torch.tensor([int(x) for x in segs[idx][0]], dtype=torch.long)
+        if segs and idx < len(segs) and utt < len(segs[idx]) and len(segs[idx][utt]) > 0:
+            return torch.tensor([int(x) for x in segs[idx][utt]], dtype=torch.long)
+        if utt > 0:
+            return None            # no flat-trace fallback for a later utterance: the flat
+                                   # trace IS every utterance, so slicing it here would be
+                                   # the concatenation bug wearing a different hat.
         trace = outputs.get("voice_unit_id_trace")
         if trace:
             seq = trace[idx] if isinstance(trace[0], (list, tuple)) else trace

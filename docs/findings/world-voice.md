@@ -361,6 +361,31 @@ then nonsense to the cap" artifact already documented for the transcription-inpu
 short generation therefore sounded like a long degenerate one, and the model got the blame.
 Fixed with `_trim_generated_voice` at both sites (voice_to_voice and text_to_voice).
 
+### EOV FIRES — the over-length failure is repeated BOV, not missing termination (2026-08-24)
+Measured, `world_voice_cosyvoice2_smollm2_ar_flat_lr_0/checkpoint-11076`, n=8 val prompts,
+voice_temperature 0.6, budget 250 frames (`scripts_local/voice_render_length_audit.py`):
+
+| prompt | utterances | real frames each | ended by |
+|---|---|---|---|
+| 0 | 1 | [22] | EOV |
+| 1 | 2 | [28, 48] | EOV, EOV |
+| 2 | 1 | [21] | EOV |
+| 3 | 2 | [26, 20] | EOV, EOV |
+| 4 | 1 | [29] | EOV |
+| 5 | 2 | [221, 181] | EOV, EOV |
+| 6 | 2 | [226, 205] | EOV, EOV |
+| 7 | 3 | [250, 250, 6] | budget, budget, EOV |
+
+**EOV fired for 12 of 14 blocks.** ⚠️ This CORRECTS the in-session reading (owner's and mine)
+that "the model does not output EOV". It does. What it then does is sample **BOV again** and
+start a second utterance, which the flat unit trace concatenated into one long clip. The
+failure is a repeated media-block hallucination, not a missing terminator.
+
+The length failure is also **bimodal, not uniformly long**: 5 of 8 prompts end utterance 0 at
+21-29 frames (~1 s) against a val median of ~102, i.e. severe UNDER-speaking; two land at
+221/226 (plausible); one runs two full 250-frame blocks. Any single "renders are too long"
+or "too short" summary of this run is wrong.
+
 ### Over-length renders: the flat unit trace concatenates EVERY voice block (fixed 2026-08-24)
 Owner observation that cracked it: 20-second renders appeared only after the Mimi/SMG ->
 CosyVoice 2 switch; Mimi runs were correctly capped at 10 s. The rate was never wrong — the
@@ -381,6 +406,20 @@ finding again rather than a render artifact.
 
 Two lessons worth carrying: a per-block budget bounds a BLOCK, not a call; and when a
 diagnostic changes at the same time as a component, suspect the diagnostic.
+
+**Structural fix (owner's proposal, 2026-08-24):** `generate(suppress_media_control_tokens=True)`
+bans BOA/BOV/BOI and the three placeholders from the text sampler. At eval the prompt already
+supplies BO*, so anything further is a hallucination, and banning it makes a second block
+IMPOSSIBLE rather than merely unlikely — the right shape of fix given the measurement above,
+where every block terminated correctly and the model simply started again. Off by default: a
+speak-at-will model must be able to emit BO*. Placeholders ride along because sampling one is
+meaningless in any regime — the interleaver consumes them at training time and at generation
+there is nothing to replace them with.
+
+**And the `n` dimension is now honoured at render.** Multiple generated utterances are logged
+as SEPARATE clips (`{tag}/{i}` then `{tag}/{i}/utt1`, ...) with an `utterance_count` note,
+rather than collapsed into one. That is what `n` is for: `<text><voice_0><text><voice_1>` is
+two disjoint clips.
 
 ### Bistream trains and decodes; it ties unistream on memorization, as predicted (2026-08-24)
 `world_voice_memorize32_bistream_0` (identical to the unistream arm plus
