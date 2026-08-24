@@ -204,6 +204,9 @@ class WorldModelTrainer(CommonTrainer):
         # generating its own transcript); optional for plain bistream TTS, where the
         # transcript is still fed at inference.
         bistream_text_loss: bool = False,
+        # Keep the text loss alive on the EOS target that follows a synthesis media block,
+        # even under --mask_text_loss_in_synthesis. See the exemption in compute_loss.
+        unmask_eos_in_synthesis: bool = False,
         voice_nar: bool = False,
         voice_nar_mask_schedule: str = "cosine",
         voice_nar_mask_ratio_min: float = 0.85,
@@ -234,6 +237,7 @@ class WorldModelTrainer(CommonTrainer):
         self.mask_text_loss_in_synthesis = mask_text_loss_in_synthesis
         self.emit_duration_token = bool(emit_duration_token)
         self.bistream_text_loss = bool(bistream_text_loss)
+        self.unmask_eos_in_synthesis = bool(unmask_eos_in_synthesis)
         self.voice_nar = bool(voice_nar)
         self.voice_nar_mask_schedule = str(voice_nar_mask_schedule)
         self.voice_nar_mask_ratio_min = float(voice_nar_mask_ratio_min)
@@ -340,6 +344,9 @@ class WorldModelTrainer(CommonTrainer):
         # mode). Used to strip placeholders when building text targets (below); must match the data.
         self._sp = constants.special_token_ids(
             getattr(model_for_config.config, 'special_token_base', constants.SPECIAL_TOKEN_BASE))
+        # Same id the collator appends after a media block, so the EOS exemption below targets
+        # the position generation actually samples at.
+        self._eos_id = int(getattr(model_for_config.config, 'eos_token_id', constants.EOS_TOKEN_ID))
         try:
             if getattr(model_for_config.config, 'text_encoder', None) is not None:
                 # Pretrained mode: the text head spans the LLM's native vocab + the 9 control tokens.
@@ -642,7 +649,8 @@ class WorldModelTrainer(CommonTrainer):
         # while every other metric looked healthy. Any future flag that supervises the TEXT
         # stream from a voice-only run has to be added here too.
         if text_input_ids is not None and (self.include_text or self.emit_duration_token
-                                           or self.bistream_text_loss):
+                                           or self.bistream_text_loss
+                                           or self.unmask_eos_in_synthesis):
             placeholder_ids = {self._sp.AUDIO_PLACEHOLDER, self._sp.VOICE_PLACEHOLDER, self._sp.IMAGE_PLACEHOLDER}
 
             # The model sees text_input_ids[:, :-1] as input (standard causal shift).
@@ -1030,6 +1038,16 @@ class WorldModelTrainer(CommonTrainer):
                 _hi = _lo + constants.N_DURATION_BUCKETS
                 _dur_keep = (text_targets >= _lo) & (text_targets < _hi)
                 _keep |= _dur_keep
+            # EOS EXEMPTION. The synthesis layout ends [.. BOV][PH][EOV][eos], so after
+            # placeholder-stripping and the causal shift the target AT the EOV position is
+            # EOS -- "the utterance is over, stop". --mask_text_loss_in_synthesis masks it
+            # with everything else, so the model receives ZERO gradient on the one position
+            # generation actually samples at: right after a media block. It is not that the
+            # model prefers to start another block, it is that the position was never
+            # trained. Measured 2026-08-24 at step 11076: 2.75 utterances per prompt on
+            # average, max 6, from a model whose EOV fires correctly on 12 of 14 blocks.
+            if self.unmask_eos_in_synthesis:
+                _keep |= (text_targets == self._eos_id)
             # BISTREAM TEXT EXEMPTION, same shape of silent failure as the duration one.
             # Under chunk interleaving the transcript is no longer purely conditioning: the
             # model has to know when it has said everything the text so far supports, and
@@ -2729,6 +2747,7 @@ def create_trainer(
         mask_text_loss_in_synthesis=getattr(args, 'mask_text_loss_in_synthesis', False),
         emit_duration_token=getattr(args, 'voice_nar_duration_token', False),
         bistream_text_loss=getattr(args, 'bistream_text_loss', False),
+        unmask_eos_in_synthesis=getattr(args, 'unmask_eos_in_synthesis', False),
         voice_nar=getattr(args, 'voice_nar', False),
         voice_nar_mask_schedule=getattr(args, 'voice_nar_mask_schedule', 'cosine'),
         voice_nar_mask_ratio_min=getattr(args, 'voice_nar_mask_ratio_min', 0.85),
@@ -3293,6 +3312,17 @@ def add_cli_args(subparsers):
                                  "the frozen LLM is untouched. Automatically exempts the token "
                                  "from --mask_text_loss_in_synthesis, which would otherwise give "
                                  "it zero gradient while training loss looked healthy.")
+    sub_parser.add_argument("--unmask_eos_in_synthesis", action="store_true", default=False,
+                            help="Keep the text loss on the EOS target that follows a synthesis "
+                                 "media block, even under --mask_text_loss_in_synthesis. The "
+                                 "layout is [text][BOV][PH][EOV][eos], so the target at the EOV "
+                                 "position is EOS -- and masking it means the model gets ZERO "
+                                 "gradient on the one position generation samples at, right "
+                                 "after a media block. It then has no learned reason to stop: "
+                                 "measured at step 11076, 2.75 utterances per prompt (max 6) "
+                                 "from a model whose EOV fires correctly on 12 of 14 blocks. "
+                                 "Opt-in so in-flight runs are unaffected; recommended for any "
+                                 "new synthesis run, voice or image.")
     # ------------------------------------------------------------------ bistream
     sub_parser.add_argument("--bistream_text_chunk", type=int, default=0,
                             help="BISTREAM chunk interleaving (CosyVoice 2 style): text tokens "

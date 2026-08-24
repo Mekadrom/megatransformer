@@ -223,3 +223,36 @@ def test_bistream_text_targets_teach_the_handoffs():
     assert tg[:10] == [11, 12, BOV, EOV, 13, 14, 15, BOV, EOV, 2]
     assert tg[2] == BOV, "the last text token of a chunk predicts BOV"
     assert tg[4] == 13, "EOV predicts the next chunk's first text token"
+
+
+def test_synthesis_target_after_eov_is_eos():
+    """The position generation actually samples at must carry an EOS target.
+
+    Synthesis layout is [text][BOV][PH][EOV][eos]. After placeholder-stripping and the causal
+    shift, the target AT the EOV position is EOS -- "the utterance is over". Under
+    --mask_text_loss_in_synthesis that target is masked with everything else, so the model
+    gets ZERO gradient on the one position it samples at right after a media block, and has no
+    learned reason to stop. --unmask_eos_in_synthesis keeps exactly this target, so this test
+    pins the assumption the flag rests on.
+    """
+    import torch as t
+    from megatransformer.scripts.train.world.training import _build_text_targets
+
+    EOS = 2
+    c = collator()
+    c.force_direction = "synthesis"
+    b = c([make_sample(11, 73, seed=5)])
+    full = b["text_token_ids"]
+    non_ph_full = full != SP.VOICE_PLACEHOLDER
+    valid = b["text_token_masks"].bool()
+    inp = full[:, :-1]
+    tg = _build_text_targets(full, non_ph_full, valid, inp != SP.VOICE_PLACEHOLDER)[0]
+
+    row = full[0].tolist()
+    eov_pos = row.index(SP.EOV)
+    # one placeholder sits before EOV and is stripped, so the EOV input lands one slot earlier
+    assert int(tg[eov_pos - 1]) == EOS, "target at the EOV position must be EOS"
+    assert int((tg == EOS).sum()) == 1, "exactly one EOS target per synthesis example"
+
+    # ...and that is precisely what the exemption keeps.
+    assert bool((tg == EOS).any()), "the EOS-keep mask would be empty"

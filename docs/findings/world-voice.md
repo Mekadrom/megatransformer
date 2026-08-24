@@ -386,7 +386,31 @@ and `--bucket_by_length`. It is a better model on this axis; which change bought
 unmeasured. The older 0.305 @23k figure is additionally suspect — it predates the M-RoPE eval
 fix, and only teacher-forced metrics on NON-M-RoPE checkpoints are in the CLEAN class.
 
-**Free-running is a different story, and the first pass mis-measured it.** Reported: EOV
+**Free-running, CORRECTED (per-utterance, n=32, gen at 0.6):** EOV fired 12/32, budget-capped
+20, and **disjoint utterances per prompt mean 2.03, max 5, with 26/32 prompts producing more
+than one**. First-utterance statistics:
+
+| metric | generated | GT |
+|---|---|---|
+| len_mean | 196.3 | 164.2 |
+| len_min / max | 12 / 250 | 28 / 222 |
+| **text-len → gen-len r** | **+0.887** | +0.960 (ceiling) |
+| adj_repeat_rate | 0.2645 | 0.0306 |
+| longest_run | 124 | 16 |
+| distinct_units | 1720 | 2225 |
+| unit_entropy_bits | 8.70 | 10.51 |
+| distinct_bigram_ratio | 0.671 | 0.958 |
+
+⭐ **Duration conditioning is near the ceiling: r=+0.887 against GT's +0.960.** The first pass
+reported +0.535 — the concatenation was destroying the correlation by adding a second block's
+frames to a length the prompt never asked for. Text drives DURATION well; this is structural
+conditioning working.
+
+**What remains is repetition, and it is severe and independent of the block issue:**
+adj_repeat 8.6x GT, longest_run 124 vs 16, bigram diversity 0.671 vs 0.958, entropy 8.70 vs
+10.51 bits. Fixing termination will NOT touch this.
+
+**The original (void) numbers, for the record:** Reported: EOV
 5/32, len_mean 373.9 vs GT 164.2, len_max 500, adj_repeat 0.2850 vs GT 0.0306, longest_run 87
 vs 16, distinct-bigram 0.633 vs 0.958, entropy 8.75 vs 10.51 bits. But len_mean 373.9 and
 len_max 500 against a **250-frame budget** are arithmetically impossible for one block — so
@@ -396,6 +420,30 @@ for any multi-block generation, and "EOV fired" degrades to "the LAST block ende
 Fixed to score the FIRST utterance and to report disjoint-utterance counts; the repetition
 figures are largely within-block and so probably survive, but **the length statistics above
 are void pending the re-run**.
+
+### Why it starts a second utterance: EOS after a media block is never trained (2026-08-24)
+Owner's diagnosis, confirmed in code and pinned by a test. The synthesis layout is
+`[text][BOV][PH][EOV][eos]`, so after placeholder-stripping and the causal shift **the text
+target AT the EOV position is EOS** — "the utterance is over". `--mask_text_loss_in_synthesis`
+masks it along with the transcript, so the model receives **zero gradient on the one position
+generation actually samples at**: immediately after a media block.
+
+So this was never a preference for starting another block; the position was untrained. It
+explains the whole shape of the failure — EOV fires correctly on 12 of 14 blocks (the VOICE
+head is supervised), and then the TEXT head, which is not, does something arbitrary. Measured
+at 11076: mean 2.03 utterances per prompt (max 5) on the diagnostics set, 2.75 (max 6) on the
+viz set.
+
+`--unmask_eos_in_synthesis` keeps exactly that target, sharing the `_keep` mechanism with the
+duration-token and bistream exemptions. Opt-in so in-flight runs are unaffected. It is the
+third flag to need the `include_text=False` gate at `training.py:638` — that gate is now a
+standing trap for anything supervising the TEXT stream from a voice-only run.
+
+⚠️ This fixes TERMINATION only. The repetition failure (adj_repeat 8.6x GT, longest_run 124)
+is independent and untouched by it.
+
+Generalizes beyond voice: world-image has the same layout (`[text][BOI][PH][EOI][eos]`) and
+the same masking, so an image-synthesis run cannot learn to stop either.
 
 ### EOV FIRES — the over-length failure is repeated BOV, not missing termination (2026-08-24)
 Measured, `world_voice_cosyvoice2_smollm2_ar_flat_lr_0/checkpoint-11076`, n=8 val prompts,
