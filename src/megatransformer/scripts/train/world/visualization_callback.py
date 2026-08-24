@@ -45,6 +45,11 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         voice_hop_length: int = 256,
         voice_temperature: float = 0.6,
         voice_variance_floor: float = 0.0,
+        # Eval decoding: ban BO*/placeholder ids from the text sampler. Default True (an eval
+        # prompt already ends with the BO* it needs, so a sampled one is a hallucination), but
+        # switchable -- how often the model starts a SECOND media block unprompted is a real
+        # termination signal, and suppressing it hides that signal as well as the artifact.
+        suppress_media_tokens: bool = True,
         voice_ras_win: int = 0,
         voice_nar_rounds: int = 16,
         voice_nar_choice_temp: float = 1.0,
@@ -96,6 +101,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         self.voice_nar_rounds = int(voice_nar_rounds or 16)
         self.voice_nar_choice_temp = float(voice_nar_choice_temp)
         self.voice_ras_tau = float(voice_ras_tau)
+        self.suppress_media_tokens = bool(suppress_media_tokens)
         self.voice_variance_floor = voice_variance_floor
         self.voice_sample_rate = voice_sample_rate
         self.voice_n_mels = voice_n_mels
@@ -292,7 +298,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         # EOV and then sampled BOV again and spoke a second time, which the render used to
         # concatenate into one long clip. Applied here rather than at the ~17 call sites for
         # the same reason the budgets are; an explicit kwarg still wins.
-        kwargs.setdefault("suppress_media_control_tokens", True)
+        kwargs.setdefault("suppress_media_control_tokens", self.suppress_media_tokens)
         if self.voice_token_budget is not None:
             kwargs.setdefault("voice_token_budget", self.voice_token_budget)
         if self.audio_token_budget is not None:

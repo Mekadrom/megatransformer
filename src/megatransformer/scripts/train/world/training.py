@@ -3044,6 +3044,26 @@ def add_cli_args(subparsers):
                             help="Maximum token sequence length for text")
 
     # Visualization callback dependencies
+    sub_parser.add_argument("--viz_suppress_media_tokens", dest="viz_suppress_media_tokens",
+                            action="store_true", default=True,
+                            help="EVAL RENDERS ONLY (changes nothing about training): ban the "
+                                 "BO* boundary tokens and the three media placeholders from the "
+                                 "text sampler. Every eval prompt already ENDS with the BO* it "
+                                 "needs, so a sampled one is a hallucination -- measured at "
+                                 "checkpoint-11076, the model terminated 12 of 14 voice blocks "
+                                 "correctly with EOV and then sampled BOV again and spoke a "
+                                 "second time. Default ON. Placeholders are banned too: sampling "
+                                 "one is meaningless in any regime, since the interleaver "
+                                 "consumes them at training time and generation has nothing to "
+                                 "replace them with. EO* is NOT banned -- generate() forces it "
+                                 "after a media block, which bypasses the sampler.")
+    sub_parser.add_argument("--no_viz_suppress_media_tokens", dest="viz_suppress_media_tokens",
+                            action="store_false",
+                            help="Let the model sample BO*/placeholders at eval. Use this to "
+                                 "MEASURE how often it starts a second media block unprompted "
+                                 "-- a real termination signal that the ban hides along with the "
+                                 "artifact. Renders stay correctly separated per utterance "
+                                 "either way; only the hallucinated block's existence changes.")
     sub_parser.add_argument("--viz_voice_ras_win", type=int, default=0,
                             help="Repetition-aware sampling window for EVAL RENDERS only (10 = the "
                                  "CosyVoice 2 value). Does not affect training or any metric — it "
