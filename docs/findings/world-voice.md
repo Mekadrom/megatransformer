@@ -325,6 +325,39 @@ Protocol note: measured on `checkpoint-20000`, train split, the same 32 samples 
 trained on, mask ratio 1.0, argmax (no sampling), duration token emitted, M-RoPE
 `scale_side=text` rate 6.0. Report: `eval_output/world_voice_memorization/text_dependence/`.
 
+### Bistream chunk interleaving is BUILT and smoke-tested; nothing measured yet (2026-08-24)
+Commits 685364e, fc0697e, ec45e6a, 90d5461, f44c3c1. Ten work items from
+`docs/plans/bistream-inner-monologue.md`, all landed, with 11 new tests beside the existing
+122. **No claim about whether it helps** — that needs the matched memorization arms
+(stage 5) and then a full run.
+
+Design decisions that turned out to matter more than expected:
+
+- **Chunks are a SLICING of the utterance's stream, not a new batch axis.** The collator
+  emits the utterance as one expanded stream (content frames with terminals inline) plus a
+  `(utt_idx, start, length)` map. That single choice made work items 2 and 7 no-ops: the
+  uninterleaver's ascending-order pack already reassembles the utterance, and fill_token is
+  just another class in the existing (B, T) target. The alternative — chunks on the `n`
+  axis — would have broken EOV, speaker conditioning, and emitted one utterance as N clips.
+- **The unistream layout is the m=1 case**, byte-for-byte, rather than a parallel path.
+- **CosyVoice 2's eligibility gate is wrong for our corpus.** They require
+  `speech_len/text_len > s/k`; at s/k = 6 against our measured 5.9 frames/token that rejects
+  ~half the data. The exact condition is `n_frames > (n_text_chunks - 1) * s`. Measured at
+  k=5/s=30 on 64 samples: ~75% eligible, interior chunks exactly 30 frames, last chunk 10-60
+  (median 27).
+
+Two train/inference parity details are recorded in the plan because they are silent if wrong:
+the chunk boundary must feed a zero FEATURE (not None, which skips the prelude), and the
+prelude/coda KV caches must NOT reset across a boundary.
+
+⚠️ **`--bistream_text_loss` was inert on the first try** — the same `include_text=False`
+trap that silently killed the NAR duration head. Implemented correctly in `compute_loss`,
+but text targets are never built for a voice-only run, so there was nothing to un-mask and
+`train/text_loss_norm` never appeared while every other metric looked healthy. Caught only
+because the smoke run checked for the metric rather than assuming it. Any future flag
+supervising the TEXT stream from a voice-only run has to be added to the gate at
+`training.py:638`.
+
 ### The shuffled-text TRAINING control was confounded by design — do not run it (2026-08-24)
 `docs/plans/bistream-inner-monologue.md` named a shuffled-transcript training arm as the
 prerequisite gating the whole bistream build. It would have been **uninformative**, and worse,

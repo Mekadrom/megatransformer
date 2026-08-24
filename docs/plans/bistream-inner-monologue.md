@@ -94,45 +94,69 @@ distinguishable. **Chunks are a different axis.** Overloading `n` with chunks br
 | default | — | `(i, 0, voice_lens[i])` — byte-identical to today |
 | bistream | — | several placeholders sharing one `utt_idx`, consecutive slices |
 
-## Work items
+## Work items — ALL LANDED 2026-08-24 (685364e, fc0697e, ec45e6a, 90d5461, f44c3c1)
 
-1. **`token_alignment.py:198` `TokenInterleaver.forward`** — accept an optional per-placeholder
-   `(utt_idx, start, length)` map. Today it does `all_placeholders[pos] = ("voice", ex_idx)`
-   then `batch_voice[ex_idx, :batch_voice_lens[ex_idx]]`. Default map preserves that exactly.
-2. **`token_alignment.py:441` `TokenUninterleaver.forward`** — gather voice positions back
-   GROUPED BY UTTERANCE, not by contiguous run. Never exercised with scattered voice.
-3. **`data_collator.py:108` `_build_token_sequence`** — emit the chunk-alternating layout for
-   bistream samples; keep `[BOV][VOICE_PH][EOV]` for unistream. Note `_collate_text` (line 185)
-   is the path `__call__` uses; `_collate_text_per_sample` (232) is NOT. (Cost 20 minutes on
-   2026-08-21 — patching the wrong one looks like the flag doing nothing.)
-4. **`data_collator.py:286` `_collate_audio_like`** — build the chunk map and per-chunk
-   lengths alongside the existing per-utterance tensors. `voice_eov_id` (line 51/67) inserts
-   EOV today; `fill_token` insertion per chunk goes here too.
-5. **`world_model.py:500` `forward`** — thread the chunk map from inputs to
-   `self.token_interleaver(...)` (line 770) and back through `token_uninterleaver` (805).
-6. **`world_model.py` ~1891 / ~2095 `_finalize_voice` + end-of-generation flush** — accumulate
-   across chunks of one `utt_idx`; emit ONE clip per utterance.
-7. **`training.py:1059-1094` voice loss** — targets are (B, T_total) against a coda output of
-   (B*n_chunks, chunk_T, V). Map back respecting utterance grouping. Add `fill_token` to the
-   targets at each chunk's last frame.
-8. **Text-loss carve-out** — `--mask_text_loss_in_synthesis` currently zeroes ALL text loss on
-   synthesis examples. Under inner monologue the interleaved text chunks MUST receive gradient
-   or the model can never generate its own transcript. Mirror the duration-token exemption
-   already in `training.py` (search `duration_only`). **This fails silently**: training loss
-   looks healthy and the model simply cannot speak at will.
-9. **`world_model.py:generate`** — alternate k text tokens and one voice chunk, tracking
-   `utt_idx` and position within the utterance. KV-cache layout MUST mirror training exactly.
-   TTS mode feeds real transcript chunks; speak-at-will mode generates them.
-10. **M-RoPE check** — the local axis resets per contiguous same-modality run, so it re-anchors
-    per chunk (desirable). The GLOBAL axis then becomes the only thing separating utterance 0
-    chunk 3 from utterance 1 chunk 3. Verify with `build_mrope_position_ids`
-    (`token_alignment.py:512`) on a two-utterance chunked example.
+Kept for the record of what was touched; every item below is done and tested.
+
+1. **`TokenInterleaver.forward`** — optional `voice_chunk_map` (B, n_placeholders, 3) =
+   (utt_idx, start, length). None reproduces the historical mapping; a test asserts the
+   explicit equivalent map gives bit-identical output. ✅
+2. **`TokenUninterleaver.forward`** — **no change needed.** Its masked left-pack already
+   gathers voice positions in ascending order, which for one utterance's chunks laid out
+   consecutively IS the utterance grouping. Verified by round-trip, not assumed. ✅
+3. **`_build_token_sequence`** — per chunk emits `[text_j][BOV][PH][EOV]`, so a 1-chunk plan
+   is byte-identical to unistream: unistream is literally the m=1 case. ✅
+4. **`_collate_audio_like`** — the discrete path now builds everything from one description,
+   a list of `(content_start, content_len, terminal_or_None)` segments laid end to end with
+   terminals INLINE. That is what keeps the unit target at (B, T_expanded) per utterance, so
+   the coda, the CE, EOV and speaker conditioning stay per-utterance and chunks are a
+   slicing of the stream rather than a new batch axis. ✅
+5. **`world_model.forward`** — chunk map threaded through, and dropped by the
+   mixed-modality null-out along with the voice it indexes. ✅
+6. **Chunk accumulation in `generate`** — fill tears down the voice block but keeps frames,
+   F0 and the prelude/coda KV caches; ONE clip per utterance. ✅
+7. **Voice loss** — **no change needed**, because of the design in (4): fill_token is just
+   another class in the existing (B, T) target. Only the head width changed. ✅
+8. **Text-loss carve-out** — `--bistream_text_loss`, a per-ROW re-target sharing the
+   mechanism with the duration-token exemption. ✅ **It failed silently on the first try
+   exactly as this plan predicted** — see the traps section. ✅
+9. **`generate()`** — chunk continuation, forced-token FIFO for the next transcript chunk,
+   and the zero-FEATURE parity detail below. Viz wired so a bistream checkpoint decodes as
+   one was trained. ✅
+10. **M-RoPE check** — done as a test: local re-anchors per chunk (desirable — a frame's
+    coordinate is relative to the text chunk it was just given), so global is the only thing
+    separating utterance 0 chunk j from utterance 1 chunk j, and it stays strictly
+    increasing. ✅
+
+### Two parity details worth re-reading before changing any of this
+
+- **The zero FEATURE at a chunk boundary.** The next chunk's first trunk input is
+  `prelude(feature at the fill slot)`, and that feature is ZERO. So generation sets
+  `last_voice_pred` to a zero FEATURE, not `None` — `None` takes the position-0 branch,
+  which is a zero in d_model space WITHOUT running the prelude, and only an utterance's very
+  first position looks like that in training.
+- **Caches do NOT reset at a chunk boundary.** In training the coda is causal over the whole
+  expanded stream with no gap there; resetting would give inference a shorter acoustic
+  history than training ever had.
+
+### Feasibility gate, corrected
+
+CosyVoice 2 gates on `speech_len/text_len > s/k`. With s/k = 6 and our corpus at 5.9
+frames/token that rejects about half the data for no reason. The exact condition is only
+that the chunks before the last one fit: `n_frames > (n_text_chunks - 1) * s`. Measured on
+64 LibriTTS-R samples at k=5/s=30: ~75% eligible, interior chunks all exactly 30 frames,
+last chunk 10–60 (median 27) — no pathological tails.
 
 ## Traps that have already cost time on this codebase
 
 - **Two collate-text paths.** `__call__` uses `_collate_text`, not `_collate_text_per_sample`.
 - **A voice-only run has `include_text=False`**, so text targets are not built unless the
   gating includes your flag (see the `emit_duration_token` clause in `compute_loss`).
+  ⚠️ **This one bit again on 2026-08-24.** `--bistream_text_loss` was implemented correctly
+  in `compute_loss` and was completely inert: targets were never built for it to un-mask, so
+  `train/text_loss_norm` simply never appeared while every other metric looked healthy. Any
+  future flag that supervises the TEXT stream from a voice-only run must be added to the
+  gate at `training.py:638`. Caught only because the smoke run CHECKED the metric.
 - **`_collate_text` reads `ex["_direction"]`.** Datasets that omit it get a 50/50 coin flip.
 - **Eval must re-derive config from weights.** `load_model` runs `strict=False`, so a widened
   unit head or a missing flag loads silently. Follow `detect_world_mrope` /
@@ -142,7 +166,7 @@ distinguishable. **Chunks are a different axis.** Overloading `n` with chunks br
 - **Decode comparisons need >=3 seeds** (floor: std 0.0089, range 0.018 at n=64) and LCS recall
   must be read beside hyp/ref, because it is partly a length metric.
 
-## Test plan — verify each stage before the next
+## Test plan — stages 1-4 PASSED 2026-08-24; stage 5 is the next thing to run
 
 1. **Collator unit test.** Build a batch with `emit_bistream`; assert the token sequence
    alternates as specified, chunk lengths sum to the utterance length, `fill_token` sits at
@@ -158,6 +182,19 @@ distinguishable. **Chunks are a different axis.** Overloading `n` with chunks br
 5. **Memorization sanity.** 32 samples, LR 1e-4: should memorize FASTER than unistream did if
    the alignment hypothesis is right. This is the first real signal.
 6. **Full run** and the diagnostics below.
+
+Stages 1-4 are green: `tests/test_bistream_collator.py` (8) and
+`tests/test_bistream_interleave.py` (3) alongside the existing 122, and two smoke runs (one
+at `bistream_prob 0.5` with generation, one at 1.0) complete with finite grad norms, unit CE
+falling, and `train/text_loss_norm` non-zero on chunked rows once the `include_text` gate was
+fixed.
+
+⚠️ **Stage 5 needs a MATCHED control, and `world_tts_memorize32_0` is not one** — it is NAR
+at mask ratio 1.0 with the duration token. Run a unistream **AR** arm and a bistream AR arm
+that differ only in the bistream flags, and compare steps-to-memorize. Keep
+`--bistream_text_loss` OFF for both: the sanity test is about ALIGNMENT, and fill_token is
+already supervised through the voice CE, so adding a text objective changes what is being
+compared.
 
 ## What to measure, and against what
 
