@@ -286,6 +286,13 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         that forgot them would silently truncate its renders, which is exactly the failure
         being fixed. Explicit kwargs still win, so a caller can override per-scenario.
         """
+        # EVAL DECODING: never sample a media BO*/placeholder token. Every eval prompt already
+        # ENDS with the BO* it needs, so a sampled one is a hallucination -- and a costly one:
+        # measured at checkpoint-11076, the model terminated 12 of 14 blocks correctly with
+        # EOV and then sampled BOV again and spoke a second time, which the render used to
+        # concatenate into one long clip. Applied here rather than at the ~17 call sites for
+        # the same reason the budgets are; an explicit kwarg still wins.
+        kwargs.setdefault("suppress_media_control_tokens", True)
         if self.voice_token_budget is not None:
             kwargs.setdefault("voice_token_budget", self.voice_token_budget)
         if self.audio_token_budget is not None:
