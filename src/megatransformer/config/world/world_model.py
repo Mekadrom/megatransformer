@@ -686,6 +686,15 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_offset"].image_gen_out_offset = T
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec_offset"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec_offset"].image_gen_out_offset = True
 
+# Aux point head as a PURE DIAGNOSTIC: its MSE trains seq_head only, never the shared stack.
+# As shipped the 0.1 aux MSE backprops seq_head -> cross_dec -> self_enc -> trunk, so the
+# "diagnostic" is partly CREATING the linear decodability it reports (and it is a real, if
+# minority, training objective). Detached it becomes an honest probe -- and the weight goes to
+# 1.0 for free, since it no longer competes with the flow loss for the shared representation.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_auxdetach"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_auxdetach"].image_coda_config.flow_aux_mse_detach = True
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_auxdetach"].image_coda_config.flow_aux_mse_weight = 1.0
+
 # xskip + explicit DISPERSION MATCHING. The best arm so far (xskip) still emits under-dispersed
 # content and leans on both leftover noise and CFG to make up for it; this makes the spread an
 # objective instead. Weight 0.5 with a small anti-collapse barrier: the term is dimensionless and
