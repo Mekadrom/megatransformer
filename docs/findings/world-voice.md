@@ -421,6 +421,45 @@ Fixed to score the FIRST utterance and to report disjoint-utterance counts; the 
 figures are largely within-block and so probably survive, but **the length statistics above
 are void pending the re-run**.
 
+### BO* suppression works — and reveals that PREMATURE EOV is the bigger failure (2026-08-24)
+A/B on `ar_flat_lr_0/checkpoint-11076`, same 8 val prompts, voice_temperature 0.6
+(`scripts_local/voice_render_length_audit.py --suppress_media_tokens / --no_...`):
+
+| prompt | suppression ON | suppression OFF |
+|---|---|---|
+| 0 | 1 utt [95] | 1 utt [75] |
+| 1 | 1 utt [20] | 4 utts [4, 69, 88, 91] |
+| 2 | 1 utt [18] | 6 utts [47, 88, 82, 95, 81, 62] |
+| 3 | 1 utt [16] | 3 utts [32, 238, 91] |
+| 4 | 1 utt [41] | 4 utts [7, 184, 191, 83] |
+| 5 | 1 utt [225] | 2 utts [250, 39] |
+| 6 | 1 utt [250] | 3 utts [250, 231, 17] |
+| 7 | 1 utt [250] | 3 utts [222, 219, 61] |
+
+**The ban is completely effective: 1 utterance on every prompt, versus mean 3.25 / max 6
+without it.** So the mechanism is confirmed — a second block requires a sampled BOV and
+nothing else produces one.
+
+⚠️ **But the ban is NOT a neutral fix, and this is the important part.** Look at the first
+utterance with suppression OFF: prompt 1 emits **4 frames** then a real 69/88/91-frame
+utterance; prompt 4 emits **7 frames** then 184/191. The model frequently emits a tiny FALSE
+START, terminates it with EOV, and only then speaks properly. Suppressing BO* makes that false
+start **final** — prompts 1/2/3 render at 20/18/16 frames (0.6-0.8 s) instead of reaching the
+real utterance. The ban converts "too much audio" into "truncated audio".
+
+So there are **two independent termination failures**, and only one of them was diagnosed:
+
+1. **Premature EOV from the VOICE head** — 5 of 8 prompts end their first utterance under ~50
+   frames against a val median of ~102. This is supervised (`eov_position_acc` 0.8848) and is
+   the DOMINANT failure by audible impact.
+2. **No EOS supervision on the TEXT head**, so after a block ends the model starts another.
+   This is what `--unmask_eos_in_synthesis` fixes.
+
+**Prediction for `ar_flat_lr_1`:** fixing (2) alone should drive utterances per prompt toward
+1.0 while making renders SHORTER and possibly worse by ear, because the false-start blocks
+will no longer be followed by the real utterance. A drop in utterance count is therefore NOT
+by itself evidence of improvement — check first-utterance length distribution beside it.
+
 ### `ar_flat_lr_0` vs `ar_flat_lr_1` IS a clean A/B (2026-08-24, corrected)
 ~~An earlier version of this entry claimed `_0` ran at LR 1e-5 for its first 11000 steps and
 was therefore confounded with `_1`.~~ **Wrong** — that was read off the CLI *handed over*, not
