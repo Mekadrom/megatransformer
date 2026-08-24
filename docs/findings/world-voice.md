@@ -402,33 +402,55 @@ mask-ratio probe, the seed-floor discipline, and a clean negative result. Note t
 token's role SHRINKS under bistream — length emerges from the chunk cadence plus EOV — so it
 becomes optional rather than load-bearing.
 
-### Bistream implementation scope
-Smaller than feared: **the interleaver already supports multiple voice placeholders per
-example.** `voice_positions[batch_idx]` is a list and `ex_idx` enumerates it, indexing
-`batch_voice[ex_idx]` and `batch_voice_lens[ex_idx]` — so the `n` dimension of
-`voice_inputs` (B, n, C, T) IS the segment count. It has simply always been 1.
+### Bistream implementation scope (CORRECTED 2026-08-24)
+
+⚠️ An earlier version of this section said the scope was "smaller than feared" because the
+interleaver already supports multiple voice placeholders per example. **That was wrong**, and
+the error is worth recording because it is the kind that survives a code read.
+
+`voice_positions[batch_idx]` is indeed a list, and the `n` dimension of `voice_inputs`
+(B, n, C, T) is indeed a segment count. But **`n` means DISJOINT UTTERANCES within one
+example** -- the `<text><voice_0><text><voice_1>` case the M-RoPE global axis exists to keep
+distinguishable. Chunks of a SINGLE utterance are a different axis, and overloading `n` with
+them collides with it.
+
+The concrete breakage, verified in world_model.py: `completed_voice[b].append(feat)` fires per
+SEGMENT (line ~1891 and the end-of-generation flush ~2095). Treat chunks as segments and one
+utterance is emitted as N separate audio clips instead of one -- structurally the same failure
+as the multi-segment trace concatenation found on 2026-08-21, except by design. Speaker
+conditioning and EOV are also per-utterance concepts that would be shredded.
+
+**The fix: make the placeholder -> media mapping EXPLICIT rather than positional.**
+
+| | today | needed |
+|---|---|---|
+| mapping | placeholder i -> `batch_voice[i]`, full length | placeholder i -> `(utt_idx, start, length)` |
+| default | — | `(i, 0, voice_lens[i])`, byte-identical to today |
+| bistream | — | several placeholders sharing one `utt_idx`, consecutive slices |
+| composed | impossible | two utterances, each chunked |
 
 Work required:
-1. **Collator** — emit `[BOV][k text][VOICE_PH][k text][VOICE_PH]...[EOV]` and split the voice
-   features into that `n` dimension with per-chunk lengths (B, n). This is the bulk of it.
-2. **Uninterleaver** — verify it handles n > 1; it should be symmetric with the interleaver
-   but has never been exercised that way.
-3. **Loss assembly** — voice targets are currently (B, T_total) against a coda output of
-   (B*n, chunk_T, V); the mapping back needs care.
-4. **Text-loss carve-out** for the interleaved text chunks (see inner monologue above).
-5. **generate()** — alternate k text tokens and one voice chunk, mirroring the training layout
-   exactly. KV-cache layout must follow.
-6. **M-RoPE** — the local axis resets per contiguous same-modality segment, so it re-anchors
-   every chunk automatically. Verify `build_mrope_position_ids` behaves sensibly with many
-   small segments.
+1. **Interleaver contract** — per-placeholder `(utt_idx, start, length)` instead of positional
+   full-segment lookup. Backward-compatible default keeps existing runs identical.
+2. **Collator** — emit `[BOV][k text][VOICE_PH][k text][VOICE_PH]...[EOV]` and the chunk map.
+3. **Uninterleaver** — must gather voice positions back GROUPED BY UTTERANCE, not by segment.
+4. **`_finalize_voice` and the generation flush** — accumulate across chunks of the same
+   utterance; emit one clip per `utt_idx`.
+5. **Two terminators** — EOV ends an UTTERANCE, `fill_token` ends a CHUNK. Only the former
+   exists today. (v1 can skip fill_token with fixed chunk sizes and a counter.)
+6. **Loss assembly** — voice targets are (B, T_total) against a coda output of
+   (B*n_chunks, chunk_T, V); the mapping back must respect utterance grouping.
+7. **Text-loss carve-out** for the interleaved text chunks (see inner monologue above).
+8. **`generate()`** — alternate k text tokens and one voice chunk, tracking which utterance and
+   how far into it; KV-cache layout must mirror training exactly.
+9. **M-RoPE check** — the local axis resets per contiguous same-modality run, so it re-anchors
+   per CHUNK (desirable). But that leaves the GLOBAL axis as the only thing separating
+   utterance 0 chunk 3 from utterance 1 chunk 3 -- exactly what it was introduced for, so it
+   should hold, but verify rather than assume.
 
-Simplification available for v1: with FIXED chunk sizes, `fill_token` is not strictly needed —
-inference can alternate deterministically. CosyVoice 2 needs it because their setting is
-streaming. Adding it later is what buys variable-rate chunking.
-
-Also copy the 50/50 unistream/bistream mix rather than going pure bistream: one model does
-both, and the unistream half is exactly what is trained today, which keeps the comparison
-clean.
+Simplification for v1: fixed chunk sizes remove the need for `fill_token`. Copy CosyVoice 2's
+50/50 unistream/bistream mix rather than going pure bistream -- one model does both, and the
+unistream half stays directly comparable to what is trained today.
 
 ### Is the crutch fixable, or is it a trunk property?
 If the r=1.0 run also flatlines, that is the same failure twice on the same trunk with
