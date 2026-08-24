@@ -163,6 +163,23 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             "voice_bistream_text_offset": int(consumed),
         }
 
+    @staticmethod
+    def _trim_generated_voice(outputs, pred_latent, utt: int = 0):
+        """Slice a generated utterance to its REAL length.
+
+        `voice_latent_preds` is (B, max_n, C, max_T), padded across every utterance the model
+        emitted in that call. Utterance 0 is therefore zero-padded out to the LONGEST one, and
+        the frozen decoder renders a zero tail as babble -- the documented "N real seconds then
+        nonsense to the cap" artifact. Reading `voice_preds[0, 0]` without this makes a short
+        generation sound like a long degenerate one, which is exactly the symptom that gets
+        blamed on the model.
+        """
+        lens = outputs.get("voice_lengths")
+        if lens is None:
+            return pred_latent
+        n = int(lens[0, utt])
+        return pred_latent[..., :n] if 0 < n <= pred_latent.shape[-1] else pred_latent
+
     def _ensure_tokenizer(self):
         """Lazy-load a tokenizer if none was provided."""
         if self.tokenizer is not None:
@@ -1300,7 +1317,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 # Log generated voice
                 voice_preds = outputs.get("voice_latent_preds")
                 if voice_preds is not None and voice_preds.numel() > 0:
-                    pred_latent = voice_preds[0, 0]
+                    pred_latent = self._trim_generated_voice(outputs, voice_preds[0, 0])
                     metrics.log_image(
                         f"{tag}/voice_to_voice/{i}/generated_latent",
                         self._latent_to_image(pred_latent),
@@ -1475,7 +1492,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             # Log generated voice if available
             voice_preds = outputs.get("voice_latent_preds")
             if voice_preds is not None and voice_preds.numel() > 0:
-                pred_latent = voice_preds[0, 0]  # (C, T)
+                pred_latent = self._trim_generated_voice(outputs, voice_preds[0, 0])  # (C, T)
                 metrics.log_image(
                     f"{tag}/{i}/generated_latent",
                     self._latent_to_image(pred_latent),

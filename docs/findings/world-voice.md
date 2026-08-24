@@ -325,6 +325,47 @@ Protocol note: measured on `checkpoint-20000`, train split, the same 32 samples 
 trained on, mask ratio 1.0, argmax (no sampling), duration token emitted, M-RoPE
 `scale_side=text` rate 6.0. Report: `eval_output/world_voice_memorization/text_dependence/`.
 
+### Teacher-forced unit accuracy does NOT predict free-running quality (2026-08-24, replication)
+Stated plainly because it keeps having to be re-derived. Two direct demonstrations in this
+project, on the same weights at the same step:
+
+- `world_tts_memorize32_0` (NAR): train unit accuracy **1.0** while free-running renders were
+  nonsense for some samples at 17.5k.
+- `distill_0` @44k: early_text_delta +0.0522 against the teacher's +0.0538, text-attributed
+  0.371 — and it **still sounded bad by ear**.
+
+The mechanism is not subtle: teacher-forced accuracy conditions every prediction on a PERFECT
+prefix. Free-running conditions on the model's own drifting output, and this model's known
+failures — self-conditioned repetition, and termination — live entirely in that gap. A rising
+`eval/voice_synthesis/voice_unit_accuracy` says the conditional is being learned. It cannot
+say whether generation terminates, and it is structurally blind to over-length degeneration.
+Read free-running from `world_voice_ar_diagnostics.py` section 3 (adj_repeat, longest_run,
+EOV firing rate, length vs GT) and `cosyvoice_wer_eval.py`, and finally by ear.
+
+### ⚠️ A constant LR may never leave the free-running collapse regime (2026-08-24, derived)
+`world_voice_cosyvoice2_smollm2_ar_flat_lr_0` runs `constant_with_warmup` at 1e-5. An earlier
+finding established that greedy EOV-collapse in this project was a **mid-cosine, high-LR
+artifact** and that late low-LR checkpoints free-ran clean — hence "judge free-running from
+late checkpoints only". A constant-LR run has no late: it stays at the same LR forever, so if
+that finding holds, this run may never produce a clean free-running checkpoint no matter how
+long it trains, while its teacher-forced metrics keep improving. **Derived, not measured** —
+but it predicts exactly the reported symptom (good and rising eval accuracy, no EOV, long
+degenerate renders) and should be checked before concluding anything about AR from this run.
+
+### Eval-path bug: generated voice was never trimmed to its real length (fixed 2026-08-24)
+`voice_latent_preds` is (B, max_n, C, max_T), padded across every utterance a generate() call
+produced. The training viz read `voice_preds[0, 0]` with no slice by `outputs["voice_lengths"]`,
+so when the model emitted more than one voice block the FIRST one was zero-padded out to the
+longest, and the frozen decoder rendered the zero tail as babble — the same "N real seconds
+then nonsense to the cap" artifact already documented for the transcription-input render. A
+short generation therefore sounded like a long degenerate one, and the model got the blame.
+Fixed with `_trim_generated_voice` at both sites (voice_to_voice and text_to_voice).
+
+⚠️ This does NOT by itself explain a 20-second render: `--voice_token_budget 250` at 25 Hz
+caps ONE block at 10 s, and the budget is applied per block (`voice_sequences` is cleared at
+each finalize). If renders really are ~20 s, something beyond the padding is also wrong and
+needs measuring, not reasoning about.
+
 ### Bistream trains and decodes; it ties unistream on memorization, as predicted (2026-08-24)
 `world_voice_memorize32_bistream_0` (identical to the unistream arm plus
 `--bistream_text_chunk 5 --bistream_voice_chunk 30 --bistream_prob 1.0`): train
