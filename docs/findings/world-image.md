@@ -295,6 +295,25 @@ window averaging +0.024. Same adjacent-step error as before; the window is the u
 ⭐⭐ **MEASURE THIS UNGUIDED.** The effect is ~2x larger at w=1 (+0.045 vs +0.024) and unambiguous
 there (10/10 vs 8/10), because CFG partially substitutes for what `cross_dec` provides. Guided
 evaluation understates it by half AND is the noisier half.
+
+⭐⭐⭐ **THE UNGUIDED DEFICIT IS OCCASIONAL MODE COLLAPSE, NOT UNIFORM DEGRADATION.** The owner
+spotted `trunkctx` at 74k rendering a PORTRAIT OF A PERSON for "an astronaut riding a horse" at
+w=1. The logs carry the signature (steps >=50k):
+
+| | w=1.0 within-prompt sd | w=3.0 within-prompt sd |
+|---|---|---|
+| t3_xskip | 0.0249 (max 0.037) | 0.0238 (max 0.039) |
+| trunkctx | **0.0325 (max 0.057)** | 0.0216 (max 0.033) |
+
+`trunkctx`'s draw-to-draw variance is +31% vs `t3_xskip` UNGUIDED and slightly TIGHTER guided --
+the excess is entirely guidance-removable. Most draws are fine; some abandon the prompt, which
+inflates spread while barely moving the mean. A portrait is plausibly the dominant mode of a web
+image-text corpus, so this is falling to the DATA PRIOR -- the textbook failure for a conditional
+signal too weak to escape it without amplification, i.e. exactly ~10%-of-constant with no CFG.
+⚠️ **A CLIPScore mean over 8 prompts is close to the worst instrument for this.** Track w=1
+within-prompt sd (or eyeball w=1 renders) when judging conditioning strength.
+⚠️ At N=2, `best-of-N - mean` is ALGEBRAICALLY IDENTICAL to the reported sd -- not independent
+evidence; do not quote both.
 ⭐ **The advantage is LARGER UNGUIDED than guided (0.040 vs 0.026)** — consistent with the
 constant-remover story plus the guidance-redundancy pattern seen everywhere else in this file: CFG
 amplifies the conditional component, partially doing for `trunkctx` what `cross_dec` does for
