@@ -280,11 +280,21 @@ The gap grew monotonically across seven windows (0.016 -> 0.025 -> 0.041 -> 0.04
 ~2 SE, and `trunkctx` reads lower than `t3_xskip` even when it is 2k steps FURTHER along
 (0.207 @22k vs 0.246 @20k).
 
-⚠️ **DOWNGRADED 2026-08-23 at 60k: the gap is SHRINKING, and is now ~a third of the recorded size.**
-Over the last 8 MATCHED steps (53k-60k): mean **+0.026 at w=3** and **+0.040 at w=1**, versus
-+0.071 at 20k. `trunkctx` WON one of the eight (57k, -0.008). Still positive at 7/8, so the
-direction holds — but "the flow head's context matters" now reads as a diminishing convergence-RATE
-advantage rather than a capability wall, which is exactly what the single-seed caveat was for.
+⚠️ **REVISED TWICE. Final read at 70k: the gap SHRANK, then STABILIZED — it is not closing.**
+
+| matched-step window | w=3.0 | w=1.0 |
+|---|---|---|
+| 20k (single) | +0.071 | — |
+| 53k-60k (n=8) | +0.0255 (7/8) | +0.0396 (8/8) |
+| **61k-70k (n=10)** | **+0.0237 (8/10)** | **+0.0448 (10/10)** |
+
+So it is neither the ~0.05 capability wall first recorded NOR a convergence-rate advantage that
+closes: it decayed to ~0.024 guided / ~0.045 unguided and held there for 20k steps.
+⚠️ I called convergence at the 70k pair alone (+0.003 at w=3) — a single matched pair inside a
+window averaging +0.024. Same adjacent-step error as before; the window is the unit.
+⭐⭐ **MEASURE THIS UNGUIDED.** The effect is ~2x larger at w=1 (+0.045 vs +0.024) and unambiguous
+there (10/10 vs 8/10), because CFG partially substitutes for what `cross_dec` provides. Guided
+evaluation understates it by half AND is the noisier half.
 ⭐ **The advantage is LARGER UNGUIDED than guided (0.040 vs 0.026)** — consistent with the
 constant-remover story plus the guidance-redundancy pattern seen everywhere else in this file: CFG
 amplifies the conditional component, partially doing for `trunkctx` what `cross_dec` does for
