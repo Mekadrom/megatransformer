@@ -325,6 +325,42 @@ Protocol note: measured on `checkpoint-20000`, train split, the same 32 samples 
 trained on, mask ratio 1.0, argmax (no sampling), duration token emitted, M-RoPE
 `scale_side=text` rate 6.0. Report: `eval_output/world_voice_memorization/text_dependence/`.
 
+### Unistream AR memorizes 32 utterances in ~400 steps AND renders them correctly (2026-08-24)
+`world_voice_memorize32_uni_ar_0` (AR, unistream, no duration token, LR 1e-4 constant, 32
+samples, batch 8): train `voice_unit_accuracy` 0.819 @100, 0.984 @200, **1.000 @400**, held
+to 1100; `voice_unit_ce_loss_norm` 1.028 -> 1.4e-4. Owner reports all 4 TB renders sound
+perfect. Held-out val is unmoved and drifting the wrong way (unit acc 0.0124, CE 1.19 ->
+1.24 between 500 and 1000) — pure memorization with zero generalization, which is the
+expected and correct outcome at n=32.
+
+Note on epochs: batch 8 over 32 samples is 4 steps/epoch, so step 400 is **100 epochs**, not
+a handful. It is fast in wall-clock (minutes), not fast in passes over the data.
+
+**This retires the open generation-path question.** The NAR arm (`world_tts_memorize32_0`)
+also reached train accuracy 1.0 — but at step ~1400-4000, and its free-running renders were
+still nonsense for some samples at 17.5k (idx 3). AR reaches the same teacher-forced ceiling
+3.5-10x sooner AND its renders are correct. So the earlier train-1.0-but-audio-nonsense
+discrepancy was specific to the NAR MaskGIT generation path, not to what was learned. It
+invalidates NAR generation numbers, not NAR training, exactly as suspected.
+
+### ~~Stage 5: does bistream memorize faster than unistream?~~ RETIRED before running (2026-08-24)
+Do not run the bistream memorization arm as a discriminating test. Two independent reasons:
+
+1. **No headroom.** The unistream control is at accuracy 1.000 by step 400 with perfect
+   renders. Nothing can beat that by enough to read.
+2. **Wrong instrument, and this was knowable in advance.** The text-dependence probe earlier
+   the same day established that at n=32 the model solves the task by RETRIEVAL — under
+   `roll` its predictions match the SOURCE utterance's units at 0.825, with text acting as a
+   key. Retrieval does not need alignment. Bistream's claim is about ALIGNMENT helping
+   GENERALIZATION, so on a task solvable by retrieval it should be expected to tie, and a
+   tie would have taught nothing. The memorization race was proposed (in the plan, and
+   endorsed in-session) before that probe existed, and should have been withdrawn when it
+   landed.
+
+The discriminating measurement is the one bistream is actually claimed to move:
+teacher-forced `text_delta` / text-attributed fraction at matched step on the full corpus,
+against AR unistream @23k (+0.0271 / 0.305) and the teacher ceiling (+0.0594 / 0.463).
+
 ### Bistream chunk interleaving is BUILT and smoke-tested; nothing measured yet (2026-08-24)
 Commits 685364e, fc0697e, ec45e6a, 90d5461, f44c3c1. Ten work items from
 `docs/plans/bistream-inner-monologue.md`, all landed, with 11 new tests beside the existing
