@@ -325,6 +325,43 @@ Protocol note: measured on `checkpoint-20000`, train split, the same 32 samples 
 trained on, mask ratio 1.0, argmax (no sampling), duration token emitted, M-RoPE
 `scale_side=text` rate 6.0. Report: `eval_output/world_voice_memorization/text_dependence/`.
 
+### Bistream trains and decodes; it ties unistream on memorization, as predicted (2026-08-24)
+`world_voice_memorize32_bistream_0` (identical to the unistream arm plus
+`--bistream_text_chunk 5 --bistream_voice_chunk 30 --bistream_prob 1.0`): train
+`voice_unit_accuracy` 0.787 @100, 0.991 @200, **1.000 @400**, CE 6.3e-4. The unistream arm
+was 0.819 / 0.984 / **1.000 @400**, CE 1.4e-4. **A tie**, which is what the retirement note
+above predicted: a task solved by retrieval does not exercise alignment. Read this only as
+"the bistream path trains end to end on real data", never as evidence about alignment.
+
+Chunk continuation at decode, `scripts_local/bistream_continuation_probe.py` on
+checkpoint-500, greedy, generated frames vs target:
+
+| idx | target | without continuation | with continuation |
+|---|---|---|---|
+| 0 | 73 | 30 | **73** |
+| 1 | 165 | 30 | **165** |
+| 2 | 129 | 30 | 7 |
+| 3 | 85 | 30 | **85** |
+
+Without the transcript continuation every utterance is exactly 30 frames — one chunk — with
+the correct content. With it, 3 of 4 match the target length EXACTLY, meaning the model
+reproduced every fill_token and the final EOV at precisely the right frames under
+free-running greedy decoding. idx 2 collapsing to 7 frames is free-running divergence at a
+partially trained checkpoint (train accuracy is teacher-forced), not a mechanism failure;
+worth re-checking at a later checkpoint before drawing anything from it.
+
+⚠️ **The one-chunk symptom was a bug, and a well-disguised one.** `forced_token_queue` was
+declared beside `forced_next_token`, INSIDE the token loop, which is right for that variable
+and wrong for this one -- so it was wiped every iteration, the continuation never fired, and
+every render came out as its first chunk with correct content. That looks exactly like "the
+model only learned one chunk" and not at all like a decode bug. Training was unaffected
+throughout.
+
+Separately, `_sample_tokens` never guarded `temperature <= 0`: it divided, produced infs, and
+`torch.multinomial` failed with a device-side assert pointing at the sampler rather than the
+argument, so greedy TEXT decoding presented as a CUDA fault. The voice sampler always took 0
+as greedy; the text one now agrees.
+
 ### Unistream AR memorizes 32 utterances in ~400 steps AND renders them correctly (2026-08-24)
 `world_voice_memorize32_uni_ar_0` (AR, unistream, no duration token, LR 1e-4 constant, 32
 samples, batch 8): train `voice_unit_accuracy` 0.819 @100, 0.984 @200, **1.000 @400**, held

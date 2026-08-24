@@ -1329,6 +1329,16 @@ class MegaTransformerWorldModel(nn.Module):
         # separately from the utterance's (voice_seg_start): fill ends a chunk, EOV ends the
         # utterance, and only the latter finalizes.
         voice_chunk_start: List[int] = [0 for _ in range(batch_size)]
+        # BISTREAM: tokens to emit verbatim over the NEXT iterations (the following text
+        # chunk, then BOV to re-enter speech).
+        #
+        # ⚠️ DECLARED HERE, OUTSIDE THE TOKEN LOOP, ON PURPOSE. `forced_next_token` is
+        # re-created every iteration because it is set and consumed within one -- but this
+        # queue must OUTLIVE the iteration that fills it: that iteration emits the forced
+        # text-EOV, and the queue is drained over the iterations after it. Declaring it in
+        # the loop wipes it every step, so the continuation silently never happens and every
+        # utterance renders as exactly its first chunk.
+        forced_token_queue: List[List[int]] = [[] for _ in range(batch_size)]
         should_continue_chunk: List[bool] = [False for _ in range(batch_size)]
         # Transcript tokens already consumed by the prompt; the next chunk starts here.
         voice_text_cursor: List[int] = [int(voice_bistream_text_offset) for _ in range(batch_size)]
@@ -1496,10 +1506,6 @@ class MegaTransformerWorldModel(nn.Module):
             # generated_tokens and the actual token driving iter N+1 would be
             # whatever BO*'s logits sampled — breaking train/inference parity.
             forced_next_token: List[Optional[int]] = [None for _ in range(batch_size)]
-            # BISTREAM: tokens to emit verbatim over the NEXT iterations (the following text
-            # chunk, then BOV to re-enter speech). forced_next_token handles the single
-            # immediately-forced EO*; this handles the run that follows it.
-            forced_token_queue: List[List[int]] = [[] for _ in range(batch_size)]
             # just_entered_streaming[b] = "voice"/"audio" when BO* transitioned
             # current_modality from None this iter. For image (single-shot) the
             # shared text_coda call naturally processes BOI because the image
@@ -2320,6 +2326,13 @@ class MegaTransformerWorldModel(nn.Module):
         top_p: Optional[float],
     ) -> torch.Tensor:
         """Sample tokens from logits with temperature, top-k, and top-p."""
+        # temperature <= 0 means GREEDY. Without this the division below produces +-inf,
+        # softmax turns that into NaN, and torch.multinomial fails with a device-side assert
+        # whose traceback points at the sampler rather than at the argument -- so a perfectly
+        # reasonable `temperature=0` looked like a CUDA/driver fault. The voice sampler has
+        # taken 0 as greedy all along; this makes the text sampler agree.
+        if temperature is None or temperature <= 0.0:
+            return logits.argmax(-1)
         if temperature != 1.0:
             logits = logits / temperature
 

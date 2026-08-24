@@ -149,6 +149,14 @@ last chunk 10–60 (median 27) — no pathological tails.
 
 ## Traps that have already cost time on this codebase
 
+- **`forced_next_token` is re-created every token-loop iteration, and that is correct for it**
+  — it is set and consumed within one iteration. Anything declared beside it inherits that
+  lifetime. The bistream `forced_token_queue` must OUTLIVE the iteration that fills it (that
+  iteration emits the forced text-EOV; the queue drains over the ones after), so it lives
+  outside the loop. Declared inside, it is wiped every step, the continuation silently never
+  happens, and **every utterance renders as exactly its first chunk with the correct content**
+  — which reads as "the model only learned one chunk" rather than as a decode bug. Cost a
+  live run's worth of misleading TB audio on 2026-08-24.
 - **Two collate-text paths.** `__call__` uses `_collate_text`, not `_collate_text_per_sample`.
 - **A voice-only run has `include_text=False`**, so text targets are not built unless the
   gating includes your flag (see the `emit_duration_token` clause in `compute_loss`).
