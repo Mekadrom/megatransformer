@@ -59,6 +59,25 @@ class MultimodalDataCollator(DataCollator):
         # decoder knows its block length before masked refinement starts. Off => the AR
         # layout is byte-identical.
         emit_duration_token: bool = False,
+        # BISTREAM chunk interleaving (CosyVoice 2 style). Instead of all text then all
+        # speech, alternate k text tokens with s speech frames so the text a frame realizes
+        # is ADJACENT rather than hundreds of positions back:
+        #
+        #   [text 0:k][BOV][PH -> frames 0:s][EOV] [text k:2k][BOV][PH -> frames s:2s][EOV] ...
+        #
+        # Each voice block is delimited exactly as the unistream one is, so a 1-chunk plan is
+        # BYTE-IDENTICAL to today's layout -- unistream is literally the m=1 case.
+        # 0 disables (default), and every tensor this collator emits is then unchanged.
+        bistream_text_chunk: int = 0,      # k
+        bistream_voice_chunk: int = 0,     # s
+        # Per-sample mix, as in CosyVoice 2: this fraction of eligible samples go bistream,
+        # the rest stay unistream. One model does both, and the unistream half stays directly
+        # comparable to what is trained today.
+        bistream_prob: float = 0.5,
+        # Terminal unit id ending a CHUNK ("I have said everything the text so far supports;
+        # send more text"), as distinct from voice_eov_id which ends the UTTERANCE. Required
+        # when bistream is on. Value is K+1 (EOV is K), so the unit head must be K+2 wide.
+        voice_fill_id: Optional[int] = None,
     ):
         self.max_seq_len = max_seq_len
         self.max_waveforms = max_waveforms
@@ -69,6 +88,16 @@ class MultimodalDataCollator(DataCollator):
         self._sp = constants.special_token_ids(special_token_base)
         self._eos = eos_token_id
         self.emit_duration_token = bool(emit_duration_token)
+        self.bistream_text_chunk = int(bistream_text_chunk or 0)
+        self.bistream_voice_chunk = int(bistream_voice_chunk or 0)
+        self.bistream_prob = float(bistream_prob)
+        self.voice_fill_id = voice_fill_id
+        self.bistream_enabled = self.bistream_text_chunk > 0 and self.bistream_voice_chunk > 0
+        if self.bistream_enabled and self.voice_fill_id is None:
+            raise ValueError(
+                "bistream needs voice_fill_id (the chunk terminator, K+1). Without it a chunk "
+                "boundary is unmarked, the model has no 'send more text' target, and the "
+                "layout silently degrades to unistream-with-extra-delimiters.")
         self.force_direction = None  # Set to "synthesis" or "transcription" to override random direction
 
     def __call__(self, examples: list[dict]) -> dict[str, torch.Tensor]:
@@ -85,11 +114,18 @@ class MultimodalDataCollator(DataCollator):
         has_voice = any(any(k.startswith("voice_") for k in ex) for ex in valid_examples)
         has_image = any("image_image" in ex for ex in valid_examples)
 
+        # Bistream plans are decided ONCE, before either collation, because the chunk
+        # boundaries shape both the voice tensors and the token sequence and the two must
+        # agree exactly. Disabled => None, and every path below is byte-identical to before.
+        plans = None
+        if self.bistream_enabled and has_voice and has_text:
+            plans = self._build_plans(valid_examples, self.force_direction)
+
         # Collate non-text modalities (only from samples that have them)
         if has_audio:
             batch.update(self._collate_audio(valid_examples))
         if has_voice:
-            batch.update(self._collate_voice(valid_examples))
+            batch.update(self._collate_voice(valid_examples, plans=plans))
         if has_image:
             batch.update(self._collate_image(valid_examples))
 
@@ -101,9 +137,74 @@ class MultimodalDataCollator(DataCollator):
                 has_voice=has_voice,
                 has_image=has_image,
                 force_direction=self.force_direction,
+                plans=plans,
             ))
 
         return batch
+
+    # ------------------------------------------------------------------ bistream planning
+
+    def _resolve_direction(self, ex, force_direction):
+        """Direction, decided ONCE per example.
+
+        Normally `_build_token_sequence` decides this inline. Bistream needs it earlier --
+        the chunk plan shapes both the voice tensors and the token sequence, and only the
+        SYNTHESIS direction is chunked (in transcription the speech is an input whose text is
+        the target, so there is no 'send more text' decision to learn). Only called when
+        bistream is enabled, so the non-bistream RNG consumption order is untouched.
+        """
+        d = force_direction or ex.get("_direction", None)
+        if d == "synthesis":
+            return True
+        if d == "transcription":
+            return False
+        return random.random() < 0.5
+
+    def _bistream_plan(self, text_length: int, n_frames: int):
+        """Chunk plan, or None if this sample cannot be chunked.
+
+        Returns a list of (tok_start, tok_len, frame_start, frame_len), text and speech
+        advancing together: k text tokens, then s speech frames, until the text runs out --
+        the final text chunk carries whatever speech remains.
+
+        FEASIBILITY is exact, not a ratio. CosyVoice 2 gates on
+        `speech_len/text_len > s/k`, which for our corpus (5.9 frames/token, s/k = 6) would
+        reject about half the data for no reason: what actually has to hold is that the
+        chunks BEFORE the last one fit, i.e. n_frames > (n_text_chunks - 1) * s. That is
+        strictly weaker and is what makes the last chunk non-empty.
+        """
+        k, s = self.bistream_text_chunk, self.bistream_voice_chunk
+        text_length = int(text_length); n_frames = int(n_frames)
+        if text_length <= 0 or n_frames <= 0:
+            return None
+        n_text_chunks = (text_length + k - 1) // k
+        if n_text_chunks < 2:
+            return None                     # one chunk IS unistream; nothing gained
+        if n_frames <= (n_text_chunks - 1) * s:
+            return None                     # the last chunk would be empty or negative
+        chunks = []
+        ti = fi = 0
+        for j in range(n_text_chunks):
+            tl = min(k, text_length - ti)
+            fl = (n_frames - fi) if j == n_text_chunks - 1 else min(s, n_frames - fi)
+            chunks.append((ti, tl, fi, fl))
+            ti += tl
+            fi += fl
+        assert ti == text_length and fi == n_frames, (ti, text_length, fi, n_frames)
+        return chunks
+
+    def _build_plans(self, examples, force_direction):
+        """Per-example bistream decision. None entry = this sample stays unistream."""
+        plans = []
+        cap = self.max_sive_feature_frames
+        for ex in examples:
+            is_syn = self._resolve_direction(ex, force_direction)
+            n = _as_int(ex.get("voice_feature_length"))
+            chunks = None
+            if is_syn and n is not None and random.random() < self.bistream_prob:
+                chunks = self._bistream_plan(int(ex["text_text_length"]), min(int(n), cap))
+            plans.append({"is_synthesis": is_syn, "chunks": chunks})
+        return plans
 
     def _build_token_sequence(
         self,
@@ -114,6 +215,7 @@ class MultimodalDataCollator(DataCollator):
         has_image: bool,
         force_direction: str = None,  # None=random, "synthesis", "transcription"
         voice_frames: Optional[int] = None,
+        plan: Optional[dict] = None,
     ) -> torch.Tensor:
         """Build a token sequence with boundary and placeholder tokens injected.
 
@@ -141,12 +243,28 @@ class MultimodalDataCollator(DataCollator):
         # a duration token, and that token only makes sense in the SYNTHESIS direction (in
         # transcription the voice is an INPUT whose length is already known, so there is
         # nothing to predict and emitting it would train a head on a free variable).
-        if force_direction == "synthesis":
+        if plan is not None:
+            # Decided in _build_plans, because the chunk layout depends on it.
+            is_synthesis = plan["is_synthesis"]
+        elif force_direction == "synthesis":
             is_synthesis = True
         elif force_direction == "transcription":
             is_synthesis = False
         else:
             is_synthesis = random.random() < 0.5
+
+        # BISTREAM: text and speech alternate, each voice block delimited exactly as the
+        # unistream one is. Only voice is chunked, and only in synthesis; a chunked sample
+        # never carries audio/image blocks (the plan is only built for voice-bearing
+        # synthesis examples), so the fixed audio/voice/image block order is not disturbed.
+        if plan is not None and plan["chunks"] is not None and is_synthesis:
+            parts = []
+            for (ts, tl, _fs, _fl) in plan["chunks"]:
+                parts.append(text_tokens[ts:ts + tl])
+                parts.append(torch.tensor(
+                    [self._sp.BOV, self._sp.VOICE_PLACEHOLDER, self._sp.EOV],
+                    dtype=text_tokens.dtype))
+            return torch.cat(parts + [eos]), True
 
         # Build media token blocks in fixed order: audio, voice, image
         media_blocks = []
@@ -189,13 +307,14 @@ class MultimodalDataCollator(DataCollator):
         has_voice: bool = False,
         has_image: bool = False,
         force_direction: str = None,
+        plans: Optional[list] = None,
     ) -> dict:
         all_token_ids = []
         all_text_lengths = []
         all_texts = []
         all_is_synthesis = []
 
-        for ex in examples:
+        for i, ex in enumerate(examples):
             raw_token_ids = trim(ex["text_token_ids"], self.max_seq_len, dim=-1)
             text_length = ex["text_text_length"]
 
@@ -211,6 +330,7 @@ class MultimodalDataCollator(DataCollator):
                 has_image=has_image,
                 force_direction=direction,
                 voice_frames=_as_int(ex.get("voice_feature_length")),
+                plan=(plans[i] if plans is not None else None),
             )
 
             all_token_ids.append(injected)
@@ -283,7 +403,8 @@ class MultimodalDataCollator(DataCollator):
             "is_synthesis": torch.tensor(all_is_synthesis, dtype=torch.bool),
         }
 
-    def _collate_audio_like(self, examples: list[dict], prefix: str, eov_id: Optional[int] = None) -> dict:
+    def _collate_audio_like(self, examples: list[dict], prefix: str, eov_id: Optional[int] = None,
+                            plans: Optional[list] = None) -> dict:
         """Collate audio-like modality (audio or voice) with the given key prefix."""
         all_waveforms = []
         all_waveform_lengths = []
@@ -372,7 +493,103 @@ class MultimodalDataCollator(DataCollator):
             for e, h in zip(eff, eov_here)
         ]
 
-        if all_features[0] is not None:
+        # ------------------------------------------------------------------ discrete path
+        # Everything the discrete path emits is built from ONE description: a list of
+        # (content_start, content_len, terminal_unit_or_None) segments per sample.
+        #
+        #   unistream  -> [(0, e, EOV)]                         (or terminal None if truncated)
+        #   bistream   -> [(fs_0, fl_0, FILL), ..., (fs_m, fl_m, EOV)]
+        #
+        # The emitted stream is those segments laid end to end WITH their terminals inline,
+        # so an utterance occupies e + (#terminals) positions. Two consequences worth stating,
+        # because they are what keep the rest of the model untouched:
+        #   - `voice_feature_lengths` is that expanded length, exactly as it already counts
+        #     the EOV slot today, so every downstream span/mask keeps working;
+        #   - the unit TARGET tensor is still (B, T_expanded) per utterance, so the coda, the
+        #     CE, EOV handling and speaker conditioning stay per-utterance concepts. Chunks
+        #     are a slicing of this stream, NOT a new batch axis (see the `n`-axis note in
+        #     docs/plans/bistream-inner-monologue.md).
+        if discrete:
+            segs = []
+            for i in range(len(examples)):
+                pl = plans[i] if plans is not None else None
+                chunks = pl["chunks"] if pl is not None else None
+                e, h = eff[i], eov_here[i]
+                if chunks is None:
+                    segs.append([(0, e, eov_id if h else None)])
+                    continue
+                m = len(chunks)
+                # A truncated utterance gets no terminal on its LAST chunk, for the same
+                # reason it gets no EOV today: it did not genuinely end, and teaching a
+                # terminal at a truncation boundary desyncs train from inference. Interior
+                # chunk boundaries are real regardless, so they keep their FILL.
+                segs.append([
+                    (fs, fl, (self.voice_fill_id if j < m - 1 else (eov_id if h else None)))
+                    for j, (_ts, _tl, fs, fl) in enumerate(chunks)
+                ])
+
+            span_lengths = [
+                torch.as_tensor(sum(cl + (1 if t is not None else 0) for _cs, cl, t in sg),
+                                dtype=torch.long)
+                for sg in segs
+            ]
+            T = max(int(x) for x in span_lengths)
+            n_chunks = [len(sg) for sg in segs]
+            M = max(n_chunks)
+            chunk_starts = torch.zeros(len(segs), M, dtype=torch.long)
+            chunk_lengths = torch.zeros(len(segs), M, dtype=torch.long)
+
+            feats_out, masks_out, units_out = [], [], []
+            for i, sg in enumerate(segs):
+                u = all_unit_ids[i]
+                f = all_features[i] if all_features[0] is not None else None
+                uo = torch.full((T,), -100, dtype=torch.long)
+                fo = torch.zeros(f.shape[:-1] + (T,), dtype=f.dtype) if f is not None else None
+                mo = torch.zeros(T, dtype=torch.float32)   # 1.0 = valid, matching pad_and_mask
+                cur = 0
+                for j, (cs, cl, term) in enumerate(sg):
+                    # Clamp against what is actually STORED, not just the recorded length:
+                    # a shard can carry a feature/unit tensor shorter than feature_length,
+                    # which pad_and_mask used to absorb silently.
+                    avail = u.shape[-1] - cs
+                    if f is not None:
+                        avail = min(avail, f.shape[-1] - cs)
+                    cl = max(0, min(cl, avail))
+                    start = cur
+                    if cl > 0:
+                        uo[cur:cur + cl] = u[cs:cs + cl].to(torch.long)
+                        if fo is not None:
+                            fo[..., cur:cur + cl] = f[..., cs:cs + cl]
+                        cur += cl
+                    if term is not None:
+                        # Terminal slot: supervised as `term`, feature left at ZERO. The coda
+                        # never consumes it as input (its target is a token, not a feature),
+                        # which is what makes a zero column correct rather than merely benign.
+                        uo[cur] = int(term)
+                        cur += 1
+                    chunk_starts[i, j] = start
+                    chunk_lengths[i, j] = cur - start
+                mo[:cur] = 1.0
+                units_out.append(uo)
+                masks_out.append(mo)
+                if fo is not None:
+                    feats_out.append(fo)
+
+            if all_features[0] is not None:
+                batch[f"{prefix}_features"] = torch.stack(feats_out)
+                batch[f"{prefix}_feature_masks"] = torch.stack(masks_out)
+            batch[f"{prefix}_feature_lengths"] = torch.stack(span_lengths)
+            batch[f"{prefix}_unit_ids"] = torch.stack(units_out)
+            if plans is not None and any(p is not None and p["chunks"] is not None for p in plans):
+                # Placeholder -> (utt_idx, start, length). utt_idx is 0 throughout because
+                # this collator emits ONE utterance per example; it is carried explicitly so
+                # the interleaver never has to infer it positionally.
+                batch[f"{prefix}_chunk_starts"] = chunk_starts
+                batch[f"{prefix}_chunk_lengths"] = chunk_lengths
+                batch[f"{prefix}_chunk_counts"] = torch.tensor(n_chunks, dtype=torch.long)
+                batch[f"{prefix}_chunk_utts"] = torch.zeros(len(segs), M, dtype=torch.long)
+
+        if not discrete and all_features[0] is not None:
             padded, masks = pad_and_mask(all_features, span_lengths)
             # Zero the feature pad. VQ quantizes EVERY frame (pad included) to a nonzero
             # centroid, and pad_and_mask masks-but-doesn't-zero — so the prelude's conv would
@@ -398,7 +615,7 @@ class MultimodalDataCollator(DataCollator):
             batch[f"{prefix}_feature_lengths"] = torch.stack(span_lengths)
             batch[f"{prefix}_feature_masks"] = torch.stack(masks)
 
-        if all_unit_ids[0] is not None:
+        if not discrete and all_unit_ids[0] is not None:
             # Pad with -100, NOT 0: 0 is a real unit id. pad_and_mask() pads with 0
             # (it is the shared waveform/mel helper), which would silently supervise the
             # coda to predict unit 0 across every padded frame — the exact bug the text
@@ -486,9 +703,14 @@ class MultimodalDataCollator(DataCollator):
         filtered = [ex for ex in examples if any(k.startswith("audio_") for k in ex)]
         return self._collate_audio_like(filtered, "audio", eov_id=self.audio_eov_id) if filtered else {}
 
-    def _collate_voice(self, examples: list[dict]) -> dict:
-        filtered = [ex for ex in examples if any(k.startswith("voice_") for k in ex)]
-        return self._collate_audio_like(filtered, "voice", eov_id=self.voice_eov_id) if filtered else {}
+    def _collate_voice(self, examples: list[dict], plans: Optional[list] = None) -> dict:
+        keep = [i for i, ex in enumerate(examples) if any(k.startswith("voice_") for k in ex)]
+        filtered = [examples[i] for i in keep]
+        # Plans are indexed against the FULL example list (that is what _collate_text sees),
+        # so they must be filtered in lockstep or every chunk map lands on the wrong sample.
+        fplans = [plans[i] for i in keep] if plans is not None else None
+        return (self._collate_audio_like(filtered, "voice", eov_id=self.voice_eov_id, plans=fplans)
+                if filtered else {})
 
     def _collate_image(self, examples: list[dict]) -> dict:
         images = [ex["image_image"] for ex in examples if "image_image" in ex]
