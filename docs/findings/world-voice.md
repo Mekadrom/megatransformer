@@ -238,10 +238,66 @@ wrong temperature. Treat as untested.
 
 ---
 
+## ESTABLISHED (continued)
+
+### Training exclusively at mask ratio 1.0 does NOT build text conditioning (2026-08-23)
+`world_tts_cosyvoice2_smollm2_nar_r1_flat_lr-flat_0`, killed at ~63k steps = **34 epochs over
+LibriTTS-R clean**. Train loss kept falling; eval did not improve; **no signs of
+memorization.**
+
+Trajectory measured at r=1.0 while it ran:
+
+| step | predictive entropy | text_delta | acc_real |
+|---|---|---|---|
+| 1000 | 11.291 | — | — |
+| 5000 | 11.072 | +0.0017 [+0.0007,+0.0026] | 0.0197 |
+| 10000 | 11.045 | +0.0015 [+0.0007,+0.0022] | 0.0133 |
+
+Entropy fell 0.219 bits over the first 4k steps and then 0.027 over the next 5k — an 8x
+collapse in rate, flattening at 87% of maximum. `text_delta` never moved.
+
+**The absence of memorization is the informative part.** Data scarcity predicts overfitting: a
+~180M model given 34 passes over ~13M target tokens should memorize something if the mapping
+is learnable. It did not. The falling train loss is consistent with learning the unit MARGINAL
+(corpus statistics), which lowers loss slightly, transfers to eval, and is not memorization.
+So the model cannot fit text -> unit even on data it has seen 34 times, which points at
+representation, capacity or framing rather than at data quantity.
+
+This is the third independent result with the same shape: gen-query (2026-08-13), the NAR
+crutch finding (2026-08-21), and now training with no crutch available at all. Removing or
+withholding the local shortcut does not cause text to carry content.
+
+⚠️ Also unresolved from that run: the r=1.0 probe reported acc_real FALLING (0.0197 -> 0.0133)
+while TensorBoard's own `eval/voice_synthesis/voice_unit_accuracy` rose monotonically
+(0.0232 -> 0.0282 by 14.8k) and was ~2x higher in absolute terms. Both claim to measure
+masked-position unit accuracy at r=1.0 on held-out data. They disagree and it was never
+reconciled — suspect the probe before the trainer. Fix this before either number is used again.
+
+---
+
 ## OPEN
 
-### Does training at mask ratio 1.0 build text conditioning the cosine schedule never did?
-Run `world_tts_cosyvoice2_smollm2_nar_r1_flat_lr-flat_0`, started 2026-08-21:
+### Can it memorize 32 utterances?
+THE NEXT DIAGNOSTIC, and it partitions the hypothesis space cheaply (hours, not days).
+`--use_memorization_dataset --max_samples 32`, LR 1e-4, constant. Judge on train loss and
+whether it reproduces those 32 utterances; there is no meaningful held-out set at n=32.
+
+- **Memorizes** -> the mapping is learnable and the architecture is capable; the 63k failure
+  is about GENERALIZATION, so data scale and alignment (bistream) become the live questions.
+- **Cannot memorize 32** -> the wall is upstream of data: capacity, the frozen text
+  representation, or the framing. LibriHeavy would not help and the data-scaling slope would
+  waste a week.
+- **Memorizes equally well with SHUFFLED text** -> it is memorizing unit sequences
+  positionally and learning no text->unit map at all. Run this control; it is the outcome that
+  would explain the whole month.
+
+⚠️ The memorization dataset was three-ways stale until 2026-08-23 (no discrete-unit support,
+no text pairing, no `_direction`); two of the three failed SILENTLY, one by training on
+nothing. Sanity-check `train/voice_unit_accuracy` climbs fast in the first few hundred steps —
+on 32 samples it should — before trusting a negative result from it.
+
+### ~~Does training at mask ratio 1.0 build text conditioning?~~ ANSWERED: no (see above)
+Run `world_tts_cosyvoice2_smollm2_nar_r1_flat_lr-flat_0`, started 2026-08-21, killed at 63k:
 `--voice_nar_mask_schedule high --voice_nar_mask_ratio_min 1.0`, constant LR after warmup so
 plateau is attributable to the model rather than LR decay, `--voice_cfg_text_dropout_prob 0.1`
 so CFG is testable later.
