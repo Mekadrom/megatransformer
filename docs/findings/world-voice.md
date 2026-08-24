@@ -421,6 +421,29 @@ Fixed to score the FIRST utterance and to report disjoint-utterance counts; the 
 figures are largely within-block and so probably survive, but **the length statistics above
 are void pending the re-run**.
 
+### `--unmask_eos_in_synthesis` works, and shows no harm at matched step (2026-08-24)
+`ar_flat_lr_1`, step 1846, **with the eval-time ban OFF** (`--no_viz_suppress_media_tokens`):
+**zero `utt1+` tags across all 8 prompts** — every prompt produced exactly ONE utterance. The
+model is emitting EOS after the voice block because it was trained to, not because sampling
+was prevented. `train/text_loss_norm` bottoms out (1.0155 -> 2.8e-4 by step 100), which is the
+expected floor for a one-class objective, so it confirms the gradient path is live and nothing
+more.
+
+The renders at 1846 are tiny — 1, 1, 1, 1, 2, 9, 11, 11 units (0.04-0.44 s). **That is
+undertraining, not the fix.** Step-matched `_0` at 1846, which has no EOS supervision at all
+and whose numbers are SUMS across every block: 3, 1, 33, 1, 224, 27, 3, 1. Equally tiny. `_0`
+then grows over training (@3692: 2, 27, 250, 250, 3, 16, 250, 7; @5538: 15, 43, 26, 431, 14,
+244, 250, 250).
+
+So the earlier prediction that this fix would make renders shorter **cannot be evaluated at
+1846** — the control is just as short there. Judge at `_1`@11076 against `_0`@11076, which is
+a one-flag comparison. n=8 with stochastic sampling either way, so read the distribution, not
+individual prompts.
+
+Practical consequence: **leave the eval-time ban OFF for voice.** It is now redundant (the
+model stops on its own), it hides the utterance count that would detect a regression, and the
+A/B showed it truncates to a false start when one occurs.
+
 ### BO* suppression works — and reveals that PREMATURE EOV is the bigger failure (2026-08-24)
 A/B on `ar_flat_lr_0/checkpoint-11076`, same 8 val prompts, voice_temperature 0.6
 (`scripts_local/voice_render_length_audit.py --suppress_media_tokens / --no_...`):
