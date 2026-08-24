@@ -54,6 +54,14 @@ def main():
                          "numbers describe a regime nobody listens at.")
     ap.add_argument("--voice_predict_f0", dest="voice_predict_f0", action="store_true", default=False)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--suppress_media_tokens", dest="suppress", action="store_true", default=True,
+                    help="Ban BO*/placeholder ids from the text sampler (the eval default).")
+    ap.add_argument("--no_suppress_media_tokens", dest="suppress", action="store_false",
+                    help="Let the model sample BO*. Run BOTH to A/B whether the ban actually "
+                         "prevents a second voice block -- the live eval produced up to SIX "
+                         "utterances with the ban nominally on, which either means it is not "
+                         "reaching generate() or that blocks start by some path other than a "
+                         "sampled BOV.")
     ap.add_argument("--out_dir", default=None)
     diag.add_mrope_args(ap)
     a = ap.parse_args()
@@ -84,7 +92,8 @@ def main():
         with torch.no_grad():
             out = model.generate(text_input_ids=prompt, max_new_tokens=a.max_new_tokens,
                                  temperature=0.8, voice_temperature=a.voice_temperature,
-                                 voice_token_budget=a.voice_max_frames)
+                                 voice_token_budget=a.voice_max_frames,
+                                 suppress_media_control_tokens=a.suppress)
         vp = out.get("voice_latent_preds")
         if vp is None or vp.numel() == 0:
             rows.append((i, 0, [], 0, 0.0, 0.0))
@@ -99,7 +108,8 @@ def main():
     lines = [f"# Render length audit — step {a.step}", "",
              f"`{a.checkpoint_path}`, n={len(rows)}, budget {tgt} frames "
              f"({tgt / a.token_rate:.1f}s at {a.token_rate:g} Hz), "
-             f"voice_temperature {a.voice_temperature}.", "",
+             f"voice_temperature {a.voice_temperature}, "
+             f"media-token suppression {'ON' if a.suppress else 'OFF'}.", "",
              "| prompt | utterances | real frames each | padded width | utt0 real s | utt0 padded s | ended by |",
              "|---|---|---|---|---|---|---|"]
     n_budget = n_eov = 0
