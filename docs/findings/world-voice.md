@@ -421,31 +421,31 @@ Fixed to score the FIRST utterance and to report disjoint-utterance counts; the 
 figures are largely within-block and so probably survive, but **the length statistics above
 are void pending the re-run**.
 
-### ⚠️ `ar_flat_lr_0` is NOT a clean control for `ar_flat_lr_1` (2026-08-24)
-Both exist and they differ in more than the thing under test. Record before anyone
-step-matches them:
+### `ar_flat_lr_0` vs `ar_flat_lr_1` IS a clean A/B (2026-08-24, corrected)
+~~An earlier version of this entry claimed `_0` ran at LR 1e-5 for its first 11000 steps and
+was therefore confounded with `_1`.~~ **Wrong** — that was read off the CLI *handed over*, not
+the one launched. `_0`'s own event file records `--learning_rate 1e-4
+--lr_scheduler_type constant_with_warmup --warmup_steps 2000`, identical to `_1`, and the
+resume at 11000 kept it. Verify launch commands from `training/command_line`, never from what
+was recommended.
+
+So the two runs differ in **exactly one thing**:
 
 | | `_0` | `_1` |
 |---|---|---|
-| start | fresh | fresh |
-| LR | **1e-5 for steps 0-11000, then 1e-4 on resume** | **1e-4 throughout** |
 | `--unmask_eos_in_synthesis` | no | **yes** |
-| everything else | same | same |
+| LR / schedule / warmup / batch / accum / seed / data | identical | identical |
 
-So a step-matched `_0` vs `_1` comparison confounds the EOS exemption with a 10x LR
-difference — and `_0`'s own curve has a discontinuity at 11000. **Do not read a text-delta or
-accuracy difference between them as an EOS effect.**
+`_0` is a usable step-matched control. Its measured baselines at 11076: text-attributed
+**0.450**, text_delta **+0.0487**, acc_real **0.1081**, disjoint utterances per prompt
+**2.03** (diagnostics n=32) / **2.75** (viz n=8), adj_repeat **0.2645**, longest_run **124**.
 
-What IS readable, because the mechanism is specific and the expected effect is large:
-- `train/text_loss_norm` must APPEAR in `_1` (it does not exist in `_0` at all). Absent =
-  the flag is inert, same as the two inert-flag bugs found the same day.
-- **Disjoint utterances per prompt within `_1`**, against `_0`'s measured 2.03 (diagnostics,
-  n=32) and 2.75 (viz, n=8) at step 11076. Falling toward 1.0 is the fix working. This is a
-  within-run readout against a documented prior, not a cross-run comparison.
+`_1` confirmed live: `train/text_loss_norm` appears and looks healthy, so the exemption is
+NOT inert (the failure mode that hit two other flags the same day).
 
-Also note `_1` holds **1e-4 constant with no decay**. The project's from-scratch default is
-7e-5 (1e-4 caused spikes/NaN — but that was with a DiT in the loss, absent here; the 32-sample
-memorization arms ran 1e-4 cleanly). Watch grad_norm early.
+The primary readout is **disjoint utterances per prompt**, which should fall toward 1.0. The
+repetition metrics should NOT move — nothing about EOS supervision touches them, so if they
+improve, something else changed and the attribution is wrong.
 
 ### Why it starts a second utterance: EOS after a media block is never trained (2026-08-24)
 Owner's diagnosis, confirmed in code and pinned by a test. The synthesis layout is
