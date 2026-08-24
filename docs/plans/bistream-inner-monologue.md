@@ -14,18 +14,34 @@ interleaved, filtered from output) extends that from TTS to the full multimodal 
 costs nothing extra at training time. Precedent: CosyVoice 2 (bistream), Moshi (inner
 monologue).
 
-## PREREQUISITE — do not skip
+## PREREQUISITE — CLEARED 2026-08-24, do not re-run it
 
-**Run the shuffled-text memorization control first.** If the model memorizes 32 utterances
-just as well with WRONG transcripts as with right ones, the transcript is decorative and this
-entire plan rests on nothing. Hours of GPU against a build measured in days.
+This plan originally gated itself on a shuffled-transcript memorization arm. **That control was
+confounded and must not be run.** Over the 32 memorization samples `(voice_frame_len, text_len)`
+is a unique index (30/32 distinct exact frame lengths; the one 173-frame collision broken by
+text length; all 32 the same speaker), so a shuffled arm memorizes by keying on the layout and
+reports "text is decorative" whether or not that is true.
 
-    --use_memorization_dataset --max_samples 32, LR 1e-4 constant, ~20k steps,
-    vs an arm with transcripts shuffled across the 32.
+The question was answered instead on the finished `world_tts_memorize32_0/checkpoint-20000`, by
+ablating the transcript at the sample level with the layout key held fixed
+(`scripts_local/memorization_text_dependence.py`):
 
-Also outstanding, cheap, and worth having: a per-utterance teacher-forced probe over all 32 to
-explain why some memorize and others do not (length is ruled out — idx 0 at 73 frames locked
-in while idx 3 at 85 did not).
+- real 1.0000 -> **matched (content changed, `(frame_len, text_len)` preserved) 0.0689.**
+  The transcript is NOT decorative; the text pathway is live and high-bandwidth.
+- Under `roll`, predictions match the SOURCE utterance's units at **0.8250** — the text is a
+  RETRIEVAL KEY selecting which memorized utterance to replay, overriding both length signals.
+
+**What that means for this plan:** it does not rest on nothing, and the 63k failure is a
+generalization failure rather than dead wiring — which is exactly the failure bistream targets.
+It does *not* establish that the model reads text phonetically; n=32 cannot separate "reads
+phonemes" from "hashes the sentence". Proceed, but do not cite memorization as evidence of
+compositional reading.
+
+Still outstanding, cheap, and worth having (NOT blocking): a per-utterance probe over all 32 to
+explain the generation-side discrepancy — train accuracy is 1.0 on every sample, yet TB
+free-running renders were still nonsense for some (idx 3 at 17.5k). Teacher-forced 1.0 with a
+broken render means the gap is in the GENERATION path, not in what was learned, and that would
+invalidate NAR generation numbers rather than NAR training.
 
 ## The layout
 

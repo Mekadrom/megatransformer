@@ -275,10 +275,73 @@ reconciled — suspect the probe before the trainer. Fix this before either numb
 
 ---
 
+### The 32-utterance memorization run ANSWERS the prerequisite: text is read, as a KEY (2026-08-24)
+`world_tts_memorize32_0` (NAR, mask ratio pinned 1.0, duration token on, LR 1e-4 constant,
+32 train samples) reaches **train `voice_unit_accuracy` 1.0 by step ~1400** and holds it to
+20000, with `voice_unit_ce_loss_norm` at 2e-5. At r=1.0 there is no voice context at all —
+every unit is predicted from text + duration alone — so this is complete memorization of all
+32 utterances from the text side.
+
+**That number alone proves nothing, because of a layout confound.** Over those 32 samples
+`(voice_frame_len, text_len)` is a *unique index*: 30 of 32 exact frame lengths are distinct,
+the single collision (3 samples at 173 frames) is broken by text length, and all 32 are the
+same speaker (730), so speaker is not a key either. The model could have reproduced all 32
+while ignoring every text token, keyed on two integers the sequence layout hands it for free.
+
+`scripts_local/memorization_text_dependence.py` settles it on the finished checkpoint, no
+training required, by editing the transcript at the SAMPLE level (before collation, so control
+tokens, placeholder positions and the duration bucket are byte-identical across arms) and
+re-scoring at r=1.0, n=32:
+
+| arm | what changes | unit acc | CE |
+|---|---|---|---|
+| real | nothing (the memorized condition) | **1.0000** | 0.0000 |
+| roll | content + text_len (the standard ablation) | 0.0478 | 19.91 |
+| matched | content only — **layout key preserved** | **0.0689** | 18.90 |
+| within | token ORDER only (same multiset, same length) | 0.3866 | 8.28 |
+| constant | all cross-sample text information removed | 0.0557 | 16.63 |
+
+`matched` is the decisive arm: the (frame_len, text_len) key is intact and accuracy still
+falls 1.0000 -> 0.0689. **The transcript is not decorative.** The text pathway is live.
+
+**But it is being used as a retrieval key, not read compositionally.** Under `roll`, sample i
+is handed sample i-1's transcript while keeping i's frame budget and i's duration bucket. The
+predictions match **sample i-1's stored units at 0.8250** (n=3629 overlapping positions). The
+text selects which memorized utterance to replay, and it replays it at 82.5% fidelity while
+overriding both length signals. `within` = 0.3866 is consistent: an order-scrambled bag of
+tokens is still a partial key over 32 items.
+
+What this licenses and what it does not:
+- **Licensed:** the text->trunk->coda path carries enough bandwidth to select among 32
+  utterances and drive ~200 frames of output. The month of weak text conditioning is a
+  GENERALIZATION failure, not a dead or low-bandwidth wiring. Data scale and alignment
+  (bistream) stay the live questions; capacity and the frozen text representation do not.
+- **Not licensed:** any claim that the model reads text phonetically. Retrieval at 0.825 is
+  the degenerate solution memorization always admits. n=32 cannot distinguish
+  "reads phonemes" from "hashes the sentence"; only a length-decorrelated set or a corpus-scale
+  measurement can.
+
+Protocol note: measured on `checkpoint-20000`, train split, the same 32 samples the run
+trained on, mask ratio 1.0, argmax (no sampling), duration token emitted, M-RoPE
+`scale_side=text` rate 6.0. Report: `eval_output/world_voice_memorization/text_dependence/`.
+
+### The shuffled-text TRAINING control was confounded by design — do not run it (2026-08-24)
+`docs/plans/bistream-inner-monologue.md` named a shuffled-transcript training arm as the
+prerequisite gating the whole bistream build. It would have been **uninformative**, and worse,
+uninformative in the direction of a false negative. Shuffling pairs each voice sample with a
+*fixed* wrong transcript, so `(frame_len, text_len)` stays a unique index and the arm memorizes
+too — reported as "text is decorative", which the ablation above shows is false. The
+inference-time ablation replaces it: same question, minutes instead of hours, and it isolates
+content from layout in a way the training arm structurally cannot.
+
+---
+
 ## OPEN
 
-### Can it memorize 32 utterances?
-THE NEXT DIAGNOSTIC, and it partitions the hypothesis space cheaply (hours, not days).
+### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
+The partition below is kept because it is what the run was launched to decide, and the answer
+picked the first branch: it memorizes, so the 63k failure is about GENERALIZATION. The third
+branch (shuffled text) was never runnable as stated — see the confound entry above.
 `--use_memorization_dataset --max_samples 32`, LR 1e-4, constant. Judge on train loss and
 whether it reproduces those 32 utterances; there is no meaningful held-out set at n=32.
 
