@@ -366,6 +366,7 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
     short utterance) independent of whether the CONTENT aligns."""
     gen_seqs, gt_seqs, prompt_lens, ent_traces = [], [], [], []
     eov_fired = budget_hit = 0
+    n_utts = []          # disjoint utterances per prompt; >1 is a termination failure
     collator.force_direction = "synthesis"
     count = 0
     for i in range(len(dataset)):
@@ -397,7 +398,20 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
             ent_traces.append([float(x) for x in _ent[0]])
         elif getattr(model, "last_nar_round_entropy", None):
             ent_traces.append([float(x) for x in model.last_nar_round_entropy])
-        trace = out.get("voice_unit_id_trace", [[]])[0]
+        # FIRST UTTERANCE, not the flat trace. `voice_unit_id_trace` spans EVERY voice block
+        # the call produced, and a model that ends one utterance and starts another therefore
+        # reports a length above the per-block budget (measured 2026-08-24: len_mean 373.9 and
+        # len_max 500 against a 250 budget, which is arithmetically impossible for one block).
+        # That inflates every length statistic, makes `len(trace) >= budget` fire for any
+        # multi-block generation, and reduces "EOV fired" to "the LAST block ended with EOV".
+        # A render is one utterance, so the statistics must be one utterance too.
+        segs = out.get("voice_unit_id_segments")
+        if segs and segs[0]:
+            n_utts.append(len([sg for sg in segs[0] if len(sg) > 0]))
+            trace = list(segs[0][0])
+        else:
+            n_utts.append(1)
+            trace = out.get("voice_unit_id_trace", [[]])[0]
         if trace and trace[-1] == K:            # EOV fired -> strip it
             eov_fired += 1
             trace = trace[:-1]
@@ -411,7 +425,7 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
         count += 1
         if count >= gen_n:
             break
-    return gen_seqs, gt_seqs, eov_fired, budget_hit, prompt_lens, ent_traces
+    return gen_seqs, gt_seqs, eov_fired, budget_hit, prompt_lens, ent_traces, n_utts
 
 
 def pearson(xs, ys):
@@ -540,7 +554,7 @@ def main():
                              nar_mask_ratio=a.nar_mask_ratio)
     if not a.skip_generation:
         print("2/3 free-running generation ...", flush=True)
-        gen, gt, eov_fired, budget_hit, prompt_lens, ent_traces = run_generation(
+        gen, gt, eov_fired, budget_hit, prompt_lens, ent_traces, n_utts = run_generation(
             model, eval_dataset, collator, device, a.gen_n, K,
             budget=a.voice_max_frames, bov_id=sp.BOV,
             ras_win=a.voice_ras_win, ras_tau=a.voice_ras_tau,
@@ -658,6 +672,14 @@ def main():
 
     lines.append("## 3. Free-running generation — degeneration vs ground truth\n")
     lines.append(f"EOV fired: {eov_fired}/{gen_deg.get('n_seqs',0)}  |  budget-capped: {budget_hit}\n")
+    if n_utts:
+        _multi = sum(1 for x in n_utts if x > 1)
+        lines.append(
+            f"**Disjoint utterances per prompt: mean {sum(n_utts)/len(n_utts):.2f}, "
+            f"max {max(n_utts)}; {_multi}/{len(n_utts)} prompts produced MORE THAN ONE.** "
+            f"Every statistic below is the FIRST utterance only, which is what a render is. "
+            f"A count above 1 means the model ended an utterance and began another unprompted "
+            f"— a termination failure that is invisible if the blocks are concatenated.\n")
     # Text-length -> generated-length correlation: does the model read the text to decide HOW
     # LONG to speak? A high r means text drives DURATION (structural conditioning) even if
     # content isn't aligned. GT r is the ceiling (how well real speech length tracks text length).

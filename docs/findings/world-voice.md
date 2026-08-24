@@ -361,6 +361,42 @@ then nonsense to the cap" artifact already documented for the transcription-inpu
 short generation therefore sounded like a long degenerate one, and the model got the blame.
 Fixed with `_trim_generated_voice` at both sites (voice_to_voice and text_to_voice).
 
+### AR flat-LR @11076: text conditioning is at the TEACHER, free-running is not (2026-08-24)
+`world_voice_cosyvoice2_smollm2_ar_flat_lr_0/checkpoint-11076`, teacher-forced, held-out
+n=512, M-RoPE engaged (`scale_side=text`):
+
+| metric | this run @11k | AR @44k | teacher |
+|---|---|---|---|
+| acc_real | **0.1081** | 0.0940 | 0.1283 |
+| text_delta (all-pos) | **+0.0487** [+0.0462,+0.0511] | +0.0349 | +0.0594 |
+| early_text_delta | **+0.0640** [+0.0549,+0.0732] | +0.0522 | +0.0538 |
+| **text-attributed fraction** | **0.450** | 0.397 | 0.463 |
+| eov_position_acc | 0.8848 | — | — |
+
+Text attribution **0.450 against the teacher's 0.463** at a QUARTER of the steps the 0.397
+figure took, and early_text_delta is nominally above the teacher (CIs overlap, so read it as
+"at the teacher", not "beyond"). The position-resolved horizon **never decays below 0.01**
+(+0.0640 at frames 0-8 down to +0.0401 at 128+), where earlier AR runs showed a horizon of a
+few words. Top-1 0.108 -> top-5 0.303 -> top-10 0.424 says the remaining top-1 gap is target
+multimodality, not a conditioning wall.
+
+⚠️ **Do not attribute the gain.** This run differs from the 44k baseline in FOUR ways at once:
+AR-vs-flat-LR schedule (constant_with_warmup vs cosine), no CFG text dropout, no distillation,
+and `--bucket_by_length`. It is a better model on this axis; which change bought it is
+unmeasured. The older 0.305 @23k figure is additionally suspect — it predates the M-RoPE eval
+fix, and only teacher-forced metrics on NON-M-RoPE checkpoints are in the CLEAN class.
+
+**Free-running is a different story, and the first pass mis-measured it.** Reported: EOV
+5/32, len_mean 373.9 vs GT 164.2, len_max 500, adj_repeat 0.2850 vs GT 0.0306, longest_run 87
+vs 16, distinct-bigram 0.633 vs 0.958, entropy 8.75 vs 10.51 bits. But len_mean 373.9 and
+len_max 500 against a **250-frame budget** are arithmetically impossible for one block — so
+those statistics were computed over the FLAT unit trace spanning several blocks, the same
+concatenation flaw found in the render path the same day. `len(trace) >= budget` then fires
+for any multi-block generation, and "EOV fired" degrades to "the LAST block ended with EOV".
+Fixed to score the FIRST utterance and to report disjoint-utterance counts; the repetition
+figures are largely within-block and so probably survive, but **the length statistics above
+are void pending the re-run**.
+
 ### EOV FIRES — the over-length failure is repeated BOV, not missing termination (2026-08-24)
 Measured, `world_voice_cosyvoice2_smollm2_ar_flat_lr_0/checkpoint-11076`, n=8 val prompts,
 voice_temperature 0.6, budget 250 frames (`scripts_local/voice_render_length_audit.py`):
