@@ -280,7 +280,33 @@ The gap grew monotonically across seven windows (0.016 -> 0.025 -> 0.041 -> 0.04
 ~2 SE, and `trunkctx` reads lower than `t3_xskip` even when it is 2k steps FURTHER along
 (0.207 @22k vs 0.246 @20k).
 
-⚠️ **REVISED TWICE. Final read at 70k: the gap SHRANK, then STABILIZED — it is not closing.**
+⛔ **THE "FINAL READ" BELOW WAS WRONG TOO. At 85k both gaps collapsed to ~+0.013 and the arms
+have essentially converged.** Full history:
+
+| window | w=3.0 | w=1.0 |
+|---|---|---|
+| 20k | +0.071 | — |
+| 53k-60k | +0.0255 (7/8) | +0.0396 (8/8) |
+| 61k-70k | +0.0237 (8/10) | +0.0448 (10/10) |
+| **71k-86k** | **+0.0132 (13/15)** | **+0.0131 (11/15)** |
+
+The w=1 gap I recorded as "stabilized at +0.045, 10/10, measure unguided" fell 70% in the NEXT
+window. Both arms are also deep in cosine decay by then (LR ~10-12% of peak, plateaued since
+~45k), which is exactly when a convergence-RATE difference would close.
+
+⭐ **ARC OF THIS FINDING, worth more than the finding:** "tracking even" (8-13k) -> recorded as a
+real ~0.05 effect (23k) -> downgraded to 0.024 (60k) -> +0.013 and converging (85k). **The FIRST
+reading was closest to right.** The middle-period separation was a transient of differing
+convergence rates — named in the original single-seed caveat, then argued past TWICE. When a
+caveat names an alternative and the data later fits it, that is the alternative, not a coincidence.
+
+**Practical conclusion:** `cross_dec` in the flow head's context buys CONVERGENCE SPEED, not
+endpoint quality — `trunkctx` reaches the same place ~2k steps later and finishes within noise.
+The one thing that has NOT converged is the qualitative failure mode (occasional unguided mode
+collapse, below), which the mean score is a poor instrument for; that remains the live reason to
+prefer the Q-Former or a cheaper constant-remover.
+
+~~**REVISED TWICE. Read at 70k: the gap SHRANK, then STABILIZED — it is not closing.**~~
 
 | matched-step window | w=3.0 | w=1.0 |
 |---|---|---|
