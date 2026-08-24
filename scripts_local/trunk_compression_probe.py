@@ -86,6 +86,16 @@ def main():
 
     rb = model.recurrent_block
     n_gen = int(getattr(model, "_n_image_gen_positions", 0) or 0)
+
+    # The adapter does NOT see the raw trunk output: world_model.py applies
+    # image_coda_input_norm (a LayerNorm) first. LayerNorm normalises each token across its
+    # FEATURE axis, which cannot subtract a PER-POSITION constant vector -- but it does rescale
+    # it, so measure how much of the constant actually survives to the adapter's input.
+    post = {}
+    _icn = getattr(model, "image_coda_input_norm", None)
+    if _icn is not None:
+        _icn.register_forward_hook(
+            lambda _m, _i, o: post.__setitem__("h", o.detach().float()))
     tok = AutoTokenizer.from_pretrained(args.text_encoder_model or "mistralai/Mistral-7B-v0.1")
     mcfg = model.config
     sptok = constants.special_token_ids(int(getattr(mcfg, "special_token_base", 32000)))
@@ -125,18 +135,23 @@ def main():
                   precomputed_latents=True,
                   is_synthesis=torch.tensor([True], device=device),
                   decode_outputs=False)
-        return len(ids), captured["x_0"][0], [t[0] for t in captured["iters"]]
+        pn = post.get("h")
+        return (len(ids), captured["x_0"][0], [t[0] for t in captured["iters"]],
+                None if pn is None else pn[0].cpu())
 
     prompts = [p for pair in PAIRS for p in pair]
-    n_text, x0, iters = run(prompts[0])
+    n_text, x0, iters, _pn = run(prompts[0])
     print(f"seq_len={x0.shape[0]} n_text={n_text} n_gen={n_gen} "
           f"iterations={len(iters)}", flush=True)
 
     stages = ["x_0"] + [f"iter{i}" for i in range(len(iters))]
     gen_acc = {s: [] for s in stages}
     txt_acc = {s: [] for s in stages}
+    post_acc = []
     for p in prompts:
-        nt, x0, its = run(p)
+        nt, x0, its, pn = run(p)
+        if pn is not None:
+            post_acc.append(pn[-n_gen:, :])
         for s, t in zip(stages, [x0] + its):
             gen_acc[s].append(t[-n_gen:, :])
             txt_acc[s].append(t[:nt, :].mean(0, keepdim=True))   # pooled text control
@@ -189,6 +204,13 @@ def main():
         print(f"{s:8s} gen cond/const={g['cond_over_const']:.4f} "
               f"(pos_spread/const={g['pos_spread_over_const']:.4f})  "
               f"text cond/const={t['cond_over_const']:.4f}", flush=True)
+
+    if post_acc:
+        d_post = decompose(post_acc)
+        print(f"\nAFTER image_coda_input_norm (what the adapter actually receives): "
+              f"cond/const={d_post['cond_over_const']:.4f}  "
+              f"pos_spread/const={d_post['pos_spread_over_const']:.4f}")
+        print("  -> compare with the final iter row above (BEFORE the LayerNorm).")
 
     rb._run_iteration = orig_run
     summary = {"checkpoint": args.checkpoint_path, "n_gen": n_gen,

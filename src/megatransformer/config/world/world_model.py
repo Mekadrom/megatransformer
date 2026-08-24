@@ -248,6 +248,21 @@ class MegaTransformerWorldModelConfig:
     # (each ~O(1/sqrt(n_blocks)) via depth-scaled residual init) compete on
     # equal footing from the first layer.
     image_gen_query_init_std: float = 3.0
+    # LEVER D: subtract a LEARNED PER-POSITION offset from the trunk's gen-query output before
+    # the image coda. The conditioning arrives as ~10% of a large per-position constant (the
+    # learned gen queries, norm ~83, which survive the trunk largely intact). The existing
+    # `image_coda_input_norm` CANNOT remove that: LayerNorm normalises each token across its
+    # FEATURE axis and is shared across positions, so it only rescales a per-position vector --
+    # measured at ckpt-85000 it takes cond/const 0.0991 -> 0.1136, about +15% relative.
+    # Hypothesis: this is what `cross_dec` does implicitly (cross-attention with its own learned
+    # queries can put anything it likes in the constant component), so doing it explicitly may
+    # buy the same protection for ~49k params instead of 18.9M.
+    # ⚠️ LEARNED, zero-init -- NOT the measured across-prompt mean. The head plausibly uses the
+    # positional constant for slot IDENTITY (pos_spread/const is 0.97), and removing it wholesale
+    # risks the positional collapse that `image_gen_query_init_std=3.0` was introduced to fix.
+    # A learned offset can settle anywhere between identity and full cancellation.
+    # Zero-init => bit-identical to off at step 0.
+    image_gen_out_offset: bool = False
 
     def __post_init__(self):
         # Single source of truth for the control-token base: derive the interleaver's
@@ -658,6 +673,18 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_trunkctx"].image_coda_config.flow
 # makes cross_dec's K -> seq_len remap identity-shaped anyway; the adapter raises if they differ.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec"].image_coda_config.use_cross_dec = False
+
+# LEVER D: learned per-position centering of the trunk's gen-query output (see
+# `image_gen_out_offset`). Tests whether an explicit constant-remover buys what `cross_dec`
+# appears to buy implicitly, for ~49k params instead of 18.9M.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_offset"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_offset"].image_gen_out_offset = True
+
+# The combination that actually tests the hypothesis: drop cross_dec AND add the explicit
+# centering. If the constant-remover reading is right this should recover most of what
+# `_nocrossdec` alone loses, at 1/380th the parameter cost.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec_offset"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec_offset"].image_gen_out_offset = True
 
 # xskip + explicit DISPERSION MATCHING. The best arm so far (xskip) still emits under-dispersed
 # content and leans on both leftover noise and CFG to make up for it; this makes the spread an

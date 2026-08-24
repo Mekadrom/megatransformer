@@ -169,6 +169,7 @@ class MegaTransformerWorldModel(nn.Module):
             # Normalize recurrent output before the decoder to prevent
             # activation growth from saturating the decoder's attention.
             self.image_coda_input_norm = nn.LayerNorm(config.text_prelude_config.d_model)
+            self.image_gen_out_offset = None
 
             # Image generation queries for synthesis tasks.
             # The gen query count is decoupled from the prelude's patch count:
@@ -189,6 +190,15 @@ class MegaTransformerWorldModel(nn.Module):
                 n_gen = self.image_num_patches
                 nps_gen = self.image_feature_extractor.num_patches_per_side
             self._n_image_gen_positions = n_gen
+
+            # Lever D (see ImageGenConfig.image_gen_out_offset): learned per-position offset,
+            # zero-init, subtracted from the trunk's gen-query output BEFORE
+            # image_coda_input_norm. Built here rather than beside that norm because n_gen is
+            # only resolved at this point. Applied only when the sequence length matches n_gen,
+            # so transcription-direction image tokens are untouched.
+            if bool(getattr(config, "image_gen_out_offset", False)):
+                self.image_gen_out_offset = nn.Parameter(
+                    torch.zeros(n_gen, config.text_prelude_config.d_model))
 
             self.gen_query_mode = config.gen_query_mode
             if config.gen_query_mode == "learned":
@@ -496,6 +506,14 @@ class MegaTransformerWorldModel(nn.Module):
         return build_mrope_position_ids(
             modality_map, voice_rate=float(getattr(self.config, "mrope_voice_rate", 6.0)),
             scale_side=str(getattr(self.config, "mrope_scale_side", "voice")))
+
+    def _image_coda_input(self, x):
+        """Trunk gen-query states -> adapter input. Optional learned per-position centering
+        (lever D) BEFORE the LayerNorm, since LayerNorm cannot remove a per-position constant."""
+        off = getattr(self, "image_gen_out_offset", None)
+        if off is not None and x.dim() == 3 and x.shape[1] == off.shape[0]:
+            x = x - off.unsqueeze(0).to(x.dtype)
+        return self.image_coda_input_norm(x)
 
     def forward(
         self,
@@ -946,7 +964,7 @@ class MegaTransformerWorldModel(nn.Module):
         # Either ImageDecoder (direct prediction) or DiffusionBridgeImageDecoder
         # (flow matching). We propagate whichever loss keys the decoder produces.
         if image_batch is not None and hasattr(self, 'image_generator') and self.image_generator is not None:
-            cross_input = self.image_coda_input_norm(image_batch)
+            cross_input = self._image_coda_input(image_batch)
             if isinstance(self.image_generator, SDXLConditioningAdapter):
                 # Frozen-SDXL path: predict CLIP conditioning; regress to caption CLIP.
                 cross_outputs = self.image_generator(
@@ -1120,7 +1138,7 @@ class MegaTransformerWorldModel(nn.Module):
         elif actual > expected:
             image_hidden = image_hidden[:expected]
         image_hidden = image_hidden.unsqueeze(0)  # (1, num_patches, d_model)
-        cross_input = self.image_coda_input_norm(image_hidden)
+        cross_input = self._image_coda_input(image_hidden)
         image_out = self.image_generator(
             encoder_hidden_states=cross_input,
         )
@@ -2064,7 +2082,7 @@ class MegaTransformerWorldModel(nn.Module):
 
                     # Decode through cross-attention decoder
                     if self.image_generator is not None:
-                        cross_input = self.image_coda_input_norm(image_hidden)
+                        cross_input = self._image_coda_input(image_hidden)
                         gen_kwargs = {}
                         if isinstance(self.image_generator, DiffusionBridgeImageDecoder):
                             if image_num_inference_steps is not None:
