@@ -1161,6 +1161,18 @@ class MegaTransformerWorldModel(nn.Module):
         # utterance at a time can pass that utterance's ground-truth frame count and ask
         # "what would perfect duration prediction be worth?" without training anything.
         voice_exact_frames: Optional[int] = None,
+        # BISTREAM decoding. `voice_bistream_text` is the FULL transcript (B, L) whose first
+        # chunk the prompt already contains; after each fill_token the next `..._chunk` tokens
+        # are fed and a BOV forces the model back into speech. Leave None for a unistream
+        # prompt: a fill_token is then treated as end-of-utterance, since there is no further
+        # text for the model to have been asking for.
+        voice_bistream_text: Optional[torch.Tensor] = None,
+        voice_bistream_text_chunk: int = 0,
+        voice_bistream_text_offset: int = 0,   # tokens of the transcript already in the prompt
+        # Minimum frames before fill_token is allowed in a chunk. Always at least 1 (a fill on
+        # a chunk's first step emits nothing, hands back to text, and burns the transcript
+        # without producing audio).
+        voice_min_chunk_frames: int = 0,
         # Truncated sampling for the discrete voice unit head (only active when voice_temperature > 0).
         # top_k keeps the k highest-prob units; top_p (nucleus) keeps the smallest set whose cumulative
         # prob >= p. Both None/0 (default) => untruncated temperature sampling = prior behavior. These cut
@@ -1313,6 +1325,13 @@ class MegaTransformerWorldModel(nn.Module):
         voice_unit_entropy_trace: List[List[float]] = [[] for _ in range(batch_size)]
         voice_unit_id_segments: List[List[List[int]]] = [[] for _ in range(batch_size)]
         voice_seg_start: List[int] = [0 for _ in range(batch_size)]
+        # BISTREAM state. A CHUNK is a slice of an utterance, so its start is tracked
+        # separately from the utterance's (voice_seg_start): fill ends a chunk, EOV ends the
+        # utterance, and only the latter finalizes.
+        voice_chunk_start: List[int] = [0 for _ in range(batch_size)]
+        should_continue_chunk: List[bool] = [False for _ in range(batch_size)]
+        # Transcript tokens already consumed by the prompt; the next chunk starts here.
+        voice_text_cursor: List[int] = [int(voice_bistream_text_offset) for _ in range(batch_size)]
         voice_f0_seq: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         completed_voice_f0: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
         # Per-segment durations on the deduped path (empty otherwise). Each loop step is a
@@ -1477,6 +1496,10 @@ class MegaTransformerWorldModel(nn.Module):
             # generated_tokens and the actual token driving iter N+1 would be
             # whatever BO*'s logits sampled — breaking train/inference parity.
             forced_next_token: List[Optional[int]] = [None for _ in range(batch_size)]
+            # BISTREAM: tokens to emit verbatim over the NEXT iterations (the following text
+            # chunk, then BOV to re-enter speech). forced_next_token handles the single
+            # immediately-forced EO*; this handles the run that follows it.
+            forced_token_queue: List[List[int]] = [[] for _ in range(batch_size)]
             # just_entered_streaming[b] = "voice"/"audio" when BO* transitioned
             # current_modality from None this iter. For image (single-shot) the
             # shared text_coda call naturally processes BOI because the image
@@ -1704,7 +1727,31 @@ class MegaTransformerWorldModel(nn.Module):
                     # path is already handled naturally by the line-896 zero_vec
                     # in iter 0; here we emulate the same behavior when BOV is
                     # sampled mid-generation so both entry paths converge.
-                    if just_entered_streaming[b] == "voice":
+                    if just_entered_streaming[b] == "voice" and voice_sequences[b] and last_voice_pred[b] is not None:
+                        # BISTREAM continuation: this BOV re-opens an utterance already in
+                        # flight, so it is NOT position 0 and must not get the zero prefix.
+                        # Training gives this position prelude(feature at the fill slot), and
+                        # that feature is zero -- last_voice_pred was set to a zero FEATURE at
+                        # the chunk boundary for exactly this step.
+                        _emb, voice_prelude_kv_caches[b] = self.voice_feature_extractor(
+                            last_voice_pred[b].unsqueeze(0),
+                            kv_caches=voice_prelude_kv_caches[b],
+                            position_offset=voice_prelude_position_offsets[b],
+                            use_cache=True,
+                            apply_prenet_dropout=True,
+                        )
+                        voice_prelude_position_offsets[b] += 1
+                        entry_hidden, kv_cache, _, _, _ = self.recurrent_block(
+                            _emb.to(current_hidden.dtype) * self.embed_scale,
+                            attention_mask=None,
+                            kv_cache=kv_cache,
+                            position_offset=position_offset,
+                            use_cache=True,
+                            share_kv_cache=share_kv_cache,
+                        )
+                        position_offset += 1
+                        hidden_b = entry_hidden
+                    elif just_entered_streaming[b] == "voice":
                         d_model_ = self.config.text_prelude_config.d_model
                         if self.voice_gen_query_mode is not None:
                             # Gen-query position 0: the trunk's first voice input is
@@ -1777,6 +1824,17 @@ class MegaTransformerWorldModel(nn.Module):
                             if _floor > 0 and _seg_len < _floor:
                                 logits = logits.clone()
                                 logits[self.voice_codebook.shape[0]] = float("-inf")
+                            # BISTREAM fill_token (K+1), when the head is wide enough to have
+                            # one. Suppressed while the CURRENT CHUNK is still empty: a fill on
+                            # a chunk's first step would emit no frames, hand back to text, and
+                            # -- with the transcript advancing each time -- burn the whole
+                            # prompt without producing audio.
+                            _fill_id = self.voice_codebook.shape[0] + 1
+                            if logits.shape[-1] > _fill_id:
+                                _chunk_len = len(voice_unit_id_trace[b]) - voice_chunk_start[b]
+                                if _chunk_len < max(1, int(voice_min_chunk_frames or 0)):
+                                    logits = logits.clone()
+                                    logits[_fill_id] = float("-inf")
                             if voice_temperature > 0.0:
                                 filt = logits.float() / voice_temperature
                                 # top-k: keep the k highest logits, mask the rest.
@@ -1823,6 +1881,14 @@ class MegaTransformerWorldModel(nn.Module):
                             # no F0), so the finalized utterance is exactly the content frames.
                             if int(unit_id) == self.voice_codebook.shape[0]:
                                 should_stop_voice = True
+                            elif int(unit_id) == self.voice_codebook.shape[0] + 1:
+                                # BISTREAM chunk terminator: "I have said everything the text
+                                # so far supports". Ends the voice BLOCK without ending the
+                                # UTTERANCE -- no frame is emitted (no centroid at this id),
+                                # and the utterance's frames, F0, and prelude/coda KV caches
+                                # all survive into the next chunk.
+                                should_stop_voice = True
+                                should_continue_chunk[b] = True
                             else:
                                 # The coda's F0/VUV for this frame, if the head exists. This is
                                 # the contour the SMG will be conditioned on -- the whole point
@@ -1884,7 +1950,32 @@ class MegaTransformerWorldModel(nn.Module):
                     _cut = (voice_exact_frames is not None
                             and (len(voice_unit_id_trace[b]) - voice_seg_start[b]) >= int(voice_exact_frames))
                     if should_stop_voice or _cut or len(voice_sequences[b]) >= voice_token_budget:
-                        if len(voice_unit_id_trace[b]) > voice_seg_start[b]:
+                        # A CHUNK boundary (fill_token) tears the voice block down but keeps
+                        # the utterance alive: frames, F0, and the prelude/coda KV caches all
+                        # carry across. The caches especially -- in training the coda runs
+                        # causally over the whole utterance's expanded stream with no gap at a
+                        # chunk boundary, so resetting them here would give inference a shorter
+                        # acoustic history than training ever had.
+                        _continue = bool(should_continue_chunk[b])
+                        if _continue:
+                            _nxt = None
+                            if (voice_bistream_text is not None and voice_bistream_text_chunk > 0
+                                    and voice_text_cursor[b] < int(voice_bistream_text.shape[1])):
+                                _end = min(voice_text_cursor[b] + int(voice_bistream_text_chunk),
+                                           int(voice_bistream_text.shape[1]))
+                                _nxt = [int(v) for v in voice_bistream_text[b, voice_text_cursor[b]:_end]]
+                                voice_text_cursor[b] = _end
+                            if not _nxt:
+                                # The model asked for text that does not exist (transcript
+                                # exhausted, or unistream decoding of a bistream-capable head).
+                                # Treat the fill as end-of-utterance rather than handing back to
+                                # a text stream with nothing to say.
+                                _continue = False
+                            else:
+                                forced_token_queue[b] = _nxt + [self._sp.BOV]
+                        should_continue_chunk[b] = False
+                        voice_chunk_start[b] = len(voice_unit_id_trace[b])
+                        if not _continue and len(voice_unit_id_trace[b]) > voice_seg_start[b]:
                             voice_unit_id_segments[b].append(voice_unit_id_trace[b][voice_seg_start[b]:])
                             voice_seg_start[b] = len(voice_unit_id_trace[b])
                         current_modality[b] = None
@@ -1893,19 +1984,32 @@ class MegaTransformerWorldModel(nn.Module):
                         # torch.cat([]) and crash. An empty utterance is a valid outcome
                         # (the model chose to emit nothing); skip finalizing it, mirroring
                         # the end-of-generation flush guard below.
-                        if self.voice_generator is not None and voice_sequences[b]:
-                            feat, f0 = _finalize_voice(voice_sequences[b], voice_f0_seq[b], voice_duration_seq[b])
-                            completed_voice[b].append(feat)
-                            if f0 is not None:
-                                completed_voice_f0[b].append(f0)
-                        voice_sequences[b] = []
-                        voice_f0_seq[b] = []
-                        voice_duration_seq[b] = []
-                        voice_prelude_kv_caches[b] = None
-                        voice_prelude_position_offsets[b] = 0
-                        voice_coda_kv_caches[b] = None
-                        voice_coda_position_offsets[b] = 0
-                        last_voice_pred[b] = None
+                        if _continue:
+                            # Next chunk's first trunk input is prelude(feature at the fill
+                            # slot), and that feature is ZERO -- the collator zeroes every
+                            # terminal column. So hand the prelude an explicit zero FEATURE,
+                            # not None: None takes the position-0 branch, which is a zero in
+                            # d_model space WITHOUT running the prelude, and only the
+                            # utterance's very first position looks like that in training.
+                            _C = self.voice_codebook.shape[1]
+                            last_voice_pred[b] = torch.zeros(
+                                _C, 1, device=device,
+                                dtype=(last_voice_pred[b].dtype if last_voice_pred[b] is not None
+                                       else current_hidden.dtype))
+                        else:
+                            if self.voice_generator is not None and voice_sequences[b]:
+                                feat, f0 = _finalize_voice(voice_sequences[b], voice_f0_seq[b], voice_duration_seq[b])
+                                completed_voice[b].append(feat)
+                                if f0 is not None:
+                                    completed_voice_f0[b].append(f0)
+                            voice_sequences[b] = []
+                            voice_f0_seq[b] = []
+                            voice_duration_seq[b] = []
+                            voice_prelude_kv_caches[b] = None
+                            voice_prelude_position_offsets[b] = 0
+                            voice_coda_kv_caches[b] = None
+                            voice_coda_position_offsets[b] = 0
+                            last_voice_pred[b] = None
                         # Inject VOICE_PLACEHOLDER into text_prelude KV cache so
                         # EOV's causal attention in iter N+1 sees VPH between
                         # BOV and EOV (matching training [..., BOV, VPH, EOV]).
@@ -2058,7 +2162,10 @@ class MegaTransformerWorldModel(nn.Module):
             if not any_media:
                 if skip_shared_coda:
                     # Finalizing iter: emit forced EO* directly, no sampling.
-                    forced_ids = [forced_next_token[b] if forced_next_token[b] is not None else self._eos for b in range(batch_size)]
+                    forced_ids = [forced_next_token[b] if forced_next_token[b] is not None
+                                  else (forced_token_queue[b].pop(0) if forced_token_queue[b]
+                                        else self._eos)
+                                  for b in range(batch_size)]
                     next_token_ids = torch.tensor(forced_ids, device=device)
                     for b in range(batch_size):
                         generated_tokens[b].append(next_token_ids[b].item())
@@ -2072,6 +2179,11 @@ class MegaTransformerWorldModel(nn.Module):
                     for b in range(batch_size):
                         if forced_next_token[b] is not None:
                             sampled[b] = forced_next_token[b]
+                        elif forced_token_queue[b]:
+                            # Bistream TTS: the transcript is fed, not invented. (Under inner
+                            # monologue the queue stays empty and these positions are sampled,
+                            # which is the only difference between the two modes at decode.)
+                            sampled[b] = forced_token_queue[b].pop(0)
                     next_token_ids = sampled
                     for b in range(batch_size):
                         generated_tokens[b].append(next_token_ids[b].item())

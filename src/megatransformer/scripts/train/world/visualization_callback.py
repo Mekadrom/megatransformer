@@ -144,6 +144,25 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         prompt_tokens = self._cap_prompt_tokens(token_ids, suffix_tokens, max_new_tokens)
         return self._build_prompt_ids(prompt_tokens, device)
 
+    def _bistream_gen_kwargs(self, collator, full_token_ids, consumed, device) -> dict:
+        """generate() kwargs that let a BISTREAM checkpoint decode as one was trained.
+
+        Without these a bistream model stops at its first fill_token -- generate() reads a
+        fill with no further transcript as end-of-utterance -- so the render would be one
+        chunk (~30 frames) of a multi-chunk utterance and look like catastrophic
+        under-speaking. Empty dict when bistream is off, so the unistream path is untouched.
+        """
+        k = int(getattr(collator, "bistream_text_chunk", 0) or 0)
+        if k <= 0 or full_token_ids is None:
+            return {}
+        ids = full_token_ids.reshape(1, -1) if torch.is_tensor(full_token_ids) else \
+            torch.tensor([list(full_token_ids)], dtype=torch.long)
+        return {
+            "voice_bistream_text": ids.to(device),
+            "voice_bistream_text_chunk": k,
+            "voice_bistream_text_offset": int(consumed),
+        }
+
     def _ensure_tokenizer(self):
         """Lazy-load a tokenizer if none was provided."""
         if self.tokenizer is not None:
@@ -949,9 +968,17 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                     prompt_text = self._decode_tokens(sample["text_token_ids"])
                 decoded = self._decode_tokens(text_ids[:bov_pos + 1])
 
+                # The collated bistream sequence starts [text 0:k][BOV], so slicing at the
+                # FIRST BOV already yields the right prompt -- only the continuation has to
+                # be supplied. bov_pos is exactly how many transcript tokens it consumed.
+                _tl = sample.get("text_text_length")
+                _full = sample.get("text_token_ids")
+                if _full is not None and _tl is not None:
+                    _full = _full[:int(_tl)]
                 outputs = self._generate(model, 
                     text_input_ids=prompt, max_new_tokens=512, temperature=0.8,
                     voice_temperature=self.voice_temperature, voice_variance_floor=self.voice_variance_floor,
+                    **self._bistream_gen_kwargs(collator, _full, bov_pos, device),
                 )
 
                 # Log the generated text alongside the media so memorization
@@ -1423,7 +1450,18 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 continue
 
             max_new = 512
-            prompt = self._encode_static_prompt(str(prompt_text)[:500], [self._sp.BOV], max_new, device)
+            _k = int(getattr(collator, "bistream_text_chunk", 0) or 0)
+            _extra = {}
+            if _k > 0:
+                self._ensure_tokenizer()
+            if _k > 0 and self.tokenizer is not None:
+                # Bistream prompt is the FIRST CHUNK only; the rest is fed back as the model
+                # asks for it with fill_token.
+                _ids = self.tokenizer.encode(str(prompt_text)[:500], add_special_tokens=False)
+                prompt = self._build_prompt_ids(list(_ids[:_k]) + [self._sp.BOV], device)
+                _extra = self._bistream_gen_kwargs(collator, _ids, min(_k, len(_ids)), device)
+            else:
+                prompt = self._encode_static_prompt(str(prompt_text)[:500], [self._sp.BOV], max_new, device)
 
             outputs = self._generate(model, 
                 text_input_ids=prompt,
@@ -1431,6 +1469,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 temperature=0.8,
                 voice_temperature=self.voice_temperature,
                 voice_variance_floor=self.voice_variance_floor,
+                **_extra,
             )
 
             # Log generated voice if available
