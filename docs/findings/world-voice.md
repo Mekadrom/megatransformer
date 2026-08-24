@@ -328,20 +328,107 @@ zero-init and has to earn its contribution. Honest caveat: gradient descent has 
 features it built earlier, so if context is still the easier predictor once admitted, the
 crutch can reassert. Readout is `text_delta` at r=1.0 across the anneal.
 
-### Bistream chunk-interleaving — scoped, never tried
-CosyVoice 2 trains 50/50 on two layouts. Unistream is `[sos][all text][task_id][all speech]`,
-what we do. Bistream is `[sos][5 text][15 speech][5 text][15 speech]...[rest][task_id][rest]`
-with `mix_ratio=[5,15]`, where the 15th speech position predicts `fill_token` (6563) — a
-learned "send me more text" signal that forces the model to track text consumption.
+### Bistream + inner monologue — THE CURRENT PLAN (scoped 2026-08-24)
 
-Why it may matter: in unistream the text a given frame realizes can be hundreds of positions
-back, so alignment must be long-range and non-local. Bistream makes it adjacent and roughly
-monotonic — the inductive bias a duration model gives classical TTS, baked into the sequence
-layout instead of the architecture. It is a DATA-LAYOUT change, not an architecture change.
+**The layout.** CosyVoice 2 trains 50/50 on two layouts. Unistream is
+`[sos][all text][task_id][all speech]`, what we do today. Bistream is
+`[sos][5 text][15 speech][5 text][15 speech]...[remaining text][task_id][remaining speech]`,
+where the 15th speech position of each chunk targets `fill_token` — the model's learned way of
+saying "this text chunk is consumed, send the next."
 
-Costs: the collator/interleaver must emit chunk-alternating segments, the uninterleaver and
-KV-cache layout must follow, the text coda must still skip media positions, and **5:15 is
-calibrated to Qwen2 tokens against 25 Hz speech — recalibrate for SmolLM2's tokens/second.**
+**Why it should help.** In unistream the text a given frame realizes can be hundreds of
+positions back, so alignment is long-range, non-local, and example-dependent. Bistream makes
+the relevant text ADJACENT and the alignment roughly monotonic — the inductive bias a duration
+model gives classical TTS, baked into the sequence layout rather than the architecture. It is
+a DATA-LAYOUT change, not an architecture change.
+
+⚠️ **Recalibrate the ratio.** Theirs is 3 frames per text token (15/5), gated to samples with
+`speech_len/text_len > 3`. Our corpus is **5.9 frames/token** (n=6102: mean 6.015, median
+5.906, std 1.239, p5 4.19, p95 8.22). At 5:15 unchanged, text would be exhausted after ~3N
+frames of a 6N-frame utterance, so only the first HALF of each utterance would get local
+alignment. Roughly **5:30** matches our rate.
+
+**What it does and does not fix.** The fixed cadence still assumes a constant rate WITHIN an
+utterance, the same assumption a global or per-utterance M-RoPE rate makes. What differs is
+that it RE-ANCHORS every chunk, so drift is bounded to one chunk instead of accumulating.
+Bounded error, not eliminated error.
+
+### Inner monologue: how bistream extends to the full multimodal model
+**The problem** (raised by the owner, 2026-08-24): bistream gets you TTS, where a transcript
+exists to chunk. It does not obviously get you an instruct model that emits voice AT WILL —
+"say your previous message aloud" has no transcript to interleave, and the text that
+corresponds to the voice is not in the input.
+
+**The resolution: the model generates its own transcript, interleaved, and it is filtered from
+the output.** Precedent is Moshi's "Inner Monologue" — a text stream generated alongside the
+audio, with text LEADING the audio it describes; they report it substantially improves the
+linguistic quality of generated speech.
+
+⭐ **The key consequence: bistream TRAINING already trains this.** Training teacher-forces the
+text chunks either way. Only inference differs:
+- **TTS mode** — feed the real transcript's chunks.
+- **Speak-at-will mode** — let the model GENERATE each text chunk, then continue.
+Same weights, same layout, same run. The multimodal capability is a decoding mode, not a
+separate finetune.
+
+⚠️ **One change this REQUIRES, and it fails silently otherwise:** the text loss must NOT be
+masked on the interleaved text chunks. `--mask_text_loss_in_synthesis` zeroes text loss on
+synthesis examples, which is right when the transcript is pure conditioning but leaves the
+model unable to GENERATE it. Same shape as the duration-token exemption already in the
+codebase, and it needs the same explicit carve-out.
+
+**Why this is the right decomposition, beyond solving the no-transcript problem.** "Say my
+previous message aloud" needs long-range reasoning over the conversation, through an
+intervening user turn. That is a TEXT-space problem where a pretrained LM is strong. Rendering
+a decided chunk of text as speech is a LOCAL problem bounded to a few frames. The current
+architecture asks the trunk to do both at once across hundreds of positions, and the
+measurements say it does neither (text-attributed 0.029; cannot uniformly fit even 32
+memorized utterances). Inner monologue splits them: reason in text, render locally.
+
+⚠️ **Design detail worth copying rather than rediscovering:** text should LEAD the audio it
+describes, not sit adjacent to it. If text and audio are emitted at the same position, the
+model must commit to semantics and acoustics simultaneously, which loses most of the benefit.
+
+### This returns the voice path to AR, and the evidence supports that
+Bistream is autoregressive at the chunk level (chunk k+1 conditions on chunk k), and inner
+monologue requires AR text generation. That is a return to AR after the NAR detour, and it is
+what the measurements point to: at matched step 23000 AR beat NAR 2.2x on intelligibility
+(truncated LCS 0.1620 vs 0.0742) and ~10x on text attribution (0.305 vs 0.029), and the NAR
+premise — that removing the AR crutch would force text conditioning — was falsified twice
+(gen-query 2026-08-13, the mask-ratio curve 2026-08-21).
+
+Kept from the NAR work: the duration token (architecture-independent, one flag), the
+mask-ratio probe, the seed-floor discipline, and a clean negative result. Note the duration
+token's role SHRINKS under bistream — length emerges from the chunk cadence plus EOV — so it
+becomes optional rather than load-bearing.
+
+### Bistream implementation scope
+Smaller than feared: **the interleaver already supports multiple voice placeholders per
+example.** `voice_positions[batch_idx]` is a list and `ex_idx` enumerates it, indexing
+`batch_voice[ex_idx]` and `batch_voice_lens[ex_idx]` — so the `n` dimension of
+`voice_inputs` (B, n, C, T) IS the segment count. It has simply always been 1.
+
+Work required:
+1. **Collator** — emit `[BOV][k text][VOICE_PH][k text][VOICE_PH]...[EOV]` and split the voice
+   features into that `n` dimension with per-chunk lengths (B, n). This is the bulk of it.
+2. **Uninterleaver** — verify it handles n > 1; it should be symmetric with the interleaver
+   but has never been exercised that way.
+3. **Loss assembly** — voice targets are currently (B, T_total) against a coda output of
+   (B*n, chunk_T, V); the mapping back needs care.
+4. **Text-loss carve-out** for the interleaved text chunks (see inner monologue above).
+5. **generate()** — alternate k text tokens and one voice chunk, mirroring the training layout
+   exactly. KV-cache layout must follow.
+6. **M-RoPE** — the local axis resets per contiguous same-modality segment, so it re-anchors
+   every chunk automatically. Verify `build_mrope_position_ids` behaves sensibly with many
+   small segments.
+
+Simplification available for v1: with FIXED chunk sizes, `fill_token` is not strictly needed —
+inference can alternate deterministically. CosyVoice 2 needs it because their setting is
+streaming. Adding it later is what buys variable-rate chunking.
+
+Also copy the 50/50 unistream/bistream mix rather than going pure bistream: one model does
+both, and the unistream half is exactly what is trained today, which keeps the comparison
+clean.
 
 ### Is the crutch fixable, or is it a trunk property?
 If the r=1.0 run also flatlines, that is the same failure twice on the same trunk with
