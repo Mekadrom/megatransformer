@@ -188,3 +188,38 @@ def test_fill_id_required():
         assert "voice_fill_id" in str(e)
     else:
         raise AssertionError("expected a ValueError when fill id is missing")
+
+
+# --------------------------------------------------------------------------- text targets
+
+def test_bistream_text_targets_teach_the_handoffs():
+    """Under chunk interleaving the text targets must encode BOTH handoffs.
+
+    `_build_text_targets` strips placeholders from the full sequence and causal-shifts, so
+    for a bistream row the supervised transitions are:
+
+        last text token of chunk j  ->  BOV      "stop writing, start speaking"
+        EOV (end of a voice chunk)  ->  first text token of chunk j+1
+                                                 "that chunk is spoken, here is what's next"
+
+    The second one is the whole of inner monologue. It is derived from how the existing
+    stripping works rather than added for bistream, which is exactly why it deserves a test:
+    nothing would fail loudly if a future change broke it.
+    """
+    import torch as t
+    from megatransformer.scripts.train.world.training import _build_text_targets
+
+    PH, BOV, EOV = SP.VOICE_PLACEHOLDER, SP.BOV, SP.EOV
+    # [10 11 12][BOV][PH][EOV][13 14 15][BOV][PH][EOV][eos]
+    row = [10, 11, 12, BOV, PH, EOV, 13, 14, 15, BOV, PH, EOV, 2]
+    full = t.tensor([row])
+    non_ph_full = full != PH
+    valid_full = t.ones_like(full, dtype=t.bool)
+    inp = full[:, :-1]
+    non_ph_inp = inp != PH
+
+    tg = _build_text_targets(full, non_ph_full, valid_full, non_ph_inp)[0].tolist()
+    # clean sequence: [10 11 12 BOV EOV 13 14 15 BOV EOV eos], shifted by one
+    assert tg[:10] == [11, 12, BOV, EOV, 13, 14, 15, BOV, EOV, 2]
+    assert tg[2] == BOV, "the last text token of a chunk predicts BOV"
+    assert tg[4] == 13, "EOV predicts the next chunk's first text token"

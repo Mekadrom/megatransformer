@@ -635,7 +635,14 @@ class WorldModelTrainer(CommonTrainer):
         # targets are never built -- and the NAR duration token lives in the TEXT stream, so
         # it would receive no gradient at all. Caught by a smoke run: nar_mask_frac logged
         # correctly while voice_duration_acc never appeared, i.e. the head was silently dead.
-        if text_input_ids is not None and (self.include_text or self.emit_duration_token):
+        #
+        # `or self.bistream_text_loss`: the SAME trap, hit again on 2026-08-24. The bistream
+        # text exemption in compute_loss was correct and completely inert, because targets
+        # were never built for it to un-mask -- train/text_loss_norm simply never appeared
+        # while every other metric looked healthy. Any future flag that supervises the TEXT
+        # stream from a voice-only run has to be added here too.
+        if text_input_ids is not None and (self.include_text or self.emit_duration_token
+                                           or self.bistream_text_loss):
             placeholder_ids = {self._sp.AUDIO_PLACEHOLDER, self._sp.VOICE_PLACEHOLDER, self._sp.IMAGE_PLACEHOLDER}
 
             # The model sees text_input_ids[:, :-1] as input (standard causal shift).
