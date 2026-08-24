@@ -204,6 +204,7 @@ class TokenInterleaver(nn.Module):
         voice_hidden_states: Optional[torch.Tensor] = None,
         voice_lengths: Optional[torch.Tensor] = None,
         image_hidden_states: Optional[torch.Tensor] = None,
+        voice_chunk_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Interleave text and media token embeddings into a single sequence.
@@ -223,6 +224,14 @@ class TokenInterleaver(nn.Module):
             voice_lengths: Actual lengths of each voice example, shape (batch_size, n_voice_examples)
             image_hidden_states: Image patch embeddings, shape (batch_size, n_image_examples, n_patches, d_model)
                 Images are fixed size, so no lengths parameter is needed.
+            voice_chunk_map: Optional (batch_size, n_placeholders, 3) long tensor mapping the
+                i-th VOICE placeholder to (utt_idx, start, length) -- a SLICE of an
+                utterance rather than the whole of it. This is what lets one utterance be
+                spread over several placeholders (bistream chunk interleaving) without
+                overloading the `n_voice_examples` axis, which means DISJOINT UTTERANCES and
+                is what the M-RoPE global axis exists to keep separable. Rows with length 0
+                are padding. When None, placeholder i maps to (i, 0, voice_lengths[i]),
+                which is exactly the historical behaviour.
 
         Returns:
             Tuple of:
@@ -272,10 +281,17 @@ class TokenInterleaver(nn.Module):
                 assert found == expected, \
                     f"Batch {batch_idx}: found {found} audio placeholders but have {expected} audio examples"
             if voice_hidden_states is not None:
-                expected = voice_hidden_states.shape[1]
-                found = len(voice_positions[batch_idx])
-                assert found == expected, \
-                    f"Batch {batch_idx}: found {found} voice placeholders but have {expected} voice examples"
+                if voice_chunk_map is not None:
+                    expected = int((voice_chunk_map[batch_idx, :, 2] > 0).sum())
+                    found = len(voice_positions[batch_idx])
+                    assert found == expected, \
+                        f"Batch {batch_idx}: found {found} voice placeholders but the chunk map " \
+                        f"has {expected} chunks"
+                else:
+                    expected = voice_hidden_states.shape[1]
+                    found = len(voice_positions[batch_idx])
+                    assert found == expected, \
+                        f"Batch {batch_idx}: found {found} voice placeholders but have {expected} voice examples"
             if image_hidden_states is not None:
                 expected = image_hidden_states.shape[1]
                 found = len(image_positions[batch_idx])
@@ -346,8 +362,12 @@ class TokenInterleaver(nn.Module):
                         torch.full((length,), MODALITY_AUDIO, dtype=torch.long, device=device)
                     )
                 elif modality == "voice":
-                    length = batch_voice_lens[ex_idx].item()
-                    media_chunk = batch_voice[ex_idx, :length]  # (length, d_model)
+                    if voice_chunk_map is not None:
+                        utt, start, length = (int(v) for v in voice_chunk_map[batch_idx, ex_idx])
+                        media_chunk = batch_voice[utt, start:start + length]
+                    else:
+                        length = batch_voice_lens[ex_idx].item()
+                        media_chunk = batch_voice[ex_idx, :length]  # (length, d_model)
                     tokens_to_concat.append(media_chunk)
                     modalities_to_concat.append(
                         torch.full((length,), MODALITY_VOICE, dtype=torch.long, device=device)

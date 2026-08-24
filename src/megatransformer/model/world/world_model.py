@@ -508,6 +508,11 @@ class MegaTransformerWorldModel(nn.Module):
         voice_inputs: Optional[torch.Tensor] = None,
         voice_lengths: Optional[torch.Tensor] = None,
         voice_latent_labels: Optional[torch.Tensor] = None,
+        # BISTREAM: (B, n_placeholders, 3) long, mapping the i-th VOICE placeholder to
+        # (utt_idx, start, length) -- a SLICE of an utterance, so one utterance can be spread
+        # over several placeholders interleaved with its transcript. None => placeholder i is
+        # the whole of utterance i, the historical layout.
+        voice_chunk_map: Optional[torch.Tensor] = None,
         # Image inputs
         image_inputs: Optional[torch.Tensor] = None,
         image_latent_labels: Optional[torch.Tensor] = None,
@@ -584,6 +589,7 @@ class MegaTransformerWorldModel(nn.Module):
                 voice_inputs = None
                 voice_lengths = None
                 voice_latent_labels = None
+                voice_chunk_map = None      # a map without its voice is a stale index
             if audio_inputs is not None and audio_inputs.shape[0] != B:
                 audio_inputs = None
                 audio_lengths = None
@@ -775,6 +781,7 @@ class MegaTransformerWorldModel(nn.Module):
             voice_hidden_states=voice_hidden_states,
             voice_lengths=voice_lengths,
             image_hidden_states=image_hidden_states,
+            voice_chunk_map=voice_chunk_map,
         )
 
         # Scale embeddings by sqrt(d_model) to match thought state initialization
