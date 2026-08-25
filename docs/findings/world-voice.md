@@ -421,6 +421,36 @@ Fixed to score the FIRST utterance and to report disjoint-utterance counts; the 
 figures are largely within-block and so probably survive, but **the length statistics above
 are void pending the re-run**.
 
+### ⭐⭐⭐ INTELLIGIBLE SPEECH: LCS recall 0.62 vs 0.89 ceiling at 28k (2026-08-25)
+`ar_flat_lr_1/checkpoint-28000`, n=64, temperature 0.6, Whisper via `cosyvoice_wer_eval.py`:
+
+| metric | plain | RAS win=10 | ceiling |
+|---|---|---|---|
+| LCS recall | 0.5438 | **0.6205** | 0.8943 |
+| WER | 0.5181 | 0.4826 | 0.1049 |
+| CER | 0.3718 | 0.3202 | 0.0416 |
+| hyp/ref word ratio | 0.9783 | 1.0731 | 1.0022 |
+| — truncated LCS | 0.4817 | 0.5782 | 0.8943 |
+
+**60.8% of ceiling plain, 69.4% with RAS.** For scale, the previous best AR arm was truncated
+LCS **0.1620** @23k — this is a **3.0-3.6x improvement**, and the first time this direction has
+produced speech that is substantially intelligible rather than "correct onset then drift".
+
+`hyp/ref` 0.978 plain says the LENGTH is right, matching the text->duration correlation
+(r +0.86-0.92 vs GT 0.96). So the model says about the right amount, in about the right
+places, with about 60% of the reference words recoverable.
+
+**What the RAS A/B actually answered.** The prediction was binary — sharp WER drop = units
+right / drift masking them, versus no drop = units wrong. The answer is BOTH, and the middle
+case is the informative one: RAS buys **+0.077 LCS recall** (4x the 0.018 decode range at
+n=64, so real), but plain is already at 0.544. **Repetition is a moderate tax, not the wall.**
+The remaining 0.27 gap to ceiling is neither repetition nor termination — it is genuine
+content error, and no decode-side trick will recover it.
+
+Protocol: single seed, n=64. Decode floor is std 0.0089 / range 0.018, so the absolute numbers
+carry ~±0.02 and the RAS delta is solid. Re-measure with >=3 seeds before quoting these as
+final.
+
 ### ⭐ `--unmask_eos_in_synthesis` ELIMINATES the extra-utterance failure (2026-08-24)
 THE one-flag comparison: `ar_flat_lr_0` vs `ar_flat_lr_1` at **checkpoint-11076**, identical
 LR/schedule/seed/data, n=512 teacher-forced + gen_n=32 free-running, eval-time ban OFF in both.
@@ -441,6 +471,41 @@ LR/schedule/seed/data, n=512 teacher-forced + gen_n=32 free-running, eval-time b
 **0 of 32 prompts produced a second utterance**, against 29 of 32 without the flag. All three
 predictions recorded in advance held: utterances → 1.0, conditioning untouched, repetition
 untouched. Supervising ONE token at ONE position removed the failure completely.
+
+### Repetition, conditioning and onset ALL plateau together ~14-18k (2026-08-25)
+Trend across `ar_flat_lr_1`, 7 epoch-boundary checkpoints, n=512 TF + gen_n=64:
+
+| step | EOV | adj_repeat | entropy | bigram | early_text_delta | acc_real | attributed | 1-32 | 128+ |
+|---|---|---|---|---|---|---|---|---|---|
+| 3692 | 20/64 | 0.429 | 7.01 | 0.421 | +0.0376 | 0.0797 | 0.165 | 0.134 | 0.526 |
+| 7384 | 25/64 | 0.371 | 7.90 | 0.518 | +0.0564 | 0.0976 | 0.373 | 0.112 | 0.475 |
+| 11076 | 21/64 | 0.292 | 8.64 | 0.607 | +0.0605 | 0.1074 | 0.439 | 0.092 | 0.330 |
+| 14768 | 22/64 | 0.303 | 8.57 | 0.602 | +0.0586 | **0.1118** | 0.485 | 0.067 | 0.406 |
+| 18460 | 17/64 | 0.236 | 9.18 | 0.672 | +0.0581 | 0.1104 | 0.519 | 0.065 | 0.296 |
+| 22152 | 31/64 | 0.234 | 9.18 | 0.673 | +0.0591 | 0.1071 | 0.534 | 0.063 | 0.316 |
+| 25844 | 28/64 | 0.236 | 9.02 | 0.663 | +0.0588 | 0.1019 | 0.547 | 0.064 | 0.330 |
+| GT | — | 0.038 | 10.51 | 0.958 | — | — | — | 0.030 | 0.030 |
+
+⚠️ **The rising "text-attributed" column is an ARTIFACT past 14768.** `early_text_delta` is
+FLAT at ~+0.0585 from 11076 on, while `acc_real` PEAKS at 0.1118 (14768) and then declines to
+0.1019. Attribution is delta/acc_real, so 0.485 -> 0.547 is a shrinking denominator. **Do not
+quote 0.547 as "past the teacher's 0.463".** Report `early_text_delta` and `acc_real`
+separately.
+
+Three things plateau together around 14-18k: repetition (0.234-0.236, flat), onset repetition
+(0.063-0.065, flat, ~2x GT), and conditioning (+0.0585, flat) — while `acc_real` DECLINES and
+training loss keeps falling. That co-plateau plus a falling accuracy is the first concrete
+evidence for the **constant-LR concern**: 1e-4 held forever with no decay, past the point of
+usefulness. An LR decay / WSD tail from ~18k is the obvious untested lever.
+
+**Position-resolved repetition is RISING with position at every checkpoint** (0.064 at frames
+1-32 vs 0.330 at 128+, against a flat GT ~0.030), which is the signature of self-conditioning
+drift / exposure bias, NOT "repetitive from the start". That rules IN scheduled sampling and
+on-policy distillation (both built, both unused) and rules OUT conditioning/decoder causes.
+
+**EOV never improves** — 17-31/64 across the whole span, no trend, while repetition halves.
+That kills the earlier hypothesis that looping is what prevents termination; they are
+independent.
 
 ### The free-running metrics have a large noise floor at gen_n=32 (2026-08-24)
 `ar_flat_lr_0/checkpoint-11076` was run through section 3 TWICE the same day, identical

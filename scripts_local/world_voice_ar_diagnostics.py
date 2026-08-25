@@ -339,10 +339,29 @@ def seq_degeneration(seqs, K):
             bi.add((s[t - 1], s[t])); n_bi += 1
         for t in range(2, len(s)):
             tri.add((s[t - 2], s[t - 1], s[t])); n_tri += 1
+    # POSITION-RESOLVED REPETITION. adj_repeat pooled over a whole utterance cannot tell
+    # "repetitive from the first frame" (a conditioning/decoder failure) from "drifts into a
+    # loop" (self-conditioning, an exposure-bias failure). Those want different fixes, so
+    # bucket the adjacent-repeat rate by position. GT is measured the same way, so the
+    # comparison is like-for-like rather than against a single pooled number.
+    RB = [(1, 32), (32, 64), (64, 128), (128, 10 ** 9)]
+    pos_rep = {b: [0, 0] for b in RB}
+    for s in seqs:
+        for t in range(1, len(s)):
+            for b in RB:
+                if b[0] <= t < b[1]:
+                    pos_rep[b][1] += 1
+                    if s[t] == s[t - 1]:
+                        pos_rep[b][0] += 1
+                    break
     total = sum(uni.values())
     probs = [c / total for c in uni.values()]
     ent = -sum(p * math.log2(p) for p in probs)
     return {
+        "adj_repeat_by_pos": {f"{a}-{'+' if b > 10**8 else b}": (r / n if n else float('nan'))
+                              for (a, b), (r, n) in pos_rep.items()},
+        "adj_repeat_by_pos_n": {f"{a}-{'+' if b > 10**8 else b}": n
+                                for (a, b), (r, n) in pos_rep.items()},
         "n_seqs": len(seqs),
         "len_mean": sum(lens) / len(lens), "len_min": min(lens), "len_max": max(lens),
         "adj_repeat_rate": rep / max(tot_pairs, 1),
@@ -699,6 +718,17 @@ def main():
         rs = f"{r:.4f}" if isinstance(r, float) else str(r)
         lines.append(f"| {k} | {gs} | {rs} |")
     lines.append(f"\nmax unit entropy = {gen_deg.get('max_entropy_bits', 0):.2f} bits (log2 K).")
+    _gp = gen_deg.get("adj_repeat_by_pos") or {}
+    _tp = gt_deg.get("adj_repeat_by_pos") or {}
+    if _gp:
+        lines.append("\n**Adjacent-repeat by POSITION** — flat = repetitive from the start "
+                     "(conditioning/decoder); rising = drifts into a loop (self-conditioning, "
+                     "exposure bias). These want different fixes.\n")
+        lines.append("| frames | n pairs | generated | ground-truth |\n|---|---|---|---|")
+        for k in _gp:
+            _n = (gen_deg.get("adj_repeat_by_pos_n") or {}).get(k, 0)
+            lines.append(f"| {k} | {_n} | {_gp[k]:.4f} | {_tp.get(k, float('nan')):.4f} |")
+        lines.append("")
     lines.append("Degeneration flags: adj_repeat_rate >> GT, longest_run large, low coverage,")
     lines.append("entropy << GT, or distinct-bigram ratio << GT all indicate collapse/looping.\n")
 
