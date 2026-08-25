@@ -421,6 +421,38 @@ Fixed to score the FIRST utterance and to report disjoint-utterance counts; the 
 figures are largely within-block and so probably survive, but **the length statistics above
 are void pending the re-run**.
 
+### The EOS exemption is ORTHOGONAL to voice conditioning — matched-step null (2026-08-24)
+`ar_flat_lr_0` vs `ar_flat_lr_1` at **checkpoint-5538**, one flag apart, teacher-forced,
+held-out n=512:
+
+| metric | `_0` (no EOS loss) | `_1` (`--unmask_eos_in_synthesis`) | Δ |
+|---|---|---|---|
+| acc_real | 0.0918 | 0.0921 | +0.0003 |
+| text_delta (all-pos) | +0.0288 [+0.0269,+0.0307] | +0.0290 [+0.0269,+0.0310] | +0.0002 |
+| early_text_delta | +0.0430 [+0.0352,+0.0510] | +0.0442 [+0.0359,+0.0525] | +0.0012 |
+| text-attributed | 0.313 | 0.315 | +0.002 |
+
+Every difference is an order of magnitude inside its own CI. **The exemption supervises the
+TEXT head's stop position and leaves the VOICE head's dependence on the transcript untouched**,
+which is what it was supposed to do — and it means an EOS-flag run can be compared to a
+non-EOS run on conditioning metrics without adjustment.
+
+This was run as a PASS/FAIL on the flag, not to find an effect: a difference here would have
+meant the added text loss was perturbing the shared trunk, which had to be known before
+attributing anything at 11076.
+
+**Answers "is 5538 too early to measure early_text_delta?" — no.** The probe is teacher-forced,
+so free-running immaturity (1-unit renders, budget-capped blocks) does not touch it, and at
+n=512 the CI is ±0.008. Conditioning trajectory for `_0`, both post-M-RoPE-fix and clean:
+
+| step | early_text_delta | text-attributed |
+|---|---|---|
+| 5538 | +0.0430 | 0.313 |
+| 11076 | +0.0640 | 0.450 |
+
+Roughly +0.02 early-delta per 5.5k steps at this stage, against a teacher ceiling of +0.0538
+(already passed at 11076) and 0.463 attributed.
+
 ### `--unmask_eos_in_synthesis` works, and shows no harm at matched step (2026-08-24)
 `ar_flat_lr_1`, step 1846, **with the eval-time ban OFF** (`--no_viz_suppress_media_tokens`):
 **zero `utt1+` tags across all 8 prompts** — every prompt produced exactly ONE utterance. The
