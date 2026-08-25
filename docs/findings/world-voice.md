@@ -463,6 +463,30 @@ data grounds alone. A WSD/cosine decay tail from ~12k distinguishes them cheaply
 minimum moves later and lower, it was the schedule; if the U simply repeats at the same place,
 it is data and LibriHeavy/MLS is the answer.
 
+### ⭐⭐⭐ PERCEPTUAL ANCHOR: what LCS 0.62 / CER 0.32 actually SOUNDS like (2026-08-25)
+Owner, on `ar_flat_lr_1` at ~28-30k: **"the first time I can hear words all the way through
+output examples, even if some of the sounds aren't quite right."**
+
+Record this, because the project has accumulated metrics with no perceptual reference and the
+mapping is what makes them usable:
+
+| measurement | perceptual counterpart |
+|---|---|
+| LCS recall 0.62 (ceiling 0.89) | words are recoverable throughout |
+| hyp/ref 0.978 | speech runs the FULL length — no truncation, no drift into silence |
+| CER 0.32 vs WER 0.48 | phonemes roughly right, words imperfect = "sounds aren't quite right" |
+| position text_delta never < 0.01 | conditioning holds to the END of the utterance |
+
+CER well below WER is the signature of the described failure: the articulation is
+approximately correct and the word identities are not quite landing. Contrast the entire prior
+history of this direction — "correct onset that falls off quickly", "coherent bursts unrelated
+to the prompt", "text horizon 3-5 words" — which is what LCS ~0.16 sounded like.
+
+**The position-resolved horizon PREDICTED this.** At 11076 the metric first showed text_delta
+never decaying below 0.01 across all position buckets, where earlier runs decayed within a few
+words. The ear confirmed the same change independently. That is a validated leading indicator:
+watch the horizon buckets, not just `early_text_delta`.
+
 ### ⭐⭐⭐ INTELLIGIBLE SPEECH: LCS recall 0.62 vs 0.89 ceiling at 28k (2026-08-25)
 `ar_flat_lr_1/checkpoint-28000`, n=64, temperature 0.6, Whisper via `cosyvoice_wer_eval.py`:
 
