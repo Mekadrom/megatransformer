@@ -54,8 +54,10 @@ ap.add_argument("--nar_reveal", type=str, default="confidence",
                 choices=["confidence", "sequential", "random"],
                 help="Which positions to commit each round. 'confidence' is MaskGIT's and "
                      "assumes confidence tracks correctness; here it tracks repetition.")
-ap.add_argument("--nar_seed", type=int, default=None,
-                help="Seed the RNG before generation. Decoding is stochastic, so two runs of the "
+ap.add_argument("--seed", "--nar_seed", dest="nar_seed", type=int, default=None,
+                help="Seed the RNG before generation. NOT NAR-specific despite the legacy "
+                     "--nar_seed spelling: it seeds the global torch RNG after the decoder "
+                     "loads, so it governs AR sampling too. Decoding is stochastic, so two runs of the "
                      "SAME config differ -- and the paired bootstrap over utterances does NOT "
                      "capture that, because it treats each run's generations as fixed. Run one "
                      "config at several seeds to get the run-to-run floor before believing any "

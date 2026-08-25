@@ -421,6 +421,35 @@ Fixed to score the FIRST utterance and to report disjoint-utterance counts; the 
 figures are largely within-block and so probably survive, but **the length statistics above
 are void pending the re-run**.
 
+### ⭐⭐ `ar_flat_lr_1` OVERFITS: eval loss is a clean U with its minimum at 14768 (2026-08-25)
+Owner observation, confirmed. `eval/voice_synthesis/voice_unit_ce_loss_norm`:
+
+| step | 1846 | 5538 | 9230 | **14768** | 18460 | 22152 | 25844 | 29536 |
+|---|---|---|---|---|---|---|---|---|
+| eval CE | 0.664 | 0.570 | 0.534 | **0.5143** | 0.522 | 0.539 | 0.565 | 0.595 |
+| eval acc | 0.0696 | 0.0947 | 0.1066 | **0.1127** | 0.1101 | 0.1065 | 0.1017 | 0.0980 |
+
+Minimum eval CE and peak eval accuracy BOTH land at 14768 (epoch 8), then reverse
+monotonically — eval CE +16% and accuracy −13% by 29536 — while train CE keeps falling
+(1.032 → ~0.29-0.43 at 30400). Falling train, rising eval, widening gap: **memorization**.
+
+This is the same 14768 inflection the trend table found independently via `acc_real`
+(0.1118 peak → 0.1019), and it retro-explains the "conditioning plateau" — conditioning did
+not plateau, the model passed its optimum and started regressing.
+
+⚠️ **CONSEQUENCE FOR THE INTELLIGIBILITY RESULT: it was measured at 28000, ~13k steps PAST
+the eval optimum.** LCS 0.62 may understate this run. It is NOT safe to assume 14768 is
+better, because teacher-forced eval and free-running degeneration DIVERGE here — the trend
+shows 25844 beating 14768 on every degeneration metric (adj_repeat 0.236 vs 0.303, entropy
+9.02 vs 8.57, bigram 0.663 vs 0.602) while its eval CE is much worse. Which checkpoint
+actually renders best is an open, cheap, and unmeasured question.
+
+**LR vs data is not yet settled.** Constant 1e-4 with no decay is the obvious suspect (this
+run anneals never), but 16 epochs over 118k utterances with a ~168M model could overfit on
+data grounds alone. A WSD/cosine decay tail from ~12k distinguishes them cheaply: if the eval
+minimum moves later and lower, it was the schedule; if the U simply repeats at the same place,
+it is data and LibriHeavy/MLS is the answer.
+
 ### ⭐⭐⭐ INTELLIGIBLE SPEECH: LCS recall 0.62 vs 0.89 ceiling at 28k (2026-08-25)
 `ar_flat_lr_1/checkpoint-28000`, n=64, temperature 0.6, Whisper via `cosyvoice_wer_eval.py`:
 
