@@ -421,6 +421,68 @@ Fixed to score the FIRST utterance and to report disjoint-utterance counts; the 
 figures are largely within-block and so probably survive, but **the length statistics above
 are void pending the re-run**.
 
+### ⭐ `--unmask_eos_in_synthesis` ELIMINATES the extra-utterance failure (2026-08-24)
+THE one-flag comparison: `ar_flat_lr_0` vs `ar_flat_lr_1` at **checkpoint-11076**, identical
+LR/schedule/seed/data, n=512 teacher-forced + gen_n=32 free-running, eval-time ban OFF in both.
+
+| metric | `_0` (no EOS loss) | `_1` (EOS loss) | verdict |
+|---|---|---|---|
+| **disjoint utterances / prompt** | **2.16 (29/32 >1, max 4)** | **1.00 (0/32 >1, max 1)** | **ELIMINATED** |
+| acc_real | 0.1083 | 0.1077 | unchanged |
+| early_text_delta | +0.0581 [+0.0491,+0.0674] | +0.0588 [+0.0500,+0.0679] | unchanged |
+| text-attributed | 0.454 | 0.438 | unchanged |
+| len_mean (first utt) | 211.1 | 193.3 | within noise |
+| adj_repeat_rate | 0.3486 | 0.3712 | **unchanged** (GT 0.0306) |
+| longest_run | 92 | 98 | unchanged (GT 16) |
+| unit_entropy_bits | 7.95 | 7.73 | unchanged (GT 10.51) |
+| distinct_bigram_ratio | 0.595 | 0.579 | unchanged (GT 0.958) |
+| EOV fired | 9/32 | 11/32 | unchanged |
+
+**0 of 32 prompts produced a second utterance**, against 29 of 32 without the flag. All three
+predictions recorded in advance held: utterances → 1.0, conditioning untouched, repetition
+untouched. Supervising ONE token at ONE position removed the failure completely.
+
+### The free-running metrics have a large noise floor at gen_n=32 (2026-08-24)
+`ar_flat_lr_0/checkpoint-11076` was run through section 3 TWICE the same day, identical
+weights, different RNG:
+
+| metric | run A | run B | spread |
+|---|---|---|---|
+| adj_repeat_rate | 0.2645 | 0.3486 | **0.084** |
+| longest_run | 124 | 92 | 32 |
+| EOV fired | 12/32 | 9/32 | 3 |
+| utterances / prompt | 2.03 | 2.16 | 0.13 |
+| len_mean | 196.3 | 211.1 | 15 |
+
+**A repetition difference under ~0.08 at gen_n=32 means NOTHING.** This is the degeneration
+analogue of the documented LCS decode floor (std 0.0089, range 0.018 at n=64). The
+arm_0-vs-arm_1 repetition delta (+0.023) sits well inside it, which is what licenses calling
+it "unchanged" rather than "slightly worse". Raise gen_n or repeat-and-average before claiming
+any repetition result.
+
+(The teacher-forced numbers in run A are NOT a noise estimate — it used `--n 64` against run
+B's `--n 512`, visible in the CI widths [+0.0215,+0.0820] vs [+0.0491,+0.0674].)
+
+### ⭐ THE WALL IS NOW REPETITION (2026-08-24)
+With termination fixed, what remains at 11076 is unambiguous and large:
+
+| | generated | GT | ratio |
+|---|---|---|---|
+| adj_repeat_rate | 0.3712 | 0.0306 | **12x** |
+| longest_run | 98 | 16 | 6x |
+| unit_entropy_bits | 7.73 | 10.51 | −2.8 bits |
+| distinct_bigram_ratio | 0.579 | 0.958 | |
+| coverage | 0.234 | 0.339 | |
+
+And it explains the residual length failure: **21 of 32 generations hit the 250-frame budget**
+rather than emitting EOV. The model falls into a loop and never reaches a natural end. So
+repetition is likely the ROOT cause of the remaining over-length, not a separate problem —
+which also means "fix termination" is not the next lever; "fix repetition" is.
+
+Teacher-forced conditioning is meanwhile essentially at the teacher: early_text_delta +0.0588
+vs +0.0538, text-attributed 0.438 vs 0.463, text→duration r +0.856-0.922 vs 0.960. **The model
+knows what to say and how long to say it, and cannot stop repeating while saying it.**
+
 ### The EOS exemption is ORTHOGONAL to voice conditioning — matched-step null (2026-08-24)
 `ar_flat_lr_0` vs `ar_flat_lr_1` at **checkpoint-5538**, one flag apart, teacher-forced,
 held-out n=512:
