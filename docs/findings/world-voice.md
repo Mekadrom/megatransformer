@@ -437,6 +437,19 @@ This is the same 14768 inflection the trend table found independently via `acc_r
 (0.1118 peak → 0.1019), and it retro-explains the "conditioning plateau" — conditioning did
 not plateau, the model passed its optimum and started regressing.
 
+⭐ **THE EAR DISAGREES WITH EVAL CE, AND THE EAR IS THE ARBITER.** Owner, 2026-08-25, on the
+LATEST checkpoints (~28-30k, i.e. deep into the eval-loss rebound): *"the latest outputs are
+the best TTS we've gotten ever."* So the U-shaped eval curve does NOT mean the model is
+getting worse at the task anyone cares about. It is consistent with the degeneration trend,
+where 25844 beats 14768 on every free-running metric while its eval CE is far worse.
+
+Two things are moving in opposite directions and they are not the same thing:
+- **teacher-forced next-unit CE** peaks at 14768 and then regresses (memorization);
+- **free-running speech quality** keeps improving well past it.
+
+Do NOT select checkpoints on eval CE for this direction. A model that memorizes the training
+distribution can still free-run better, and free-running is the product.
+
 ⚠️ **CONSEQUENCE FOR THE INTELLIGIBILITY RESULT: it was measured at 28000, ~13k steps PAST
 the eval optimum.** LCS 0.62 may understate this run. It is NOT safe to assume 14768 is
 better, because teacher-forced eval and free-running degeneration DIVERGE here — the trend
