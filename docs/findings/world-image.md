@@ -4,11 +4,15 @@ Image synthesis from the recurrent trunk into a frozen diffusion decoder (Z-Imag
 a trainable conditioning adapter.
 
 📁 **RUN PATHS MOVED 2026-08-26.** Runs now live in `runs/world_image/` (split out from
-`runs/world/`, which mixed image and voice), and the redundant `world_image_` prefix was stripped
-from every directory: `runs/world/world_image_zimage_qwen_X` -> `runs/world_image/zimage_qwen_X`.
-**Entries below still use the OLD full run names** — they are the names the measurements were
-recorded under and the ones the git log quotes, so they were deliberately left alone rather than
-rewritten. Map by dropping `world_image_`.
+the old `runs/world/`, which mixed image and voice), and the redundant `world_image_` prefix was
+stripped from every directory. Run names in this file have been UPDATED to match, matching how
+`world-voice.md` records its own move:
+
+    old: runs/world/world_image_zimage_qwen_<name>
+    new: runs/world_image/zimage_qwen_<name>
+
+⚠️ Commit messages and older memory entries still quote the OLD names, so when cross-referencing
+git history, add `world_image_` back.
 
 ⚠️ The **ESTABLISHED (owner-reported)** section below was reported in conversation by the
 project owner during the 2026-08-21 world-voice session. Those numbers come from the WARM-START
@@ -106,7 +110,7 @@ simply what "right subject, wrong details" SCORES on CLIPScore, not a capacity w
 
 # world-image session, 2026-08-21
 
-Measured on the two live from-scratch runs (`world_image_zimage_qwen_t3_xskip_0` and
+Measured on the two from-scratch runs (`zimage_qwen_t3_xskip_0` and
 `..._t3_xskip_trunkctx_0`, identical but for `flow_ctx`), not the warm-start lineage above.
 
 ## ESTABLISHED
