@@ -22,7 +22,7 @@ is a unique index (30/32 distinct exact frame lengths; the one 173-frame collisi
 text length; all 32 the same speaker), so a shuffled arm memorizes by keying on the layout and
 reports "text is decorative" whether or not that is true.
 
-The question was answered instead on the finished `world_tts_memorize32_0/checkpoint-20000`, by
+The question was answered instead on the finished `memorize32_0/checkpoint-20000`, by
 ablating the transcript at the sample level with the layout key held fixed
 (`scripts_local/memorization_text_dependence.py`):
 
@@ -197,7 +197,7 @@ at `bistream_prob 0.5` with generation, one at 1.0) complete with finite grad no
 falling, and `train/text_loss_norm` non-zero on chunked rows once the `include_text` gate was
 fixed.
 
-⚠️ **Stage 5 needs a MATCHED control, and `world_tts_memorize32_0` is not one** — it is NAR
+⚠️ **Stage 5 needs a MATCHED control, and `memorize32_0` is not one** — it is NAR
 at mask ratio 1.0 with the duration token. Run a unistream **AR** arm and a bistream AR arm
 that differ only in the bistream flags, and compare steps-to-memorize. Keep
 `--bistream_text_loss` OFF for both: the sanity test is about ALIGNMENT, and fill_token is

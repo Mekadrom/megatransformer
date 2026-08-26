@@ -11,7 +11,7 @@ for the SMG, falling back to each utterance's own embedding. Voice sampling is d
 stochastic intelligibility.
 
   python -m megatransformer.scripts.eval.world.tts_intelligibility \
-    --checkpoint_path runs/world/world_tts_sive_0/checkpoint-N --config small_sum --include_modes text,voice --tie_word_embeddings --bf16 \
+    --checkpoint_path runs/world_voice/sive_0/checkpoint-N --config small_sum --include_modes text,voice --tie_word_embeddings --bf16 \
     --voice_cache_dir ../cached_datasets/world_voice_libritts_val \
     --voice_smg_checkpoint_path <SMG_CKPT> --voice_smg_config medium_decoder_only_1d_3x --voice_smg_sive_encoder_dim 256 \
     --vocoder_config hifigan --static_speaker_embedding_path saved_embeddings/real_spk93.pt \

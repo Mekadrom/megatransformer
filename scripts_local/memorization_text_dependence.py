@@ -1,6 +1,6 @@
 """Did the memorization run actually READ the transcript, or key on the sequence layout?
 
-`world_tts_memorize32_0` reaches train unit-accuracy 1.0 by ~step 1400 on 32 utterances at
+`memorize32_0` reaches train unit-accuracy 1.0 by ~step 1400 on 32 utterances at
 mask-ratio 1.0 (no voice context at all -- every unit predicted from text + duration alone).
 That looks like proof the text is being read. It is not, because of a confound:
 
@@ -38,7 +38,7 @@ Reading it:
 
 Usage:
   python scripts_local/memorization_text_dependence.py \
-      --checkpoint_path runs/world/world_tts_memorize32_0/checkpoint-20000 --step 20000 \
+      --checkpoint_path runs/world_voice/memorize32_0/checkpoint-20000 --step 20000 \
       --cache_dir ./cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2 \
       --codebook .../cosyvoice2_codebook.pt --config small_sum \
       --text_encoder_model HuggingFaceTB/SmolLM2-135M --voice_max_frames 250 \

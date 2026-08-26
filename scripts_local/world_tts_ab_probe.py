@@ -32,9 +32,9 @@ CACHE = "cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2"
 CODEBOOK = f"{CACHE}/val/cosyvoice2_codebook.pt"
 ARMS = {
     # name: (run_dir, curriculum settings as LAUNCHED; None = no curriculum, always alpha=1)
-    "curric":   ("runs/world/world_tts_cosyvoice2_smollm2_0",
+    "curric":   ("runs/world_voice/cosyvoice2_smollm2_0",
                  {"mask": 10000, "ramp": 20000, "floor": 0.0, "cap": 1.0, "power": 1.0}),
-    "nocurric": ("runs/world/world_tts_cosyvoice2_smollm2_nocurric_0", None),
+    "nocurric": ("runs/world_voice/cosyvoice2_smollm2_nocurric_0", None),
 }
 
 

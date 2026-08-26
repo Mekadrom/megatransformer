@@ -13,7 +13,7 @@ Loads the model once per checkpoint and calls run_tf_and_ablation directly (no s
 teacher-forced only — no generation, so it is comparatively cheap.
 
   uv run python scripts_local/voice_text_horizon_sweep.py \
-      --run_dir runs/world/world_tts_cosyvoice2_smollm2_mrope_scale_text_0 \
+      --run_dir runs/world_voice/cosyvoice2_smollm2_mrope_scale_text_0 \
       --steps 10000,20000,30000 --n 1024 --device cuda:3
 """
 import argparse, glob, json, os, re, sys

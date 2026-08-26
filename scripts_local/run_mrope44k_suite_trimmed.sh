@@ -29,8 +29,8 @@ DEV="cuda:${GPU}"
 CACHE=./cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2
 CB=$CACHE/val/cosyvoice2_codebook.pt
 CV2=/mnt/nasbro/cache/hf_home/hub/models--FunAudioLLM--CosyVoice2-0.5B/snapshots/eec1ae6c79877dbd9379285cf8789c9e0879293d
-TEXT_RUN=runs/world/world_tts_cosyvoice2_smollm2_mrope_scale_text_0
-DISTILL_RUN=runs/world/world_tts_cosyvoice2_smollm2_distill_0
+TEXT_RUN=runs/world_voice/cosyvoice2_smollm2_mrope_scale_text_0
+DISTILL_RUN=runs/world_voice/cosyvoice2_smollm2_distill_0
 OUT=eval_output/world_tts_mrope44k
 LOGS=$OUT/logs
 mkdir -p "$LOGS"

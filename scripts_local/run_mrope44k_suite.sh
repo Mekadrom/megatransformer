@@ -16,14 +16,14 @@ DEV="cuda:${GPU}"
 CACHE=./cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2
 CB=$CACHE/val/cosyvoice2_codebook.pt
 CV2=/mnt/nasbro/cache/hf_home/hub/models--FunAudioLLM--CosyVoice2-0.5B/snapshots/eec1ae6c79877dbd9379285cf8789c9e0879293d
-TEXT_RUN=runs/world/world_tts_cosyvoice2_smollm2_mrope_scale_text_0
-VOICE_RUN=runs/world/world_tts_cosyvoice2_smollm2_mrope_0
-DISTILL_RUN=runs/world/world_tts_cosyvoice2_smollm2_distill_0
+TEXT_RUN=runs/world_voice/cosyvoice2_smollm2_mrope_scale_text_0
+VOICE_RUN=runs/world_voice/cosyvoice2_smollm2_mrope_0
+DISTILL_RUN=runs/world_voice/cosyvoice2_smollm2_distill_0
 OUT=eval_output/world_tts_mrope44k
 LOGS=$OUT/logs
 mkdir -p "$LOGS"
 
-# CosyVoice2 text-free baselines (from runs/world/world_tts_cosyvoice2_smollm2_0__baseline_*),
+# CosyVoice2 text-free baselines (from runs/world_voice/cosyvoice2_smollm2_0__baseline_*),
 # NOT the Mimi-era script defaults (0.211/0.229/0.117) the scripts still ship.
 BASE="--ngram_ceiling 0.0545 --asymptote 0.2261 --repeat 0.0314"
 # --no_voice_predict_f0 exists ONLY in world_voice_ar_diagnostics; the others already default

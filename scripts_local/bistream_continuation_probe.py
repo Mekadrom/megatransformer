@@ -16,7 +16,7 @@ from argparse import Namespace
 
 CACHE = "./cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2"
 CB = f"{CACHE}/val/cosyvoice2_codebook.pt"
-CKPT = sys.argv[1] if len(sys.argv) > 1 else "runs/world/world_voice_memorize32_bistream_0/checkpoint-500"
+CKPT = sys.argv[1] if len(sys.argv) > 1 else "runs/world_voice/memorize32_bistream_0/checkpoint-500"
 DEV = sys.argv[2] if len(sys.argv) > 2 else "cuda:3"
 K_TEXT, S = 5, 30
 

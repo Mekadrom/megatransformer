@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NAR-relevant eval suite for world_tts_cosyvoice2_smollm2_nar_0.
+# NAR-relevant eval suite for cosyvoice2_smollm2_nar_0.
 #
 # The AR bars do not transfer unchanged:
 #   - early_text_delta is meaningless (a masked model has no left-to-right history), and
@@ -22,7 +22,7 @@ DEV="cuda:${GPU}"
 CACHE=./cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2
 CB=$CACHE/val/cosyvoice2_codebook.pt
 CV2=/mnt/nasbro/cache/hf_home/hub/models--FunAudioLLM--CosyVoice2-0.5B/snapshots/eec1ae6c79877dbd9379285cf8789c9e0879293d
-RUN=runs/world/world_tts_cosyvoice2_smollm2_nar_0
+RUN=runs/world_voice/cosyvoice2_smollm2_nar_0
 CKPT=$RUN/checkpoint-$STEP
 OUT=eval_output/world_tts_nar_${STEP}
 LOGS=$OUT/logs

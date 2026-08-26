@@ -14,6 +14,14 @@ embeddings; no mel, no F0. Codebook is CosyVoice 2's own `flow.input_embedding` 
 into what the decoder expects. Utterance lengths: min 25, median 102, mean 112, p90 204
 frames; 0.16% hit the 250 cap.
 
+⚠️ **RUN DIRECTORY RENAME, 2026-08-26.** Voice runs moved to `runs/world_voice/` and the
+redundant `world_tts_` / `world_voice_` prefixes were stripped, e.g.
+`world_voice_cosyvoice2_smollm2_ar_flat_lr_1` -> `cosyvoice2_smollm2_ar_flat_lr_1`. Run names
+in THIS file use the new form. The `--run_name` recorded inside each run's TensorBoard
+`training/command_line` is the ORIGINAL prefixed name and was not rewritten — that is launch
+history, not a path. So a TB command line and a directory name will disagree by that prefix;
+strip it to map between them.
+
 Provenance note: entries dated before 2026-08-21 are recorded from prior sessions of this
 project. Entries dated 2026-08-21 were measured in that session. Contamination status for the
 older ones is in its own section below — read it before trusting any pre-08-21 number.
@@ -241,7 +249,7 @@ wrong temperature. Treat as untested.
 ## ESTABLISHED (continued)
 
 ### Training exclusively at mask ratio 1.0 does NOT build text conditioning (2026-08-23)
-`world_tts_cosyvoice2_smollm2_nar_r1_flat_lr-flat_0`, killed at ~63k steps = **34 epochs over
+`cosyvoice2_smollm2_nar_r1_flat_lr-flat_0`, killed at ~63k steps = **34 epochs over
 LibriTTS-R clean**. Train loss kept falling; eval did not improve; **no signs of
 memorization.**
 
@@ -276,7 +284,7 @@ reconciled — suspect the probe before the trainer. Fix this before either numb
 ---
 
 ### The 32-utterance memorization run ANSWERS the prerequisite: text is read, as a KEY (2026-08-24)
-`world_tts_memorize32_0` (NAR, mask ratio pinned 1.0, duration token on, LR 1e-4 constant,
+`memorize32_0` (NAR, mask ratio pinned 1.0, duration token on, LR 1e-4 constant,
 32 train samples) reaches **train `voice_unit_accuracy` 1.0 by step ~1400** and holds it to
 20000, with `voice_unit_ce_loss_norm` at 2e-5. At r=1.0 there is no voice context at all —
 every unit is predicted from text + duration alone — so this is complete memorization of all
@@ -329,7 +337,7 @@ trained on, mask ratio 1.0, argmax (no sampling), duration token emitted, M-RoPE
 Stated plainly because it keeps having to be re-derived. Two direct demonstrations in this
 project, on the same weights at the same step:
 
-- `world_tts_memorize32_0` (NAR): train unit accuracy **1.0** while free-running renders were
+- `memorize32_0` (NAR): train unit accuracy **1.0** while free-running renders were
   nonsense for some samples at 17.5k.
 - `distill_0` @44k: early_text_delta +0.0522 against the teacher's +0.0538, text-attributed
   0.371 — and it **still sounded bad by ear**.
@@ -343,7 +351,7 @@ Read free-running from `world_voice_ar_diagnostics.py` section 3 (adj_repeat, lo
 EOV firing rate, length vs GT) and `cosyvoice_wer_eval.py`, and finally by ear.
 
 ### ⚠️ A constant LR may never leave the free-running collapse regime (2026-08-24, derived)
-`world_voice_cosyvoice2_smollm2_ar_flat_lr_0` runs `constant_with_warmup` at 1e-5. An earlier
+`cosyvoice2_smollm2_ar_flat_lr_0` runs `constant_with_warmup` at 1e-5. An earlier
 finding established that greedy EOV-collapse in this project was a **mid-cosine, high-LR
 artifact** and that late low-LR checkpoints free-ran clean — hence "judge free-running from
 late checkpoints only". A constant-LR run has no late: it stays at the same LR forever, so if
@@ -362,7 +370,7 @@ short generation therefore sounded like a long degenerate one, and the model got
 Fixed with `_trim_generated_voice` at both sites (voice_to_voice and text_to_voice).
 
 ### AR flat-LR @11076: text conditioning is at the TEACHER, free-running is not (2026-08-24)
-`world_voice_cosyvoice2_smollm2_ar_flat_lr_0/checkpoint-11076`, teacher-forced, held-out
+`cosyvoice2_smollm2_ar_flat_lr_0/checkpoint-11076`, teacher-forced, held-out
 n=512, M-RoPE engaged (`scale_side=text`):
 
 | metric | this run @11k | AR @44k | teacher |
@@ -796,7 +804,7 @@ Generalizes beyond voice: world-image has the same layout (`[text][BOI][PH][EOI]
 the same masking, so an image-synthesis run cannot learn to stop either.
 
 ### EOV FIRES — the over-length failure is repeated BOV, not missing termination (2026-08-24)
-Measured, `world_voice_cosyvoice2_smollm2_ar_flat_lr_0/checkpoint-11076`, n=8 val prompts,
+Measured, `cosyvoice2_smollm2_ar_flat_lr_0/checkpoint-11076`, n=8 val prompts,
 voice_temperature 0.6, budget 250 frames (`scripts_local/voice_render_length_audit.py`):
 
 | prompt | utterances | real frames each | ended by |
@@ -856,7 +864,7 @@ rather than collapsed into one. That is what `n` is for: `<text><voice_0><text><
 two disjoint clips.
 
 ### Bistream trains and decodes; it ties unistream on memorization, as predicted (2026-08-24)
-`world_voice_memorize32_bistream_0` (identical to the unistream arm plus
+`memorize32_bistream_0` (identical to the unistream arm plus
 `--bistream_text_chunk 5 --bistream_voice_chunk 30 --bistream_prob 1.0`): train
 `voice_unit_accuracy` 0.787 @100, 0.991 @200, **1.000 @400**, CE 6.3e-4. The unistream arm
 was 0.819 / 0.984 / **1.000 @400**, CE 1.4e-4. **A tie**, which is what the retirement note
@@ -893,7 +901,7 @@ argument, so greedy TEXT decoding presented as a CUDA fault. The voice sampler a
 as greedy; the text one now agrees.
 
 ### Unistream AR memorizes 32 utterances in ~400 steps AND renders them correctly (2026-08-24)
-`world_voice_memorize32_uni_ar_0` (AR, unistream, no duration token, LR 1e-4 constant, 32
+`memorize32_uni_ar_0` (AR, unistream, no duration token, LR 1e-4 constant, 32
 samples, batch 8): train `voice_unit_accuracy` 0.819 @100, 0.984 @200, **1.000 @400**, held
 to 1100; `voice_unit_ce_loss_norm` 1.028 -> 1.4e-4. Owner reports all 4 TB renders sound
 perfect. Held-out val is unmoved and drifting the wrong way (unit acc 0.0124, CE 1.19 ->
@@ -903,7 +911,7 @@ expected and correct outcome at n=32.
 Note on epochs: batch 8 over 32 samples is 4 steps/epoch, so step 400 is **100 epochs**, not
 a handful. It is fast in wall-clock (minutes), not fast in passes over the data.
 
-**This retires the open generation-path question.** The NAR arm (`world_tts_memorize32_0`)
+**This retires the open generation-path question.** The NAR arm (`memorize32_0`)
 also reached train accuracy 1.0 — but at step ~1400-4000, and its free-running renders were
 still nonsense for some samples at 17.5k (idx 3). AR reaches the same teacher-forced ceiling
 3.5-10x sooner AND its renders are correct. So the earlier train-1.0-but-audio-nonsense
@@ -996,7 +1004,7 @@ nothing. Sanity-check `train/voice_unit_accuracy` climbs fast in the first few h
 on 32 samples it should — before trusting a negative result from it.
 
 ### ~~Does training at mask ratio 1.0 build text conditioning?~~ ANSWERED: no (see above)
-Run `world_tts_cosyvoice2_smollm2_nar_r1_flat_lr-flat_0`, started 2026-08-21, killed at 63k:
+Run `cosyvoice2_smollm2_nar_r1_flat_lr-flat_0`, started 2026-08-21, killed at 63k:
 `--voice_nar_mask_schedule high --voice_nar_mask_ratio_min 1.0`, constant LR after warmup so
 plateau is attributable to the model rather than LR decay, `--voice_cfg_text_dropout_prob 0.1`
 so CFG is testable later.
@@ -1262,10 +1270,10 @@ ceiling; `--nar_seed`, `--nar_reveal`, `--nar_rounds`, `--duration_shuffle`),
 
 | run | latest | status |
 |---|---|---|
-| `world_tts_cosyvoice2_smollm2_nar_r1_flat_lr-flat_0` | training | **LIVE** — the r=1.0 probe |
-| `world_tts_cosyvoice2_smollm2_nar_0` | 23000 | stopped; the cosine-masked NAR baseline |
-| `world_tts_cosyvoice2_smollm2_mrope_scale_text_0` | 44000+ | stopped; best AR arm, all checkpoints kept |
-| `world_tts_cosyvoice2_smollm2_distill_0` | 55000 | stopped; the distillation result above |
-| `world_tts_cosyvoice2_smollm2_mrope_0` | 28000 | killed (voice-scaled M-RoPE) |
-| `world_tts_cosyvoice2_smollm2_0` / `_nocurric_0` | 27000 / 23000 | stopped; pre-distill baselines |
+| `cosyvoice2_smollm2_nar_r1_flat_lr-flat_0` | training | **LIVE** — the r=1.0 probe |
+| `cosyvoice2_smollm2_nar_0` | 23000 | stopped; the cosine-masked NAR baseline |
+| `cosyvoice2_smollm2_mrope_scale_text_0` | 44000+ | stopped; best AR arm, all checkpoints kept |
+| `cosyvoice2_smollm2_distill_0` | 55000 | stopped; the distillation result above |
+| `cosyvoice2_smollm2_mrope_0` | 28000 | killed (voice-scaled M-RoPE) |
+| `cosyvoice2_smollm2_0` / `_nocurric_0` | 27000 / 23000 | stopped; pre-distill baselines |
 | `..._0__baseline_ngram_*` | — | synthetic text-free baselines, not models |
