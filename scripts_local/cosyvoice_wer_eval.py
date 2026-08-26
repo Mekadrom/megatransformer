@@ -111,7 +111,10 @@ def transcribe(wav_24k):
     # optional here -- feeding 24 kHz straight in mis-times everything.
     x = wav_24k.numpy().astype(np.float32)
     x16 = librosa.resample(x, orig_sr=sr, target_sr=16000)
-    r = asr.transcribe(x16, language="en", fp16=False)
+    # fp16 on CUDA: Whisper defaults to fp32 and warns otherwise. Transcription is a
+    # small share of the wall clock here (AR generation at batch 1 dominates), so this
+    # is a minor win -- taken because it is free and changes no output materially.
+    r = asr.transcribe(x16, language="en", fp16=str(a.device).startswith("cuda"))
     return r.get("text", "").strip()
 
 

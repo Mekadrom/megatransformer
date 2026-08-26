@@ -463,6 +463,43 @@ data grounds alone. A WSD/cosine decay tail from ~12k distinguishes them cheaply
 minimum moves later and lower, it was the schedule; if the U simply repeats at the same place,
 it is data and LibriHeavy/MLS is the answer.
 
+### ⭐⭐⭐ WER TREND across `ar_flat_lr_1`: 28000 is the peak; keep it (2026-08-25)
+30 runs — 5 checkpoints x 2 arms x 3 seeds, n=128, temperature 0.6, ceiling LCS 0.884:
+
+| ckpt | RAS LCS | plain LCS | RAS WER | plain WER | plain hyp/ref |
+|---|---|---|---|---|---|
+| 14768 | 0.4701 ±0.0069 | 0.3683 ±0.0051 | 0.6210 | 0.6778 | 0.785 |
+| 24000 | 0.5646 ±0.0102 | 0.4471 ±0.0124 | 0.4924 | 0.5878 | 0.836 |
+| 26000 | 0.5655 ±0.0118 | 0.4609 ±0.0047 | 0.5006 | 0.5760 | 0.870 |
+| **28000** | **0.5785 ±0.0021** | **0.5252 ±0.0069** | **0.4869** | **0.5181** | **0.946** |
+| 30000 | 0.5792 ±0.0045 | 0.4743 ±0.0096 | 0.4942 | 0.5760 | 0.850 |
+
+**14768 — the eval-CE OPTIMUM — is the WORST checkpoint measured**, by 0.16 LCS against seed
+spreads of ±0.007. Selecting on eval CE would have picked a model ~30% worse at the task.
+This is the ear-vs-eval-CE dissociation made quantitative; treat eval CE as diagnostic only.
+
+**28000 is a genuine peak on the PLAIN arm** (0.5252 vs 0.4471/0.4609 before and 0.4743
+after, 6-8σ), not the start of a plateau. An earlier partial read of the RAS-only data said
+"plateau from 24k" — **wrong**, corrected when the plain arm landed.
+
+⚠️ **RAS COMPRESSES CHECKPOINT DIFFERENCES and will mislead checkpoint selection.** Across
+24000-30000 the RAS arm spans 0.015 while plain spans 0.078. Judge checkpoints on the PLAIN
+arm; use RAS for rendering only.
+
+`hyp/ref` tracks the plain arm exactly (0.836/0.870/0.946/0.850), so most of the plain
+difference is HOW MUCH the model says — 28000 says about the right amount, its neighbours
+under-speak. The advantage is narrower in kind than the LCS gap implies.
+
+⚠️ A sharp single-point peak flanked by dips at 2000-step spacing may be a favourable point
+in a noisy walk rather than a true optimum. If an anneal from 28000 underperforms, suspect
+this first.
+
+**RAS value grows as the model degrades**: +0.053 at 28000, +0.105 at 30000, +0.102 at 14768,
++0.118 at 24000. It is a compensator for a worse model, not a fixed bonus.
+⚠️ It can also KILL a short utterance outright — utterance 02 renders 0.0 s under RAS at
+28000 (target 1.1 s, plain 0.7 s). One empty render in twelve barely moves a mean, so the
+aggregate hides it.
+
 ### ⭐⭐⭐ PERCEPTUAL ANCHOR: what LCS 0.62 / CER 0.32 actually SOUNDS like (2026-08-25)
 Owner, on `ar_flat_lr_1` at ~28-30k: **"the first time I can hear words all the way through
 output examples, even if some of the sounds aren't quite right."**
