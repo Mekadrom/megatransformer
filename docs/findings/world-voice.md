@@ -3,6 +3,24 @@
 Speech synthesis from the recurrent trunk into CosyVoice 2 speech tokens, decoded by the
 frozen CosyVoice 2 flow decoder. Formerly "world-tts".
 
+📁 **RUN PATHS MOVED 2026-08-26.** Runs now live in `runs/world_voice/` (split out from
+`runs/world/`, which mixed image and voice), and the redundant `world_tts_` / `world_voice_`
+prefixes were stripped from every directory:
+`runs/world/world_voice_cosyvoice2_smollm2_ar_flat_lr_1` ->
+`runs/world_voice/cosyvoice2_smollm2_ar_flat_lr_1`.
+
+**Entries below use the NEW stripped names**, so a name in this file can be pasted straight
+at `runs/world_voice/`. Two consequences:
+- Each run's TensorBoard `training/command_line` still records the ORIGINAL prefixed
+  `--run_name`. That is launch history, not a path, so it was not rewritten. A TB command line
+  and a directory name therefore differ by the prefix; strip it to map between them.
+- The git log before this date quotes the old names.
+
+⚠️ **`docs/findings/world-image.md` made the OPPOSITE choice** — it kept the OLD full run names
+in its entries and maps forward by dropping the prefix. So the two direction files are
+internally consistent but differ from each other. When moving between them, check which
+convention the file declares at its top rather than assuming.
+
 **Stack:** text -> frozen SmolLM2-135M -> recurrent trunk (trainable) -> voice coda ->
 CosyVoice 2 FSQ tokens (25 Hz, vocab 6562, EOV = 6561) -> frozen flow decoder + campplus
 speaker embedding -> audio. Only the trunk and its per-mode adapters train.
@@ -13,14 +31,6 @@ embeddings; no mel, no F0. Codebook is CosyVoice 2's own `flow.input_embedding` 
 `val/cosyvoice2_codebook.pt` — the flow decoder's input table, so predicted ids index straight
 into what the decoder expects. Utterance lengths: min 25, median 102, mean 112, p90 204
 frames; 0.16% hit the 250 cap.
-
-⚠️ **RUN DIRECTORY RENAME, 2026-08-26.** Voice runs moved to `runs/world_voice/` and the
-redundant `world_tts_` / `world_voice_` prefixes were stripped, e.g.
-`world_voice_cosyvoice2_smollm2_ar_flat_lr_1` -> `cosyvoice2_smollm2_ar_flat_lr_1`. Run names
-in THIS file use the new form. The `--run_name` recorded inside each run's TensorBoard
-`training/command_line` is the ORIGINAL prefixed name and was not rewritten — that is launch
-history, not a path. So a TB command line and a directory name will disagree by that prefix;
-strip it to map between them.
 
 Provenance note: entries dated before 2026-08-21 are recorded from prior sessions of this
 project. Entries dated 2026-08-21 were measured in that session. Contamination status for the
