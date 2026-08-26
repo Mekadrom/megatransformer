@@ -3,6 +3,13 @@
 Image synthesis from the recurrent trunk into a frozen diffusion decoder (Z-Image / SDXL) via
 a trainable conditioning adapter.
 
+📁 **RUN PATHS MOVED 2026-08-26.** Runs now live in `runs/world_image/` (split out from
+`runs/world/`, which mixed image and voice), and the redundant `world_image_` prefix was stripped
+from every directory: `runs/world/world_image_zimage_qwen_X` -> `runs/world_image/zimage_qwen_X`.
+**Entries below still use the OLD full run names** — they are the names the measurements were
+recorded under and the ones the git log quotes, so they were deliberately left alone rather than
+rewritten. Map by dropping `world_image_`.
+
 ⚠️ The **ESTABLISHED (owner-reported)** section below was reported in conversation by the
 project owner during the 2026-08-21 world-voice session. Those numbers come from the WARM-START
 lineage (whiten -> t3_1 -> t3_2 -> xskip, ~63k cumulative steps) and have not been re-measured
