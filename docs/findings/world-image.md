@@ -257,9 +257,29 @@ SE. `trunkctx` at 0.175 IS clearly behind. And `t3_xskip` is climbing fast (0.21
 gain-corrected 0.283, at 74% of GT. **And it passed the GAIN-CORRECTED point head too, confirmed
 at 32k**: smoothed 0.2825 over 29k-32k (0.292 / 0.263 / 0.282 / 0.293), three of four checkpoints
 at or above 0.28, 80% of GT. Confirmed on a window rather than the single 0.292 at 29k, which
-did not hold at 30k (0.263) — this probe produces threshold-crossing outliers readily. So the flow head needs ~20k steps to MATCH a regression head
-and ~21k to BEAT it, not the ~63k the warm-start lineage implied. **From-scratch is a viable
-recipe**; warm-starting buys a one-time ~20k head start, not a structural requirement.
+did not hold at 30k (0.263) — this probe produces threshold-crossing outliers readily. So the flow
+head needs ~20k steps to MATCH a regression head and ~21k to BEAT it.
+
+⛔ **~~From-scratch is a viable recipe; warm-starting buys a one-time ~20k head start, not a
+structural requirement.~~ — RETRACTED 2026-08-27.** That compared from-scratch against the
+POINT-HEAD baseline only, and read "passed the baseline" as "matches the lineage". It does not.
+`ws_xskip_0`/ckpt-3000 RE-MEASURED in the current harness (N=4, same probe — this number had never
+been verified here): **0.355 at w=3 / 0.268 at w=1**, against the historical quote of 0.359. It
+verifies to 0.004.
+
+| | w=3.0 | w=1.0 | cumulative steps |
+|---|---|---|---|
+| `ws_xskip_0` (whiten -> t3_1 -> t3_2 -> xskip) | **0.355** | **0.268** | ~63k |
+| `t3_xskip_0` from-scratch, final | 0.326 | 0.245 | 100k |
+| warm restarts ON TOP of from-scratch | 0.3235-0.3245 | 0.240-0.251 | 103k |
+
+**The staged lineage beats from-scratch by ~0.03 on BOTH axes with ~37k FEWER cumulative steps.**
+⭐⭐ And NOT because its trunk learned the conditioning better — from-scratch ends with BETTER
+conditioning (eval MSE 0.233 / R^2 0.767 vs `whiten_0`'s 0.275 / R^2 0.725). Whatever staging
+buys, it is in the HEAD or the trajectory, not the trunk.
+⚠️ It is also not a restart artifact: three 3000-step warm restarts from the from-scratch
+checkpoint (control / auxdetach / offset) land at 0.322-0.329, matching the `ws_*` restart-only
+confound of +0.009.
 
 ⚠️ **This CORRECTS what this entry said an hour earlier**, when it was written from `trunkctx`@20k
 plus `t3_xskip`@18k (0.231): "the point head renders much better" and "a from-scratch flow run
