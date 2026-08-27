@@ -1,6 +1,7 @@
 import argparse
 import math
 import numpy as np
+import json
 import os
 import psutil
 
@@ -90,6 +91,12 @@ def get_training_args(args, run_dir) -> TrainingArguments:
     ta = TrainingArguments(
         output_dir=run_dir,
         lr_scheduler_type=args.lr_scheduler_type,
+        # The CLI took --lr_scheduler_kwargs as a JSON string and then DROPPED it: the flag
+        # parsed, nothing read it, and a schedule needing phase config (warmup_stable_decay
+        # wants num_stable_steps / num_decay_steps) silently fell back to defaults. Found
+        # 2026-08-26 while smoke-testing a WSD run before launching it.
+        lr_scheduler_kwargs=(json.loads(args.lr_scheduler_kwargs)
+                             if getattr(args, "lr_scheduler_kwargs", None) else None),
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
         per_device_train_batch_size=args.batch_size,
