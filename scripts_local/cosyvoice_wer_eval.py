@@ -154,7 +154,20 @@ for i in range(len(ds)):
                                  voice_top_k=a.voice_top_k, voice_top_p=a.voice_top_p,
                                  voice_ras_win=a.ras_win, voice_ras_tau=a.ras_tau,
                                  decode_outputs=False)
-    tr = [int(x) for x in out.get("voice_unit_id_trace", [[]])[0] if 0 <= int(x) < K]
+    # FIRST UTTERANCE, not the flat trace. `voice_unit_id_trace` spans EVERY voice block the
+    # call produced, so a model that ends one utterance and starts another (i.e. anything
+    # WITHOUT --unmask_eos_in_synthesis) gets its blocks concatenated here -- inflating length
+    # and handing Whisper a long tail that corrupts the transcription of the correct part.
+    # A render is one utterance, so the measurement must be one utterance.
+    #
+    # ⚠️ This changes NOTHING for runs that emit a single utterance (measured: ar_flat_lr_1 is
+    # 1.00 utterances/prompt at every checkpoint), so the 2026-08-25 trend numbers stand. It
+    # DOES mean pre-EOS-fix runs were scored on concatenated output and are understated --
+    # re-measure before comparing across that boundary.
+    _segs = out.get("voice_unit_id_segments")
+    _raw = (_segs[0][0] if _segs and _segs[0] and len(_segs[0][0]) > 0
+            else out.get("voice_unit_id_trace", [[]])[0])
+    tr = [int(x) for x in _raw if 0 <= int(x) < K]
     L_ref = int(s["voice_feature_length"])
     row = {"idx": i, "ref": ref, "gen_frames": len(tr), "ref_frames": L_ref}
     if a.duration_shuffle and _IS_NAR:
