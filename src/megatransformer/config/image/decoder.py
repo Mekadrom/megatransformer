@@ -457,6 +457,16 @@ class ZImageAdapterConfig:
     # the flow loss. Default False = existing behaviour, bit-identical.
     # No effect at inference (nothing backprops there), so surfaced predictions are unchanged.
     flow_aux_mse_detach: bool = False
+    # Contrastive Flow Matching (dFM, arXiv 2506.05350): repel the predicted velocity from a
+    # permuted (negative) target's velocity at the same (x_t, t), on top of the usual FM pull
+    # toward the true one. Attacks flow OVERLAP between conditions -- the objective-level version
+    # of the observed collapse where v_cond falls onto v_uncond and a portrait renders for an
+    # astronaut prompt. ⚠️ MUST be < 1 (curvature is 1-w; >= 1 diverges); the head raises.
+    # ⚠️ DISTINCT from `contrastive_weight`, the Tier-1 InfoNCE term on the pooled point estimate.
+    # ⚠️ Its published gains (up to 9x faster training, 5x fewer steps) come from class-conditional
+    # ImageNet DiTs at dozens-to-hundreds of NFE; this head runs 8 NFE with continuous 2560-d
+    # conditioning, so expect the SEPARATION benefit rather than the speedup.
+    flow_contrastive_weight: float = 0.0
     # DISPERSION MATCHING on a SAMPLED draw: |std(draw)/std(target) - 1|, plus an optional
     # -log(ratio) anti-collapse barrier. Same form as the trainer's modality var-loss, which is
     # wired only to the LATENT image path and never reaches this adapter.

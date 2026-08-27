@@ -82,6 +82,7 @@ class CondFlowHead(nn.Module):
     def __init__(self, seq_dim, ctx_dim, dim=512, n_heads=8, n_layers=4,
                  mlp_ratio=4.0, dropout=0.0, steps=8, time_sampling="logit_normal",
                  cfg_dropout=0.0, guidance=1.0, max_len=128, pos_embed=False, x_skip=False,
+                 contrastive_weight=0.0,
                  x1_pred=False, x1_sigma_min=0.02, loss_weighting="none", min_snr_gamma=5.0,
                  var_loss_weight=0.0, var_barrier_weight=0.0, var_steps=4):
         super().__init__()
@@ -99,6 +100,23 @@ class CondFlowHead(nn.Module):
         # exactly the axis where a sampler loses to a conditional-mean point estimate.
         self.cfg_dropout = float(cfg_dropout)
         self.guidance = float(guidance)
+        # CONTRASTIVE FLOW MATCHING (dFM, arXiv 2506.05350). Standard FM only pulls the predicted
+        # velocity TOWARD this sample's target; flows for different conditions may overlap, which
+        # is the objective-level version of "v_cond collapses onto v_uncond" (the observed
+        # mode-collapse failure: a portrait rendered for an astronaut prompt). dFM adds a repulsion
+        # from a NEGATIVE sample's velocity drawn from the same batch:
+        #     L = ||v - (x1 - x0)||^2  -  w * ||v - (x1_neg - x0)||^2
+        # Same x0 and the same x_t, a permuted target -- so the head is pushed away from where a
+        # DIFFERENT caption's flow would go from this very point.
+        # ⚠️ w MUST be < 1: the combined quadratic has curvature (1 - w), so w >= 1 is unbounded
+        # below and will diverge. Enforced below.
+        self.contrastive_weight = float(contrastive_weight)
+        if self.contrastive_weight >= 1.0:
+            raise ValueError(
+                f"flow_contrastive_weight={self.contrastive_weight} >= 1 makes the dFM objective "
+                f"unbounded below (curvature 1-w <= 0); use a value well under 1 (~0.05-0.2).")
+        if self.contrastive_weight < 0:
+            raise ValueError("flow_contrastive_weight must be >= 0")
         self.null_ctx = nn.Parameter(torch.zeros(1, 1, ctx_dim))
         self.x_in = nn.Linear(seq_dim, dim)
         self.ctx_in = nn.Linear(ctx_dim, dim)
@@ -253,6 +271,12 @@ class CondFlowHead(nn.Module):
         x_t = (1 - tv) * noise + tv * target
         v = self.velocity(x_t, t, ctx)
         err = (v - (target - noise)) ** 2
+        if self.contrastive_weight > 0 and self.training and b >= 2:
+            # dFM: repel from a permuted target's velocity at the SAME (x_t, t). Roll by 1 so no
+            # row is its own negative; reuses the single `v` forward, so the cost is one extra
+            # elementwise term, not another network pass.
+            neg = torch.roll(target, shifts=1, dims=0)
+            err = err - self.contrastive_weight * ((v - (neg - noise)) ** 2)
         if self.loss_weighting == "min_snr":
             om = (1 - t).clamp_min(self.x1_sigma_min)
             snr = (t / om) ** 2

@@ -153,6 +153,11 @@ class ZImageConditioningAdapter(nn.Module):
                 guidance=float(getattr(config, "flow_guidance", 1.0)),
                 max_len=int(getattr(config, "flow_max_len", 128)),
                 pos_embed=bool(getattr(config, "flow_pos_embed", False)),
+                # dFM repulsion weight. DISTINCT from `contrastive_weight` above, which is the
+                # Tier-1 InfoNCE term on the pooled POINT estimate -- a different object, and one
+                # that measurably improved retrieval without moving the render. This one acts on
+                # the VELOCITY field during training.
+                contrastive_weight=float(getattr(config, "flow_contrastive_weight", 0.0)),
                 x_skip=bool(getattr(config, "flow_x_skip", False)),
                 x1_pred=bool(getattr(config, "flow_x1_pred", False)),
                 x1_sigma_min=float(getattr(config, "flow_x1_sigma_min", 0.02)),

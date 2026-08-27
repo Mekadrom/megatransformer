@@ -695,6 +695,10 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_auxdetach"] = copy.deepcopy(WORLD
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_auxdetach"].image_coda_config.flow_aux_mse_detach = True
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_auxdetach"].image_coda_config.flow_aux_mse_weight = 1.0
 
+# dFM arm: contrastive flow matching on the velocity field (arXiv 2506.05350).
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_dfm"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_dfm"].image_coda_config.flow_contrastive_weight = 0.1
+
 # xskip + explicit DISPERSION MATCHING. The best arm so far (xskip) still emits under-dispersed
 # content and leans on both leftover noise and CFG to make up for it; this makes the spread an
 # objective instead. Weight 0.5 with a small anti-collapse barrier: the term is dimensionless and
