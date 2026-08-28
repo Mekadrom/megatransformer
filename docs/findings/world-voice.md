@@ -518,6 +518,39 @@ this first.
 28000 (target 1.1 s, plain 0.7 s). One empty render in twelve barely moves a mean, so the
 aggregate hides it.
 
+### ⭐⭐⭐⭐ THE WALL WAS THE LEARNING RATE, not the architecture (2026-08-27)
+All measured with IDENTICAL current tooling and protocol — n=128, temperature 0.6, 3 seeds,
+first-utterance scoring — so this is model-vs-model, not instrument-vs-instrument:
+
+| run | step | LR | EOS loss | RAS LCS | RAS trunc | plain hyp/ref |
+|---|---|---|---|---|---|---|
+| `cosyvoice2_smollm2_mrope_scale_text_0` | 44000 | 1e-5 cosine | no | 0.1238 | 0.1120 | 0.276 |
+| `cosyvoice2_smollm2_distill_0` | 44000 | 1e-5 cosine | no | 0.1966 | 0.1721 | 0.427 |
+| `cosyvoice2_smollm2_ar_flat_lr_0` | **12000** | **1e-4 const** | **no** | **0.4267** | **0.3796** | 0.717 |
+| `cosyvoice2_smollm2_ar_flat_lr_1` | 28000 | 1e-4 const | yes | 0.5785 | 0.5444 | 0.946 |
+
+**`ar_flat_lr_0` at 12000 steps more than DOUBLES the old arms at 44000, with no EOS
+supervision and no distillation** — a quarter of the training and 2.2x the truncated LCS. The
+only material difference is 1e-4 constant vs 1e-5 cosine. **The learning rate was the wall.**
+
+EOS supervision adds on top (0.3796 -> 0.5444 truncated), though that comparison also spans
+12000 -> 28000 steps and is therefore confounded with training length.
+
+⚠️ **This retroactively undermines every "structural ceiling" conclusion measured at 1e-5** —
+the 0.267 unit-accuracy plateau, "voice conditioning develops over 20k-45k steps", and the
+framing that text->content binding was an architectural limitation. Those were measured on an
+under-optimised model. They are not disproven, but they cannot be cited as properties of the
+architecture until re-measured at a working LR.
+
+**The old numbers were also FLATTERED by the old tooling, not penalised by it.** Documented
+truncated LCS was 0.1620; re-measured at the operating point with correct tooling the old arms
+score 0.112-0.172. The earlier figure was inflated by temperature 1.0 and by flat-trace
+concatenation (more emitted text -> more matched words). The prediction that eval fixes would
+make the old runs look BETTER was wrong; they look worse, and the ~3x improvement stands.
+
+**Dominant old failure: UNDER-SPEAKING.** `hyp/ref` 0.276-0.427 against `_1`'s 0.946. Those
+models said a quarter to a half of what they should and then started another utterance.
+
 ### ⭐⭐⭐ PERCEPTUAL ANCHOR: what LCS 0.62 / CER 0.32 actually SOUNDS like (2026-08-25)
 Owner, on `ar_flat_lr_1` at ~28-30k: **"the first time I can hear words all the way through
 output examples, even if some of the sounds aren't quite right."**
