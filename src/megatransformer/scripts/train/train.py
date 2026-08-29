@@ -684,6 +684,10 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, optimizer: Option
 
     if ema is not None:
         trainer.add_callback(ema)
+        # Hand the EMA to the trainer so evaluate() can swap the shadow weights in. Without
+        # this the callback only UPDATES and SAVES the average -- every eval metric and every
+        # render would still be the raw weights, making --use_ema invisible during a run.
+        trainer.ema = ema.ema
 
     if args.stop_step > 0:
         early_stopping_callback = EarlyStoppingCallback(stop_step=args.stop_step)

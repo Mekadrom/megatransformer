@@ -2244,6 +2244,22 @@ class WorldModelTrainer(CommonTrainer):
             print(f"Warning: pre-eval checkpoint save failed: {e}")
 
         self._eval_task_accumulator = {}
+        # EMA AT EVAL. The EMA callback maintained shadow weights and saved them to
+        # ema_state.pt, but nothing ever evaluated them -- every eval metric and every
+        # training render showed the RAW weights, so --use_ema was measurable only by
+        # loading ema_state.pt by hand afterwards.
+        #
+        # The swap wraps ONLY super().evaluate(): the pre-eval checkpoint above must keep
+        # writing RAW weights (otherwise pytorch_model.bin silently becomes the EMA and a
+        # resume would restart from averaged weights), while the viz callback's on_evaluate
+        # -- which fires INSIDE super().evaluate() -- lands inside the swap, so the audio
+        # renders reflect the EMA too. restore() is in a finally so a crashed eval cannot
+        # leave the live weights replaced by the average.
+        _ema = getattr(self, "ema", None)
+        _swapped = False
+        if _ema is not None:
+            _ema.apply_shadow()
+            _swapped = True
         try:
             output = super().evaluate(
                 eval_dataset=eval_dataset,
@@ -2251,6 +2267,8 @@ class WorldModelTrainer(CommonTrainer):
                 metric_key_prefix=metric_key_prefix,
             )
         finally:
+            if _swapped:
+                _ema.restore()
             global_step = self.state.global_step + self.step_offset
             for task_type, bucket in self._eval_task_accumulator.items():
                 for component, (s, c) in bucket.items():
