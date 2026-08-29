@@ -518,6 +518,38 @@ this first.
 28000 (target 1.1 s, plain 0.7 s). One empty render in twelve barely moves a mean, so the
 aggregate hides it.
 
+### ⭐⭐⭐ Flat LR PLATEAUS at ~34k; the WSD decay beats the plateau (2026-08-28)
+Full WER trend, all identical protocol (n=128, temp 0.6, 3 seeds, first-utterance scoring):
+
+| checkpoint | RAS LCS | RAS trunc | RAS WER | plain LCS | plain hyp/ref |
+|---|---|---|---|---|---|
+| flat @24000 | 0.5646 ±0.0102 | 0.5199 | 0.4924 | 0.4471 | 0.836 |
+| flat @28000 | 0.5785 ±0.0021 | 0.5444 | 0.4869 | 0.5252 | 0.946 |
+| flat @30000 | 0.5792 ±0.0045 | 0.5317 | 0.4942 | 0.4743 | 0.850 |
+| flat @34000 | 0.5928 ±0.0169 | 0.5581 | 0.4840 | 0.5580 | 1.001 |
+| flat @37000 | 0.5887 ±0.0090 | 0.5596 | 0.4761 | 0.5448 | 0.976 |
+| flat @40612 | 0.5810 ±0.0165 | 0.5467 | 0.4820 | 0.5602 | 0.991 |
+| **WSD @34000** | **0.6138 ±0.0065** | **0.5772** | **0.4424** | 0.5592 | 0.964 |
+
+**Flat LR plateaus from ~34000.** 34000/37000/40612 are 0.5928/0.5887/0.5810 with spreads of
+±0.009-0.017 — indistinguishable. Training past 34k at constant 1e-4 buys nothing.
+
+**The WSD decay beats the whole plateau**: 0.6138 vs a best flat of 0.5928 (+0.021, marginal
+against the combined spread) and WER 0.4424 vs a best flat of 0.4761 (**−0.034, clear**). So
+annealing is worth roughly one WER point beyond anything constant LR reaches, and
+`ar_wsd_0/checkpoint-34000` is the best model this direction has produced.
+
+⚠️ **Two of my own earlier claims corrected by this table.** (1) "28000 is a genuine peak,
+6-8σ" — false; it was the peak of a sweep that stopped at 30000, and 34000 is higher. (2) "I
+annealed a model that was still improving and stopped it while it was still improving" —
+also false; flat plateaus at ~34000, so decaying from 26000 to 34000 was reasonably timed.
+Both errors came from extrapolating a trend past its last measured point.
+
+**Anchor for a cosine run:** flat saturates ~34k and decay adds on top, so a total in the
+34-40k range is supported by measurement rather than guessed. The earlier argument AGAINST
+cosine was built on eval CE accelerating during decay — and eval CE anti-correlates with
+speech quality here, so that argument should not have been made.
+
 ### ⭐⭐⭐⭐ THE WALL WAS THE LEARNING RATE, not the architecture (2026-08-27)
 All measured with IDENTICAL current tooling and protocol — n=128, temperature 0.6, 3 seeds,
 first-utterance scoring — so this is model-vs-model, not instrument-vs-instrument:
