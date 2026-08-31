@@ -3,6 +3,19 @@
 Speech synthesis from the recurrent trunk into CosyVoice 2 speech tokens, decoded by the
 frozen CosyVoice 2 flow decoder. Formerly "world-tts".
 
+⛔ **THE LibriTTS-R CACHE IS GONE (2026-08-30).**
+`cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2` was deleted ahead of a full
+re-preprocess. Every eval script (`cosyvoice_wer_eval.py`, `world_voice_ar_diagnostics.py`,
+`voice_render_length_audit.py`, ...) resolves `--cache_dir <...>/val`, so **no eval can run
+until a new val cache exists**. Building one is the prerequisite for measuring anything,
+including `ar_cos_0`'s finished 40000 checkpoint, which is currently UNMEASURED and is the
+open question on which LR schedule wins.
+
+Replacement in progress: LibriHeavy `large` -> ~2000 h via the new one-command path
+(`preprocess_dataset voice --content_encoder cosyvoice2`). Note the corpus differs — kept
+segments average 7.46 s against LibriTTS-R's 4.5 s — so length-sensitive results
+(hyp/ref, budget-capping, EOV rate) are NOT directly comparable across the boundary.
+
 📁 **RUN PATHS MOVED 2026-08-26.** Runs now live in `runs/world_voice/` (split out from
 `runs/world/`, which mixed image and voice), and the redundant `world_tts_` / `world_voice_`
 prefixes were stripped from every directory:

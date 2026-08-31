@@ -51,6 +51,11 @@ python -m megatransformer.scripts.data.preprocess_dataset audio \
     --sive_checkpoint_path ./checkpoints/sive \
     --compute_speaker_embeddings --extract_f0 --save_mel_specs
 
+# Voice preprocessing for the world model (CosyVoice 2 units + campplus + SmolLM2 text).
+# ONE command -- produces the world-voice cache directly. Needs onnxruntime-gpu>=1.20,<1.24.
+# For LOCAL parquet use --dataset_name parquet --data_files '<glob>' and DROP --dataset_config.
+python -m megatransformer.scripts.data.preprocess_dataset voice --dataset_name mythicinfinity/libriheavy --dataset_config large --split train --streaming --output_dir ../cached_datasets/libriheavy_cosyvoice2_smollm2/train --content_encoder cosyvoice2 --cosyvoice2_model_dir <CosyVoice2-0.5B snapshot> --compute_speaker_embeddings --tokenize_text --tokenizer_name HuggingFaceTB/SmolLM2-135M --sample_rate 16000 --voice_max_seconds 10.0 --audio_column audio --text_conditions_column text_original --speaker_id_column speaker_id --duration_column audio_duration --max_hours 2000
+
 # Build shard index after preprocessing
 python -m megatransformer.scripts.data.preprocess_dataset stat-shards --output_dir ../cached_datasets/audio_train
 
