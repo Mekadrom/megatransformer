@@ -1621,6 +1621,24 @@ class VoiceDatasetPreprocessor(Preprocessor):
             self.batch_accumulators['batch_conditions'] = []
     
     def preprocess_example(self, example) -> bool:
+        # EARLY-OUT BEFORE DECODING. When the dataset carries a duration column, the
+        # length filters can be applied without touching the audio at all. That matters a
+        # lot on corpora where most segments are rejected: LibriHeavy at a 10s cap keeps
+        # ~27% of rows, so decoding first meant ~73% of all decode+resample work was thrown
+        # away. Measured on 48kHz source: 26ms decode per row, which was the single largest
+        # cost in the pipeline once files were local.
+        _dcol = getattr(self.args, "duration_column", None)
+        if _dcol:
+            _d = example.get(_dcol)
+            if _d is not None:
+                _d = float(_d)
+                if _d > self.args.voice_max_seconds:
+                    self.stats_accumulator["skipped"]["too_long"] += 1
+                    return False
+                if _d < self.args.min_audio_seconds:
+                    self.stats_accumulator["skipped"]["too_short"] += 1
+                    return False
+
         # Extract fields. The audio column is Audio(decode=False) (raw {"bytes","path"});
         # decode_audio() does soundfile decode + soxr resample to args.sample_rate.
         waveform = torch.tensor(
