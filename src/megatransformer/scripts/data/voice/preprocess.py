@@ -501,7 +501,7 @@ class CosyVoice2BatchProcessor(BatchProcessor):
     """
 
     def __init__(self, model_dir: str, voice_max_frames: int, mel_frame_rate: float,
-                 device: str = "cuda", source_sr: int = 16000, cpu_threads: int = 6):
+                 device: str = "cuda", source_sr: int = 16000, cpu_threads: int = 0):
         import onnxruntime as ort
         import whisper  # noqa: F401  (imported here so the dep is only needed on this path)
         self.frame_rate = 25.0
@@ -517,9 +517,12 @@ class CosyVoice2BatchProcessor(BatchProcessor):
         if want_cuda:
             k = _preload_venv_cuda_libs()
             print(f"  preloaded {k} bundled CUDA libs for onnxruntime")
+        if not cpu_threads:
+            cpu_threads = int(os.environ.get("ONNX_CPU_THREADS",
+                                             os.environ.get("OMP_NUM_THREADS", 6)))
         opt = ort.SessionOptions()
         opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opt.intra_op_num_threads = 1 if want_cuda else cpu_threads
+        opt.intra_op_num_threads = 1 if want_cuda else max(1, int(cpu_threads))
         providers = ([("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC",
                                                  "do_copy_in_default_stream": True}),
                       "CPUExecutionProvider"] if want_cuda else ["CPUExecutionProvider"])
@@ -571,11 +574,20 @@ class CampplusBatchProcessor(BatchProcessor):
     decode. Runs on CPU in the reference implementation and is cheap enough to leave there.
     """
 
-    def __init__(self, model_dir: str, source_sr: int = 16000, cpu_threads: int = 6):
+    def __init__(self, model_dir: str, source_sr: int = 16000, cpu_threads: int = 0):
         import onnxruntime as ort
+        # Thread budget: hardcoding this oversubscribes badly when several preprocessing
+        # processes share a box. Measured 2026-08-31: 4 processes on 32 cores, each with
+        # torch's default 16 intra-op threads plus 6 here, gave load average 70 and
+        # 5.4 utt/s TOTAL -- less than half the 12.5 utt/s a single process reached alone.
+        # Respect OMP_NUM_THREADS (which torch also honours) so one env var caps the whole
+        # process, and set OMP_NUM_THREADS ~= cores/n_processes when sharding.
+        if not cpu_threads:
+            cpu_threads = int(os.environ.get("ONNX_CPU_THREADS",
+                                             os.environ.get("OMP_NUM_THREADS", 6)))
         opt = ort.SessionOptions()
         opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opt.intra_op_num_threads = cpu_threads
+        opt.intra_op_num_threads = max(1, int(cpu_threads))
         self.spk = ort.InferenceSession(os.path.join(model_dir, "campplus.onnx"),
                                         sess_options=opt, providers=["CPUExecutionProvider"])
         self._in0 = self.spk.get_inputs()[0].name
