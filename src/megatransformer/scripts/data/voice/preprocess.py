@@ -2,6 +2,7 @@
 import argparse
 import io
 import os
+import sys
 import re
 import numpy as np
 import soundfile as sf
@@ -456,6 +457,155 @@ class MimiBatchProcessor(BatchProcessor):
         return {"unit_ids": unit_ids, "feature_lengths": feat_lengths}
 
 
+def _preload_venv_cuda_libs() -> int:
+    """dlopen the venv's bundled NVIDIA libs so onnxruntime's CUDA EP can resolve them.
+
+    onnxruntime-gpu links against cuDNN 9 / CUDA 12 but does NOT ship them; torch's cu124
+    wheels DO, under site-packages/nvidia/*/lib. Without this the CUDA provider fails to
+    load and onnxruntime SILENTLY falls back to CPU -- `get_providers()` still lists
+    CUDAExecutionProvider as available while the session runs on CPU at ~50x the cost. That
+    is a throughput bug with no error message, so preload here rather than relying on the
+    caller having exported LD_LIBRARY_PATH.
+    """
+    import ctypes, glob
+    base = os.path.join(os.path.dirname(sys.executable), "..", "lib",
+                        f"python{sys.version_info.major}.{sys.version_info.minor}",
+                        "site-packages", "nvidia")
+    n = 0
+    for pat in ("cudnn/lib/libcudnn*.so*", "cublas/lib/libcublas*.so*",
+                "cufft/lib/libcufft*.so*", "curand/lib/libcurand*.so*"):
+        for f in sorted(glob.glob(os.path.join(base, pat))):
+            try:
+                ctypes.CDLL(f, mode=ctypes.RTLD_GLOBAL)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+class CosyVoice2BatchProcessor(BatchProcessor):
+    """CosyVoice 2 speech_tokenizer_v2 (FSQ) as a DISCRETE content tokenizer.
+
+    Emits INTEGER unit ids at 25 Hz -- the same ids the frozen CosyVoice 2 flow decoder
+    consumes, so a predicted id indexes straight into `flow.input_embedding`. This is the
+    encoder the world-voice runs use; previously it lived in an out-of-repo script
+    (cosyvoice-runtime/scripts/extract_libritts_full.py) whose output then needed a SECOND
+    pass through assemble_cosyvoice_cache.py. Both stages now happen here.
+
+    Ported faithfully from that script, including two details that matter:
+      - the tokenizer wants whisper's 128-bin log-mel at 16 kHz, and takes the frame count
+        as a second int32 input;
+      - `cudnn_conv_algo_search: HEURISTIC` avoids EXHAUSTIVE per-shape cudnn autotune,
+        which the reference measured at 343 ms/utterance against ~4 ms with the heuristic,
+        because every new sequence length triggers a fresh search.
+    """
+
+    def __init__(self, model_dir: str, voice_max_frames: int, mel_frame_rate: float,
+                 device: str = "cuda", source_sr: int = 16000, cpu_threads: int = 6):
+        import onnxruntime as ort
+        import whisper  # noqa: F401  (imported here so the dep is only needed on this path)
+        self.frame_rate = 25.0
+        self.source_sr = source_sr
+        # voice_max_frames counts MEL frames; convert to 25 Hz unit frames the way
+        # MimiBatchProcessor does, or every row is padded to the mel width instead.
+        self.max_id_frames = int(voice_max_frames * self.frame_rate / float(mel_frame_rate)) + 1
+        self.encoder_dim = 512          # CosyVoice 2 flow.input_embedding width
+        self.num_layers = 1
+        self._resamplers = {}
+
+        want_cuda = str(device).startswith("cuda")
+        if want_cuda:
+            k = _preload_venv_cuda_libs()
+            print(f"  preloaded {k} bundled CUDA libs for onnxruntime")
+        opt = ort.SessionOptions()
+        opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opt.intra_op_num_threads = 1 if want_cuda else cpu_threads
+        providers = ([("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC",
+                                                 "do_copy_in_default_stream": True}),
+                      "CPUExecutionProvider"] if want_cuda else ["CPUExecutionProvider"])
+        self.tok = ort.InferenceSession(
+            os.path.join(model_dir, "speech_tokenizer_v2.onnx"), sess_options=opt,
+            providers=providers)
+        got = self.tok.get_providers()
+        print(f"  CosyVoice 2 tokenizer providers: {got}")
+        if want_cuda and "CUDAExecutionProvider" not in got:
+            print("  [warn] CUDA provider did NOT load -- running on CPU, expect ~50x slower. "
+                  "onnxruntime-gpu needs cuDNN 9 / CUDA 12 visible.")
+        self._in_feats = self.tok.get_inputs()[0].name
+        self._in_len = self.tok.get_inputs()[1].name
+
+    def _resample(self, wav_t, sr):
+        import torchaudio
+        if sr == 16000:
+            return wav_t
+        if sr not in self._resamplers:
+            self._resamplers[sr] = torchaudio.transforms.Resample(sr, 16000)
+        return self._resamplers[sr](wav_t)
+
+    @torch.no_grad()
+    def process_batch(self, waveforms, waveform_lengths, mel_spec_lengths=None):
+        import numpy as np
+        import whisper
+        B = len(waveforms)
+        unit_ids = torch.zeros(B, self.max_id_frames, dtype=torch.long)
+        feat_lengths = torch.zeros(B, dtype=torch.long)
+        for i in range(B):
+            wlen = int(waveform_lengths[i].item())
+            wav = waveforms[i][:wlen].float().reshape(1, -1).cpu()      # trim pad first
+            wav16 = self._resample(wav, self.source_sr)
+            feat = whisper.log_mel_spectrogram(wav16, n_mels=128).numpy()
+            ids = self.tok.run(None, {self._in_feats: feat,
+                                      self._in_len: np.array([feat.shape[2]], dtype=np.int32)}
+                               )[0].flatten().astype("int64")
+            L = min(int(ids.shape[0]), self.max_id_frames)
+            unit_ids[i, :L] = torch.from_numpy(ids[:L])
+            feat_lengths[i] = max(L, 1)
+        return {"unit_ids": unit_ids, "feature_lengths": feat_lengths}
+
+
+class CampplusBatchProcessor(BatchProcessor):
+    """CosyVoice 2's campplus.onnx speaker encoder -> 192-d embedding.
+
+    The world-voice cache stores THESE, not ECAPA/WavLM: the frozen flow decoder is
+    conditioned on campplus vectors, so any other speaker encoder would be off-manifold at
+    decode. Runs on CPU in the reference implementation and is cheap enough to leave there.
+    """
+
+    def __init__(self, model_dir: str, source_sr: int = 16000, cpu_threads: int = 6):
+        import onnxruntime as ort
+        opt = ort.SessionOptions()
+        opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opt.intra_op_num_threads = cpu_threads
+        self.spk = ort.InferenceSession(os.path.join(model_dir, "campplus.onnx"),
+                                        sess_options=opt, providers=["CPUExecutionProvider"])
+        self._in0 = self.spk.get_inputs()[0].name
+        self.source_sr = source_sr
+        self.embedding_dim = 192
+        self._resamplers = {}
+
+    def _resample(self, wav_t, sr):
+        import torchaudio
+        if sr == 16000:
+            return wav_t
+        if sr not in self._resamplers:
+            self._resamplers[sr] = torchaudio.transforms.Resample(sr, 16000)
+        return self._resamplers[sr](wav_t)
+
+    @torch.no_grad()
+    def process_batch(self, waveforms, waveform_lengths, mel_spec_lengths=None):
+        import torchaudio.compliance.kaldi as kaldi
+        out = torch.zeros(len(waveforms), self.embedding_dim, dtype=torch.float32)
+        for i in range(len(waveforms)):
+            wlen = int(waveform_lengths[i].item())
+            wav = waveforms[i][:wlen].float().reshape(1, -1).cpu()
+            wav16 = self._resample(wav, self.source_sr)
+            fb = kaldi.fbank(wav16, num_mel_bins=80, dither=0, sample_frequency=16000)
+            fb = fb - fb.mean(dim=0, keepdim=True)
+            emb = self.spk.run(None, {self._in0: fb.unsqueeze(0).numpy()})[0].flatten()
+            out[i] = torch.from_numpy(emb.astype("float32"))
+        return {"speaker_embeddings": out}
+
+
 class SpeakerEmbeddingBatchProcessor(BatchProcessor):
     """Batched GPU processing for extracting speaker embeddings."""
 
@@ -631,11 +781,11 @@ class VoiceDatasetPreprocessor(Preprocessor):
         self._samples_in_shard = 0
 
         assert args.save_waveforms or args.save_mel_specs or args.sive_checkpoint_path is not None \
-            or args.content_encoder in ("contentvec", "mimi"), \
+            or args.content_encoder in ("contentvec", "mimi", "cosyvoice2"), \
             "At least one of --save_waveforms, --save_mel_specs, --sive_checkpoint_path, or " \
-            "--content_encoder contentvec|mimi must be specified."
+            "--content_encoder contentvec|mimi|cosyvoice2 must be specified."
 
-        self.voice_max_frames = (args.voice_max_seconds * args.sample_rate) // args.hop_length
+        self.voice_max_frames = int(args.voice_max_seconds * args.sample_rate) // args.hop_length
 
         # decode=False: hand back the raw {"bytes", "path"} struct instead of letting
         # datasets 5.x decode via torchcodec (ABI-incompatible with torch 2.6). Resampling
@@ -770,6 +920,30 @@ class VoiceDatasetPreprocessor(Preprocessor):
                   "--hop_length 256; train SMG with medium_decoder_only_1d_8x_mimicontour_vocos "
                   "+ --vocoder_config vocos.")
 
+        self.cosyvoice2_batch_processor = None
+        self.campplus_batch_processor = None
+        if args.content_encoder == "cosyvoice2":
+            if not args.cosyvoice2_model_dir:
+                raise SystemExit("--content_encoder cosyvoice2 requires --cosyvoice2_model_dir")
+            print("Loading CosyVoice 2 speech_tokenizer_v2 (FSQ, 25 Hz) ...")
+            self.cosyvoice2_batch_processor = CosyVoice2BatchProcessor(
+                model_dir=args.cosyvoice2_model_dir,
+                voice_max_frames=self.voice_max_frames,
+                mel_frame_rate=args.sample_rate / args.hop_length,
+                device=self.device,
+                source_sr=args.sample_rate,
+            )
+            print(f"  CosyVoice 2 25Hz unit ids, padded width "
+                  f"{self.cosyvoice2_batch_processor.max_id_frames}")
+            # Speaker vectors MUST be campplus: the frozen flow decoder is conditioned on
+            # them, so ECAPA/WavLM would be off-manifold at decode time.
+            self.campplus_batch_processor = CampplusBatchProcessor(
+                model_dir=args.cosyvoice2_model_dir, source_sr=args.sample_rate)
+            shard_fields.update({
+                'shard_unit_ids': [],
+                'shard_feature_lengths': [],
+            })
+
         self.mimi_batch_processor = None
         if args.content_encoder == "mimi":
             print("Loading Mimi (kyutai/mimi) semantic codebook-0 as a discrete tokenizer ...")
@@ -789,7 +963,9 @@ class VoiceDatasetPreprocessor(Preprocessor):
             })
 
         self.speaker_feature_batch_processor = None
-        if args.compute_speaker_embeddings:
+        # On the CosyVoice 2 path campplus supersedes ECAPA/WavLM (the frozen flow decoder is
+        # conditioned on campplus vectors), so don't load a speaker model that will never run.
+        if args.compute_speaker_embeddings and self.campplus_batch_processor is None:
             # ECAPA/WavLM are 16kHz models -> build the speaker processor at 16kHz; on a
             # 24kHz (Vocos) run the process loop hands it a 16k-resampled waveform.
             _spk_sr = 16000 if self.args.sample_rate > 16000 else self.args.sample_rate
@@ -937,7 +1113,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
     
         # SIVE model
         sub_parser.add_argument("--content_encoder", type=str, default="sive",
-                            choices=["sive", "contentvec", "mimi"],
+                            choices=["sive", "contentvec", "mimi", "cosyvoice2"],
                             help="Which content encoder to store. 'sive' (default) = the custom SIVE checkpoint "
                                  "(--sive_checkpoint_path), continuous 'features'. 'contentvec' = off-the-shelf "
                                  "ContentVec (~50 Hz continuous 'features'; pair --hop_length 320 + 1x decoder). "
@@ -947,6 +1123,13 @@ class VoiceDatasetPreprocessor(Preprocessor):
                                  "codebook from scripts.data.voice.extract_mimi_codebook.")
         sub_parser.add_argument("--mimi_model", type=str, default="kyutai/mimi",
                             help="HF model id for the Mimi tokenizer (--content_encoder mimi).")
+        sub_parser.add_argument("--cosyvoice2_model_dir", type=str, default=None,
+                            help="CosyVoice 2 snapshot dir (--content_encoder cosyvoice2). Must "
+                                 "contain speech_tokenizer_v2.onnx and campplus.onnx. Emits "
+                                 "DISCRETE unit_ids at 25 Hz -- the ids the frozen flow decoder "
+                                 "consumes -- plus campplus-192 speaker embeddings, which is the "
+                                 "exact cache the world-voice runs read. Replaces the old "
+                                 "two-stage extract + assemble_cosyvoice_cache.py flow.")
         sub_parser.add_argument("--contentvec_dim", type=int, default=768, choices=[256, 768],
                             help="ContentVec feature width: 768 (last_hidden_state) or 256 (final_proj — same 95M "
                                  "model, matches SIVE's width; pair with the SMG's --sive_encoder_dim).")
@@ -986,7 +1169,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
                                      "synthesis). Pair with --sample_rate 24000 --hop_length 256; the "
                                      "waveform is treated as native 24kHz (so LibriTTS-R without "
                                      "downsampling, and Mimi skips its 16->24 upsample).")
-        sub_parser.add_argument("--voice_max_seconds", type=int, default=10,
+        sub_parser.add_argument("--voice_max_seconds", type=float, default=10,
                             help="Maximum audio length in seconds")
         sub_parser.add_argument("--min_audio_seconds", type=float, default=0.1,
                             help="Minimum audio length in seconds. Samples shorter than "
@@ -1125,8 +1308,8 @@ class VoiceDatasetPreprocessor(Preprocessor):
             self.shard_fields['shard_features'] = []
             self.shard_fields['shard_feature_lengths'] = []
 
-        if self.args.content_encoder == "mimi":
-            # Discrete unit ids (Mimi): [N, T'] int at 12.5Hz. Stored under "unit_ids"
+        if self.args.content_encoder in ("mimi", "cosyvoice2"):
+            # Discrete unit ids (Mimi 12.5Hz / CosyVoice 2 25Hz): [N, T'] int. Stored under "unit_ids"
             # (NOT "features") so the dataset embeds them rather than treating them as
             # continuous features / snapping them to a k-means codebook.
             max_id_len = max(u.shape[-1] for u in self.shard_fields['shard_unit_ids'])
@@ -1317,8 +1500,17 @@ class VoiceDatasetPreprocessor(Preprocessor):
                 features_result = self.contentvec_batch_processor.process_batch(waveforms, waveform_lengths, mel_spec_lengths)
             elif self.mimi_batch_processor is not None:
                 unit_ids_result = self.mimi_batch_processor.process_batch(waveforms, waveform_lengths, mel_spec_lengths)
+            elif self.cosyvoice2_batch_processor is not None:
+                unit_ids_result = self.cosyvoice2_batch_processor.process_batch(waveforms, waveform_lengths, mel_spec_lengths)
 
-            if self.args.compute_speaker_embeddings:
+            if self.args.compute_speaker_embeddings and self.campplus_batch_processor is not None:
+                # CosyVoice 2 path: campplus, not ECAPA/WavLM. The frozen flow decoder is
+                # conditioned on campplus-192 vectors, so any other encoder is off-manifold
+                # at decode -- this is not a quality preference, it is a compatibility
+                # requirement. Resampling to 16k happens inside the processor.
+                speaker_features_result = self.campplus_batch_processor.process_batch(
+                    waveforms, waveform_lengths, mel_spec_lengths)
+            elif self.args.compute_speaker_embeddings:
                 spk_wavs, spk_wav_lens = waveforms, waveform_lengths
                 spk_mels, spk_mel_lens = mel_specs, mel_spec_lengths
                 if self.args.sample_rate != 16000:
@@ -1534,10 +1726,12 @@ class VoiceDatasetPreprocessor(Preprocessor):
             "contentvec_model": self.args.contentvec_model if self.contentvec_batch_processor is not None else None,
             "encoder_dim": (self.sive_batch_processor.sive_model.config.encoder_dim if self.sive_batch_processor is not None
                             else self.contentvec_batch_processor.encoder_dim if self.contentvec_batch_processor is not None
-                            else self.mimi_batch_processor.encoder_dim if self.mimi_batch_processor is not None else 0),
+                            else self.mimi_batch_processor.encoder_dim if self.mimi_batch_processor is not None
+                            else self.cosyvoice2_batch_processor.encoder_dim if self.cosyvoice2_batch_processor is not None else 0),
             # ContentVec features are interpolated to the mel-frame count, so 1:1 with mel (stride 1).
             "total_stride": (self.sive_batch_processor.sive_model.conv_subsample.total_stride if self.sive_batch_processor is not None
-                             else 1 if self.contentvec_batch_processor is not None else 0),
+                             else 1 if self.contentvec_batch_processor is not None
+                             else 1 if self.cosyvoice2_batch_processor is not None else 0),
             "dataset_name": self.args.dataset_name,
             "dataset_config": self.args.dataset_config,
             "split": self.args.split,
