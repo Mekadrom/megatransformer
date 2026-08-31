@@ -56,6 +56,10 @@ def parse_args():
     p.add_argument("--guidance", type=float, default=3.0)
     p.add_argument("--gen_steps", type=int, default=8)
     p.add_argument("--max_prompts", type=int, default=None)
+    p.add_argument("--no_save_images", action="store_true",
+                   help="skip writing renders. Default SAVES them: a depth sweep is about whether "
+                        "the IMAGE changes, and CLIPScore moving by 0.02 does not tell you "
+                        "whether the failure mode changed. Renders are the arbiter here.")
     p.add_argument("--zimage_model", default="Tongyi-MAI/Z-Image-Turbo")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--device", default=None)
@@ -172,27 +176,57 @@ def main():
                         decode_outputs=False)
         return out["image_clip_seq_pred"][0].float(), int(out.get("recurrent_num_iterations", -1))
 
+    save_imgs = not args.no_save_images
+    rdir = os.path.join(args.output_dir, "renders")
+    if save_imgs:
+        os.makedirs(rdir, exist_ok=True)
+
     # ── GT reference per prompt (deterministic; one render each) ──
-    gt = {}
+    gt, gt_img = {}, {}
     for i, p in enumerate(prompts):
-        gt[p] = clipscore(render(gt_cond(p).float(), 10_000 + i), p)
+        im = render(gt_cond(p).float(), 10_000 + i)
+        gt[p] = clipscore(im, p)
+        if save_imgs:
+            gt_img[i] = im
+            im.save(os.path.join(rdir, f"p{i:02d}_GT.png"))
         print(f"  [GT {i+1}/{len(prompts)}] {gt[p]:.3f}  {p[:52]}", flush=True)
     print(f"GT mean {np.mean(list(gt.values())):.4f}", flush=True)
 
     rows = []
+    imgs_by_prompt = {}
     for it in args.iters:
         rb.mean_thinking_steps = int(it)
         for pi, p in enumerate(prompts):
             for s in range(args.n_samples):
                 seed = args.seed_base + 1000 * pi + s     # PAIRED across iteration counts
                 seq, used = pred_cond(p, seed)
-                sc = clipscore(render(seq, seed), p)
+                im = render(seq, seed)
+                sc = clipscore(im, p)
+                if save_imgs:
+                    im.save(os.path.join(rdir, f"p{pi:02d}_s{s}_it{it:02d}.png"))
+                    imgs_by_prompt.setdefault((pi, s), {})[it] = im
                 rows.append({"iters_req": it, "iters_used": used, "prompt": p, "prompt_i": pi,
                              "sample": s, "seed": seed, "clip": sc, "gt": gt[p],
                              "frac_of_gt": sc / max(gt[p], 1e-9)})
         got = sorted({r["iters_used"] for r in rows if r["iters_req"] == it})
         m = np.mean([r["clip"] for r in rows if r["iters_req"] == it])
         print(f"[iters={it:>2}] mean CLIP {m:.4f}   actual iterations observed: {got}", flush=True)
+
+    if save_imgs and imgs_by_prompt:
+        from PIL import Image, ImageDraw
+        TH = 320
+        for (pi, s_i), byit in sorted(imgs_by_prompt.items()):
+            cols = [byit[i] for i in args.iters if i in byit] + [gt_img.get(pi)]
+            cols = [c for c in cols if c is not None]
+            labels = [f"it={i}" for i in args.iters if i in byit] + ["GT"]
+            canvas = Image.new("RGB", (TH * len(cols), TH + 22), "white")
+            d = ImageDraw.Draw(canvas)
+            for k, (c, lab) in enumerate(zip(cols, labels)):
+                canvas.paste(c.resize((TH, TH)), (k * TH, 22))
+                d.text((k * TH + 6, 6), lab, fill="black")
+            canvas.save(os.path.join(rdir, f"montage_p{pi:02d}_s{s_i}.png"))
+        print(f"wrote {len(imgs_by_prompt)} per-prompt montages (columns = iteration counts, "
+              f"rightmost = GT) to {rdir}", flush=True)
 
     rb.exit_criteria, rb.mean_thinking_steps = saved_exit, saved_steps
     with open(os.path.join(args.output_dir, "iteration_sweep.json"), "w") as f:
