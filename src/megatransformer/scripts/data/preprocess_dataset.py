@@ -325,6 +325,23 @@ def main():
     max_hours_budget = getattr(args, "max_hours", None)
     max_seconds_budget = max_hours_budget * 3600 if max_hours_budget else None
 
+    def _postfix(seen=None):
+        """Progress postfix. Surfaces HOURS COLLECTED, which is the quantity that actually
+        decides when an audio run is done -- `saved` counts utterances, and utterance length
+        varies enough between corpora (LibriTTS-R 4.5s vs LibriHeavy <=10s at 7.5s) that a
+        sample count says little about corpus size. With --max_hours set it shows progress
+        toward the budget, so the ETA is readable without arithmetic."""
+        d = {}
+        if seen is not None:
+            d["seen"] = seen
+        d["skipped"] = sum(stats["skipped"].values())
+        secs = stats.get("seconds_saved", 0.0) or 0.0
+        # 2dp on the collected side: at 1dp a multi-hour run reads 0.0 for its first
+        # several minutes, which looks like the counter is broken.
+        d["hours"] = (f"{secs/3600:.2f}/{max_hours_budget:g}" if max_hours_budget
+                      else f"{secs/3600:.2f}")
+        return d
+
     preprocessor: Preprocessor = get_preprocessor(args.command, args, dataset, output_dir, shard_fields, batch_accumulators, stats, device)
 
     # preprocessor may modify dataset (e.g., map speaker IDs)
@@ -372,10 +389,10 @@ def main():
                 delta = stats["saved"] - _last_saved
                 if delta:
                     _last_saved = stats["saved"]
-                    pbar.set_postfix(seen=idx + 1, skipped=sum(stats["skipped"].values()), refresh=False)
+                    pbar.set_postfix(**_postfix(seen=idx + 1), refresh=False)
                     pbar.update(delta)
                 elif (idx & 0x3FF) == 0:
-                    pbar.set_postfix(seen=idx + 1, skipped=sum(stats["skipped"].values()), refresh=False)
+                    pbar.set_postfix(**_postfix(seen=idx + 1), refresh=False)
                     pbar.update(0)
     else:
         # Standard mode: random access by index
@@ -399,6 +416,8 @@ def main():
                 example = dataset[idx]
                 if preprocessor.preprocess_example(example):
                     stats["processed"] += 1
+                if (idx & 0x3F) == 0:
+                    pbar.set_postfix(**_postfix(), refresh=False)
                 pbar.update(1)
             except Exception as e:
                 import traceback
