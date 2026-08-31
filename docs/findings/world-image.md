@@ -468,6 +468,95 @@ Also note ~96% of the conditioning arrives in iteration 0 — 23+ further iterat
 this is a transient or a trend matters for recurrent depth generally; re-measure at 20k and 40k
 before drawing any conclusion for the refinement thesis.
 
+### RECURRENT DEPTH: monotone but SATURATED BY 8 iterations
+`scripts_local/iteration_sweep.py` on the lr1e-4 run's ckpt-46000, 20 UNSEEN prompts x 2 PAIRED
+draws (same flow seed at every depth), w=3, KL early-exit DISABLED so the counts are exact:
+
+| iterations | 1 | 2 | 4 | 8 | 16 | 32 | GT |
+|---|---|---|---|---|---|---|---|
+| CLIPScore | 0.3196 | 0.3281 | 0.3310 | 0.3329 | 0.3332 | **0.3334** | 0.3613 |
+| delta | — | +0.0085 | +0.0029 | +0.0019 | +0.0003 | +0.0002 | |
+| % of per-prompt GT | 88.9 | 91.1 | 92.0 | 92.5 | 92.6 | 92.7 | |
+
+Each octave buys about half the previous one. **8 -> 32 iterations is worth +0.0005 for 4x the
+trunk compute** — far below this eval's noise. The knee is at 8; the KL exit already converges
+near 13 unprompted.
+⭐ **This RECONCILES the compression probe rather than contradicting it.** That probe found
+cond/const flat from iteration 0 — conditioning MAGNITUDE saturates immediately — yet the render
+improves through 8. So iterations after the first change the conditioning's DIRECTION usefully
+while its magnitude stays put; the probe measured the wrong quantity to see it.
+⚠️ **Only 12/20 prompts improve from 1->32** (median +0.008, range -0.020 to +0.089). The smooth
+mean averages over prompts that behave quite differently; a third are flat or slightly worse.
+⚠️ A 3-prompt x 1-draw smoke test of the same script said 1 iteration BEAT 4 (0.337 vs 0.317).
+The full 20-prompt run reverses it cleanly. This probe needs ~20 prompts before its ORDERING is
+trustworthy, not just its magnitude.
+⭐ **OPEN, and the largest efficiency lever on the board:** this measured INFERENCE depth on a
+model TRAINED at mean_thinking_steps=32 (Huginn samples depth, so it is explicitly trained to be
+depth-robust). It does NOT establish that TRAINING at 8 gives the same model — a shallow-trained
+recurrent model is generally a shallow model, not a shallow-and-deep one. `backprop_depth` is
+already 8, so gradients only flow through <=8 steps either way; what changes is the forward state
+those gradients see. The trunk is the throughput bottleneck ("launch-bound, 32 iters small kernels
+@ batch8"), so if training at 8 holds up it is a ~4x speedup on every future image run — worth
+more than any of the +0.02 quality levers queued. One arm at mean_thinking_steps=8, matched steps.
+
+### LR 1e-4 x3: 5x FASTER to the same plateau, not a higher one
+`zimage_qwen_t3_xskip_lr1e-4_1e-4_1e-4_cosine_0` (lr/lr_dit/lr_flow all 1e-4) vs the original
+from-scratch run (1e-5 / 7e-5 / 1e-4), same config otherwise. No loss spikes or NaN — the failure
+[[project_peak_lr_default]] warns about for 1e-4 did not appear.
+
+| milestone | prev run | lr1e-4 run |
+|---|---|---|
+| pass point head (0.266) | ~21k | **9k** |
+| pass point+gain (0.283) | ~32k | **11k** |
+| reach ~0.32 | ~100k (its final) | **20k** |
+| @50k | 0.330 / 0.274 | 0.337 / 0.275 |
+| @82k | — | 0.347 / 0.308 |
+
+⭐ **The early advantage is enormous and then vanishes**: 2-5x faster to any given level up to ~30k,
+but by 50k the two runs are within 0.007 — the higher LR bought SPEED TO a plateau, not a higher
+plateau. Both settle near 0.33-0.35.
+⭐ Its UNGUIDED column is the standout: 0.308 at 82k vs the staged lineage's 0.268 and the previous
+run's 0.245. The guided/unguided gap narrowed from ~0.09 early to ~0.04, i.e. it depends on
+guidance less — consistent with the "peak-w drifts left as conditioning strengthens" prediction,
+here as a run-level effect. **A guidance re-sweep on this run would likely find its optimum below
+w=3, so the w=3 column understates it.**
+
+### The three warm-start finetune arms are ALL NULL (control included)
+Warm restarts from `t3_xskip_0/ckpt-100000`, 3000 steps, identical CLI, one config field apart.
+Late-window means (1500-3000, n=4):
+
+| arm | w=3.0 | vs control | w=1.0 | vs control |
+|---|---|---|---|---|
+| `control` (nothing changed) | 0.3255 | — | 0.2505 | — |
+| `offset` (lever D) | 0.3245 | -0.0010 | 0.2510 | +0.0005 |
+| `auxdetach` | 0.3235 | -0.0020 | 0.2402 | **-0.0103** |
+
+⛔ **LEVER D DOES NOTHING.** The learned per-position offset — built on a measured mechanism
+(conditioning at ~10% of a norm-83 constant; a LayerNorm provably cannot remove a per-position
+vector; measured at ckpt-85000 the existing norm takes cond/const only 0.0991 -> 0.1136) — lands
+on top of the control at both guidance settings. A correct mechanism story is not a prediction.
+⚠️ `auxdetach` is -0.0103 unguided, the only reading outside noise and NEGATIVE: detaching the
+0.1-weight aux MSE COSTS a little unguided quality, so that term is mildly load-bearing as a
+training signal, contradicting the "purely diagnostic" reading of its own code comment. One seed.
+⭐ **THE CONTROL EARNED ITS SLOT.** Without it, `offset` at 0.3245 against the source's 0.322 reads
+as a small win; against the control it is -0.001. Never run a warm-start arm without one — the
+restart alone is worth ~+0.009.
+
+### Was the MSE baseline just under-trained? (whiten continuation, IN FLIGHT)
+`whiten_0` was stopped at 20k while the flow runs went to 100k, and the flow runs reach R^2 0.787
+against its 0.725 — backwards, since R^2 is what the point head directly optimises and the flow
+head carries only as a 0.1-weight auxiliary. So "flow beats MSE" rested on a 20k baseline vs 100k
+arms. `zimage_qwen_whiten_cont_0` continues it (warm restart; a true optimiser resume was
+impossible, see the gotcha below).
+**First 12 checkpoints (steps 21k-32k): 0.262, 0.279, 0.272, 0.262, 0.269, 0.264, 0.266, 0.273,
+0.272, 0.283, 0.263, 0.267 — mean 0.269 vs `whiten_0`'s 0.266. FLAT.** Two apparent highs (0.279
+@22k, 0.283 @30k) both fell back the next checkpoint.
+So far this SUPPORTS the original stopping decision ("plateaued 16k-20k, loss dropping steeply but
+renders frozen") and is another instance of the loss/render anti-correlation: more training buys
+feature accuracy the decoder does not use. ⚠️ Only 12k of an 80k run; the flow runs took ~20k to
+show their trajectory. The sharper test is whether R^2 climbs to ~0.787 while render stays at
+0.266 — that would demonstrate the decoupling directly.
+
 ### Untested levers for the gen-query compression, cheapest first
 - **Cap the iterations** (~18). Free, inference-only: `max_iterations_override` is plumbed through
   `recurrent.forward` and `world_model.py:1918`, and `multimodal_chat.py:129` exposes
@@ -516,6 +605,39 @@ a learned head can amplify a small direction. The accurate claim is low SNR plus
 tax, and that a SCALAR at the output cannot fix it (the gamma sweep).
 
 ---
+
+## PRACTICAL GOTCHAS (world-image session)
+
+### Old checkpoints can no longer be optimiser-resumed
+Resuming `whiten_0/ckpt-20000` with the current code fails:
+`ValueError: loaded state dict contains a parameter group that doesn't match the size of
+optimizer's group`. The saved optimiser has **4** groups (23/44/56/95 tensors — a decay x DiT
+split); `create_optimizer` now builds **2** (71/203). The model also gained parameters since
+(`contrastive_proj`, +4 in image_generator, +66 elsewhere). Model weights still load fine
+(`load_model` defaults to `strict=False`), so a WARM RESTART works — but the optimiser moments
+and the schedule position are gone, which reintroduces the ~+0.009 restart confound.
+⚠️ **And `--fresh_schedule` restarts HF's `global_step` at 0, so checkpoints are written as
+`checkpoint-1000`, `checkpoint-2000`… — straight OVER the original run's checkpoints if you reuse
+its run_name.** `whiten_0` is the baseline every matched-step comparison rests on; that would have
+destroyed it. ALWAYS give a fresh_schedule continuation a NEW run name. `whiten_cont_0`'s
+checkpoint N is therefore actual step N+20000.
+
+### Dataset scale
+**2,639,029 train captions** (165 shards), 25,010 held-out COCO val. At 100k steps x batch 8 x
+grad-accum 8 = 6.4M samples, a full run sees **2.43 epochs**. For reference ELLA — the closest
+published analogue, mapping LLM features to a frozen diffusion model's conditioning — used ~30M
+image-text pairs, ~10x this. Caption QUALITY is already flagged as a limiter in
+[[project_image_caption_quality]].
+
+### The flow head is emphatically NOT a disguised deterministic map
+Two independent measurements. Cosine distance between two sampler draws of the SAME prompt
+(`trunk_compression_probe`, ckpt-11000): **d_seed 0.881 at w=1**, 0.767 at w=3, 0.728 at w=4.5 —
+against d_other (different prompts, same seed) of 0.131 / 0.393 / 0.471. Unguided, the SEED moves
+the conditioning 7x more than changing the prompt entirely. And the shrinkage probe on the flow
+output reports alpha 0.061 / R^2 -0.659, which is what a point-estimate metric says about a
+genuine sample. Meanwhile the CLIPScore across those same seeds varies by only ~+-0.03 (the
+`within-prompt sd` on every eval line IS the across-seed spread). **Different samples, similarly
+good** — a working sampler.
 
 ## RETRACTED
 
