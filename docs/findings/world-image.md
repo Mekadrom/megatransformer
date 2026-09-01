@@ -521,6 +521,36 @@ guidance less — consistent with the "peak-w drifts left as conditioning streng
 here as a run-level effect. **A guidance re-sweep on this run would likely find its optimum below
 w=3, so the w=3 column understates it.**
 
+**RUN COMPLETE 2026-09-01, 100k/100k, all 100 checkpoints evaluated** (8-prompt committed probe,
+N=4, GT ceiling 0.368). Final: w=3 last-10-ckpt mean **0.3475**, best 0.351 @97k; w=1 last-10 mean
+**0.3047**, best 0.311 @90k.
+
+⚠️ **CORRECTION to the "plateau" reading above — at block resolution the run never stopped
+improving.** Per-checkpoint noise (individual points bounce over a ~0.02 band) hid a slow monotone
+climb that only appears when 10 checkpoints are averaged:
+
+| steps | w=1.0 block mean | w=3.0 block mean |
+|---|---|---|
+| 21000-30000 | 0.2631 | 0.3261 |
+| 31000-40000 | 0.2753 | 0.3305 |
+| 41000-50000 | 0.2788 | 0.3359 |
+| 51000-60000 | 0.2820 | 0.3345 |
+| 61000-70000 | 0.2903 | 0.3376 |
+| 71000-80000 | 0.2985 | 0.3424 |
+| 81000-90000 | 0.3029 | 0.3453 |
+| 91000-100000 | **0.3047** | **0.3475** |
+
+Monotone in w=1 throughout, and in w=3 but for one -0.0014 step. 30k->100k is **+0.042 (w=1)** and
+**+0.021 (w=3)** — an order of magnitude larger than the block-mean standard error (~0.002). The
+increments decelerate (+0.0018 / +0.0022 in the final block) but had NOT reached zero when the
+schedule ended: 100k steps was not enough to converge this arm.
+⚠️ **Confounded with the cosine tail.** The LR anneals to ~0 at 100k, so the late climb cannot be
+separated from an annealing bump. Distinguishing them needs a WSD or held-LR arm — the same
+untested lever [[project_world_tts_ceiling_noise_floor]] flags for world-TTS.
+⚠️ I called this run "flat" from single checkpoints several times while it was live. That was
+wrong at block resolution and is the third premature trend call of this session; **read block
+means, not consecutive checkpoints, on an eval whose per-point noise is 10x its per-10k drift.**
+
 ### The three warm-start finetune arms are ALL NULL (control included)
 Warm restarts from `t3_xskip_0/ckpt-100000`, 3000 steps, identical CLI, one config field apart.
 Late-window means (1500-3000, n=4):
