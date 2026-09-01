@@ -3,18 +3,49 @@
 Speech synthesis from the recurrent trunk into CosyVoice 2 speech tokens, decoded by the
 frozen CosyVoice 2 flow decoder. Formerly "world-tts".
 
-⛔ **THE LibriTTS-R CACHE IS GONE (2026-08-30).**
-`cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2` was deleted ahead of a full
-re-preprocess. Every eval script (`cosyvoice_wer_eval.py`, `world_voice_ar_diagnostics.py`,
-`voice_render_length_audit.py`, ...) resolves `--cache_dir <...>/val`, so **no eval can run
-until a new val cache exists**. Building one is the prerequisite for measuring anything,
-including `ar_cos_0`'s finished 40000 checkpoint, which is currently UNMEASURED and is the
-open question on which LR schedule wins.
+✅ **VAL CACHE RESTORED (2026-08-31) — evals are unblocked.**
+The LibriTTS-R cache (`libritts_r_cosyvoice2_smollm2`) was deleted 2026-08-30 and is NOT
+coming back. Its replacement is **LibriHeavy `large`, 1,985.5 h**, at
+`cached_datasets/Mekadrom/libriheavy_cosyvoice2_smollm2/{train,val}`.
 
-Replacement in progress: LibriHeavy `large` -> ~2000 h via the new one-command path
-(`preprocess_dataset voice --content_encoder cosyvoice2`). Note the corpus differs — kept
-segments average 7.46 s against LibriTTS-R's 4.5 s — so length-sensitive results
-(hyp/ref, budget-capping, EOV rate) are NOT directly comparable across the boundary.
+⚠️ **`train`/`val` are SUBDIRECTORIES, not `_train`/`_val` siblings.** `--voice_cache_dir`
+appends `_train`/`_val` (`train.py:216`) and will NOT resolve this layout — pass
+`--voice_train_cache_dir .../libriheavy_cosyvoice2_smollm2/train` and
+`--voice_val_cache_dir .../libriheavy_cosyvoice2_smollm2/val` explicitly. Eval scripts that
+take `--cache_dir <...>/val` point straight at the val dir and are fine.
+
+| | value |
+|---|---|
+| train | 480 shards, 959,663 utts |
+| val | 3 shards, 6,000 utts (utterance-disjoint; **speakers overlap train**) |
+| total | 965,663 utts, 1,985.5 h, 178.7M voice tokens, 2,465 speakers |
+| tokens/param | **~1.40** (was 0.078 on the 146 h corpus — 18x) |
+
+Built by 3 parallel `preprocess_dataset voice --content_encoder cosyvoice2` workers over
+disjoint parquet ranges, then `merge_shards --shuffle` (global shuffle across all three —
+the worker dirs had disjoint speaker pools of 940/1,167/358, and `ShardAwareSampler` groups
+batches by shard, so an unshuffled merge would have made every batch one narrow speaker
+pool), then `stat-shards --speaker_id_column speaker_ids --additional_shard_dirs <val>` to
+densify speaker ids to [0,2464] across both splits jointly.
+
+**Verified before the `train_p*` sources were deleted** (2026-08-31): per-sample fingerprint
+multiset over (unit_ids ⊕ token_ids ⊕ speaker_emb ⊕ speaker_id) is IDENTICAL to the sources;
+train∩val fingerprint overlap 0; 0 unreadable shards / NaN embeddings / all-zero embeddings /
+bad lengths / nonzero padding past `feature_lengths`. Aggregate-only checks would not have
+caught a field-permutation bug, which is why the fingerprint check was run.
+
+Two quirks, neither a defect: the corpus contains **26 exact-duplicate utterances**
+(0.003%, present in the LibriHeavy source, all pairs landed within one split); and
+`token_ids` width is a uniform 71 post-merge (merge pads to the per-output-shard max),
+costing ~130 MB — `text_lengths` preserves truth.
+
+⚠️ **NOT comparable across the corpus boundary.** Kept LibriHeavy segments average 7.46 s
+against LibriTTS-R's 4.5 s, so length-sensitive results (hyp/ref ratio, budget-capping rate,
+EOV rate) break at 2026-08-30. `--max_speaker_id 2338` was a LibriSpeech filter and is
+meaningless here.
+
+**Still UNMEASURED:** `ar_cos_0`'s finished 40000 checkpoint — the open question on which LR
+schedule wins. It was blocked on this cache; it no longer is.
 
 📁 **RUN PATHS MOVED 2026-08-26.** Runs now live in `runs/world_voice/` (split out from
 `runs/world/`, which mixed image and voice), and the redundant `world_tts_` / `world_voice_`
