@@ -2395,6 +2395,7 @@ def load_model(args, device='cuda'):
                       getattr(args, 'voice_cfg_text_dropout_prob', 0.0) > 0.0 or
                       getattr(args, 'mean_thinking_steps', None) is not None or
                       getattr(args, 'image_contrastive_queue_size', None) is not None or
+                      getattr(args, 'image_flow_aux_mse_weight', None) is not None or
                       getattr(args, 'voice_stochastic_output', False) or
                       getattr(args, 'use_mrope', False))
     if needs_override:
@@ -2484,6 +2485,17 @@ def load_model(args, device='cuda'):
                 raise SystemExit("--image_contrastive_queue_size requires a Z-Image adapter config "
                                  f"(got {type(config.image_coda_config).__name__}).")
             config.image_coda_config.contrastive_queue_size = int(args.image_contrastive_queue_size)
+        if getattr(args, 'image_flow_aux_mse_weight', None) is not None:
+            # Weight of the point-head MSE that rides alongside the flow objective. Its gradient
+            # runs seq_head -> cross_dec -> self_enc -> TRUNK, so this is not a pure diagnostic
+            # knob: 0.0 removes a real training signal into the trunk, not just a readout.
+            # Pre-construction because the adapter copies the value into an attribute in its
+            # __init__ (zimage_adapter.py:169) -- patching the config afterwards would be inert.
+            # `is not None`, NOT truthiness: 0.0 is the whole point of the flag.
+            if not isinstance(config.image_coda_config, ZImageAdapterConfig):
+                raise SystemExit("--image_flow_aux_mse_weight requires a Z-Image adapter config "
+                                 f"(got {type(config.image_coda_config).__name__}).")
+            config.image_coda_config.flow_aux_mse_weight = float(args.image_flow_aux_mse_weight)
         if getattr(args, 'voice_predict_f0', False):
             config.voice_coda_config.predict_f0 = True
         if getattr(args, 'voice_dedup', False):
@@ -2865,6 +2877,15 @@ def add_cli_args(subparsers):
                                  "(~1e-4) while the Q-Former beside it stays slow; both live under "
                                  "image_generator.*, so --lr_dit alone cannot separate them. "
                                  "Defaults to --lr_dit. Follows the DiT LR schedule.")
+    sub_parser.add_argument("--image_flow_aux_mse_weight", type=float, default=None,
+                            help="Z-Image adapter: override flow_aux_mse_weight (config default 0.1). "
+                                 "Set 0.0 to train a PURE sampler. seq_head then gets ZERO gradient and "
+                                 "stays at its init, so alpha/R^2 become a frozen random readout of "
+                                 "a still-moving representation -- not comparable to the regression "
+                                 "runs any more. NOTE this is a "
+                                 "different ablation from flow_aux_mse_detach, which keeps the term "
+                                 "but stops its gradient reaching the trunk. Ignored unless the coda "
+                                 "is a Z-Image adapter config.")
     sub_parser.add_argument("--image_contrastive_queue_size", type=int, default=None,
                             help="Z-Image adapter Tier-1: size of the MoCo-style memory queue of past "
                                  "Qwen3 targets used as extra InfoNCE negatives (overrides the config; "
