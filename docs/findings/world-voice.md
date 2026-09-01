@@ -69,12 +69,34 @@ convention the file declares at its top rather than assuming.
 CosyVoice 2 FSQ tokens (25 Hz, vocab 6562, EOV = 6561) -> frozen flow decoder + campplus
 speaker embedding -> audio. Only the trunk and its per-mode adapters train.
 
-**Data:** `cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2` — 118,102 train / 4,708 val,
-<=10 s, 25 Hz, feature_channels 512. Holds `unit_ids` + SmolLM2 text + campplus-192 speaker
-embeddings; no mel, no F0. Codebook is CosyVoice 2's own `flow.input_embedding` (6561x512) at
-`val/cosyvoice2_codebook.pt` — the flow decoder's input table, so predicted ids index straight
-into what the decoder expects. Utterance lengths: min 25, median 102, mean 112, p90 204
-frames; 0.16% hit the 250 cap.
+**Data (current):** `cached_datasets/Mekadrom/libriheavy_cosyvoice2_smollm2/{train,val}` —
+959,663 train / 6,000 val, <=10 s, 25 Hz, feature_channels 512. Holds `unit_ids` +
+SmolLM2 `token_ids` + campplus-192 speaker embeddings; no mel, no F0. See the restored-cache
+block at the top for the full build + verification record.
+
+**Codebook:** `val/cosyvoice2_codebook.pt` (6561 x 512) is CosyVoice 2's own
+`flow.input_embedding.weight`, the frozen decoder's input table — so a predicted id indexes
+straight into what the decoder expects. It is NOT fit from data, so it regenerates exactly
+from the model snapshot: `scripts_local/extract_cosyvoice2_codebook.py` (written 2026-08-31,
+after the original was lost with the LibriTTS-R cache). Bound ids by the codebook's 6561 rows,
+never by `flow.input_size` (512, the feature width). **EOV = 6561 sits OUTSIDE the codebook**;
+stored `unit_ids` span exactly [0, 6560].
+
+⚠️ **`--save_text` defaults to FALSE and its absence fails SILENTLY (found 2026-08-31).**
+The LibriHeavy cache was built without it, so the shards carry `token_ids` but no raw `text`.
+`world/dataset.py:405` only sets `voice_text` when `"text" in shard`, and
+`cosyvoice_wer_eval.py:129` does `ref = str(s.get("voice_voice_text","")).strip()` then
+`continue`s on empty — so **every sample is skipped and the eval reports zero rows rather
+than erroring**. Add `--save_text` to any future voice preprocessing run. For an existing
+cache the transcripts are recoverable exactly, no re-preprocessing needed:
+`scripts_local/backfill_shard_text.py` decodes `token_ids[:text_lengths]` with SmolLM2
+(verified `re-tokenize(decode(ids)) == ids` on 100% of 2,000 val rows; the old cache stored
+the NORMALIZED transcript too, so this reproduces it rather than approximating it).
+
+**Old data (pre-2026-08-30, deleted):** `libritts_r_cosyvoice2_smollm2` — 118,102 train /
+4,708 val. Utterance lengths: min 25, median 102, mean 112, p90 204 frames; 0.16% hit the
+250 cap. Numbers measured against it are length-incomparable with LibriHeavy (7.46 s mean
+segment vs 4.5 s).
 
 Provenance note: entries dated before 2026-08-21 are recorded from prior sessions of this
 project. Entries dated 2026-08-21 were measured in that session. Contamination status for the
