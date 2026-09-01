@@ -572,7 +572,7 @@ training signal, contradicting the "purely diagnostic" reading of its own code c
 as a small win; against the control it is -0.001. Never run a warm-start arm without one — the
 restart alone is worth ~+0.009.
 
-### Was the MSE baseline just under-trained? (whiten continuation, IN FLIGHT)
+### Was the MSE baseline just under-trained? NO -- and the decoupling test PASSED
 `whiten_0` was stopped at 20k while the flow runs went to 100k, and the flow runs reach R^2 0.787
 against its 0.725 — backwards, since R^2 is what the point head directly optimises and the flow
 head carries only as a 0.1-weight auxiliary. So "flow beats MSE" rested on a 20k baseline vs 100k
@@ -581,11 +581,29 @@ impossible, see the gotcha below).
 **First 12 checkpoints (steps 21k-32k): 0.262, 0.279, 0.272, 0.262, 0.269, 0.264, 0.266, 0.273,
 0.272, 0.283, 0.263, 0.267 — mean 0.269 vs `whiten_0`'s 0.266. FLAT.** Two apparent highs (0.279
 @22k, 0.283 @30k) both fell back the next checkpoint.
-So far this SUPPORTS the original stopping decision ("plateaued 16k-20k, loss dropping steeply but
-renders frozen") and is another instance of the loss/render anti-correlation: more training buys
-feature accuracy the decoder does not use. ⚠️ Only 12k of an 80k run; the flow runs took ~20k to
-show their trajectory. The sharper test is whether R^2 climbs to ~0.787 while render stays at
-0.266 — that would demonstrate the decoupling directly.
+⭐⭐⭐ **RESOLVED 2026-09-01 — the sharper test this entry asked for has now RUN, and it separates
+cleanly. R^2 climbed while the render did not move.**
+
+| | steps 21k-38k (18 evaluated ckpts) |
+|---|---|
+| eval MSE (whitened) | **0.2734 -> 0.2438** (min 0.2399 @50k) |
+| => R^2 = 1 - MSE | **0.727 -> 0.760** (min-MSE ckpt: 0.760) |
+| CLIPScore, block means of 6 | 0.2680 -> 0.2707 -> **0.2715** |
+| CLIPScore drift vs block-mean SE | **+0.0035 vs SE 0.0036 = 1.0 SE** |
+
+The point head spent 30k steps closing most of the R^2 gap it was launched to close (0.727 -> 0.760,
+against the flow runs' 0.787) and bought **exactly nothing** in render: 1 SE of drift, and the run
+sits at 0.270 vs `whiten_0`'s 0.266. The original stopping decision at 20k was correct.
+⭐ **This is the cleanest demonstration in the project of the loss/render decoupling** — same
+model, same data, same eval, one axis moving and the other flat, no gain knob or arm swap in
+between. It generalises the [[project_dispersion_over_smoothing]] result from "the gain axis" to
+"the training axis": R^2 is not a proxy for render quality for a POINT head, in either direction.
+⛔ **Therefore "flow beats MSE" does NOT rest on a 20k-vs-100k artefact.** The worry that opened
+this entry is retired: the baseline is trained out, not under-trained.
+⚠️ Do not read this as "R^2 never matters" — it is a statement about a point head near its own
+ceiling, one seed, 8-prompt probe. What it rules out is the under-training explanation.
+Per-checkpoint eval was dropped to stride 5000 on 2026-09-01; there is nothing left to resolve at
+1000-step resolution.
 
 ### Untested levers for the gen-query compression, cheapest first
 - **Cap the iterations** (~18). Free, inference-only: `max_iterations_override` is plumbed through
