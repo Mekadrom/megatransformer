@@ -157,6 +157,29 @@ some prompts — 6/48 still budget-cap, so both failure modes coexist), and `adj
 0.0093 is well BELOW GT's 0.0792, i.e. RAS bans legitimate repeats. Untested: `--ras_tau 0.2`
 or a shorter window.
 
+**Per-utterance render lengths** (`eval_output/world_voice_ras_ab/audio_ck40000/`, n=8, frames):
+
+| # | GT | RAS | plain | plain/GT |
+|---|---|---|---|---|
+| 0 | 130 | 155 | 245 | 1.88x |
+| 1 | 246 | 250 | 250 | 1.02x |
+| 2 | 155 | **62** | 250 | 1.61x |
+| 3 | 136 | 96 | 244 | 1.79x |
+| 4 | 156 | 207 | 248 | 1.59x |
+| 5 | 205 | 162 | 231 | 1.13x |
+| 6 | 172 | **39** | 250 | 1.45x |
+| 7 | 242 | 235 | 250 | 1.03x |
+
+**Plain hits 231-250 on ALL 8** regardless of whether the text wants 130 or 246 frames — it does
+not track text length at all, it runs until the budget stops it. This is the single clearest
+statement of the "dragging" the ear reports.
+
+⭐ **The bimodal "either it works or it doesn't" is RAS's failure mode, not plain's.** With RAS,
+6/8 are reasonable but #6 gives 39 frames for text needing 172 and #2 gives 62 for 155 — TRUNCATED,
+not dragged. Plain never truncates (it never terminates at all). So enabling RAS trades a
+guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
+arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
+
 **Training health at 40k:** eval/loss fell monotonically at all 19 eval points, 0.5822 -> 0.4268,
 unit accuracy 0.1202 -> 0.1830. No overfitting anywhere — the 1985 h corpus removed the epoch-8
 wall the 146 h corpus hit. Gains decelerate log-linearly (10k->20k +0.0227 acc; 30k->40k +0.0075).
