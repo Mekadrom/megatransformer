@@ -104,6 +104,63 @@ older ones is in its own section below — read it before trusting any pre-08-21
 
 ---
 
+## Sampling: RAS w=10 is the whole fix for "dragged-out" speech (2026-09-02, ESTABLISHED)
+
+`cosyvoice2_smollm2_libriheavy_ar_flat_lr_ema_0` **checkpoint-40000**, val n=128 TF / gen_n=48,
+three arms differing ONLY in the sampler. Reports: `eval_output/world_voice_ras_ab/{A,B,C}/report.md`.
+
+⚠️ **`--viz_voice_ras_win` DEFAULTS TO 0**, so training-time TB renders have RAS **OFF** unless
+the run passes it. Every render judged by ear before this date was arm A. This is not a
+model failure being heard, it is an unset flag.
+
+| metric | A: T=0.6 no RAS | **B: T=0.6 RAS w=10 tau=0.1** | C: T=1.0 top-p 0.8 | GT |
+|---|---|---|---|---|
+| adj_repeat_rate | 0.4506 | **0.0093** | 0.1734 | 0.0792 |
+| longest_run | 179 | **4** | 79 | 18 |
+| len_mean | 229.7 | **173.5** | 193.8 | 179.7 |
+| EOV fired /48 | 18 | **42** | 40 | — |
+| budget-capped /48 | 30 | **6** | 8 | — |
+| unit_entropy_bits | 7.51 | **10.22** | 9.63 | 10.40 |
+| distinct_bigram_ratio | 0.478 | **0.872** | 0.755 | 0.869 |
+| text->length r | 0.076 | 0.465 | 0.570 | 0.744 |
+
+`longest_run 179` at 25 Hz = **7.2 s of one repeated unit** — that IS the "dragging words out"
+the ear reports. RAS takes length from +28% over GT to -3% and termination from 18/48 to 42/48.
+Nucleus (C) is strictly worse than RAS on every degeneration axis.
+
+**RAS fixes over-length HERE, contradicting the prior-era note** in `render_distill_audio.py`'s
+docstring ("RAS fixed repetition ... but did NOT fix over-length, 2.54x -> 2.32x GT"). That
+observation belongs to the pre-LibriHeavy era/checkpoint; do not carry it forward. Not marked
+RETRACTED because it was never a findings entry — but treat the docstring as era-scoped.
+
+**Position-resolved repeat is FRONT-LOADED at this checkpoint, not rising** (A: 0.569 / 0.362 /
+0.432 / 0.453 over frame buckets 1-32 / 32-64 / 64-128 / 128+). Per the probe's own rubric that
+means "repetitive from the start" = conditioning, NOT exposure bias. The old LibriTTS-R run at
+step 11076 WAS rising (0.064 -> 0.330); that diagnosis does not transfer. Arm C's profile does
+rise (0.187 / 0.087 / 0.133 / 0.231) — nucleus permits the late drift RAS blocks outright.
+
+⭐ **The wall is text conditioning, and sampling cannot touch it.** Teacher-forced metrics are
+IDENTICAL across all three arms (acc_real 0.1769 / 0.1765 / 0.1763 — the clean control proving
+only the sampler varied):
+
+| | value | teacher ceiling |
+|---|---|---|
+| early_text_delta | **+0.0264** [+0.0078, +0.0459] | +0.0538 [+0.0480, +0.0597] |
+| text-attributed fraction | **0.344** | 0.463 |
+
+RAS makes output SOUND right — length, diversity, termination all land on GT — while text->content
+binding stays at ~half the teacher's. Judging by render alone will now hide this, because the
+renders improve a lot without this number moving at all.
+
+Two open items on B: `len_min` 4 frames vs GT 74 (RAS may convert droning into premature EOV on
+some prompts — 6/48 still budget-cap, so both failure modes coexist), and `adj_repeat_rate`
+0.0093 is well BELOW GT's 0.0792, i.e. RAS bans legitimate repeats. Untested: `--ras_tau 0.2`
+or a shorter window.
+
+**Training health at 40k:** eval/loss fell monotonically at all 19 eval points, 0.5822 -> 0.4268,
+unit accuracy 0.1202 -> 0.1830. No overfitting anywhere — the 1985 h corpus removed the epoch-8
+wall the 146 h corpus hit. Gains decelerate log-linearly (10k->20k +0.0227 acc; 30k->40k +0.0075).
+
 ## Reference numbers
 
 Quote results against these rather than against adjectives.
