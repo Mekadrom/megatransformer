@@ -180,6 +180,46 @@ not dragged. Plain never truncates (it never terminates at all). So enabling RAS
 guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
 arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
 
+### EMA-vs-raw probe: noise reduction does NOT fix free-running (2026-09-02, ESTABLISHED)
+
+ck40000 EMA shadow (decay 0.9995, ~2k-step horizon) materialized into a loadable checkpoint
+(`scripts_local/materialize_ema_checkpoint.py`) and run through the SAME arm-A regime
+(T=0.6, RAS off). EMA = "same weights, less optimizer noise", so this is a cheap proxy for
+what an LR anneal would buy. Report: `eval_output/world_voice_ema_probe/EMA_t06_noras/`.
+
+| | raw | EMA | RAS (arm B) | GT |
+|---|---|---|---|---|
+| acc_real (TF) | 0.1769 | **0.1810** | 0.1765 | — |
+| ppl_real (TF) | 46.54 | **42.90** | — | — |
+| EOV fired /48 | 18 | **18** | 42 | — |
+| budget-capped /48 | 30 | **30** | 6 | — |
+| len_mean | 229.7 | 233.9 | 173.5 | 179.7 |
+| adj_repeat_rate | 0.4506 | 0.3709 | 0.0093 | 0.0792 |
+| longest_run | 179 | 156 | 4 | 18 |
+| early_text_delta | +0.0273 | +0.0254 | +0.0264 | — |
+
+⭐ **Termination is IDENTICAL (18/48 EOV, 30 capped) and len_mean is slightly WORSE.** Removing
+optimizer noise buys ~1/5 of the repetition gap (0.451 -> 0.371, still 4.7x GT) and NONE of the
+termination gap. Teacher-forced quality does improve (ppl 46.5 -> 42.9, acc +0.004).
+
+**Consequence for the LR anneal:** expect it to buy MODEL QUALITY (loss/accuracy), NOT a fix for
+the dragging/termination. An earlier same-session claim that annealing would likely fix the
+free-running pathology (reasoning from `project_world_tts_lr_volatility`, "late low-LR ckpts
+free-run clean") is WEAKENED by this. Not RETRACTED, because EMA's 2k-step horizon is a weak
+proxy for a full 1e-4->0 decay and the tension may be era-specific — but do not plan the decay
+expecting it to fix free-running. OPEN.
+
+⭐⭐ **`early_text_delta` is invariant to EVERYTHING tried so far**: +0.0273 raw / +0.0254 EMA /
++0.0264 RAS / +0.0264 nucleus — all CIs overlapping, against a teacher ceiling of +0.0538.
+Not sampling, not noise reduction, not weight averaging. This is the load-bearing deficit and
+only a training-side change addressing text->content binding can move it.
+
+**Eval uses EMA weights** (`training.py:2257-2270`): `apply_shadow()` wraps `super().evaluate()`
+with `restore()` in a finally, and the viz callback fires INSIDE that, so eval metrics AND TB
+audio renders are EMA. The pre-eval checkpoint stays RAW so a resume cannot restart from
+averaged weights. ⚠️ Consequence: `pytorch_model.bin` is RAW, so any eval script loading a
+checkpoint directly is measuring DIFFERENT weights than the TB renders show.
+
 **Training health at 40k:** eval/loss fell monotonically at all 19 eval points, 0.5822 -> 0.4268,
 unit accuracy 0.1202 -> 0.1830. No overfitting anywhere — the 1985 h corpus removed the epoch-8
 wall the 146 h corpus hit. Gains decelerate log-linearly (10k->20k +0.0227 acc; 30k->40k +0.0075).
