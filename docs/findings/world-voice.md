@@ -180,6 +180,42 @@ not dragged. Plain never truncates (it never terminates at all). So enabling RAS
 guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
 arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
 
+### ck50000 check: duration conditioning improves, content binding does NOT (2026-09-02, ESTABLISHED)
+
+Protocol identical to the ck40000 arms (raw weights, n=128 TF / gen_n=48, T=0.6).
+Reports: `eval_output/world_voice_ck50000/`.
+
+| | 40k plain | 50k plain | 40k RAS | **50k RAS** | GT |
+|---|---|---|---|---|---|
+| ppl_real (TF) | 46.54 | 44.31 | — | — | — |
+| early_text_delta | +0.0273 | **+0.0273** | +0.0264 | **+0.0254** | — |
+| EOV fired /48 | 18 | 17 | 42 | **46** | — |
+| budget-capped /48 | 30 | 31 | 6 | **2** | — |
+| len_mean | 229.7 | 231.8 | 173.5 | **179.06** | 179.67 |
+| text->length r | 0.076 | 0.073 | 0.465 | **0.595** | 0.744 |
+| adj_repeat_rate | 0.4506 | 0.4247 | 0.0093 | 0.0145 | 0.0792 |
+
+⭐⭐ **The dissociation, stated precisely: the model is learning HOW LONG to speak from the text
+and NOT WHAT to say.** Duration r climbed 0.465 -> 0.595 in 10k steps (ceiling 0.744) and length
+landed on GT; `early_text_delta` did not move at all (+0.0273 at BOTH 40k and 50k under plain).
+Per the probe's own rubric, duration r is "structural conditioning, independent of content
+alignment" — so structural conditioning is progressing while content binding is frozen.
+
+⚠️ **PLAIN SAMPLING IS A SATURATED MEASUREMENT — do not judge progress from it.** 31/48 sit at
+the 250-frame cap, so the metric cannot move even when the model improves. A same-session claim
+that "free-running is not improving between 40k and 50k" was drawn from the plain arm and is
+WRONG; the RAS arm shows clear improvement over the same interval. Always read free-running
+progress from the RAS arm.
+
+⚠️ **`len_mean` is a BAD summary here — the length distribution is BIMODAL.** 50k RAS len_mean
+179.06 vs GT 179.67 looks exact, but the 8-utterance render shows 3/8 collapsing to 8, 4 and 22
+frames (0.16-0.9 s) while the survivors run long; the two errors cancel in the mean. At 40k the
+same 8 texts failed 2/8 at 62 and 39 frames — so the failures got MORE SEVERE even as aggregates
+improved. (Rate is uncertain: the 48-sample arm reported len_min 13 and 46/48 EOV, so n=8 caught
+an unlucky subset. The EXISTENCE of sub-25-frame collapses is not noise.) **A per-utterance hit
+rate (fraction within +-30% of GT length) is the metric this needs; the probe does not yet
+compute one.**
+
 ### EMA-vs-raw probe: noise reduction does NOT fix free-running (2026-09-02, ESTABLISHED)
 
 ck40000 EMA shadow (decay 0.9995, ~2k-step horizon) materialized into a loadable checkpoint
