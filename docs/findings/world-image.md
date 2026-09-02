@@ -594,16 +594,35 @@ cleanly. R^2 climbed while the render did not move.**
 The point head spent 30k steps closing most of the R^2 gap it was launched to close (0.727 -> 0.760,
 against the flow runs' 0.787) and bought **exactly nothing** in render: 1 SE of drift, and the run
 sits at 0.270 vs `whiten_0`'s 0.266. The original stopping decision at 20k was correct.
-⭐ **This is the cleanest demonstration in the project of the loss/render decoupling** — same
-model, same data, same eval, one axis moving and the other flat, no gain knob or arm swap in
-between. It generalises the [[project_dispersion_over_smoothing]] result from "the gain axis" to
+⭐ ~~This is the cleanest demonstration in the project of the loss/render decoupling~~ — see the
+2026-09-02 amendment below: the decoupling held over 21k-38k and then stopped holding. Do NOT cite
+this run as the clean decoupling case. It generalises the [[project_dispersion_over_smoothing]] result from "the gain axis" to
 "the training axis": R^2 is not a proxy for render quality for a POINT head, in either direction.
 ⛔ **Therefore "flow beats MSE" does NOT rest on a 20k-vs-100k artefact.** The worry that opened
 this entry is retired: the baseline is trained out, not under-trained.
 ⚠️ Do not read this as "R^2 never matters" — it is a statement about a point head near its own
 ceiling, one seed, 8-prompt probe. What it rules out is the under-training explanation.
-Per-checkpoint eval was dropped to stride 5000 on 2026-09-01; there is nothing left to resolve at
-1000-step resolution.
+
+⚠️⚠️ **AMENDED 2026-09-02 — the "render does not move" half is WINDOW-SPECIFIC and does not hold
+past ~40k.** Continuing to stride-5000 eval over steps 40k-75k:
+
+| window | eval MSE (=> R^2) | CLIPScore mean |
+|---|---|---|
+| 21k-38k (n=18, stride 1000) | 0.2734 -> 0.2438 (0.727 -> 0.756) | 0.2701 (sd 0.0088) |
+| 40k-75k (n=8, stride 5000) | 0.2438 -> 0.2336, min 0.2298 @66k (0.756 -> **0.770**) | **0.2812** (sd 0.0107) |
+
++0.0112 render, combined SE 0.0043 => ~2.6 SE. The newer window's WORST point (0.265) is about the
+older window's MEAN. So render did eventually move, and in window B it moved roughly in step with
+R^2 (+0.010 R^2, +0.011 render) rather than decoupling from it as in window A (+0.029 R^2, +0.0035
+render). **The clean decoupling above was a property of steps 21k-38k, not of the point head.**
+⚠️ 2.6 SE is an OVERSTATEMENT: consecutive checkpoints on one trajectory are autocorrelated, not
+independent draws, so the true SE is larger. Read this as "a real level shift, magnitude uncertain",
+not as a p-value. This is the same error class the run-level entries above were corrected for.
+⛔ What SURVIVES: the baseline is not under-trained (that question is still answered), and the point
+head remains far below the flow arms — 0.281 vs the cosine run's 0.347 guided / 0.305 unguided. The
+"flow beats MSE" conclusion is untouched. What does NOT survive is using this run as the clean
+demonstration that R^2 and render are decoupled; it shows both behaviours in different windows.
+Per-checkpoint eval was dropped to stride 5000 on 2026-09-01.
 
 ### Untested levers for the gen-query compression, cheapest first
 - **Cap the iterations** (~18). Free, inference-only: `max_iterations_override` is plumbed through
