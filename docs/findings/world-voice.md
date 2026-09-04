@@ -207,8 +207,16 @@ LR points). Reports: `eval_output/world_voice_distill_ab/`.
 
 ⭐ **Every text-conditioning measure moved the WRONG way**, plus accuracy, termination, duration
 correlation and length hit rate. KD's only win (collapse 8.3% -> 4.2%) was bought by converting
-truncations into overruns, so the net hit rate still fell. No single CI is cleared alone; the
-result rests on ~8 measures agreeing in direction.
+truncations into overruns, so the net hit rate still fell.
+
+⭐ **The deficit is ~12x the measurement noise floor.** Re-running the control at the SAME
+checkpoint in a second arm (CTL_ras10 vs CTL_noras) gives early_text_delta +0.0342 vs +0.0332
+and acc_real 0.1799 vs 0.1800 — reproducibility +-0.0010. The KD gap is 0.0117.
+**Do NOT read the overlapping bootstrap CIs as "not significant"**: those are MARGINAL CIs that
+resample utterances and are dominated by per-utterance variance, whereas control and KD were
+scored on the SAME 128 utterances, so the comparison is PAIRED and its error is the +-0.001
+reproducibility, not the +-0.02 marginal interval. (A proper paired bootstrap over per-utterance
+differences would be better still; the probe does not currently emit per-utterance values.)
 
 **Why, and it was PREDICTED**: the open-questions section already argued "off-policy KD only
 supervises states reachable from a perfect prefix — where this model is already near the
