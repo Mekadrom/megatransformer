@@ -709,6 +709,25 @@ def main():
     lines.append(f"**text-length → generated-length correlation: r={r_gen:+.3f}** "
                  f"(GT ceiling r={r_gt:+.3f}). High r = text drives DURATION (structural "
                  f"conditioning), independent of content alignment.\n")
+    # PER-UTTERANCE length agreement. len_mean is a BAD summary when the length distribution
+    # is BIMODAL: near-zero collapses and overruns cancel, so the mean can land exactly on GT
+    # while most utterances are wrong in opposite directions. Measured 2026-09-02 at ck50000
+    # under RAS: len_mean 179.06 vs GT 179.67 (looks perfect) while 3/8 rendered utterances
+    # collapsed to 4-22 frames. These four numbers are what that mean was hiding.
+    _pairs = [(g, t) for g, t in zip(gen_lens, gt_lens) if t > 0]
+    if _pairs:
+        _rel = [g / t for g, t in _pairs]
+        _hit = sum(1 for r in _rel if 0.7 <= r <= 1.3) / len(_rel)
+        _trunc = sum(1 for r in _rel if r < 0.5) / len(_rel)
+        _over = sum(1 for r in _rel if r > 1.5) / len(_rel)
+        _med = sorted(abs(r - 1.0) for r in _rel)[len(_rel) // 2]
+        lines.append(
+            f"**Per-utterance length agreement** (n={len(_rel)}): "
+            f"**hit rate {_hit:.1%}** within +-30% of GT  |  collapsed (<50% of GT) "
+            f"{_trunc:.1%}  |  overrun (>150%) {_over:.1%}  |  median |len/GT - 1| = {_med:.2f}. "
+            f"Read this INSTEAD of len_mean — a bimodal split of collapses and overruns averages "
+            f"to a mean that looks correct.\n")
+
     lines.append("| metric | generated | ground-truth |\n|---|---|---|")
     for k in ["len_mean", "len_min", "len_max", "adj_repeat_rate", "longest_run",
               "distinct_units", "coverage", "unit_entropy_bits", "distinct_bigram_ratio",

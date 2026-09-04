@@ -180,6 +180,62 @@ not dragged. Plain never truncates (it never terminates at all). So enabling RAS
 guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
 arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
 
+### Off-policy CosyVoice 2 KD at weight 0.3: NET NEGATIVE (2026-09-04, ESTABLISHED)
+
+Falsification run as designed: `..._distill_0` resumed from the control's **checkpoint-50000**
+and ran 10k steps to 60000 with `--voice_distill_weight 0.3 --voice_distill_temperature 2.0`,
+EVERY other flag byte-identical. The control's own 50k->60k segment is therefore a perfectly
+matched baseline (same start, same steps, same flat 1e-4 — verified flat across all 100 logged
+LR points). Reports: `eval_output/world_voice_distill_ab/`.
+
+**Distillation was verifiably LIVE** — `voice_distill_kl` fell 0.568 -> 0.402 and
+`voice_distill_agreement` rose 0.515 -> 0.562 over the window. This is not an inert-flag result.
+
+| | control 60k | distill 60k |
+|---|---|---|
+| acc_real (TF) | **0.1799** | 0.1769 |
+| eval unit accuracy (TB) | **0.1881** | 0.1829 |
+| early_acc_real | **0.3105** | 0.2988 |
+| early_acc_shuffled | 0.2764 | 0.2764 (identical — no baseline confound) |
+| early_text_delta | **+0.0342** | +0.0225 |
+| text_delta all-pos | **+0.0653** | +0.0613 |
+| EOV fired /48 | **47** | 40 |
+| budget-capped /48 | **1** | 8 |
+| length hit rate +-30% | **81.2%** | 70.8% |
+| collapsed / overrun | 8.3% / 2.1% | 4.2% / **8.3%** |
+| text->length r | **0.707** | 0.499 |
+
+⭐ **Every text-conditioning measure moved the WRONG way**, plus accuracy, termination, duration
+correlation and length hit rate. KD's only win (collapse 8.3% -> 4.2%) was bought by converting
+truncations into overruns, so the net hit rate still fell. No single CI is cleared alone; the
+result rests on ~8 measures agreeing in direction.
+
+**Why, and it was PREDICTED**: the open-questions section already argued "off-policy KD only
+supervises states reachable from a perfect prefix — where this model is already near the
+teacher. Its failure is off that manifold." Confirmed: `voice_distill_teacher_acc` = **0.1771**
+against the student's 0.1799 — the teacher is a PEER on this data, not a superior — so
+mode-covering forward KL spent capacity matching a distribution that was no better, and paid in
+sharpness.
+
+**Scope of the refutation:** off-policy KD, weight 0.3, T=2.0, 10k steps. Does NOT refute
+on-policy distillation (`--voice_onpolicy_distill`, requires `--voice_scheduled_sampling_prob
+> 0`) or a much smaller weight.
+
+⚠️ **TEACHER-ACCURACY DISCREPANCY, UNRESOLVED.** The diagnostics report
+`TEACHER acc_real (ceiling) 0.1283` while the training harness logs
+`voice_distill_teacher_acc 0.1771` — same teacher, same val set, 38% apart. One path conditions
+the teacher wrongly (the diagnostics' is the more suspect, since the harness number is what
+actually shaped training). Any argument resting on the 0.1283 ceiling — including the
+teacher-ceiling rows in every report above — should be held loosely until reconciled. OPEN.
+
+**Control-only result worth keeping:** plain CE took duration r from 0.595 (50k) to **0.707**
+(60k) against a 0.744 ceiling, with 47/48 terminating and an 81.2% length hit rate. Duration
+conditioning is close to solved by CE alone.
+
+**Probe change:** `world_voice_ar_diagnostics.py` now emits a per-utterance length hit rate
+(fraction within +-30% of GT, plus collapsed/overrun splits). Added after `len_mean` was shown
+to hide a bimodal distribution at ck50000; first emission verified here.
+
 ### ck50000 check: duration conditioning improves, content binding does NOT (2026-09-02, ESTABLISHED)
 
 Protocol identical to the ck40000 arms (raw weights, n=128 TF / gen_n=48, T=0.6).
