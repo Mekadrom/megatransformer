@@ -210,8 +210,18 @@ correlation and length hit rate. KD's only win (collapse 8.3% -> 4.2%) was bough
 truncations into overruns, so the net hit rate still fell.
 
 ⭐ **The deficit is ~12x the measurement noise floor.** Re-running the control at the SAME
-checkpoint in a second arm (CTL_ras10 vs CTL_noras) gives early_text_delta +0.0342 vs +0.0332
-and acc_real 0.1799 vs 0.1800 — reproducibility +-0.0010. The KD gap is 0.0117.
+checkpoint in a second arm gives +-0.0010, INDEPENDENTLY REPLICATED in both conditions:
+
+| arm | acc_real | early_acc_real | early_acc_shuffled | early_text_delta |
+|---|---|---|---|---|
+| CTL_ras10 | 0.1799 | 0.3105 | 0.2764 | +0.0342 |
+| CTL_noras | 0.1800 | 0.3086 | 0.2754 | +0.0332 |
+| KD_ras10 | 0.1769 | 0.2988 | 0.2764 | +0.0225 |
+| KD_noras | 0.1769 | 0.2979 | 0.2764 | +0.0215 |
+
+Control spans [0.0332, 0.0342], KD spans [0.0215, 0.0225] — **non-overlapping with 0.0107 of
+clear air**, against a within-condition spread of 0.0010 in BOTH arms. acc_real replicates to
++-0.0001 (control) and +-0.0000 (KD). The KD gap is 0.0117.
 **Do NOT read the overlapping bootstrap CIs as "not significant"**: those are MARGINAL CIs that
 resample utterances and are dominated by per-utterance variance, whereas control and KD were
 scored on the SAME 128 utterances, so the comparison is PAIRED and its error is the +-0.001
