@@ -551,6 +551,58 @@ untested lever [[project_world_tts_ceiling_noise_floor]] flags for world-TTS.
 wrong at block resolution and is the third premature trend call of this session; **read block
 means, not consecutive checkpoints, on an eval whose per-point noise is 10x its per-10k drift.**
 
+### Constant vs cosine LR: the late climb IS annealing, but it is VARIANCE, not level
+`zimage_qwen_t3_xskip_lr1e-4_1e-4_1e-4_constant_0` — identical to the cosine run in every respect
+but `--lr_scheduler_type constant_with_warmup`. Both ran to 100k; all 100 checkpoints evaluated on
+both arms at w=1.0 and w=3.0, N=4, same probe. 200 evals, 0 failures. This is the held-LR arm the
+cosine entry said was needed.
+
+| steps | cosine LR | w=3.0 delta | w=1.0 delta |
+|---|---|---|---|
+| 1000-10000 | 100% | +0.0033 | -0.0032 |
+| 11000-20000 | 96% | +0.0045 | +0.0080 |
+| 21000-30000 | 87% | +0.0020 | +0.0010 |
+| 31000-40000 | 75% | -0.0003 | -0.0032 |
+| 41000-50000 | 60% | **-0.0220** | **-0.0261** |
+| 51000-60000 | 44% | -0.0136 | -0.0228 |
+| 61000-70000 | 28% | -0.0187 | -0.0262 |
+| 71000-80000 | 15% | -0.0060 | -0.0140 |
+| 81000-90000 | 6% | -0.0094 | -0.0155 |
+| 91000-100000 | 1% | -0.0118 | -0.0193 |
+
+(delta = constant - cosine at matched steps.) EARLY (<=40k): +0.0024 +- 0.0018 SE at w=3, 20/40 —
+a coin flip, as it must be while the schedules are within 25 LR points. LATE (>40k): **-0.0136 +-
+0.0019 (10/60)** at w=3 and **-0.0206 +- 0.0019 (5/60)** at w=1. The crossover is at ~40k, i.e.
+where cosine falls below ~75% of peak.
+
+⭐⭐⭐ **BUT THE GAP IS ENTIRELY VARIANCE. The two arms reach the SAME ceiling.**
+
+| late window (>40k) | cosine | constant |
+|---|---|---|
+| mean w=3 | 0.3405 | 0.3270 |
+| **sd** w=3 | **0.0071** | **0.0151 (2.12x)** |
+| top-5 mean w=3 | 0.3502 | 0.3478 (**-0.0024**) |
+| best single w=3 | 0.351 | **0.351 (tied)** |
+| best single w=1 | 0.311 | **0.313 (constant HIGHER)** |
+
+Constant is 1.7-2.1x noisier checkpoint-to-checkpoint and its mean is dragged down by the troughs,
+but its PEAK is identical — tied at w=3 and marginally ahead at w=1. So annealing is buying
+STABILITY, not capability.
+⭐ **Practical consequence: if you select the best checkpoint, the schedule is nearly free
+(~0.002).** If you deploy whatever the run ends on, cosine is clearly safer. The right reason to
+anneal here is variance reduction, not a better optimum.
+
+⚠️ **This QUALIFIES the cosine run's "it never plateaued" entry above.** Late climb from the
+31k-40k block to the final-10 mean: cosine **+0.0170**, constant **+0.0055** (w=3); +0.0294 vs
++0.0133 (w=1). So ~2/3 of the cosine late climb is the schedule. Combined with the variance result,
+the honest reading of that climb is **the mean converging onto a ceiling both arms can already
+touch**, not continued learning — the max barely moves (cosine's best is 0.351, first reached at
+97k but matched by constant's noisy peak). Do not cite the cosine tail as evidence that more steps
+were buying more quality.
+⚠️ One seed per arm. The 41k-50k block is the sharpest drop (-0.022/-0.026) and partially recovers
+by 71k-80k, so some of that specific block is likely high-LR instability rather than the schedule
+effect proper.
+
 ### The three warm-start finetune arms are ALL NULL (control included)
 Warm restarts from `t3_xskip_0/ckpt-100000`, 3000 steps, identical CLI, one config field apart.
 Late-window means (1500-3000, n=4):
