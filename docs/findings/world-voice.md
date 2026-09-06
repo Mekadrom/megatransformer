@@ -180,6 +180,46 @@ not dragged. Plain never truncates (it never terminates at all). So enabling RAS
 guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
 arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
 
+### The 100k run DID overfit — flat eval was only half the signature (2026-09-06, ESTABLISHED)
+
+`..._ar_flat_lr_ema_0` completed to step 100000 = **epoch 6.67** on the 1985 h corpus.
+Eval alone looks merely FLAT, which is why this was nearly missed; the train side is what
+identifies it. Train metrics are per-batch and swing 0.14-0.29 between adjacent points — they
+are meaningless pointwise and MUST be binned.
+
+| window | train acc | eval acc | gap | train CE | eval CE | gap |
+|---|---|---|---|---|---|---|
+| 40-50k | 0.1810 | ~0.1846 | -0.0036 | 0.4285 | ~0.4243 | +0.0042 |
+| 50-60k | 0.1841 | ~0.1868 | -0.0027 | 0.4230 | ~0.4212 | +0.0018 |
+| 60-70k | 0.1913 | ~0.1885 | +0.0028 | 0.4149 | ~0.4187 | -0.0038 |
+| 70-80k | 0.1936 | ~0.1899 | +0.0037 | 0.4125 | ~0.4170 | -0.0045 |
+| 80-90k | 0.1938 | ~0.1902 | +0.0036 | 0.4108 | ~0.4164 | -0.0056 |
+| 90-100k | **0.1989** | ~0.1904 | **+0.0085** | **0.4044** | ~0.4162 | **-0.0118** |
+
+⭐ **The train/eval gap CROSSES OVER at ~60k and then widens ~3x.** In the final window train
+improved faster than in the two before it (+0.0050 acc, -0.0064 CE) while eval went BACKWARDS
+(acc 0.19096@90k -> 0.19073@100k; CE 0.41526 -> 0.41564). Flat eval + still-descending train =
+overfitting; neither half alone is diagnostic.
+
+⚠️ **The gap is UNDERSTATED by this table.** Eval runs on EMA weights (`training.py:2257`)
+while train logs RAW, and EMA measured ~+0.004 accuracy BETTER than raw at ck40000. On matched
+weights the final-window gap is nearer +0.012. Any future train-vs-eval comparison in this repo
+has the same bias and must correct for it.
+
+**Keeper = checkpoint-90000, not 100000**: best eval accuracy (0.19096) and lowest eval CE
+(0.41526), and it precedes the window where train pulled away hardest.
+
+**Epoch count, not hours, predicts the wall.** The 146 h corpus overfit at ~epoch 8; this
+1985 h corpus (13.6x the data) overfits at ~epoch 6.7. Scaling data 13.6x did NOT buy 13.6x the
+steps — it bought a better model at a similar epoch budget. Plan future runs in EPOCHS.
+
+**Accuracy trajectory for reference** (eval, EMA): 0.1202@4k, 0.1685@20k, 0.1830@40k,
+0.1881@60k, 0.1895@72k, 0.1910@90k, 0.1907@100k. A 40k->100k stretch bought +0.0077.
+
+OPEN: whether the overfit is visible in GENERATION. Teacher-forced eval has dissociated from
+free-running repeatedly in this direction (see the plain-sampling saturation note), so a
+ck100000-vs-ck60000 diagnostics run at matched protocol is the outstanding check.
+
 ### Off-policy CosyVoice 2 KD at weight 0.3: NET NEGATIVE (2026-09-04, ESTABLISHED)
 
 Falsification run as designed: `..._distill_0` resumed from the control's **checkpoint-50000**
