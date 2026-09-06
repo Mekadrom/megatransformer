@@ -138,6 +138,7 @@ class WorldModelTrainer(CommonTrainer):
         voice_duration_loss_weight: float = 1.0,
         voice_scheduled_sampling_prob: float = 0.0,
         voice_scheduled_sampling_ramp_steps: int = 10000,
+        voice_scheduled_sampling_start_step: int = 0,
         voice_onpolicy_distill: bool = False,
         voice_onpolicy_temperature: float = 0.8,
         # NAR→AR voice-attention curriculum (Variant B). Down-scales voice→voice
@@ -283,6 +284,7 @@ class WorldModelTrainer(CommonTrainer):
         self.voice_duration_loss_weight = voice_duration_loss_weight
         self.voice_scheduled_sampling_prob = voice_scheduled_sampling_prob
         self.voice_scheduled_sampling_ramp_steps = voice_scheduled_sampling_ramp_steps
+        self.voice_scheduled_sampling_start_step = int(voice_scheduled_sampling_start_step or 0)
         self.voice_onpolicy_distill = bool(voice_onpolicy_distill)
         self.voice_onpolicy_temperature = float(voice_onpolicy_temperature)
         if self.voice_onpolicy_distill and voice_scheduled_sampling_prob <= 0.0:
@@ -1690,17 +1692,27 @@ class WorldModelTrainer(CommonTrainer):
 
     def _scheduled_sampling_prob(self, global_step: int) -> float:
         """Per-frame probability of feeding the model's OWN prediction instead of ground
-        truth, ramped linearly from 0 over --voice_scheduled_sampling_ramp_steps.
+        truth, ramped linearly from 0 over --voice_scheduled_sampling_ramp_steps, beginning
+        at --voice_scheduled_sampling_start_step.
 
         Ramped, not constant: at step 0 the model's predictions are noise, and training on
         noise-as-history teaches nothing. The ramp lets the model first learn to predict,
         then progressively removes the ground-truth crutch it would otherwise rely on
         forever.
+
+        The ramp is measured from start_step, NOT from global_step 0. Without that, a warm
+        start via --resume_from_checkpoint enters with global_step already past the ramp
+        length (e.g. resuming at 50000 with ramp 2000 gives min(1.0, 25) = 1.0), so the
+        probability jumps to its full value on the first step and the ramp flag is silently
+        inert. Set start_step to the resume step to get the ramp actually asked for.
         """
         if self.voice_scheduled_sampling_prob <= 0.0:
             return 0.0
+        start = self.voice_scheduled_sampling_start_step
+        if global_step < start:
+            return 0.0
         ramp = max(1, self.voice_scheduled_sampling_ramp_steps)
-        return self.voice_scheduled_sampling_prob * min(1.0, global_step / ramp)
+        return self.voice_scheduled_sampling_prob * min(1.0, (global_step - start) / ramp)
 
     def _apply_nar_masking(self, model, voice_inputs, voice_lengths, is_synthesis, global_step):
         """MaskGIT-style corruption of the voice INPUT, for masked-parallel (NAR) training.
@@ -2745,6 +2757,7 @@ def create_trainer(
         voice_duration_loss_weight=getattr(args, 'voice_duration_loss_weight', 1.0),
         voice_scheduled_sampling_prob=getattr(args, 'voice_scheduled_sampling_prob', 0.0),
         voice_scheduled_sampling_ramp_steps=getattr(args, 'voice_scheduled_sampling_ramp_steps', 10000),
+        voice_scheduled_sampling_start_step=getattr(args, 'voice_scheduled_sampling_start_step', 0),
         voice_ar_attn_mask_steps=getattr(args, 'voice_ar_attn_mask_steps', 0),
         voice_ar_attn_ramp_steps=getattr(args, 'voice_ar_attn_ramp_steps', 0),
         voice_ar_attn_floor=getattr(args, 'voice_ar_attn_floor', 0.0),
@@ -3474,6 +3487,14 @@ def add_cli_args(subparsers):
                             help="Linear ramp length for --voice_scheduled_sampling_prob. Ramped "
                                  "because early predictions are noise, and training on "
                                  "noise-as-history teaches nothing.")
+    sub_parser.add_argument("--voice_scheduled_sampling_start_step", type=int, default=0,
+                            help="Global step at which the --voice_scheduled_sampling_prob ramp "
+                                 "BEGINS; the probability is 0 before it. Default 0 = ramp from "
+                                 "the start of training, correct for a fresh run. On a warm start "
+                                 "set it to the resume step (e.g. 50000 when resuming from "
+                                 "checkpoint-50000), otherwise global_step is already past the "
+                                 "ramp length on the first step and the probability jumps "
+                                 "straight to its full value — the ramp flag does nothing.")
     sub_parser.add_argument("--voice_ar_attn_mask_steps", type=int, default=0,
                             help="NAR→AR curriculum (Variant B): number of steps to HOLD "
                                  "voice→voice attention at --voice_ar_attn_floor (the NAR phase, "
