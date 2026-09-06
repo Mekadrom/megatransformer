@@ -180,6 +180,49 @@ not dragged. Plain never truncates (it never terminates at all). So enabling RAS
 guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
 arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
 
+### MEASURED noise floor of the AR diagnostics probe (2026-09-06, ESTABLISHED)
+
+**n=4 runs of ck60000 with a byte-identical command** (`eval_output/world_voice_noise_floor/`
+plus the original `CTL_ras10`). Nothing varies but RNG/GPU non-determinism. Quote effect sizes
+against THESE numbers, not against the bootstrap CIs, which are marginal and utterance-dominated.
+
+| metric | mean | **sd** | range |
+|---|---|---|---|
+| acc_real | 0.1799 | **0.0002** | 0.0005 |
+| early_acc_real | 0.3100 | **0.0005** | 0.0009 |
+| early_acc_shuffled | 0.2773 | 0.0018 | 0.0039 |
+| early_text_delta | 0.0327 | **0.0023** | 0.0048 |
+| duration r | 0.6895 | **0.0271** | 0.0600 |
+| length hit rate % | 81.23 | **3.39** | 8.30 |
+| len_mean | 170.95 | 1.24 | 2.73 |
+| adj_repeat_rate | 0.0106 | 0.0012 | 0.0026 |
+
+⭐⭐ **USE `early_acc_real`, NOT `early_text_delta`, TO COMPARE CHECKPOINTS.** The delta is 4.6x
+noisier (sd 0.0023 vs 0.0005) for one reason: the shuffled baseline it subtracts has sd 0.0018.
+That baseline is a CONTROL that should not vary with the model, so at fixed protocol subtracting
+it adds noise without adding information. Keep the delta only to establish that text matters at
+all. This is a free 4.6x precision gain — the 60k->100k onset decline reads **15 sd** on
+early_acc_real and would read ~3 sd on the delta.
+(Better still: seed the ablation shuffle, or average several shuffles, and the delta becomes
+usable too. Currently unseeded.)
+
+**Effect sizes against this floor** — every prior conclusion survives:
+
+| claim | effect | sd |
+|---|---|---|
+| 100k onset decline vs 60k (early_acc_real) | 0.0078 | **15.0** |
+| KD duration r deficit | 0.208 | **7.7** |
+| ck90000 duration r drop | 0.142 | **5.2** |
+| KD early_text_delta deficit | 0.0112 | **4.9** |
+
+⚠️ **`length hit rate` is the WEAKEST generation metric** (sd 3.39 points): 81.2 vs 68.8 at 90k
+is 3.7 sd (real), but 81.2 vs 72.9 at 100k is only 2.4 sd (marginal). Do not read hit-rate
+differences under ~7 points. `len_mean` sd 1.24 and `adj_repeat` sd 0.0012 are both usable.
+
+**Method note:** two samples are NOT a noise floor. The +-0.0010 figure first reported for
+early_text_delta came from two arms that happened to land close; the third and fourth samples
+were 4-5x further apart. n>=4 for any reproducibility claim.
+
 ### Late-checkpoint generation check: the overfit shows at the ONSET (2026-09-06, ESTABLISHED)
 
 ck90000 and ck100000 run at protocol byte-identical to the ck60000 control arm
@@ -206,22 +249,14 @@ improves throughout.
 **Generation did NOT collapse**: repetition, entropy and n-gram diversity steady; ck100000
 len_mean 179.56 vs GT 179.67. Termination mildly worse (43/48, 5 capped, vs 47/48, 1).
 
-⚠️⚠️ **GENERATION METRICS AT gen_n=48 ARE TOO NOISY TO READ SMALL DIFFERENCES.** Duration r
-across checkpoints runs 0.465 (40k) -> 0.595 (50k) -> 0.707 (60k) -> 0.565 (90k) -> 0.676
-(100k) — NON-MONOTONIC, spread ~+-0.1. **Differences in r below ~0.15 are not interpretable**,
-and the same applies to the length hit rate. Contrast the TEACHER-FORCED metrics, whose
-reproducibility was directly measured at +-0.0010 by re-running a checkpoint.
-
-⚠️ **This retro-weakens the GENERATION half of the KD verdict** (see the KD entry): the r=0.499
-vs 0.707 comparison quoted there is within ~2x this noise band and was stated more confidently
-than the instrument supports. The KD conclusion STANDS on its teacher-forced evidence (0.0117
-gap against +-0.0010 reproducibility, replicated in both conditions); the free-running
-comparison should be treated as suggestive only.
-
-**Still unmeasured:** the generation-metric noise floor. No checkpoint has been run twice under
-an IDENTICAL sampler — the CTL_ras10/CTL_noras pair differs in sampler, so it bounds only the TF
-metrics. A same-checkpoint, same-sampler, different-seed repeat is the missing calibration, and
-until it exists every free-running comparison in this file rests on unmeasured variance.
+~~**GENERATION METRICS AT gen_n=48 ARE TOO NOISY TO READ SMALL DIFFERENCES** — claimed
+2026-09-06 from the r sequence being non-monotonic (0.465/0.595/0.707/0.565/0.676), asserting
+a ~+-0.1 spread and that differences below ~0.15 were uninterpretable; and that this weakened
+the generation half of the KD verdict.~~ **RETRACTED the same day by direct measurement.**
+n=4 identical runs of ck60000 give duration r **sd 0.0271** (not +-0.1) — see the noise-floor
+entry below. The non-monotonic sequence is REAL SIGNAL at 4-8x the noise band. The ck90000 drop
+is 5.2 sd and the KD r deficit is 7.7 sd; both stand. The error was inferring a noise magnitude
+from non-monotonicity instead of measuring it.
 
 ### The 100k run DID overfit — flat eval was only half the signature (2026-09-06, ESTABLISHED)
 
@@ -293,7 +328,9 @@ correlation and length hit rate. KD's only win (collapse 8.3% -> 4.2%) was bough
 truncations into overruns, so the net hit rate still fell.
 
 ⭐ **The deficit is ~12x the measurement noise floor.** Re-running the control at the SAME
-checkpoint in a second arm gives +-0.0010, INDEPENDENTLY REPLICATED in both conditions:
+checkpoint in a second arm gives +-0.0010 — **but that was two samples that happened to land
+close; the measured n=4 sd is 0.0023, so the KD gap is 4.9 sd, NOT the "12x" first claimed.**
+Corrected 2026-09-06 (see the noise-floor entry). The four arms:
 
 | arm | acc_real | early_acc_real | early_acc_shuffled | early_text_delta |
 |---|---|---|---|---|
@@ -302,9 +339,10 @@ checkpoint in a second arm gives +-0.0010, INDEPENDENTLY REPLICATED in both cond
 | KD_ras10 | 0.1769 | 0.2988 | 0.2764 | +0.0225 |
 | KD_noras | 0.1769 | 0.2979 | 0.2764 | +0.0215 |
 
-Control spans [0.0332, 0.0342], KD spans [0.0215, 0.0225] — **non-overlapping with 0.0107 of
-clear air**, against a within-condition spread of 0.0010 in BOTH arms. acc_real replicates to
-+-0.0001 (control) and +-0.0000 (KD). The KD gap is 0.0117.
+Control spans [0.0332, 0.0342], KD spans [0.0215, 0.0225]. Against the MEASURED
+early_text_delta sd of 0.0023 the 0.0112 gap is **4.9 sd** — solid, but a third the strength
+originally claimed. On duration r the KD deficit is **7.7 sd**, so the generation half of the
+verdict is in fact the STRONGER half, the opposite of what the retracted warning said.
 **Do NOT read the overlapping bootstrap CIs as "not significant"**: those are MARGINAL CIs that
 resample utterances and are dominated by per-utterance variance, whereas control and KD were
 scored on the SAME 128 utterances, so the comparison is PAIRED and its error is the +-0.001
