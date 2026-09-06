@@ -180,6 +180,49 @@ not dragged. Plain never truncates (it never terminates at all). So enabling RAS
 guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
 arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
 
+### Late-checkpoint generation check: the overfit shows at the ONSET (2026-09-06, ESTABLISHED)
+
+ck90000 and ck100000 run at protocol byte-identical to the ck60000 control arm
+(`eval_output/world_voice_late_ckpt/`, n=128 TF / gen_n=48, T=0.6, RAS w=10).
+
+| | 60k | 90k | 100k |
+|---|---|---|---|
+| acc_real (TF, val) | 0.1799 | 0.1816 | **0.1859** |
+| early_acc_real | **0.3105** | 0.3086 | **0.3027** |
+| early_acc_shuffled | 0.2764 | 0.2725 | 0.2734 |
+| early_text_delta | +0.0342 | +0.0361 | +0.0293 |
+| EOV fired /48 | 47 | 47 | 43 |
+| budget-capped /48 | 1 | 1 | 5 |
+| text->length r | 0.707 | 0.565 | 0.676 |
+| length hit rate | 81.2% | 68.8% | 72.9% |
+
+⭐ **acc_real RISES monotonically while early_acc_real FALLS monotonically.** Overall next-unit
+prediction improves (0.1799 -> 0.1859) while the utterance ONSET — the one place with no voice
+history, where text must carry the prediction — degrades (0.3105 -> 0.3027). The model is
+shifting weight OFF the text and ONTO the local unit prior. That is what the train/eval gap
+looks like in the place it hurts most, and it is invisible in aggregate accuracy, which
+improves throughout.
+
+**Generation did NOT collapse**: repetition, entropy and n-gram diversity steady; ck100000
+len_mean 179.56 vs GT 179.67. Termination mildly worse (43/48, 5 capped, vs 47/48, 1).
+
+⚠️⚠️ **GENERATION METRICS AT gen_n=48 ARE TOO NOISY TO READ SMALL DIFFERENCES.** Duration r
+across checkpoints runs 0.465 (40k) -> 0.595 (50k) -> 0.707 (60k) -> 0.565 (90k) -> 0.676
+(100k) — NON-MONOTONIC, spread ~+-0.1. **Differences in r below ~0.15 are not interpretable**,
+and the same applies to the length hit rate. Contrast the TEACHER-FORCED metrics, whose
+reproducibility was directly measured at +-0.0010 by re-running a checkpoint.
+
+⚠️ **This retro-weakens the GENERATION half of the KD verdict** (see the KD entry): the r=0.499
+vs 0.707 comparison quoted there is within ~2x this noise band and was stated more confidently
+than the instrument supports. The KD conclusion STANDS on its teacher-forced evidence (0.0117
+gap against +-0.0010 reproducibility, replicated in both conditions); the free-running
+comparison should be treated as suggestive only.
+
+**Still unmeasured:** the generation-metric noise floor. No checkpoint has been run twice under
+an IDENTICAL sampler — the CTL_ras10/CTL_noras pair differs in sampler, so it bounds only the TF
+metrics. A same-checkpoint, same-sampler, different-seed repeat is the missing calibration, and
+until it exists every free-running comparison in this file rests on unmeasured variance.
+
 ### The 100k run DID overfit — flat eval was only half the signature (2026-09-06, ESTABLISHED)
 
 `..._ar_flat_lr_ema_0` completed to step 100000 = **epoch 6.67** on the 1985 h corpus.
