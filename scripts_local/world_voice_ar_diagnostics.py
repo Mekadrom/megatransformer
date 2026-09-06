@@ -486,7 +486,16 @@ def main():
     ap.add_argument("--n", type=int, default=1024, help="TF/ablation val utterances (n=256 gives a ~+-0.012 CI on early_text_delta — too wide; do not go lower)")
     ap.add_argument("--bs", type=int, default=16, help="TF/ablation batch size (lower to avoid OOM "
                     "when sharing a GPU with a training run)")
-    ap.add_argument("--gen_n", type=int, default=32, help="free-running generations")
+    ap.add_argument("--gen_n", type=int, default=128,
+                    help="free-running generations. 128, not 32/48: the measured noise floor at "
+                         "gen_n=48 (n=4 identical ck60000 runs, 2026-09-06) is duration r sd "
+                         "0.0271 and length-hit-rate sd 3.39 points, which cannot resolve the "
+                         "differences these comparisons turn on. Noise falls as 1/sqrt(n), so "
+                         "128 buys ~1.63x precision (r sd ~0.017, hit rate ~2.1 pts) at ~2.7x "
+                         "the wall clock, since batch-1 AR generation dominates the runtime. "
+                         "A different gen_n estimates the SAME quantity with different "
+                         "precision, so old numbers stay valid — but state the gen_n when "
+                         "mixing them in one comparison, since the error bars differ.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--ngram_ceiling", type=float, default=0.211)
     ap.add_argument("--asymptote", type=float, default=0.229)
