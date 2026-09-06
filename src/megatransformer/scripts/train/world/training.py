@@ -1711,7 +1711,9 @@ class WorldModelTrainer(CommonTrainer):
         start = self.voice_scheduled_sampling_start_step
         if global_step < start:
             return 0.0
-        ramp = max(1, self.voice_scheduled_sampling_ramp_steps)
+        ramp = self.voice_scheduled_sampling_ramp_steps
+        if ramp <= 0:                       # 0 = no ramp: full value AT start_step, not one
+            return self.voice_scheduled_sampling_prob   # step later (which max(1, ramp) gave)
         return self.voice_scheduled_sampling_prob * min(1.0, (global_step - start) / ramp)
 
     def _apply_nar_masking(self, model, voice_inputs, voice_lengths, is_synthesis, global_step):
@@ -3484,7 +3486,11 @@ def add_cli_args(subparsers):
                                  "the guarantee that history is perfect. COSTS ~1.6x step time (one "
                                  "extra no-grad forward per step). 0 = off.")
     sub_parser.add_argument("--voice_scheduled_sampling_ramp_steps", type=int, default=10000,
-                            help="Linear ramp length for --voice_scheduled_sampling_prob. Ramped "
+                            help="Linear ramp length for --voice_scheduled_sampling_prob. 0 = no "
+                                 "ramp (full value from --voice_scheduled_sampling_start_step "
+                                 "onward), which is the right choice on a warm start from a "
+                                 "competent checkpoint, where the ramp\'s premise — that early "
+                                 "predictions are noise — no longer holds. Ramped "
                                  "because early predictions are noise, and training on "
                                  "noise-as-history teaches nothing.")
     sub_parser.add_argument("--voice_scheduled_sampling_start_step", type=int, default=0,
