@@ -180,6 +180,58 @@ not dragged. Plain never truncates (it never terminates at all). So enabling RAS
 guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
 arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
 
+### Scheduled sampling at p=0.5: NET NEGATIVE (2026-09-07, ESTABLISHED)
+
+Arm A of the on-policy plan — exposure-bias training with NO teacher, to establish whether
+scheduled sampling alone buys anything before paying for distillation. Resumed from the
+control's **checkpoint-50000**, 10k steps to 60000, `--voice_scheduled_sampling_prob 0.5
+--voice_scheduled_sampling_ramp_steps 0 --voice_scheduled_sampling_start_step 50000`, every
+other flag byte-identical. Control = the CE run's own 50k->60k segment, which has FOUR
+diagnostic replicates, so effects are quoted in measured sd. Reports:
+`eval_output/world_voice_ss_ab/` (2 replicates).
+
+**Verified live:** `train/scheduled_sampling_prob` = 0.500 from step 50000 (ramp 0 working).
+
+| metric | CTL (n=4) | sd | SS (n=2) | delta | sd units |
+|---|---|---|---|---|---|
+| acc_real | 0.1799 | 0.0002 | 0.1709 | -0.0089 | **-37.8** |
+| early_acc_real | 0.3100 | 0.0005 | 0.2891 | -0.0210 | **-40.4** |
+| early_acc_shuffled | 0.2773 | 0.0018 | 0.2515 | -0.0259 | -14.6 |
+| duration r | 0.6895 | 0.0271 | 0.4565 | -0.2330 | **-8.6** |
+| len_mean | 170.95 | 1.244 | 152.08 | -18.86 | **-15.2** |
+| hit rate % | 81.23 | 3.389 | 78.15 | -3.08 | -0.9 (ns) |
+| EOV /48 | 47.5 | 0.577 | 47.5 | 0.00 | 0.0 |
+| adj_repeat | 0.0106 | 0.0012 | 0.0101 | -0.0005 | -0.4 (ns) |
+| collapsed % | 8.83 | 2.642 | 11.45 | +2.63 | +1.0 (ns) |
+
+Teacher-forced eval agrees: eval/loss 0.4358 vs the control's 0.4193, unit accuracy 0.1797 vs
+0.1881 — and SS is worse than its OWN 50k starting point (0.4226 / 0.1859), rising to a plateau
+by 58k.
+
+⚠️ **The apparent wins are under-generation artifacts.** Output is far too SHORT (len_mean 152
+vs GT 179.7), so EOV 48/48 with 0 budget-capped, low adj_repeat and high distinct-bigram all
+follow trivially from stopping early. Do not read them as quality.
+
+⭐⭐ **CONCRETE CASE FOR `early_acc_real` OVER `early_text_delta`.** The delta reads **+0.0376
+for SS vs +0.0327 for the control — it would call this run a WIN.** It rises only because the
+shuffled baseline fell FURTHER (-0.0259) than early_acc_real did (-0.0210). Both terms dropped;
+the ratio improved while the model got worse. Any conclusion drawn from the delta alone here
+would have been backwards. This is the failure mode the noise-floor entry predicted.
+
+**Not a pure loss — the mechanism SS targets did fire.** early_acc_shuffled falling 14.6 sd
+means the model can predict materially LESS from voice history alone, i.e. the AR crutch really
+was weakened. It just lost more absolute capability than it converted into text use. That points
+at DOSE, not direction: p=0.5 with no ramp removes too much history at once. **Untested: p=0.25,
+and any p with a ramp.** p=0.5/no-ramp was chosen deliberately (ramp premise — "early
+predictions are noise" — does not hold at a competent 50k checkpoint) and that reasoning still
+stands; the magnitude was the error.
+
+**Status of the exposure-bias programme: two arms, both negative.** Off-policy KD at 0.3 and
+scheduled sampling at 0.5 each made things worse from the same ck50000 start. On-policy KD
+(scheduled sampling + teacher, `--voice_onpolicy_distill`) remains untested, but it inherits
+whatever dose problem this arm has, since it REQUIRES `--voice_scheduled_sampling_prob > 0`.
+Fix the dose before spending a run on it.
+
 ### MEASURED noise floor of the AR diagnostics probe (2026-09-06, ESTABLISHED)
 
 **n=4 runs of ck60000 with a byte-identical command** (`eval_output/world_voice_noise_floor/`
