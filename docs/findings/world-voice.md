@@ -180,7 +180,54 @@ not dragged. Plain never truncates (it never terminates at all). So enabling RAS
 guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
 arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
 
-### Scheduled sampling at p=0.5: NET NEGATIVE (2026-09-07, ESTABLISHED)
+### Scheduled sampling is a net negative at BOTH p=0.25 and p=0.5 (2026-09-07/08, ESTABLISHED)
+
+Two doses, each 10k steps from the control's **checkpoint-50000** to 60000, every other flag
+byte-identical, 2 diagnostic replicates each, quoted against the CE control's 4 replicates.
+Both verified live (`train/scheduled_sampling_prob` = 0.250 / 0.500 from step 50000, ramp 0).
+`eval_output/world_voice_ss_ab/`, `eval_output/world_voice_ss025_ab/`.
+
+| metric | CTL | sd | p=0.25 | sd | p=0.50 | sd |
+|---|---|---|---|---|---|---|
+| acc_real | 0.1799 | 0.0002 | 0.1763 | **-15.1** | 0.1709 | **-37.8** |
+| early_acc_real | 0.3100 | 0.0005 | 0.3076 | **-4.7** | 0.2891 | **-40.4** |
+| early_acc_shuffled | 0.2773 | 0.0018 | 0.2710 | -3.6 | 0.2515 | -14.6 |
+| duration r | 0.6895 | 0.0271 | 0.5825 | **-3.9** | 0.4565 | **-8.6** |
+| len_mean | 170.95 | 1.244 | 168.70 | -1.8 | 152.08 | **-15.2** |
+| hit rate % | 81.23 | 3.389 | 80.20 | -0.3 (ns) | 78.15 | -0.9 (ns) |
+| EOV /48 | 47.5 | 0.577 | 48.0 | +0.9 (ns) | 47.5 | 0.0 |
+| collapsed % | 8.83 | 2.642 | 9.35 | +0.2 (ns) | 11.45 | +1.0 (ns) |
+
+⭐ **The DOSE hypothesis was half right and it does not rescue the direction.** The trade does
+improve at lower p — real-accuracy lost per unit of crutch removed is **0.39 at p=0.25 vs 0.81
+at p=0.50** — but the absolute result is negative at BOTH. p=0.25 is worse than control on
+every metric that moved. Lowering p shrinks both effects together and converges on the control;
+there is no tested dose where the crutch reduction converts into a gain.
+
+**The mechanism does fire at both doses**: early_acc_shuffled falls 3.6 / 14.6 sd, so the model
+really can predict less from voice history alone. It just never turns that into text use within
+this window.
+
+⚠️ **Alternative explanation NOT excluded: 10k steps may be too short.** Scheduled sampling is
+normally applied across a long run, not as a short finetune; the model has to re-learn
+prediction from a corrupted-history regime, and at 10k the disruption may simply dominate any
+eventual payoff. These arms establish that SS does not help IN A 10k WINDOW from a competent
+checkpoint. They do not establish that SS is useless in a from-scratch run. OPEN.
+
+⭐⭐ **SECOND confirmation of the `early_text_delta` trap.** It reads **0.0366 (p=0.25) and
+0.0376 (p=0.50) against the control's 0.0327 — it would score BOTH arms as wins**, because in
+each case the shuffled baseline fell further than early_acc_real. Two independent runs, same
+inversion. Use `early_acc_real`.
+
+**Consequence for on-policy KD:** it REQUIRES `--voice_scheduled_sampling_prob > 0`, so it
+inherits a 4.7-40 sd onset penalty before the teacher contributes anything — and the teacher
+already measured as the student's PEER (0.1771 vs 0.1799) and lost off-policy. Running it now
+would stack a negative on a negative. Not recommended without a reason to expect the teacher to
+overcome the SS cost.
+
+---
+
+### (superseded) Scheduled sampling at p=0.5: NET NEGATIVE (2026-09-07, ESTABLISHED)
 
 Arm A of the on-policy plan — exposure-bias training with NO teacher, to establish whether
 scheduled sampling alone buys anything before paying for distillation. Resumed from the
