@@ -603,6 +603,76 @@ were buying more quality.
 by 71k-80k, so some of that specific block is likely high-LR instability rather than the schedule
 effect proper.
 
+### From scratch, the aux point-head MSE is a CONVERGENCE ACCELERANT, not a quality term
+`zimage_qwen_t3_xskip_lr1e-4_1e-4_1e-4_noaux_0` — the cosine baseline's CLI plus
+`--image_flow_aux_mse_weight 0.0` (the flag added 2026-09-01, `9d3e9be`), so `flow_aux_mse_weight`
+0.1 -> 0.0 and NOTHING else. Both ran 100k; all 100 checkpoints evaluated on both arms at
+w=1.0/3.0, N=4. This is the from-scratch version of the question the warm-start `auxdetach` arm
+could only ask weakly.
+
+| steps | w=3.0 delta | w=1.0 delta |
+|---|---|---|
+| 1000-20000 | **-0.0472** | **-0.0645** |
+| 21000-40000 | -0.0141 | -0.0266 |
+| 41000-60000 | -0.0079 | -0.0040 |
+| 61000-80000 | +0.0002 | -0.0009 |
+| 81000-100000 | -0.0020 | -0.0015 |
+
+(delta = noaux - baseline at matched steps.) **LATE (>60k): -0.0009 +- 0.0010 SE at w=3 and
+-0.0012 +- 0.0012 at w=1 — both under 1 SE.** Final-10 means -0.0036 / -0.0026; best single
+checkpoint 0.349 vs 0.351 (w=3) and 0.311 vs 0.311 (w=1, exactly tied). The user independently
+called the 100k renders "indiscernible to the eye" before seeing these numbers.
+
+⭐⭐ **So the 0.1-weight aux MSE buys EARLY CONVERGENCE and contributes nothing at the endpoint.**
+Removing it costs ~0.05-0.06 through the first 20k and is paid back in full by ~60k.
+⚠️ This CORRECTS the reading of the warm-start `auxdetach` arm above, which measured -0.0103
+unguided and was recorded as "the aux term is mildly load-bearing". It is not load-bearing for
+quality; that arm was 3000 steps on a trunk already shaped by 100k steps of aux gradient, which is
+exactly where removing an accelerant looks like removing a contributor.
+⭐⭐⭐ **THIRD instance of the same pattern in this direction**: `cross_dec` buys speed not endpoint;
+LR 1e-4 x3 buys speed not endpoint; the aux MSE buys speed not endpoint. Every intervention that
+has looked promising here has turned out to move the CONVERGENCE RATE while the ceiling stays put
+— which is itself evidence the ceiling is set by something none of them touch (the trunk
+gen-query compression). Treat "arm X is ahead at 20k" as uninformative about the endpoint by
+default; this direction has now paid for that lesson three times.
+⚠️ One seed per arm.
+
+### Native length + slot positions COLLAPSES to prompt-independent generation
+`zimage_qwen_t3_xskip_lr1e-4_1e-4_1e-4_native_0`, `small_sum_zimage_t5_native_pos_xskip`, correct
+`whiten_stats_native.pt` (a first attempt with k64 stats was discarded). Stopped by the user at
+~96k. **This is NOT a native-length quality result — the arm is BROKEN, and must not be cited as
+one.**
+
+| steps | native w=3.0 | noaux w=3.0 |
+|---|---|---|
+| 1000-5000 | 0.1066 | 0.1170 |
+| 11000-15000 | 0.0182 | 0.2252 |
+| 56000-60000 | 0.0194 | 0.3340 |
+
+Native tracks the control for ~5k, then DECAYS to ~0.02 and flatlines there for 90k steps. Raw
+cosine ~0.02 is what unrelated images score; several per-prompt means are NEGATIVE.
+⭐ **Training is healthy the whole time** — eval loss falls smoothly 0.758 -> 0.710 (control:
+0.694 -> 0.666). So this is an inference/conditioning failure, not divergence.
+⭐⭐ **The montage is unambiguous** (`eval_output/native/ckpt-93000_w3.0/`, 8 prompts x [target,
+sample0-3]): the target column matches every prompt, and the four sample columns are COHERENT,
+photographic, and completely unrelated to the prompt — with **the same four subjects repeating
+down every row** (curly-haired portrait / man handling bread / uniformed group in a field / aerial
+forest canopy). Sample INDEX determines content; the prompt does not. The head emits valid
+Qwen-space embeddings of generic dataset-like captions, i.e. it has stopped reading its context and
+samples its unconditional prior. Consistent with w=1 and w=3 being equally dead: CFG amplifies
+`v_cond - v_uncond`, which is ~0.
+❓ **HYPOTHESIS, NOT MEASURED — a positional shortcut.** Every caption goes through the same Qwen3
+chat template, so at native length position j is nearly the same token across captions and position
+alone predicts much of the target; `F.interpolate` at K=64 smears captions of different lengths
+across the same slots, weakening position->content and forcing reliance on context. If true, the
+failure belongs to native+pos TOGETHER, not to native length.
+Two cheap tests, neither run: `small_sum_zimage_t5_native_xskip` (native WITHOUT pos, preset
+exists, set up precisely as the independent ablation) and `scripts_local/text_dependency_probe.py`
+on ckpt-94000 to confirm prompt-independence numerically rather than by reading a montage.
+⚠️ The 2026-08-20 warm-start native result (-0.045, blob artifacts) is a DIFFERENT failure signature
+(off-manifold texture vs coherent-but-wrong). Do not merge them.
+⚠️ ckpt-96000 is truncated (run stopped mid-write); its eval fails with PytorchStreamReader.
+
 ### The three warm-start finetune arms are ALL NULL (control included)
 Warm restarts from `t3_xskip_0/ckpt-100000`, 3000 steps, identical CLI, one config field apart.
 Late-window means (1500-3000, n=4):
