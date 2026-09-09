@@ -637,6 +637,34 @@ gen-query compression). Treat "arm X is ahead at 20k" as uninformative about the
 default; this direction has now paid for that lesson three times.
 ⚠️ One seed per arm.
 
+### ⚠️ The T4 "AR factorisation loses" verdict rests on an UNDER-TRAINED arm — reopened
+The recorded claim (in `world_model.py`, and the stated reason T5 exists) was that T4 "lost
+decisively (w=3 plateau ~0.248 vs T3's 0.344), which indicts the factorisation, not the length
+handling." Re-examined 2026-09-09 from `zimage_qwen_t4_0`'s own launch command and loss curve,
+**that arm cannot support the claim.** Three independent defects, any one of which would be
+disqualifying:
+
+| | T4 run (`zimage_qwen_t4_0`) | every from-scratch arm we trust |
+|---|---|---|
+| init | **warm start** off `t3_2/ckpt-20000`, which contains NO `ar_flow_head` — the AR head began RANDOM | from scratch |
+| LR | **5e-6** | 1e-4 / 1e-4 / 1e-4 |
+| steps | **20000** (`--fresh_schedule`) | 100000 |
+| whiten stats | **`qwen_whiten_stats_k64.pt`** — but `ar_flow_head` takes the `encode_native` path, so native-length targets were whitened by RESAMPLED stats | matched to the target layout |
+
+Its eval loss fell monotonically to the end — 1.355 @2k -> 1.196 @20k, still decreasing on the
+final interval — so it had **not converged**; 0.248 is where it got to, not a plateau.
+⭐⭐ **Why this matters beyond one arm:** this direction has now measured THREE interventions that
+looked clearly worse early and were level by ~60k (`cross_dec`, LR 1e-4x3, the aux MSE — see the
+accelerant finding). A 20k warm start at 1/20th LR is precisely the regime that cannot separate
+"wrong factorisation" from "barely trained". **The AR factorisation is OPEN, not settled.**
+⚠️ T5 was justified in-comment as "the part of T4's premise that survives its result". T5 is still
+worth running on its own merits, but it is not downstream of a settled T4 result, and the native
++pos collapse below is a separate failure that says nothing about AR either.
+⚠️ Not re-derived: the 0.248 figure itself. The reader timed out walking that run's 74 event files,
+so the trajectory argument rests on the loss curve and the launch command, both verified.
+The honest test is T4 on the standard recipe — from scratch, 1e-4 x3, cosine, 100k, native whiten
+stats. Not yet run.
+
 ### Native length + slot positions COLLAPSES to prompt-independent generation
 `zimage_qwen_t3_xskip_lr1e-4_1e-4_1e-4_native_0`, `small_sum_zimage_t5_native_pos_xskip`, correct
 `whiten_stats_native.pt` (a first attempt with k64 stats was discarded). Stopped by the user at

@@ -595,10 +595,21 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"] = copy.deepcopy(WORLD_MODEL_CONFIG
 WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"].image_coda_config.ar_flow_head = True
 
 # T5: T3's PARALLEL head at NATIVE length. T4 bundled two changes -- autoregressive
-# factorisation AND native length -- and lost decisively (w=3 plateau ~0.248 vs T3's 0.344),
-# which indicts the factorisation, not the length handling. This keeps the winning parallel
-# sampler and drops only the K=64 resample, so ~2/3 of the supervised slots stop being linear
-# blends of neighbouring Qwen3 states. Inference stays one-shot (no sequential decode).
+# factorisation AND native length -- and scored ~0.248 at w=3 vs T3's 0.344.
+# ⚠️ CORRECTED 2026-09-09: that number was previously described here as a "plateau" that
+# "indicts the factorisation". It does not support that. The T4 run (`zimage_qwen_t4_0`) was
+#   (a) a 20k WARM START off t3_2/ckpt-20000, a checkpoint with no ar_flow_head at all, so the
+#       AR head began randomly initialised;
+#   (b) trained at --learning_rate 5e-6, 20x below the 1e-4 every from-scratch arm uses; and
+#   (c) run with --image_whiten_stats_path qwen_whiten_stats_k64.pt, while ar_flow_head takes
+#       the encode_native path -- native-length targets whitened by RESAMPLED stats.
+# Its eval loss was still falling monotonically at step 20000 (1.355 -> 1.196, never flat), so
+# it had not converged. This direction has since measured three separate interventions that
+# looked bad early and landed level by 60k, so a 20k low-LR warm start cannot distinguish
+# "wrong factorisation" from "barely trained". TREAT THE AR FACTORISATION AS OPEN.
+# T5 remains worth running on its own merits, but it is NOT downstream of a settled T4 result.
+# This keeps the parallel sampler and drops only the K=64 resample, so ~2/3 of the supervised
+# slots stop being linear blends of neighbouring Qwen3 states. Inference stays one-shot.
 # Warm-start from a T3 checkpoint: trunk/Q-Former/flow head all load, since the head's shape is
 # unchanged -- only how many slots it is asked for.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t5_native"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3"])
