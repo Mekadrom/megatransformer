@@ -180,6 +180,59 @@ not dragged. Plain never truncates (it never terminates at all). So enabling RAS
 guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
 arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
 
+### Cadence decomposed: the drawl is uniform, not a termination artifact (2026-09-09, ESTABLISHED)
+
+First WER/LCS measurement on the LibriHeavy corpus. **ck90000**, n=64, T=0.6, both RAS settings.
+`eval_output/world_voice_cadence/`. New metric `frames_per_hyp_word` in `cosyvoice_wer_eval.py`
+divides rendered frames by ASR-transcribed words and compares against the CEILING row, which
+isolates speaking rate from content loss — `hyp_ref_word_ratio` counts words and `len_mean`
+counts frames, and NEITHER can see cadence.
+
+| | RAS 0 (the TB-render default) | RAS 10 | ceiling (GT units) |
+|---|---|---|---|
+| **cadence** | **1.63x** (16.5 f/word, 0.659 s) | **1.01x** (10.2 f/word) | 10.1 f/word |
+| hyp/ref words | 0.76 | 0.99 | 0.98 |
+| LCS-recall | 0.5004 | 0.6862 | 0.8576 |
+| WER | 0.5153 | 0.3735 | 0.1520 |
+| CER | 0.3993 | 0.2354 | 0.0668 |
+
+⭐ **Without RAS the model speaks 63% slower per word AND emits 24% fewer words.** Duration goes
+into drawl rather than content. RAS removes essentially all of it: cadence 1.01x, word count 0.99.
+
+⭐⭐ **The drawl is NOT a termination artifact.** Bucketing by generated/GT length ratio (the
+owner's observation: "even well-conditioned examples with the RIGHT length say only a portion"):
+
+| len ratio | n | LCS | frames/word | hyp/ref w |
+|---|---|---|---|---|
+| RAS 0, <0.7 | 3 | 0.044 | 19.5 | 0.32 |
+| **RAS 0, 0.7-1.3** | **34** | **0.555** | **15.0** | **0.77** |
+| RAS 0, 1.3-2.0 | 24 | 0.497 | 17.8 | 0.79 |
+| RAS 0, >2.0 | 3 | 0.375 | 31.6 | 0.75 |
+| **RAS 10, 0.7-1.3** | **49** | **0.754** | **9.7** | **1.03** |
+| CEILING | 64 | 0.859 | 10.1 | — |
+
+Renders that land at CORRECT duration still deliver only 56% of reference words at 1.5x the
+ceiling's frames each. Length ratio barely predicts coverage (0.555 at 0.7-1.3 vs 0.497 at
+1.3-2.0), so over-running is a SYMPTOM of the drawl, not its cause. Fixing termination would
+not fix this.
+
+⚠️ **`--viz_voice_ras_win` defaults to 0, so every ear-judged render since the corpus switch has
+been the 1.63x-drawl arm.** In the like-for-like length bucket RAS is worth +0.20 LCS
+(0.555 -> 0.754). This flag is the largest single gap between model capability and what gets
+heard. Pass `--viz_voice_ras_win 10` on every run.
+
+**The residual deficit, cleanly isolated:** with RAS and correct length, LCS 0.754 vs the
+ceiling's 0.862. Cadence and duration are both accounted for; the remaining 0.11 is content
+binding. That is a much narrower target than "text conditioning is weak".
+
+**Dead end recorded so the family is not retried:** unit-space smoothness metrics cannot
+diagnose articulation on this codebook. Measured on real GT speech, adjacent-frame cosine is
+mean +0.094 / median +0.024 against +0.016 for random same-utterance pairs, and the fraction of
+adjacent pairs above cosine 0.5 (0.0763) EQUALS the fraction above 0.2 — nothing lies between.
+Adjacent units are either identical or orthogonal, so there is no "acoustically nearby unit"
+and any cosine-threshold transition rate reduces to `1/(1-adj_repeat_rate)`. Matches the earlier
+Mimi result that its codebook is not locally smooth. ASR is the only route to cadence here.
+
 ### Scheduled sampling is a net negative at BOTH p=0.25 and p=0.5 (2026-09-07/08, ESTABLISHED)
 
 Two doses, each 10k steps from the control's **checkpoint-50000** to 60000, every other flag

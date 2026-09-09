@@ -223,17 +223,38 @@ def lcs_recall(ref_words, hyp_words):
     return prev[m] / n
 
 
+# Frames actually rendered for each scored variant. CADENCE needs this: hyp_ref_word_ratio
+# counts WORDS and len_mean counts FRAMES, and neither can see speaking rate. A model that
+# spends near-GT duration on FEWER words is slow per spoken word while looking correct — or
+# even short — on both existing metrics. frames_per_hyp_word divides the two, and comparing
+# it against the CEILING row (GT units through the same decoder) isolates cadence from
+# content loss, since both then describe the same words-per-frame question.
+_FRAMES_FOR = {
+    "hyp":         lambda r: r["gen_frames"],
+    "hyp_trunc":   lambda r: min(r["gen_frames"], r["ref_frames"]),
+    "hyp_ceiling": lambda r: r["ref_frames"],
+}
+
+
 def score(key):
-    pairs = [(normalize_text(r["ref"]), normalize_text(r.get(key, ""))) for r in rows if key in r]
-    pairs = [(x, y) for x, y in pairs if x]
+    sel = [r for r in rows if key in r and normalize_text(r["ref"])]
+    pairs = [(normalize_text(r["ref"]), normalize_text(r.get(key, ""))) for r in sel]
     if not pairs:
         return None
     refs, hyps = [p[0] for p in pairs], [p[1] for p in pairs]
     ratio = sum(len(h.split()) for h in hyps) / max(sum(len(r.split()) for r in refs), 1)
     rec = [lcs_recall(r.split(), h.split()) for r, h in pairs]
-    return {"n": len(pairs), "wer": jiwer_wer(refs, hyps), "cer": jiwer_cer(refs, hyps),
-            "hyp_ref_word_ratio": ratio,
-            "lcs_recall": sum(rec) / len(rec)}
+    out = {"n": len(pairs), "wer": jiwer_wer(refs, hyps), "cer": jiwer_cer(refs, hyps),
+           "hyp_ref_word_ratio": ratio,
+           "lcs_recall": sum(rec) / len(rec)}
+    fget = _FRAMES_FOR.get(key)
+    if fget is not None:
+        tot_f = sum(fget(r) for r in sel)
+        tot_w = sum(len(h.split()) for h in hyps)
+        if tot_w > 0:
+            out["frames_per_hyp_word"] = tot_f / tot_w
+            out["sec_per_hyp_word"] = tot_f / tot_w / 25.0   # CosyVoice 2 units are 25 Hz
+    return out
 
 
 g, t, c = score("hyp"), score("hyp_trunc"), score("hyp_ceiling")
@@ -244,6 +265,12 @@ if t: print(f"  TRUNC->REF  WER {t['wer']:.4f}  CER {t['cer']:.4f}  "
             f"LCS-recall {t['lcs_recall']:.4f}  hyp/ref words {t['hyp_ref_word_ratio']:.2f}")
 if c: print(f"  CEILING(GT) WER {c['wer']:.4f}  CER {c['cer']:.4f}  "
             f"LCS-recall {c['lcs_recall']:.4f}  hyp/ref words {c['hyp_ref_word_ratio']:.2f}")
+if g and c and "frames_per_hyp_word" in g and "frames_per_hyp_word" in c:
+    gf, cf = g["frames_per_hyp_word"], c["frames_per_hyp_word"]
+    print(f"  CADENCE  generated {gf:.1f} frames/word ({g['sec_per_hyp_word']:.3f}s)  vs  "
+          f"ceiling {cf:.1f} ({c['sec_per_hyp_word']:.3f}s)  =  {gf/cf:.2f}x")
+    print("  ^ >1 means SLOW per spoken word. Independent of hyp/ref word count and of "
+          "len_mean, either of which can look correct while cadence is wrong.")
 if g and c:
     print(f"  GAP (model's own cost)  WER {g['wer']-c['wer']:+.4f}  "
           f"LCS-recall {g['lcs_recall']-c['lcs_recall']:+.4f}")
