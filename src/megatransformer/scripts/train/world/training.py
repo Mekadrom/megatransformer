@@ -3137,11 +3137,20 @@ def add_cli_args(subparsers):
                                  "-- a real termination signal that the ban hides along with the "
                                  "artifact. Renders stay correctly separated per utterance "
                                  "either way; only the hallucinated block's existence changes.")
-    sub_parser.add_argument("--viz_voice_ras_win", type=int, default=0,
+    sub_parser.add_argument("--viz_voice_ras_win", type=int, default=10,
                             help="Repetition-aware sampling window for EVAL RENDERS only (10 = the "
-                                 "CosyVoice 2 value). Does not affect training or any metric — it "
-                                 "only changes what the logged audio sounds like. Measured: "
-                                 "adj_repeat 0.103 -> 0.007, longest_run 56 -> 7.")
+                                 "CosyVoice 2 value; 0 disables). Does not affect training or any "
+                                 "metric — it only changes what the logged audio sounds like. "
+                                 "DEFAULT FLIPPED 0 -> 10 on 2026-09-10. At 0 the renders are the "
+                                 "drawl arm: measured at ck90000 (n=64) the model runs 1.63x slow "
+                                 "per word (16.5 frames/word vs the GT-ceiling's 10.1) and emits "
+                                 "24% fewer words, and in the like-for-like correct-length bucket "
+                                 "RAS is worth +0.20 LCS-recall (0.555 -> 0.754 against a 0.862 "
+                                 "ceiling). Every render judged by ear between the 2026-08-30 "
+                                 "corpus switch and this date was the degraded arm — the model "
+                                 "sounded far worse than it was, and the gap was an unset flag. "
+                                 "Also: adj_repeat 0.103 -> 0.007, longest_run 56 -> 7. Pass 0 "
+                                 "explicitly to recover the old behaviour.")
     sub_parser.add_argument("--viz_voice_ras_tau", type=float, default=0.1,
                             help="RAS repetition threshold for eval renders.")
     sub_parser.add_argument("--voice_cosyvoice2_distill_model_dir", type=str, default=None,
