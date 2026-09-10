@@ -637,6 +637,40 @@ gen-query compression). Treat "arm X is ahead at 20k" as uninformative about the
 default; this direction has now paid for that lesson three times.
 ⚠️ One seed per arm.
 
+### AR (T4) at native length TRACKS the K=64 baseline; the collapse was `flow_pos_embed`
+Three native-length arms now exist on the SAME recipe (from scratch, 1e-4 x3, cosine, 100k, native
+whiten stats), differing only in how the output slots are ordered. IN FLIGHT: t4 at 27k, nopos at
+53k. Matched-step block means, w=3.0:
+
+| steps | t4 (AR) | nopos (parallel, no pos) | native+pos | K=64 baseline |
+|---|---|---|---|---|
+| 11000-15000 | **0.2508** | 0.2056 | 0.0182 | 0.2932 |
+| 21000-25000 | 0.3108 | 0.2598 | 0.0200 | 0.3244 |
+| 26000-30000 | **0.3180** | 0.2694 | 0.0184 | 0.3278 |
+| 51000-55000 | — | 0.2925 | 0.0166 | 0.3344 |
+
+⭐⭐⭐ **THE COLLAPSE WAS `flow_pos_embed`, NOT NATIVE LENGTH.** Same config minus the positional
+table goes from 0.02 (noise) to 0.29-0.30. The positional-shortcut hypothesis is confirmed at the
+level of WHICH KNOB; the mechanism (chat-template tokens make position j near-constant across
+captions, so `pos[j]` alone satisfies the objective and the context is ignored) remains inferred,
+not directly measured.
+⭐⭐⭐ **THE T4 VERDICT IS OVERTURNED.** From scratch at the standard LR, T4 passes the old run's
+"plateau" of 0.248 by ~13k steps and reaches 0.3180 by 26-30k — within 0.010 of the K=64 baseline
+at w=3, and AHEAD of it unguided at 21-25k (0.2548 vs 0.2542). The old 0.248 was an artifact of a
+20k warm start at 5e-6 with a randomly-initialised AR head and mismatched whiten stats. AR
+factorisation does NOT lose.
+⭐⭐ **AR BEATS THE PARALLEL SET AT NATIVE LENGTH** — 0.3180 vs 0.2694 at matched steps, +0.049.
+Mechanism (consistent, not proven): without `pos` the parallel head is permutation-equivariant and
+emits an unordered SET, but the Qwen3 target is an ordered causal sequence. AR gets ordering
+intrinsically and pays no positional-shortcut tax. So the three arms separate exactly along "how is
+order supplied": shortcut -> collapse; no order -> handicapped; AR -> tracks baseline.
+⚠️ **CORRECTION to a prediction I recorded:** T4's sequential decode (L x flow_steps ~ 160 forwards
+vs 8) was expected to make its evals much slower. Measured medians: **t4 456s vs nopos 444s, ~3%**.
+Z-Image's own 1024x1024 decode dominates the eval, so the flow head's step count is nearly free at
+this scale. Do not budget eval time by flow-head forwards.
+⚠️ Both arms IN FLIGHT and single-seed; T4 has only 27 checkpoints. Given this direction has three
+times seen early leads vanish by 60k, do NOT call the endpoint yet.
+
 ### ⚠️ The T4 "AR factorisation loses" verdict rests on an UNDER-TRAINED arm — reopened
 The recorded claim (in `world_model.py`, and the stated reason T5 exists) was that T4 "lost
 decisively (w=3 plateau ~0.248 vs T3's 0.344), which indicts the factorisation, not the length
