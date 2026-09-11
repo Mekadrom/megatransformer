@@ -127,19 +127,42 @@ into a coherent image or it does not. So the *measurement* is precise and the *c
 **Read trends across several checkpoints; never read adjacent pairs.** The `within-prompt sd`
 printed on every eval line (~0.03) is prompt/sample spread, NOT an error bar on the mean.
 
-### The from-scratch guidance optimum is w=4.5, not w=3
-Sweep on `t3_xskip/checkpoint-8000`, n_samples 2, same eval path as the monitor:
+### ~~The from-scratch guidance optimum is w=4.5, not w=3~~ — RETRACTED 2026-09-11
+~~Sweep on `t3_xskip/checkpoint-8000`, n_samples 2:~~ 0.088 / 0.116 / 0.150 / 0.158 / **0.180** /
+0.169 at w = 1.0 / 1.5 / 2.0 / 3.0 / 4.5 / 6.0. ~~The optimum moved right; every from-scratch number
+recorded at w=3 is a floor understating the arm by ~0.02.~~
 
-| w | 1.0 | 1.5 | 2.0 | 3.0 | **4.5** | 6.0 |
-|---|---|---|---|---|---|---|
-| CLIPScore | 0.088 | 0.116 | 0.150 | 0.158 | **0.180** | 0.169 |
+⛔ **WRONG, and the error was the CHECKPOINT.** ckpt-8000 is a barely-trained arm (its own w=3 score
+was 0.158, less than half the converged 0.346), measured at n_samples=2 where the noise floor is
+~0.008 — the same size as the 2.0->3.0 step the entry itself flagged. Peak-w drifts as conditioning
+strengthens, which the entry ALSO said, and then applied the number to converged arms anyway.
+The "every number is a floor, understating by ~0.02" caveat was carried on several tables in this
+file for three weeks. **It was never true of the converged runs. Drop it wherever it appears.**
+Superseded by the sweep below.
 
-w=3 was inherited from `t3_2/ckpt-7000`, which carried ~40k steps of warm-start lineage. A
-from-scratch arm carrying `x_skip` from step 0 is less converged and MORE guidance-dependent, so
-the optimum moved right — as the noise-leak model predicts. Consequences: every from-scratch number
-recorded at w=3 is a floor understating the arm by ~0.02; the arm-vs-arm comparison is unaffected
-(identical w on both). Note 2.0->3.0 is only +0.008 — sweeping only around the incumbent would have
-read a shoulder and hidden the peak.
+### Guidance is FLAT from w=3 to w=6 on a converged baseline
+`zimage_qwen_t3_xskip_lr1e-4_1e-4_1e-4_cosine_0/checkpoint-97000` (the best from-scratch checkpoint
+at w=3), **N=8**, `--flow_seed_base 4242` so every w sees IDENTICAL draws, one checkpoint across all
+w so per-checkpoint variance is a constant offset and cannot move the peak:
+
+| w | 1.0 | 1.5 | 2.0 | 2.5 | 3.0 | 3.5 | 4.0 | 4.5 | 5.0 | 6.0 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mean | 0.308 | 0.335 | 0.335 | 0.344 | 0.346 | **0.350** | 0.349 | **0.350** | **0.350** | 0.347 |
+| best-of-8 | 0.362 | 0.380 | 0.370 | 0.380 | 0.377 | 0.385 | 0.384 | **0.389** | 0.383 | 0.379 |
+
+⭐⭐ **w=3 to w=6 spans 0.346-0.350 — a 0.004 range against ~0.004/point residual noise (unpinned
+thought-init). There is no peak, there is a PLATEAU.** All the action is below w=3: 1.0 -> 2.5 gains
++0.036, and 2.5 -> 6.0 gains +0.003.
+⭐ **Therefore w=3 is within noise of optimal for a converged arm, and every matched comparison in
+this file was made at a sensible operating point.** No table needs re-running or re-qualifying.
+⭐ best-of-8 peaks slightly higher and later (0.389 at w=4.5): if you SAMPLE AND SELECT, a bit more
+guidance still helps even though the mean is flat. The mean and the best-of-N optima are not the
+same quantity.
+⚠️ One checkpoint, one seed base, 8 prompts. This establishes the SHAPE for a converged t3_xskip
+arm; it does not transfer to a different architecture. T4 (AR) in particular has a structural
+reason to differ — guidance compounds along an autoregressive sample in a way it cannot for a
+one-shot parallel head — and has NOT been swept.
+
 
 ### The trunk emits gen-query states that are nearly prompt-INVARIANT
 `scripts_local/trunk_compression_probe.py`, `t3_xskip/checkpoint-11000`, 16 prompts, cosine on
@@ -518,8 +541,13 @@ plateau. Both settle near 0.33-0.35.
 ⭐ Its UNGUIDED column is the standout: 0.308 at 82k vs the staged lineage's 0.268 and the previous
 run's 0.245. The guided/unguided gap narrowed from ~0.09 early to ~0.04, i.e. it depends on
 guidance less — consistent with the "peak-w drifts left as conditioning strengthens" prediction,
-here as a run-level effect. **A guidance re-sweep on this run would likely find its optimum below
-w=3, so the w=3 column understates it.**
+here as a run-level effect. ~~**A guidance re-sweep on this run would likely find its optimum below
+w=3, so the w=3 column understates it.**~~
+⛔ **PREDICTION TESTED AND WRONG (2026-09-11).** The sweep was run on THIS run's own ckpt-97000:
+w=3 sits on a flat plateau running to w=6 (0.346-0.350), and everything BELOW w=3 is worse
+(w=2.5 0.344, w=2.0 0.335, w=1.0 0.308). The optimum did not move left, and the w=3 column does not
+understate this run. A narrowing guided/unguided gap evidently does NOT imply the peak shifts —
+only that the unguided floor rose. See the sweep entry near the top of this file.
 
 **RUN COMPLETE 2026-09-01, 100k/100k, all 100 checkpoints evaluated** (8-prompt committed probe,
 N=4, GT ceiling 0.368). Final: w=3 last-10-ckpt mean **0.3475**, best 0.351 @97k; w=1 last-10 mean
