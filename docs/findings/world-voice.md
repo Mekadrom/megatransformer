@@ -222,7 +222,34 @@ individually within noise at gen_n=48.
 not the 6-11% seen at other checkpoints — that comparison crossed checkpoints, runs AND M-RoPE
 rates. The control is what caught it.
 
-**Arm comparison at ck78000 (all post-fix), n=48:**
+**Sampler map at ck78000 (all post-fix), n=48 — a 2x2 of temperature x nucleus, plus floors:**
+
+| | hit% | dur_r | len_mean | len_min | adj_rep | entropy | bigram | coll% |
+|---|---|---|---|---|---|---|---|---|
+| **A: T=0.6, RAS** | **83.3** | **0.702** | 192.0 | 49 | **0.0362** | 10.056 | 0.8167 | 0.0 |
+| D: T=0.6 + nucleus | 72.9 | 0.435 | 190.4 | 66 | 0.0554 | 9.694 | 0.7597 | 2.1 |
+| E: T=1.0 | 75.0 | 0.545 | 183.9 | 23 | 0.0044 | **10.939** | 0.9517 | 4.2 |
+| C: T=1.0 + nucleus + floor 5 | 81.2 | 0.601 | 188.0 | 66 | 0.0096 | 10.334 | 0.8836 | 0.0 |
+| B: T=0.6 + floor 3 | 81.2 | 0.583 | 200.1 | 55 | 0.0414 | 9.967 | — | 2.1 |
+| GT | — | 0.744 | 179.67 | 74 | 0.0792 | 10.398 | 0.8694 | — |
+
+⭐ **Entropy orders by TOTAL concentration**, temperature and nucleus being two of the same kind
+of knob: D (both) 9.69 < A (temp only) 10.06 < C (temp, offset by truncation) 10.33 < E
+(neither) 10.94. **T=1.0 alone OVERSHOOTS ground truth** — entropy 10.94 vs 10.40, bigram 0.952
+vs 0.869, adj_repeat 0.0044 vs 0.0792. It is not diverse, it is noisy. Nucleus in arm C is
+CORRECTING that overshoot, not contributing anything of its own: bolted onto T=0.6 (arm D) the
+same truncation over-concentrates and duration r collapses to 0.435.
+
+**KEEP A: T=0.6 + RAS, no nucleus, no floor.** Its duration-r margin over C is +0.101 = ~3.7 sd
+against the measured 0.027 — the only difference in the table that clearly clears noise. A also
+has the closest adj_repeat to GT of all five. Its one real weakness is being slightly
+UNDER-diverse (entropy 10.06 vs 10.40); C fixes that but pays 3.7 sd of duration conditioning.
+
+**Untested and cheap:** T=0.7-0.8 with no nucleus. Temperature moves entropy monotonically here
+(0.6 -> 10.06, 1.0 -> 10.94, GT 10.40), so ~0.7 should land on GT's entropy without the
+truncation that wrecked D. Strictly better than A if duration r holds.
+
+**(superseded framing) Arm comparison at ck78000 (all post-fix), n=48:**
 
 | arm | EOV | coll% | hit% | dur r | len_mean | len_min | adj_rep | entropy |
 |---|---|---|---|---|---|---|---|---|
