@@ -180,6 +180,72 @@ not dragged. Plain never truncates (it never terminates at all). So enabling RAS
 guaranteed-mild failure on every utterance for a severe failure on ~25% of them. Ear must
 arbitrate that trade; the degeneration metrics all favour RAS and cannot see it.
 
+### CosyVoice 2 sampler alignment: three fixes, one clear effect (2026-09-11, ESTABLISHED)
+
+Our voice sampler diverged from CosyVoice 2's in three ways; all fixed in `0f1e429`, each
+checked against the reference in `~/dev/projects/cosyvoice-runtime`.
+
+1. **Resample scaling (a real bug).** The RAS resample read RAW `logits` while the initial pick
+   read `logits/temperature`, so at T=0.6 every ban silently resampled at **T=1.0** — flatter,
+   handing EOV and the tail more mass at exactly the moments RAS fires. CV2 passes the same
+   `weighted_scores` to `nucleus_sampling` and `random_sampling`, so one tensor is also what the
+   reference does. The resample stays UNTRUNCATED: CV2's `random_sampling` is
+   `weighted_scores.softmax(0).multinomial(1)` over the full vocab. (An earlier same-session
+   claim that omitting top-k/top-p on resample was ALSO a bug was WRONG — it matches CV2.)
+2. **Nucleus semantics.** Now one prefix over the FULL softmax while `cum < top_p and
+   len < top_k`. Ours applied top_k first and measured top_p against the RENORMALISED top-k
+   mass, a different and smaller set. Verified the kept sets are now identical to CV2's on
+   random logits.
+3. **`voice_min_frame_ratio`** — CV2's text-proportional EOS floor
+   (`min_len = text_len * min_token_text_ratio`). CV2's ratio 2 is against its 3:1 token rate;
+   scaled to our 7.5 frames/token that is 5.0. Calibrated on the 6,000-utterance val set:
+   ratio 3.0 -> mean floor 73 frames, **0%** of GT violates; 5.0 -> 122 frames, 1.07%; 6.0 -> 8.92%.
+
+**MATCHED pre/post control at ck78000** (same checkpoint, rate, flags; only `world_model.py` +
+the probe swapped to `6af9337`). `eval_output/world_voice_cv2sampling/`:
+
+| | PRE-FIX | POST-FIX | vs measured sd |
+|---|---|---|---|
+| adj_repeat | 0.0100 | **0.0362** | **+22 sd** (GT 0.0792) |
+| collapsed <50% GT | 4.2% | 0.0% | 2 utterances |
+| len_min | 22 | 49 | — |
+| hit rate | 79.2% | 83.3% | +1.2 sd (ns) |
+| duration r | 0.716 | 0.702 | -0.5 sd (ns) |
+| acc_real | 0.1825 | 0.1822 | flat |
+
+⭐ **The one unambiguous effect is REPETITION NATURALNESS**, not the cutoffs: adj_repeat 22 sd
+toward GT. **Every prior RAS arm's 0.009-0.014 adj_repeat was the BUG over-suppressing**, not
+RAS working as designed. Cutoff improvements are directionally right on every measure but
+individually within noise at gen_n=48.
+
+⚠️ **"The fix eliminated collapses" would OVERSTATE it.** Pre-fix at THIS checkpoint was 4.2%,
+not the 6-11% seen at other checkpoints — that comparison crossed checkpoints, runs AND M-RoPE
+rates. The control is what caught it.
+
+**Arm comparison at ck78000 (all post-fix), n=48:**
+
+| arm | EOV | coll% | hit% | dur r | len_mean | len_min | adj_rep | entropy |
+|---|---|---|---|---|---|---|---|---|
+| **A: T=0.6 RAS, no floor** | 47 | 0.0 | **83.3** | **0.702** | 192.0 | 49 | **0.0362** | 10.056 |
+| B: T=0.6 RAS, ratio 3 | 42 | 2.1 | 81.2 | 0.583 | 200.1 | 55 | 0.0414 | 9.967 |
+| C: full CV2 parity | 45 | 0.0 | 81.2 | 0.601 | 188.0 | 66 | 0.0096 | 10.334 |
+| GT | — | — | — | 0.744 | 179.67 | 74 | 0.0792 | 10.398 |
+
+**Keep A: T=0.6 + RAS, no nucleus, no floor.** The EOS floor is REDUNDANT once the resample
+scaling is fixed — there is no ratchet left to prevent, and it only adds length and defers
+termination. Full CV2 parity (C) buys a tighter length distribution and higher entropy but
+loses duration correlation (0.601 vs 0.702) and over-suppresses repetition (0.0096 vs GT
+0.0792). CV2's config is tuned for their model and their 3:1 rate; the parts that were
+unambiguously BUGS are fixed, and the rest are tuning choices our measurements do not favour.
+
+⚠️⚠️ **`early_acc_real`'s noise floor is CHECKPOINT-SPECIFIC — do not reuse the +-0.0005
+figure.** Across four ck78000 arms that CANNOT affect a teacher-forced metric it read
+0.2969 / 0.2988 / 0.2998 / 0.3027 — spread **0.0058**, against the 0.0009 range measured at
+ck60000. `acc_real` over the same four arms was 0.1825 / 0.1822 / 0.1827 (stable, consistent
+with its 0.0002 sd). early_acc_real is computed over a much smaller position subset and its
+variance is not constant across checkpoints. **Re-measure it at the checkpoint in question
+before quoting an effect size** — this affects the pending mrope75-vs-baseline comparison.
+
 ### Cadence decomposed: the drawl is uniform, not a termination artifact (2026-09-09, ESTABLISHED)
 
 First WER/LCS measurement on the LibriHeavy corpus. **ck90000**, n=64, T=0.6, both RAS settings.
@@ -341,7 +407,7 @@ against THESE numbers, not against the bootstrap CIs, which are marginal and utt
 | metric | mean | **sd** | range |
 |---|---|---|---|
 | acc_real | 0.1799 | **0.0002** | 0.0005 |
-| early_acc_real | 0.3100 | **0.0005** | 0.0009 |
+| early_acc_real | 0.3100 | **0.0005** | 0.0009 | ⚠️ ck60000-SPECIFIC; ck78000 gave spread 0.0058 — see the sampler-alignment entry |
 | early_acc_shuffled | 0.2773 | 0.0018 | 0.0039 |
 | early_text_delta | 0.0327 | **0.0023** | 0.0048 |
 | duration r | 0.6895 | **0.0271** | 0.0600 |
