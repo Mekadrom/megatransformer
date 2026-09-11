@@ -377,7 +377,7 @@ def seq_degeneration(seqs, K):
 def run_generation(model, dataset, collator, device, gen_n, K, budget,
                    bov_id=constants.BOV_TOKEN_ID, ras_win=0, ras_tau=0.1,
                    voice_temp=0.6, top_k=None, top_p=None, nar_rounds=16,
-                   nar_choice_temp=1.0):
+                   nar_choice_temp=1.0, min_frames=0, min_frame_ratio=0.0):
     """Free-running generation from text prompts; return generated + GT unit sequences + EOV info.
 
     Also collects per-sample prompt TEXT length (tokens before BOV) so the caller can correlate
@@ -411,6 +411,8 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
                                  voice_token_budget=budget, voice_temperature=voice_temp,
                                  voice_top_k=top_k, voice_top_p=top_p,
                                  voice_ras_win=ras_win, voice_ras_tau=ras_tau,
+                                 voice_min_frames=min_frames,
+                                 voice_min_frame_ratio=min_frame_ratio,
                                  decode_outputs=False)
         _ent = out.get("voice_unit_id_entropy_trace") or out.get("voice_unit_entropy_trace")
         if _ent and _ent[0]:
@@ -532,6 +534,28 @@ def main():
                     help="Repetition-aware sampling window (CosyVoice 2 uses 10). If the sampled "
                          "unit occurred >= win*tau times in the last `win` emitted units, ban it and "
                          "resample. 0 = off. EOV is exempt from the ban.")
+    ap.add_argument("--voice_min_frames", type=int, default=0,
+                    help="Ban EOV until this many content frames have been emitted IN THE "
+                         "SEGMENT. 0 = off. Exists to counter the RAS EOV RATCHET: on a ban "
+                         "the repeated unit gets -inf and the distribution is renormalised "
+                         "over everything else INCLUDING EOV, so each ban multiplies EOV's "
+                         "probability by 1/(1-p_banned) — and bans fire exactly where the "
+                         "model is already drawn out and uncertain. Measured at ck90000 "
+                         "(n=64): RAS roughly doubled sub-0.7x-length collapses, 3 -> 6, "
+                         "while cutting over-length ~3x. GT len_min is 74 frames, so a floor "
+                         "of 40-50 removes sub-second cutoffs without touching any legitimate "
+                         "short utterance.")
+    ap.add_argument("--voice_min_frame_ratio", type=float, default=0.0,
+                    help="TEXT-PROPORTIONAL EOV floor: ban EOV until ratio*n_text_tokens frames "
+                         "are emitted. 0 = off. This is CosyVoice 2's own scheme "
+                         "(min_len = text_len * min_token_text_ratio, ratio 2 against its 3:1 "
+                         "token rate = two thirds of expected length); scaled to our measured "
+                         "7.5 frames/token that is 5.0. Calibrated on the 6,000-utterance val "
+                         "set: ratio 3.0 gives a mean floor of 73 frames and 0%% of GT "
+                         "utterances violate their own floor; 5.0 gives 122 frames and 1.07%% "
+                         "violate; 6.0 gives 8.92%%. Prefer this over --voice_min_frames: a "
+                         "fixed floor is far too high for a 5-token prompt and too low for a "
+                         "40-token one.")
     ap.add_argument("--voice_ras_tau", type=float, default=0.1,
                     help="RAS repetition threshold (CosyVoice 2 uses 0.1 => any repeat within the window)")
     ap.add_argument("--skip_generation", action="store_true",
@@ -586,6 +610,7 @@ def main():
             model, eval_dataset, collator, device, a.gen_n, K,
             budget=a.voice_max_frames, bov_id=sp.BOV,
             ras_win=a.voice_ras_win, ras_tau=a.voice_ras_tau,
+            min_frames=a.voice_min_frames, min_frame_ratio=a.voice_min_frame_ratio,
             voice_temp=a.voice_temperature, top_k=a.voice_top_k, top_p=a.voice_top_p,
             nar_rounds=a.nar_rounds, nar_choice_temp=a.nar_choice_temperature)
         if ent_traces:

@@ -1173,6 +1173,7 @@ class MegaTransformerWorldModel(nn.Module):
         # byte-identical to prior behavior (training-viz generate() never sets this). A diagnostic
         # lever to test whether "under-speaking" is the model quitting early vs already-drifted.
         voice_min_frames: int = 0,
+        voice_min_frame_ratio: float = 0.0,
         # ORACLE LENGTH (duration upper-bound experiment): force the voice segment to be
         # EXACTLY this many frames -- EOV is banned before it and the segment is cut at it.
         # None (default) => untouched behavior. Per-call scalar, so callers generating one
@@ -1281,6 +1282,14 @@ class MegaTransformerWorldModel(nn.Module):
         """
         batch_size = text_input_ids.shape[0]
         device = text_input_ids.device
+
+        # Real TEXT tokens in the prompt, per batch row — the denominator for CV2's
+        # text-proportional EOS floor (voice_min_frame_ratio). Control tokens (BOV/EOV/
+        # placeholders) live at or above special_token_base and are excluded: they are not
+        # speech to be realised, and counting them would inflate the floor by a fixed amount
+        # that matters most on the short prompts where the floor is most delicate.
+        _sp_base = int(getattr(self.config, "special_token_base", constants.SPECIAL_TOKEN_BASE))
+        _n_text_tokens = (text_input_ids < _sp_base).sum(dim=1).tolist()
 
         # Required token count for image generation
         image_token_budget = self.image_num_patches
@@ -1871,7 +1880,16 @@ class MegaTransformerWorldModel(nn.Module):
                             voice_unit_entropy_trace[b].append(
                                 float(-(_pe.clamp_min(1e-12).log2() * _pe).sum().item()))
                             _seg_len = len(voice_unit_id_trace[b]) - voice_seg_start[b]
+                            # CV2 makes its EOS floor TEXT-PROPORTIONAL, not a fixed count:
+                            # `min_len = (text_len - prompt_text_len) * min_token_text_ratio`
+                            # with min_token_text_ratio=2 against its own 3:1 token rate
+                            # (5:15 chunks) -- i.e. two thirds of the expected length. Scaled
+                            # to our measured 7.5 frames/token that ratio is 5.0. A fixed floor
+                            # cannot do this: the same number is far too high for a 5-token
+                            # prompt and far too low for a 40-token one.
                             _floor = max(int(voice_min_frames or 0), int(voice_exact_frames or 0))
+                            if voice_min_frame_ratio and voice_min_frame_ratio > 0.0:
+                                _floor = max(_floor, int(voice_min_frame_ratio * _n_text_tokens[b]))
                             if _floor > 0 and _seg_len < _floor:
                                 logits = logits.clone()
                                 logits[self.voice_codebook.shape[0]] = float("-inf")
@@ -1886,22 +1904,40 @@ class MegaTransformerWorldModel(nn.Module):
                                 if _chunk_len < max(1, int(voice_min_chunk_frames or 0)):
                                     logits = logits.clone()
                                     logits[_fill_id] = float("-inf")
+                            # `scaled` is the SINGLE scored tensor both the initial pick and
+                            # the RAS resample draw from. Keeping one tensor is the point: the
+                            # resample used to read raw `logits` while the pick read
+                            # logits/temperature, so at T=0.6 every ban silently resampled at
+                            # T=1.0 -- flatter, handing EOV and the tail more mass at exactly
+                            # the moments RAS fires. CosyVoice 2 passes the same
+                            # `weighted_scores` to nucleus_sampling and random_sampling
+                            # (cosyvoice/utils/common.py), so one tensor is also what the
+                            # reference does.
+                            scaled = (logits.float() / voice_temperature
+                                      if voice_temperature > 0.0 else logits.float())
                             if voice_temperature > 0.0:
-                                filt = logits.float() / voice_temperature
-                                # top-k: keep the k highest logits, mask the rest.
-                                if voice_top_k is not None and voice_top_k > 0 and voice_top_k < filt.numel():
-                                    kth = torch.topk(filt, voice_top_k).values[-1]
-                                    filt = filt.masked_fill(filt < kth, float("-inf"))
-                                # top-p (nucleus): keep the smallest prefix whose cumulative prob >= p.
-                                if voice_top_p is not None and 0.0 < voice_top_p < 1.0:
-                                    sorted_logits, sorted_idx = torch.sort(filt, descending=True)
-                                    cum = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                                    remove = cum > voice_top_p
-                                    remove[..., 1:] = remove[..., :-1].clone()  # keep the first token crossing p
-                                    remove[..., 0] = False
-                                    filt = filt.masked_fill(remove.scatter(0, sorted_idx, remove), float("-inf"))
-                                probs = torch.softmax(filt, dim=-1)
-                                unit_id = torch.multinomial(probs, 1)[0]
+                                # CV2-EXACT nucleus (cosyvoice/utils/common.py:nucleus_sampling):
+                                # sort the FULL softmax and take the prefix while
+                                # `cum_prob < top_p and len < top_k`. Ours previously applied
+                                # top_k FIRST and then measured top_p against the renormalised
+                                # top-k mass, so top_p meant "fraction of the top-k mass" rather
+                                # than "fraction of total mass" -- a different, smaller set.
+                                filt = scaled
+                                _k = voice_top_k if (voice_top_k or 0) > 0 else None
+                                _p = voice_top_p if (voice_top_p or 0) > 0 and voice_top_p < 1.0 else None
+                                if _k is not None or _p is not None:
+                                    sv, si = torch.sort(torch.softmax(scaled, dim=-1), descending=True)
+                                    cum = torch.cumsum(sv, dim=-1)
+                                    keep = torch.ones_like(sv, dtype=torch.bool)
+                                    if _p is not None:
+                                        # keep the token that CROSSES p, drop everything after
+                                        keep &= torch.cat([torch.ones(1, dtype=torch.bool, device=sv.device),
+                                                           cum[:-1] < _p])
+                                    if _k is not None:
+                                        keep &= (torch.arange(sv.numel(), device=sv.device) < _k)
+                                    mask = torch.zeros_like(keep).scatter(0, si, keep)
+                                    filt = scaled.masked_fill(~mask, float("-inf"))
+                                unit_id = torch.multinomial(torch.softmax(filt, dim=-1), 1)[0]
                             else:
                                 unit_id = logits.argmax(-1)
                             # REPETITION-AWARE SAMPLING (RAS), after CosyVoice 2's own decoder
@@ -1918,7 +1954,12 @@ class MegaTransformerWorldModel(nn.Module):
                                 if recent and int(unit_id) != eov_id:
                                     rep = sum(1 for u in recent if u == int(unit_id))
                                     if rep >= voice_ras_win * voice_ras_tau:
-                                        banned = logits.float().clone()
+                                        # UNTRUNCATED but temperature-scaled: CV2's
+                                        # random_sampling is
+                                        # `weighted_scores.softmax(0).multinomial(1)` over the
+                                        # full vocab, i.e. it drops the nucleus on resample but
+                                        # keeps the caller's scaling. Matching both halves.
+                                        banned = scaled.clone()
                                         banned[int(unit_id)] = float("-inf")
                                         if _floor > 0 and _seg_len < _floor:
                                             banned[eov_id] = float("-inf")

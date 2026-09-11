@@ -29,6 +29,12 @@ ap.add_argument("--voice_predict_f0", dest="voice_predict_f0", action="store_tru
 ap.add_argument("--n", type=int, default=8)
 ap.add_argument("--ras_win", type=int, default=10)
 ap.add_argument("--ras_tau", type=float, default=0.1)
+ap.add_argument("--voice_min_frame_ratio", type=float, default=0.0,
+                help="Text-proportional EOV floor (CV2's min_len scheme); 3.0 is safe on this "
+                     "corpus, 5.0 is CV2-parity. 0 = off. See world_voice_ar_diagnostics.py.")
+ap.add_argument("--voice_min_frames", type=int, default=0,
+                help="Ban EOV until this many content frames are emitted (0 = off). Counters "
+                     "the RAS EOV ratchet; see world_voice_ar_diagnostics.py for the numbers.")
 ap.add_argument("--device", default="cuda:2")
 ap.add_argument("--out_dir", required=True)
 ap.add_argument("--voice_temperature", type=float, default=0.6,
@@ -94,7 +100,9 @@ for i in range(len(ds)):
                 out = model.generate(text_input_ids=prompt, max_new_tokens=512,
                                      voice_token_budget=a.voice_max_frames, voice_temperature=voice_temp,
                                      voice_top_k=a.voice_top_k, voice_top_p=a.voice_top_p,
-                                     voice_ras_win=win, voice_ras_tau=a.ras_tau, decode_outputs=False)
+                                     voice_ras_win=win, voice_ras_tau=a.ras_tau,
+                                     voice_min_frames=a.voice_min_frames,
+                                     voice_min_frame_ratio=a.voice_min_frame_ratio, decode_outputs=False)
         tr = out.get("voice_unit_id_trace", [[]])[0]
         tr = [int(x) for x in tr if 0 <= int(x) < K]
         row[f"{tag}_frames"] = len(tr)
