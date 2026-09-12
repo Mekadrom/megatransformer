@@ -222,6 +222,50 @@ individually within noise at gen_n=48.
 not the 6-11% seen at other checkpoints — that comparison crossed checkpoints, runs AND M-RoPE
 rates. The control is what caught it.
 
+### mrope75 run: the rate fix bought NOTHING, and 100k is worse than 78k (2026-09-12, ESTABLISHED)
+
+From-scratch run at the corrected `--mrope_voice_rate 7.5`, 100k steps, otherwise identical to
+the rate-6.0 run. **Statistically identical to the baseline — the same numbers to five decimals:**
+
+| | rate 6.0 | rate 7.5 |
+|---|---|---|
+| eval/loss @90k | 0.41527 | 0.41527 |
+| eval/loss @100k | 0.41566 | 0.41566 |
+| unit acc @90k | 0.19096 | 0.19093 |
+| unit acc @100k | 0.19073 | 0.19073 |
+
+⭐ **A 25% M-RoPE rate miscalibration is fully absorbed by training.** Predicted by the
+position-resolved data (text_delta does not decay with position); now confirmed end-to-end.
+Both runs also overfit at the SAME place — eval bottoms at 90k, turns by 100k, epoch 6.67.
+**Use 7.5 for BISTREAM** (where the chunk ratio and positional rate are the same quantity and a
+mismatch is structural, not absorbable), not as an improvement in its own right.
+
+**Free-running degrades 78k -> 100k on BOTH decodes**, while teacher-forced accuracy stays flat
+(acc_real 0.1832) — the overfit is visible only in generation:
+
+| | EOV | coll% | hit% | dur_r | len_mean | len_min | adj_rep |
+|---|---|---|---|---|---|---|---|
+| ck78000 T=0.6+RAS | 47 | **0.0** | 83.3 | 0.702 | 192.0 | **49** | 0.0362 |
+| ck78000 greedy+RAS | 47 | 4.2 | **89.6** | **0.741** | 178.4 | 17 | 0.0097 |
+| ck100000 T=0.6+RAS | 42 | 4.2 | 75.0 | **0.332** | 196.4 | 30 | 0.0473 |
+| ck100000 greedy+RAS | 47 | 4.2 | 83.3 | 0.458 | 177.2 | 28 | 0.0135 |
+| GT | — | — | — | 0.744 | 179.67 | 74 | 0.0792 |
+
+⭐⭐ **greedy+RAS REPLICATED as the better decode on an independent checkpoint**: +6.3 / +8.3
+points of hit rate and +0.039 / +0.126 duration r at 78k / 100k. The earlier 1.9 sd result
+survived replication, with a LARGER margin on the weaker checkpoint. At ck100000 it also
+restores termination (47/48 vs 42/48) and pulls len_mean to 177.2 vs GT 179.67 (T=0.6: 196.4).
+Mechanism is consistent: it bans the degenerate mode every step, and overfitting strengthens
+that mode.
+
+⚠️ **greedy+RAS does NOT fix early EOS.** Collapses stay 4.2% and len_min ~28 under both decodes
+at ck100000. The owner's report of clips cutting off abruptly is real at that checkpoint and is
+NOT a sampling artifact. ck78000 T=0.6 remains the only arm measured at 0.0% collapsed.
+
+⚠️ ck100000's duration r of 0.332 is 13 sd below ck78000's against a 0.027 within-checkpoint
+noise floor, and far outside the 0.565-0.707 range the rate-6.0 run showed across late
+checkpoints. Direction is corroborated by the greedy arm; treat the MAGNITUDE as unreplicated.
+
 ### ⭐⭐ The argmax IS the repeat: greedy collapses, greedy+RAS is the best decode (2026-09-11)
 
 ck78000, n=48, same protocol as the sampler map below.
