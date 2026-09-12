@@ -222,6 +222,46 @@ individually within noise at gen_n=48.
 not the 6-11% seen at other checkpoints — that comparison crossed checkpoints, runs AND M-RoPE
 rates. The control is what caught it.
 
+### ⭐⭐ The argmax IS the repeat: greedy collapses, greedy+RAS is the best decode (2026-09-11)
+
+ck78000, n=48, same protocol as the sampler map below.
+
+| | hit% | dur_r | len_mean | len_min | adj_rep | longest_run | entropy | bigram | coll% |
+|---|---|---|---|---|---|---|---|---|---|
+| **T=0 greedy, no RAS** | 45.8 | nan | 250.0 | 250 | **0.9932** | **249** | **1.59** | 0.0043 | 0.0 |
+| **T=0 greedy + RAS** | **89.6** | **0.741** | **178.4** | 17 | 0.0097 | 7 | 10.090 | 0.8482 | 4.2 |
+| T=0.6 + RAS (arm A) | 83.3 | 0.702 | 192.0 | **49** | **0.0362** | 10 | 10.056 | 0.8167 | **0.0** |
+| GT | — | 0.744 | 179.67 | 74 | 0.0792 | 18 | 10.398 | 0.8694 | — |
+
+⭐⭐⭐ **Pure greedy is total degeneration: 99.3% adjacent repeats, longest_run 249/250, and
+42 distinct units across ALL 48 generations** (entropy 1.59 bits vs GT's 10.398). EOV never
+fires; every output is exactly the 250-frame cap, which is why duration r is `nan` — zero
+variance in length. The in-code note recorded 96% at step 44k on the old run; at 78k post-fix
+it is 99.3%, so this is not a stage the model trains out of.
+
+**The model's top-1 prediction in free-running is "repeat the previous unit", essentially
+always.** Consequences, which reframe the whole sampler thread:
+- **Sampling is LOAD-BEARING, not a refinement.** This model cannot generate at all without it.
+- The drawl exists because repeat is the MODE — even sampled decoding dwells.
+- RAS is worth +0.20 LCS because it explicitly bans that mode.
+- The useful signal lives in the TAIL, which is why truncation hurts: nucleus at T=0.6 (arm D)
+  cut away the part carrying the content and duration r collapsed to 0.435.
+- Contrast teacher-forced `acc_real` 0.18: given GT history the top-1 is right 18% of the time,
+  but conditioned on its own output the argmax degenerates completely. That gap is a sharper
+  statement of the exposure problem than either scheduled-sampling arm produced.
+
+⭐⭐ **Greedy + RAS is the best decode measured**: duration r **0.741 against the 0.744 GT
+ceiling**, len_mean 178.4 vs GT 179.67, hit rate 89.6%. Mechanism: since the argmax is the
+repeat ~99% of the time, RAS fires at nearly every step, making this "ban the mode, then
+sample" at essentially every position. Compare T=1.0+RAS at 0.545 — there the initial pick is
+itself a sample, so RAS only fires when that sample happens to repeat; greedy makes the ban
+near-universal.
+
+⚠️ **NOT yet adopted.** Margins over arm A are 1.9 sd (hit rate) and 1.4 sd (duration r) at
+n=48 — exactly the size that fails to replicate — and it regresses on the cutoff axis
+(4.2% collapsed, len_min 17, vs A's 0.0% and 49). It also still under-repeats badly
+(adj_repeat 0.0097 vs GT 0.0792). **Replicate (>=3 arms) and confirm by ear before switching.**
+
 **Sampler map at ck78000 (all post-fix), n=48 — a 2x2 of temperature x nucleus, plus floors:**
 
 | | hit% | dur_r | len_mean | len_min | adj_rep | entropy | bigram | coll% |
