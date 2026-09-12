@@ -222,6 +222,57 @@ individually within noise at gen_n=48.
 not the 6-11% seen at other checkpoints — that comparison crossed checkpoints, runs AND M-RoPE
 rates. The control is what caught it.
 
+### ⭐⭐ BEST CHECKPOINT + DECODE: 12-arm post-fix sweep (2026-09-12, ESTABLISHED)
+
+All arms post-sampler-fix, n=128 TF / gen_n=48, RAS w=10, each checkpoint evaluated at the rate
+it was TRAINED at. `eval_output/world_voice_bestsweep/` + the four earlier post-fix arms.
+
+| arm | EOV | coll% | hit% | dur_r | len_mean | len_min | adj_rep | ent |
+|---|---|---|---|---|---|---|---|---|
+| r6.0 ck60000 T=0.6 | 44 | 4.2 | 85.4 | 0.410 | 185.9 | 12 | 0.0435 | 9.878 |
+| r6.0 ck60000 greedy | 48 | 14.6 | 72.9 | 0.624 | 165.4 | 7 | 0.0077 | 10.041 |
+| r6.0 ck78000 T=0.6 | 41 | **0.0** | 75.0 | 0.644 | 205.4 | **75** | 0.0387 | 10.027 |
+| r6.0 ck78000 greedy | 47 | 2.1 | **89.6** | 0.674 | 177.3 | 28 | 0.0109 | 10.006 |
+| r6.0 ck90000 T=0.6 | 43 | 4.2 | 62.5 | 0.480 | 198.0 | 33 | **0.0598** | 9.760 |
+| r6.0 ck90000 greedy | 48 | 8.3 | 81.2 | 0.562 | 170.0 | 11 | 0.0113 | 10.061 |
+| **r7.5 ck78000 T=0.6** | **47** | **0.0** | **83.3** | **0.702** | 192.0 | 49 | 0.0362 | 10.056 |
+| r7.5 ck78000 greedy | 47 | 4.2 | **89.6** | 0.741 | 178.4 | 17 | 0.0097 | 10.090 |
+| r7.5 ck90000 T=0.6 | 45 | 4.2 | 72.9 | 0.516 | 200.8 | 35 | 0.0386 | 10.010 |
+| r7.5 ck90000 greedy | 46 | 2.1 | 83.3 | 0.746 | **179.67** | 8 | 0.0129 | 10.025 |
+| r7.5 ck100000 T=0.6 | 42 | 4.2 | 75.0 | 0.332 | 196.4 | 30 | 0.0473 | 9.917 |
+| r7.5 ck100000 greedy | 47 | 4.2 | 83.3 | 0.458 | 177.2 | 28 | 0.0135 | 10.020 |
+| GT | — | — | — | 0.744 | 179.67 | 74 | 0.0792 | 10.398 |
+
+⭐ **THE PICK: `mrope75_0/checkpoint-78000` with T=0.6 + RAS w=10.** 0.0% collapsed, len_min 49,
+hit 83.3%, dur_r 0.702. Use **greedy** on the same checkpoint only if length-TRACKING matters
+more than cutoffs (hit 89.6%, dur_r 0.741, but 4.2% collapsed and len_min 17).
+
+⭐ **A CLEAN DECODE TRADE, consistent across all 6 pairs.** greedy+RAS: higher hit rate and
+duration r, LOWER len_min, MORE collapses, adj_repeat ~0.01. T=0.6: fewer collapses, higher
+len_min, adj_repeat ~0.04 (closer to GT's 0.0792), lower hit rate and dur_r. Greedy optimises
+length-tracking; T=0.6 optimises not-cutting-off. There is no arm that wins both.
+
+⭐⭐ **78k is the free-running optimum in BOTH runs** — the only two arms at 0.0% collapsed are
+r6 ck78000 T=0.6 and r7.5 ck78000 T=0.6. **Eval metrics peak at 90k, so selecting a checkpoint
+by eval CE overshoots the generation optimum by ~12k steps.** Fourth instance today of an effect
+visible only in free-running.
+
+⭐ **RATE 7.5 DOES BEAT 6.0 — amends the "bought nothing" verdict.** That call rested on eval CE
+and unit accuracy being identical to five decimals; they were, and they were blind to this. At
+matched steps, four comparisons all favour 7.5: hit 83.3 vs 75.0 (2.4 sd) and dur_r 0.702 vs
+0.644 (2.1 sd) at 78k; hit 72.9 vs 62.5 (3.1 sd) and dur_r 0.516 vs 0.480 (1.3 sd) at 90k.
+None decisive alone; the consistency across two steps and two metrics is the evidence.
+
+⚠️ **Do not over-read two numbers.** r7.5 ck90000 greedy hit len_mean 179.6667 against GT's
+179.6667 and dur_r 0.746 against the 0.744 "ceiling" — that ceiling is GT's OWN correlation at
+n=48, so exceeding it is chance, not a result.
+
+⚠️ **hit rate and duration r DISAGREE about the optimum.** Hit rate declines monotonically over
+training (r6: 85.4 -> 75.0 -> 62.5) while dur_r, collapses and len_min peak at 78k. They measure
+different things: hit rate is per-utterance "within +-30% of GT length", dur_r is whether length
+TRACKS THE TEXT across utterances. ck60000 produces plausible lengths that are not text-driven
+(hit 85.4 with r 0.410 and len_min 12). For cutoffs, read collapsed% and len_min.
+
 ### mrope75 run: the rate fix bought NOTHING, and 100k is worse than 78k (2026-09-12, ESTABLISHED)
 
 From-scratch run at the corrected `--mrope_voice_rate 7.5`, 100k steps, otherwise identical to
