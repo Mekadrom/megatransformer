@@ -357,7 +357,9 @@ class CosyVoice2Voice:
         # Built on first upload only: the ONNX sessions cost seconds and a TTS-only session
         # never needs them.
         if self._tok is None:
-            from megatransformer.scripts.data.voice.preprocess import (
+            # Light module on purpose: importing scripts.data.voice.preprocess here pulls
+            # datasets/torchcrepe/SIVE and fails on a box that only wants to tokenise audio.
+            from megatransformer.utils.cosyvoice2_encoders import (
                 CosyVoice2BatchProcessor, CampplusBatchProcessor)
             # CPU on purpose: campplus measured 3.7x SLOWER on GPU, and the FSQ tokenizer is
             # static batch-1, so neither benefits from the device the world model is on.
