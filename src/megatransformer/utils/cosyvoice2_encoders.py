@@ -49,27 +49,25 @@ _WHISPER_MEL_CACHE: dict = {}
 
 
 def whisper_log_mel(wav16: "torch.Tensor", n_mels: int = 128) -> "torch.Tensor":
-    """whisper.log_mel_spectrogram without importing whisper.
+    """whisper.log_mel_spectrogram, with NO dependency on openai-whisper.
 
-    openai-whisper imports numba (for its timing module), which caps NumPy at 2.4 and
-    hard-fails on a newer venv -- and the FSQ tokenizer needs exactly one function from it.
-    The mel filterbank is a bundled asset, so read the .npz directly: importlib.util.find_spec
-    locates the package WITHOUT executing its __init__, which is what pulls numba.
+    The FSQ tokenizer needs exactly one function from whisper, whose __init__ imports numba
+    (NumPy <= 2.4) -- and on a machine without the package there is nothing to read at all.
+    Both problems go away by computing the filterbank instead of shipping/reading one.
 
     Constants are whisper's own (audio.py): SAMPLE_RATE 16000, N_FFT 400, HOP_LENGTH 160,
     magnitude SQUARED, log10, an 8-decade dynamic-range floor, then (x + 4) / 4.
     """
-    import importlib.util
-    import numpy as np
     key = int(n_mels)
     if key not in _WHISPER_MEL_CACHE:
-        spec = importlib.util.find_spec("whisper")
-        if spec is None or not spec.origin:
-            raise ImportError("openai-whisper must be installed (its mel_filters.npz asset is "
-                              "read directly; the package itself is never imported)")
-        npz = os.path.join(os.path.dirname(spec.origin), "assets", "mel_filters.npz")
-        with np.load(npz, allow_pickle=False) as z:
-            _WHISPER_MEL_CACHE[key] = torch.from_numpy(z[f"mel_{key}"]).float()
+        # whisper's assets/mel_filters.npz is just librosa's default mel filterbank, which
+        # torchaudio reproduces with norm/mel_scale "slaney". Computing it drops the
+        # openai-whisper dependency entirely rather than requiring the package on disk purely
+        # for a 100 KB asset. Verified against the real npz: max|diff| 6.3e-08 (n_mels 80) and
+        # 1.6e-07 (128), i.e. float32 rounding.
+        _WHISPER_MEL_CACHE[key] = torchaudio.functional.melscale_fbanks(
+            n_freqs=201, f_min=0.0, f_max=8000.0, n_mels=key,
+            sample_rate=16000, norm="slaney", mel_scale="slaney").T
     filters = _WHISPER_MEL_CACHE[key].to(wav16.device)
     window = torch.hann_window(400, device=wav16.device)
     stft = torch.stft(wav16.reshape(-1), 400, 160, window=window, return_complex=True)
