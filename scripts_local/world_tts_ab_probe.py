@@ -28,7 +28,7 @@ import re
 import subprocess
 import sys
 
-CACHE = "cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2"
+CACHE = "cached_datasets/Mekadrom/libriheavy_cosyvoice2_smollm2"
 CODEBOOK = f"{CACHE}/val/cosyvoice2_codebook.pt"
 ARMS = {
     # name: (run_dir, curriculum settings as LAUNCHED; None = no curriculum, always alpha=1)

@@ -14,7 +14,7 @@ from megatransformer.utils import constants
 import world_voice_ar_diagnostics as diag
 from argparse import Namespace
 
-CACHE = "./cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2"
+CACHE = "./cached_datasets/Mekadrom/libriheavy_cosyvoice2_smollm2"
 CB = f"{CACHE}/val/cosyvoice2_codebook.pt"
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "runs/world_voice/memorize32_bistream_0/checkpoint-500"
 DEV = sys.argv[2] if len(sys.argv) > 2 else "cuda:3"

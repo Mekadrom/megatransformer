@@ -39,7 +39,7 @@ Reading it:
 Usage:
   python scripts_local/memorization_text_dependence.py \
       --checkpoint_path runs/world_voice/memorize32_0/checkpoint-20000 --step 20000 \
-      --cache_dir ./cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2 \
+      --cache_dir ./cached_datasets/Mekadrom/libriheavy_cosyvoice2_smollm2 \
       --codebook .../cosyvoice2_codebook.pt --config small_sum \
       --text_encoder_model HuggingFaceTB/SmolLM2-135M --voice_max_frames 250 \
       --duration_token --mrope_scale_side text --device cuda:0 \

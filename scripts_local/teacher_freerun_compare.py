@@ -11,7 +11,7 @@ reports the same degeneration statistics `world_voice_ar_diagnostics.seq_degener
 for our student, so all three (teacher / GT / student) are directly comparable.
 
   uv run python scripts_local/teacher_freerun_compare.py --model_dir <cv2 snapshot> \
-      --cache_dir cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2/val --n 32 --device cuda:3
+      --cache_dir cached_datasets/Mekadrom/libriheavy_cosyvoice2_smollm2/val --n 32 --device cuda:3
 """
 import os, sys, glob, argparse, functools, json
 

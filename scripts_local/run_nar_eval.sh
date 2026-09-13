@@ -19,7 +19,7 @@ GPU="${1:?usage: run_nar_eval.sh <gpu> [step]}"
 STEP="${2:-23000}"
 DEV="cuda:${GPU}"
 
-CACHE=./cached_datasets/Mekadrom/libritts_r_cosyvoice2_smollm2
+CACHE=./cached_datasets/Mekadrom/libriheavy_cosyvoice2_smollm2
 CB=$CACHE/val/cosyvoice2_codebook.pt
 CV2=/mnt/nasbro/cache/hf_home/hub/models--FunAudioLLM--CosyVoice2-0.5B/snapshots/eec1ae6c79877dbd9379285cf8789c9e0879293d
 RUN=runs/world_voice/cosyvoice2_smollm2_nar_0

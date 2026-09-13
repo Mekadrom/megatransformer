@@ -32,6 +32,8 @@ dependencies = [
     "sentencepiece",   # required by the Mistral tokenizer (not auto-installed by transformers)
     "protobuf",        # ditto (tokenizer conversion)
     "rotary-embedding-torch",
+    "onnxruntime-gpu>=1.20,<1.24",
+    "hf-transfer>=0.1.9",
 ]
 
 [project.optional-dependencies]
