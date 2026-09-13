@@ -190,6 +190,14 @@ def parse_args():
                         "the model's free-running argmax is 'repeat the previous unit' almost "
                         "always, so RAS is load-bearing, not a refinement. 0 disables.")
     p.add_argument("--voice_ras_tau", type=float, default=0.1)
+    p.add_argument("--voice_prompt_seconds", type=float, default=3.0,
+                   help="Seconds of an uploaded voice clip used as ZERO-SHOT prompt conditioning "
+                        "(its FSQ units + 24 kHz mel are concatenated ahead of the target inside "
+                        "the flow). The 192-d embedding is a global summary; the prompt adds "
+                        "per-frame acoustic evidence. Measured +0.014 mean campplus cosine to the "
+                        "reference over 6 same-speaker pairs (5/6 positive). 0 disables, leaving "
+                        "embedding-only conditioning. Prompt shares flow context with the target, "
+                        "so longer is not automatically better.")
     p.add_argument("--voice_min_frame_ratio", type=float, default=0.0,
                    help="Text-proportional EOV floor (CV2's min_len scheme). 0 = off, which is "
                         "the measured-best setting once the resample scaling is correct.")
@@ -328,7 +336,7 @@ class CosyVoice2Voice:
         return self._tok, self._spk
 
     def encode(self, waveform_16k: torch.Tensor):
-        """(T,) @16 kHz -> (centroids (D, T'), campplus (192,))."""
+        """(T,) @16 kHz -> (centroids (D, T'), campplus (192,), unit ids (T',))."""
         tok, spk = self._lazy_encoders()
         wl = torch.tensor([waveform_16k.numel()])
         # Both processors return DICTS of padded batch tensors. unit_ids is padded to
@@ -341,28 +349,39 @@ class CosyVoice2Voice:
         emb = spk.process_batch([waveform_16k], wl)["speaker_embeddings"][0]
         ids = ids[(ids >= 0) & (ids < self.K)]
         feats = self.codebook[ids].permute(1, 0).contiguous()            # (D, T')
-        return feats, torch.as_tensor(emb).reshape(-1).float()
+        return feats, torch.as_tensor(emb).reshape(-1).float(), ids
 
-    def decode(self, unit_ids, speaker_embedding: torch.Tensor):
+    def decode(self, unit_ids, speaker_embedding: torch.Tensor,
+               prompt_ids=None, prompt_feat=None):
         ids = torch.as_tensor(unit_ids).reshape(-1).long()
         # EOV (id == K) has no codebook row; passing it would index out of bounds.
         ids = ids[(ids >= 0) & (ids < self.K)]
         if ids.numel() == 0:
             return None
-        wav = self.decoder.decode(ids, speaker_embedding.reshape(-1).float())
+        wav = self.decoder.decode(ids, speaker_embedding.reshape(-1).float(),
+                                  prompt_ids=prompt_ids, prompt_feat=prompt_feat)
         if wav is None:
             return None
         return self.sample_rate, wav.detach().cpu().numpy()
 
 
-def encode_voice_file_cv2(path: str, cv2: "CosyVoice2Voice"):
+def encode_voice_file_cv2(path: str, cv2: "CosyVoice2Voice", prompt_seconds: float = 0.0):
+    """-> (centroids (D,T), campplus (192,), prompt_ids | None, prompt_mel | None)."""
     waveform, sr = torchaudio.load(path)
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
-    # The FSQ tokenizer and campplus both want 16 kHz regardless of the model's mel settings.
-    if sr != 16000:
-        waveform = torchaudio.functional.resample(waveform, sr, 16000)
-    return cv2.encode(waveform.squeeze(0))
+    # The FSQ tokenizer and campplus read 16 kHz; the flow's prompt mel reads 24 kHz. Keep the
+    # original around rather than round-tripping 16k->24k, which would lose the top octave.
+    w16 = waveform if sr == 16000 else torchaudio.functional.resample(waveform, sr, 16000)
+    feats, spk, ids = cv2.encode(w16.squeeze(0))
+    p_ids = p_mel = None
+    if prompt_seconds and prompt_seconds > 0:
+        n = min(int(prompt_seconds * sr), waveform.shape[-1])
+        p_mel = cv2.decoder.prompt_mel(waveform[..., :n], sr)
+        # decode() re-trims to 2 mel frames per token; cap here so we never hand it more
+        # units than the prompt audio actually covers.
+        p_ids = ids[:int(p_mel.shape[0] // 2)]
+    return feats, spk, p_ids, p_mel
 
 
 def render_file_list(state: dict) -> str:
@@ -823,7 +842,10 @@ def main():
                     gr.Warning("SIVE not loaded — cannot accept voice uploads")
                     continue
                 if cv2_voice is not None:
-                    tensor, _spk = encode_voice_file_cv2(path, cv2_voice)
+                    tensor, _spk, _pid, _pmel = encode_voice_file_cv2(
+                        path, cv2_voice, args.voice_prompt_seconds)
+                    state["uploaded_prompt_ids"] = _pid
+                    state["uploaded_prompt_mel"] = _pmel
                     # An uploaded voice also supplies its OWN speaker embedding, which beats
                     # the static one for cloning: campplus of the actual clip rather than a
                     # pinned reference. Last upload wins.
@@ -1147,7 +1169,10 @@ def main():
                         f"decoder expects campplus-192. Output will be off-manifold.")
                 for k, ids in enumerate(id_blocks):
                     try:
-                        got = cv2_voice.decode(ids, spk)
+                        got = cv2_voice.decode(
+                            ids, spk,
+                            prompt_ids=state.get("uploaded_prompt_ids"),
+                            prompt_feat=state.get("uploaded_prompt_mel"))
                         if got is None:
                             status_lines.append(f"Voice {k + 1}: no renderable units")
                             continue

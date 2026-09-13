@@ -129,22 +129,63 @@ class CosyVoice2Decoder(torch.nn.Module):
         m = cls(flow, hift, int(configs["sample_rate"]))
         return m.to(device=device, dtype=dtype)
 
+    # CosyVoice 2's prompt mel. NOT our training mel: n_fft/hop/win and the 24 kHz rate are
+    # the flow's own feat_extractor settings (conf/cosyvoice2.yaml), and a mismatch puts the
+    # prompt off-manifold in a way that is worse than no prompt at all.
+    PROMPT_MEL = dict(n_fft=1920, num_mels=80, sampling_rate=24000,
+                      hop_size=480, win_size=1920, fmin=0, fmax=8000, center=False)
+
     @torch.no_grad()
-    def decode(self, unit_ids: torch.Tensor, speaker_embedding: torch.Tensor) -> Optional[torch.Tensor]:
+    def prompt_mel(self, waveform: torch.Tensor, sr: int) -> torch.Tensor:
+        """Reference waveform -> (T_mel, 80) prompt feature for zero-shot cloning.
+
+        24 kHz on purpose: the flow's mel is 24000/480 = 50 Hz while the FSQ tokenizer reads
+        16 kHz, so a reference clip feeds the two halves of the prompt at DIFFERENT rates
+        (frontend.py:_extract_speech_feat vs _extract_spk_embedding).
+        """
+        import torchaudio
+        from matcha.utils.audio import mel_spectrogram
+        wav = waveform.reshape(1, -1).float()
+        if sr != 24000:
+            wav = torchaudio.functional.resample(wav, sr, 24000)
+        return mel_spectrogram(wav, **self.PROMPT_MEL).squeeze(0).transpose(0, 1)
+
+    @torch.no_grad()
+    def decode(self, unit_ids: torch.Tensor, speaker_embedding: torch.Tensor,
+               prompt_ids: Optional[torch.Tensor] = None,
+               prompt_feat: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """unit_ids: (T,) or (1,T) int content units (EOV/padding already stripped).
-        speaker_embedding: (192,) or (1,192) campplus. Returns (T_wav,) float32 on CPU."""
+        speaker_embedding: (192,) or (1,192) campplus. Returns (T_wav,) float32 on CPU.
+
+        prompt_ids / prompt_feat are OPTIONAL zero-shot conditioning: the reference clip's FSQ
+        units and its 24 kHz 80-bin mel, concatenated ahead of the target inside the flow. The
+        192-d embedding is a global summary that modulates via spk_embed_affine_layer; the
+        prompt supplies PER-FRAME acoustic evidence (timbre detail, channel, style) that no
+        fixed-size vector carries. Passing neither reproduces the previous embedding-only
+        behaviour exactly.
+        """
         ids = unit_ids.reshape(1, -1).to(device=self._device, dtype=torch.int32)
         if ids.shape[1] == 0:
             return None
         emb = speaker_embedding.reshape(1, -1).to(device=self._device, dtype=self._dtype)
 
+        p_ids = torch.zeros(1, 0, dtype=torch.int32, device=self._device)
+        p_feat = torch.zeros(1, 0, 80, device=self._device, dtype=self._dtype)
+        if prompt_ids is not None and prompt_feat is not None:
+            _pi = prompt_ids.reshape(1, -1).to(device=self._device, dtype=torch.int32)
+            _pf = prompt_feat.reshape(-1, 80).unsqueeze(0).to(device=self._device, dtype=self._dtype)
+            # force  mel_frames == 2 * token_frames  (frontend.py:176-178)
+            n_tok = min(int(_pf.shape[1] // 2), int(_pi.shape[1]))
+            if n_tok > 0:
+                p_ids, p_feat = _pi[:, :n_tok], _pf[:, :2 * n_tok]
+
         kw = dict(
             token=ids,
             token_len=torch.tensor([ids.shape[1]], dtype=torch.int32, device=self._device),
-            prompt_token=torch.zeros(1, 0, dtype=torch.int32, device=self._device),
-            prompt_token_len=torch.tensor([0], dtype=torch.int32, device=self._device),
-            prompt_feat=torch.zeros(1, 0, 80, device=self._device, dtype=self._dtype),
-            prompt_feat_len=torch.tensor([0], dtype=torch.int32, device=self._device),
+            prompt_token=p_ids,
+            prompt_token_len=torch.tensor([p_ids.shape[1]], dtype=torch.int32, device=self._device),
+            prompt_feat=p_feat,
+            prompt_feat_len=torch.tensor([p_feat.shape[1]], dtype=torch.int32, device=self._device),
             embedding=emb,
         )
         # Signature drifts across CosyVoice revisions; pass only what this one declares.
