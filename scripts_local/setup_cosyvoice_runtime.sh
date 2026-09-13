@@ -20,8 +20,11 @@ PY="${PYTHON:-python3}"
 echo "==> target: $DIR"
 mkdir -p "$DIR"
 
-# 1. upstream repo. --recursive is REQUIRED: third_party/Matcha-TTS provides
-#    matcha.utils.audio.mel_spectrogram, which is the prompt-mel extractor.
+# 1. upstream repo. --recursive is REQUIRED: cosyvoice.flow.flow_matching imports
+#    matcha.models.components, so the submodule is on the decode path.
+#    NOTE matcha.utils.audio is NOT needed -- it does `from librosa.filters import mel` ->
+#    numba (NumPy <= 2.4). The yaml's feat_extractor is stripped and the prompt mel is
+#    reimplemented on torchaudio, so nothing here should ever import it.
 if [ -d "$DIR/CosyVoice/.git" ]; then
   echo "==> CosyVoice already present, skipping clone"
 else
