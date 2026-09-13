@@ -369,6 +369,21 @@ class CosyVoice2Voice:
         return self.sample_rate, wav.detach().cpu().numpy()
 
 
+_PROMPT_MAX_SECONDS = 10.0   # upper bound of the UI slider; encode once, trim per-request
+
+
+def trim_prompt(prompt_ids, prompt_mel, seconds: float):
+    """Cut a stored prompt to `seconds`. Mel is 50 Hz and tokens 25 Hz, so the flow's
+    2-mel-frames-per-token contract is preserved by construction."""
+    if prompt_ids is None or prompt_mel is None or not seconds or seconds <= 0:
+        return None, None
+    n_mel = min(int(round(seconds * 50.0)), int(prompt_mel.shape[0]))
+    n_tok = min(n_mel // 2, int(prompt_ids.shape[0]))
+    if n_tok <= 0:
+        return None, None
+    return prompt_ids[:n_tok], prompt_mel[:2 * n_tok]
+
+
 def encode_voice_file_cv2(path: str, cv2: "CosyVoice2Voice", prompt_seconds: float = 0.0):
     """-> (centroids (D,T), campplus (192,), prompt_ids | None, prompt_mel | None)."""
     waveform, sr = torchaudio.load(path)
@@ -852,8 +867,11 @@ def main():
                     gr.Warning("SIVE not loaded — cannot accept voice uploads")
                     continue
                 if cv2_voice is not None:
+                    # Encode the LONGEST prompt the slider can ask for; decode trims it.
+                    # Doing it the other way round would pin the prompt length to whatever the
+                    # slider read at upload time and make the control inert after the fact.
                     tensor, _spk, _pid, _pmel = encode_voice_file_cv2(
-                        path, cv2_voice, args.voice_prompt_seconds)
+                        path, cv2_voice, _PROMPT_MAX_SECONDS)
                     state["uploaded_prompt_ids"] = _pid
                     state["uploaded_prompt_mel"] = _pmel
                     # An uploaded voice also supplies its OWN speaker embedding, which beats
@@ -909,6 +927,10 @@ def main():
         image_iter_override_in,
         image_steps_in,
         image_sampler_in,
+        voice_temp_in,
+        voice_ras_win_in,
+        voice_ras_tau_in,
+        voice_prompt_sec_in,
     ):
         if not msg_text or not msg_text.strip():
             return "", [], [], "Empty prompt."
@@ -1179,10 +1201,11 @@ def main():
                         f"decoder expects campplus-192. Output will be off-manifold.")
                 for k, ids in enumerate(id_blocks):
                     try:
-                        got = cv2_voice.decode(
-                            ids, spk,
-                            prompt_ids=state.get("uploaded_prompt_ids"),
-                            prompt_feat=state.get("uploaded_prompt_mel"))
+                        _pid, _pmel = trim_prompt(
+                            state.get("uploaded_prompt_ids"),
+                            state.get("uploaded_prompt_mel"),
+                            float(voice_prompt_sec_in))
+                        got = cv2_voice.decode(ids, spk, prompt_ids=_pid, prompt_feat=_pmel)
                         if got is None:
                             status_lines.append(f"Voice {k + 1}: no renderable units")
                             continue
@@ -1192,9 +1215,12 @@ def main():
                         voice_wav_paths.append(path)
                     except Exception as e:
                         status_lines.append(f"Voice {k + 1} decode failed: {e}")
+                _ps = float(voice_prompt_sec_in)
+                _has_prompt = state.get("uploaded_prompt_ids") is not None and _ps > 0
                 status_lines.append(
                     f"Decoded {len(voice_wav_paths)} voice clip(s) via CosyVoice 2 "
-                    f"(T={args.voice_temperature}, RAS win={args.voice_ras_win})")
+                    f"(T={float(voice_temp_in):g}, RAS win={int(voice_ras_win_in or 0)}, "
+                    f"prompt={f'{_ps:g}s' if _has_prompt else 'off (embedding only)'})")
         elif voice_preds is not None and voice_counts is not None:
             n_voice = int(voice_counts[0].item())
             if n_voice and (smg_decoder is None or vocoder is None):
@@ -1292,6 +1318,31 @@ def main():
                             value=0, label="top_k (0 = off)",
                         )
                     with gr.Row():
+                        # VOICE unit sampler -- separate from the text sampler above. Measured
+                        # at ck78000 (n=48): T=0.6 is the only setting with 0% collapsed
+                        # clips, greedy (0.0) wins length-tracking (hit 89.6% vs 83.3%,
+                        # duration r 0.741 vs 0.702) but cuts off more. RAS is LOAD-BEARING,
+                        # not a refinement: the free-running argmax is "repeat the previous
+                        # unit" ~99% of the time, so at win=0 the model drones.
+                        voice_temp_slider = gr.Slider(
+                            minimum=0.0, maximum=1.5, step=0.05,
+                            value=args.voice_temperature,
+                            label="voice temperature (0 = greedy; 0.6 fewest cutoffs)",
+                        )
+                        voice_ras_win_slider = gr.Slider(
+                            minimum=0, maximum=40, step=1, value=args.voice_ras_win,
+                            label="voice RAS window (0 = OFF -> drones; 10 = CosyVoice 2)",
+                        )
+                        voice_ras_tau_slider = gr.Slider(
+                            minimum=0.0, maximum=1.0, step=0.05, value=args.voice_ras_tau,
+                            label="voice RAS tau",
+                        )
+                        voice_prompt_sec_slider = gr.Slider(
+                            minimum=0.0, maximum=10.0, step=0.5,
+                            value=args.voice_prompt_seconds,
+                            label="prompt seconds from upload (0 = embedding only)",
+                        )
+                    with gr.Row():
                         max_new_tokens_num = gr.Number(
                             value=args.max_new_tokens, precision=0,
                             label="max_new_tokens",
@@ -1385,6 +1436,8 @@ def main():
                 max_new_tokens_num, voice_budget_num, audio_budget_num,
                 seed_num, image_iter_override_num,
                 image_steps_num, image_sampler_dd,
+                voice_temp_slider, voice_ras_win_slider,
+                voice_ras_tau_slider, voice_prompt_sec_slider,
             ],
             outputs=[out_text, out_gallery, out_audio_files, status_box],
         )
