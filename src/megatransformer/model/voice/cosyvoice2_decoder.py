@@ -84,13 +84,33 @@ def _load_configs_without_llm(model_dir: str):
     with open(yaml_path) as f:
         raw = f.read()
 
-    # Drop the top-level `llm:` block (its nested lines are indented; the block ends at the
-    # next unindented line). hyperpyyaml would otherwise construct the Qwen2 wrapper.
+    # Keep ONLY what decode needs: the scalars plus `flow:` and `hift:`. Everything else in
+    # this yaml is training/frontend machinery that hyperpyyaml would eagerly construct or
+    # import via pydoc.locate at LOAD time -- including `feat_extractor: !name:
+    # matcha.utils.audio.mel_spectrogram`, which pulls librosa -> numba and dies outright on
+    # a venv with numpy > 2.4. Neither flow nor hift references any of it (verified against
+    # cosyvoice2.yaml: 0 hits for feat_extractor inside either block).
+    #
+    # Rule: a top-level key starts a block that ends at the next unindented line. Drop the
+    # block if it constructs something we don't want (`!new:` other than flow/hift), if it's
+    # a `!name:` callable (the whole dataset.processor pipeline), or if it's one of the
+    # structural training keys.
+    _KEEP_NEW = ("flow:", "hift:")
+    _DROP_KEYS = ("data_pipeline:", "data_pipeline_gan:", "train_conf:")
     keep, skipping = [], False
     for ln in raw.split("\n"):
-        if ln.startswith("llm:"):
-            skipping = True
-        elif skipping and ln and not ln[0].isspace():
+        if ln and not ln[0].isspace() and ":" in ln:
+            top = ln.split(":", 1)[0] + ":"
+            if top in _KEEP_NEW:
+                skipping = False
+            elif top in _DROP_KEYS or "!name:" in ln or "!new:" in ln:
+                skipping = True
+            else:
+                skipping = False
+        elif skipping and ln and not ln[0].isspace() and ":" in ln:
+            # Only a real top-level KEY ends a skipped block. `data_pipeline: [` closes with a
+            # bare unindented `]`, which would otherwise end the skip and leave an orphan
+            # bracket behind -- a yaml parse error rather than a quiet one, but still wrong.
             skipping = False
         if not skipping:
             keep.append(ln)
@@ -98,6 +118,39 @@ def _load_configs_without_llm(model_dir: str):
         "\n".join(keep),
         overrides={"qwen_pretrain_path": os.path.join(model_dir, "CosyVoice-BlankEN")},
     )
+
+
+_MEL_BASIS: dict = {}
+_HANN: dict = {}
+
+
+def _matcha_mel(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
+    """matcha.utils.audio.mel_spectrogram, reimplemented on torchaudio.
+
+    Byte-for-byte the same computation, but WITHOUT librosa: matcha imports
+    `librosa.filters.mel`, which pulls numba, which caps NumPy at 2.4 and hard-fails on a
+    newer venv. torchaudio's melscale_fbanks with norm="slaney"/mel_scale="slaney" is
+    librosa's default filterbank; the rest (reflect pad by (n_fft-hop)/2, magnitude with the
+    1e-9 floor, log-clamp at 1e-5) is copied from matcha. Equivalence is asserted in
+    tests rather than assumed -- a silent mismatch here puts the prompt off-manifold, which
+    is worse than passing no prompt at all.
+    """
+    import torchaudio
+    key = f"{fmax}_{y.device}_{n_fft}_{num_mels}"
+    if key not in _MEL_BASIS:
+        fb = torchaudio.functional.melscale_fbanks(
+            n_freqs=n_fft // 2 + 1, f_min=float(fmin), f_max=float(fmax),
+            n_mels=num_mels, sample_rate=sampling_rate, norm="slaney", mel_scale="slaney")
+        _MEL_BASIS[key] = fb.T.to(y.device)                      # (n_mels, n_freqs)
+        _HANN[key] = torch.hann_window(win_size).to(y.device)
+    pad = int((n_fft - hop_size) / 2)
+    yp = torch.nn.functional.pad(y.unsqueeze(1), (pad, pad), mode="reflect").squeeze(1)
+    spec = torch.stft(yp, n_fft, hop_length=hop_size, win_length=win_size,
+                      window=_HANN[key], center=center, pad_mode="reflect",
+                      normalized=False, onesided=True, return_complex=True)
+    spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
+    spec = torch.matmul(_MEL_BASIS[key], spec)
+    return torch.log(torch.clamp(spec, min=1e-5))
 
 
 class CosyVoice2Decoder(torch.nn.Module):
@@ -144,11 +197,10 @@ class CosyVoice2Decoder(torch.nn.Module):
         (frontend.py:_extract_speech_feat vs _extract_spk_embedding).
         """
         import torchaudio
-        from matcha.utils.audio import mel_spectrogram
         wav = waveform.reshape(1, -1).float()
         if sr != 24000:
             wav = torchaudio.functional.resample(wav, sr, 24000)
-        return mel_spectrogram(wav, **self.PROMPT_MEL).squeeze(0).transpose(0, 1)
+        return _matcha_mel(wav, **self.PROMPT_MEL).squeeze(0).transpose(0, 1)
 
     @torch.no_grad()
     def decode(self, unit_ids: torch.Tensor, speaker_embedding: torch.Tensor,
