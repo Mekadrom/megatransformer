@@ -907,6 +907,27 @@ def main():
         msg_text = (msg_text + suffix) if msg_text else f"@{ref}"
         return msg_text, render_file_list(state), state, None  # clear paste zone
 
+    def on_speaker_ref(path, state):
+        """Set the speaker embedding (+ zero-shot prompt) from a reference clip."""
+        if not path:
+            state.pop("uploaded_speaker_emb", None)
+            state.pop("uploaded_prompt_ids", None)
+            state.pop("uploaded_prompt_mel", None)
+            return state, "*No reference voice — voice output cannot be rendered.*"
+        if cv2_voice is None:
+            return state, "*Reference voice needs the CosyVoice 2 path (--voice_cosyvoice2_model_dir).*"
+        try:
+            _, spk, pid, pmel = encode_voice_file_cv2(path, cv2_voice, _PROMPT_MAX_SECONDS)
+        except Exception as e:
+            return state, f"*Reference voice failed: {type(e).__name__}: {e}*"
+        state["uploaded_speaker_emb"] = spk
+        state["uploaded_prompt_ids"] = pid
+        state["uploaded_prompt_mel"] = pmel
+        secs = (pmel.shape[0] / 50.0) if pmel is not None else 0.0
+        return state, (f"**Speaker set** — campplus-192 (norm {spk.norm():.1f}), "
+                       f"{secs:.1f}s of prompt available "
+                       f"(trimmed by the *prompt seconds* slider at generation).")
+
     def on_clear(state):
         return "", render_file_list({}), {}, "", [], [], ""
 
@@ -1191,9 +1212,11 @@ def main():
                 spk = static_speaker_emb
             if id_blocks and spk is None:
                 status_lines.append(
-                    f"{len(id_blocks)} voice block(s) generated but no speaker embedding — "
-                    f"upload a voice file to clone from, or pass "
-                    f"--static_speaker_embedding_path (campplus-192).")
+                    f"⚠️ {len(id_blocks)} voice block(s) WERE generated but could not be "
+                    f"rendered: no speaker. The frozen CosyVoice 2 decoder needs a campplus-192 "
+                    f"vector to know who is speaking. Set one with the **Reference voice** "
+                    f"control (right-hand panel), or launch with "
+                    f"--static_speaker_embedding_path.")
             elif id_blocks:
                 if spk.reshape(-1).numel() != 192:
                     status_lines.append(
@@ -1417,7 +1440,22 @@ def main():
                     label="Paste image here (Cmd/Ctrl-V)",
                     height=180,
                 )
+                # SEPARATE from "Attach files": attaching a voice clip inserts an @ref and
+                # feeds it to the model as transcription INPUT. This one only sets who the
+                # output sounds like, and never touches the prompt. Without it (and without
+                # --static_speaker_embedding_path) the frozen decoder has no speaker to render
+                # as, so generated units cannot be turned into audio at all.
+                speaker_ref = gr.Audio(
+                    sources=["upload", "microphone"], type="filepath",
+                    label="Reference voice (sets the speaker — required to hear output)",
+                )
+                speaker_ref_md = gr.Markdown("*No reference voice — voice output cannot be rendered.*")
 
+        speaker_ref.change(
+            on_speaker_ref,
+            inputs=[speaker_ref, state],
+            outputs=[state, speaker_ref_md],
+        )
         upload.upload(
             on_files_uploaded,
             inputs=[upload, msg_box, state],
