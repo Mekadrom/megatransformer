@@ -13,7 +13,6 @@ import traceback
 
 from megatransformer.scripts.data.ctc_tokens_batch_processor import TextCTCTokensBatchProcessor
 from megatransformer.scripts.data.text_batch_processor import TextConditionsBatchProcessor
-import torchcrepe
 
 
 from platform import processor
@@ -186,7 +185,13 @@ def extract_f0_batch_gpu(
     f0_batch_size: int = 512,
 ) -> tuple:
     """
+    import torchcrepe
     Extract F0 (fundamental frequency) using torchcrepe on GPU (batched).
+
+    torchcrepe is imported HERE, not at module scope: it pulls librosa -> numba, which caps
+    NumPy at 2.4 and hard-fails on a newer venv. Importing this module at all would then break
+    -- including for callers that only want the CosyVoice 2 tokenizer and never touch F0 (the
+    chat UI's Reference voice control, which is how this surfaced).
 
     Args:
         waveforms: [B, T] batch of audio waveforms as torch tensor
@@ -200,6 +205,7 @@ def extract_f0_batch_gpu(
         log_f0: [B, T'] Log F0 contour (always computed, even for unvoiced)
         voiced: [B, T'] Soft voicing probability (0-1, from periodicity)
     """
+    import torchcrepe
     # torchcrepe expects [batch, samples]
     if waveforms.dim() == 1:
         waveforms = waveforms.unsqueeze(0)
@@ -483,6 +489,41 @@ def _preload_venv_cuda_libs() -> int:
     return n
 
 
+_WHISPER_MEL_CACHE: dict = {}
+
+
+def whisper_log_mel(wav16: "torch.Tensor", n_mels: int = 128) -> "torch.Tensor":
+    """whisper.log_mel_spectrogram without importing whisper.
+
+    openai-whisper imports numba (for its timing module), which caps NumPy at 2.4 and
+    hard-fails on a newer venv -- and the FSQ tokenizer needs exactly one function from it.
+    The mel filterbank is a bundled asset, so read the .npz directly: importlib.util.find_spec
+    locates the package WITHOUT executing its __init__, which is what pulls numba.
+
+    Constants are whisper's own (audio.py): SAMPLE_RATE 16000, N_FFT 400, HOP_LENGTH 160,
+    magnitude SQUARED, log10, an 8-decade dynamic-range floor, then (x + 4) / 4.
+    """
+    import importlib.util
+    import numpy as np
+    key = int(n_mels)
+    if key not in _WHISPER_MEL_CACHE:
+        spec = importlib.util.find_spec("whisper")
+        if spec is None or not spec.origin:
+            raise ImportError("openai-whisper must be installed (its mel_filters.npz asset is "
+                              "read directly; the package itself is never imported)")
+        npz = os.path.join(os.path.dirname(spec.origin), "assets", "mel_filters.npz")
+        with np.load(npz, allow_pickle=False) as z:
+            _WHISPER_MEL_CACHE[key] = torch.from_numpy(z[f"mel_{key}"]).float()
+    filters = _WHISPER_MEL_CACHE[key].to(wav16.device)
+    window = torch.hann_window(400, device=wav16.device)
+    stft = torch.stft(wav16.reshape(-1), 400, 160, window=window, return_complex=True)
+    magnitudes = stft[..., :-1].abs() ** 2
+    mel = filters @ magnitudes
+    log_spec = torch.clamp(mel, min=1e-10).log10()
+    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+    return ((log_spec + 4.0) / 4.0).unsqueeze(0)
+
+
 class CosyVoice2BatchProcessor(BatchProcessor):
     """CosyVoice 2 speech_tokenizer_v2 (FSQ) as a DISCRETE content tokenizer.
 
@@ -503,7 +544,11 @@ class CosyVoice2BatchProcessor(BatchProcessor):
     def __init__(self, model_dir: str, voice_max_frames: int, mel_frame_rate: float,
                  device: str = "cuda", source_sr: int = 16000, cpu_threads: int = 0):
         import onnxruntime as ort
-        import whisper  # noqa: F401  (imported here so the dep is only needed on this path)
+        # NO `import whisper` here. We only need its mel_filters.npz asset, which
+        # whisper_log_mel() reads via importlib.util.find_spec WITHOUT executing the package
+        # __init__ -- that __init__ pulls numba, which caps NumPy at 2.4. Fail early with a
+        # useful message if the asset is absent, rather than at the first process_batch call.
+        whisper_log_mel(torch.zeros(400), n_mels=128)
         self.frame_rate = 25.0
         self.source_sr = source_sr
         # voice_max_frames counts MEL frames; convert to 25 Hz unit frames the way
@@ -548,7 +593,6 @@ class CosyVoice2BatchProcessor(BatchProcessor):
     @torch.no_grad()
     def process_batch(self, waveforms, waveform_lengths, mel_spec_lengths=None):
         import numpy as np
-        import whisper
         B = len(waveforms)
         unit_ids = torch.zeros(B, self.max_id_frames, dtype=torch.long)
         feat_lengths = torch.zeros(B, dtype=torch.long)
@@ -556,7 +600,7 @@ class CosyVoice2BatchProcessor(BatchProcessor):
             wlen = int(waveform_lengths[i].item())
             wav = waveforms[i][:wlen].float().reshape(1, -1).cpu()      # trim pad first
             wav16 = self._resample(wav, self.source_sr)
-            feat = whisper.log_mel_spectrogram(wav16, n_mels=128).numpy()
+            feat = whisper_log_mel(wav16, n_mels=128).numpy()
             ids = self.tok.run(None, {self._in_feats: feat,
                                       self._in_len: np.array([feat.shape[2]], dtype=np.int32)}
                                )[0].flatten().astype("int64")
