@@ -173,8 +173,12 @@ def parse_args():
                    help="cosyvoice2_codebook.pt (6561x512). REQUIRED with "
                         "--voice_cosyvoice2_model_dir: it defines the unit->feature map the "
                         "prelude consumes AND fixes the EOV id at K.")
-    p.add_argument("--cosyvoice_runtime_dir", type=str, default=None,
-                   help="CosyVoice repo checkout (default ~/dev/projects/cosyvoice-runtime).")
+    # Name matches the training CLI (training.py:3179) and the error raised by
+    # _ensure_importable; --cosyvoice_runtime_dir is kept as an alias.
+    p.add_argument("--voice_cosyvoice2_runtime_dir", "--cosyvoice_runtime_dir",
+                   dest="voice_cosyvoice2_runtime_dir", type=str, default=None,
+                   help="CosyVoice repo checkout (default ~/dev/projects/cosyvoice-runtime, or "
+                        "$COSYVOICE_RUNTIME). Set up with scripts_local/setup_cosyvoice_runtime.sh.")
     p.add_argument("--mrope_voice_rate", type=float, default=None,
                    help="M-RoPE voice rate the checkpoint was TRAINED at (7.5 for the LibriHeavy "
                         "runs, 6.0 for older ones). Evaluating under the wrong rate uses a "
@@ -314,7 +318,7 @@ class CosyVoice2Voice:
         self.codebook = load_codebook(args.voice_codebook_path)          # (K, D)
         self.K = int(self.codebook.shape[0])
         self.decoder = CosyVoice2Decoder.from_pretrained(
-            args.voice_cosyvoice2_model_dir, runtime_dir=args.cosyvoice_runtime_dir,
+            args.voice_cosyvoice2_model_dir, runtime_dir=args.voice_cosyvoice2_runtime_dir,
             device=device, dtype=torch.float32)
         self.sample_rate = int(getattr(self.decoder, "sample_rate", 24000))
         self._tok = self._spk = None
