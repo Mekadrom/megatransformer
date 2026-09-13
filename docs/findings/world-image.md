@@ -665,6 +665,42 @@ gen-query compression). Treat "arm X is ahead at 20k" as uninformative about the
 default; this direction has now paid for that lesson three times.
 ⚠️ One seed per arm.
 
+### FOUR-ARM RESULT at 100k: AR ties the baseline UNGUIDED and loses only on guidance response
+All four from-scratch arms complete at 100k on the same recipe (1e-4 x3, cosine, seed 42), every
+checkpoint evaluated at w=1.0/3.0, N=4. Final-10 means:
+
+| arm | w=3.0 | w=1.0 | best (w=3) | w3-w1 GAIN |
+|---|---|---|---|---|
+| baseline `t3_xskip` (K=64) | **0.3475** | **0.3047** | 0.351 | 0.0428 |
+| `noaux` (K=64, aux 0) | 0.3439 | 0.3021 | 0.349 | 0.0418 |
+| `t4_ar` (AR, native) | 0.3209 | 0.2972 | 0.329 | **0.0237** |
+| `nopos` (parallel, native) | 0.2972 | 0.2258 | 0.314 | 0.0714 |
+
+Paired over all 100 matched checkpoints:
+
+| | w=3.0 | w=1.0 |
+|---|---|---|
+| t4 - baseline | -0.0235 +- 0.0022 (**1**/100 t4 higher) | **-0.0068 +- 0.0024 (46/100)** |
+| t4 - noaux | -0.0093 +- 0.0022 (22/100) | **+0.0127 +- 0.0019 (67/100)** |
+| t4 - nopos | +0.0260 +- 0.0024 (92/100) | +0.0583 +- 0.0026 (95/100) |
+
+⭐⭐⭐ **AT THE OPERATING POINT THE K=64 BASELINE WINS** (-0.0235, 99/100 checkpoints). That is the
+headline and it should not be softened.
+⭐⭐⭐ **BUT UNGUIDED, AR TIES IT** — 46/100 is a coin flip — **and BEATS the noaux arm (+0.0127,
+67/100).** T4's entire deficit is guidance response: it extracts **0.0237** from w1->w3 where both
+K=64 arms extract ~0.042, barely half. So AR-at-native-length is NOT worse at CONDITIONING; it is
+worse at EXPLOITING CFG.
+⭐ Mechanism (predicted in advance of this data, still not directly measured): guidance COMPOUNDS
+along an autoregressive sample — each position is guided conditioned on tokens that were themselves
+guided, so over-sharpening accumulates along the sequence instead of being applied once as it is
+for a one-shot parallel head.
+⚠️ **w=3 may therefore be an unfair operating point for T4**, and the converged baseline sweep
+(flat w=3..6) explicitly does not transfer to it. A T4 sweep on ckpt-100000 over
+w = 0.5 .. 4.5 is RUNNING 2026-09-13; until it lands, treat the -0.0235 as "T4 at the baseline's
+operating point", not "T4 at its own".
+⚠️ Single seed per arm. `nopos` is last on every axis and has the LARGEST guidance gain (0.0714),
+consistent with it having the weakest conditioning of the four — the unordered-set handicap.
+
 ### AR (T4) at native length TRACKS the K=64 baseline; the collapse was `flow_pos_embed`
 Three native-length arms now exist on the SAME recipe (from scratch, 1e-4 x3, cosine, 100k, native
 whiten stats), differing only in how the output slots are ordered. IN FLIGHT: t4 at 27k, nopos at
