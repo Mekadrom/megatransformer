@@ -274,8 +274,36 @@ def encode_image_file(path: str, litevae, image_size: int, device: str) -> torch
     return latent[0].detach().cpu()  # (C, H', W')
 
 
+def _audio_load(path: str):
+    """(1, T) float32 waveform + sample rate, without depending on torchaudio's backend.
+
+    torchaudio >= 2.9 routes `load` through TorchCodec and raises ImportError when it is
+    absent, which broke the Reference voice control on a newer install. soundfile is already
+    present transitively (librosa depends on it) and reads wav/flac/ogg directly, so try it
+    first and keep torchaudio as the fallback for anything it cannot open.
+    """
+    try:
+        import soundfile as sf
+        data, sr = sf.read(path, dtype="float32", always_2d=True)   # (T, C)
+        return torch.from_numpy(data).transpose(0, 1).contiguous(), int(sr)
+    except Exception:
+        import torchaudio as _ta
+        w, sr = _ta.load(path)
+        return w.float(), int(sr)
+
+
+def _audio_save(path: str, wav: torch.Tensor, sr: int):
+    """Mirror of _audio_load for the same reason."""
+    try:
+        import soundfile as sf
+        sf.write(path, wav.reshape(-1).cpu().numpy(), int(sr))
+    except Exception:
+        import torchaudio as _ta
+        _ta.save(path, wav.reshape(1, -1).cpu(), int(sr))
+
+
 def encode_voice_file(path: str, sive, shared_window_buffer, args, device: str) -> torch.Tensor:
-    waveform, sr = torchaudio.load(path)
+    waveform, sr = _audio_load(path)
     if sr != args.sample_rate:
         waveform = torchaudio.functional.resample(waveform, sr, args.sample_rate)
     if waveform.shape[0] > 1:
@@ -386,7 +414,7 @@ def trim_prompt(prompt_ids, prompt_mel, seconds: float):
 
 def encode_voice_file_cv2(path: str, cv2: "CosyVoice2Voice", prompt_seconds: float = 0.0):
     """-> (centroids (D,T), campplus (192,), prompt_ids | None, prompt_mel | None)."""
-    waveform, sr = torchaudio.load(path)
+    waveform, sr = _audio_load(path)
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     # The FSQ tokenizer and campplus read 16 kHz; the flow's prompt mel reads 24 kHz. Keep the
@@ -1234,7 +1262,7 @@ def main():
                             continue
                         sr, wav_np = got
                         path = os.path.join(wav_tmpdir, f"voice_{int(time.time() * 1000)}_{k}.wav")
-                        torchaudio.save(path, torch.from_numpy(wav_np).reshape(1, -1), sr)
+                        _audio_save(path, torch.from_numpy(wav_np), sr)
                         voice_wav_paths.append(path)
                     except Exception as e:
                         status_lines.append(f"Voice {k + 1} decode failed: {e}")
@@ -1261,7 +1289,7 @@ def main():
                             latent, smg_decoder, vocoder, static_speaker_emb, args.sample_rate,
                         )
                         path = os.path.join(wav_tmpdir, f"voice_{int(time.time() * 1000)}_{k}.wav")
-                        torchaudio.save(path, torch.from_numpy(wav_np).unsqueeze(0), sr)
+                        _audio_save(path, torch.from_numpy(wav_np), sr)
                         voice_wav_paths.append(path)
                     except Exception as e:
                         status_lines.append(f"Voice {k + 1} decode failed: {e}")
