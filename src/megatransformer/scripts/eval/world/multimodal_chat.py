@@ -868,6 +868,12 @@ def main():
             print("[cosyvoice2] NOTE: SIVE/SMG also supplied; the CV2 path takes precedence "
                   "for voice. Text and image paths are unaffected.")
 
+    # Speaker/prompt live HERE, not in gr.State. Gradio can treat a returned State object
+    # that was mutated in place as unchanged and skip the update, so on_submit was reading a
+    # stale dict and reporting "no speaker" immediately after the control confirmed one. A
+    # closure dict has no such semantics; this UI is single-session anyway.
+    speaker_store: dict = {}
+
     static_speaker_emb = None
     if args.static_speaker_embedding_path:
         static_speaker_emb = torch.load(
@@ -902,12 +908,12 @@ def main():
                     # slider read at upload time and make the control inert after the fact.
                     tensor, _spk, _pid, _pmel = encode_voice_file_cv2(
                         path, cv2_voice, _PROMPT_MAX_SECONDS)
-                    state["uploaded_prompt_ids"] = _pid
-                    state["uploaded_prompt_mel"] = _pmel
+                    speaker_store.setdefault("prompt_ids", _pid)
+                    speaker_store.setdefault("prompt_mel", _pmel)
                     # An uploaded voice also supplies its OWN speaker embedding, which beats
                     # the static one for cloning: campplus of the actual clip rather than a
                     # pinned reference. Last upload wins.
-                    state["uploaded_speaker_emb"] = _spk
+                    speaker_store.setdefault("emb", _spk)
                 else:
                     tensor = encode_voice_file(path, sive, shared_window_buffer, args, device)
             ref = safe_ref_name(path, state)
@@ -940,9 +946,7 @@ def main():
     def on_speaker_ref(path, state):
         """Set the speaker embedding (+ zero-shot prompt) from a reference clip."""
         if not path:
-            state.pop("uploaded_speaker_emb", None)
-            state.pop("uploaded_prompt_ids", None)
-            state.pop("uploaded_prompt_mel", None)
+            speaker_store.clear()
             return state, "*No reference voice — voice output cannot be rendered.*"
         if cv2_voice is None:
             return state, "*Reference voice needs the CosyVoice 2 path (--voice_cosyvoice2_model_dir).*"
@@ -950,9 +954,9 @@ def main():
             _, spk, pid, pmel = encode_voice_file_cv2(path, cv2_voice, _PROMPT_MAX_SECONDS)
         except Exception as e:
             return state, f"*Reference voice failed: {type(e).__name__}: {e}*"
-        state["uploaded_speaker_emb"] = spk
-        state["uploaded_prompt_ids"] = pid
-        state["uploaded_prompt_mel"] = pmel
+        speaker_store["emb"] = spk
+        speaker_store["prompt_ids"] = pid
+        speaker_store["prompt_mel"] = pmel
         secs = (pmel.shape[0] / 50.0) if pmel is not None else 0.0
         return state, (f"**Speaker set** — campplus-192 (norm {spk.norm():.1f}), "
                        f"{secs:.1f}s of prompt available "
@@ -1237,7 +1241,7 @@ def main():
             else:
                 _tr = (outputs.get("voice_unit_id_trace") or [[]])[0]
                 id_blocks = [list(_tr)] if len(_tr) else []
-            spk = state.get("uploaded_speaker_emb")
+            spk = speaker_store.get("emb")
             if spk is None:
                 spk = static_speaker_emb
             if id_blocks and spk is None:
@@ -1255,8 +1259,8 @@ def main():
                 for k, ids in enumerate(id_blocks):
                     try:
                         _pid, _pmel = trim_prompt(
-                            state.get("uploaded_prompt_ids"),
-                            state.get("uploaded_prompt_mel"),
+                            speaker_store.get("prompt_ids"),
+                            speaker_store.get("prompt_mel"),
                             float(voice_prompt_sec_in))
                         got = cv2_voice.decode(ids, spk, prompt_ids=_pid, prompt_feat=_pmel)
                         if got is None:
@@ -1269,7 +1273,7 @@ def main():
                     except Exception as e:
                         status_lines.append(f"Voice {k + 1} decode failed: {e}")
                 _ps = float(voice_prompt_sec_in)
-                _has_prompt = state.get("uploaded_prompt_ids") is not None and _ps > 0
+                _has_prompt = speaker_store.get("prompt_ids") is not None and _ps > 0
                 status_lines.append(
                     f"Decoded {len(voice_wav_paths)} voice clip(s) via CosyVoice 2 "
                     f"(T={float(voice_temp_in):g}, RAS win={int(voice_ras_win_in or 0)}, "
