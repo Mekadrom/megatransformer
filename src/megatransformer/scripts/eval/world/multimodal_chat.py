@@ -680,8 +680,11 @@ def main():
         )
         sive.eval()
 
+    # Gated on include_modes, not just on the decoder flag: --image_vae_decoder_config
+    # defaults to "litevae", so a VOICE-ONLY run used to import olvae and die on a box that
+    # has no reason to have it installed. Same for the vocoder below.
     litevae = None
-    if args.image_vae_decoder_config == "litevae":
+    if args.image_vae_decoder_config == "litevae" and "image" in include_modes:
         print("Loading LiteVAE (encoder + decoder)...")
         from megatransformer.scripts.data.image.vae.preprocess import _load_litevae
         litevae = _load_litevae("litevae", device=device)
@@ -792,8 +795,11 @@ def main():
         )
         smg_decoder.eval()
 
+    # The CosyVoice 2 path renders with its own flow+HiFT, so HiFiGAN is dead weight there;
+    # it is only needed by the legacy SIVE/SMG voice stack.
     vocoder = None
-    if args.vocoder_config or args.vocoder_checkpoint_path:
+    _need_vocoder = ("voice" in include_modes or "audio" in include_modes) and not args.voice_cosyvoice2_model_dir
+    if _need_vocoder and (args.vocoder_config or args.vocoder_checkpoint_path):
         vocoder = model_loading_utils.load_vocoder(
             args.vocoder_checkpoint_path, args.vocoder_config, shared_window_buffer,
         )
