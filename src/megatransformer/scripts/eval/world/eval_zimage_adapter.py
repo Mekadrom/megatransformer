@@ -97,6 +97,12 @@ def parse_args():
                         "the prompt-conditional residual (norm ~3.5, i.e. ~4%%). This feeds "
                         "mu + gain*r to the head. gain=1.0 is a no-op. Calibrates mu over the "
                         "prompt list in one extra pass. See scripts_local/trunk_compression_probe.py.")
+    p.add_argument("--flow_steps", type=int, default=None,
+                   help="Override the conditioning sampler's Euler step count (config default 8). "
+                        "Applies to the T3/T5 parallel head and the T4 AR head alike. More steps "
+                        "reduce ODE discretisation error, a variance source -- and variance, not "
+                        "ceiling, is what separates these arms. Errors out rather than no-opping "
+                        "if the checkpoint has no flow head.")
     p.add_argument("--flow_guidance", type=float, default=None,
                    help="T3 classifier-free guidance weight w. v = v_uncond + w*(v_cond - v_uncond). "
                         "1.0 = off. >1 trades diversity for fidelity (2x sampling cost). Only "
@@ -297,6 +303,25 @@ def main():
         return (int(ni) if ni is not None else -1), [float(x) for x in kl]
 
     _adapter = model.image_generator
+
+    if args.flow_steps is not None:
+        # Euler steps for the conditioning sampler. Both heads read self.steps when sample() is
+        # called with steps=None (cond_flow_head.py:322, ar_cond_flow_head.py:173), so setting the
+        # attribute here IS the override -- there is no separate plumbing to thread.
+        # Cost asymmetry worth knowing: the parallel head pays `steps` forwards total, the AR head
+        # pays L x steps. Measured at steps=8 the AR arm's whole eval was only ~3% slower than the
+        # parallel one, because Z-Image's 1024x1024 decode dominates -- so raising steps is far
+        # cheaper here than the forward counts suggest.
+        _n_patched = 0
+        for _h in ("flow_head", "ar_flow_head"):
+            _m = getattr(_adapter, _h, None)
+            if _m is not None and hasattr(_m, "steps"):
+                print(f"[flow_steps] {_h}.steps {_m.steps} -> {args.flow_steps}")
+                _m.steps = int(args.flow_steps)
+                _n_patched += 1
+        if _n_patched == 0:
+            raise SystemExit("--flow_steps was passed but this checkpoint has no flow head with a "
+                             "`steps` attribute; the flag would have silently done nothing.")
 
     def _set_flow_seed(seed):
         """Pin the flow head's sampling noise so the SAME draw is compared across checkpoints."""
