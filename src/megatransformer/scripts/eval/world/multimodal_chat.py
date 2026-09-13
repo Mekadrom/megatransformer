@@ -13,8 +13,24 @@ UX:
 - Generation target (text / voice / image) controls the trailing BO* token
   appended to the prompt
 
-Usage:
+Voice has TWO backends. Supplying --voice_cosyvoice2_model_dir selects the CosyVoice 2
+discrete path (25 Hz FSQ unit ids, frozen flow+HiFT decoder, campplus-192 speaker
+conditioning) for both directions; without it the legacy SIVE/SMG/HiFiGAN stack is used.
+Text and image paths are identical either way.
+
+Usage (CosyVoice 2 world-voice checkpoint -- current):
+    python -m megatransformer.scripts.eval.world.multimodal_chat --checkpoint_path runs/world_voice/<run>/checkpoint-78000 --config small_sum --include_modes text,voice --text_encoder_model HuggingFaceTB/SmolLM2-135M --voice_cosyvoice2_model_dir <CosyVoice2-0.5B snapshot> --voice_codebook_path <cache>/val/cosyvoice2_codebook.pt --mrope_voice_rate 7.5 --mrope_scale_side text --bf16
+
+Usage (legacy SIVE/SMG stack):
     python -m megatransformer.scripts.eval.world.multimodal_chat --checkpoint_path runs/world/my_run/checkpoint-3000 --config small_sum_dit --include_modes text,voice,image --tie_word_embeddings --bf16 --sive_checkpoint_path ./checkpoints/sive --sive_config tiny_deep --voice_smg_checkpoint_path ./checkpoints/smg --voice_smg_config medium_decoder_only_1d_3x --voice_smg_sive_encoder_dim 256 --vocoder_config hifigan --image_vae_decoder_config litevae --static_speaker_embedding_path ./logs/speaker_embedding_1.pt
+
+Speaker conditioning on the CV2 path: uploading a voice file sets the speaker embedding from
+THAT clip (campplus of the upload), which is what makes voice cloning work; otherwise
+--static_speaker_embedding_path is used and must be a 192-d campplus vector.
+
+⚠️ --mrope_scale_side carries no weights and cannot be detected from the checkpoint. Pass the
+value training used, and --mrope_voice_rate to match (7.5 for the LibriHeavy runs, 6.0 for
+older ones): a mismatch evaluates under a coordinate system the model never saw.
 """
 
 import argparse
@@ -147,6 +163,36 @@ def parse_args():
     p.add_argument("--voice_smg_sive_encoder_dim", type=int, default=None)
     p.add_argument("--vocoder_config", type=str, default="hifigan")
     p.add_argument("--vocoder_checkpoint_path", type=str, default=None)
+    # CosyVoice 2 discrete voice path. Supplying --voice_cosyvoice2_model_dir switches the
+    # VOICE modality (both directions) from the SIVE/SMG/HiFiGAN stack to CV2: uploads are
+    # tokenised to 25 Hz FSQ unit ids and fed as centroid vectors, and generated unit ids are
+    # rendered by the frozen CV2 flow+HiFT decoder. Text and image paths are untouched.
+    p.add_argument("--voice_cosyvoice2_model_dir", type=str, default=None,
+                   help="CosyVoice2-0.5B snapshot dir. Enables the discrete voice path.")
+    p.add_argument("--voice_codebook_path", type=str, default=None,
+                   help="cosyvoice2_codebook.pt (6561x512). REQUIRED with "
+                        "--voice_cosyvoice2_model_dir: it defines the unit->feature map the "
+                        "prelude consumes AND fixes the EOV id at K.")
+    p.add_argument("--cosyvoice_runtime_dir", type=str, default=None,
+                   help="CosyVoice repo checkout (default ~/dev/projects/cosyvoice-runtime).")
+    p.add_argument("--mrope_voice_rate", type=float, default=None,
+                   help="M-RoPE voice rate the checkpoint was TRAINED at (7.5 for the LibriHeavy "
+                        "runs, 6.0 for older ones). Evaluating under the wrong rate uses a "
+                        "coordinate system the model never saw.")
+    p.add_argument("--mrope_scale_side", type=str, default=None, choices=["voice", "text", "off"],
+                   help="Which stream absorbs the rate. Carries no weights, so it cannot be "
+                        "detected from the checkpoint; the loader hard-fails without it.")
+    p.add_argument("--voice_temperature", type=float, default=0.6,
+                   help="Voice unit sampling temperature. 0 = greedy, which on this model "
+                        "degenerates (~99%% adjacent repeats) UNLESS --voice_ras_win > 0.")
+    p.add_argument("--voice_ras_win", type=int, default=10,
+                   help="Repetition-aware sampling window. Default 10 (CosyVoice 2's value): "
+                        "the model's free-running argmax is 'repeat the previous unit' almost "
+                        "always, so RAS is load-bearing, not a refinement. 0 disables.")
+    p.add_argument("--voice_ras_tau", type=float, default=0.1)
+    p.add_argument("--voice_min_frame_ratio", type=float, default=0.0,
+                   help="Text-proportional EOV floor (CV2's min_len scheme). 0 = off, which is "
+                        "the measured-best setting once the resample scaling is correct.")
     p.add_argument("--static_speaker_embedding_path", type=str, default=None,
                    help="Fallback speaker embedding for voice decoding (.pt file)")
 
@@ -236,6 +282,87 @@ def encode_voice_file(path: str, sive, shared_window_buffer, args, device: str) 
     )  # (1, T', encoder_dim)
     features_cf = features.permute(0, 2, 1)[0]  # (encoder_dim, T')
     return features_cf.detach().cpu()
+
+
+class CosyVoice2Voice:
+    """Bundles everything the discrete voice path needs, in BOTH directions.
+
+    Encode (voice -> text): waveform -> FSQ unit ids -> codebook centroids, because
+    `voice_inputs` is CENTROID VECTORS upstream of the prelude, never raw ids (see the
+    voice_mask_feature comment in world_model.py). Shape contract is identical to the SIVE
+    path's (C, T), so nothing downstream changes.
+
+    Decode (text -> voice): generated unit ids -> frozen flow + HiFT -> waveform.
+
+    Speaker conditioning is campplus-192, NOT ECAPA/WavLM: the frozen decoder is conditioned
+    on campplus vectors, so any other encoder is off-manifold at decode.
+    """
+
+    def __init__(self, args, device: str):
+        from megatransformer.model.voice.cosyvoice2_decoder import CosyVoice2Decoder
+        from megatransformer.utils.codebook import load_codebook
+        if not args.voice_codebook_path:
+            raise SystemExit("--voice_cosyvoice2_model_dir requires --voice_codebook_path")
+        self.codebook = load_codebook(args.voice_codebook_path)          # (K, D)
+        self.K = int(self.codebook.shape[0])
+        self.decoder = CosyVoice2Decoder.from_pretrained(
+            args.voice_cosyvoice2_model_dir, runtime_dir=args.cosyvoice_runtime_dir,
+            device=device, dtype=torch.float32)
+        self.sample_rate = int(getattr(self.decoder, "sample_rate", 24000))
+        self._tok = self._spk = None
+        self._model_dir = args.voice_cosyvoice2_model_dir
+        self._max_frames = int(round(float(args.voice_max_seconds) * 25.0))
+
+    def _lazy_encoders(self):
+        # Built on first upload only: the ONNX sessions cost seconds and a TTS-only session
+        # never needs them.
+        if self._tok is None:
+            from megatransformer.scripts.data.voice.preprocess import (
+                CosyVoice2BatchProcessor, CampplusBatchProcessor)
+            # CPU on purpose: campplus measured 3.7x SLOWER on GPU, and the FSQ tokenizer is
+            # static batch-1, so neither benefits from the device the world model is on.
+            self._tok = CosyVoice2BatchProcessor(
+                self._model_dir, voice_max_frames=self._max_frames,
+                mel_frame_rate=25.0, device="cpu")
+            self._spk = CampplusBatchProcessor(self._model_dir)
+        return self._tok, self._spk
+
+    def encode(self, waveform_16k: torch.Tensor):
+        """(T,) @16 kHz -> (centroids (D, T'), campplus (192,))."""
+        tok, spk = self._lazy_encoders()
+        wl = torch.tensor([waveform_16k.numel()])
+        # Both processors return DICTS of padded batch tensors. unit_ids is padded to
+        # max_id_frames with zeros, and 0 is a VALID unit id — so the real length must come
+        # from feature_lengths, never from a nonzero test.
+        tok_out = tok.process_batch([waveform_16k], wl)
+        ids = tok_out["unit_ids"][0]
+        n = int(tok_out["feature_lengths"][0].item())
+        ids = ids[:n].reshape(-1).long()
+        emb = spk.process_batch([waveform_16k], wl)["speaker_embeddings"][0]
+        ids = ids[(ids >= 0) & (ids < self.K)]
+        feats = self.codebook[ids].permute(1, 0).contiguous()            # (D, T')
+        return feats, torch.as_tensor(emb).reshape(-1).float()
+
+    def decode(self, unit_ids, speaker_embedding: torch.Tensor):
+        ids = torch.as_tensor(unit_ids).reshape(-1).long()
+        # EOV (id == K) has no codebook row; passing it would index out of bounds.
+        ids = ids[(ids >= 0) & (ids < self.K)]
+        if ids.numel() == 0:
+            return None
+        wav = self.decoder.decode(ids, speaker_embedding.reshape(-1).float())
+        if wav is None:
+            return None
+        return self.sample_rate, wav.detach().cpu().numpy()
+
+
+def encode_voice_file_cv2(path: str, cv2: "CosyVoice2Voice"):
+    waveform, sr = torchaudio.load(path)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    # The FSQ tokenizer and campplus both want 16 kHz regardless of the model's mel settings.
+    if sr != 16000:
+        waveform = torchaudio.functional.resample(waveform, sr, 16000)
+    return cv2.encode(waveform.squeeze(0))
 
 
 def render_file_list(state: dict) -> str:
@@ -416,6 +543,48 @@ def main():
     print(f"Loading world model from {args.checkpoint_path}...")
     include_modes = [m.strip() for m in args.include_modes.split(",")]
     overrides = {"include_modes": include_modes}
+    # M-RoPE carries no weights, so scale_side cannot be detected from the checkpoint and the
+    # loader refuses to guess. Rate must match TRAINING (7.5 for the LibriHeavy runs, 6.0 for
+    # the older ones) — a mismatch evaluates under a coordinate system the model never saw.
+    # mrope_voice_rate / mrope_scale_side are flat world-config fields and ride in overrides.
+    # use_mrope is NESTED (recurrent_block_config.block_config), as are the voice head width
+    # and feature width, and from_config passes overrides straight to the world config
+    # constructor -- so those go through a registered mutated config instead, mirroring
+    # visualize.load_world_model. Only engages when the voice/M-RoPE flags are supplied, so
+    # the text and image paths are byte-identical without them.
+    if args.mrope_scale_side is not None:
+        overrides["mrope_scale_side"] = args.mrope_scale_side
+    if args.mrope_voice_rate is not None:
+        overrides["mrope_voice_rate"] = float(args.mrope_voice_rate)
+
+    config_name = args.config
+    if args.voice_codebook_path or (args.mrope_scale_side not in (None, "off")):
+        import copy as _copy
+        from megatransformer.config.world.world_model import WORLD_MODEL_CONFIGS
+        _cfg = _copy.deepcopy(WORLD_MODEL_CONFIGS[args.config])
+        if args.mrope_scale_side not in (None, "off"):
+            if not model_loading_utils.detect_world_mrope(args.checkpoint_path):
+                print("[mrope] WARNING: --mrope_scale_side given but no rotary_global/local "
+                      "weights found in the checkpoint — it was NOT trained with M-RoPE.")
+            _cfg.recurrent_block_config.block_config.use_mrope = True
+            print(f"[mrope] use_mrope=True, scale_side={args.mrope_scale_side}, "
+                  f"rate={args.mrope_voice_rate or 6.0}")
+        if args.voice_codebook_path:
+            from megatransformer.utils.codebook import load_codebook as _lcb
+            _cb = _lcb(args.voice_codebook_path)
+            _K, _D = int(_cb.shape[0]), int(_cb.shape[1])
+            # The unit head is K+1-way (EOV = class K), or K+2 on a bistream checkpoint
+            # (fill_token = K+1). Prefer the width actually stored in the checkpoint: the flag
+            # that decided it lives in the training CLI, which this script never sees. Getting
+            # it wrong shape-mismatches the head, which strict=False then silently DROPS.
+            _w = model_loading_utils.detect_voice_unit_vocab_size(args.checkpoint_path)
+            _cfg.voice_coda_config.unit_vocab_size = _w if _w is not None else _K + 1
+            _cfg.voice_prelude_config.feature_channels = _D
+            _cfg.voice_coda_config.feature_channels = _D
+            print(f"[voice] discrete head: K={_K}, unit_vocab_size="
+                  f"{_cfg.voice_coda_config.unit_vocab_size}, feature_channels={_D}")
+        config_name = args.config + "_chat_eval"
+        WORLD_MODEL_CONFIGS[config_name] = _cfg
     if args.tie_word_embeddings:
         overrides["tie_word_embeddings"] = True
     if args.text_encoder_model:
@@ -437,7 +606,7 @@ def main():
             "n_special_tokens": constants.N_SPECIAL_TOKENS,
         }
     model = model_loading_utils.load_model(
-        MegaTransformerWorldModel, args.config,
+        MegaTransformerWorldModel, config_name,
         checkpoint_path=args.checkpoint_path,
         overrides=overrides, device=device,
     )
@@ -612,6 +781,19 @@ def main():
         if vocoder is not None:
             vocoder = vocoder.to(device)
 
+    # CosyVoice 2 discrete voice path. When enabled it REPLACES SIVE/SMG/vocoder for voice;
+    # set_voice_codebook is what makes generate() emit unit ids (and fixes EOV = K).
+    cv2_voice = None
+    if args.voice_cosyvoice2_model_dir:
+        cv2_voice = CosyVoice2Voice(args, device)
+        model.set_voice_codebook(cv2_voice.codebook)
+        print(f"[cosyvoice2] decoder + codebook loaded: K={cv2_voice.K}, "
+              f"dim={cv2_voice.codebook.shape[1]}, EOV id={cv2_voice.K}, "
+              f"sr={cv2_voice.sample_rate}")
+        if sive is not None or smg_decoder is not None:
+            print("[cosyvoice2] NOTE: SIVE/SMG also supplied; the CV2 path takes precedence "
+                  "for voice. Text and image paths are unaffected.")
+
     static_speaker_emb = None
     if args.static_speaker_embedding_path:
         static_speaker_emb = torch.load(
@@ -640,7 +822,14 @@ def main():
                 if sive is None:
                     gr.Warning("SIVE not loaded — cannot accept voice uploads")
                     continue
-                tensor = encode_voice_file(path, sive, shared_window_buffer, args, device)
+                if cv2_voice is not None:
+                    tensor, _spk = encode_voice_file_cv2(path, cv2_voice)
+                    # An uploaded voice also supplies its OWN speaker embedding, which beats
+                    # the static one for cloning: campplus of the actual clip rather than a
+                    # pinned reference. Last upload wins.
+                    state["uploaded_speaker_emb"] = _spk
+                else:
+                    tensor = encode_voice_file(path, sive, shared_window_buffer, args, device)
             ref = safe_ref_name(path, state)
             state[ref] = {"type": mtype, "tensor": tensor, "path": path}
             suffix = f" @{ref}"
@@ -783,6 +972,16 @@ def main():
 
         with torch.no_grad():
             with autocast(device, dtype=dtype, enabled=args.bf16):
+                # Voice sampling knobs only exist on the discrete path; passing them on a
+                # SIVE checkpoint would be a silent no-op at best.
+                _voice_gen_kwargs = {}
+                if cv2_voice is not None:
+                    _voice_gen_kwargs = dict(
+                        voice_temperature=args.voice_temperature,
+                        voice_ras_win=args.voice_ras_win,
+                        voice_ras_tau=args.voice_ras_tau,
+                        voice_min_frame_ratio=args.voice_min_frame_ratio,
+                    )
                 outputs = model.generate(
                     text_input_ids=prompt,
                     max_new_tokens=max_new_tokens,
@@ -800,6 +999,7 @@ def main():
                     image_iteration_override=image_iter_override,
                     image_num_inference_steps=image_num_steps,
                     image_sampler=image_sampler_choice,
+                    **_voice_gen_kwargs,
                 )
 
         # Generation stopped because the trunk ran out of context, not because the model
@@ -921,7 +1121,46 @@ def main():
         voice_preds = outputs.get("voice_latent_preds")
         voice_counts = outputs.get("voice_counts")
         voice_lens_out = outputs.get("voice_lengths")
-        if voice_preds is not None and voice_counts is not None:
+
+        if cv2_voice is not None:
+            # DISCRETE path. generate() emits per-utterance id segments; prefer them over the
+            # flat trace, which concatenates every block and would render several utterances
+            # as one clip.
+            segs = outputs.get("voice_unit_id_segments")
+            if segs and segs[0]:
+                id_blocks = [list(x) for x in segs[0]]
+            else:
+                _tr = (outputs.get("voice_unit_id_trace") or [[]])[0]
+                id_blocks = [list(_tr)] if len(_tr) else []
+            spk = state.get("uploaded_speaker_emb")
+            if spk is None:
+                spk = static_speaker_emb
+            if id_blocks and spk is None:
+                status_lines.append(
+                    f"{len(id_blocks)} voice block(s) generated but no speaker embedding — "
+                    f"upload a voice file to clone from, or pass "
+                    f"--static_speaker_embedding_path (campplus-192).")
+            elif id_blocks:
+                if spk.reshape(-1).numel() != 192:
+                    status_lines.append(
+                        f"⚠️ speaker embedding is {spk.reshape(-1).numel()}-d, but the CosyVoice 2 "
+                        f"decoder expects campplus-192. Output will be off-manifold.")
+                for k, ids in enumerate(id_blocks):
+                    try:
+                        got = cv2_voice.decode(ids, spk)
+                        if got is None:
+                            status_lines.append(f"Voice {k + 1}: no renderable units")
+                            continue
+                        sr, wav_np = got
+                        path = os.path.join(wav_tmpdir, f"voice_{int(time.time() * 1000)}_{k}.wav")
+                        torchaudio.save(path, torch.from_numpy(wav_np).reshape(1, -1), sr)
+                        voice_wav_paths.append(path)
+                    except Exception as e:
+                        status_lines.append(f"Voice {k + 1} decode failed: {e}")
+                status_lines.append(
+                    f"Decoded {len(voice_wav_paths)} voice clip(s) via CosyVoice 2 "
+                    f"(T={args.voice_temperature}, RAS win={args.voice_ras_win})")
+        elif voice_preds is not None and voice_counts is not None:
             n_voice = int(voice_counts[0].item())
             if n_voice and (smg_decoder is None or vocoder is None):
                 status_lines.append(f"{n_voice} voice block(s) generated but SMG/vocoder missing — skipping decode")
