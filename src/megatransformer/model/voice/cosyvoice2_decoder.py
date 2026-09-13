@@ -58,12 +58,43 @@ def _preserve_root_logging():
             logging.getLogger(n).setLevel(lv)
 
 
+_SETUP_HINT = (
+    "Build it with:  ./scripts_local/setup_cosyvoice_runtime.sh [target_dir]\n"
+    "It is a manual sys.path checkout, NOT pip-installable: cv_extra/ holds --no-deps "
+    "installs that are deliberately kept out of .venv because `uv sync` would fight them."
+)
+
+
 def _ensure_importable(runtime_dir: str):
-    """Put the CosyVoice checkout (+ Matcha, shims, no-deps extras) on sys.path."""
+    """Put the CosyVoice checkout (+ Matcha, shims, no-deps extras) on sys.path.
+
+    Checks each required subdir up front. Without this, a half-built runtime fails much later
+    and much less legibly: a missing cv_extra/ surfaces as `ModuleNotFoundError: onnxruntime`
+    raised from inside pydoc.locate while hyperpyyaml resolves a yaml tag, and a missing
+    Matcha-TTS submodule as `No module named 'matcha'` from cosyvoice.flow.flow_matching.
+    Neither names the runtime, the setup script, or what is actually absent.
+    """
     if not os.path.isdir(runtime_dir):
         raise FileNotFoundError(
-            f"CosyVoice runtime dir not found: {runtime_dir}. Set --voice_cosyvoice2_runtime_dir "
-            f"or $COSYVOICE_RUNTIME."
+            f"CosyVoice runtime dir not found: {runtime_dir}\n"
+            f"Set --voice_cosyvoice2_runtime_dir or $COSYVOICE_RUNTIME.\n" + _SETUP_HINT
+        )
+    required = {
+        "cv_extra": "--no-deps packages satisfying module-level imports in cosyvoice/flow/*.py "
+                    "(onnxruntime, conformer, hydra-core, ...) that decode never calls",
+        "cv_shims": "stub `modelscope` module (CosyVoice imports snapshot_download at import time)",
+        "CosyVoice": "the upstream repo",
+        os.path.join("CosyVoice", "third_party", "Matcha-TTS"):
+            "Matcha submodule -- cosyvoice.flow.flow_matching imports it. Clone with "
+            "--recursive, or `git submodule update --init --recursive`",
+    }
+    missing = [(k, why) for k, why in required.items()
+               if not os.path.isdir(os.path.join(runtime_dir, k))]
+    if missing:
+        lines = "\n".join(f"  - {k}/  ({why})" for k, why in missing)
+        raise FileNotFoundError(
+            f"CosyVoice runtime at {runtime_dir} is incomplete. Missing:\n{lines}\n"
+            + _SETUP_HINT
         )
     for p in (
         os.path.join(runtime_dir, "cv_extra"),
@@ -71,7 +102,7 @@ def _ensure_importable(runtime_dir: str):
         os.path.join(runtime_dir, "CosyVoice", "third_party", "Matcha-TTS"),
         os.path.join(runtime_dir, "CosyVoice"),
     ):
-        if os.path.isdir(p) and p not in sys.path:
+        if p not in sys.path:
             sys.path.insert(0, p)
 
 

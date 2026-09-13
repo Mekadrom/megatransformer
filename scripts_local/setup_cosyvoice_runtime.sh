@@ -61,10 +61,16 @@ for p in (os.path.join(d, "cv_extra"), os.path.join(d, "cv_shims"),
           os.path.join(d, "CosyVoice"), os.path.join(d, "CosyVoice", "third_party", "Matcha-TTS")):
     assert os.path.isdir(p), f"MISSING {p}"
     sys.path.insert(0, p)
-from cosyvoice.flow.flow import CausalMaskedDiffWithXvec  # noqa: F401
-from matcha.utils.audio import mel_spectrogram           # noqa: F401
-from cosyvoice.utils.common import ras_sampling          # noqa: F401
-print("OK: cosyvoice.flow, matcha.utils.audio and cosyvoice.utils.common all import")
+# Import exactly what DECODE imports. Deliberately NOT matcha.utils.audio: it does
+# `from librosa.filters import mel` -> numba, which caps NumPy at 2.4 and fails on a newer
+# venv -- and nothing on the decode path needs it (the yaml's feat_extractor is stripped and
+# the prompt mel is reimplemented on torchaudio). Checking it here would reject a runtime
+# that works fine.
+from cosyvoice.flow.flow import CausalMaskedDiffWithXvec   # noqa: F401
+from cosyvoice.flow.flow_matching import CausalConditionalCFM  # noqa: F401  (pulls matcha)
+from cosyvoice.utils.common import ras_sampling            # noqa: F401
+from cosyvoice.hifigan.generator import HiFTGenerator      # noqa: F401
+print("OK: flow, flow_matching (via matcha), hifigan and utils.common all import")
 CHECK
 
 echo

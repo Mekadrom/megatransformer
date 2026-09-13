@@ -277,6 +277,31 @@ Runs are logged to `runs/<run_name>/` (metrics + checkpoints). Backend is select
   live in the uv `training` dependency-group, which is invisible to pip consumers).
   Torch cu124 comes from the `pytorch-cu124` index via `[tool.uv.sources]`.
 
+## CosyVoice 2 runtime (world-voice decode)
+
+The voice path decodes through CosyVoice 2's frozen flow + HiFT, which needs a **manual
+sys.path checkout** — it is not pip-installable and is not in `uv.lock`:
+
+```bash
+./scripts_local/setup_cosyvoice_runtime.sh [target_dir]   # default ~/dev/projects/cosyvoice-runtime
+```
+
+Pass it as `--voice_cosyvoice2_runtime_dir` (training, eval scripts and the chat UI all take
+this) or `$COSYVOICE_RUNTIME`. Model weights are NOT in it — they stay in the HF cache and go
+in via `--voice_cosyvoice2_model_dir`.
+
+`cv_extra/` inside it holds `--no-deps` installs kept deliberately OUT of `.venv`, because
+`uv sync` would fight them. They only satisfy module-level imports in `cosyvoice/flow/*.py`
+that decode never calls. Two pins matter: `antlr4-python3-runtime==4.9.3` (4.13 raises
+"Could not deserialize ATN with version 3") and `setuptools<81` (81+ removed `pkg_resources`,
+which `pyworld` imports).
+
+Decode needs neither the ONNX speech tokenizer (that builds caches), the text frontend (we
+feed unit ids), nor the Qwen LLM (the world model replaces it) — `_load_configs_without_llm`
+keeps only `flow:` and `hift:` from the yaml. A half-built runtime is reported by
+`_ensure_importable` with the missing directory named; the raw symptom would otherwise be a
+`ModuleNotFoundError` from inside `pydoc.locate`.
+
 ## Import Convention
 
 The codebase is a `src`-layout package named `megatransformer` (see `pyproject.toml`).
