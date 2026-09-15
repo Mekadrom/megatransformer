@@ -3200,22 +3200,35 @@ def add_cli_args(subparsers):
                             help="Speaker-embedding width of the voice SMG checkpoint (192 ECAPA, 768 WavLM). "
                                  "Required to load a WavLM-conditioned SMG or its FiLM/F0 speaker weights "
                                  "load as random under strict=False.")
-    sub_parser.add_argument("--viz_voice_temperature", type=float, default=0.6,
-                            help="Sampling temperature for voice latents in TB eval renders (0=deterministic mu; "
-                                 "~0.5-0.7=moderate). Only active if the model was trained with "
+    sub_parser.add_argument("--viz_voice_temperature", type=float, default=0.0,
+                            help="Sampling temperature for voice latents in TB eval renders. "
+                                 "DEFAULT 0.0 as of 2026-09-15, changed from 0.6: the RAS "
+                                 "resample inherits this scaling and is discontinuous at zero, "
+                                 "so 0.2-0.6 is a TROUGH where termination breaks (budget caps "
+                                 "12/12 at T=0.2, 3/12 at T=0.6, 0/12 at T=0.0 and T=0.7). At "
+                                 "T=0 the pick is argmax while the resample runs at an "
+                                 "effective 1.0, which measured best overall. If you want a "
+                                 "mid-range temperature, pass --viz_voice_ras_temperature 1.0 "
+                                 "with it. Only active if the model was trained with "
                                  "--voice_stochastic_output (else generate() ignores it).")
     sub_parser.add_argument("--viz_voice_variance_floor", type=float, default=0.0,
                             help="Clamp the per-frame std floor when sampling voice latents in TB renders (0=off).")
     sub_parser.add_argument("--static_speaker_embedding_path", type=str, default=None,
                             help="Path to a .pt file containing a speaker embedding tensor for static-speaker voice decoding")
-    sub_parser.add_argument("--viz_voice_prompt_audio", type=str, default=None,
+    sub_parser.add_argument("--viz_voice_prompt_audio", type=str,
+                            default="logs/speaker_male.wav",
                             help="WAV of the SAME speaker as --static_speaker_embedding_path. "
                                  "Enables CosyVoice 2 zero-shot prompt conditioning in the eval "
                                  "renders: the 192-d embedding is a global summary, while the "
                                  "prompt supplies per-frame acoustic evidence (timbre, channel, "
                                  "style) no fixed-size vector carries. Needs "
                                  "--voice_cosyvoice2_model_dir for speech_tokenizer_v2.onnx. "
-                                 "A failure degrades to embedding-only rendering with a warning.")
+                                 "A failure degrades to embedding-only rendering with a warning. "
+                                 "DEFAULTS to logs/speaker_male.wav, which is gitignored -- a "
+                                 "fresh clone warns and falls back rather than failing. "
+                                 "REQUIRED for correct speaker identity: the 192-d campplus "
+                                 "embedding alone rendered a male reference as female "
+                                 "(2026-09-15, ear-confirmed).")
     sub_parser.add_argument("--num_eval_samples", type=int, default=4,
                             help="Number of samples per visualization scenario")
 
