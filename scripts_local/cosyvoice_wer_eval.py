@@ -22,6 +22,7 @@ so a WER near 1.0 with a low ratio means "said almost nothing", not "said wrong 
 import argparse, glob, json, os, sys
 
 import torch
+import torchaudio
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from world_voice_ar_diagnostics import build_args, make_collator, add_mrope_args
@@ -42,12 +43,22 @@ ap.add_argument("--text_encoder_model", default="HuggingFaceTB/SmolLM2-135M")
 ap.add_argument("--voice_max_frames", type=int, default=250)
 ap.add_argument("--voice_predict_f0", dest="voice_predict_f0", action="store_true", default=False)
 ap.add_argument("--n", type=int, default=32)
-ap.add_argument("--ras_win", type=int, default=0, help="0 = off (match the training-time renders)")
+ap.add_argument("--ras_win", type=int, default=0,
+                help="Repetition-aware sampling window. 0 = OFF. NOTE: the training-time "
+                     "viz default flipped to 10 at commit 6af9337, so 0 no longer matches "
+                     "the renders -- it reproduces the 1.63x-drawl arm. Pass 10 to match.")
 ap.add_argument("--ras_tau", type=float, default=0.1)
 ap.add_argument("--whisper_model", default="base")
 ap.add_argument("--skip_ceiling", action="store_true", help="skip the GT-units ceiling pass")
 ap.add_argument("--device", default="cuda:3")
 ap.add_argument("--out_dir", default="eval_output/world_tts_wer")
+ap.add_argument("--save_audio", default=None,
+                help="Directory to write decoded .wav files: gen_<i>.wav (full generation), "
+                     "gen_trunc_<i>.wav (truncated to the reference length, only when the "
+                     "generation over-ran), and ceiling_<i>.wav (GROUND-TRUTH units through "
+                     "the SAME frozen decoder). Listen to gen vs ceiling: whatever the "
+                     "ceiling also gets wrong is the decoder/pipeline, not the world model. "
+                     "Writes manifest.tsv mapping index -> reference and transcripts.")
 ap.add_argument("--voice_temperature", type=float, default=0.6,
                 help="voice unit sampling temperature. Default 0.6 MATCHES THE TRAINING-TIME VIZ (train.py: viz_voice_temperature=0.6), i.e. the TensorBoard renders the ear has been judging. These scripts previously HARDCODED 1.0, which samples far into the 6561-way tail and is audibly less coherent than the model's actual operating point -- so every free-running number they produced described the wrong regime.")
 ap.add_argument("--nar_reveal", type=str, default="confidence",
@@ -75,6 +86,16 @@ ap.add_argument("--nar_rounds", type=int, default=16,
                 help="MaskGIT refinement rounds for a NAR checkpoint (ignored for AR).")
 ap.add_argument("--voice_top_k", type=int, default=None, help="top-k truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0.")
 ap.add_argument("--voice_top_p", type=float, default=None, help="top-p / nucleus truncation for voice unit sampling (0/None = off). Only active when --voice_temperature > 0. The natural middle ground: T=0.6 mode-collapses into repetition loops, T=1.0 draws tail noise -- nucleus cuts the tail without sharpening into a loop.")
+ap.add_argument("--bistream_text_chunk", type=int, default=0,
+                help="k text tokens per chunk. >0 collates AND decodes bistream. A bistream "
+                     "checkpoint decoded WITHOUT this stops at its first fill_token and "
+                     "scores as catastrophic under-speaking -- it is the wrong protocol for "
+                     "a bistream run, not a result.")
+ap.add_argument("--bistream_voice_chunk", type=int, default=0,
+                help="s voice frames per chunk (pairs with --bistream_text_chunk).")
+ap.add_argument("--bistream_prob", type=float, default=1.0,
+                help="Fraction of ELIGIBLE samples collated bistream. 1.0 here (not the "
+                     "training 0.5) so the arm measures the bistream path, not a mixture.")
 add_mrope_args(ap)
 a = ap.parse_args()
 voice_temp = a.voice_temperature
@@ -88,7 +109,10 @@ sp = constants.special_token_ids(sp_base)
 _IS_NAR = getattr(model, "voice_mask_feature", None) is not None
 print(f"decode path: {'NAR masked-parallel' if _IS_NAR else 'AR'}", flush=True)
 ds = load_dataset(args, "val")
-coll = make_collator(K, a.voice_max_frames, special_token_base=sp_base); coll.force_direction = "synthesis"
+coll = make_collator(K, a.voice_max_frames, special_token_base=sp_base,
+                     bistream_text_chunk=a.bistream_text_chunk,
+                     bistream_voice_chunk=a.bistream_voice_chunk,
+                     bistream_prob=a.bistream_prob); coll.force_direction = "synthesis"
 dec = CosyVoice2Decoder.from_pretrained(a.cosyvoice_dir, device=a.device)
 sr = dec.sample_rate
 # Seed AFTER the decoder is constructed, not before: loading it perturbs (and apparently
@@ -99,6 +123,22 @@ if a.nar_seed is not None:
     torch.manual_seed(a.nar_seed)
     print(f"seeded generation with {a.nar_seed} (after decoder load)", flush=True)
 os.makedirs(a.out_dir, exist_ok=True)
+if a.save_audio:
+    os.makedirs(a.save_audio, exist_ok=True)
+
+
+def _save(wav, name):
+    """Write one decoded waveform. No-op unless --save_audio was passed.
+
+    dec.decode() returns a 1-D float tensor at the decoder's own 24 kHz; torchaudio wants
+    (channels, samples), and the tensor must be on CPU and detached.
+    """
+    if not a.save_audio or wav is None:
+        return
+    x = wav.detach().to("cpu").float()
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    torchaudio.save(os.path.join(a.save_audio, name), x, sr)
 
 import whisper, librosa, numpy as np
 from jiwer import wer as jiwer_wer, cer as jiwer_cer
@@ -149,11 +189,27 @@ for i in range(len(ds)):
                 fallback_frames=a.voice_max_frames, force_bucket=_fb)
             out = {"voice_unit_id_trace": [_ids]}
         else:
+            # BISTREAM continuation -- see world_voice_ar_diagnostics for the full rationale.
+            # The collated bistream prompt is [text 0:k][BOV], so bov's position IS how many
+            # transcript tokens the prompt consumed; the rest is fed back as the model emits
+            # fill_token. Without these a bistream checkpoint ends after one ~s-frame chunk.
+            _bi_kwargs = {}
+            if a.bistream_text_chunk > 0:
+                _full = s.get("text_token_ids")
+                _tl = s.get("text_text_length")
+                if _full is not None:
+                    if _tl is not None:
+                        _full = _full[:int(_tl)]
+                    _bi_kwargs = {
+                        "voice_bistream_text": _full.reshape(1, -1).to(a.device),
+                        "voice_bistream_text_chunk": a.bistream_text_chunk,
+                        "voice_bistream_text_offset": int(bov[0].item()),
+                    }
             out = model.generate(text_input_ids=prompt, max_new_tokens=512,
                                  voice_token_budget=a.voice_max_frames, voice_temperature=voice_temp,
                                  voice_top_k=a.voice_top_k, voice_top_p=a.voice_top_p,
                                  voice_ras_win=a.ras_win, voice_ras_tau=a.ras_tau,
-                                 decode_outputs=False)
+                                 decode_outputs=False, **_bi_kwargs)
     # FIRST UTTERANCE, not the flat trace. `voice_unit_id_trace` spans EVERY voice block the
     # call produced, so a model that ends one utterance and starts another (i.e. anything
     # WITHOUT --unmask_eos_in_synthesis) gets its blocks concatenated here -- inflating length
@@ -179,6 +235,7 @@ for i in range(len(ds)):
         w = dec.decode(torch.tensor(tr), spk)
         if w is not None:
             row["hyp"] = transcribe(w)
+            _save(w, f"gen_{i:04d}.wav")
         # TRUNCATED-TO-REFERENCE pass. Both arms over-run (2x+ GT length) and Whisper decodes
         # WITH CONTEXT, so a long garbage tail can corrupt the transcription of a correct
         # opening -- observed: a clip heard by ear as "What do you make of it, grey" came back
@@ -189,17 +246,33 @@ for i in range(len(ds)):
             wt = dec.decode(torch.tensor(tr[:L_ref]), spk)
             if wt is not None:
                 row["hyp_trunc"] = transcribe(wt)
+                _save(wt, f"gen_trunc_{i:04d}.wav")
         else:
             row["hyp_trunc"] = row.get("hyp")
     if not a.skip_ceiling:
         L = int(s["voice_feature_length"])
+        # NOTE: `w` is deliberately a fresh binding -- the generated waveform above has already
+        # been transcribed and saved, so shadowing it here is harmless.
         w = dec.decode(s["voice_unit_ids"][:L], spk)
         if w is not None:
             row["hyp_ceiling"] = transcribe(w)
+            _save(w, f"ceiling_{i:04d}.wav")
     rows.append(row); done += 1
     print(f"  [{done}] ref: {ref[:52]}\n        gen: {row.get('hyp','')[:52]}", flush=True)
     if done >= a.n:
         break
+
+if a.save_audio:
+    # Without this the wav files are anonymous indices. Whisper's transcripts are what the
+    # report scores, so pairing them with the file makes a disagreement between the ear and
+    # the number traceable to a specific clip instead of a vague "some of them are wrong".
+    with open(os.path.join(a.save_audio, "manifest.tsv"), "w") as _f:
+        _f.write("idx\tgen_frames\tref_frames\treference\thyp_gen\thyp_ceiling\n")
+        for _r in rows:
+            _f.write("\t".join(str(_r.get(_k, "")).replace("\t", " ")
+                                for _k in ("idx", "gen_frames", "ref_frames",
+                                           "ref", "hyp", "hyp_ceiling")) + "\n")
+    print(f"wrote {a.save_audio}/manifest.tsv", flush=True)
 
 
 def lcs_recall(ref_words, hyp_words):
