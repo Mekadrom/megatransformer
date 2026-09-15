@@ -217,7 +217,8 @@ class ZImageConditioningAdapter(nn.Module):
                 time_sampling=getattr(config, "flow_time_sampling", "logit_normal"),
                 cfg_dropout=float(getattr(config, "flow_cfg_dropout", 0.0)),
                 guidance=float(getattr(config, "flow_guidance", 1.0)),
-                x_skip=bool(getattr(config, "flow_x_skip", False)))
+                x_skip=bool(getattr(config, "flow_x_skip", False)),
+                pos_mode=str(getattr(config, "ar_pos_mode", "learned")))
 
     def _flow_out_basis(self):
         """Orthonormal basis of the flow head's REACHABLE output subspace, cached.

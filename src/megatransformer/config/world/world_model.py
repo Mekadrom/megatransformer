@@ -594,6 +594,13 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3"].image_coda_config.flow_head = True
 WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_whiten"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"].image_coda_config.ar_flow_head = True
 
+# T4 + ROPE: identical to t4_ar but the AR backbone gets rotary self-attention instead of the
+# learned absolute table, so there is NO architectural ceiling on emitted conditioning tokens --
+# length is whatever budget the caller passes. Built for the long-caption comparison: the K=64
+# baseline compresses any length to 64, while this represents the caption as-is.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar_rope"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar_rope"].image_coda_config.ar_pos_mode = "rope"
+
 # T5: T3's PARALLEL head at NATIVE length. T4 bundled two changes -- autoregressive
 # factorisation AND native length -- and scored ~0.248 at w=3 vs T3's 0.344.
 # ⚠️ CORRECTED 2026-09-09: that number was previously described here as a "plateau" that

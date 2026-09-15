@@ -491,6 +491,15 @@ class ZImageAdapterConfig:
     ar_layers: int = 4            # causal backbone depth
     ar_flow_layers: int = 3       # per-token velocity MLP depth
     ar_max_len: int = 128         # positional table + target truncation
+    # "learned" = absolute table of ar_max_len rows. The table is a PARAMETER, so ar_max_len is a
+    #   hard ceiling on emitted conditioning tokens and cannot be raised on a trained checkpoint.
+    # "rope" = rotary on the AR backbone's self-attention. No table, no ceiling: emitted length
+    #   becomes purely a budget the caller passes to generate()/sample(). Cross-attention to the
+    #   trunk context was never length-bounded, so the table was the only real limit.
+    #   ⚠️ Removing the cap grants PERMISSION, not ability: encode_native still truncates TRAINING
+    #   targets at ar_max_len, and the caption corpus averages 19.77 Qwen3 tokens, so anything past
+    #   ~40 positions is extrapolation until longer captions are actually trained on.
+    ar_pos_mode: str = "learned"
     flow_cfg_dropout: float = 0.1
     flow_guidance: float = 1.0             # inference w; 1.0 = off (single forward per step)
 
