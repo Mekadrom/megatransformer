@@ -128,6 +128,42 @@ model failure being heard, it is an unset flag.
 the ear reports. RAS takes length from +28% over GT to -3% and termination from 18/48 to 42/48.
 Nucleus (C) is strictly worse than RAS on every degeneration axis.
 
+**AMENDED 2026-09-15 — RAS is most of the fix, not the whole fix; GREEDY closes the rest.**
+Measured through ASR (not units) at step 68000, n=12 paired samples, `--ras_win 10` in every
+arm, `eval_output/world_voice_bistream_audio/`. CADENCE = generated frames per ASR-transcribed
+word, divided by the same quantity for GROUND-TRUTH units through the SAME decoder, so a
+value of 1.00 is the pipeline's own speaking rate and >1 is genuinely slow per spoken word:
+
+| arm | WER | LCS-recall | cadence | hyp/ref words |
+|---|---|---|---|---|
+| unistream T=0.6 | 0.330 | 0.709 | 1.16x | 0.94 |
+| bistream T=0.6 | 0.490 | 0.515 | 1.31x | 0.82 |
+| unistream greedy | 0.355 | **0.723** | **0.99x** | 1.02 |
+| bistream greedy | **0.325** | 0.695 | **0.99x** | 0.94 |
+| CEILING (GT units) | 0.095 | 0.915 | 1.00x | 1.00 |
+
+With RAS already on, T=0.6 still costs 16% (unistream) to 31% (bistream) in speaking rate.
+Greedy lands both models at 0.99x — indistinguishable from the ceiling. The 2026-09-02 entry
+stands (RAS removes the catastrophic 7.2 s repeat runs), but "the whole fix" was too strong:
+residual drawl survived it and is a TEMPERATURE effect.
+
+⚠️ **Do not read the LCS spread 0.723 / 0.695 / 0.709 as a ranking** — n=12, and a 0.03
+difference there is noise. What n=12 supports is (a) cadence collapsing to 0.99x under greedy
+and (b) bistream-at-T=0.6 being genuinely bad. Note also that greedy's unit-space
+`adj_repeat_rate` is 0.0096-0.0127 against GT's 0.0792, i.e. it under-repeats badly; ASR word
+overlap is blind to that, so greedy's cadence win should be confirmed BY EAR before it becomes
+the default.
+
+⚠️ **The bistream arms here decode UNISTREAM**, which is out-of-distribution for a
+50%-bistream checkpoint. Chunked-protocol arms are the pending measurement; an n=3 chunked
+smoke scored WORSE (LCS 0.325), but n=3 including the Latin sample is not a measurement.
+
+**The decoder is NOT the bottleneck.** Ground-truth units through the frozen CosyVoice 2
+decoder score WER 0.095 / LCS 0.915 on this val set, so ~0.20 of LCS gap is the world model's
+own. (An earlier n=2 smoke suggested a much worse ceiling, WER 0.250 — that was one Latin
+utterance, "Quos vult perdere dementat", which the ceiling renders as "Kwas would perdere the
+mentored". At n=12 the ceiling is clean.)
+
 **RAS fixes over-length HERE, contradicting the prior-era note** in `render_distill_audio.py`'s
 docstring ("RAS fixed repetition ... but did NOT fix over-length, 2.54x -> 2.32x GT"). That
 observation belongs to the pre-LibriHeavy era/checkpoint; do not carry it forward. Not marked
