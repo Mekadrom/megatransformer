@@ -241,10 +241,27 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         # full-eval sweep. Visit at most `budget` indices, in shard (sorted)
         # order so the dataset's LRU shard cache loads each shard at most once.
         budget = min(len(eval_dataset), max(n * 50, 1000))
-        indices = torch.randperm(len(eval_dataset))[:budget].sort().values
+        # RANDOM START OFFSET, then a SEQUENTIAL scan -- NOT randperm().sort().
+        #
+        # The previous form was `torch.randperm(N)[:budget].sort().values`, which sorted a
+        # random subset and then took the first n MATCHES. That collapses selection onto the
+        # smallest indices of the subset: measured over 2000 simulated evals with N=6000,
+        # n=8, budget=1000, EVERY sample ever chosen came from indices 0-125, and individual
+        # low indices were picked in ~17% of evals. The renders were a fixed ~2% of the val
+        # set, so the same handful of utterances (including one in Latin, which even the
+        # ground-truth-unit ceiling cannot render) recurred at every single eval.
+        #
+        # A sequential walk from a random offset preserves the shard-cache locality the sort
+        # was there to protect -- consecutive indices share a shard, so the LRU loads each at
+        # most once, which is strictly better than a scattered sorted subset -- while covering
+        # the whole eval set uniformly across evals. Shards were globally shuffled at merge
+        # time, so consecutive samples are not correlated in speaker or content.
+        _N = len(eval_dataset)
+        _start = int(torch.randint(0, _N, (1,)).item())
+        indices = [(_start + _j) % _N for _j in range(budget)]
         samples = []
         for idx in indices:
-            sample = eval_dataset[idx.item()]
+            sample = eval_dataset[idx]
             if requires_text_only and sample.get("_modality") != "text":
                 continue
             if requires_audio and not any(k.startswith("audio_") for k in sample):
