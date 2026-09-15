@@ -2213,6 +2213,58 @@ sampled variation at equal-or-better content. **Resolve with n=48 on the two can
 before changing the default** — this session already produced one wrong conclusion (the tau
 axis) from reasoning past the noise floor.
 
+## ⚠️ SEED VARIANCE IS THE DOMINANT TERM: single-seed LCS comparisons are worthless (2026-09-15, ESTABLISHED)
+
+**Read this before running or citing any world-voice generation comparison.**
+
+Decision run: bistream EMA ck68000, n=48, two seeds per config, all arms `--skip_ceiling`
+(`eval_output/world_voice_n48_decision/`, analysis `scripts_local/summarize_n48_decision.py`).
+
+| config | seed 1 | seed 2 | seed-averaged | WER | caps |
+|---|---|---|---|---|---|
+| greedy, tau 0.1 | 0.6904 | 0.7598 | **0.7251** | 0.3057 | 5/96 |
+| T=0.6 + ras_temp 1.0, tau 0.1 | 0.7605 | 0.6980 | **0.7293** | 0.2943 | 3/96 |
+
+**Seed-averaged difference: +0.0041 LCS. The two configs are EQUIVALENT.**
+
+Per-seed spread is **0.069** (greedy) and **0.063** (decoupled) — each config's two seeds
+straddle the other's. A single-seed comparison of these arms gave +0.0684 in favour of the
+decoupled regime with a paired bootstrap 95% CI of [+0.0240, +0.1088] that EXCLUDED ZERO.
+That "significant" result was pure seed luck: A's bad seed met B's good seed.
+
+⚠️ **The paired bootstrap CI is NOT a valid significance test here.** It captures variance
+across UTTERANCES and is blind to variance across SEEDS, and the seed term dominates. Proof
+from the same run: the seed replicate A2-A gives +0.0700 CI [+0.0266, +0.1124] and B2-B gives
+-0.0622 CI [-0.1116, -0.0127] — two runs of an IDENTICAL config, each "significant", in
+OPPOSITE directions.
+
+**Protocol going forward:** a generation comparison needs >= 2 seeds per arm and must compare
+SEED-AVERAGED means. n alone does not fix this — going from n=12 to n=48 did not shrink the
+seed term. Cap counts (integers, mechanistic) remain the more trustworthy readout.
+
+**Casualties — every single-seed LCS claim from 2026-09-15 is void**, including:
+- "bistream buys duration not content" generation-side numbers (already struck)
+- the `--ras_temperature` +0.045 at T=0.6 (already downgraded)
+- "tau 0.3 is best" at n=12 (already refuted at n=48)
+- "bistream leads at every temperature" from the temperature sweep
+The unistream T=0.2 cap result (12/12 -> 1/12) SURVIVES: an integer count moving 11 of 12 is
+not a noise-scale effect.
+
+### Bistream vs unistream on CONTENT: NULL (2026-09-15, ESTABLISHED)
+
+Paired at n=48, greedy tau 0.1, EMA, same 48 utterances: **-0.0038, 95% CI
+[-0.0685, +0.0652]**. Aggregate LCS 0.6904 (bi) vs 0.6940 (uni); caps 2 vs 1. Unistream's
+0.6940 sits INSIDE bistream's own seed range (0.6904-0.7598).
+
+This session produced three different answers to this question before getting here: raw
+weights at T=0.6 said bistream was much WORSE (LCS 0.515 vs 0.709), EMA at greedy said much
+BETTER (0.727 vs 0.619), n=48 seed-aware says IDENTICAL. The first two were n=12 single-seed.
+
+**What survives about bistream:** duration control (length r=+0.763 vs GT ceiling +0.744,
+zero collapsed utterances) is a large effect and stands. Termination robustness across the
+temperature band (0/12 caps at T=0.5/0.6 vs unistream's 5/12 and 3/12) is n=12 single-seed
+and NOT yet verified. Content: no advantage.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
