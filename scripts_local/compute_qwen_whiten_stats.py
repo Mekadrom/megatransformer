@@ -53,8 +53,13 @@ def main():
                 return c
         return None
     tdir = resolve(args.cache_dir, "train")
+    # ⚠️ max_samples TRUNCATES the dataset to its first N samples. Under --shuffle that would make
+    # the shuffle inert -- permuting an already-truncated set changes order, not membership (the
+    # tell: native n_tokens came back byte-identical to the unshuffled run, 161977). Only cap when
+    # NOT shuffling.
     dataset = MultimodalShardedDataset(text_shard_dir=tdir, image_shard_dir=tdir,
-                                       cache_size=8, max_samples=args.n_samples)
+                                       cache_size=8,
+                                       max_samples=None if args.shuffle else args.n_samples)
     collator = MultimodalDataCollator(special_token_base=49152, eos_token_id=0)
     collator.force_direction = "synthesis"
 
@@ -70,6 +75,9 @@ def main():
     if args.shuffle:
         import random as _random
         _random.Random(args.seed).shuffle(order)
+        # Random MEMBERSHIP, shard-ORDERED access: pick the sample at random, then read them in
+        # index order so the 8-shard LRU cache is not thrashed across 165 shards.
+        order = sorted(order[:args.n_samples * 2])
     for i in order:
         b = collator([dataset[i]])
         c = (b.get("text_texts") or [""])[0]

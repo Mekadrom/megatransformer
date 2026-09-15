@@ -600,6 +600,11 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"].image_coda_config.ar_flow_head = T
 # baseline compresses any length to 64, while this represents the caption as-is.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar_rope"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar_rope"].image_coda_config.ar_pos_mode = "rope"
+# ar_max_len raised 128 -> 320. Under pos_mode="rope" this is FREE: there is no positional table,
+# so it only sets where encode_native truncates targets and where the Qwen tokenizer caps. Sized
+# from the long-caption subset's own maximum (256 SmolLM2 tokens ~= 282 Qwen at the measured 1.10x
+# ratio incl. chat template), so no caption in that corpus is truncated.
+WORLD_MODEL_CONFIGS["small_sum_zimage_t4_ar_rope"].image_coda_config.ar_max_len = 320
 
 # T5: T3's PARALLEL head at NATIVE length. T4 bundled two changes -- autoregressive
 # factorisation AND native length -- and scored ~0.248 at w=3 vs T3's 0.344.
