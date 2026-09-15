@@ -48,6 +48,12 @@ ap.add_argument("--ras_win", type=int, default=0,
                      "viz default flipped to 10 at commit 6af9337, so 0 no longer matches "
                      "the renders -- it reproduces the 1.63x-drawl arm. Pass 10 to match.")
 ap.add_argument("--ras_tau", type=float, default=0.1)
+ap.add_argument("--ras_temperature", type=float, default=None,
+                help="Temperature for the RAS RESAMPLE only, decoupled from the pick. Default "
+                     "None = inherit the pick's scaling, which is DISCONTINUOUS at T=0 "
+                     "(greedy resamples at an effective 1.0, T=0.2 resamples 5x sharper than "
+                     "any pick). Set this to hold the resample fixed while sweeping "
+                     "--voice_temperature.")
 ap.add_argument("--whisper_model", default="base")
 ap.add_argument("--skip_ceiling", action="store_true", help="skip the GT-units ceiling pass")
 ap.add_argument("--device", default="cuda:3")
@@ -209,6 +215,7 @@ for i in range(len(ds)):
                                  voice_token_budget=a.voice_max_frames, voice_temperature=voice_temp,
                                  voice_top_k=a.voice_top_k, voice_top_p=a.voice_top_p,
                                  voice_ras_win=a.ras_win, voice_ras_tau=a.ras_tau,
+                                 voice_ras_temperature=a.ras_temperature,
                                  decode_outputs=False, **_bi_kwargs)
     # FIRST UTTERANCE, not the flat trace. `voice_unit_id_trace` spans EVERY voice block the
     # call produced, so a model that ends one utterance and starts another (i.e. anything

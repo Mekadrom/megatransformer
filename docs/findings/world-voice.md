@@ -1975,6 +1975,109 @@ checkpoint-specific and has since changed, or the original measurement was wrong
 yet because the original entry has not been re-located and re-read; do that before editing it.
 Flagged here so the claim is not cited again in the meantime.
 
+## The RAS resample inherits the pick's temperature — and is DISCONTINUOUS at T=0 (2026-09-15, ESTABLISHED)
+
+**This is a decode bug, not a model property, and it has been contaminating every
+temperature comparison in this direction.**
+
+In `world_model.py` the voice sampler builds ONE tensor and uses it twice:
+
+```python
+scaled = (logits.float() / voice_temperature
+          if voice_temperature > 0.0 else logits.float())   # <-- T=0 keeps RAW logits
+...
+banned = scaled.clone()        # the RAS resample draws from the SAME tensor
+banned[int(unit_id)] = -inf
+unit_id = torch.multinomial(torch.softmax(banned, -1), 1)[0]
+```
+
+So the RAS resample temperature is not independent of the pick temperature, and it is
+discontinuous at zero: at **T=0 the resample runs at an effective temperature of 1.0**
+(raw logits), while at **T=0.2 it runs 5x SHARPER than any pick ever is**. Resample
+sharpness is therefore non-monotonic in T — maximal just above zero, relaxing back toward
+1.0 as T rises.
+
+A near-deterministic second-best pick locks into cycles that never reach EOV. Termination
+tracks resample sharpness exactly. Step 68000, EMA weights, unistream decode, n=12 paired
+samples, `--ras_win 10 --ras_tau 0.1`, budget 250 frames
+(`eval_output/world_voice_temp_sweep/`):
+
+| T | uni capped | uni LCS | bi capped | bi LCS |
+|---|---|---|---|---|
+| 0.0 | 0/12 | 0.6188 | 0/12 | 0.7270 |
+| 0.2 | **12/12** | 0.2016 | **10/12** | 0.1785 |
+| 0.4 | 7/12 | 0.4422 | 5/12 | 0.4524 |
+| 0.5 | 5/12 | 0.4598 | 0/12 | 0.6621 |
+| 0.6 | 3/12 | 0.5920 | 0/12 | 0.6398 |
+| 0.7 | 0/12 | 0.6076 | 0/12 | 0.5973 |
+| 0.8 | 0/12 | 0.5477 | 0/12 | 0.7206 |
+| 1.0 | 2/12 | 0.4724 | 0/12 | 0.4952 |
+
+**"Greedy" on this codebase is NOT greedy decoding.** It is argmax picks plus a T=1.0
+multinomial resample on every RAS trigger. With `ras_win=10 tau=0.1` the trigger is
+`rep >= win*tau` = 1, i.e. ANY repeat within the last 10 units, so the resample fires
+constantly. That is why greedy looks so strong, and why it under-repeats badly
+(adj_repeat 0.0096-0.0127 vs GT 0.0792 — RAS at tau=0.1 bans legitimate repetition).
+
+**CAUSAL CONFIRMATION.** Built `voice_ras_temperature` (generate()) / `--ras_temperature`
+(cosyvoice_wer_eval), which decouples the resample. Default None keeps the inherited
+behaviour. Unistream EMA, T=0.2, everything else identical:
+
+| T=0.2 arm | capped | LCS | WER | hyp/ref | median len |
+|---|---|---|---|---|---|
+| default (resample inherits 0.2) | 12/12 | 0.2016 | 0.8150 | 0.375 | 250 |
+| `--ras_temperature 1.0` | **1/12** | **0.5868** | 0.4450 | 0.805 | 208 |
+| (T=0.0 reference) | 0/12 | 0.6188 | 0.4000 | 0.850 | 188 |
+
+One argument takes the worst arm in the sweep to within noise of greedy. The trough is
+fully explained.
+
+⚠️ **The training default T=0.6 sits INSIDE the trough** (uni 3/12 capped). Every TB render
+judged by ear at T=0.6 has been sampling from the pathological band. This is a plausible
+contributor to the long-standing "early stopping" complaint, independent of architecture.
+
+⚠️ **Retroactive contamination.** Any prior comparison of greedy against a mid-range
+temperature compared out-of-band against in-band, NOT temperature per se. That includes the
+2026-09-15 `bi_t06` vs `bi_greedy` audio arms. Unit-space teacher-forced metrics are
+sampler-free and unaffected.
+
+**Default inertness verified EMPIRICALLY, not just by reading the branch**: `ema_bi_uni_06`
+ran before the edit (14:17) and `bi_t06` after it (14:54) at identical config — LCS
+0.639817, WER 0.400000, CER 0.263355 on both. Identical to 6 dp.
+
+### NOISE FLOOR: LCS at n=12 carries ~0.12 of trajectory spread across temperature (2026-09-15, ESTABLISHED)
+
+Re-running an identical config reproduces to 6 decimals (above), so there is no RNG noise
+between processes. But ADJACENT TEMPERATURES follow different sampling trajectories, and
+among bistream's four clean-termination points T=0.5/0.6/0.7/0.8 the LCS runs
+0.662 / 0.640 / 0.597 / 0.721 — a **0.124 spread with zero caps throughout**.
+
+**Consequence: a single-point LCS difference below ~0.12 at n=12 is not a result**, even
+though the arms are paired on the same utterances and each is individually deterministic.
+Determinism under replication does NOT imply smoothness in T. Cap counts (integers over 12
+with monotonic structure) are the more trustworthy readout at this n.
+
+### REVISION to "Bistream buys DURATION, not content" (2026-09-15)
+
+~~The generation-side half of that entry is **STRUCK**.~~ It concluded bistream was worse on
+content from raw-weight arms at T=0.6 — a single point inside the trough, on non-EMA
+weights. With the full curve:
+
+- **Bistream terminates over a far wider band — SOLID.** 0/12 caps at T>=0.5; unistream
+  still caps at 0.5 (5/12) and 0.6 (3/12). Totals across the sweep: uni 29 caps, bi 15.
+- **Bistream's content advantage — SUGGESTIVE ONLY.** Mean LCS over clean-termination
+  points ~0.67 vs ~0.56, but no single comparison clears the 0.12 spread, and unistream
+  actually edges bistream at T=0.7 (0.6076 vs 0.5973).
+- **Teacher-forced unit metrics still favour unistream slightly** (acc_real 0.1734 vs
+  0.1791, ppl 46.56 vs 42.51). These are sampler-free and stand.
+
+The reading that fits both: chunk-interleaving did not make the trunk better at PREDICTING
+units — it made generation less likely to DERAIL when a sampled unit is wrong. TF accuracy
+is blind to that; cap counts are not.
+
+The DURATION half of the original entry (length r=+0.763 above the GT ceiling, zero
+collapsed utterances at bi_greedy) is unaffected and stands.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)

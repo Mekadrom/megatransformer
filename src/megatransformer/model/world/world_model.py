@@ -1214,6 +1214,7 @@ class MegaTransformerWorldModel(nn.Module):
         # Off by default so existing behaviour is byte-identical unless asked for.
         voice_ras_win: int = 0,
         voice_ras_tau: float = 0.1,
+        voice_ras_temperature: Optional[float] = None,
         # Pre-encoded media for transcription / cross-modal tasks
         audio_inputs: Optional[torch.Tensor] = None,
         audio_lengths: Optional[torch.Tensor] = None,
@@ -1959,7 +1960,25 @@ class MegaTransformerWorldModel(nn.Module):
                                         # `weighted_scores.softmax(0).multinomial(1)` over the
                                         # full vocab, i.e. it drops the nucleus on resample but
                                         # keeps the caller's scaling. Matching both halves.
-                                        banned = scaled.clone()
+                                        # RESAMPLE TEMPERATURE. `scaled` is the PICK's
+                                        # tensor, and reusing it couples two decisions that
+                                        # want different sharpness. Worse, it is discontinuous
+                                        # at T=0: `scaled` is logits/T for T>0 but RAW logits
+                                        # at T=0, so "greedy" resamples at an effective 1.0
+                                        # while T=0.2 resamples 5x sharper than the pick ever
+                                        # is. Measured at step 68000, n=12, ras_win=10: budget
+                                        # caps ran 0/12 at T=0, 12/12 at T=0.2, then recovered
+                                        # monotonically 7/12, 5/12, 3/12 at T=0.4/0.5/0.6 as
+                                        # the resample re-flattened. A near-deterministic
+                                        # second-best pick locks into cycles that never reach
+                                        # EOV; a softer draw escapes them.
+                                        #
+                                        # None keeps the inherited behaviour EXACTLY, so this
+                                        # is inert unless set.
+                                        if voice_ras_temperature is not None and voice_ras_temperature > 0.0:
+                                            banned = logits.float() / voice_ras_temperature
+                                        else:
+                                            banned = scaled.clone()
                                         banned[int(unit_id)] = float("-inf")
                                         if _floor > 0 and _seg_len < _floor:
                                             banned[eov_id] = float("-inf")
