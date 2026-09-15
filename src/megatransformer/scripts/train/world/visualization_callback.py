@@ -37,6 +37,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         voice_smg_decoder: Optional[torch.nn.Module] = None,
         voice_cosyvoice2_decoder: Optional[torch.nn.Module] = None,
         static_speaker_embedding: Optional[torch.Tensor] = None,
+        voice_prompt_audio_path: Optional[str] = None,
+        voice_cosyvoice2_model_dir: Optional[str] = None,
         num_eval_samples: int = 4,
         step_offset: int = 0,
         voice_sample_rate: int = 16000,
@@ -86,6 +88,15 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         # SMG (trained on Mimi cb0 latents) cannot decode.
         self.voice_cosyvoice2_decoder = voice_cosyvoice2_decoder
         self.static_speaker_embedding = static_speaker_embedding
+        # ZERO-SHOT PROMPT CONDITIONING. The 192-d campplus embedding is a global summary;
+        # the prompt supplies PER-FRAME acoustic evidence (timbre detail, channel, style)
+        # that no fixed-size vector carries. Resolved lazily on first render and cached --
+        # tokenizing the reference needs the CosyVoice 2 ONNX speech tokenizer, which the
+        # training process otherwise never loads.
+        self.voice_prompt_audio_path = voice_prompt_audio_path
+        self.voice_cosyvoice2_model_dir = voice_cosyvoice2_model_dir
+        self._voice_prompt = None          # (prompt_ids, prompt_feat) once resolved
+        self._voice_prompt_failed = False  # never retry a failed load every eval
         # Lazily pinned in _resolve_static_speaker when no explicit static embedding was
         # given, so the TTS renders still have a voice that is constant across evals.
         self._pinned_speaker = None
@@ -2185,6 +2196,82 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             metrics.log_figure(f"{tag_prefix}/{speaker_label}_mel", fig, global_step)
         plt.close(fig)
 
+    def _campplus_from_prompt(self):
+        """192-d campplus for the prompt clip, or None. Cached; failures latch."""
+        if getattr(self, "_prompt_campplus", None) is not None:
+            return self._prompt_campplus
+        if getattr(self, "_prompt_campplus_failed", False):
+            return None
+        try:
+            import torchaudio
+            from megatransformer.utils.cosyvoice2_encoders import CampplusBatchProcessor
+            if not self.voice_cosyvoice2_model_dir:
+                raise ValueError("voice_cosyvoice2_model_dir is required (campplus.onnx)")
+            wav, sr = torchaudio.load(self.voice_prompt_audio_path)
+            wav = wav.mean(0, keepdim=True) if wav.shape[0] > 1 else wav
+            proc = CampplusBatchProcessor(self.voice_cosyvoice2_model_dir, source_sr=sr)
+            out = proc.process_batch([wav.reshape(-1)],
+                                     torch.tensor([wav.shape[-1]], dtype=torch.long))
+            e = (out["speaker_embeddings"] if isinstance(out, dict) else out)[0]
+            # .clone(): a slice of the batch tensor pickles its whole storage.
+            self._prompt_campplus = e.reshape(-1).clone()
+            print(f"[viz] Derived static speaker embedding from the prompt clip "
+                  f"(norm {self._prompt_campplus.norm():.2f}); pass "
+                  f"--static_speaker_embedding_path to override.", flush=True)
+            return self._prompt_campplus
+        except Exception as e:
+            self._prompt_campplus_failed = True
+            print(f"[viz] Could not derive campplus from the prompt clip "
+                  f"({type(e).__name__}: {e}).", flush=True)
+            return None
+
+    def _resolve_voice_prompt(self):
+        """(prompt_ids, prompt_feat) for zero-shot conditioning, or (None, None).
+
+        Resolved ONCE and cached. A failure is latched so a missing tokenizer or an
+        unreadable wav degrades to embedding-only rendering instead of raising every eval --
+        a viz path must never be able to kill a training run.
+
+        The two halves are fed at DIFFERENT rates on purpose: the FSQ tokenizer reads 16 kHz
+        (25 Hz ids) while the flow's mel is 24000/480 = 50 Hz, and decode() then trims to
+        mel_frames == 2 * token_frames.
+        """
+        if self._voice_prompt is not None or self._voice_prompt_failed:
+            return self._voice_prompt if self._voice_prompt is not None else (None, None)
+        if not self.voice_prompt_audio_path or self.voice_cosyvoice2_decoder is None:
+            self._voice_prompt_failed = True
+            return (None, None)
+        try:
+            import torchaudio
+            from megatransformer.utils.cosyvoice2_encoders import CosyVoice2BatchProcessor
+            wav, sr = torchaudio.load(self.voice_prompt_audio_path)
+            wav = wav.mean(0, keepdim=True) if wav.shape[0] > 1 else wav
+            model_dir = self.voice_cosyvoice2_model_dir
+            if not model_dir:
+                raise ValueError(
+                    "voice_cosyvoice2_model_dir is required to tokenize the prompt audio "
+                    "(speech_tokenizer_v2.onnx lives there)")
+            # voice_max_frames/mel_frame_rate only size the processor's pad width; the
+            # reference clip is short and we read back its true length.
+            proc = CosyVoice2BatchProcessor(model_dir, voice_max_frames=4096,
+                                            mel_frame_rate=50.0, device="cpu",
+                                            source_sr=sr)
+            out = proc.process_batch([wav.reshape(-1)],
+                                     torch.tensor([wav.shape[-1]], dtype=torch.long))
+            n = int(out["feature_lengths"][0].item())
+            prompt_ids = out["unit_ids"][0, :n].clone()
+            prompt_feat = self.voice_cosyvoice2_decoder.prompt_mel(wav.reshape(-1), sr)
+            self._voice_prompt = (prompt_ids, prompt_feat)
+            print(f"[viz] Voice prompt conditioning ON: {self.voice_prompt_audio_path} -> "
+                  f"{prompt_ids.numel()} units, mel {tuple(prompt_feat.shape)} "
+                  f"({wav.shape[-1]/sr:.2f}s @ {sr}Hz)", flush=True)
+            return self._voice_prompt
+        except Exception as e:
+            self._voice_prompt_failed = True
+            print(f"[viz] Voice prompt conditioning DISABLED ({type(e).__name__}: {e}); "
+                  f"falling back to embedding-only rendering.", flush=True)
+            return (None, None)
+
     def _resolve_static_speaker(self, gt_speaker_emb):
         """The fixed reference voice for TTS renders.
 
@@ -2196,6 +2283,17 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         """
         if self.static_speaker_embedding is not None:
             return self.static_speaker_embedding
+        # AUTO-DERIVE from the prompt clip. --static_speaker_embedding_path and
+        # --viz_voice_prompt_audio are independent inputs and NOTHING checks they are the
+        # same speaker; a mismatched pair hands the decoder a global summary and per-frame
+        # evidence that disagree. Deriving campplus from the prompt wav guarantees a
+        # consistent pair, and costs nothing extra -- onnxruntime is already loaded for the
+        # speech tokenizer by the time we get here.
+        if self.voice_prompt_audio_path and not self._voice_prompt_failed:
+            _e = self._campplus_from_prompt()
+            if _e is not None:
+                self.static_speaker_embedding = _e
+                return _e
         if self._pinned_speaker is None and gt_speaker_emb is not None:
             if not hasattr(self, "_speaker_pool"):
                 self._speaker_pool = []
@@ -2309,9 +2407,12 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             return
 
         sr = self.voice_cosyvoice2_decoder.sample_rate
+        _p_ids, _p_feat = self._resolve_voice_prompt()
         for suffix, spk in renders:
             try:
-                wav = self.voice_cosyvoice2_decoder.decode(ids, spk)
+                wav = self.voice_cosyvoice2_decoder.decode(ids, spk,
+                                                           prompt_ids=_p_ids,
+                                                           prompt_feat=_p_feat)
             except Exception as e:
                 print(f"Warning: CosyVoice 2 decode failed for {tag_prefix}{suffix}: "
                       f"{type(e).__name__}: {e}")

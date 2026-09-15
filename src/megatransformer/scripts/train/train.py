@@ -567,6 +567,8 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             voice_smg_decoder=voice_smg_decoder,
             voice_cosyvoice2_decoder=voice_cosyvoice2_decoder,
             static_speaker_embedding=static_speaker_embedding,
+            voice_prompt_audio_path=getattr(args, 'viz_voice_prompt_audio', None),
+            voice_cosyvoice2_model_dir=getattr(args, 'voice_cosyvoice2_model_dir', None),
             num_eval_samples=getattr(args, 'num_eval_samples', 4),
             step_offset=args.start_step,
             voice_sample_rate=getattr(args, 'voice_sample_rate', 16000),

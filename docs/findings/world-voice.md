@@ -2111,6 +2111,49 @@ is blind to that; cap counts are not.
 The DURATION half of the original entry (length r=+0.763 above the GT ceiling, zero
 collapsed utterances at bi_greedy) is unaffected and stands.
 
+## campplus embedding alone does NOT preserve speaker identity — the PROMPT does (2026-09-15, ESTABLISHED)
+
+**Ear-confirmed by the user, who is the arbiter for speaker identity.** Same ground-truth
+units, same frozen CosyVoice 2 decoder, same 192-d campplus embedding — the ONLY difference
+is whether `prompt_ids`/`prompt_feat` were supplied:
+
+- **embedding-only**: rendered a MALE reference speaker as **entirely female**.
+- **with prompt** (`logs/speaker_male.wav`, 131 units + (260,80) mel): correct speaker.
+
+Renders: `eval_output/world_voice_prompt_check/{embed_only,with_prompt}.wav`. Mean |diff|
+0.064 over the common span, identical duration; prompted render is 2.5x quieter
+(rms 0.105 -> 0.041), consistent with the prompt pulling the output toward the reference's
+own channel/level.
+
+The 192-d vector is a GLOBAL SUMMARY that modulates through `spk_embed_affine_layer`. It is
+evidently not enough to pin identity: the flow decoder falls back toward its own prior for
+everything the vector does not specify, and that fallback can cross sex.
+
+⚠️ **This undermines the `_static_speaker` control render.** That second render exists to
+separate speaker drift from off-manifold units — "a wandering GT render with a STABLE static
+render means the units are at fault, not the embedding". It has always been embedding-only,
+so a wandering static render may have been the CONDITIONING failing, not the units. Do not
+cite pre-2026-09-15 static-speaker drift observations as evidence about unit quality.
+
+⚠️ **Cache-based evals CANNOT do this today.** The val shards store
+`unit_ids / speaker_embeddings / speaker_ids / text / token_ids / feature_lengths` — no
+waveform and no mel — so `prompt_feat` cannot be built from the cache. Every WER/LCS number
+in this file is embedding-only. **Content metrics are unaffected** (Whisper transcribes the
+words regardless of the rendered voice's identity), but any claim about speaker similarity
+or timbre from a cache-based eval is void. Fixing it needs a preprocessing change storing one
+reference mel + its unit ids per speaker.
+
+✅ **BUILT**: `--viz_voice_prompt_audio <wav>` on the world trainer. Resolves `prompt_ids`
+(CosyVoice 2 `speech_tokenizer_v2.onnx`) and `prompt_feat` (`decoder.prompt_mel()`) lazily,
+caches them, and latches failures so a viz problem cannot kill a run. When
+`--static_speaker_embedding_path` is absent the campplus embedding is DERIVED FROM THE SAME
+WAV, which also removes the footgun of an embedding and a prompt clip that are different
+speakers (nothing checked this before). Verified end-to-end: 2:1 mel-to-unit ratio honoured,
+derived norm 13.377 matching an independently extracted `.pt`, and the render demonstrably
+differs from embedding-only.
+
+Requiring a reference clip costs nothing: one is needed to produce the embedding anyway.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)

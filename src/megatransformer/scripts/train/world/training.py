@@ -3144,7 +3144,7 @@ def add_cli_args(subparsers):
                                  "DEFAULT FLIPPED 0 -> 10 on 2026-09-10. At 0 the renders are the "
                                  "drawl arm: measured at ck90000 (n=64) the model runs 1.63x slow "
                                  "per word (16.5 frames/word vs the GT-ceiling's 10.1) and emits "
-                                 "24% fewer words, and in the like-for-like correct-length bucket "
+                                 "24%% fewer words, and in the like-for-like correct-length bucket "
                                  "RAS is worth +0.20 LCS-recall (0.555 -> 0.754 against a 0.862 "
                                  "ceiling). Every render judged by ear between the 2026-08-30 "
                                  "corpus switch and this date was the degraded arm — the model "
@@ -3208,6 +3208,14 @@ def add_cli_args(subparsers):
                             help="Clamp the per-frame std floor when sampling voice latents in TB renders (0=off).")
     sub_parser.add_argument("--static_speaker_embedding_path", type=str, default=None,
                             help="Path to a .pt file containing a speaker embedding tensor for static-speaker voice decoding")
+    sub_parser.add_argument("--viz_voice_prompt_audio", type=str, default=None,
+                            help="WAV of the SAME speaker as --static_speaker_embedding_path. "
+                                 "Enables CosyVoice 2 zero-shot prompt conditioning in the eval "
+                                 "renders: the 192-d embedding is a global summary, while the "
+                                 "prompt supplies per-frame acoustic evidence (timbre, channel, "
+                                 "style) no fixed-size vector carries. Needs "
+                                 "--voice_cosyvoice2_model_dir for speech_tokenizer_v2.onnx. "
+                                 "A failure degrades to embedding-only rendering with a warning.")
     sub_parser.add_argument("--num_eval_samples", type=int, default=4,
                             help="Number of samples per visualization scenario")
 
@@ -3323,7 +3331,7 @@ def add_cli_args(subparsers):
                                  "frames is replaced by a learned MASK feature and the unit loss is "
                                  "restricted to those positions. Makes the voice coda BIDIRECTIONAL "
                                  "so the head sees revealed units on both sides. Motivated by the "
-                                 "measured AR failure: greedy decoding puts 96% adjacent repeats, "
+                                 "measured AR failure: greedy decoding puts 96%% adjacent repeats, "
                                  "i.e. the conditional mode is 'repeat the previous unit' -- a loop "
                                  "that is structurally impossible without an AR feedback path.")
     sub_parser.add_argument("--voice_nar_mask_schedule", type=str, default="cosine",
