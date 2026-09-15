@@ -1,6 +1,7 @@
 from typing import List, Optional
 
 import math
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -2238,8 +2239,32 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         """
         if self._voice_prompt is not None or self._voice_prompt_failed:
             return self._voice_prompt if self._voice_prompt is not None else (None, None)
-        if not self.voice_prompt_audio_path or self.voice_cosyvoice2_decoder is None:
+        if self.voice_cosyvoice2_decoder is None:
             self._voice_prompt_failed = True
+            return (None, None)
+        # Both the unset and the missing-file cases warn LOUDLY and ONCE (the failure latches).
+        # Silence here is dangerous: embedding-only rendering still produces confident,
+        # fluent, correctly-timed speech -- in the WRONG VOICE. It rendered a male reference
+        # as female (2026-09-15, ear-confirmed), which is not a degradation anyone notices
+        # from the metrics, because WER/LCS score the words and ignore who said them.
+        if not self.voice_prompt_audio_path:
+            self._voice_prompt_failed = True
+            print("[viz] ⚠️  NO SPEAKER PROMPT (--viz_voice_prompt_audio unset). Rendering "
+                  "embedding-only.\n"
+                  "      The 192-d campplus embedding does NOT reliably preserve speaker "
+                  "identity -- it has been measured\n"
+                  "      rendering a MALE reference speaker as FEMALE. Voice renders are "
+                  "usable for CONTENT (words,\n"
+                  "      timing, intelligibility) but NOT for speaker similarity or timbre.",
+                  flush=True)
+            return (None, None)
+        if not os.path.exists(self.voice_prompt_audio_path):
+            self._voice_prompt_failed = True
+            print(f"[viz] ⚠️  SPEAKER PROMPT NOT FOUND: {self.voice_prompt_audio_path}\n"
+                  f"      Falling back to embedding-only rendering, whose speaker identity is "
+                  f"UNRELIABLE (see above).\n"
+                  f"      Note the default path is under logs/, which is gitignored -- a fresh "
+                  f"clone will not have it.", flush=True)
             return (None, None)
         try:
             import torchaudio
@@ -2268,8 +2293,17 @@ class WorldModelVisualizationCallback(VisualizationCallback):
             return self._voice_prompt
         except Exception as e:
             self._voice_prompt_failed = True
-            print(f"[viz] Voice prompt conditioning DISABLED ({type(e).__name__}: {e}); "
-                  f"falling back to embedding-only rendering.", flush=True)
+            # First line only: torchaudio's RuntimeError carries a ~20-line C++ backtrace
+            # that would bury the warning it is attached to.
+            _msg = str(e).strip().splitlines()[0] if str(e).strip() else ""
+            print(f"[viz] ⚠️  SPEAKER PROMPT FAILED TO LOAD ({type(e).__name__}: {_msg})\n"
+                  f"      Path: {self.voice_prompt_audio_path}\n"
+                  f"      Falling back to embedding-only rendering, whose speaker identity is "
+                  f"UNRELIABLE:\n"
+                  f"      campplus alone has been measured rendering a MALE reference as "
+                  f"FEMALE. Content metrics\n"
+                  f"      (words/timing) remain valid; speaker similarity and timbre do not.",
+                  flush=True)
             return (None, None)
 
     def _resolve_static_speaker(self, gt_speaker_emb):
