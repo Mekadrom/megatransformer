@@ -2084,11 +2084,18 @@ reproduce (0.659834 vs 0.639817 at identical model/config/temperature).
 | comparison | LCS spread |
 |---|---|
 | identical config, identical RNG stream | 0.000000 (6 dp) |
-| identical config, DIFFERENT RNG stream | ~0.020 |
+| identical config, DIFFERENT RNG stream | **0.020 - 0.055** |
 | adjacent temperature | ~0.124 |
 
 Pick the yardstick that matches the perturbation: an RNG-stream shift for a same-temperature
 A/B, the adjacent-temperature spread for anything that moves T.
+
+⚠️ **The RNG-stream figure was first recorded as ~0.020 from ONE pair and is understated.** A
+second pair — `bi_t00` (0.7270, with ceiling) vs `bi_t00_tau01_rtnone` (0.6719, identical
+except `--skip_ceiling`) — differs by **0.055**. Treat 0.02-0.055 as the band. Consequence:
+the `--ras_temperature` result at T=0.6 (+0.045) sits INSIDE it and is NOT established at
+n=12; the unistream T=0.2 result (12/12 -> 1/12 capped) is untouched, because an integer cap
+count moving by 11 of 12 is not a noise-scale effect.
 
 ### REVISION to "Bistream buys DURATION, not content" (2026-09-15)
 
@@ -2153,6 +2160,58 @@ derived norm 13.377 matching an independently extracted `.pt`, and the render de
 differs from embedding-only.
 
 Requiring a reference clip costs nothing: one is needed to produce the embedding anyway.
+
+## RAS tau: the axis is NOT flat — it interacts with the resample temperature (2026-09-15, ESTABLISHED)
+
+Bistream EMA ck68000, n=12, `ras_win=10`, all arms `--skip_ceiling` so the RNG streams match
+(`eval_output/world_voice_tau_sweep/`). Two regimes: greedy (resample inherits an effective
+1.0) and T=0.6 with the resample pinned to 1.0.
+
+| tau | greedy capped / LCS | T=0.6 + rt1.0 capped / LCS |
+|---|---|---|
+| 0.0 | **12/12 / 0.0000** | 3/12 / 0.5327 |
+| 0.1 | **0/12** / 0.6719 | **0/12** / 0.7051 |
+| 0.2 | 2/12 / 0.6705 | 1/12 / 0.6820 |
+| 0.3 | 2/12 / 0.6376 | 1/12 / **0.7442** |
+| 0.5 | 4/12 / 0.6547 | 0/12 / 0.5978 |
+
+**RAS OFF (tau=0) at greedy is TOTAL COLLAPSE**: 12/12 budget-capped, LCS 0.0000, WER 1.0000,
+and EMPTY Whisper transcripts — the degenerate repeat-the-previous-unit loop rendering as a
+held tone. This **VINDICATES the old "greedy decoding puts 96% adjacent repeats" finding**,
+which an earlier 2026-09-15 note flagged as a retraction candidate on the strength of
+measuring adj_repeat 0.0096-0.0127. Both are correct and describe DIFFERENT SAMPLERS: the
+original is greedy WITHOUT RAS, every 2026-09-15 measurement had `--ras_win 10` on. **The
+retraction candidate is withdrawn; the original entry stands as written.**
+
+RAS is therefore not a mild anti-repetition nudge — it is the only thing between this model
+and total collapse under greedy. "Greedy is incredibly good" is entirely RAS's doing.
+
+⚠️ **CORRECTION to an intermediate conclusion in this session.** After the greedy regime alone
+(tau 0.1/0.2/0.3 = 0.672/0.671/0.638, all inside noise) the tau axis was declared "flat" and
+"closed". That was an artifact of holding the wrong variable fixed. With the resample
+decoupled at 1.0, **tau=0.3 goes from worst (0.6376) to best (0.7442)**. tau sets how OFTEN
+RAS fires; ras_temperature sets HOW it resamples. Sweeping either alone reads as flat.
+Never sweep one without the other.
+
+**Practical picks.** tau=0.1 is the only value giving 0/12 caps in BOTH regimes, so it is the
+safe default. Content differences across tau 0.1-0.3 span 0.062 within the rt1.0 regime and
+0.034 within greedy — both inside the 0.02-0.055 RNG band, so the content ranking is NOT
+resolved at n=12. tau extremes (0.0 and 0.5) are genuinely worse in both regimes.
+
+### OPEN: greedy vs T=0.6 + ras_temperature 1.0 is UNRESOLVED at n=12
+
+Both reach 0/12 caps at tau=0.1, so the reliable metric cannot separate them. LCS favours the
+decoupled regime by +0.033 (tau 0.1) to +0.072 (tau 0.3) — straddling the noise band.
+
+Current viz default is **greedy, tau 0.1** (`c9d9a1d`), chosen because it is the simpler
+configuration and ties on the metric that is trustworthy at this n.
+
+An argument the metrics cannot see: greedy under-repeats badly (adj_repeat 0.0096-0.0127 vs
+GT 0.0792) and ASR word-overlap is blind to repetition naturalness, which the user HAS
+reacted to by ear. If the decoupled regime is confirmed at larger n, it would also restore
+sampled variation at equal-or-better content. **Resolve with n=48 on the two candidates
+before changing the default** — this session already produced one wrong conclusion (the tau
+axis) from reasoning past the noise floor.
 
 ## OPEN
 
