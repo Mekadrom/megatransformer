@@ -2265,6 +2265,60 @@ zero collapsed utterances) is a large effect and stands. Termination robustness 
 temperature band (0/12 caps at T=0.5/0.6 vs unistream's 5/12 and 3/12) is n=12 single-seed
 and NOT yet verified. Content: no advantage.
 
+## Bistream buys SAMPLER INSENSITIVITY, not better speech (2026-09-15, ESTABLISHED)
+
+Full 2x2, ck68000 EMA, n=48, **2 seeds per cell**, tau 0.1, `--skip_ceiling` throughout
+(`eval_output/world_voice_n48_decision/`).
+
+| model | config | seed1 | seed2 | mean LCS | WER | caps | seed spread |
+|---|---|---|---|---|---|---|---|
+| bistream | greedy | 0.6904 | 0.7598 | 0.7251 | 0.3057 | 5/96 | 0.069 |
+| bistream | T=0.6 + rt1.0 | 0.7605 | 0.6980 | 0.7293 | 0.2943 | 3/96 | 0.063 |
+| unistream | greedy | 0.6940 | 0.7178 | 0.7059 | 0.3092 | 4/96 | 0.024 |
+| unistream | T=0.6 + rt1.0 | 0.6397 | 0.6562 | **0.6480** | **0.3971** | 4/96 | 0.017 |
+
+| | greedy -> T=0.6+rt1.0 |
+|---|---|
+| bistream | **+0.0041** (no detectable change) |
+| unistream | **-0.0579** (~3x its own seed spread; WER +0.088 agrees) |
+| interaction | **+0.0620** |
+
+**Unistream degrades under the decoupled-resample regime; bistream does not.** The unistream
+effect is readable because that row's seed spread is 0.017-0.024 — THREE TIMES TIGHTER than
+bistream's 0.063-0.069, consistently across both cells. Two independent metrics move together
+(LCS -0.058, WER +0.088).
+
+**Bistream's margin over unistream is entirely conditional on the sampler:** +0.019 at greedy
+(nothing) vs +0.081 at T=0.6+rt1.0 (where unistream falls apart). Combined with the
+established content NULL at greedy, the reading is that chunk-interleaving did not make the
+model better at producing speech — it made the model **insensitive to how it is sampled**.
+That is independently consistent with the n=12 temperature sweep, where bistream held 0/12
+caps at T=0.5/0.6 while unistream capped 5/12 and 3/12.
+
+⚠️ **OBSERVATION, NOT A FINDING — the variance asymmetry runs the other way.** Bistream is
+~3x LESS stable seed-to-seed at a FIXED config while being MORE stable ACROSS configs. Two
+seeds cannot establish a variance ratio; the consistency across both cells is what makes it
+worth checking. If real it is an odd result for an architecture whose claimed virtue is
+robustness, and it also means bistream needs MORE seeds than unistream to measure at all.
+
+**Practical:** greedy remains the default — it is the configuration where BOTH models do
+well, so it is the one that does not depend on the bistream/unistream choice being settled.
+
+### EMA vs raw on generation: NULL (2026-09-15, ESTABLISHED)
+
+Bistream greedy, n=48: raw 0.7339 / WER 0.3011 / 0 caps, vs EMA seed-averaged 0.7251 /
+0.3057 / 5 per 96. Paired EMA-raw = -0.0399, 95% CI [-0.0972, +0.0180]. Raw's value sits
+INSIDE EMA's own seed range (0.6904-0.7598).
+
+**Closes the loose end** left by the n=12 arms, which had EMA helping +0.125 at T=0.6 and
+hurting -0.104 at greedy — both seed noise. It also defuses the protocol worry raised earlier
+that day: eval scripts load RAW `pytorch_model.bin` while the training viz renders under EMA.
+For CONTENT that mismatch is immaterial. (It remains real for anything measuring the weights
+themselves.)
+
+Asterisk: raw posted 0/48 caps against EMA's 2 and 3 — the cleanest termination of any arm —
+but that is one seed and cap counts this small need a replicate.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
