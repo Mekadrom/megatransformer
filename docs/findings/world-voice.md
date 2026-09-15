@@ -1852,6 +1852,93 @@ content from layout in a way the training arm structurally cannot.
 
 ---
 
+## Bistream buys DURATION, not content (2026-09-15, ESTABLISHED)
+
+Matched-step four-arm probe at **step 68000**, `world_voice_ar_diagnostics.py`, n=128 TF /
+gen_n=48, `--voice_ras_win 10 --voice_ras_tau 0.1`, M-RoPE 7.5/text. Arms:
+`cosyvoice2_smollm2_libriheavy_ar_flat_lr_ema_mrope75_0` (unistream, the prior best) vs
+`cosyvoice2_smollm2_libriheavy_bistream_scratch_0` (from-scratch, 50% bistream), each at
+T=0.6 and greedy. Raw reports: `eval_output/world_voice_bistream_ab/`.
+
+⚠️ **PROTOCOL: all four arms decode UNISTREAM.** The bistream checkpoint was evaluated in
+unistream layout, because the chunked path makes the text-shuffle ablation structurally
+invalid (a different transcript yields a different chunk plan and different voice padding, so
+the two forwards stop being positionally comparable). The TensorBoard renders the ear judges
+are CHUNKED. An n=8 chunked smoke gave acc_real 0.1925 vs 0.1734 unistream, so the chunked
+numbers are probably better than what is tabulated here — **the content conclusion below is
+therefore conservative, not confounded, but the chunked arm is still unmeasured at n=48.**
+
+| metric | uni T=.6 | bi T=.6 | uni greedy | bi greedy | GT / ceiling |
+|---|---|---|---|---|---|
+| acc_real (TF) | 0.1791 | 0.1734 | 0.1791 | 0.1729 | 0.2110 n-gram |
+| ppl_real | 42.51 | 46.56 | 42.51 | 46.65 | — |
+| text_delta all-pos | +0.0642 | +0.0561 | +0.0639 | +0.0543 | +0.0594 teacher |
+| text-attributed frac | 0.358 | 0.323 | 0.357 | 0.314 | 0.463 teacher |
+| eov_position_acc | 0.4766 | 0.4453 | 0.4688 | 0.4453 | — |
+| length r | +0.653 | +0.727 | +0.671 | **+0.763** | +0.744 |
+| length hit rate | 75.0% | 83.3% | 83.3% | 83.3% | — |
+| collapsed (<50% GT) | 4.2% | 4.2% | 4.2% | **0.0%** | — |
+| len_min | 5 | 32 | 38 | **67** | 74 |
+| adj_repeat_rate | 0.0378 | 0.0639 | 0.0127 | 0.0096 | 0.0792 |
+| distinct_bigram_ratio | 0.806 | 0.735 | 0.849 | 0.815 | 0.869 |
+
+**Content: bistream is no better and slightly worse.** Lower acc_real, higher perplexity,
+lower all-position `text_delta`, lower text-attributed fraction — consistently, at both
+temperatures. Chunk-interleaving made text->speech alignment local and monotonic without
+making text bind harder.
+
+**The text horizon did not widen, which was the entire reason to try it.** Neither arm's
+position-resolved delta ever falls below the 0.01 threshold, so the horizon metric does not
+discriminate; but bistream's TAIL deltas are *lower* (+0.0543 vs +0.0673 at 128+ frames).
+Whatever bistream fixed, it was not the decay of text influence into the utterance.
+
+**Duration is now essentially solved, and `bi_greedy` is the arm that does it**: r=+0.763
+*above* the GT ceiling of +0.744, zero collapsed utterances, and a shortest generation of 67
+frames against a GT minimum of 74. The unistream T=0.6 arm by contrast produced a 5-frame
+utterance. This corroborates the earlier read that duration control was nearly solved by CE
+and closes the remaining gap.
+
+**Greedy beats T=0.6 on duration for BOTH models** (uni hit rate 83.3% vs 75.0%, median
+length error 0.09 vs 0.17, zero overruns). The cost is naturalness: greedy `adj_repeat_rate`
+is 0.0096-0.0127 against GT's 0.0792 — it essentially never repeats a unit, and real speech
+does. Sampling buys repetition structure and spends length discipline.
+
+**The user-audible "natural stutter" of the bistream run has a number.** Adjacent-repeat in
+the first 32 frames: bistream 0.0793 vs unistream 0.0457 (GT 0.0894). Bistream's aggregate
+repeat rate is the closest of any arm to GT, but its bigram diversity is well BELOW GT (0.735
+vs 0.869). It repeats locally in a GT-plausible way while drawing from a narrower vocabulary,
+and the excess is concentrated at ONSET, not drift — so it is a conditioning/decoder effect,
+not exposure bias.
+
+### Accidental replicate: early-frame TF metrics carry ~0.006 of jitter (2026-09-15, ESTABLISHED)
+
+Sections 1/1b/2 are teacher-forced and temperature-independent, so the T=0.6 and greedy arms
+of the SAME checkpoint are exact replicates of those metrics. They did not reproduce exactly:
+
+| | uni T=.6 | uni greedy | bi T=.6 | bi greedy |
+|---|---|---|---|---|
+| acc_real (n~24k positions) | 0.1791 | 0.1791 | 0.1734 | 0.1729 |
+| early_acc_real (n=1024) | 0.2969 | 0.3047 | 0.3066 | 0.3086 |
+| early_text_delta | +0.0293 | +0.0352 | +0.0332 | +0.0332 |
+| eov_position_acc | 0.4766 | 0.4688 | 0.4453 | 0.4453 |
+
+All-position `acc_real` and `ppl_real` reproduce to 4 and 2 decimals; the n=1024 early-frame
+subset moves by up to 0.008 in `early_acc_real` and **0.0059 in `early_text_delta`**.
+Consistent with nondeterministic GPU reductions flipping near-tie argmaxes: stable in
+aggregate, visible at n=1024.
+
+**Consequence: the uni-vs-bi `early_text_delta` difference (~0.004) is SMALLER than this
+jitter and must not be read as a result.** The stated 95% CIs are sampling CIs and do not
+include this term. Any future `early_text_delta` comparison needs replicates, not one run.
+
+### RETRACTION CANDIDATE: "free-running argmax repeats the previous unit ~99% of the time"
+
+Both greedy arms here show `adj_repeat_rate` of 0.0096-0.0127 — about 1%, the opposite of the
+earlier claim, and BELOW ground truth rather than above it. Either the behaviour is
+checkpoint-specific and has since changed, or the original measurement was wrong. Not struck
+yet because the original entry has not been re-located and re-read; do that before editing it.
+Flagged here so the claim is not cited again in the meantime.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
