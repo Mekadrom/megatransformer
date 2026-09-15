@@ -124,11 +124,18 @@ def add_mrope_args(ap):
     return ap
 
 
-def make_collator(K, max_frames, special_token_base=constants.SPECIAL_TOKEN_BASE):
+def make_collator(K, max_frames, special_token_base=constants.SPECIAL_TOKEN_BASE,
+                  bistream_text_chunk=0, bistream_voice_chunk=0, bistream_prob=1.0):
     return MultimodalDataCollator(
         max_seq_len=1024, max_waveforms=160000, max_mel_spec_frames=625,
         max_sive_feature_frames=max_frames, voice_eov_id=K,
         special_token_base=special_token_base,
+        bistream_text_chunk=bistream_text_chunk,
+        bistream_voice_chunk=bistream_voice_chunk,
+        bistream_prob=bistream_prob,
+        # fill_token = EOV + 1, mirroring train.py. Without it the collator lays out chunks
+        # but never emits the token that ends one.
+        voice_fill_id=(K + 1 if bistream_text_chunk > 0 else None),
     )
 
 
@@ -225,14 +232,47 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
         tgt = b["voice_unit_ids"].to(device)
         syn = b["is_synthesis"].to(device)
 
-        def fwd(text_ids):
+        # BISTREAM: a chunked batch has M voice placeholders per row but still ONE voice
+        # example, so the interleaver needs the (utt_idx, start, length) map to know which
+        # slice of that example each placeholder takes. Without it the forward asserts
+        # "found M voice placeholders but have 1 voice examples". Mirrors training.py:766;
+        # absent keys mean a unistream batch and cost nothing.
+        _cs = b.get("voice_chunk_starts")
+        _chunk_map = None
+        if _cs is not None:
+            _chunk_map = torch.stack(
+                [b["voice_chunk_utts"], _cs, b["voice_chunk_lengths"]], dim=-1).to(device)
+
+        def fwd(text_ids, chunk_map=_chunk_map):
             out = model(text_input_ids=text_ids, voice_inputs=vin, voice_lengths=vlen,
                         voice_latent_labels=vlbl, is_synthesis=syn, decode_outputs=False,
-                        voice_attn_alpha=voice_attn_alpha)
+                        voice_attn_alpha=voice_attn_alpha, voice_chunk_map=chunk_map)
             return out["voice_unit_logits"]
 
         lr = fwd(text)                                   # real text
-        ls = fwd(torch.roll(text, 1, dims=0))            # each voice + WRONG (rolled) text
+        if _chunk_map is None:
+            # UNISTREAM: the transcript is a contiguous prefix, so rolling the collated text
+            # pairs each voice with the wrong transcript and changes nothing else.
+            ls = fwd(torch.roll(text, 1, dims=0))
+        else:
+            # BISTREAM: the text-shuffle ablation is STRUCTURALLY INCOMPATIBLE here, and a
+            # half-correct version would be worse than none.
+            #
+            # Voice placeholders are interleaved INTO the text stream, so rolling the collated
+            # text moves them too: row 0 gets another row's chunk count while the map still
+            # describes its own, and the forward asserts. Shuffling transcripts at the SAMPLE
+            # level and re-collating fixes that, but a different transcript yields a different
+            # chunk plan and therefore different voice padding (measured: 250 vs 252 frames on
+            # one batch), so the two forwards are no longer positionally comparable and the
+            # PAIRED per-position delta the CI rests on is meaningless.
+            #
+            # Everything the shuffle feeds -- text_delta, early_text_delta, the per-bucket
+            # deltas -- is therefore skipped under bistream. acc_real / early_acc_real and the
+            # position-resolved REAL accuracies come from the real-text forward alone and are
+            # unaffected; they are also the metrics established as the reliable ones (the
+            # shuffled baseline contributes most of early_text_delta's noise -- see the
+            # noise-floor entry in docs/findings/world-voice.md).
+            ls = None
         Bc, Tc, V = lr.shape
         t = tgt[:, :Tc]
         if t.shape[1] < Tc:
@@ -244,9 +284,11 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
             _m = nar_masked[:, :Tc]
             if _m.shape[0] == content.shape[0]:
                 content = content & _m.to(content.device)
-        pr, ps = lr.argmax(-1), ls.argmax(-1)
+        pr = lr.argmax(-1)
+        ps = ls.argmax(-1) if ls is not None else None
         tot["real_hits"] += (pr[content] == t[content]).sum().item()
-        tot["shuf_hits"] += (ps[content] == t[content]).sum().item()
+        if ps is not None:
+            tot["shuf_hits"] += (ps[content] == t[content]).sum().item()
         tot["content"] += int(content.sum().item())
         # Top-k membership on real text (compute top-10 once, derive top-5 from it).
         top10 = lr.topk(10, dim=-1).indices                  # (Bc, Tc, 10)
@@ -258,7 +300,7 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
         # Early-frame (text-dominant) region: first early_k voice positions.
         # per-utterance tallies for the bootstrap CI
         hit_r = (pr == t) & content
-        hit_s = (ps == t) & content
+        hit_s = ((ps == t) & content) if ps is not None else torch.zeros_like(content)
         early = content.clone()
         early[:, early_k:] = False
         for _b in range(Bc):
@@ -271,7 +313,8 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
                                       int((hit_s[_b] & early[_b]).sum().item()), _e))
         if early.any():
             tot["early_real"] += (pr[early] == t[early]).sum().item()
-            tot["early_shuf"] += (ps[early] == t[early]).sum().item()
+            if ps is not None:
+                tot["early_shuf"] += (ps[early] == t[early]).sum().item()
             tot["early_content"] += int(early.sum().item())
             tot["early_top5"] += int(hit5[early].sum().item())
             tot["early_top10"] += int(hit10[early].sum().item())
@@ -280,7 +323,8 @@ def run_tf_and_ablation(model, dataset, collator, device, n, K, bs=16, early_k=8
             m = content & (pos_ix >= lo) & (pos_ix < hi)
             if m.any():
                 bstats[(lo, hi)]["real"] += int((pr[m] == t[m]).sum().item())
-                bstats[(lo, hi)]["shuf"] += int((ps[m] == t[m]).sum().item())
+                if ps is not None:
+                    bstats[(lo, hi)]["shuf"] += int((ps[m] == t[m]).sum().item())
                 bstats[(lo, hi)]["n"] += int(m.sum().item())
         ce = F.cross_entropy(lr.reshape(Bc * Tc, V), t.reshape(Bc * Tc), ignore_index=-100)
         tot["ce_real"] += ce.item() * Bc
@@ -399,6 +443,26 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
             continue
         prompt_lens.append(int(bov[0].item()))   # text tokens before BOV = transcript length proxy
         prompt = text[:bov[0].item() + 1].unsqueeze(0).to(device)
+        # BISTREAM continuation. A bistream checkpoint decoded WITHOUT these stops at its
+        # first fill_token -- generate() reads a fill with no further transcript as
+        # end-of-utterance -- so it emits one ~s-frame chunk of a multi-chunk utterance and
+        # scores as catastrophic under-speaking. Mirrors
+        # visualization_callback._bistream_gen_kwargs: the collated bistream sequence is
+        # [text 0:k][BOV], so bov_pos is exactly how many transcript tokens the prompt
+        # consumed, and the FULL plain transcript comes from the uncollated sample.
+        _bi_kwargs = {}
+        _k = int(getattr(collator, "bistream_text_chunk", 0) or 0)
+        if _k > 0:
+            _full = s.get("text_token_ids")
+            _tl = s.get("text_text_length")
+            if _full is not None:
+                if _tl is not None:
+                    _full = _full[:int(_tl)]
+                _bi_kwargs = {
+                    "voice_bistream_text": _full.reshape(1, -1).to(device),
+                    "voice_bistream_text_chunk": _k,
+                    "voice_bistream_text_offset": int(bov[0].item()),
+                }
         if getattr(model, "voice_mask_feature", None) is not None:
             # NAR: masked-parallel decode. The AR loop would step a bidirectional head one
             # frame at a time, which measures a procedure the model is never used under.
@@ -413,6 +477,7 @@ def run_generation(model, dataset, collator, device, gen_n, K, budget,
                                  voice_ras_win=ras_win, voice_ras_tau=ras_tau,
                                  voice_min_frames=min_frames,
                                  voice_min_frame_ratio=min_frame_ratio,
+                                 **_bi_kwargs,
                                  decode_outputs=False)
         _ent = out.get("voice_unit_id_entropy_trace") or out.get("voice_unit_entropy_trace")
         if _ent and _ent[0]:
@@ -545,6 +610,18 @@ def main():
                          "while cutting over-length ~3x. GT len_min is 74 frames, so a floor "
                          "of 40-50 removes sub-second cutoffs without touching any legitimate "
                          "short utterance.")
+    ap.add_argument("--bistream_text_chunk", type=int, default=0,
+                    help="REQUIRED to evaluate a BISTREAM checkpoint: it both lays out chunked "
+                         "batches and enables the generate() continuation kwargs. Without it a "
+                         "bistream model stops at its first fill_token and scores as massive "
+                         "under-speaking. Must match the training value (4 for the 4:30 runs).")
+    ap.add_argument("--bistream_voice_chunk", type=int, default=0,
+                    help="Speech frames per chunk (30 for the 4:30 runs; ratio must equal the "
+                         "corpus frames/token, measured at 7.506 on LibriHeavy).")
+    ap.add_argument("--bistream_prob", type=float, default=1.0,
+                    help="Fraction of ELIGIBLE samples collated bistream. 1.0 here (not the "
+                         "training 0.5) so the arm measures the bistream path rather than a "
+                         "coin-flip mixture; pass 0.0 to measure the same checkpoint unistream.")
     ap.add_argument("--voice_min_frame_ratio", type=float, default=0.0,
                     help="TEXT-PROPORTIONAL EOV floor: ban EOV until ratio*n_text_tokens frames "
                          "are emitted. 0 = off. This is CosyVoice 2's own scheme "
@@ -579,7 +656,10 @@ def main():
     sp_base = getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE)
     sp = constants.special_token_ids(sp_base)
     eval_dataset = load_dataset(args, "val")
-    collator = make_collator(K, a.voice_max_frames, special_token_base=sp_base)
+    collator = make_collator(K, a.voice_max_frames, special_token_base=sp_base,
+                             bistream_text_chunk=a.bistream_text_chunk,
+                             bistream_voice_chunk=a.bistream_voice_chunk,
+                             bistream_prob=a.bistream_prob)
     print(f"val: {len(eval_dataset)} | K={K} | feature_channels={D} | "
           f"voice_max_frames={a.voice_max_frames} | predict_f0={a.voice_predict_f0} | "
           f"special_token_base={sp_base}", flush=True)
