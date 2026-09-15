@@ -312,12 +312,15 @@ def main():
         # pays L x steps. Measured at steps=8 the AR arm's whole eval was only ~3% slower than the
         # parallel one, because Z-Image's 1024x1024 decode dominates -- so raising steps is far
         # cheaper here than the forward counts suggest.
+        # NB: do NOT name these `_m` -- that is bound at the top of this function to the metrics
+        # module (`from megatransformer.utils import metrics as _m`), and shadowing it here made
+        # every --flow_steps eval die later at `_m.get_logger()`.
         _n_patched = 0
-        for _h in ("flow_head", "ar_flow_head"):
-            _m = getattr(_adapter, _h, None)
-            if _m is not None and hasattr(_m, "steps"):
-                print(f"[flow_steps] {_h}.steps {_m.steps} -> {args.flow_steps}")
-                _m.steps = int(args.flow_steps)
+        for _head_name in ("flow_head", "ar_flow_head"):
+            _head_mod = getattr(_adapter, _head_name, None)
+            if _head_mod is not None and hasattr(_head_mod, "steps"):
+                print(f"[flow_steps] {_head_name}.steps {_head_mod.steps} -> {args.flow_steps}")
+                _head_mod.steps = int(args.flow_steps)
                 _n_patched += 1
         if _n_patched == 0:
             raise SystemExit("--flow_steps was passed but this checkpoint has no flow head with a "

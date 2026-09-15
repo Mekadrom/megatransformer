@@ -22,6 +22,11 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--cache_dir", type=str, required=True, help="train shard dir (text+image)")
     p.add_argument("--n_samples", type=int, default=8192)
+    p.add_argument("--shuffle", action="store_true",
+                   help="Sample captions RANDOMLY instead of taking the first n_samples in cache "
+                        "order. Required for a representative estimate: the cache concatenates "
+                        "caption sources of very different lengths without shuffling.")
+    p.add_argument("--seed", type=int, default=0, help="shuffle seed")
     p.add_argument("--seq_len", type=int, default=64)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--output", type=str, required=True)
@@ -54,8 +59,18 @@ def main():
     collator.force_direction = "synthesis"
 
     # gather captions
+    # ⚠️ ORDER MATTERS. The cache is an UNSHUFFLED CONCATENATION of caption sources with very
+    # different lengths (measured 2026-09-15: shards 0-39 average ~11.9 SmolLM2 tokens, shards
+    # 150-164 average ~105, corpus mean 31.94). Walking indices 0..n_samples therefore samples ONLY
+    # the shortest source. The ORIGINAL k64/native stats were built that way and describe the
+    # shortest ~1.2% of the corpus. The trainer itself shuffles (ModalityGroupedSampler), so the
+    # stats did not match the data they were applied to.
     caps = []
-    for i in range(len(dataset)):
+    order = list(range(len(dataset)))
+    if args.shuffle:
+        import random as _random
+        _random.Random(args.seed).shuffle(order)
+    for i in order:
         b = collator([dataset[i]])
         c = (b.get("text_texts") or [""])[0]
         if c:
