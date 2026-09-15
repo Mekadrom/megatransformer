@@ -971,3 +971,21 @@ collapse signature — that quantity was never re-checked after the fix.
 Also retracted: the implication that std=3.0 is what fixed it. Distinct LEARNABLE DIRECTIONS fixed
 it; the magnitude is separable and, per the mechanism entry above, is now actively suppressing
 conditioning.
+
+### The validation split does not match the training distribution (full corpus)
+`image_gen_captions_only/val` is 25,010 samples of **mean 11.9 SmolLM2 tokens, max 53, ZERO
+captions >= 64**, i.e. entirely the short COCO source. Training data across all 165 shards is mean
+**31.9**, median 23, p95 101, max 256, with 11.8% over 64 tokens. The cache is an unshuffled
+concatenation of caption sources (shards 0-39 ~11.9 tokens, 36-41 and 150-164 ~90-105, the rest
+mixed); the val split was cut from the short end only.
+⚠️ Every `eval/loss` curve in this file was therefore measured OUT OF DISTRIBUTION. That includes
+the train-vs-eval gap used to argue the corpus is large enough for ~215M params (constant -0.17,
+never widening) and the whiten point head's converged eval loss. Those statements hold for THAT val
+set; they are not evidence about the training distribution.
+⚠️ It does NOT affect any arm-vs-arm comparison: every arm used the same val split, and CLIPScore —
+which all the headline results rest on — is computed on the 8-prompt probe, not on val.
+✅ `image_gen_captions_only/val_mixed` (24,915 samples sampled evenly from all 165 shards: mean
+31.8, median 23, p95 102, max 249, 11.2% >= 64) now matches train. The original val is left in
+place so the finished runs' logged curves stay interpretable.
+✅ The long-caption subset ships its own matched val (one held-out long shard, 15,029 samples,
+median 100, 98.5% >= 64).
