@@ -2319,6 +2319,54 @@ themselves.)
 Asterisk: raw posted 0/48 caps against EMA's 2 and 3 — the cleanest termination of any arm —
 but that is one seed and cap counts this small need a replicate.
 
+## BEST MEASURED CONFIG (2026-09-15): unistream ck90000-ema + greedy
+
+```
+checkpoint: cosyvoice2_smollm2_libriheavy_ar_flat_lr_ema_mrope75_0/checkpoint-90000-ema
+sampling:   --voice_temperature 0.0 --ras_win 10 --ras_tau 0.1
+            LCS 0.7519   WER 0.2621   (n=48, 2 seeds, --skip_ceiling)
+```
+
+ck90000 is that run's eval-loss minimum (0.41527, epoch 6.00). Sweep:
+`eval_output/world_voice_ck90k/`.
+
+| config | LCS | WER | hyp/ref | caps | collapsed | seed spread |
+|---|---|---|---|---|---|---|
+| **greedy** | **0.7519** | **0.2621** | 0.953 | 5/96 | 7/96 | 0.017 |
+| T=0.6 + rt1.0 | 0.7103 | 0.3201 | 0.944 | **1/96** | 6/96 | 0.057 |
+| T=0.7 | 0.6933 | 0.3592 | **0.974** | 3/96 | **4/96** | 0.031 |
+
+Greedy wins on BOTH metrics; the margin over T=0.7 is 2-3x seed spread. Unistream preferring
+greedy over the decoupled-resample regime REPLICATES the ck68000 result (0.7059 vs 0.6480),
+so it is a property of the model, not one checkpoint.
+
+**Supersedes the earlier "best config" answer.** Full ranking of everything measured at n=48
+with 2 seeds:
+
+| rank | checkpoint + config | LCS | WER |
+|---|---|---|---|
+| 1 | **unistream ck90000 greedy** | **0.7519** | **0.2621** |
+| 2 | bistream ck68000 T=0.6+rt1.0 | 0.7293 | 0.2943 |
+| 3 | bistream ck68000 greedy | 0.7251 | 0.3057 |
+| 4 | unistream ck68000 greedy | 0.7059 | 0.3092 |
+
+⚠️ **The bistream-vs-unistream comparison earlier that day was handicapped**: both models were
+evaluated at ck68000, the BISTREAM run's eval minimum. Unistream's own minimum is ck90000, and
+at it unistream beats every bistream arm. ck90000 vs ck68000 greedy is +0.046 against a
+unistream seed spread of 0.017-0.024, so the checkpoint difference is real. This does NOT
+revive a bistream content advantage (the paired null at matched step stands) but it does mean
+**no bistream arm has been measured at ITS best step past 68000** — the run stopped at 75000
+having turned at 68000.
+
+⚠️ **Greedy wins the MEAN while failing hardest on the TAIL**: most caps (5/96) and most
+collapsed utterances (7/96) of the three. Per-utterance inspection of `greedy_s1` shows the
+distribution is bimodal, not centred — 2 of 46 produced <30 frames against 100+ frame targets
+("Indeed." for a 183-frame reference). LCS 0.75 is an average over near-perfect and
+catastrophic, which is what the ear has always reported as "either works or it doesn't".
+
+⚠️ LCS-recall ignores insertions: `gen_0026` scores a perfect 1.00 while audibly stuttering
+"in times in times past". These numbers rank configs; they do not describe quality.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
