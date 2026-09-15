@@ -2032,6 +2032,19 @@ behaviour. Unistream EMA, T=0.2, everything else identical:
 One argument takes the worst arm in the sweep to within noise of greedy. The trough is
 fully explained.
 
+**Where termination is ALREADY fine, the fix is modest.** Bistream EMA at T=0.6 (0/12 capped
+either way), both arms sharing `--skip_ceiling` so the RNG streams match:
+
+| bi T=0.6 | capped | LCS | WER | median len |
+|---|---|---|---|---|
+| inherited resample | 0/12 | 0.6598 | 0.3850 | — |
+| `--ras_temperature 1.0` | 0/12 | **0.7051** | **0.3050** | 175 |
+
++0.045 LCS at ~2x the applicable noise (see the RNG-stream figure below), with WER moving
+the same direction. Real but modest. **The fix is decisive where termination is BROKEN and
+marginal where it is not** — so for a run already at 0/12 caps it is a small positive, not
+the large recovery the unistream T=0.2 numbers imply on their own.
+
 ⚠️ **The training default T=0.6 sits INSIDE the trough** (uni 3/12 capped). Every TB render
 judged by ear at T=0.6 has been sampling from the pathological band. This is a plausible
 contributor to the long-standing "early stopping" complaint, independent of architecture.
@@ -2056,6 +2069,26 @@ among bistream's four clean-termination points T=0.5/0.6/0.7/0.8 the LCS runs
 though the arms are paired on the same utterances and each is individually deterministic.
 Determinism under replication does NOT imply smoothness in T. Cap counts (integers over 12
 with monotonic structure) are the more trustworthy readout at this n.
+
+⚠️ **`--skip_ceiling` IS NOT A PURE SPEED FLAG — it changes what you measure.** The CosyVoice 2
+flow decoder draws `torch.randn_like(mu)` per call (`cosyvoice/flow/flow_matching.py:56`, and
+HiFiGAN draws again), so EVERY `dec.decode()` advances the global RNG. The per-sample loop is
+`generate -> decode(gen) -> decode(trunc) -> decode(ceiling)`, so sample i+1's GENERATION
+consumes the stream left by sample i's CEILING decode. Dropping the ceiling pass therefore
+shifts the sampling trajectory of every later sample. An A/B where one arm has it and the
+other does not is confounded — this was caught only because a determinism control failed to
+reproduce (0.659834 vs 0.639817 at identical model/config/temperature).
+
+**Three distinct noise scales, measured 2026-09-15, n=12:**
+
+| comparison | LCS spread |
+|---|---|
+| identical config, identical RNG stream | 0.000000 (6 dp) |
+| identical config, DIFFERENT RNG stream | ~0.020 |
+| adjacent temperature | ~0.124 |
+
+Pick the yardstick that matches the perturbation: an RNG-stream shift for a same-temperature
+A/B, the adjacent-temperature spread for anything that moves T.
 
 ### REVISION to "Bistream buys DURATION, not content" (2026-09-15)
 
