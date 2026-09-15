@@ -578,6 +578,7 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
             voice_temperature=getattr(args, 'viz_voice_temperature', 0.6),
             suppress_media_tokens=getattr(args, 'viz_suppress_media_tokens', True),
             voice_ras_win=getattr(args, 'viz_voice_ras_win', 0),
+            voice_ras_temperature=getattr(args, 'viz_voice_ras_temperature', None),
             voice_nar_rounds=getattr(args, 'voice_nar_rounds', 16),
             voice_nar_choice_temp=getattr(args, 'voice_nar_choice_temperature', 1.0),
             voice_ras_tau=getattr(args, 'viz_voice_ras_tau', 0.1),

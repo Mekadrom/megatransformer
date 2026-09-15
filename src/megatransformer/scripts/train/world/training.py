@@ -3152,7 +3152,21 @@ def add_cli_args(subparsers):
                                  "Also: adj_repeat 0.103 -> 0.007, longest_run 56 -> 7. Pass 0 "
                                  "explicitly to recover the old behaviour.")
     sub_parser.add_argument("--viz_voice_ras_tau", type=float, default=0.1,
-                            help="RAS repetition threshold for eval renders.")
+                            help="RAS repetition threshold for eval renders: RAS fires when the "
+                                 "chosen unit occurred >= ras_win*tau times in the last ras_win. "
+                                 "tau=0 disables RAS, which at T=0 collapses COMPLETELY (12/12 "
+                                 "budget-capped, empty transcripts). Interacts with "
+                                 "--viz_voice_ras_temperature: at greedy, tau 0.1/0.2/0.3 are "
+                                 "flat and 0.1 wins on cap count; with the resample decoupled at "
+                                 "1.0, tau 0.3 measured best. Do not sweep one without the other.")
+    sub_parser.add_argument("--viz_voice_ras_temperature", type=float, default=None,
+                            help="Temperature for the RAS RESAMPLE in eval renders, decoupled "
+                                 "from the pick. None (default) inherits the pick's scaling, "
+                                 "which is DISCONTINUOUS at zero: greedy resamples at an "
+                                 "effective 1.0 while T=0.2 resamples 5x sharper than any pick, "
+                                 "making 0.2-0.6 a trough where termination breaks. Set 1.0 to "
+                                 "hold the resample fixed and make --viz_voice_temperature "
+                                 "behave monotonically.")
     sub_parser.add_argument("--voice_cosyvoice2_distill_model_dir", type=str, default=None,
                             help="CosyVoice2-0.5B snapshot dir for KL DISTILLATION. Runs the frozen "
                                  "Qwen2-0.5B speech LM teacher-forced in the training loop and adds "

@@ -57,6 +57,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         voice_nar_rounds: int = 16,
         voice_nar_choice_temp: float = 1.0,
         voice_ras_tau: float = 0.1,
+        voice_ras_temperature: Optional[float] = None,
         include_modes: Optional[list[str]] = None,
         include_tasks: Optional[list[str]] = None,
         voice_token_budget: Optional[int] = None,
@@ -113,6 +114,9 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         self.voice_nar_rounds = int(voice_nar_rounds or 16)
         self.voice_nar_choice_temp = float(voice_nar_choice_temp)
         self.voice_ras_tau = float(voice_ras_tau)
+        # None => generate() inherits the pick's scaling (the discontinuous default).
+        self.voice_ras_temperature = (None if voice_ras_temperature is None
+                                      else float(voice_ras_temperature))
         self.suppress_media_tokens = bool(suppress_media_tokens)
         self.voice_variance_floor = voice_variance_floor
         self.voice_sample_rate = voice_sample_rate
@@ -339,6 +343,8 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         if self.voice_ras_win:
             kwargs.setdefault("voice_ras_win", self.voice_ras_win)
             kwargs.setdefault("voice_ras_tau", self.voice_ras_tau)
+            if self.voice_ras_temperature is not None:
+                kwargs.setdefault("voice_ras_temperature", self.voice_ras_temperature)
         # NAR checkpoints decode by masked refinement, not autoregression. Gate on a prompt
         # that ENDS at BOV (that is what the voice-synthesis scenarios build) so image/text
         # scenarios are untouched.
