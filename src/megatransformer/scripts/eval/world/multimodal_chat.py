@@ -1196,10 +1196,19 @@ def main():
                 # SIVE checkpoint would be a silent no-op at best.
                 _voice_gen_kwargs = {}
                 if cv2_voice is not None:
+                    # ⚠️ These MUST come from the UI inputs, not from `args`. Until
+                    # 2026-09-16 they read args.* -- the command-line defaults fixed at
+                    # launch -- so every voice sampling slider in the UI was INERT: temp
+                    # 0.0-1.5, RAS win 0-40 and tau 0.0-1.0 all produced byte-identical
+                    # sampling, and observed variation between runs was only the random
+                    # seed. The status line even printed the slider values back, so it
+                    # looked applied. Fall back to args.* only when a control is absent.
+                    def _ui(v, fallback):
+                        return fallback if v is None else v
                     _voice_gen_kwargs = dict(
-                        voice_temperature=args.voice_temperature,
-                        voice_ras_win=args.voice_ras_win,
-                        voice_ras_tau=args.voice_ras_tau,
+                        voice_temperature=float(_ui(voice_temp_in, args.voice_temperature)),
+                        voice_ras_win=int(_ui(voice_ras_win_in, args.voice_ras_win) or 0),
+                        voice_ras_tau=float(_ui(voice_ras_tau_in, args.voice_ras_tau) or 0.0),
                         voice_min_frame_ratio=args.voice_min_frame_ratio,
                     )
                 # RECURRENT EXIT CRITERION + TRUNK DEPTH, set from the UI.
