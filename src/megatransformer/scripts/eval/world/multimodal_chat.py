@@ -600,6 +600,9 @@ def decode_voice_latent(latent: torch.Tensor, smg_decoder, vocoder, speaker_embe
     return sample_rate, wav.cpu().float().numpy()
 
 
+_AUDIO_PLAYER_POOL = 4
+
+
 def main():
     args = parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -968,7 +971,8 @@ def main():
                        f"(trimmed by the *prompt seconds* slider at generation).")
 
     def on_clear(state):
-        return "", render_file_list({}), {}, "", [], [], ""
+        return ("", render_file_list({}), {}, "", [], [], "",
+                *[gr.update(value=None, visible=False) for _ in range(_AUDIO_PLAYER_POOL)])
 
     import tempfile
     wav_tmpdir = tempfile.mkdtemp(prefix="mm_chat_wavs_")
@@ -996,7 +1000,9 @@ def main():
         trunk_iters_in,
     ):
         if not msg_text or not msg_text.strip():
-            return "", [], [], "Empty prompt."
+            # Must match the 8-wide outputs wiring: 4 values + one update per player.
+            return ("", [], [], "Empty prompt.",
+                    *[gr.update(value=None, visible=False) for _ in range(_AUDIO_PLAYER_POOL)])
         state = state or {}
 
         # Normalize UI values into the generate() API. 0 / None / negative
@@ -1391,7 +1397,14 @@ def main():
             if line:
                 status_lines.append(line)
 
-        return gen_text, gallery_images, voice_wav_paths, "\n".join(status_lines)
+        # One update per pooled player: fill the first N, hide the rest.
+        _players = [
+            gr.update(value=(voice_wav_paths[i] if i < len(voice_wav_paths) else None),
+                      visible=(i < len(voice_wav_paths)))
+            for i in range(_AUDIO_PLAYER_POOL)
+        ]
+        return (gen_text, gallery_images, voice_wav_paths,
+                "\n".join(status_lines), *_players)
 
     # --- UI ---
     with gr.Blocks(title="MegaTransformer Multimodal Chat") as demo:
@@ -1535,7 +1548,17 @@ def main():
                 # scroll -- inherent to native size, and preferable to silent downscaling.
                 out_gallery = gr.Gallery(label="Generated images", columns=1, height=1040,
                                          object_fit="scale-down", preview=False)
-                out_audio_files = gr.Files(label="Generated voice clips (.wav)")
+                # PLAYBACK + DOWNLOAD. gr.Files is download-only -- it renders a file list
+                # with no transport, so clips could not be auditioned without saving them
+                # first. gr.Audio plays exactly one file, so a fixed pool is used and the
+                # unused slots are hidden. The pool is capped; gr.Files below still carries
+                # EVERY clip, so nothing is lost when a response exceeds the pool.
+                out_audio_players = [
+                    gr.Audio(label=f"voice clip {i + 1}", visible=False,
+                             type="filepath", interactive=False)
+                    for i in range(_AUDIO_PLAYER_POOL)
+                ]
+                out_audio_files = gr.Files(label="Generated voice clips (.wav) — download all")
 
             with gr.Column(scale=1):
                 file_list_md = gr.Markdown(render_file_list({}))
@@ -1586,12 +1609,14 @@ def main():
                 voice_ras_tau_slider, voice_prompt_sec_slider,
                 exit_criteria_dd, exit_threshold_num, trunk_iters_num,
             ],
-            outputs=[out_text, out_gallery, out_audio_files, status_box],
+            outputs=[out_text, out_gallery, out_audio_files, status_box,
+                     *out_audio_players],
         )
         clear_btn.click(
             on_clear,
             inputs=[state],
-            outputs=[msg_box, file_list_md, state, out_text, out_gallery, out_audio_files, status_box],
+            outputs=[msg_box, file_list_md, state, out_text, out_gallery,
+                     out_audio_files, status_box, *out_audio_players],
         )
 
     demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)
