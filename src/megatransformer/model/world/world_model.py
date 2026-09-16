@@ -1240,6 +1240,9 @@ class MegaTransformerWorldModel(nn.Module):
         voice_ras_win: int = 0,
         voice_ras_tau: float = 0.1,
         voice_ras_temperature: Optional[float] = None,
+        voice_step_stats: Optional[list] = None,
+        voice_eov_min_prob: Optional[float] = None,
+        voice_eov_max_entropy: Optional[float] = None,
         # Pre-encoded media for transcription / cross-modal tasks
         audio_inputs: Optional[torch.Tensor] = None,
         audio_lengths: Optional[torch.Tensor] = None,
@@ -1919,6 +1922,35 @@ class MegaTransformerWorldModel(nn.Module):
                             if _floor > 0 and _seg_len < _floor:
                                 logits = logits.clone()
                                 logits[self.voice_codebook.shape[0]] = float("-inf")
+                            # EOV CONFIDENCE GUARD. Premature collapse is NOT the model
+                            # confidently deciding to stop -- measured at ck90000, n=96, the
+                            # 5 collapsed utterances fired EOV at entropy 5.87 nats / p_max
+                            # 0.064 / p(EOV) 0.031, against 2.59 / 0.287 / 0.219 for the 89
+                            # that ended normally. The distribution has gone nearly flat
+                            # (5.87 nats ~ 350 effective candidates of 6562) and EOV wins by
+                            # accident, sometimes as "argmax" only because nothing is likely.
+                            #
+                            # So the discriminator is an ABSOLUTE floor. Relative truncation
+                            # (min-p, top-a) cannot see this: their threshold is a multiple of
+                            # p_max, which is itself tiny exactly when this happens.
+                            #
+                            # BOTH conditions are required. Either alone blocks 5/5 collapses
+                            # but breaks 22-27 of 89 legitimate stops; together they still
+                            # block 5/5 while breaking 13. They are not redundant -- some good
+                            # stops are low-confidence-but-sharp, others diffuse-but-confident;
+                            # only the collapses are both.
+                            #
+                            # Inert unless BOTH are set. Reads only the current distribution,
+                            # so it carries to non-TTS voice targets unchanged.
+                            if (voice_eov_min_prob is not None
+                                    and voice_eov_max_entropy is not None):
+                                _eov_id_g = self.voice_codebook.shape[0]
+                                _pg = torch.softmax(logits.float(), dim=-1)
+                                _Hg = float(-(_pg * torch.log(_pg.clamp_min(1e-12))).sum())
+                                if (float(_pg[_eov_id_g]) < voice_eov_min_prob
+                                        and _Hg > voice_eov_max_entropy):
+                                    logits = logits.clone()
+                                    logits[_eov_id_g] = float("-inf")
                             # BISTREAM fill_token (K+1), when the head is wide enough to have
                             # one. Suppressed while the CURRENT CHUNK is still empty: a fill on
                             # a chunk's first step would emit no frames, hand back to text, and
@@ -2010,6 +2042,26 @@ class MegaTransformerWorldModel(nn.Module):
                                         p2 = torch.softmax(banned, dim=-1)
                                         if bool(torch.isfinite(p2).all()) and float(p2.sum()) > 0:
                                             unit_id = torch.multinomial(p2, 1)[0]
+                            if voice_step_stats is not None:
+                                # DIAGNOSTIC HOOK. Records the model's own belief at this
+                                # step, from RAW logits -- NOT `scaled` -- so entropy and
+                                # p_max describe the model rather than the sampler, and stay
+                                # comparable across temperature arms. Appended only when a
+                                # collector list is passed, so this is inert by default.
+                                _pp = torch.softmax(logits.float(), dim=-1)
+                                _H = float(-(_pp * torch.log(_pp.clamp_min(1e-12))).sum())
+                                _top = torch.topk(_pp, 2)
+                                voice_step_stats.append({
+                                    "b": int(b),
+                                    "t": len(voice_unit_id_trace[b]),
+                                    "entropy": _H,
+                                    "p_max": float(_top.values[0]),
+                                    "p_2nd": float(_top.values[1]),
+                                    "argmax_id": int(_top.indices[0]),
+                                    "chosen_id": int(unit_id),
+                                    "p_eov": float(_pp[self.voice_codebook.shape[0]]),
+                                    "is_eov": bool(int(unit_id) == self.voice_codebook.shape[0]),
+                                })
                             voice_unit_id_trace[b].append(int(unit_id))
                             # EOV token: the terminal unit (id == codebook size; the codebook
                             # has no row there). It is the discrete-vocab replacement for the
