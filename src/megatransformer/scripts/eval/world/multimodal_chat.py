@@ -1624,8 +1624,8 @@ def main():
                             label="exit threshold (0 = criterion default; logit_kl 5e-4, latent_diff 0.03)",
                         )
                         trunk_iters_num = gr.Number(
-                            value=0, precision=0,
-                            label="max trunk iterations (0 = model default; a CAP -- the criterion may stop earlier)",
+                            value=8, precision=0,
+                            label="max trunk iterations (8 = saturation, BEST measured; 0 = model default)",
                         )
                     with gr.Row():
                         image_steps_num = gr.Number(

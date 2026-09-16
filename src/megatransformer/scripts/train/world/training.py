@@ -3159,6 +3159,14 @@ def add_cli_args(subparsers):
                                  "--viz_voice_ras_temperature: at greedy, tau 0.1/0.2/0.3 are "
                                  "flat and 0.1 wins on cap count; with the resample decoupled at "
                                  "1.0, tau 0.3 measured best. Do not sweep one without the other.")
+    sub_parser.add_argument("--viz_trunk_iters", type=int, default=8,
+                            help="Recurrent iteration CAP for eval RENDERS only (not for "
+                                 "eval loss, which stays at full depth so historical curves "
+                                 "remain comparable). DEFAULT 8 as of 2026-09-16: measured "
+                                 "n=48 x 2 seeds, voice quality saturates at ~6 iterations "
+                                 "(LCS 0.9179 at 18.6% of trunk compute) and mildly declines "
+                                 "past it (0.9051 at 32). 8 sits just past saturation. "
+                                 "0 = model default (mean_thinking_steps).")
     sub_parser.add_argument("--viz_voice_ras_temperature", type=float, default=None,
                             help="Temperature for the RAS RESAMPLE in eval renders, decoupled "
                                  "from the pick. None (default) inherits the pick's scaling, "

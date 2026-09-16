@@ -58,6 +58,7 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         voice_nar_choice_temp: float = 1.0,
         voice_ras_tau: float = 0.1,
         voice_ras_temperature: Optional[float] = None,
+        trunk_iters: Optional[int] = None,
         include_modes: Optional[list[str]] = None,
         include_tasks: Optional[list[str]] = None,
         voice_token_budget: Optional[int] = None,
@@ -117,6 +118,15 @@ class WorldModelVisualizationCallback(VisualizationCallback):
         # None => generate() inherits the pick's scaling (the discontinuous default).
         self.voice_ras_temperature = (None if voice_ras_temperature is None
                                       else float(voice_ras_temperature))
+        # RENDER-ONLY trunk iteration cap. Measured 2026-09-16 (n=48 x 2 seeds): voice
+        # quality saturates at ~6 iterations and mildly DECLINES past it -- cap 6 gives LCS
+        # 0.9179 at 18.6% of trunk compute vs 0.9051 at the full 32. Renders therefore cost
+        # a fraction of what they did with no quality loss.
+        #
+        # Applied around the RENDER call only, never around eval loss: mean_thinking_steps is
+        # module state, and changing it for the whole of evaluate() would silently alter
+        # eval/loss and break comparability with every historical curve.
+        self.trunk_iters = (None if trunk_iters in (None, 0) else int(trunk_iters))
         self.suppress_media_tokens = bool(suppress_media_tokens)
         self.voice_variance_floor = voice_variance_floor
         self.voice_sample_rate = voice_sample_rate
@@ -359,7 +369,17 @@ class WorldModelVisualizationCallback(VisualizationCallback):
                 except Exception as e:
                     print(f"Warning: NAR voice render failed ({e}); no voice this step")
                     return {}
-        return model.generate(**kwargs)
+        if self.trunk_iters is None:
+            return model.generate(**kwargs)
+        _blk = getattr(model, "recurrent_block", None)
+        if _blk is None:
+            return model.generate(**kwargs)
+        _saved = _blk.mean_thinking_steps
+        _blk.mean_thinking_steps = self.trunk_iters
+        try:
+            return model.generate(**kwargs)
+        finally:
+            _blk.mean_thinking_steps = _saved
 
     def _scenario_enabled(self, required_modes: set, satisfying_tasks: set) -> bool:
         """Should this scenario run, given --include_modes / --include_tasks?
