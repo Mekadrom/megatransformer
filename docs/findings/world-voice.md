@@ -2812,6 +2812,60 @@ rare-word ceiling IS a data-scale limit and is the more consequential one.
 is the closest available proxy for "unseen" -- truly unseen words (recall ~0 by ear) are
 WORSE than the 0.623 shown.
 
+## Trunk depth saturates at SIX iterations -- 5.3x cheaper than full depth (2026-09-16, ESTABLISHED)
+
+ck90000-ema, greedy + RAS w=10 tau=0.1, `logit_kl` 1e-4, n=48 x 2 seeds. The cap is a hard
+ceiling on `recurrent_block.mean_thinking_steps`; below cap 8 the cap BINDS and the criterion
+is inert, so that portion is a clean measurement of pure depth
+(`scripts_local/world_voice_itercap_sweep.sh`, `reports/cap*`).
+
+| cap | measured depth | trunk compute | LCS | WER | dLCS |
+|---|---|---|---|---|---|
+| 1 | 1.00 | 3.1% | 0.1774 | 0.8586 | -- |
+| 2 | 2.00 | 6.2% | 0.6925 | 0.3351 | **+0.5151** |
+| 3 | 2.99 | 9.4% | 0.8437 | 0.1701 | +0.1512 |
+| 4 | 3.99 | 12.5% | 0.8772 | 0.1328 | +0.0334 |
+| **6** | **5.97** | **18.6%** | **0.9179** | 0.0885 | +0.0408 |
+| 8 | 7.92 | 24.7% | 0.9141 | 0.0839 | -0.0039 |
+| 16 | 14.41 | 45.0% | 0.9074 | 0.0931 | -0.0067 |
+| 32 | 23.61 | 73.8% | 0.9051 | 0.0989 | -0.0023 |
+
+**Quality saturates at cap 6 and mildly DECLINES thereafter** (0.9179 -> 0.9141 -> 0.9074 ->
+0.9051). Each step is inside the spreads, but four consecutive decreases is a pattern. Full
+depth `none` (32 iters, no criterion) is 0.9103 -- also inside that band.
+
+⭐ **The single biggest jump in this whole direction is cap 1 -> cap 2: +0.5151 LCS.** For
+scale, fixing the broken exit criterion -- the headline result of 2026-09-15/16 -- was +0.133.
+
+✅ **VALIDATION**: the cap-32 arm reproduces the independent threshold sweep EXACTLY (LCS
+0.9051, WER 0.0989 to 4 dp, different run, hours apart).
+
+### What the depth is actually buying: RARE WORDS
+
+Cross-referencing the per-word analysis: from cap 3 to full depth, very rare words go
+0.415 -> 0.623 recall while very common words move only 0.968 -> 0.984. **The entire
+cap-3-to-cap-6 gap is rare-word recall.** For common speech cap 3 is already at 0.95+.
+
+### Practical
+
+- **cap 6** (`--trunk_iters 6`) -- full quality at 18.6% of trunk compute, **5.3x cheaper**.
+- **cap 3** -- 93% of quality at 9.4%, 10.7x cheaper. Its shortfall is concentrated in rare
+  words, which this model mispronounces anyway (see the rare-word entry).
+- cap 1-2 are broken.
+
+⚠️ **This SUPERSEDES both earlier 2026-09-16 recommendations** (`--exit_criteria none`, then
+`logit_kl 1e-4` at 74%). Neither found cap 6 because **`logit_kl` never exits below ~17
+iterations on its own** -- the threshold sweep was exploring a region that begins long after
+quality has saturated. A hard cap reaches an operating point the criterion structurally cannot.
+
+⚠️ **UNTESTED and NOT implied**: whether the model could be TRAINED at low depth. It trains at
+32 and needs 6 at inference; the deep training may be what produces a model that converges in
+6. Training-depth and inference-depth are different experiments.
+
+⚠️ Seed spread is again U-shaped (0.004-0.008 below saturation, 0.010-0.017 on the plateau,
+0.0023 at cap 16), matching the threshold sweep: near the knee, small trajectory differences
+change how much computation positions actually receive.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
