@@ -48,6 +48,15 @@ ap.add_argument("--ras_win", type=int, default=0,
                      "viz default flipped to 10 at commit 6af9337, so 0 no longer matches "
                      "the renders -- it reproduces the 1.63x-drawl arm. Pass 10 to match.")
 ap.add_argument("--ras_tau", type=float, default=0.1)
+ap.add_argument("--exit_criteria", default=None,
+                choices=["kl_divergence","logit_kl","latent_diff","none"],
+                help="Override the recurrent exit criterion AFTER loading. Default None "
+                     "keeps the checkpoint config (kl_divergence on every run to date, "
+                     "which is the numerically broken one). logit_kl is Huginn's real "
+                     "criterion and needs a readout -- for voice that is wired in "
+                     "generate() via _trunk_readout_voice.")
+ap.add_argument("--exit_criteria_threshold", type=float, default=None,
+                help="Threshold for --exit_criteria. logit_kl: 5e-4 (paper) / 1e-3 (ref).")
 ap.add_argument("--eov_min_prob", type=float, default=None,
                 help="EOV confidence guard: ban EOV when p(EOV) is below this AND entropy is "
                      "above --eov_max_entropy. Needs BOTH to be set. Targets premature "
@@ -122,6 +131,21 @@ sp_base = getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BA
 sp = constants.special_token_ids(sp_base)
 _IS_NAR = getattr(model, "voice_mask_feature", None) is not None
 print(f"decode path: {'NAR masked-parallel' if _IS_NAR else 'AR'}", flush=True)
+if a.exit_criteria is not None:
+    from megatransformer.model import recurrent_criteria as _rc
+    _thr = a.exit_criteria_threshold
+    _blk = model.recurrent_block
+    if a.exit_criteria == "none":
+        _blk.exit_criteria = _rc.NoOpCriteria()
+    elif a.exit_criteria == "logit_kl":
+        _blk.exit_criteria = _rc.LogitKLCriteria(_thr if _thr is not None else 5e-4)
+    elif a.exit_criteria == "latent_diff":
+        _blk.exit_criteria = _rc.LatentDiffCriteria(_thr if _thr is not None else 0.03)
+    else:
+        _blk.exit_criteria = _rc.KLDivergenceCriteria(_thr if _thr is not None else 1e-4)
+    print(f"exit criterion overridden -> {a.exit_criteria} "
+          f"(threshold {getattr(_blk.exit_criteria, 'threshold', None)})", flush=True)
+
 ds = load_dataset(args, "val")
 coll = make_collator(K, a.voice_max_frames, special_token_base=sp_base,
                      bistream_text_chunk=a.bistream_text_chunk,
@@ -243,6 +267,9 @@ for i in range(len(ds)):
     tr = [int(x) for x in _raw if 0 <= int(x) < K]
     L_ref = int(s["voice_feature_length"])
     row = {"idx": i, "ref": ref, "gen_frames": len(tr), "ref_frames": L_ref}
+    _its = out.get("recurrent_iteration_counts") or []
+    if _its:
+        row["mean_iters"] = sum(int(x) for x in _its) / len(_its)
     if a.duration_shuffle and _IS_NAR:
         from megatransformer.utils import constants as _C2
         row["forced_bucket"] = row_forced

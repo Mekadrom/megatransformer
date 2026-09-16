@@ -492,6 +492,44 @@ class MegaTransformerWorldModel(nn.Module):
         """
         self.voice_codebook = None if centroids is None else centroids.float()
 
+    def _trunk_readout_voice(self, latents: torch.Tensor,
+                             kv_caches: Optional[list] = None,
+                             position_offset: int = 0) -> Optional[torch.Tensor]:
+        """Latent -> VOICE UNIT logits, for `logit_kl` at voice positions.
+
+        The text readout is meaningless at voice positions -- different head, different
+        vocabulary -- so `forward()` restricts convergence to text and lets voice run the
+        full budget. This is the voice analogue, so voice positions can be scored by the
+        head that actually produces them.
+
+        ⚠️ SNAPSHOT/RESTORE, and it is load-bearing. The voice coda is CAUSAL and
+        KV-cached, and `KVCache.update()` does `self.key_cache = torch.cat([...])` -- it
+        REBINDS on every call. A readout invoked once per recurrent iteration would
+        therefore append one phantom frame per iteration, so at the default 32 iterations
+        the coda's cache would grow 32x faster than the utterance and every subsequent
+        frame would attend to garbage.
+
+        Passing `kv_caches=None` instead would avoid that but score a distribution with no
+        history, which for a causal coda is not the distribution the model would emit.
+        Because update() REBINDS rather than mutating the tensor in place, saving the old
+        references and restoring them afterwards is O(1) and exact: the readout sees the
+        real context, and the cache is byte-identical when it returns.
+        """
+        if self.voice_generator is None:
+            return None
+        snap = None
+        if kv_caches is not None:
+            snap = [(getattr(c, "key_cache", None), getattr(c, "value_cache", None))
+                    for c in kv_caches]
+        try:
+            out = self.voice_generator(latents, kv_caches=kv_caches,
+                                       position_offset=position_offset, use_cache=False)
+        finally:
+            if snap is not None:
+                for c, (k, v) in zip(kv_caches, snap):
+                    c.key_cache, c.value_cache = k, v
+        return out.get("voice_unit_logits")
+
     def _trunk_readout(self, latents: torch.Tensor) -> torch.Tensor:
         """Latent -> text logits, for the `logit_kl` exit criterion only.
 
@@ -1715,6 +1753,47 @@ class MegaTransformerWorldModel(nn.Module):
                         mrope_local_next[b] += (1.0 / max(rate, 1e-3)) if is_media_b else 1.0
                 step_pids = torch.tensor(rows, dtype=torch.float32,
                                          device=next_hidden.device).unsqueeze(1)  # (B,1,2)
+            # VOICE-POSITION EXIT CRITERION. `logit_kl` is Huginn's real criterion --
+            # KL between successive POST-READOUT distributions -- and Huginn applies it
+            # during single-token generation, which is exactly here. Until now it was
+            # wired only into forward(), so generation always ran the full budget no
+            # matter what the config said.
+            #
+            # The readout must match the head that produces the position: scoring a voice
+            # latent with the TEXT coda compares the wrong distribution. Items not
+            # currently emitting voice get zeros and are masked out of the exit decision
+            # by `converge_eligible`, so they simply run the full budget as before.
+            _v_readout = None
+            _v_eligible = None
+            # voice_codebook gates the DISCRETE path, which is what produces
+            # `voice_unit_logits`. Without it the readout would return None and the block
+            # would call init_state(None) -- it only checks that the readout is not None,
+            # not that it returns something.
+            if (self.voice_generator is not None
+                    and self.voice_codebook is not None
+                    and getattr(self.recurrent_block.exit_criteria, "needs_readout", False)):
+                _v_flags = [current_modality[b] == "voice" for b in range(batch_size)]
+                if any(_v_flags):
+                    _v_eligible = torch.tensor(
+                        [[f] for f in _v_flags], dtype=torch.bool,
+                        device=next_hidden.device)  # (B,1)
+
+                    def _v_readout(h, _flags=tuple(_v_flags)):
+                        outs = []
+                        for _b in range(h.shape[0]):
+                            lg = None
+                            if _flags[_b]:
+                                lg = self._trunk_readout_voice(
+                                    h[_b:_b + 1],
+                                    kv_caches=voice_coda_kv_caches[_b],
+                                    position_offset=voice_coda_position_offsets[_b])
+                            outs.append(lg)
+                        _ref = next((o for o in outs if o is not None), None)
+                        if _ref is None:
+                            return None
+                        outs = [o if o is not None else torch.zeros_like(_ref) for o in outs]
+                        return torch.cat(outs, dim=0)
+
             # Process through recurrent block with KV cache
             current_hidden, kv_cache, n_iters, kl_trace, _ = self.recurrent_block(
                 next_hidden * self.embed_scale,
@@ -1724,6 +1803,8 @@ class MegaTransformerWorldModel(nn.Module):
                 use_cache=True,
                 share_kv_cache=share_kv_cache,
                 position_ids=step_pids,
+                readout=_v_readout,
+                converge_eligible=_v_eligible,
             )
             recurrent_iteration_counts.append(n_iters)
             recurrent_kl_final.append(kl_trace[-1] if kl_trace else 0.0)
