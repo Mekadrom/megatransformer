@@ -87,6 +87,26 @@ class MegaTransformerRecurrentConfig:
     #                   distributions, uniform-initialised, threshold 5e-4 in the paper.
     #                   Needs a readout; world_model supplies the text coda and restricts
     #                   early exit to text positions.
+    #   "latent_diff"   Huginn's readout-free criterion: relative latent movement,
+    #                   |dx|/|x|, threshold 0.03. Scale-free, so the threshold ports
+    #                   across widths and norm settings. Cheapest correct option.
+    #   "latent_kl"     the legacy latent check made into a real KL (log_softmax over
+    #                   d_model first). Readout-free. Valid KL of an INVENTED
+    #                   distribution -- softmax over hidden channels is not a belief --
+    #                   and its scale depends on the activation scale, so the threshold
+    #                   does NOT port across configs. Empirically
+    #                   latent_kl ~= 0.5 * latent_diff^2, so Huginn's 0.03 corresponds
+    #                   to roughly 4.5e-4 here.
+    #   "latent_diff"   Huginn's readout-free criterion: relative L2 movement of the
+    #                   trunk state, |dx|/|x|, threshold 0.03. Scale-free, so the
+    #                   threshold ports across widths and norm settings. This is the
+    #                   correct latent-space analogue of a KL: KL and squared Euclidean
+    #                   distance are the same Bregman divergence under different
+    #                   generators (negative entropy on the simplex vs 1/2|x|^2 on R^d),
+    #                   so L2 is what KL BECOMES off the simplex. Note that under
+    #                   iteration_norm="post_projection" (what small_sum uses) this is
+    #                   the same measure as cosine distance: relL2^2 ~= 2(1-cos) to
+    #                   within 0.1%, so the two differ only by a squared threshold.
     #   "none"          never exit -- always run the full `mean_thinking_steps` budget.
     #                   This is the control arm, and the depth the model trained at.
     #   "kl_divergence" LEGACY DEFAULT, NUMERICALLY BROKEN. Applies F.kl_div to raw

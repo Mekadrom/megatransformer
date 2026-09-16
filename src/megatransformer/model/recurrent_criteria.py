@@ -23,8 +23,17 @@ class NoOpCriteria(RecurrentExitCriteria):
     training. Use it as the baseline any adaptive criterion has to beat.
     """
 
+    # -inf so the generic `exit_values < threshold` test can never fire, while still
+    # letting the block log a real per-iteration diagnostic (see exit_values below).
+    threshold = float("-inf")
+
     def should_exit(self, last_thought_state, current_thought_state):
         return False
+
+    def exit_values(self, last_thought_state: torch.Tensor, current_thought_state: torch.Tensor) -> torch.Tensor:
+        """Relative latent movement -- logged for diagnostics, never used to exit."""
+        delta = (current_thought_state - last_thought_state).norm(dim=-1)
+        return delta / current_thought_state.norm(dim=-1).clamp_min(1e-6)
 
     def converged_mask(self, last_thought_state: torch.Tensor, current_thought_state: torch.Tensor) -> torch.Tensor:
         return torch.zeros(
@@ -61,6 +70,41 @@ class KLDivergenceCriteria(RecurrentExitCriteria):
         """Per-token convergence mask. Shape: (batch, seq_len). True = converged."""
         kl = F.kl_div(last_thought_state, current_thought_state, reduction="none", log_target=True).sum(dim=-1)
         return kl < self.threshold
+
+
+class LatentDiffCriteria(RecurrentExitCriteria):
+    """Huginn's `LatentDiffExitEvaluator`: normalised relative distance in latent space.
+
+    Ported from `tomg-group-umd/huginn-0125`, `raven_modeling_minimal.py`:
+
+        exit_values = ((latents - self.prev_latents).norm(dim=-1) / latents.norm(dim=-1)).mean(dim=-1)
+        return exit_values < self.exit_threshold      # exit_threshold "auto" = 0.03
+
+    This is the reference implementation's own readout-free criterion, and the paper
+    describes it as "the simplest adaptive exit criterion ... normalized distance in latent
+    space". If the goal is "Huginn's criterion but without the readout", this is literally
+    it -- `latent_kl` is a corrected version of what THIS codebase was doing, which is a
+    different thing.
+
+    Scale-free by construction (it divides by the state norm), so unlike `latent_kl` its
+    threshold does transfer across widths and normalisation settings. That is the main
+    reason to prefer it.
+
+    Deviation from the reference: Huginn takes `.mean(dim=-1)` over the sequence, giving one
+    value per batch row, because its adaptive compute runs during single-token generation.
+    Kept per position here, (B, T), to match the rest of this codebase's per-token freeze.
+    At seq_len 1 the two are identical.
+    """
+
+    def __init__(self, threshold: float = 0.03):
+        self.threshold = threshold
+
+    def exit_values(self, last_thought_state: torch.Tensor, current_thought_state: torch.Tensor) -> torch.Tensor:
+        delta = (current_thought_state - last_thought_state).norm(dim=-1)
+        return delta / current_thought_state.norm(dim=-1).clamp_min(1e-6)
+
+    def converged_mask(self, last_thought_state: torch.Tensor, current_thought_state: torch.Tensor) -> torch.Tensor:
+        return self.exit_values(last_thought_state, current_thought_state) < self.threshold
 
 
 class LogitKLCriteria(RecurrentExitCriteria):

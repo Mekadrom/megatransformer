@@ -76,12 +76,15 @@ class MegatransformerRecurrentBlock(nn.Module):
             # Needs a readout (latent -> logits) passed to forward(); without one it cannot
             # fire and the trunk runs its full budget.
             self.exit_criteria = recurrent_criteria.LogitKLCriteria(self.exit_criteria_threshold)
+        elif self.exit_criteria == 'latent_diff':
+            # Huginn's own readout-free criterion: relative latent movement, scale-free.
+            self.exit_criteria = recurrent_criteria.LatentDiffCriteria(self.exit_criteria_threshold)
         elif self.exit_criteria in ('none', None):
             self.exit_criteria = recurrent_criteria.NoOpCriteria()
         else:
             raise ValueError(
-                f"Invalid exit criteria: {self.exit_criteria!r} "
-                "(expected 'logit_kl', 'none', or legacy 'kl_divergence')")
+                f"Invalid exit criteria: {self.exit_criteria!r} (expected 'logit_kl', "
+                "'latent_diff', 'none', or legacy 'kl_divergence')")
         
         self.step = 0
         self.track_iteration_stats = False
@@ -444,6 +447,12 @@ class MegatransformerRecurrentBlock(nn.Module):
                         newly_converged, prev_log_probs, kl_per_token = self.exit_criteria.step(
                             prev_log_probs, logits,
                         )
+                    elif hasattr(self.exit_criteria, 'exit_values'):
+                        # Readout-free criteria that expose their own well-defined score.
+                        # The logged trace is THAT score, so kl_per_iteration stops
+                        # reporting the legacy (signed, meaningless) quantity.
+                        kl_per_token = self.exit_criteria.exit_values(last_thought_state, new_thought)
+                        newly_converged = kl_per_token < self.exit_criteria.threshold
                     elif track_kl or iteration_stats is not None:
                         kl_per_token = F.kl_div(
                             last_thought_state, new_thought,
