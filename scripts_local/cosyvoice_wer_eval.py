@@ -48,6 +48,14 @@ ap.add_argument("--ras_win", type=int, default=0,
                      "viz default flipped to 10 at commit 6af9337, so 0 no longer matches "
                      "the renders -- it reproduces the 1.63x-drawl arm. Pass 10 to match.")
 ap.add_argument("--ras_tau", type=float, default=0.1)
+ap.add_argument("--eov_min_prob", type=float, default=None,
+                help="EOV confidence guard: ban EOV when p(EOV) is below this AND entropy is "
+                     "above --eov_max_entropy. Needs BOTH to be set. Targets premature "
+                     "collapse, which measures as a loss of coherence (flat distribution), "
+                     "not a confident stop. Suggested 0.10 / 3.0.")
+ap.add_argument("--eov_max_entropy", type=float, default=None,
+                help="Entropy (nats) above which a low-probability EOV is rejected. Pairs "
+                     "with --eov_min_prob; both must be set or the guard is inert.")
 ap.add_argument("--ras_temperature", type=float, default=None,
                 help="Temperature for the RAS RESAMPLE only, decoupled from the pick. Default "
                      "None = inherit the pick's scaling, which is DISCONTINUOUS at T=0 "
@@ -216,6 +224,8 @@ for i in range(len(ds)):
                                  voice_top_k=a.voice_top_k, voice_top_p=a.voice_top_p,
                                  voice_ras_win=a.ras_win, voice_ras_tau=a.ras_tau,
                                  voice_ras_temperature=a.ras_temperature,
+                                 voice_eov_min_prob=a.eov_min_prob,
+                                 voice_eov_max_entropy=a.eov_max_entropy,
                                  decode_outputs=False, **_bi_kwargs)
     # FIRST UTTERANCE, not the flat trace. `voice_unit_id_trace` spans EVERY voice block the
     # call produced, so a model that ends one utterance and starts another (i.e. anything
