@@ -2367,6 +2367,75 @@ catastrophic, which is what the ear has always reported as "either works or it d
 ⚠️ LCS-recall ignores insertions: `gen_0026` scores a perfect 1.00 while audibly stuttering
 "in times in times past". These numbers rank configs; they do not describe quality.
 
+## Premature collapse is a COHERENCE failure, not a confident stop (2026-09-15, ESTABLISHED)
+
+Measured with `scripts_local/voice_eov_entropy_probe.py` at ck90000-ema, greedy + RAS w=10
+tau=0.1, n=96 (2 seeds). Distribution shape AT THE STEP EOV FIRED:
+
+| | collapsed (n=5) | normal (n=89) |
+|---|---|---|
+| entropy | **5.87 nats** | 2.59 |
+| p_max | **0.064** | 0.287 |
+| p(EOV) | **0.031** | 0.219 |
+| EOV was argmax | 3/5 | 63/89 |
+
+5.87 nats is ~350 effective candidates out of 6562. The model has NOT decided to stop -- it
+has lost the plot, everything is roughly equally unlikely, and EOV wins by accident. In 3 of
+5 it is "argmax" only in that degenerate sense. `max_p_eov_before_end` agrees: collapsed
+utterances never had a confident stop moment (median 0.021 vs 0.066).
+
+⚠️ **This RULES OUT min-p and top-a for this failure.** Their threshold is `min_p * p_max`,
+and p_max is itself tiny exactly when collapse happens (0.064), so the cutoff lands near
+0.006 and EOV at 0.031 passes. Every RELATIVE truncation scheme is blind here by
+construction. An ABSOLUTE floor is what discriminates.
+
+### The EOV confidence guard: collapses 7/96 -> 1/96 (2026-09-15, ESTABLISHED — but read the caveat)
+
+`voice_eov_min_prob` + `voice_eov_max_entropy` (committed 584c569, flags 229270c) ban EOV
+when p(EOV) is below the first AND entropy above the second. Threshold sizing on the n=5
+collapses: p(EOV)<0.10 alone blocks 5/5 but breaks 27/89 good stops; entropy>3.0 alone blocks
+5/5 and breaks 22/89; **both together block 5/5 and break 13/89**. They are not redundant --
+some good stops are low-confidence-but-sharp, others diffuse-but-confident, only collapses
+are both.
+
+A/B at ck90000-ema greedy, n=48 x 2 seeds (`eval_output/world_voice/`):
+
+| | LCS | WER | hyp/ref | caps | collapsed |
+|---|---|---|---|---|---|
+| baseline | 0.7519 | 0.2621 | 0.953 | 5/96 | **7/96** |
+| eov_guard (0.10 / 3.0) | 0.7667 | 0.2569 | 0.986 | 5/96 | **1/96** |
+
+Replicated in both seeds (4->1, 3->0). **Budget-caps unchanged at 5/96** — the guard does not
+convert collapses into runaways in aggregate. LCS +0.0147 / WER -0.0052 are INSIDE the seed
+spread (0.013-0.017) and are NOT claimed.
+
+⚠️ **The collapse count OVERSTATES the win — per-utterance inspection of seed 1's four
+collapses:**
+
+| idx | ref | baseline | guard | verdict |
+|---|---|---|---|---|
+| 34 | 109f | 16f "I hand turned a" | 109f "The announcement was re-scvering caft pi." | genuine rescue |
+| 31 | 183f | 26f "Indeed." | 250f "Indeed no You know I understand it..." | better content, ran to budget |
+| 22 | 202f | 56f "Gara Sutjiks, which he touched." | 144f "улиbnil-gil ... Aladhey Copus" | **longer GIBBERISH** |
+| 32 | 168f | 58f "Look, my old Duke!" | 44f "Nook, my lord." | still collapsed |
+
+One clean rescue, one partial, one lateral-into-garbage, one null. That is why the LCS gain is
+only +0.015. **The collapse metric counts LENGTH, and length is exactly what the guard
+manipulates**, so it reads closer to "did the intervention fire" than "did quality improve".
+
+**Mechanistic reading:** the guard removes the EXIT without restoring COHERENCE. idx 22 shows
+what that means -- with EOV blocked the model keeps generating from the flat distribution and
+emits multilingual junk. The underlying failure (losing the plot mid-utterance) is NOT a
+sampling problem and no sampler addresses it.
+
+**Status:** keep the guard (nothing got worse in aggregate; the tail improved), but thresholds
+0.10/3.0 are tuned on n=5 and are provisional. The MECHANISM is the durable part. Ear check on
+the A/B pairs is pending.
+
+**Generality:** reads only the current distribution -- no reference transcript, no text-length
+prior -- so unlike ASR-rerank and `voice_min_frame_ratio` (which multiplies `_n_text_tokens`,
+`world_model.py:1894`) it carries to instruction-following voice targets unchanged.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
