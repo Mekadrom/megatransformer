@@ -2644,6 +2644,67 @@ checkpoint: ck90000-ema       # ck68000 within ~1.4x noise; fewer caps
 # no EOV guard
 ```
 
+## logit_kl threshold curve: a KNEE at ~24 iterations, and a U-shaped seed spread (2026-09-16, ESTABLISHED)
+
+ck90000-ema, greedy, RAS w=10 tau=0.1, n=48 x 2 seeds
+(`scripts_local/world_voice_logitkl_threshold_sweep.sh`, `reports/thr_logitkl_*`).
+
+| threshold | depth | trunk compute | LCS | WER | seed spread | marginal LCS/iter |
+|---|---|---|---|---|---|---|
+| 1e-3 | 17.55 | 54.8% | 0.8711 | 0.1592 | 0.0016 | -- |
+| 5e-4 | 19.50 | 60.9% | 0.8849 | 0.1333 | 0.0007 | 0.00707 |
+| **1e-4** | 23.79 | **74.4%** | 0.9051 | 0.0989 | 0.0086 | 0.00472 |
+| 5e-5 | 25.53 | 79.8% | 0.9063 | 0.0989 | 0.0094 | 0.00067 |
+| 1e-5 | 28.30 | 88.4% | 0.8986 | 0.1011 | 0.0106 | -0.00278 |
+| **none** | 32.00 | 100% | **0.9103** | **0.0879** | 0.0012 | 0.00317 |
+
+**The curve rises steeply to ~24 iterations then plateaus.** Marginal return runs 0.005-0.007
+per iteration up to 1e-4, then collapses: 1e-4 / 5e-5 / 1e-5 span 0.8986-0.9063 with no trend,
+all inside their own ~0.01 spreads, and WER is pinned at 0.0989 across three of them. Anything
+at or tighter than 1e-4 is ONE FLAT REGION -- the threshold choice there is compute, not
+quality.
+
+### ⭐ Seed spread is U-SHAPED in depth
+
+**0.0016, 0.0007** (shallow) -> **0.0086, 0.0094, 0.0106** (plateau) -> **0.0012** (full depth).
+Six to eight times wider through the plateau, monotonic in, monotonic out.
+
+Reading: on the plateau the EXIT DECISION ITSELF is marginal -- positions sit near the
+threshold, so small trajectory differences flip whether a position stops at 23 or 28
+iterations, and realised depth varies run to run. Far from the boundary the decision is
+decisive; at `none` there is no decision at all. This is a property of adaptive exit, not of
+the model.
+
+**Consequence: `none` is not just nominally best, it is 8x more REPRODUCIBLE.** Any future
+comparison run under an adaptive criterion inherits ~0.01 of extra noise for free.
+
+### Practical
+
+- **`--exit_criteria none`** — best mean (0.9103), best WER (0.0879), 8x tighter spread. Use
+  for quality, and for any measurement that will be compared against another.
+- **`--exit_criteria logit_kl --exit_criteria_threshold 1e-4`** — 74% of trunk compute, ~0.005
+  LCS behind, 7x noisier. Use for throughput.
+- ⚠️ The trunk saving is NOT necessarily a wall-clock saving: `logit_kl` invokes the voice coda
+  (20.7M params) every recurrent iteration as its readout, against a 127.5M trunk. Plausibly
+  still a win, but UNPROFILED.
+
+### Reference: parameter counts (2026-09-16)
+
+| component | params |
+|---|---|
+| CosyVoice 2 decoder (frozen; the ASR ceiling's own renderer) | **133.4M** (flow 112.5M + HiFT 20.8M) |
+| world model checkpoint, total | 362.1M |
+| — text_feature_extractor (frozen SmolLM2) | 165.6M |
+| — recurrent trunk | 127.5M |
+| — text_generator | 30.4M |
+| — voice_generator (coda) | 20.7M |
+| — voice_feature_extractor | 14.6M |
+
+CosyVoice 2's own `llm.pt` (2.0 GB) is NOT loaded — the world model replaces it. So a 127.5M
+trunk substitutes for a ~0.5B speech LM and drives a 133M decoder. Relevant to
+[[project_leanness_and_open_data]]: unlike the 6.2B Z-Image departure on the image side, the
+voice stack is already lean, and a future own-decoder distillation target is 133M.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
