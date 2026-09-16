@@ -986,6 +986,9 @@ def main():
         voice_ras_win_in,
         voice_ras_tau_in,
         voice_prompt_sec_in,
+        exit_criteria_in,
+        exit_threshold_in,
+        trunk_iters_in,
     ):
         if not msg_text or not msg_text.strip():
             return "", [], [], "Empty prompt."
@@ -1091,6 +1094,44 @@ def main():
                         voice_ras_tau=args.voice_ras_tau,
                         voice_min_frame_ratio=args.voice_min_frame_ratio,
                     )
+                # RECURRENT EXIT CRITERION + TRUNK DEPTH, set from the UI.
+                # This is the single largest quality lever measured on world-voice: the
+                # shipped default `kl_divergence` compares post-norm ACTIVATIONS with
+                # F.kl_div, a signed quantity, so it exits by sign accident and freezes
+                # arbitrary positions mid-computation. Measured ck90000 greedy n=48 x2:
+                # LCS 0.7519 at that default vs 0.9103 at full depth ("none").
+                #
+                # Applied to the block rather than passed to generate() because the
+                # criterion is module state, and mean_thinking_steps is what every call
+                # site defaults to -- so setting it here covers text, voice AND image
+                # rather than only the image override that already existed.
+                #
+                # `mean_thinking_steps` is misleadingly named: the Poisson log-normal
+                # sampling it feeds is TRAINING-only. At eval, n_k_steps() returns it
+                # verbatim as (n, k=0) -- i.e. it is the hard ITERATION CAP, and the exit
+                # criterion decides whether to stop before reaching it. Confirmed by
+                # measurement: the `none` criterion runs at exactly 32.00 iterations.
+                try:
+                    from megatransformer.model import recurrent_criteria as _rc
+                    _blk = model.recurrent_block
+                    if not hasattr(_blk, "_ui_default_steps"):
+                        _blk._ui_default_steps = _blk.mean_thinking_steps
+                    _crit = str(exit_criteria_in or "none")
+                    _thr = float(exit_threshold_in or 0) or None
+                    if _crit == "none":
+                        _blk.exit_criteria = _rc.NoOpCriteria()
+                    elif _crit == "logit_kl":
+                        _blk.exit_criteria = _rc.LogitKLCriteria(_thr if _thr else 5e-4)
+                    elif _crit == "latent_diff":
+                        _blk.exit_criteria = _rc.LatentDiffCriteria(_thr if _thr else 0.03)
+                    elif _crit == "kl_divergence (legacy, broken)":
+                        _blk.exit_criteria = _rc.KLDivergenceCriteria(_thr if _thr else 1e-4)
+                    _it = int(trunk_iters_in or 0)
+                    _blk.mean_thinking_steps = _it if _it > 0 else _blk._ui_default_steps
+                except Exception as _e:
+                    print(f"[chat] exit-criteria setup failed ({type(_e).__name__}: {_e}); "
+                          f"leaving the model's own criterion in place", flush=True)
+
                 outputs = model.generate(
                     text_input_ids=prompt,
                     max_new_tokens=max_new_tokens,
@@ -1435,6 +1476,21 @@ def main():
                             label="image iteration override (0 = off, uses mean_thinking_steps + KL early-exit)",
                         )
                     with gr.Row():
+                        exit_criteria_dd = gr.Dropdown(
+                            choices=["none", "logit_kl", "latent_diff",
+                                     "kl_divergence (legacy, broken)"],
+                            value="none",
+                            label="recurrent exit criterion  (none = full depth, BEST measured)",
+                        )
+                        exit_threshold_num = gr.Number(
+                            value=0.0,
+                            label="exit threshold (0 = criterion default; logit_kl 5e-4, latent_diff 0.03)",
+                        )
+                        trunk_iters_num = gr.Number(
+                            value=0, precision=0,
+                            label="max trunk iterations (0 = model default; a CAP -- the criterion may stop earlier)",
+                        )
+                    with gr.Row():
                         image_steps_num = gr.Number(
                             value=(args.image_num_inference_steps or 0),
                             precision=0,
@@ -1523,6 +1579,7 @@ def main():
                 image_steps_num, image_sampler_dd,
                 voice_temp_slider, voice_ras_win_slider,
                 voice_ras_tau_slider, voice_prompt_sec_slider,
+                exit_criteria_dd, exit_threshold_num, trunk_iters_num,
             ],
             outputs=[out_text, out_gallery, out_audio_files, status_box],
         )
