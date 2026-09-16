@@ -2760,6 +2760,58 @@ error; it emits fluent maximum-length garbage. Our decode path never calls `forw
 so the flow/HiFT renderer is unaffected, but `inference_bistream` and the streaming paths
 would be. Fixed in `cosyvoice2_llm_baseline.cv2_generate_units` by passing a past+current mask.
 
+## ⭐⭐⭐ RARE/UNSEEN WORDS ARE THE REAL CEILING -- and it is DATA SCALE, not the paradigm (2026-09-16, ESTABLISHED)
+
+The ear reported that the model "cannot say archaeologists, meticulous, or sixteenth, even at
+32 or 64 iterations". Confirmed, quantified, and attributed.
+
+**Per-word recall by corpus frequency** (is the reference word present in the ASR transcript
+of the render; frequencies from the val transcripts themselves, n=48 per arm,
+`scripts_local/voice_word_difficulty_analysis.py`):
+
+| frequency bucket | cap 3 | cap 32 | full depth |
+|---|---|---|---|
+| very rare (<=2) | 0.415 | 0.613 | **0.623** |
+| rare (3-10) | 0.809 | 0.913 | 0.957 |
+| uncommon (11-50) | 0.913 | 0.930 | 0.965 |
+| common (51-500) | 0.951 | 0.938 | 0.965 |
+| very common (>500) | 0.968 | 0.964 | **0.984** |
+
+**Rarity is the dominant failure axis: 0.623 vs 0.984 at full depth, a 36-point gap** -- larger
+than any other effect measured in this direction.
+
+⚠️ **DEPTH CANNOT FIX IT.** Very rare words go 0.415 -> 0.623 from cap 3 to full depth and then
+PLATEAU. Common words barely move (0.968 -> 0.984). So the entire cap-3-to-full-depth gap is a
+RARE-WORD gap, and 64 iterations does not rescue an unseen word. This is a capability ceiling,
+not a compute one.
+
+**The specific words the ear flagged have ZERO training occurrences:** archaeologist 0,
+archaeologists 0, meticulous 0, chrysanthemum 0, catalogue 0, imitations 0, sixteenth 1 --
+against "the" 6645, "only" 186. The trunk has learned WORD->UNIT mappings, not compositional
+grapheme-to-phoneme: it can say what it has heard and cannot sound out what it has not.
+
+### ✅ NOT a paradigm limit: CosyVoice 2's LM says them all
+
+Same unit space, same frozen decoder, same prompt clip, same sentence. CosyVoice 2's own
+505.8M LM renders: *"The archaeologist meticulous cataloged distinguished 16th century
+chrysanthemum motifs from later imitations."* -- every word the world model fails.
+
+So discrete units + a semantic (non-phonetic) text representation are NOT the blocker, and a
+G2P front-end is not required. The difference is **training data scale: ~2,000 h vs
+CosyVoice 2's ~170,000 h (~85x)**. At that scale the same architecture evidently learns
+compositional phonetics rather than word-level memorisation.
+
+**Consequence for the data question** (see [[project_world_voice_data_scale]]): this is the
+first DIRECT evidence that more data buys a specific, nameable capability rather than a
+general loss improvement. It also revises the 2026-09-16 conclusion that the bistream eval
+turn was "not data-limited" -- that was about the eval-loss turn, and remains true, but the
+rare-word ceiling IS a data-scale limit and is the more consequential one.
+
+⚠️ Audio: `eval_output/world_voice/audio/caps_female/hard_words_cap{01..32}.wav` and
+`cv2_hard_words.wav`. The frequency table is built from the val transcripts, so "very rare"
+is the closest available proxy for "unseen" -- truly unseen words (recall ~0 by ear) are
+WORSE than the 0.623 shown.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)

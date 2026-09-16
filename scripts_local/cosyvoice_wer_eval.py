@@ -55,6 +55,11 @@ ap.add_argument("--exit_criteria", default=None,
                      "which is the numerically broken one). logit_kl is Huginn's real "
                      "criterion and needs a readout -- for voice that is wired in "
                      "generate() via _trunk_readout_voice.")
+ap.add_argument("--trunk_iters", type=int, default=None,
+                help="Hard CAP on recurrent iterations (sets recurrent_block.mean_thinking_steps, "
+                     "which at eval is returned verbatim by n_k_steps as the cap -- the Poisson "
+                     "sampling it feeds is training-only). The exit criterion may still stop "
+                     "earlier. None = model default.")
 ap.add_argument("--exit_criteria_threshold", type=float, default=None,
                 help="Threshold for --exit_criteria. logit_kl: 5e-4 (paper) / 1e-3 (ref).")
 ap.add_argument("--eov_min_prob", type=float, default=None,
@@ -145,6 +150,10 @@ if a.exit_criteria is not None:
         _blk.exit_criteria = _rc.KLDivergenceCriteria(_thr if _thr is not None else 1e-4)
     print(f"exit criterion overridden -> {a.exit_criteria} "
           f"(threshold {getattr(_blk.exit_criteria, 'threshold', None)})", flush=True)
+
+if a.trunk_iters is not None and a.trunk_iters > 0:
+    model.recurrent_block.mean_thinking_steps = int(a.trunk_iters)
+    print(f"trunk iteration cap -> {a.trunk_iters}", flush=True)
 
 ds = load_dataset(args, "val")
 coll = make_collator(K, a.voice_max_frames, special_token_base=sp_base,
