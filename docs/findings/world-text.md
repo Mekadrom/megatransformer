@@ -265,6 +265,69 @@ silently fixing it would change every historical eval that produced a number. Ve
 untouched by rebuilding the old block from `git show HEAD:` — same 16 iterations, zero
 output difference, identical trace.
 
+### Measure in OUTPUT space, not latent space — the divergence is the easy half (2026-09-15)
+Two choices get conflated and are independent:
+
+1. **Which space** the criterion measures in — the trunk latent, or the post-readout output.
+2. **Which divergence** on that space — KL on a simplex, relative L2 on a continuous space
+   (they are the same Bregman divergence under different generators: negative entropy vs
+   `1/2|x|^2`, so L2 is what KL becomes off the simplex).
+
+(2) is settled and cheap. **(1) is the one that decides quality, and output space wins.**
+
+Reasoning that "every readout is a deterministic function of the trunk state, so latent
+convergence implies output convergence" is true but WEAK: deterministic continuity gives
+convergence *in the limit*, and a thresholded criterion is not a limit statement. At a
+threshold what matters is the Jacobian. Per the `huginn-exit-criteria-sweep` session:
+
+> "not pointwise: the coda contains attention, so logits at position t depend on latents at
+> all positions <= t. And the map isn't an isometry — ‖Δlogits‖ ≈ ‖J·Δx‖, so a latent step
+> of a given size produces wildly different logit changes depending on its direction, then
+> softmax weights that by probability mass."
+
+Two distinct failures there: freezing token t's latent does not freeze token t's *output*
+while other positions still move, and equal-norm latent steps produce unequal output steps.
+Measured by that session on **huginn-0125**: relative-L2 in latent space is **~3x worse**
+than KL on post-coda logits. NOT replicated on this model — external, different scale
+(3.5B / 4096-wide core), recorded as the prior to beat, not as a local result.
+
+Practical reading: `latent_diff` is the correct *readout-free* criterion and the right
+fallback when a readout is unavailable or too expensive, but `logit_kl` should be expected
+to beat it wherever the readout is strongly expansive and nonlinear — which is exactly the
+text case (768 -> 49k-152k, then a softmax).
+
+### For a continuous output space, measure the CONDITIONING, not a sample (2026-09-15)
+Relevant once world-image goes autoregressive (see [[project_zimage_t4_ar]]) and image
+positions want an exit criterion after all — the "single-shot, so no latency to amortise"
+argument only holds for one-shot gen queries.
+
+- **Do not quantise** the Qwen features or the flow-head conditioning to manufacture a
+  distribution. That is the same error the original `kl_divergence` made and the reason
+  `latent_kl` was dropped: inventing structure to fit the tool.
+- **Do not diffuse per iteration.** The flow head maps `(conditioning, noise, t) ->
+  velocity`, so with the conditioning fixed the induced output distribution is fixed. The
+  conditioning is a *sufficient statistic* for what a sample-space criterion would measure.
+  Sampling to check convergence measures the same quantity through an expensive stochastic
+  channel and adds sampling noise to the test.
+- **Do** apply the output-space rule above: relative L2 on the **Q-Former adapter output**
+  (the flow-head conditioning) — the last deterministic representation before the generative
+  head, which is the structural analogue of where `logit_kl` measures for text, with the
+  divergence that matches a continuous space. One adapter forward per iteration, no diffusion.
+
+### The recurrent block receives no timestep (2026-09-15)
+`_run_iteration` passes `iteration` only to `kv_cache.get_layer_at_iteration(...)` for cache
+slot selection; the blocks themselves get `(h, attention_mask, kv_cache, position_offset,
+use_cache, additive_attn_bias, position_ids)` and no `t`. The trunk is therefore an
+**autonomous** (time-invariant) iterated map, `dx/dtau = f(x)`.
+
+Consequence for the "recurrent loop as sampler" direction ([[project_recurrent_loop_as_sampler]]):
+flow matching needs a time-DEPENDENT velocity field `v(x, t)`. An autonomous field cannot
+represent most probability paths (its trajectories cannot cross in state space), so
+timestep conditioning into the recurrent block — AdaLN-style, which the image DiT already
+does and is a pattern to copy — is a hard prerequisite, not a refinement.
+`initialize_thinking_state` already supports noise init (`"normal"` / `"embed"`), so that
+half is in place.
+
 ---
 
 ## OPEN
