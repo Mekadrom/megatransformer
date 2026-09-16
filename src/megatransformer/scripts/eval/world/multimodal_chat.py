@@ -186,9 +186,14 @@ def parse_args():
     p.add_argument("--mrope_scale_side", type=str, default=None, choices=["voice", "text", "off"],
                    help="Which stream absorbs the rate. Carries no weights, so it cannot be "
                         "detected from the checkpoint; the loader hard-fails without it.")
-    p.add_argument("--voice_temperature", type=float, default=0.6,
-                   help="Voice unit sampling temperature. 0 = greedy, which on this model "
-                        "degenerates (~99%% adjacent repeats) UNLESS --voice_ras_win > 0.")
+    p.add_argument("--voice_temperature", type=float, default=0.0,
+                   help="Voice unit sampling temperature. DEFAULT 0.0 (greedy) as of "
+                        "2026-09-16: greedy is the best-measured sampler at every checkpoint "
+                        "and every exit criterion tested (ck90000 n=48 x2 -- greedy 0.8849 "
+                        "LCS vs T=0.6+ras_temp 0.8619 vs T=0.7 0.8384). Greedy degenerates "
+                        "(~99%% adjacent repeats) WITHOUT --voice_ras_win > 0, which defaults "
+                        "to 10; at ras_tau=0 with no RAS it collapses completely (LCS 0.0, "
+                        "empty transcripts). Do not set this to 0 while disabling RAS.")
     p.add_argument("--voice_ras_win", type=int, default=10,
                    help="Repetition-aware sampling window. Default 10 (CosyVoice 2's value): "
                         "the model's free-running argmax is 'repeat the previous unit' almost "
@@ -1438,7 +1443,7 @@ def main():
                         voice_temp_slider = gr.Slider(
                             minimum=0.0, maximum=1.5, step=0.05,
                             value=args.voice_temperature,
-                            label="voice temperature (0 = greedy; 0.6 fewest cutoffs)",
+                            label="voice temperature (0 = greedy, BEST measured; needs RAS win > 0)",
                         )
                         voice_ras_win_slider = gr.Slider(
                             minimum=0, maximum=40, step=1, value=args.voice_ras_win,
