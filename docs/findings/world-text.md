@@ -214,6 +214,57 @@ and `exit_criteria=None` is not currently accepted (`__init__` raises on anythin
 
 **Relay to world-voice and world-image** — measured here, but it is not a world-text finding.
 
+### `logit_kl` implements Huginn's criterion exactly (2026-09-15, commit e4074ea)
+Ported from `tomg-group-umd/huginn-0125`, `raven_modeling_minimal.py`, `KLExitEvaluator`.
+The three details that were wrong in the legacy version and are right here:
+
+1. **The readout runs every iteration.** Huginn's `predict_from_latents` is `ln_f` +
+   `lm_head`, so the comparison is between post-head *distributions*. The analogue here is
+   the text coda, passed into `forward()` as `readout` with `use_cache=False`.
+2. **`KL(prev ‖ current)`.** `F.kl_div(input, target, log_target=True)` is
+   `exp(target) * (target - input)`; the reference passes current as `input` and previous
+   as `target`. Non-negative by construction.
+3. **`prev_log_probs` starts UNIFORM**, not at the first step's output — which is what
+   guarantees one real iteration before any exit is possible.
+
+Threshold: paper says 5e-4 ("if this divergence falls below 5x10^-4, we stop iterating");
+the reference code's `"auto"` is 1e-3. Default here is 5e-4.
+
+Verified: uniform init matches `log(1/V)` exactly; iteration-1 values all >= 0; identical
+logits two steps running give exactly 0.0; on a fresh `small_sum`, `none` runs the full 32
+and legacy `kl_divergence` runs 16-20 with a trace that goes negative.
+
+⚠️ **The iteration COUNT is not yet validated on a trained model.** On random init the
+criterion exits at iteration 2 (values 4.247e-02 then 6.642e-06 against a 5e-4 threshold) —
+correct behaviour, because an untrained model's output distribution is near-uniform and
+barely moves between iterations, so it genuinely has converged. It means a random-init test
+can confirm the *math* but says nothing about whether 5e-4 is the right threshold here.
+**Settled by:** running `logit_kl` vs `none` on a real checkpoint and reading the iteration
+histogram. Huginn's threshold was tuned for a 3.5B model with a 4096-wide recurrent core
+and `padded_vocab_size` 65536; nothing guarantees it transfers to a 127.5M trunk.
+
+Deviation from the reference, deliberate: Huginn scores only the last position
+(`logits[:, -1, :]`) because its adaptive compute runs during single-token generation.
+`forward()` here processes whole sequences, so the quantity is computed per position,
+(B, T). At seq_len 1 — generation, Huginn's actual regime — they are identical.
+
+Scoping decision: `world_model` passes `converge_eligible = (modality_map == MODALITY_TEXT)`,
+so only text positions can exit early. A text head's distribution is meaningless at
+voice/audio/image positions; those run the full budget. Also note the readout is *exact*
+only in pretrained/trainable-head mode, where the coda is stateless (norm -> MLP -> head).
+With a from-scratch transformer coda it self-attends across the interleaved sequence, which
+training never does, so the scored distribution is an approximation. It never contributes to
+the output either way.
+
+Cost: `logit_kl` holds (B, T, V) fp32 log-probs and runs the readout once per iteration —
+negligible at seq_len 1, but ~5 GB at batch 8 x seq 1024 x vocab 152k. Use small eval
+batches, or `none`, for full-sequence evaluation.
+
+The broken `kl_divergence` is left in place **and left as the default** deliberately:
+silently fixing it would change every historical eval that produced a number. Verified
+untouched by rebuilding the old block from `git show HEAD:` — same 16 iterations, zero
+output difference, identical trace.
+
 ---
 
 ## OPEN
