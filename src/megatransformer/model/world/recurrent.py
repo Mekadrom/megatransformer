@@ -1,5 +1,5 @@
 import math
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -68,10 +68,20 @@ class MegatransformerRecurrentBlock(nn.Module):
             self.post_projection_norm = RMSNorm(out_dim)
         
         if self.exit_criteria == 'kl_divergence':
+            # LEGACY and numerically broken (signed, not a KL -- see recurrent_criteria).
+            # Left as the default ONLY so historical eval numbers stay reproducible.
             self.exit_criteria = recurrent_criteria.KLDivergenceCriteria(self.exit_criteria_threshold)
+        elif self.exit_criteria == 'logit_kl':
+            # Huginn's actual criterion: KL between successive POST-READOUT distributions.
+            # Needs a readout (latent -> logits) passed to forward(); without one it cannot
+            # fire and the trunk runs its full budget.
+            self.exit_criteria = recurrent_criteria.LogitKLCriteria(self.exit_criteria_threshold)
+        elif self.exit_criteria in ('none', None):
+            self.exit_criteria = recurrent_criteria.NoOpCriteria()
         else:
-            # todo: implement other exit criteria
-            raise ValueError(f"Invalid exit criteria: {self.exit_criteria}")
+            raise ValueError(
+                f"Invalid exit criteria: {self.exit_criteria!r} "
+                "(expected 'logit_kl', 'none', or legacy 'kl_divergence')")
         
         self.step = 0
         self.track_iteration_stats = False
@@ -309,6 +319,8 @@ class MegatransformerRecurrentBlock(nn.Module):
         max_iterations_override: Optional[int] = None,
         additive_attn_bias: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        readout: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        converge_eligible: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache], int, List[float]]:
         """
         Forward pass through recurrent block with optional KV caching.
@@ -328,6 +340,17 @@ class MegatransformerRecurrentBlock(nn.Module):
             kv_cache: Optional RecurrentKVCache for efficient generation
             position_offset: Position offset for RoPE (for cached generation)
             use_cache: Whether to use and update KV cache
+            readout: Optional latent -> logits map, (B, T, d_model) -> (B, T, V).
+                Required by `exit_criteria='logit_kl'`, which compares successive OUTPUT
+                distributions (Huginn's criterion) rather than latents. Must be
+                side-effect free -- in particular it must NOT write a KV cache, since it
+                is called once per iteration purely to score convergence. Ignored by the
+                latent-space criteria.
+            converge_eligible: Optional (B, T) bool mask of positions allowed to exit
+                early. Positions that are False always run the full iteration budget.
+                Used to restrict `logit_kl` to text positions, where a text readout is
+                the meaningful one; media positions have no comparable output
+                distribution and should not be scored by a text head.
 
         Returns:
             thought_states: Output thought states, shape (batch, seq_len, d_model)
@@ -361,6 +384,16 @@ class MegatransformerRecurrentBlock(nn.Module):
                 x_0.shape[0], x_0.shape[1],
                 dtype=torch.bool, device=x_0.device,
             )
+
+        # logit_kl needs a readout and carries per-call state (the previous step's
+        # log-probs). State is local to this call, not on the module, so concurrent /
+        # nested forwards cannot corrupt each other.
+        use_logit_kl = (
+            converged is not None
+            and getattr(self.exit_criteria, 'needs_readout', False)
+            and readout is not None
+        )
+        prev_log_probs: Optional[torch.Tensor] = None
 
         # Initialize or use existing cache
         new_kv_cache = kv_cache if use_cache and kv_cache is not None else None
@@ -400,8 +433,18 @@ class MegatransformerRecurrentBlock(nn.Module):
                         position_ids=position_ids,
                     )
 
+                    newly_converged = None
                     kl_per_token = None
-                    if track_kl or iteration_stats is not None:
+                    if use_logit_kl:
+                        # Huginn: apply the readout every iteration and compare the
+                        # resulting distributions. kl_per_token here is a REAL KL.
+                        logits = readout(new_thought)
+                        if prev_log_probs is None:
+                            prev_log_probs = self.exit_criteria.init_state(logits)
+                        newly_converged, prev_log_probs, kl_per_token = self.exit_criteria.step(
+                            prev_log_probs, logits,
+                        )
+                    elif track_kl or iteration_stats is not None:
                         kl_per_token = F.kl_div(
                             last_thought_state, new_thought,
                             reduction="none", log_target=True,
@@ -410,8 +453,12 @@ class MegatransformerRecurrentBlock(nn.Module):
                         kl_per_iteration.append(kl_per_token.mean().item())
 
                     # Per-token freeze: only update non-converged tokens
-                    if converged is not None and hasattr(self.exit_criteria, 'converged_mask'):
-                        newly_converged = self.exit_criteria.converged_mask(last_thought_state, new_thought)
+                    if converged is not None and (newly_converged is not None
+                                                  or hasattr(self.exit_criteria, 'converged_mask')):
+                        if newly_converged is None:
+                            newly_converged = self.exit_criteria.converged_mask(last_thought_state, new_thought)
+                        if converge_eligible is not None:
+                            newly_converged = newly_converged & converge_eligible
                         converged = converged | newly_converged
                         thought_states = torch.where(converged.unsqueeze(-1), last_thought_state, new_thought)
                         if converged.all():

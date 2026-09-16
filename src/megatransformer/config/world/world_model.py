@@ -80,8 +80,24 @@ class MegaTransformerRecurrentConfig:
     block_init_gain: float = 1.0  # Xavier gain for recurrent block weights (1.0 = standard Xavier; depth_scaled_init handles residual stability)
     iteration_norm: str = "none"  # "none", "pre_projection", or "post_projection"
     share_block_weights: bool = False  # If True, all recurrent blocks share weights (deeper 1-block)
+    # Adaptive-compute exit for the recurrent trunk. EVAL/GENERATION ONLY -- training
+    # always uses the stochastic Poisson-log-normal step sampler, so this never affects
+    # trained weights.
+    #   "logit_kl"      Huginn's criterion: KL between successive POST-READOUT output
+    #                   distributions, uniform-initialised, threshold 5e-4 in the paper.
+    #                   Needs a readout; world_model supplies the text coda and restricts
+    #                   early exit to text positions.
+    #   "none"          never exit -- always run the full `mean_thinking_steps` budget.
+    #                   This is the control arm, and the depth the model trained at.
+    #   "kl_divergence" LEGACY DEFAULT, NUMERICALLY BROKEN. Applies F.kl_div to raw
+    #                   latents, which is not a KL; the value is signed and the `< thr`
+    #                   test passes on every negative, freezing ~half the tokens per
+    #                   iteration by sign accident (measured: 17 of 32 iterations on a
+    #                   fresh small_sum). Kept as the default ONLY so historical eval
+    #                   numbers stay reproducible -- see docs/findings/world-text.md.
+    #                   Do not use it for new evaluation.
     exit_criteria: str = "kl_divergence"
-    exit_criteria_threshold: float = 1e-4
+    exit_criteria_threshold: float = 1e-4  # note: logit_kl wants 5e-4 (paper) / 1e-3 (ref code)
     lockstep_n: bool = False
     lockstep_k: bool = False
 

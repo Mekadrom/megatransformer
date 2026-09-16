@@ -492,6 +492,26 @@ class MegaTransformerWorldModel(nn.Module):
         """
         self.voice_codebook = None if centroids is None else centroids.float()
 
+    def _trunk_readout(self, latents: torch.Tensor) -> torch.Tensor:
+        """Latent -> text logits, for the `logit_kl` exit criterion only.
+
+        Huginn's criterion compares successive POST-READOUT distributions, so the trunk
+        needs a way to turn a thought state into logits. Its `predict_from_latents` is
+        `ln_f` + `lm_head`; the analogue here is the text coda.
+
+        MUST stay side-effect free: `use_cache=False` and `targets=None`, so no KV cache is
+        written and no loss is computed. It is called once per iteration purely to score
+        convergence and its output is discarded.
+
+        Exactness caveat: in pretrained/trainable-head mode the text coda is STATELESS
+        (norm -> MLP -> head), so this is exactly the distribution the model would emit.
+        With a from-scratch transformer coda it self-attends across the interleaved
+        sequence, which training never does (the uninterleaver hands it text only), so the
+        scored distribution is an approximation of the real one. The criterion is a
+        convergence heuristic either way -- this readout never contributes to the output.
+        """
+        return self.text_generator(latents, targets=None, use_cache=False)["logits"]
+
     def _mrope_ids(self, modality_map):
         """(batch, seq, 2) global+local coordinates for M-RoPE, or None when it is off.
 
@@ -820,6 +840,11 @@ class MegaTransformerWorldModel(nn.Module):
             attention_mask=attn_mask,  # True for attend, False for padding
             additive_attn_bias=trunk_voice_bias,
             position_ids=self._mrope_ids(modality_map),
+            readout=self._trunk_readout,
+            # Only text positions may exit early: `_trunk_readout` is a TEXT head, so its
+            # distribution is meaningless at voice/audio/image positions. Those run the
+            # full iteration budget rather than being scored by the wrong head.
+            converge_eligible=(modality_map == MODALITY_TEXT),
         )
 
         # print("\tInputs to uninterleaver:")
