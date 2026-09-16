@@ -1099,6 +1099,19 @@ def main():
                     top_k=top_k,
                     audio_token_budget=audio_budget,
                     voice_token_budget=voice_budget,
+                    # SUPPRESS THE BISTREAM FILL TOKEN. A bistream checkpoint has a K+2-wide
+                    # unit head, and generate() only bans the fill id while the current chunk
+                    # is shorter than max(1, voice_min_chunk_frames) -- i.e. with the default
+                    # 0, only at the very first frame. From frame 2 on, a spurious fill can be
+                    # sampled during this UNISTREAM generation, and generate() reads a fill
+                    # with no further transcript as end-of-utterance: the clip stops
+                    # mid-sentence for no visible reason.
+                    #
+                    # The UI always generates unistream (it has no chunk plan and no
+                    # continuation transcript), so the fill is never legitimate here. Setting
+                    # the floor to the whole budget bans it for the entire utterance. Inert on
+                    # a unistream checkpoint, whose head has no fill id at all.
+                    voice_min_chunk_frames=(voice_budget or 0) + 1,
                     audio_inputs=audio_inputs,
                     audio_lengths=audio_lengths,
                     voice_inputs=voice_inputs,
