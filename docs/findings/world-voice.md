@@ -2866,6 +2866,36 @@ quality has saturated. A hard cap reaches an operating point the criterion struc
 0.0023 at cap 16), matching the threshold sweep: near the knee, small trajectory differences
 change how much computation positions actually receive.
 
+## The 10-second limit is LEARNED EOV, not the budget -- long text TRUNCATES (2026-09-16, ESTABLISHED)
+
+Raising `voice_token_budget` does nothing. ck90000-ema, greedy + RAS, cap 8, prompt-conditioned,
+a 4-sentence text of 69 SmolLM2 tokens (implying ~518 frames / 20.7 s at the measured
+7.5 frames/token):
+
+| budget | units produced | duration | hit budget? |
+|---|---|---|---|
+| 250 | 185 | 7.40 s | no |
+| 500 | **185** | **7.40 s** | no |
+
+**Byte-identical output.** The model emits EOV at 185 frames on its own and never approaches
+either ceiling. The transcript is only the FIRST of four sentences -- roughly 60% of the text
+is silently dropped.
+
+**Cause: the training distribution is strictly <=10 s.** The preprocessing config records
+`too_long: 2,769,935` utterances EXCLUDED for exceeding `--voice_max_seconds 10.0`. The model
+has never seen a longer target and has learned to stop within that distribution regardless of
+how much room it is given.
+
+**The long-text failure mode is TRUNCATION, not degeneration.** It does not ramble or fall
+apart past 250 frames -- it stops early and omits content. Safer, but it means the
+text->length relationship (r~0.76) breaks down above ~10 s: a 20.7 s text produced 7.4 s.
+
+⚠️ **Consequence for the instruction-following regime**: short answers are fine, but any
+paragraph-length response will be cut off at ~10 s no matter the settings. Long-form synthesis
+needs either sentence-level chunking at the application layer, or retraining with longer
+targets (which means re-preprocessing -- 2.77M utterances were discarded by the 10 s cap, so
+the data exists).
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
