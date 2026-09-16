@@ -2554,6 +2554,74 @@ in the RAS resample. Also expected to survive: tau=0 causing total degenerate co
 positions**, so voice now runs full budget in eval. Eval losses from before that commit and
 after it are NOT comparable, and every checkpoint-selection decision to date predates it.
 
+## RE-MEASUREMENT of the 2026-09-15 findings under a working criterion (2026-09-16)
+
+Full campaign, ck90000-ema unless stated, n=48 x 2 seeds, `logit_kl` 5e-4 unless stated.
+Runner: `scripts_local/world_voice_recheck_campaign.sh`. Results:
+`eval_output/world_voice/{reports,audio,logs}/`.
+
+### Transfer scorecard
+
+| 2026-09-15 conclusion | verdict under a working criterion |
+|---|---|
+| sampling ranking greedy > T=0.6+rt1.0 > T=0.7 | **SURVIVES** — identical order, similar gaps |
+| bistream vs unistream on CONTENT = null | **SURVIVES** — +0.011 vs ~0.011 spread |
+| bistream buys TERMINATION robustness | **STRENGTHENED** — 0/96 caps vs uni 2/96 |
+| ck90000 > ck68000 | **WEAKENED** — +0.046 -> +0.016, ~1.4x spread |
+| seed variance dominates; >=2 seeds required | **DEAD** — spread was 24x inflated by the bug |
+| premature collapse needs an EOV guard | **DEAD** — 0/96 collapse without it; guard neutral |
+| best config LCS 0.7519 | **SUPERSEDED** — 0.9103 at full depth |
+
+### Sampling (2 seeds, n=96)
+
+| sampler | LCS | WER | caps | spread | LCS under the broken criterion |
+|---|---|---|---|---|---|
+| **greedy** | **0.8849** | **0.1333** | 6/96 | 0.0007 | 0.7519 |
+| T=0.6+rt1.0 | 0.8619 | 0.1626 | 2/96 | 0.0110 | 0.7103 |
+| T=0.7 | 0.8384 | 0.1868 | 4/96 | 0.0031 | 0.6933 |
+
+Same ordering as under the broken criterion, so the criterion degraded all three roughly
+uniformly rather than interacting with temperature. Greedy's margins are now 20-30x the seed
+spread instead of 1.4x. The "greedy fails harder but occasionally nails it" tradeoff the ear
+reported is GONE: all three collapse 0/96, so greedy simply wins.
+
+### Checkpoints (2 seeds, n=96, greedy)
+
+| checkpoint | LCS | WER | caps | spread |
+|---|---|---|---|---|
+| uni ck90000 | 0.8849 | 0.1333 | 6/96 | 0.0007 |
+| uni ck68000 | 0.8690 | 0.1511 | 2/96 | 0.0113 |
+| bi ck68000 | 0.8581 | 0.1598 | **0/96** | 0.0107 |
+
+⚠️ **ck90000 over ck68000 is now MARGINAL** (+0.016 against 0.011). On 2026-09-15 it was
++0.046 at ~2x spread and was called real; most of that gap was the broken criterion hurting
+ck68000 more. 22k extra steps bought little, and ck68000 has fewer budget-caps.
+
+**Bistream vs unistream at matched step 68000 is STILL A NULL** (+0.011, spreads ~0.011),
+replicating the 2026-09-15 paired result in a completely different regime. Bistream's
+termination edge shows again: 0/96 caps, the best of any arm.
+
+### EOV confidence guard: NEUTRAL, not needed
+
+| arm | LCS | WER | caps | spread |
+|---|---|---|---|---|
+| guard OFF | 0.8849 | 0.1333 | 6/96 | 0.0007 |
+| guard ON (0.10/3.0) | 0.8946 | 0.1241 | 3/96 | 0.0109 |
+
++0.0097 against a 0.0109 spread — inside noise. Seed 1 alone showed +0.0155 and was briefly
+read as a real benefit; seed 2 gave ~+0.004. **Keep the flag, do not enable it by default.**
+Full depth with NO guard beats both (0.9103 / 0.0879 / 1 cap per 96).
+
+### RECOMMENDED CONFIG (2026-09-16)
+
+```
+--exit_criteria none          # full 32 iterations; the depth the model was trained at
+--voice_temperature 0.0       # greedy
+--ras_win 10 --ras_tau 0.1    # RAS is load-bearing: tau=0 is total collapse
+checkpoint: ck90000-ema       # ck68000 within ~1.4x noise; fewer caps
+# no EOV guard
+```
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
