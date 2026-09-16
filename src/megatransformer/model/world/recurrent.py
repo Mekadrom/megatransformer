@@ -1,5 +1,5 @@
 import math
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -322,8 +322,8 @@ class MegatransformerRecurrentBlock(nn.Module):
         max_iterations_override: Optional[int] = None,
         additive_attn_bias: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        readout: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        converge_eligible: Optional[torch.Tensor] = None,
+        readout: Optional[Union[Callable[[torch.Tensor], torch.Tensor], Dict[str, Callable]]] = None,
+        converge_eligible: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, Optional[RecurrentKVCache], int, List[float]]:
         """
         Forward pass through recurrent block with optional KV caching.
@@ -343,17 +343,28 @@ class MegatransformerRecurrentBlock(nn.Module):
             kv_cache: Optional RecurrentKVCache for efficient generation
             position_offset: Position offset for RoPE (for cached generation)
             use_cache: Whether to use and update KV cache
-            readout: Optional latent -> logits map, (B, T, d_model) -> (B, T, V).
-                Required by `exit_criteria='logit_kl'`, which compares successive OUTPUT
-                distributions (Huginn's criterion) rather than latents. Must be
-                side-effect free -- in particular it must NOT write a KV cache, since it
-                is called once per iteration purely to score convergence. Ignored by the
-                latent-space criteria.
-            converge_eligible: Optional (B, T) bool mask of positions allowed to exit
-                early. Positions that are False always run the full iteration budget.
-                Used to restrict `logit_kl` to text positions, where a text readout is
-                the meaningful one; media positions have no comparable output
-                distribution and should not be scored by a text head.
+            readout: latent -> logits map, (B, T, d_model) -> (B, T, V). Required by
+                `exit_criteria='logit_kl'`, which compares successive OUTPUT distributions
+                (Huginn's criterion) rather than latents. Must be side-effect free -- in
+                particular it must not leave a KV cache mutated, since it is called once
+                per iteration purely to score convergence. Ignored by latent-space criteria.
+
+                May also be a **dict of {modality_key: callable}**, in which case each key
+                is scored SEPARATELY, with its own criterion state. This is the form to use
+                whenever more than one modality is being generated, because the heads have
+                different vocabularies -- text is ~49k-152k wide, voice `unit_vocab_size` is
+                ~6.5k -- so one (B, T, V) tensor cannot represent both, and scoring a voice
+                latent with a text head compares the wrong distribution entirely. A callable
+                may return None (nothing eligible for it this step); that key is skipped.
+            converge_eligible: (B, T) bool mask of positions allowed to exit early.
+                Positions that are False always run the full iteration budget. With a dict
+                `readout`, pass a matching dict of masks -- key k's mask selects the
+                positions that key is allowed to decide. **Masks across keys must be
+                disjoint**: a position scored by two heads would have its exit decided by
+                OR (either head may retire it) while its logged value is the max, which is
+                inconsistent. A single mask alongside a dict readout is broadcast to all
+                keys. Media positions with no comparable output distribution should simply
+                be left out of every mask; they then run the full budget.
 
         Returns:
             thought_states: Output thought states, shape (batch, seq_len, d_model)
@@ -391,12 +402,36 @@ class MegatransformerRecurrentBlock(nn.Module):
         # logit_kl needs a readout and carries per-call state (the previous step's
         # log-probs). State is local to this call, not on the module, so concurrent /
         # nested forwards cannot corrupt each other.
+        # Normalise readout/eligibility to dict form so there is ONE code path. A bare
+        # callable becomes a single-key dict; a bare mask is broadcast to every key.
+        readout_map: Dict[str, Callable] = {}
+        eligible_map: Dict[str, Optional[torch.Tensor]] = {}
+        if readout is not None:
+            readout_map = readout if isinstance(readout, dict) else {"_default": readout}
+            if isinstance(converge_eligible, dict):
+                eligible_map = {k: converge_eligible.get(k) for k in readout_map}
+            else:
+                eligible_map = {k: converge_eligible for k in readout_map}
+
+        # Union of every key's mask, for the latent-space criteria (which have no notion
+        # of a per-head readout and just need to know which positions may retire at all).
+        eligible_any: Optional[torch.Tensor] = None
+        if isinstance(converge_eligible, dict):
+            for _m in converge_eligible.values():
+                if _m is None:
+                    continue
+                eligible_any = _m if eligible_any is None else (eligible_any | _m)
+        else:
+            eligible_any = converge_eligible
+
         use_logit_kl = (
             converged is not None
             and getattr(self.exit_criteria, 'needs_readout', False)
-            and readout is not None
+            and bool(readout_map)
         )
-        prev_log_probs: Optional[torch.Tensor] = None
+        # Per-key criterion state (the previous step's log-probs), local to this call so
+        # nested or concurrent forwards cannot corrupt each other.
+        prev_log_probs: Dict[str, torch.Tensor] = {}
 
         # Initialize or use existing cache
         new_kv_cache = kv_cache if use_cache and kv_cache is not None else None
@@ -440,13 +475,29 @@ class MegatransformerRecurrentBlock(nn.Module):
                     kl_per_token = None
                     if use_logit_kl:
                         # Huginn: apply the readout every iteration and compare the
-                        # resulting distributions. kl_per_token here is a REAL KL.
-                        logits = readout(new_thought)
-                        if prev_log_probs is None:
-                            prev_log_probs = self.exit_criteria.init_state(logits)
-                        newly_converged, prev_log_probs, kl_per_token = self.exit_criteria.step(
-                            prev_log_probs, logits,
-                        )
+                        # resulting distributions. kl_per_token here is a REAL KL. Each
+                        # modality key is scored by its OWN head in its OWN vocabulary and
+                        # keeps its own state; the per-position results are then merged.
+                        for _key, _fn in readout_map.items():
+                            _elig = eligible_map.get(_key)
+                            if _elig is not None and not bool(_elig.any()):
+                                continue
+                            _logits = _fn(new_thought)
+                            if _logits is None:
+                                continue
+                            if _key not in prev_log_probs:
+                                prev_log_probs[_key] = self.exit_criteria.init_state(_logits)
+                            _m, prev_log_probs[_key], _v = self.exit_criteria.step(
+                                prev_log_probs[_key], _logits,
+                            )
+                            if _elig is not None:
+                                # Zero (not mask-out) so the merge below is a plain max:
+                                # KL is non-negative, so a key that does not own a position
+                                # contributes 0 and the owner's value survives.
+                                _m = _m & _elig
+                                _v = torch.where(_elig, _v, torch.zeros_like(_v))
+                            newly_converged = _m if newly_converged is None else (newly_converged | _m)
+                            kl_per_token = _v if kl_per_token is None else torch.maximum(kl_per_token, _v)
                     elif hasattr(self.exit_criteria, 'exit_values'):
                         # Readout-free criteria that expose their own well-defined score.
                         # The logged trace is THAT score, so kl_per_iteration stops
@@ -466,8 +517,8 @@ class MegatransformerRecurrentBlock(nn.Module):
                                                   or hasattr(self.exit_criteria, 'converged_mask')):
                         if newly_converged is None:
                             newly_converged = self.exit_criteria.converged_mask(last_thought_state, new_thought)
-                        if converge_eligible is not None:
-                            newly_converged = newly_converged & converge_eligible
+                        if eligible_any is not None:
+                            newly_converged = newly_converged & eligible_any
                         converged = converged | newly_converged
                         thought_states = torch.where(converged.unsqueeze(-1), last_thought_state, new_thought)
                         if converged.all():

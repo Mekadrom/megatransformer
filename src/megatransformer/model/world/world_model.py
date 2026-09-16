@@ -29,6 +29,7 @@ from megatransformer.model.world.kv_cache import RecurrentKVCache
 from megatransformer.model.world.recurrent import MegatransformerRecurrentBlock
 from megatransformer.model.world.token_alignment import (
     MODALITY_TEXT,
+    MODALITY_VOICE,
     TokenInterleaver,
     TokenUninterleaver,
     build_all_voice_attn_bias,
@@ -530,6 +531,64 @@ class MegaTransformerWorldModel(nn.Module):
                     c.key_cache, c.value_cache = k, v
         return out.get("voice_unit_logits")
 
+    def _exit_readouts(self) -> dict:
+        """{modality_key: readout} for `logit_kl` in forward().
+
+        forward() has no KV caches (use_cache=False throughout), so both heads can be
+        called plainly. Voice is included only when the DISCRETE path exists -- the
+        criterion needs a categorical distribution, and `voice_unit_logits` is only
+        produced when a codebook is configured.
+        """
+        outs = {"text": self._trunk_readout}
+        if self.voice_generator is not None and getattr(self, "voice_codebook", None) is not None:
+            outs["voice"] = lambda h: self.voice_generator(
+                h, kv_caches=None, position_offset=0, use_cache=False,
+            ).get("voice_unit_logits")
+        return outs
+
+    def _exit_eligibility(self, modality_map: torch.Tensor) -> dict:
+        """Disjoint per-key position masks, matching `_exit_readouts()` keys."""
+        elig = {"text": modality_map == MODALITY_TEXT}
+        if self.voice_generator is not None and getattr(self, "voice_codebook", None) is not None:
+            elig["voice"] = modality_map == MODALITY_VOICE
+        return elig
+
+    def _trunk_readout_text_cached(self, latents: torch.Tensor,
+                                   kv_caches: Optional[list] = None,
+                                   position_offset: int = 0) -> Optional[torch.Tensor]:
+        """Latent -> TEXT logits during GENERATION, where the coda may be KV-cached.
+
+        `_trunk_readout` below is the forward() version and passes `use_cache=False` with
+        no caches, which is exact there because forward() has none. In generate() the text
+        coda carries `text_coda_kv_caches`, and a from-scratch (transformer) coda attends
+        over them -- so scoring with `kv_caches=None` would compare a distribution with no
+        history, which is not what the model would emit.
+
+        Same snapshot/restore as `_trunk_readout_voice`, and for the same reason:
+        `KVCache.update()` REBINDS (`self.key_cache = torch.cat([...])`) rather than
+        mutating in place, so a readout called once per recurrent iteration would append a
+        phantom entry per iteration -- at 32 iterations the cache grows 32x faster than the
+        text being generated. Saving and restoring the references is O(1) and exact.
+
+        In pretrained/trainable-head mode the coda is stateless (norm -> MLP -> head) and
+        ignores caches entirely, so this reduces to a plain forward; the guard costs
+        nothing and keeps the from-scratch path correct.
+        """
+        if self.text_generator is None:
+            return None
+        snap = None
+        if kv_caches is not None:
+            snap = [(getattr(c, "key_cache", None), getattr(c, "value_cache", None))
+                    for c in kv_caches]
+        try:
+            out = self.text_generator(latents, targets=None, kv_caches=kv_caches,
+                                      position_offset=position_offset, use_cache=False)
+        finally:
+            if snap is not None:
+                for c, (k, v) in zip(kv_caches, snap):
+                    c.key_cache, c.value_cache = k, v
+        return out.get("logits")
+
     def _trunk_readout(self, latents: torch.Tensor) -> torch.Tensor:
         """Latent -> text logits, for the `logit_kl` exit criterion only.
 
@@ -878,11 +937,13 @@ class MegaTransformerWorldModel(nn.Module):
             attention_mask=attn_mask,  # True for attend, False for padding
             additive_attn_bias=trunk_voice_bias,
             position_ids=self._mrope_ids(modality_map),
-            readout=self._trunk_readout,
-            # Only text positions may exit early: `_trunk_readout` is a TEXT head, so its
-            # distribution is meaningless at voice/audio/image positions. Those run the
-            # full iteration budget rather than being scored by the wrong head.
-            converge_eligible=(modality_map == MODALITY_TEXT),
+            # Per-modality exit: each head scores only the positions it produces, in its
+            # own vocabulary. Scoring a voice latent with the text head compares the wrong
+            # distribution, and the two vocabularies (49k-152k vs ~6.5k units) cannot share
+            # one tensor anyway. Audio/image positions are in no mask, so they run the full
+            # budget -- image deliberately so, see docs/findings/world-text.md.
+            readout=self._exit_readouts(),
+            converge_eligible=self._exit_eligibility(modality_map),
         )
 
         # print("\tInputs to uninterleaver:")
@@ -1794,6 +1855,37 @@ class MegaTransformerWorldModel(nn.Module):
                         outs = [o if o is not None else torch.zeros_like(_ref) for o in outs]
                         return torch.cat(outs, dim=0)
 
+            # TEXT-POSITION EXIT. The voice wiring above covers items emitting voice;
+            # items in TEXT mode (`current_modality[b] is None`) were left ineligible and
+            # so ran the full budget. They get their own head here, scored in the text
+            # vocabulary -- the two heads cannot share a readout because their vocabularies
+            # differ, which is why the block takes a per-key dict.
+            #
+            # Eligibility mirrors the guard the text coda itself uses below: it only runs
+            # when NO item is in a media modality (`any_media`), because its KV cache is
+            # shared across the batch and feeding it media positions would pollute it. The
+            # readout inherits that constraint exactly -- scoring under any_media would
+            # read a cache the real call never builds.
+            _t_readout = None
+            _t_eligible = None
+            if (self.text_generator is not None
+                    and getattr(self.recurrent_block.exit_criteria, "needs_readout", False)):
+                _t_flags = [current_modality[b] is None for b in range(batch_size)]
+                if all(_t_flags):
+                    _t_eligible = torch.ones((batch_size, 1), dtype=torch.bool,
+                                             device=next_hidden.device)
+
+                    def _t_readout(h):
+                        return self._trunk_readout_text_cached(
+                            h, kv_caches=text_coda_kv_caches,
+                            position_offset=text_coda_position_offset)
+
+            _readouts, _eligible = {}, {}
+            if _v_readout is not None:
+                _readouts["voice"], _eligible["voice"] = _v_readout, _v_eligible
+            if _t_readout is not None:
+                _readouts["text"], _eligible["text"] = _t_readout, _t_eligible
+
             # Process through recurrent block with KV cache
             current_hidden, kv_cache, n_iters, kl_trace, _ = self.recurrent_block(
                 next_hidden * self.embed_scale,
@@ -1803,8 +1895,8 @@ class MegaTransformerWorldModel(nn.Module):
                 use_cache=True,
                 share_kv_cache=share_kv_cache,
                 position_ids=step_pids,
-                readout=_v_readout,
-                converge_eligible=_v_eligible,
+                readout=_readouts or None,
+                converge_eligible=_eligible or None,
             )
             recurrent_iteration_counts.append(n_iters)
             recurrent_kl_final.append(kl_trace[-1] if kl_trace else 0.0)
