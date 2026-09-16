@@ -2436,6 +2436,73 @@ the A/B pairs is pending.
 prior -- so unlike ASR-rerank and `voice_min_frame_ratio` (which multiplies `_n_text_tokens`,
 `world_model.py:1894`) it carries to instruction-following voice targets unchanged.
 
+## ⭐⭐⭐ THE RECURRENT EXIT CRITERION WAS BROKEN DURING GENERATION (2026-09-16, ESTABLISHED)
+
+**Read this before citing ANY world-voice generation number measured on or before
+2026-09-15.** All of them were produced under a criterion that freezes arbitrary positions
+mid-computation.
+
+`logit_kl` was wired only into `forward()`. Every `generate()` call site passed no readout,
+so generation fell through to the legacy `kl_divergence` path, which compares POST-NORM
+ACTIVATIONS with `F.kl_div`. That is a SIGNED quantity, so `value < threshold` passes
+whenever it goes negative -- by sign accident, not convergence. The damage is not that it
+runs shallow; it is that it halts computation on positions that have NOT converged while
+letting others continue.
+
+Fixed in 64861ba (`_trunk_readout_voice` + generate wiring). ck90000-ema unistream, greedy,
+RAS w=10 tau=0.1, n=48 x 2 seeds (`eval_output/world_voice/reports/crit_*`):
+
+| criterion | depth | LCS | WER | hyp/ref | caps | collapsed | seed spread |
+|---|---|---|---|---|---|---|---|
+| legacy kl_divergence | 14.92 | 0.7519 | 0.2621 | 0.953 | 5/96 | 7/96 | 0.0168 |
+| **logit_kl 5e-4** | 19.50 | **0.8849** | **0.1333** | **1.007** | 6/96 | **0/96** | **0.0007** |
+| CEILING (GT units) | -- | 0.9146 | 0.0950 | -- | -- | -- | -- |
+
+**LCS +0.133, WER -0.129 (49% relative). The gap to the pipeline ceiling falls from 0.163 to
+0.030 -- ~82% of it closed by a comparison operator.**
+
+Depth rises only 14.92 -> 19.50, so this is NOT "more compute". It is computing the RIGHT
+positions. ~4.5 extra iterations cannot explain a 0.133 LCS move; freezing the wrong tokens
+can.
+
+### Consequence 1: "seed variance dominates" was measuring THIS BUG
+
+Seed spread falls **0.0168 -> 0.0007, 24x tighter**. The 2026-09-15 finding that single-seed
+LCS comparisons are worthless and that generation carries ~0.07 of seed noise was TRUE FOR
+THAT REGIME and is an artifact of the broken criterion: freezing arbitrary positions is the
+noise source. Under a correct criterion the model is near-deterministic across seeds.
+⚠️ Do NOT relax the 2-seed protocol on the strength of one checkpoint -- but expect single-seed
+comparisons to become viable again, which changes the cost of every future sweep.
+
+### Consequence 2: premature collapse was a SYMPTOM of it
+
+Collapse goes 7/96 -> **0/96**. The 2026-09-15 diagnosis (collapse = flat distribution,
+entropy 5.87 vs 2.59 nats at the EOV step) was ACCURATE but identified a symptom: a trunk
+state frozen mid-computation is what produces those flat distributions. The EOV confidence
+guard (584c569) therefore targets a failure that does not occur under a correct criterion.
+Its continued value is being measured (`guard_on_logitkl_*`); expect a no-op at best.
+
+### ⚠️ EVERYTHING from 2026-09-15 needs re-measurement
+
+Under re-measurement now (`scripts_local/world_voice_recheck_campaign.sh`, results under
+`eval_output/world_voice/{reports,audio,logs}/`): sampling config (greedy vs T=0.7 vs
+T=0.6+rt1.0), checkpoint ranking (uni90k vs uni68k vs bi68k), the EOV guard, and
+`latent_diff` as a readout-free alternative.
+
+Specifically suspect, because they rest on failure modes this bug may have CAUSED:
+- best sampling config (greedy won partly on collapse frequency)
+- ck90000 vs ck68000 (+0.046, and the eval-loss minima that nominated both were themselves
+  computed under the broken criterion in forward())
+- bistream vs unistream (its surviving claim was "sampler insensitivity")
+- the 0.7519 headline, already superseded
+
+Probably survives, being a code-path fact rather than an empirical one: the T=0 discontinuity
+in the RAS resample. Also expected to survive: tau=0 causing total degenerate collapse.
+
+⚠️ **`bf4769e` (2026-09-15 21:53) changed `forward()` to restrict convergence to TEXT
+positions**, so voice now runs full budget in eval. Eval losses from before that commit and
+after it are NOT comparable, and every checkpoint-selection decision to date predates it.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
