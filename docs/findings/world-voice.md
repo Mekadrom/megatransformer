@@ -2475,6 +2475,40 @@ disfluencies the decoder renders awkwardly) is a story, not evidence.
 **Practical:** use `none` for quality. Use `logit_kl` only when generation throughput matters,
 and know it costs 0.025 LCS.
 
+### `latent_diff` — Huginn's own readout-free criterion — is CATASTROPHIC here (2026-09-16, ESTABLISHED)
+
+Same protocol, n=48 x 2 seeds:
+
+| criterion | depth | LCS | WER | hyp/ref | collapsed |
+|---|---|---|---|---|---|
+| none (full 32) | 32.00 | 0.9103 | 0.0879 | 0.988 | 0/96 |
+| logit_kl 5e-4 | 19.50 | 0.8849 | 0.1333 | 1.007 | 0/96 |
+| legacy (broken) | 14.92 | 0.7519 | 0.2621 | 0.953 | 7/96 |
+| **latent_diff 0.01** | 24.98 | **0.2007** | 0.7948 | 0.301 | **65/96** |
+| **latent_diff 0.03** | 23.90 | **0.0964** | 0.9115 | 0.250 | **75/96** |
+
+It does not merely underperform -- it INDUCES collapse, 65-75 of 96, against ZERO for
+logit_kl, and is far worse than the numerically broken legacy criterion despite running ~10
+iterations DEEPER.
+
+**This settles that depth is not the variable.** Ordered by depth: legacy 14.9 < logit_kl 19.5
+< latent_diff 23.9-25.0 < none 32. Ordered by quality: none > logit_kl > legacy >> latent_diff.
+What matters is WHICH positions freeze, not how many iterations run.
+
+**Mechanism (inferred, not measured):** relative latent movement is a poor proxy for the
+output distribution having settled. A voice frame's trunk state can stabilise while its unit
+distribution is still moving; freezing there locks in an unconverged distribution, and
+empirically that favours EOV. Note also that the two thresholds give nearly identical depth
+(24.98 vs 23.90) despite being 3x apart, which suggests it fires on a few positions almost
+regardless of threshold rather than tracking convergence smoothly. The implementation is a
+faithful port (per-position rather than Huginn's per-batch mean, identical at seq_len 1) --
+this is not a porting bug.
+
+⚠️ **Do not recommend `latent_diff` to other directions as "the readout-free option" without
+measuring it.** world-image cannot use `logit_kl` (its DiT coda has no categorical head), and
+the obvious substitution is exactly this criterion. On voice it is the worst of four. Start
+those directions on `none`, which needs no readout at all.
+
 **LCS +0.133, WER -0.129 (49% relative). The gap to the pipeline ceiling falls from 0.163 to
 0.030 -- ~82% of it closed by a comparison operator.**
 
