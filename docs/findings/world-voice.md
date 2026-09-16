@@ -2705,6 +2705,61 @@ trunk substitutes for a ~0.5B speech LM and drives a 133M decoder. Relevant to
 [[project_leanness_and_open_data]]: unlike the 6.2B Z-Image departure on the image side, the
 voice stack is already lean, and a future own-decoder distillation target is 133M.
 
+## ⭐⭐⭐ THREE-WAY vs CosyVoice 2's OWN LM: the trunk wins on content, ties on identity (2026-09-16, ESTABLISHED)
+
+First like-for-like comparison against the module the world model replaces. Prompt-conditioned
+throughout, n=40, ck90000-ema greedy + `--exit_criteria none`. All three render through the
+SAME frozen decoder with the SAME zero-shot prompt -- a DIFFERENT utterance by the same
+speaker -- so only the UNIT SOURCE varies. Cache: `cached_datasets/Mekadrom/libriheavy_prompt_val`
+(held-out LibriHeavy **dev** split, 639 utts / 54 speakers). Runner:
+`scripts_local/voice_three_way_compare.py`.
+
+| arm | params | LCS | WER | CER | spk cos | <0.70 | len/GT |
+|---|---|---|---|---|---|---|---|
+| ceiling (GT units) | -- | 0.8492 | 0.1769 | 0.0765 | **0.7923** | **1/40** | 1.00 |
+| **world model** | 127.5M trunk | 0.9085 | **0.0947** | **0.0372** | 0.7497 | 7/40 | 0.95 |
+| CosyVoice 2 LM | 505.8M | **0.9148** | 0.2516 | 0.2316 | 0.7627 | 7/40 | 1.09 |
+
+**The 127.5M trunk beats the 505.8M reference LM on WER (0.095 vs 0.252) and CER (0.037 vs
+0.232) and ties on LCS.** The LCS/WER split is diagnostic: LCS ignores insertions, WER does
+not, and CV2 runs 9% LONGER than GT -- it says the right words AND adds extra material. The
+world model runs at 0.95 of GT length and inserts almost nothing.
+
+⚠️ Both synthetic arms BEAT the ceiling on content, for the reason established earlier: the
+ceiling is real human speech and Whisper mis-transcribes archaic verse ("Parties in wit attend
+on those of state" -> "partisan with the thin on doors of state") that canonical synthesis
+renders cleanly.
+
+### Speaker identity: NOT the trunk's fault
+
+**Identity failures are IDENTICAL between the world model and CosyVoice 2's own LM -- 7/40
+each below the human baseline -- against 1/40 for GT units.** Means 0.7497 vs 0.7627, inside
+the spread. So degraded identity is a property of GENERATED units in general, not of this
+trunk. The reference implementation degrades it exactly as much.
+
+Reference: **two REAL recordings of the same speaker score campplus cosine 0.7005 +- 0.1683**
+(n=639, measured on the new cache). A "perfect" clone is NOT 1.0 -- natural within-speaker
+variation averages 0.70, so renders at 0.75 are ABOVE what a second genuine recording achieves.
+
+⚠️ **campplus is accent-INVARIANT by design.** A render can score high and still carry the
+wrong accent. The user's report ("my voice with a British accent / feminine lilt", prompt
+conditioning confirmed active in the chat UI) is an ACCENT/PROSODY complaint that no cosine
+here can measure. Accent lives in the UNITS (phonetic realisation); timbre comes from the
+prompt+embedding. LibriHeavy is British audiobook narration, so narrator-accented units are
+the expected signature of this training set. Judge by EAR from the audio triplets
+(`eval_output/world_voice/audio/three_way_ck90k/`, arms `ceiling_/model_/cv2_`).
+
+### ⚠️ TOOLING TRAP: vendored CosyVoice is broken under transformers >= 5
+
+`Qwen2Encoder.forward_one_step` passes `attention_mask = masks[:, -1, :]`, which on a 1-token
+decode step covers ONLY the new token. transformers 4.x expanded it against the KV cache;
+5.13.1 takes it literally and masks the entire past, so the model sees a context-free token
+every step. **The output distribution FREEZES** -- identical top-k and p(EOS)=0.000118 from
+step 5 through step 339 -- and generation always runs to `max_token_text_ratio`. It does NOT
+error; it emits fluent maximum-length garbage. Our decode path never calls `forward_one_step`
+so the flow/HiFT renderer is unaffected, but `inference_bistream` and the streaming paths
+would be. Fixed in `cosyvoice2_llm_baseline.cv2_generate_units` by passing a past+current mask.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
