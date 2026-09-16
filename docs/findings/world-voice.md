@@ -2465,7 +2465,29 @@ iterations for -0.025 LCS, and the legacy criterion was destroying the model. **
 it was TRAINED at, the model sits within 0.004 LCS of the pipeline ceiling and scores BETTER
 WER than ground-truth units through the same decoder.**
 
-⚠️ **The "at ceiling" claim is not yet matched-n.** The published ceiling (0.9146 / 0.0950) is
+✅ **RESOLVED 2026-09-16 — the model BEATS the ceiling at matched n.** Same run, same 48
+utterances (`reports/ceiling_n48`): model 0.9134 LCS / 0.0920 WER / 0.0424 CER vs ceiling
+0.8601 / 0.1460 / 0.0649. **+0.053 LCS, -0.054 WER.** The n=12 ceiling (0.9146) was an easy
+sample; the matched one is WORSE, so the lead is larger than first measured, not smaller.
+
+Not an error: the ceiling is real human speech round-tripped through tokenizer + decoder, and
+it carries disfluencies, accent and noise that Whisper mis-transcribes. The model emits
+canonical, evenly-paced speech that ASR finds easier (cadence 0.95x -- slightly FASTER than
+the reference). This is `project_dispersion_over_smoothing` seen from the other side: here
+canonicalisation HELPS the metric.
+
+⚠️⚠️ **THE ASR EVALUATION IS THEREFORE SATURATED.** LCS/WER against Whisper can no longer
+measure world-voice progress -- the best config has passed the reference. Consequences:
+- every ranking on 2026-09-15/16 was made on a metric the winner now exceeds; further sampler
+  or checkpoint tuning measured this way will return noise
+- the remaining gap lives where ASR is blind: prosody, speaker similarity, naturalness. That
+  is exactly what the EAR kept reporting while the numbers could not see it
+- speaker similarity needs prompt conditioning, which is viz-only today because the val cache
+  stores no waveforms (see the campplus/prompt entry)
+- next metrics should be speaker-similarity (campplus cosine vs the reference speaker),
+  prosody (F0/duration correlation), and ear/MOS
+
+~~The "at ceiling" claim is not yet matched-n.~~ The published ceiling (0.9146 / 0.0950) is
 **n=12**; these arms are n=96. A matched n=48 ceiling is being measured
 (`reports/ceiling_n48`). WER beating the ceiling is exactly the pattern a sample-set mismatch
 produces, so treat "beats the teacher" as unverified until that lands -- the plausible
