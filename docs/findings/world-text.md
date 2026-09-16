@@ -206,11 +206,59 @@ default config is `exit_criteria="kl_divergence"`, `exit_criteria_threshold=1e-4
 exiting the whole batch when a *single* token trips — but no caller reaches it.
 
 Consequence: eval has been running the trunk at roughly half its trained depth, with each token
-frozen at an effectively random iteration. This is a train/eval mismatch in the one component
-the whole architecture is built around, and it is a candidate confound for any eval-time result
-in ANY direction. **Not yet re-measured with the criterion disabled** — that is the next step,
-and `exit_criteria=None` is not currently accepted (`__init__` raises on anything but
-`"kl_divergence"`).
+frozen at an iteration **uncorrelated with how much refinement that token needed**. This is a
+train/eval mismatch in the one component the whole architecture is built around, and it is a
+candidate confound for any eval-time result in ANY direction.
+
+**Stopping-time distribution, measured 2026-09-16** (fresh `small_sum` block, 12 trials x 4 x 32
+positions, cap 32). "Random iteration" (my first phrasing) and "roughly the same per token" (the
+world-voice reading) are both wrong; it is **bimodal**:
+
+| | |
+|---|---|
+| mean / std / CV | 8.07 / 6.43 / **0.797** |
+| exit within 3 iterations | **42.6%** (38% of all positions retire at the SECOND check) |
+| exit at >= 10 iterations | 49.5% |
+| range | 1 to 18 |
+
+The spike at the second check is structural, not incidental: the logged trace goes
+`1315 -> -0.009 -> -0.137 -> ...`, so whichever positions happen to be negative the moment it
+crosses zero retire instantly, having had essentially no recurrence at all. The rest stay
+positive a while and run 10+.
+
+So the variance is real but it is **noise, not signal** — a hard token is no likelier to get
+more iterations than an easy one. That is a fixed budget with jitter, which is the exact
+opposite of adaptive compute, and it explains the observed symptom directly: a token that drew
+an early exit is sampled mid-trajectory, while its distribution is still near the uniform the
+iteration starts from. See the flat-logit entry below.
+(Caveat: measured on a randomly-initialised block with random input, so the exact shape need
+not match a trained checkpoint. The sign-flip mechanism that produces it is structural and does.)
+
+### Flat logits at eval were unfinished recurrence, not model uncertainty (2026-09-16)
+Diagnosed by the world-voice session and mechanistically consistent with the above. Voice
+generation intermittently produced a near-uniform distribution over units — no confident choice
+anywhere in the vocabulary — and considerable sampler engineering went into recovering from a
+unit history containing one such state.
+
+That symptom is what an early exit looks like. The recurrent trajectory starts near uniform (it
+is why Huginn's `KLExitEvaluator` *initialises* `prev_log_probs` to uniform), so a position
+retired at the second check is read out before its distribution has sharpened. With ~38% of
+positions retiring there, flat logits were not rare events to be sampled around — they were the
+expected output for a large minority of tokens.
+
+Fixing the criterion collapsed the symptom. World-voice reports **WER 0.0989 vs a GT ceiling of
+0.1460, at 74% of the compute** under `logit_kl` — better numbers AND less compute, because the
+budget now follows the need instead of being spent uniformly. (GT ceiling = real audio through
+the CV2 encoder to units, then back through the same decoder and speaker embedding. Generated
+speech scoring *below* that is expected and is not "better than ground truth": real recordings
+carry disfluency and noise that a TTS model does not reproduce. Judge quality by ear, per
+[[feedback_recurring_reminders]].)
+
+⚠️ The sampler that was tuned to work around flat logits is still the best config under the
+fixed criterion. That the RANKING held is weak evidence; the informative quantity is the
+**margin**. If the clever sampler's advantage over greedy has narrowed, it was a workaround and
+can be simplified away; if the margin is unchanged, it is doing independent work. Not yet
+measured.
 
 **Relay to world-voice and world-image** — measured here, but it is not a world-text finding.
 
