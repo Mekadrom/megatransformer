@@ -1434,17 +1434,26 @@ def main():
 
                 with gr.Accordion("Sampling parameters", open=False):
                     with gr.Row():
+                        # TEXT ONLY. These three reach generate() as `temperature`/`top_p`/
+                        # `top_k`, which are consumed by _sample_tokens() at both of its call
+                        # sites -- and both sample from the TEXT coda's logits. Voice uses the
+                        # separate voice_* controls below; image uses its own diffusion steps
+                        # and sampler. Naming them bare invited the reading that they were
+                        # global.
                         temperature_slider = gr.Slider(
                             minimum=0.05, maximum=2.0, step=0.05,
-                            value=args.temperature, label="Temperature",
+                            value=args.temperature,
+                            label="TEXT temperature (text tokens only; 0 = greedy)",
                         )
                         top_p_slider = gr.Slider(
                             minimum=0.0, maximum=1.0, step=0.01,
-                            value=args.top_p, label="top_p (0 = off)",
+                            value=args.top_p,
+                            label="TEXT top_p (text tokens only; 0 = off)",
                         )
                         top_k_slider = gr.Slider(
                             minimum=0, maximum=500, step=1,
-                            value=0, label="top_k (0 = off)",
+                            value=0,
+                            label="TEXT top_k (text tokens only; 0 = off)",
                         )
                     with gr.Row():
                         # VOICE unit sampler -- separate from the text sampler above. Measured
@@ -1491,7 +1500,7 @@ def main():
                         image_iter_override_num = gr.Number(
                             value=(args.image_iteration_override or 0),
                             precision=0,
-                            label="image iteration override (0 = off, uses mean_thinking_steps + KL early-exit)",
+                            label="IMAGE trunk iterations (0 = off; overrides the global cap for image only)",
                         )
                     with gr.Row():
                         exit_criteria_dd = gr.Dropdown(
