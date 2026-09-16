@@ -2455,8 +2455,25 @@ RAS w=10 tau=0.1, n=48 x 2 seeds (`eval_output/world_voice/reports/crit_*`):
 | criterion | depth | LCS | WER | hyp/ref | caps | collapsed | seed spread |
 |---|---|---|---|---|---|---|---|
 | legacy kl_divergence | 14.92 | 0.7519 | 0.2621 | 0.953 | 5/96 | 7/96 | 0.0168 |
-| **logit_kl 5e-4** | 19.50 | **0.8849** | **0.1333** | **1.007** | 6/96 | **0/96** | **0.0007** |
-| CEILING (GT units) | -- | 0.9146 | 0.0950 | -- | -- | -- | -- |
+| logit_kl 5e-4 | 19.50 | 0.8849 | 0.1333 | 1.007 | 6/96 | **0/96** | 0.0007 |
+| **none (full 32)** | 32.00 | **0.9103** | **0.0879** | 0.988 | **1/96** | **0/96** | 0.0012 |
+| CEILING (GT units, n=12) | -- | 0.9146 | 0.0950 | -- | -- | -- | -- |
+
+**Quality rises MONOTONICALLY with depth all the way to the trained budget.** The exit
+criterion is therefore a pure compute knob, not a quality feature: `logit_kl` buys ~40% fewer
+iterations for -0.025 LCS, and the legacy criterion was destroying the model. **At the depth
+it was TRAINED at, the model sits within 0.004 LCS of the pipeline ceiling and scores BETTER
+WER than ground-truth units through the same decoder.**
+
+⚠️ **The "at ceiling" claim is not yet matched-n.** The published ceiling (0.9146 / 0.0950) is
+**n=12**; these arms are n=96. A matched n=48 ceiling is being measured
+(`reports/ceiling_n48`). WER beating the ceiling is exactly the pattern a sample-set mismatch
+produces, so treat "beats the teacher" as unverified until that lands -- the plausible
+mechanism (the model emits smoother, more canonical speech than GT units, which carry
+disfluencies the decoder renders awkwardly) is a story, not evidence.
+
+**Practical:** use `none` for quality. Use `logit_kl` only when generation throughput matters,
+and know it costs 0.025 LCS.
 
 **LCS +0.133, WER -0.129 (49% relative). The gap to the pipeline ceiling falls from 0.163 to
 0.030 -- ~82% of it closed by a comparison operator.**
