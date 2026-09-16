@@ -171,6 +171,49 @@ NOT independently verified here: only Qwen3-4B and 0.6B weights are cached local
 equal-`d` embedding matrices were never compared numerically. Treat "unrelated bases" as the
 architecturally-motivated default, not a measurement.
 
+### ⚠️ The recurrent exit criterion reads the THOUGHT STATE, and it is not a KL (2026-09-15)
+`recurrent_criteria.KLDivergenceCriteria` is fed `last_thought_state` / `new_thought` — raw
+`(B, T, d_model)` trunk hidden states straight out of `_run_iteration`. It never sees the coda
+or the LM head, so the answer to "does it exit on the output distribution?" is **no**: it exits
+on the trunk's internal state between iterations. That alone is a design choice (Huginn's
+adaptive-compute criterion uses successive *output distributions*). The bug is what it computes:
+
+`F.kl_div(a, b, log_target=True)` evaluates `exp(b) * (b - a)`, which is a KL only when both
+arguments are log-probabilities. Thought states are post-norm activations, so the quantity is
+`sum_d exp(h_new_d) * (h_new_d - h_old_d)` — **signed**, and the test is `value < 1e-4`, so
+every negative value passes as "converged".
+
+Measured (`small_sum`, text-only, fresh init, batch 2 x 24, `mean_thinking_steps=32`):
+
+| | result |
+|---|---|
+| iterations run, **train** mode | 43 (stochastic n+k sampling — criterion inactive) |
+| iterations run, **eval** mode | **17** |
+| reported "kl" trace, first 8 iters | 1254.1, 0.249, 0.015, **-0.083, -0.128, -0.148, -0.158, -0.162** |
+| `converged_mask` on a 1%-perturbed state | **0.500 of tokens** declared converged |
+| `converged_mask` on identical states | 1.000 (correct) |
+
+The trace going negative at iteration 4 is the tell — a real KL is non-negative. Because
+`converged` is sticky (`converged = converged | newly_converged`) and ~half of the remaining
+tokens pass on each iteration by sign accident, essentially every token freezes within ~5-10
+iterations and `forward()` returns early.
+
+**Scope.** Gated on `not self.training`, so **training is unaffected** — no trained weights are
+compromised. But it is live in **every eval, generation, and diagnostic**, for every modality:
+all seven `self.recurrent_block(...)` call sites in `world_model.py` use `forward()`, and the
+default config is `exit_criteria="kl_divergence"`, `exit_criteria_threshold=1e-4`. The
+`generate_step()` path (line 466) has a second copy of the flaw — `should_exit` uses `.any()`,
+exiting the whole batch when a *single* token trips — but no caller reaches it.
+
+Consequence: eval has been running the trunk at roughly half its trained depth, with each token
+frozen at an effectively random iteration. This is a train/eval mismatch in the one component
+the whole architecture is built around, and it is a candidate confound for any eval-time result
+in ANY direction. **Not yet re-measured with the criterion disabled** — that is the next step,
+and `exit_criteria=None` is not currently accepted (`__init__` raises on anything but
+`"kl_divergence"`).
+
+**Relay to world-voice and world-image** — measured here, but it is not a world-text finding.
+
 ---
 
 ## OPEN
