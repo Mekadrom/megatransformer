@@ -1561,6 +1561,11 @@ class MegaTransformerWorldModel(nn.Module):
         # Track recurrent iteration counts and KL divergences per generated token
         recurrent_iteration_counts: List[int] = []
         recurrent_kl_final: List[float] = []  # final KL per token (convergence measure)
+        # Which modality each generation step was emitting, so an iteration count can be
+        # attributed to the head that consumed it. One entry per step, per batch item
+        # ("text" when current_modality[b] is None). Without this the counts are a flat
+        # list with no way to tell a text token from a voice frame.
+        recurrent_step_modalities: List[List[str]] = []
 
         # M-RoPE coordinates for the prompt. Generation MUST use the same coordinate system
         # training used, or the trunk sees positions it was never trained on — the exact
@@ -1900,6 +1905,8 @@ class MegaTransformerWorldModel(nn.Module):
             )
             recurrent_iteration_counts.append(n_iters)
             recurrent_kl_final.append(kl_trace[-1] if kl_trace else 0.0)
+            recurrent_step_modalities.append(
+                [current_modality[b] or "text" for b in range(batch_size)])
             position_offset += 1
 
             # Accumulate hidden states and run codas for non-text modalities
@@ -2601,6 +2608,7 @@ class MegaTransformerWorldModel(nn.Module):
         # Recurrent iteration counts and KL divergences per generated token
         outputs["recurrent_iteration_counts"] = recurrent_iteration_counts
         outputs["recurrent_kl_final"] = recurrent_kl_final
+        outputs["recurrent_step_modalities"] = recurrent_step_modalities
         outputs["prompt_recurrent_iterations"] = prompt_iters
         outputs["prompt_recurrent_kl"] = prompt_kls
 

@@ -542,6 +542,103 @@ def render_generated_text(
     return "".join(chunks).strip()
 
 
+_MODALITY_COLORS = {
+    "text": "#4C78A8",
+    "voice": "#F58518",
+    "audio": "#54A24B",
+    "image": "#B279A2",
+}
+
+
+def render_iteration_plot(outputs: dict, cap: Optional[int]):
+    """Per-position recurrent iteration counts, coloured by the modality that consumed them.
+
+    The point of the plot is ADAPTIVITY: with a working exit criterion the trunk should
+    spend more iterations on positions that need them, so a flat line means the criterion
+    is not adapting (which is what the legacy `kl_divergence` produced -- a fixed budget
+    with jitter, uncorrelated with difficulty). Positions pinned at the cap are drawn
+    hollow: those hit the iteration limit WITHOUT converging, so they were read out
+    mid-trajectory and the budget, not the criterion, was the binding constraint.
+
+    Returns None when there is nothing to draw, so the caller can leave the panel empty.
+    """
+    counts = outputs.get("recurrent_iteration_counts") or []
+    mods_per_step = outputs.get("recurrent_step_modalities") or []
+    img_iters = (outputs.get("image_recurrent_iterations") or [[]])
+    img_iters = img_iters[0] if img_iters else []
+    if not counts and not img_iters:
+        return None
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # batch item 0 -- the demo generates one conversation at a time
+    mods = [(m[0] if m else "text") for m in mods_per_step]
+    if len(mods) < len(counts):
+        mods += ["text"] * (len(counts) - len(mods))
+
+    fig, ax = plt.subplots(figsize=(11, 3.4), dpi=110)
+
+    # Token positions, one series per modality so the legend is meaningful.
+    for mod in ("text", "voice", "audio"):
+        xs = [i for i, m in enumerate(mods) if m == mod]
+        if not xs:
+            continue
+        ys = [counts[i] for i in xs]
+        at_cap = [cap is not None and y >= cap for y in ys]
+        c = _MODALITY_COLORS[mod]
+        # Break the connecting line across gaps. A modality's positions are not contiguous
+        # (text resumes after a voice block), and a line drawn straight across the gap reads
+        # as a trend through positions this modality never occupied.
+        lx, ly = [], []
+        for j, (x, y) in enumerate(zip(xs, ys)):
+            if j and x != xs[j - 1] + 1:
+                lx.append(float("nan")); ly.append(float("nan"))
+            lx.append(x); ly.append(y)
+        ax.plot(lx, ly, marker="", linewidth=0.8, alpha=0.45, color=c, zorder=1)
+        # filled = converged, hollow = hit the cap without converging
+        ax.scatter([x for x, a in zip(xs, at_cap) if not a],
+                   [y for y, a in zip(ys, at_cap) if not a],
+                   s=14, color=c, label=f"{mod} ({len(xs)})", zorder=3)
+        ax.scatter([x for x, a in zip(xs, at_cap) if a],
+                   [y for y, a in zip(ys, at_cap) if a],
+                   s=26, facecolors="none", edgecolors=c, linewidths=1.2, zorder=4)
+
+    # Images are single-shot (one recurrent call over all gen-query positions), so they are
+    # not token positions -- draw them past the right edge rather than pretending otherwise.
+    if img_iters:
+        x0 = max(len(counts), 1) + 1
+        xs = [x0 + i * 2 for i in range(len(img_iters))]
+        ax.scatter(xs, img_iters, s=46, marker="D", color=_MODALITY_COLORS["image"],
+                   label=f"image ({len(img_iters)}, single-shot)", zorder=3)
+        for x, y in zip(xs, img_iters):
+            ax.annotate(f"{int(y)}", (x, y), textcoords="offset points", xytext=(0, 7),
+                        ha="center", fontsize=7, color=_MODALITY_COLORS["image"])
+
+    if cap:
+        ax.axhline(cap, linestyle="--", linewidth=1.0, color="#888",
+                   label=f"cap ({cap})")
+        ax.set_ylim(0, cap * 1.12)
+
+    n_cap = sum(1 for y in counts if cap is not None and y >= cap)
+    mean = (sum(counts) / len(counts)) if counts else 0.0
+    frac = (sum(counts) / (len(counts) * cap)) if (counts and cap) else None
+    bits = [f"mean {mean:.1f} iters"]
+    if frac is not None:
+        bits.append(f"{frac * 100:.0f}% of full budget")
+    if cap is not None and counts:
+        bits.append(f"{n_cap}/{len(counts)} pinned at cap ({n_cap / len(counts) * 100:.0f}%)")
+    ax.set_title("Recurrent iterations per generated position — " + ", ".join(bits), fontsize=10)
+    ax.set_xlabel("generated position")
+    ax.set_ylabel("iterations")
+    ax.grid(alpha=0.25, linewidth=0.6)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8, loc="lower right", framealpha=0.9)
+    fig.tight_layout()
+    return fig
+
+
 def decode_image_latent(litevae, latent: torch.Tensor, device: str) -> tuple[Image.Image, dict]:
     """Decode LiteVAE latent → PIL image.
 
@@ -971,7 +1068,7 @@ def main():
                        f"(trimmed by the *prompt seconds* slider at generation).")
 
     def on_clear(state):
-        return ("", render_file_list({}), {}, "", [], [], "",
+        return ("", render_file_list({}), {}, "", [], [], "", None,
                 *[gr.update(value=None, visible=False) for _ in range(_AUDIO_PLAYER_POOL)])
 
     import tempfile
@@ -1000,8 +1097,8 @@ def main():
         trunk_iters_in,
     ):
         if not msg_text or not msg_text.strip():
-            # Must match the 8-wide outputs wiring: 4 values + one update per player.
-            return ("", [], [], "Empty prompt.",
+            # Must match the outputs wiring: 5 values + one update per player.
+            return ("", [], [], "Empty prompt.", None,
                     *[gr.update(value=None, visible=False) for _ in range(_AUDIO_PLAYER_POOL)])
         state = state or {}
 
@@ -1403,8 +1500,21 @@ def main():
                       visible=(i < len(voice_wav_paths)))
             for i in range(_AUDIO_PLAYER_POOL)
         ]
+        # Iteration plot. `cap` is what the trunk was actually allowed this run -- the UI's
+        # trunk-iterations box overrides mean_thinking_steps, so read it back off the block
+        # rather than assuming the config default, or the cap line lands in the wrong place.
+        try:
+            _cap = int(getattr(model.recurrent_block, "mean_thinking_steps", 0)) or None
+        except Exception:
+            _cap = None
+        try:
+            _iter_fig = render_iteration_plot(outputs, _cap)
+        except Exception as _e:
+            print(f"[chat] iteration plot failed ({type(_e).__name__}: {_e})", flush=True)
+            _iter_fig = None
+
         return (gen_text, gallery_images, voice_wav_paths,
-                "\n".join(status_lines), *_players)
+                "\n".join(status_lines), _iter_fig, *_players)
 
     # --- UI ---
     with gr.Blocks(title="MegaTransformer Multimodal Chat") as demo:
@@ -1535,6 +1645,10 @@ def main():
                         )
 
                 status_box = gr.Textbox(label="Status", interactive=False, lines=3)
+                # Adaptive-compute readout. Flat = the criterion is not adapting; hollow
+                # markers = positions that hit the cap without converging (budget-limited,
+                # not criterion-limited). See render_iteration_plot.
+                out_iter_plot = gr.Plot(label="Recurrent iterations per position")
 
                 gr.Markdown("### Outputs")
                 out_text = gr.Textbox(
@@ -1619,13 +1733,13 @@ def main():
                 exit_criteria_dd, exit_threshold_num, trunk_iters_num,
             ],
             outputs=[out_text, out_gallery, out_audio_files, status_box,
-                     *out_audio_players],
+                     out_iter_plot, *out_audio_players],
         )
         clear_btn.click(
             on_clear,
             inputs=[state],
             outputs=[msg_box, file_list_md, state, out_text, out_gallery,
-                     out_audio_files, status_box, *out_audio_players],
+                     out_audio_files, status_box, out_iter_plot, *out_audio_players],
         )
 
     demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)
