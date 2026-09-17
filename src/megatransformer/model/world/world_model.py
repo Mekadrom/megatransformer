@@ -690,6 +690,7 @@ class MegaTransformerWorldModel(nn.Module):
         decode_outputs: bool = False,
         # Per-sample direction: True = synthesis (text→media), False = transcription
         is_synthesis: Optional[torch.Tensor] = None,
+        image_is_synthesis: Optional[torch.Tensor] = None,
         # NAR→AR curriculum (Variant B): scalar in [0, 1] that down-scales voice→voice
         # attention in the prelude, recurrent trunk, and voice coda on SYNTHESIS rows.
         # alpha=0 severs voice history (position t sees text + its own shifted-TF frame
@@ -887,9 +888,28 @@ class MegaTransformerWorldModel(nn.Module):
             batch_size, n_images = image_inputs.shape[:2]
             image_flat = image_inputs.view(batch_size * n_images, *image_inputs.shape[2:])
 
+            # PER-IMAGE direction. `is_synthesis` is (B,) and shared with audio/voice, so a row is
+            # all-input or all-generated -- which cannot express an instruct turn where the user
+            # supplies one image and the model generates another. `image_is_synthesis` is (B, N)
+            # and overrides it for images only. Absent, it broadcasts the row flag, so every
+            # existing caller is bit-identical (verified: same loss to 8 dp).
+            # ⚠️ SCOPE: this selects PRELUDE vs GEN-QUERY features per image, which is the part
+            # that silently feeds the trunk the wrong thing. The conditioning LOSS is still
+            # row-level -- `sample_mask=is_synthesis` and `image_cond_labels` are (B, ...) with no
+            # image axis -- so a row with one input and one generated image trains on a single
+            # target. Instruct finetune needs per-image labels too; that is a collator change.
+            if image_is_synthesis is not None:
+                img_syn = image_is_synthesis.to(image_inputs.device).bool()
+                if img_syn.dim() == 1:
+                    img_syn = img_syn.unsqueeze(1).expand(batch_size, n_images)
+            elif is_synthesis is not None:
+                img_syn = is_synthesis.to(image_inputs.device).bool().view(batch_size, 1).expand(batch_size, n_images)
+            else:
+                img_syn = None
+
             # Build generation queries (used at all synthesis-direction image
             # positions). Either learned + 2D PE or PE-only depending on mode.
-            if is_synthesis is not None and is_synthesis.any():
+            if img_syn is not None and img_syn.any():
                 if getattr(self, "image_gen_ar", False) and image_cond_labels is not None:
                     # TEACHER FORCING: position i receives conditioning token i-1, position 0 a
                     # learned BOS. The 2D positional embedding is still added so positions keep
@@ -918,22 +938,25 @@ class MegaTransformerWorldModel(nn.Module):
                     raw_gen_queries = self.image_gen_pos_embedding.pe.expand(batch_size, -1, -1)
                 gen_queries = raw_gen_queries.unsqueeze(1)  # (B, 1, n_patches, d_model)
 
-            if is_synthesis is not None and is_synthesis.all():
+            if img_syn is not None and img_syn.all():
                 # All-synthesis batch: skip the prelude entirely. The image
                 # feature extractor's output isn't used for anything in this
                 # path — gen queries replace the image positions outright.
                 image_hidden_states = gen_queries
-            elif is_synthesis is not None and is_synthesis.any():
-                # Mixed batch: run the prelude for the transcription samples,
-                # then overwrite the synthesis samples' positions with gen queries.
+            elif img_syn is not None and img_syn.any():
+                # Mixed: run the prelude for every image, then overwrite the GENERATED ones with
+                # gen queries. Per image, not per row -- one turn can now contain a user-supplied
+                # image and a model-generated one.
                 image_hidden_flat = self.image_feature_extractor(
                     image_flat, precomputed_latents=precomputed_latents
                 )
                 seq_len, d_model = image_hidden_flat.shape[1], image_hidden_flat.shape[2]
                 image_hidden_states = image_hidden_flat.view(batch_size, n_images, seq_len, d_model).clone()
                 for b in range(batch_size):
-                    if is_synthesis[b]:
-                        image_hidden_states[b] = gen_queries[b]
+                    for i in range(n_images):
+                        if img_syn[b, i]:
+                            # gen_queries is (B, 1, n, d): one query block, reused per image slot.
+                            image_hidden_states[b, i] = gen_queries[b, 0]
             else:
                 # No direction info or all transcription: run the prelude normally.
                 image_hidden_flat = self.image_feature_extractor(
