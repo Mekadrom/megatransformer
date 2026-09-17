@@ -2946,6 +2946,60 @@ what a 20 s pass yields and should be dropped or raised. 20 s is preferred over 
 ⚠️ 20 s requires `--voice_token_budget 500` (was 250). Eval loss is then NOT comparable to any
 existing checkpoint -- new runs start fresh.
 
+### ESTABLISHED 2026-09-17: `ds_config_zero-2.json` silently replaces flat LR with cosine-to-zero
+
+Measured on GPU0, `--max_steps 12 --warmup_steps 5 --lr_scheduler_type constant_with_warmup
+--learning_rate 1e-4`, three DeepSpeed configs, single GPU, deepspeed 0.19.2 /
+transformers 5.13.1. Logged `learning_rate` per step:
+
+| step | A: no `optimizer`, no `scheduler` | B: `optimizer` kept, `scheduler` removed | C: `ds_config_zero-2.json` as-is |
+|---|---|---|---|
+| 1 | 0 | 2e-5 | 0 |
+| 3 | 4e-5 | 6e-5 | 6.826e-5 |
+| 5 | 8e-5 | 1e-4 | 1e-4 |
+| 7 | **1e-4** | **1e-4** | 8.118e-5 |
+| 9 | **1e-4** | **1e-4** | 3.888e-5 |
+| 12 | **1e-4** | **1e-4** | **1e-08** |
+
+The config's `"scheduler": {"type": "WarmupCosineLR"}` block **overrides
+`--lr_scheduler_type` entirely**. Any DeepSpeed run using that file got cosine decay to zero
+no matter what the CLI said -- including runs whose names assert a flat LR. The warmup shape
+differs too (C reaches 6.826e-5 at step 3 where the HF schedule gives 4e-5).
+
+New config `ds_config_zero-2_voice.json` (this commit): no `optimizer` block, no `scheduler`
+block, no CPU optimizer offload, `communication_data_type: bf16`. Verified to produce the
+correct flat-after-warmup trace (column A).
+
+⚠️ Removing the `scheduler` block does **NOT** error on the current stack. All three configs
+above exited 0. Earlier failures on that edit were a version artifact; do not carry the
+belief forward.
+
+**Two secondary results from the same runs:**
+
+1. **DeepSpeed ZeRO-2 costs nothing at world_size=1.** Matched batch 8 x accum 8 (64
+   utts/step), 20 steps, no compile either side: **9.518 samples/s with DeepSpeed vs 9.368
+   without** (+1.6%). So a 2-GPU run should scale close to 2x. Removing the CPU
+   `offload_optimizer` is worth ~20% on its own (it was in the old config for a 167M-param
+   trainable model with no memory pressure).
+
+2. ⚠️ **`--compile_recurrent_block` is silently DROPPED under DeepSpeed.** `train.py:1053`
+   gates it on `not args.use_deepspeed`; the `[compile] recurrent trunk blocks compiled`
+   line is absent from the DeepSpeed log and present in the eager one. The comment at
+   `train.py:1049` says compile exists because the trunk is launch-bound (~75% GPU idle in
+   profiling). Steady-state suggests ~8% (6.21 vs 6.73 s/it), but 20 steps cannot measure
+   this properly. Net expectation for 2 GPUs is therefore **~1.85x, not 2x**.
+
+⚠️ Absolute s/it from these runs (6.2-6.7) is NOT comparable to the production 2.87 s/step:
+20 steps does not amortize startup, compile, or a cold length-bucket sampler. Only the
+D-vs-F ratio is load-bearing.
+
+**Untested at world_size=1:** `lockstep_n`/`lockstep_k` default to `False`
+(`config/world/world_model.py:133-134`), and `recurrent.py:284` multiplies the sampling seed
+by `rank+1` when distributed, so each rank draws a DIFFERENT recurrent depth. Correct, but
+every rank waits for the deepest at the gradient reduction, making step time the max rather
+than the mean of the Poisson-lognormal draw. Set `lockstep_n: true` for multi-GPU unless the
+depth diversity is wanted.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
