@@ -531,24 +531,54 @@ Measured consequences of 49161 vs Qwen3's 151945, text-only `small_sum`, d_model
 | model, tied | **184.2M** | 263.3M |
 | embed+head share | 20% | 44% |
 | logits @ batch 8 x 1024, bf16 | **0.75 GiB** | 2.32 GiB |
-| largest batch that fit (fwd+bwd, 24GB) | **2** | 1 |
+| largest batch that fits (fwd+bwd, 24GB) | **8** (22.5 GiB) | **4** (17.8 GiB) |
 
-⚠️ The batch row ran both vocabs in ONE process, so fragmentation may understate Qwen3; treat
-it as indicative. The logits and parameter numbers are exact.
+Batch sweep, ONE PROCESS PER CONFIG (peak GiB; no teacher, no KL):
+
+| vocab | b1 | b2 | b4 | b6 | b8 |
+|---|---|---|---|---|---|
+| 49161 | 3.9 | 6.5 | 11.9 | 17.2 | **22.5** |
+| 151945 | 5.7 | 9.7 | **17.8** | OOM | OOM |
+
+~~Earlier reading: SmolLM2 OOM at batch 4, Qwen3 OOM at batch 2.~~ **RETRACTED 2026-09-17** —
+that sweep ran every config in a single process and fragmentation made it wrong by 2-4x. Run
+memory probes in separate processes. The corrected numbers say the model needs batch 1 nowhere:
+Qwen3 fits batch 4 and SmolLM2 batch 8. Add ~1.2 GiB for a 0.6B teacher plus KL working set for
+a real distillation run.
 
 Teacher quality, bits-per-byte on identical text (39 documents / 144,881 UTF-8 bytes decoded
 from the Mistral master cache, so every candidate scores the same bytes — bpb is
 tokenizer-independent, which is what makes the comparison fair):
 
-| model | bits/byte |
-|---|---|
-| SmolLM2-135M (the current frozen prelude) | 0.4803 |
-| **SmolLM2-1.7B** | **0.3731** |
+| model | params | bits/byte |
+|---|---|---|
+| **SmolLM2-1.7B** | 1.7B | **0.3731** |
+| SmolLM2-360M | 360M | 0.4229 |
+| Qwen3-4B | 4.0B | 0.4414 |
+| Qwen3-1.7B | 1.7B | 0.4694 |
+| SmolLM2-135M (current frozen prelude) | 135M | 0.4803 |
+| Qwen3-0.6B | 0.6B | 0.5050 |
 
-SmolLM2-1.7B is 22% better than the 135M already in the stack, so it has real signal to
-transfer. **INCOMPLETE:** the Qwen3-0.6B / 1.7B / 4B rows were not measured — the probe was
-killed for running on an unauthorized GPU. Without them there is no evidence that Qwen3 is a
-better teacher, only that it is a bigger one.
+⭐ **SmolLM2-1.7B beats Qwen3-4B by 15% on this corpus, and SmolLM2-360M beats it too** — an
+11x smaller model. Size does not order this table; family does. Every SmolLM2 outscores the
+Qwen3 of comparable or larger size.
+
+⚠️ **Two confounds, and the first is probably the whole effect.**
+1. **Domain match, possibly train-set overlap.** This corpus is the Huginn mixture, whose
+   largest components are `HuggingFaceTB/smollm-corpus` (fineweb-edu) and cosmopedia — i.e.
+   SmolLM2's OWN pretraining data. SmolLM2 is being scored on text drawn from its training
+   distribution and Qwen3 is not. So this measures "who models THIS corpus", which is the
+   right question for picking a teacher for THIS run, but it is NOT evidence that SmolLM2 is
+   the better model in general, and the margin should not be quoted as such.
+2. **Base vs instruct.** `Qwen/Qwen3-4B` has `eos_token_id 151645` (`<|im_end|>`) — the
+   post-trained hybrid-thinking variant. `HuggingFaceTB/SmolLM2-1.7B` has eos 0
+   (`<|endoftext|>`) — a base model. Post-training reshapes the output distribution away from
+   raw next-token prediction on plain text, so the Qwen3 rows are likely understated.
+   `Qwen/Qwen3-*-Base` was NOT measured. Anyone re-running this comparison should use the Base
+   checkpoints.
+
+Neither confound changes the recommendation, because the structural argument below does not
+depend on the margin — but they do mean the margin itself is not a general claim.
 
 ⭐ **The structural argument, which outweighs the memory one.** A Qwen3 teacher is INCOMPATIBLE
 with the frozen SmolLM2-135M prelude (different vocab), so choosing it does not merely select a
