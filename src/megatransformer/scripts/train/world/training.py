@@ -1187,9 +1187,12 @@ class WorldModelTrainer(CommonTrainer):
                         total_loss = total_loss + self.text_distill_weight * _kl
                         loss_components["text_distill_kl"] = _kl.detach()
                         with torch.no_grad():
-                            _ta = (_t_logits[_kl_mask].argmax(-1).to(_tgt_k.device)
-                                   == _tgt_k[_kl_mask]).float().mean()
-                            _ag = (_t_logits[_kl_mask].argmax(-1).to(_s_logits.device)
+                            # Same cross-device rule as the KL: index the teacher's logits with
+                            # a mask on THEIR device, then bring the (N,) argmax back.
+                            _tm = _kl_mask.to(_t_logits.device)
+                            _t_arg = _t_logits[_tm].argmax(-1)
+                            _ta = (_t_arg.to(_tgt_k.device) == _tgt_k[_kl_mask]).float().mean()
+                            _ag = (_t_arg.to(_s_logits.device)
                                    == _s_logits[_kl_mask][:, :_t_teacher.vocab_size].argmax(-1)
                                    ).float().mean()
                             loss_components["text_distill_teacher_acc"] = _ta.detach()

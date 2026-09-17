@@ -170,5 +170,11 @@ def text_distill_kl(
             mask = torch.zeros_like(mask)
             mask[idx[keep, 0], idx[keep, 1]] = True
     s_logp = torch.log_softmax(student_logits[mask][:, :teacher_vocab].float() / temp, dim=-1)
-    t_prob = torch.softmax(teacher_logits[mask].to(s_logp.device).float() / temp, dim=-1)
+    # CROSS-DEVICE. With --text_distill_device the teacher's logits live on another card while
+    # `mask` was built on the student's, and torch requires the index to share the indexed
+    # tensor's device. Index FIRST on the teacher's device, then transfer the gathered subset:
+    # moving the (N, V) selection costs a fraction of moving the full (B, T, V) tensor, and
+    # with subsampling N is 1024 rather than B*T.
+    t_prob = torch.softmax(
+        teacher_logits[mask.to(teacher_logits.device)].to(s_logp.device).float() / temp, dim=-1)
     return torch.nn.functional.kl_div(s_logp, t_prob, reduction="batchmean") * (temp ** 2)
