@@ -2982,12 +2982,21 @@ belief forward.
    `offload_optimizer` is worth ~20% on its own (it was in the old config for a 167M-param
    trainable model with no memory pressure).
 
-2. ⚠️ **`--compile_recurrent_block` is silently DROPPED under DeepSpeed.** `train.py:1053`
-   gates it on `not args.use_deepspeed`; the `[compile] recurrent trunk blocks compiled`
-   line is absent from the DeepSpeed log and present in the eager one. The comment at
-   `train.py:1049` says compile exists because the trunk is launch-bound (~75% GPU idle in
-   profiling). Steady-state suggests ~8% (6.21 vs 6.73 s/it), but 20 steps cannot measure
-   this properly. Net expectation for 2 GPUs is therefore **~1.85x, not 2x**.
+2. **`--compile_recurrent_block` is INCOMPATIBLE with DeepSpeed, not merely disabled by
+   it.** `train.py:1053` gates it on `not args.use_deepspeed`. Tested 2026-09-17 by removing
+   the gate and re-running the same 20-step DeepSpeed smoke: the block compiles, then
+   inductor dies with `BackendCompilerFailed: backend='inductor' raised: AssertionError` at
+   `_inductor/ir.py:5135 require_strides` <- `5146 require_stride_order` <- `graph.py:1571
+   run_node`, exit 1. Consistent with the engine flattening parameters into contiguous
+   buckets so the block's weights arrive as strided views inductor cannot lay out. The gate
+   is load-bearing; `6bc4d48` added it without stating a reason and validated eager only.
+
+   ⚠️ An earlier version of this entry estimated the gate cost ~8% (6.21 vs 6.73 s/it) and
+   put 2-GPU scaling at ~1.85x. That was wrong -- it priced an option that does not exist.
+   The correct comparison is DeepSpeed-without-compile at 2 GPUs vs DeepSpeed-without-compile
+   at 1, and since DeepSpeed matches eager at world_size=1 (result 1 above), **~2x is the
+   right expectation**. The compile win is given up by adopting DeepSpeed at all, and no
+   config change recovers it.
 
 ⚠️ Absolute s/it from these runs (6.2-6.7) is NOT comparable to the production 2.87 s/step:
 20 steps does not amortize startup, compile, or a cold length-bucket sampler. Only the
