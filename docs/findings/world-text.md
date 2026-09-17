@@ -448,6 +448,41 @@ Three things that are load-bearing rather than defensive:
 Verified on CPU against a real Qwen3-0.6B: guard passes on a match and raises on 32000, KL 4.03
 nats, backward clean, teacher `requires_grad=False` throughout. Not yet run on GPU or at scale.
 
+**WHERE the KL applies, and why (2026-09-17, commits 6883bd6 + f978f3e).** A text-only teacher
+cannot supervise text conditioned on something it never saw. For `image_transcription` /
+`voice_transcription` its distribution over the caption is not a worse estimate of the right
+answer — it answers a DIFFERENT question, "what text plausibly follows this text?" — so
+distilling it would teach the student to ignore the very conditioning those tasks exist to
+learn. Gated on `task_type`, which is exact because batches are homogeneous under
+`ModalityGroupedSampler`; `valid_ctx` is a second line of defence.
+
+`--text_distill_all_tasks` (off by default) extends the KL to the pre-media PREFIX of any
+batch. That case is not merely harmless, it is *warranted*: text before BOV/BOI has context
+identical to the student's, because no media has entered the sequence yet. Measured eligibility
+against a real Qwen3-0.6B:
+
+| layout | eligible positions |
+|---|---|
+| `text_continuation` (pure text) | **40/40** |
+| `voice_synthesis` (transcript, BOV@20, placeholders after) | **20/40** — prefix only |
+| interleaved text -> image -> text | **10/40** — leading text only |
+| `image_transcription` (media first, caption after) | **0/40** — fully excluded |
+
+⚠️ **The flag was inert when first written, and silently so.** `--mask_text_loss_in_synthesis`
+sets `skip_text_loss` on synthesis batches, and the KL block was nested inside
+`if ... and not skip_text_loss:` — so on exactly the batches the flag was meant to unlock, the
+whole block was skipped. It failed by producing no `text_distill_kl` entry, which reads as "no
+synthesis batches this window". Fixed by hoisting the KL out of the CE guard and keying it off
+a pre-mask snapshot of the targets: *which positions hold real text* and *which positions CE
+should train on* stop being the same question once synthesis masking is on.
+
+This is defensible against the objection that `--mask_text_loss_in_synthesis` exists to REMOVE
+transcript supervision: that is an argument about what to put a CE on, not about whether the
+text is text. Under the old nesting those positions produced no text gradient at all, so the
+KL is signal recovered from batches contributing nothing — not a reintroduced distraction.
+Note the consequence: with the flag on, synthesis batches carry a text gradient they did not
+have, so such runs are NOT step-comparable to earlier ones.
+
 ---
 
 ## OPEN
