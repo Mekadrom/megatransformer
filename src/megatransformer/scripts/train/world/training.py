@@ -166,6 +166,7 @@ class WorldModelTrainer(CommonTrainer):
         text_distill_teacher=None,
         text_distill_weight: float = 0.0,
         text_distill_temperature: float = 1.0,
+        text_distill_all_tasks: bool = False,
         voice_distill_weight: float = 0.0,
         voice_distill_temperature: float = 1.0,
         # Modality flags
@@ -326,6 +327,7 @@ class WorldModelTrainer(CommonTrainer):
         object.__setattr__(self, "text_distill_teacher", text_distill_teacher)
         self.text_distill_weight = text_distill_weight
         self.text_distill_temperature = max(1e-3, text_distill_temperature)
+        self.text_distill_all_tasks = bool(text_distill_all_tasks)
         if text_distill_teacher is not None:
             # Fail NOW, not 10k steps in. A vocabulary mismatch does not raise on its own --
             # every id still indexes a row -- so this is the only place it gets caught.
@@ -1111,8 +1113,26 @@ class WorldModelTrainer(CommonTrainer):
             # CE supervises one id per position; the teacher supervises the whole
             # distribution. With this corpus at ~17.5 tok/param (about Chinchilla-optimal, so
             # NOT data-rich) the lever is signal-per-token, not more tokens.
+            # TASK GATE. A text-only teacher cannot supervise text that is conditioned on
+            # something it never saw. In image_transcription and voice_transcription the
+            # student is describing an image or transcribing audio; the teacher sees only the
+            # token stream, so its distribution over the caption is not a worse estimate of the
+            # right answer, it is an estimate of a DIFFERENT question ("what text plausibly
+            # follows this text?"). Distilling it would actively teach the student to ignore
+            # the very conditioning those tasks exist to learn.
+            #
+            # Batches are homogeneous under ModalityGroupedSampler, so gating on task_type is
+            # exact. `valid_ctx` in the teacher is a second line of defence and would already
+            # truncate at the first placeholder, but relying on that leaves the intent implicit
+            # and depends on placeholders happening to live above the teacher's vocab.
+            #
+            # --text_distill_all_tasks relaxes this to "the pre-media prefix of any batch",
+            # which is defensible for text->voice synthesis (text positions before BOV have
+            # identical context for teacher and student) but is off by default.
+            _distill_ok = (task_type == "text_continuation"
+                           or getattr(self, "text_distill_all_tasks", False))
             _t_teacher = getattr(self, "text_distill_teacher", None)
-            if _t_teacher is not None and self.text_distill_weight > 0:
+            if _t_teacher is not None and self.text_distill_weight > 0 and _distill_ok:
                 from megatransformer.model.text.distill_teacher import text_distill_kl
                 _t_in = inputs.get("text_token_ids")
                 if _t_in is not None:
@@ -1150,7 +1170,12 @@ class WorldModelTrainer(CommonTrainer):
                                    ).float().mean()
                             loss_components["text_distill_teacher_acc"] = _ta.detach()
                             loss_components["text_distill_agreement"] = _ag.detach()
+                            # Fraction of positions actually supervised, per task, so it is
+                            # visible that the gate is doing what it claims rather than
+                            # silently distilling nothing (or everything).
                             loss_components["text_distill_frac"] = _kl_mask.float().mean().detach()
+                            loss_components[f"text_distill_frac/{task_type}"] = (
+                                _kl_mask.float().mean().detach())
             if duration_only:
                 with torch.no_grad():
                     # Restricted to duration positions: with the bistream exemption on, the
@@ -2898,6 +2923,7 @@ def create_trainer(
         text_distill_teacher=_build_text_distill_teacher(args),
         text_distill_weight=getattr(args, 'text_distill_weight', 0.0),
         text_distill_temperature=getattr(args, 'text_distill_temperature', 1.0),
+        text_distill_all_tasks=getattr(args, 'text_distill_all_tasks', False),
         voice_distill_weight=getattr(args, 'voice_distill_weight', 0.0),
         voice_distill_temperature=getattr(args, 'voice_distill_temperature', 1.0),
         voice_onpolicy_distill=getattr(args, 'voice_onpolicy_distill', False),
@@ -3336,6 +3362,15 @@ def add_cli_args(subparsers):
                             help="KD temperature. Gradient scale is kept temperature-independent "
                                  "by the standard T^2 factor, so the weight means the same thing "
                                  "at any T.")
+    sub_parser.add_argument("--text_distill_all_tasks", action="store_true",
+                            help="Apply the text KL on mixed-modality batches too, confined to "
+                                 "the pre-media prefix. OFF by default: a text-only teacher "
+                                 "supervising a caption or a transcript is answering a "
+                                 "different question than the student (it never saw the image "
+                                 "or the audio), so distilling it teaches the student to ignore "
+                                 "the conditioning those tasks exist to learn. Defensible for "
+                                 "text->voice synthesis, where text positions before BOV have "
+                                 "identical context for both.")
     sub_parser.add_argument("--text_distill_device", type=str, default=None,
                             help="Device for the text teacher (default: cuda). Put it on a "
                                  "second GPU to keep it out of the student's memory budget.")
