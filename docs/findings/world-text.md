@@ -24,7 +24,10 @@ Packing mode, so there is no padding waste — every stored token is real. Store
 max id observed 31999, so the tokenizer is `mistralai/Mistral-7B-v0.1` (the preprocessing
 commands in `logs/huginn_dataset_mixture.md` pass no `--tokenizer_name` and take that default).
 No `config.json` and no `shard_index.json` in the directory, and no raw text is preserved in
-pack mode, so the corpus cannot be re-tokenized in place — it has to be rebuilt from source.
+pack mode. ~~So the corpus cannot be re-tokenized in place — it has to be rebuilt from
+source.~~ **Superseded 2026-09-17** — see "the corpus converts to any tokenizer in an hour"
+below. The inference was that no stored text means no re-tokenization; decoding recovers it
+exactly, which was not tested at the time.
 
 At uint16 the same 5.25B tokens would be 10.5 GB rather than 42 GB; vocab 49161 fits with room
 to spare. Untaken 4x disk saving, noted for whenever the corpus is rebuilt.
@@ -375,6 +378,36 @@ timestep conditioning into the recurrent block — AdaLN-style, which the image 
 does and is a pattern to copy — is a hard prerequisite, not a refinement.
 `initialize_thinking_state` already supports noise init (`"normal"` / `"embed"`), so that
 half is in place.
+
+### The corpus converts to any tokenizer in an hour, so the teacher choice is reversible (2026-09-17)
+`scripts/data/text/retokenize_shards.py` (commit f5b2bcb). Pack mode stores no text, but
+decoding recovers it: split the stream on the source EOS to get documents, decode with the
+source tokenizer, re-encode with the target, re-pack. Measured on the real cache,
+Mistral -> Qwen3:
+
+| | |
+|---|---|
+| decoded text round-trip | **exact**, 194/194 through both tokenizers |
+| source id round-trip | 0/194 — *only* the first token of each document differs (`hip` vs `▁hip`) |
+| token-count ratio | **0.900x** (Qwen3 is denser on English), so 5.25B -> ~4.7B |
+| throughput | ~1.4M tok/s single process, **~1 hour** for the whole corpus |
+| end-to-end check | 51,636 documents both sides, decoded text identical 300/300 |
+
+The id mismatch is SentencePiece writing a word-boundary marker when encoding fresh text, so a
+document that was cut mid-word loses that fact. One token per document, text unchanged.
+
+⭐ **This removes the blocker that has been gating this whole direction, and weakens the
+constraint above it.** "The teacher must be chosen BEFORE the re-preprocessing pass" assumed
+the pass was a multi-terabyte re-download. It is not: the **Mistral cache is the master copy**
+and a tokenizer-specific corpus is a cheap derived artifact. Choosing the wrong teacher now
+costs an hour of CPU, not a re-download of the ~30-source mixture. Tokenizer-family choice is
+still load-bearing for what a run MEANS — do not train an arm on a corpus tokenized for a
+different model — but it is no longer an expensive one-way door.
+
+Consequence for the shared-head ablation in OPEN below: its stated cost was "a full
+re-download-and-preprocess pass". That cost is now an hour, so the decision rule there should
+be re-read — the ablation is much cheaper than recorded, though the Qwen3-teacher argument that
+it answers itself by fiat is unaffected.
 
 ---
 
