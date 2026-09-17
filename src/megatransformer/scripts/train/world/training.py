@@ -1051,6 +1051,7 @@ class WorldModelTrainer(CommonTrainer):
         # NOT a duration bucket.
         duration_only = False
         _dur_keep = None
+        text_targets_unmasked = text_targets
         if skip_text_loss and text_targets is not None:
             _keep = torch.zeros_like(text_targets, dtype=torch.bool)
             if self.emit_duration_token:
@@ -1080,6 +1081,12 @@ class WorldModelTrainer(CommonTrainer):
                 if _bi is not None and _bi.shape[0] == text_targets.shape[0] and bool(_bi.any()):
                     _keep |= _bi.to(text_targets.device).bool().unsqueeze(1).expand_as(_keep)
             if bool(_keep.any()):
+                # Snapshot BEFORE the synthesis mask. The KL needs to know which positions
+                # hold a real text token, which is a different question from which positions
+                # CE should be trained on -- under --mask_text_loss_in_synthesis the transcript
+                # is deliberately not a CE target, but it is still text, and the teacher's
+                # distribution over it is still valid supervision.
+                text_targets_unmasked = text_targets
                 text_targets = text_targets.masked_fill(~_keep, -100)
                 skip_text_loss = False
                 # "duration_only" gates the duration ACCURACY metric, which is only
@@ -1109,73 +1116,6 @@ class WorldModelTrainer(CommonTrainer):
             # independently. Same value, just logged under a task-specific key.
             loss_components[f"text_loss_norm/{task_type}"] = text_loss_norm.detach()
 
-            # --- KL distillation from a frozen text LM ------------------------------------
-            # CE supervises one id per position; the teacher supervises the whole
-            # distribution. With this corpus at ~17.5 tok/param (about Chinchilla-optimal, so
-            # NOT data-rich) the lever is signal-per-token, not more tokens.
-            # TASK GATE. A text-only teacher cannot supervise text that is conditioned on
-            # something it never saw. In image_transcription and voice_transcription the
-            # student is describing an image or transcribing audio; the teacher sees only the
-            # token stream, so its distribution over the caption is not a worse estimate of the
-            # right answer, it is an estimate of a DIFFERENT question ("what text plausibly
-            # follows this text?"). Distilling it would actively teach the student to ignore
-            # the very conditioning those tasks exist to learn.
-            #
-            # Batches are homogeneous under ModalityGroupedSampler, so gating on task_type is
-            # exact. `valid_ctx` in the teacher is a second line of defence and would already
-            # truncate at the first placeholder, but relying on that leaves the intent implicit
-            # and depends on placeholders happening to live above the teacher's vocab.
-            #
-            # --text_distill_all_tasks relaxes this to "the pre-media prefix of any batch",
-            # which is defensible for text->voice synthesis (text positions before BOV have
-            # identical context for teacher and student) but is off by default.
-            _distill_ok = (task_type == "text_continuation"
-                           or getattr(self, "text_distill_all_tasks", False))
-            _t_teacher = getattr(self, "text_distill_teacher", None)
-            if _t_teacher is not None and self.text_distill_weight > 0 and _distill_ok:
-                from megatransformer.model.text.distill_teacher import text_distill_kl
-                _t_in = inputs.get("text_token_ids")
-                if _t_in is not None:
-                    # The teacher scores the SAME inputs the student saw: [:, :-1] is the
-                    # trainer's causal shift, and T_min re-applies the logits/target alignment
-                    # done above so all three line up position-for-position.
-                    #
-                    # That 1:1 correspondence holds for a pure TEXT sequence. In a mixed batch
-                    # the student's logits come from the uninterleaver and media placeholders
-                    # occupy text positions, so the mapping is no longer positional. This does
-                    # not need a separate guard: placeholders ARE control tokens, sitting above
-                    # the teacher's vocab, so `valid_ctx` goes False at the first one and stays
-                    # False -- the KL is simply confined to the clean text prefix rather than
-                    # being computed against misaligned positions.
-                    _t_in = _t_in[:, :-1][:, :T_min].contiguous()
-                    _t_logits, _valid_ctx = _t_teacher(_t_in)
-                    _t_logits = _t_logits[:, :T_min, :]
-                    _valid_ctx = _valid_ctx[:, :T_min]
-                    # Supervise only where CE does, where the teacher's context is clean, and
-                    # where the target is a REAL token -- the teacher has no control tokens and
-                    # its distribution there would be noise.
-                    _kl_mask = (text_targets != -100) & _valid_ctx.to(text_targets.device)
-                    _kl_mask &= text_targets < _t_teacher.vocab_size
-                    if bool(_kl_mask.any()):
-                        _kl = text_distill_kl(logits, _t_logits, _kl_mask,
-                                              temperature=self.text_distill_temperature,
-                                              teacher_vocab=_t_teacher.vocab_size)
-                        total_loss = total_loss + self.text_distill_weight * _kl
-                        loss_components["text_distill_kl"] = _kl.detach()
-                        with torch.no_grad():
-                            _ta = (_t_logits[_kl_mask].argmax(-1).to(text_targets.device)
-                                   == text_targets[_kl_mask]).float().mean()
-                            _ag = (_t_logits[_kl_mask].argmax(-1).to(logits.device)
-                                   == logits[_kl_mask][:, :_t_teacher.vocab_size].argmax(-1)
-                                   ).float().mean()
-                            loss_components["text_distill_teacher_acc"] = _ta.detach()
-                            loss_components["text_distill_agreement"] = _ag.detach()
-                            # Fraction of positions actually supervised, per task, so it is
-                            # visible that the gate is doing what it claims rather than
-                            # silently distilling nothing (or everything).
-                            loss_components["text_distill_frac"] = _kl_mask.float().mean().detach()
-                            loss_components[f"text_distill_frac/{task_type}"] = (
-                                _kl_mask.float().mean().detach())
             if duration_only:
                 with torch.no_grad():
                     # Restricted to duration positions: with the bistream exemption on, the
@@ -1192,6 +1132,71 @@ class WorldModelTrainer(CommonTrainer):
                         loss_components["voice_duration_acc_pm1"] = (
                             (_pred - _tgt).abs() <= 1).float().mean().detach()
 
+
+        # --- KL distillation from a frozen text LM ---------------------------------------
+        # CE supervises one id per position; the teacher supervises the whole distribution.
+        # With this corpus at ~17.5 tok/param (about Chinchilla-optimal, so NOT data-rich) the
+        # lever is signal-per-token, not more tokens.
+        #
+        # Deliberately OUTSIDE the CE guard above. --mask_text_loss_in_synthesis drops the
+        # whole text loss on synthesis batches because the transcript is conditioning rather
+        # than a target -- but that is an argument about what to put a CE on, not about
+        # whether the text is text. Those positions are ordinary causal text with no media
+        # before them, the teacher's context there is identical to the student's, and under
+        # the old nesting they contributed exactly nothing. Distilling them is free signal
+        # from batches that currently produce no text gradient at all.
+        _t_teacher = getattr(self, "text_distill_teacher", None)
+        if (_t_teacher is not None and self.text_distill_weight > 0
+                and logits is not None and text_targets_unmasked is not None):
+            # TASK GATE. A text-only teacher cannot supervise text conditioned on something it
+            # never saw. In image_transcription / voice_transcription the student is describing
+            # an image or transcribing audio; the teacher sees only the token stream, so its
+            # distribution is an answer to a DIFFERENT question ("what text plausibly follows
+            # this text?"). Distilling it would teach the student to ignore the very
+            # conditioning those tasks exist to learn. Batches are homogeneous under
+            # ModalityGroupedSampler, so gating on task_type is exact.
+            #
+            # --text_distill_all_tasks extends this to the pre-media PREFIX of any batch, which
+            # is what makes synthesis transcripts eligible: text before BOV/BOI has identical
+            # context for teacher and student. `valid_ctx` enforces the "pre-media" part.
+            if (task_type == "text_continuation"
+                    or getattr(self, "text_distill_all_tasks", False)):
+                from megatransformer.model.text.distill_teacher import text_distill_kl
+                _t_in = inputs.get("text_token_ids")
+                if _t_in is not None:
+                    _Tk = min(logits.shape[1], text_targets_unmasked.shape[1])
+                    _s_logits = logits[:, :_Tk, :]
+                    _tgt_k = text_targets_unmasked[:, :_Tk]
+                    # The teacher scores the SAME inputs the student saw: [:, :-1] is the
+                    # trainer's causal shift. 1:1 positionally for pure text; in a mixed batch
+                    # the uninterleaver moves things, but placeholders are control tokens above
+                    # the teacher's vocab so `valid_ctx` goes False at the first one and the KL
+                    # confines itself to the clean prefix rather than scoring misaligned slots.
+                    _t_in = _t_in[:, :-1][:, :_Tk].contiguous()
+                    _t_logits, _valid_ctx = _t_teacher(_t_in)
+                    _t_logits = _t_logits[:, :_Tk, :]
+                    _kl_mask = (_tgt_k != -100) & _valid_ctx[:, :_Tk].to(_tgt_k.device)
+                    _kl_mask &= _tgt_k < _t_teacher.vocab_size
+                    if bool(_kl_mask.any()):
+                        _kl = text_distill_kl(_s_logits, _t_logits, _kl_mask,
+                                              temperature=self.text_distill_temperature,
+                                              teacher_vocab=_t_teacher.vocab_size)
+                        total_loss = total_loss + self.text_distill_weight * _kl
+                        loss_components["text_distill_kl"] = _kl.detach()
+                        with torch.no_grad():
+                            _ta = (_t_logits[_kl_mask].argmax(-1).to(_tgt_k.device)
+                                   == _tgt_k[_kl_mask]).float().mean()
+                            _ag = (_t_logits[_kl_mask].argmax(-1).to(_s_logits.device)
+                                   == _s_logits[_kl_mask][:, :_t_teacher.vocab_size].argmax(-1)
+                                   ).float().mean()
+                            loss_components["text_distill_teacher_acc"] = _ta.detach()
+                            loss_components["text_distill_agreement"] = _ag.detach()
+                            # Per-task, so it is visible which batches actually contribute --
+                            # a gate that silently distils nothing looks identical to one that
+                            # is working.
+                            loss_components["text_distill_frac"] = _kl_mask.float().mean().detach()
+                            loss_components[f"text_distill_frac/{task_type}"] = (
+                                _kl_mask.float().mean().detach())
         # Audio: whitened L1+MSE + variance-matching aux loss (masked by feature lengths)
         audio_latent_preds = outputs.get("audio_latent_preds")
         if audio_latent_preds is not None and audio_latent_labels is not None and audio_latent_preds.numel() > 0:
