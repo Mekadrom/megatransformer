@@ -691,6 +691,8 @@ class MegaTransformerWorldModel(nn.Module):
         # Per-sample direction: True = synthesis (text→media), False = transcription
         is_synthesis: Optional[torch.Tensor] = None,
         image_is_synthesis: Optional[torch.Tensor] = None,
+        voice_is_synthesis: Optional[torch.Tensor] = None,
+        audio_is_synthesis: Optional[torch.Tensor] = None,
         # NAR→AR curriculum (Variant B): scalar in [0, 1] that down-scales voice→voice
         # attention in the prelude, recurrent trunk, and voice coda on SYNTHESIS rows.
         # alpha=0 severs voice history (position t sees text + its own shifted-TF frame
@@ -791,12 +793,29 @@ class MegaTransformerWorldModel(nn.Module):
         #     text coda predicts the transcript.
         #   - At inference: autoregressive generation re-encodes each coda
         #     prediction through the prelude (no teacher forcing).
+
+        def _per_media_syn(override, n_media, device):
+            """(B, n_media) bool direction mask for one modality.
+
+            `is_synthesis` is (B,) and SHARED across audio/voice/image, so a row is all-input or
+            all-generated. That cannot express an instruct turn where the user sends a clip and the
+            model answers with one -- and it fails silently, feeding the trunk synthesis features
+            where prelude features belong. A per-modality override fixes that without disturbing
+            the other two. Absent, it broadcasts the row flag, so existing callers are unchanged.
+            """
+            if override is not None:
+                m = override.to(device).bool()
+                return m.unsqueeze(1).expand(batch_size, n_media) if m.dim() == 1 else m
+            if is_synthesis is not None:
+                return is_synthesis.to(device).bool().view(batch_size, 1).expand(batch_size, n_media)
+            return None
         audio_hidden_states = None
         if audio_inputs is not None and self.audio_feature_extractor is not None:
             batch_size, n_audio = audio_inputs.shape[:2]
             audio_flat = audio_inputs.view(batch_size * n_audio, *audio_inputs.shape[2:])
+            aud_syn = _per_media_syn(audio_is_synthesis, n_audio, audio_inputs.device)
 
-            if is_synthesis is not None and is_synthesis.any():
+            if aud_syn is not None and aud_syn.any():
                 d_model = self.config.text_prelude_config.d_model
                 # Shift: encode frames [0..T-2], prepend zero at position 0
                 shifted_input = audio_flat[:, :, :-1]  # (B*N, C, T-1)
@@ -804,7 +823,7 @@ class MegaTransformerWorldModel(nn.Module):
                 zero_prefix = torch.zeros(shifted_hidden.shape[0], 1, d_model, device=shifted_hidden.device, dtype=shifted_hidden.dtype)
                 synth_hidden = torch.cat([zero_prefix, shifted_hidden], dim=1)  # (B*N, T, d_model)
 
-                if is_synthesis.all():
+                if aud_syn is not None and aud_syn.all():
                     audio_hidden_states = synth_hidden.view(batch_size, n_audio, synth_hidden.shape[1], d_model)
                 else:
                     # Mixed batch: run prelude normally for transcription samples
@@ -813,8 +832,9 @@ class MegaTransformerWorldModel(nn.Module):
                     audio_hidden_states = normal_hidden.view(batch_size, n_audio, seq_len, d_model).clone()
                     synth_view = synth_hidden.view(batch_size, n_audio, synth_hidden.shape[1], d_model)
                     for b in range(batch_size):
-                        if is_synthesis[b]:
-                            audio_hidden_states[b] = synth_view[b]
+                        for i in range(n_audio):
+                            if aud_syn[b, i]:
+                                audio_hidden_states[b, i] = synth_view[b, i]
             else:
                 audio_hidden_flat = self.audio_feature_extractor(audio_flat)
                 seq_len, d_model = audio_hidden_flat.shape[1], audio_hidden_flat.shape[2]
@@ -825,8 +845,9 @@ class MegaTransformerWorldModel(nn.Module):
         if voice_inputs is not None and self.voice_feature_extractor is not None:
             batch_size, n_voice = voice_inputs.shape[:2]
             voice_flat = voice_inputs.view(batch_size * n_voice, *voice_inputs.shape[2:])
+            voc_syn = _per_media_syn(voice_is_synthesis, n_voice, voice_inputs.device)
 
-            if is_synthesis is not None and is_synthesis.any():
+            if voc_syn is not None and voc_syn.any():
                 d_model = self.config.text_prelude_config.d_model
                 if self.voice_gen_query_mode is not None:
                     # GEN-QUERY synthesis: the trunk's voice input is a learned per-position query
@@ -867,7 +888,7 @@ class MegaTransformerWorldModel(nn.Module):
                     zero_prefix = torch.zeros(shifted_hidden.shape[0], 1, d_model, device=shifted_hidden.device, dtype=shifted_hidden.dtype)
                     synth_hidden = torch.cat([zero_prefix, shifted_hidden], dim=1)  # (B*N, T, d_model)
 
-                if is_synthesis.all():
+                if voc_syn is not None and voc_syn.all():
                     voice_hidden_states = synth_hidden.view(batch_size, n_voice, synth_hidden.shape[1], d_model)
                 else:
                     normal_hidden = self.voice_feature_extractor(voice_flat)
@@ -875,8 +896,9 @@ class MegaTransformerWorldModel(nn.Module):
                     voice_hidden_states = normal_hidden.view(batch_size, n_voice, seq_len, d_model).clone()
                     synth_view = synth_hidden.view(batch_size, n_voice, synth_hidden.shape[1], d_model)
                     for b in range(batch_size):
-                        if is_synthesis[b]:
-                            voice_hidden_states[b] = synth_view[b]
+                        for i in range(n_voice):
+                            if voc_syn[b, i]:
+                                voice_hidden_states[b, i] = synth_view[b, i]
             else:
                 voice_hidden_flat = self.voice_feature_extractor(voice_flat)
                 seq_len, d_model = voice_hidden_flat.shape[1], voice_hidden_flat.shape[2]
@@ -888,24 +910,12 @@ class MegaTransformerWorldModel(nn.Module):
             batch_size, n_images = image_inputs.shape[:2]
             image_flat = image_inputs.view(batch_size * n_images, *image_inputs.shape[2:])
 
-            # PER-IMAGE direction. `is_synthesis` is (B,) and shared with audio/voice, so a row is
-            # all-input or all-generated -- which cannot express an instruct turn where the user
-            # supplies one image and the model generates another. `image_is_synthesis` is (B, N)
-            # and overrides it for images only. Absent, it broadcasts the row flag, so every
-            # existing caller is bit-identical (verified: same loss to 8 dp).
-            # ⚠️ SCOPE: this selects PRELUDE vs GEN-QUERY features per image, which is the part
-            # that silently feeds the trunk the wrong thing. The conditioning LOSS is still
-            # row-level -- `sample_mask=is_synthesis` and `image_cond_labels` are (B, ...) with no
-            # image axis -- so a row with one input and one generated image trains on a single
-            # target. Instruct finetune needs per-image labels too; that is a collator change.
-            if image_is_synthesis is not None:
-                img_syn = image_is_synthesis.to(image_inputs.device).bool()
-                if img_syn.dim() == 1:
-                    img_syn = img_syn.unsqueeze(1).expand(batch_size, n_images)
-            elif is_synthesis is not None:
-                img_syn = is_synthesis.to(image_inputs.device).bool().view(batch_size, 1).expand(batch_size, n_images)
-            else:
-                img_syn = None
+            # Per-image direction; see _per_media_syn. ⚠️ SCOPE: this selects PRELUDE vs GEN-QUERY
+            # features per example, which is the part that silently feeds the trunk the wrong
+            # thing. The conditioning LOSS is still row-level -- sample_mask and image_cond_labels
+            # have no media axis -- so a row mixing an input and a generated example trains
+            # against a single target. Instruct finetune needs per-example labels: collator work.
+            img_syn = _per_media_syn(image_is_synthesis, n_images, image_inputs.device)
 
             # Build generation queries (used at all synthesis-direction image
             # positions). Either learned + 2D PE or PE-only depending on mode.
