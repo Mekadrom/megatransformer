@@ -97,6 +97,26 @@ def parse_args():
                         "the prompt-conditional residual (norm ~3.5, i.e. ~4%%). This feeds "
                         "mu + gain*r to the head. gain=1.0 is a no-op. Calibrates mu over the "
                         "prompt list in one extra pass. See scripts_local/trunk_compression_probe.py.")
+    p.add_argument("--image_exit_eligible", action="store_true",
+                   help="Let IMAGE gen-query positions exit early. They are exempt by default "
+                        "(world_model._exit_eligibility masks text/voice only), so no criterion "
+                        "fires on them and the trunk always runs its full budget. The iteration "
+                        "sweep measured CLIPScore flat from 8 to 32 iterations (+0.0005 for 4x the "
+                        "compute), so there is real headroom -- this flag measures whether a "
+                        "criterion actually lands in that flat region.")
+    p.add_argument("--exit_criteria", type=str, default=None,
+                   choices=["kl_divergence", "latent_diff", "logit_kl", "none"],
+                   help="Override the recurrent trunk's early-exit criterion for this eval. The "
+                        "shipped default is the LEGACY kl_divergence, which applies F.kl_div to "
+                        "post-norm activations -- a signed quantity, so `value < threshold` passes "
+                        "whenever it goes negative. Image generation is hit unmasked: "
+                        "world_model.py passes no converge_eligible, so gen-query positions freeze "
+                        "at ARBITRARY depths mid-pass. Measured image evals run 12-23 of a 32 "
+                        "budget. 'none' is the honest control: 32 is the depth the model trained "
+                        "at. 'latent_diff' is Huginn's own readout-free criterion (threshold 0.03).")
+    p.add_argument("--exit_threshold", type=float, default=None,
+                   help="Threshold for --exit_criteria. Defaults: latent_diff 0.03, others keep "
+                        "the config value.")
     p.add_argument("--flow_steps", type=int, default=None,
                    help="Override the conditioning sampler's Euler step count (config default 8). "
                         "Applies to the T3/T5 parallel head and the T4 AR head alike. More steps "
@@ -303,6 +323,30 @@ def main():
         return (int(ni) if ni is not None else -1), [float(x) for x in kl]
 
     _adapter = model.image_generator
+
+    if args.exit_criteria is not None:
+        # Named _crit_* deliberately: `_m` at the top of this function is the metrics module, and
+        # shadowing it once already broke every --flow_steps eval.
+        from megatransformer.model import recurrent_criteria as _crit_mod
+        _crit_rb = model.recurrent_block
+        _crit_thr = args.exit_threshold
+        if args.exit_criteria == "none":
+            _crit_new = _crit_mod.NoOpCriteria()
+        elif args.exit_criteria == "latent_diff":
+            _crit_new = _crit_mod.LatentDiffCriteria(0.03 if _crit_thr is None else _crit_thr)
+        elif args.exit_criteria == "logit_kl":
+            _crit_new = _crit_mod.LogitKLCriteria(5e-4 if _crit_thr is None else _crit_thr)
+        else:
+            _crit_new = _crit_mod.KLDivergenceCriteria(
+                _crit_rb.exit_criteria_threshold if _crit_thr is None else _crit_thr)
+        print(f"[exit_criteria] {type(_crit_rb.exit_criteria).__name__} -> "
+              f"{type(_crit_new).__name__} (budget {_crit_rb.mean_thinking_steps})")
+        _crit_rb.exit_criteria = _crit_new
+
+    if args.image_exit_eligible:
+        # Sets the real config field, so this exercises the same path a training run would.
+        model.config.recurrent_block_config.image_exit_eligible = True
+        print("[image_exit_eligible] image gen-query positions may now exit early")
 
     if args.flow_steps is not None:
         # Euler steps for the conditioning sampler. Both heads read self.steps when sample() is

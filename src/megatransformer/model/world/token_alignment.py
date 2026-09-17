@@ -204,6 +204,7 @@ class TokenInterleaver(nn.Module):
         voice_hidden_states: Optional[torch.Tensor] = None,
         voice_lengths: Optional[torch.Tensor] = None,
         image_hidden_states: Optional[torch.Tensor] = None,
+        image_lengths: Optional[torch.Tensor] = None,
         voice_chunk_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -373,8 +374,19 @@ class TokenInterleaver(nn.Module):
                         torch.full((length,), MODALITY_VOICE, dtype=torch.long, device=device)
                     )
                 elif modality == "image":
-                    # Images are fixed size (all patches)
-                    media_chunk = batch_image[ex_idx]  # (n_patches, d_model)
+                    # Per-sample length when given (AR conditioning: one position per real Qwen
+                    # token), else the full fixed chunk. Audio and voice have always sliced this
+                    # way -- image was hardcoded to the whole block, which is what pinned the
+                    # conditioning sequence to a fixed K.
+                    if image_lengths is not None:
+                        # (B, n_images) indexes both; a 1-D tensor is PER-SAMPLE, so it indexes
+                        # by batch_idx -- indexing it by ex_idx gives every row the first row's
+                        # length, which silently collapses the batch to one length.
+                        _ilen = int(image_lengths[batch_idx, ex_idx]) if image_lengths.dim() > 1 \
+                                else int(image_lengths[batch_idx])
+                        media_chunk = batch_image[ex_idx, :_ilen]
+                    else:
+                        media_chunk = batch_image[ex_idx]  # (n_patches, d_model)
                     tokens_to_concat.append(media_chunk)
                     modalities_to_concat.append(
                         torch.full((media_chunk.shape[0],), MODALITY_IMAGE, dtype=torch.long, device=device)

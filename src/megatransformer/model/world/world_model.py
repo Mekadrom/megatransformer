@@ -28,6 +28,7 @@ from megatransformer.model.image.zimage_adapter import ZImageConditioningAdapter
 from megatransformer.model.world.kv_cache import RecurrentKVCache
 from megatransformer.model.world.recurrent import MegatransformerRecurrentBlock
 from megatransformer.model.world.token_alignment import (
+    MODALITY_IMAGE,
     MODALITY_TEXT,
     MODALITY_VOICE,
     TokenInterleaver,
@@ -211,6 +212,21 @@ class MegaTransformerWorldModel(nn.Module):
             # Sized to the gen query grid (nps_gen × nps_gen), which may differ
             # from the prelude's patch grid.
             self.image_gen_pos_embedding = Sinusoidal2DPositionalEmbedding(nps_gen, d_model)
+
+            # AR-through-trunk feedback path. `image_ar_in` is the mirror of the adapter's output
+            # head: it maps a conditioning token (seq_dim, WHITENED space -- the space the head
+            # predicts in) back to trunk width so it can be the next position's input.
+            self.image_gen_ar = bool(getattr(config, "image_gen_ar", False))
+            if self.image_gen_ar:
+                _icfg = config.image_coda_config
+                if not getattr(_icfg, "coda_positionwise", False):
+                    raise ValueError(
+                        "image_gen_ar requires image_coda_config.coda_positionwise=True: the "
+                        "default coda runs in_proj/self_enc/cross_dec, all of which mix positions, "
+                        "so conditioning token i would depend on tokens after it and the "
+                        "generation loop could not be unrolled.")
+                self.image_ar_in = nn.Linear(_icfg.seq_dim, d_model)
+                self.image_ar_bos = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
         # Voice/audio use teacher forcing during training (ground-truth SIVE
         # through the prelude) and autoregressive generation at inference
@@ -551,6 +567,11 @@ class MegaTransformerWorldModel(nn.Module):
         elig = {"text": modality_map == MODALITY_TEXT}
         if self.voice_generator is not None and getattr(self, "voice_codebook", None) is not None:
             elig["voice"] = modality_map == MODALITY_VOICE
+        if getattr(self.config.recurrent_block_config, "image_exit_eligible", False):
+            # Readout-free by design: the image coda is a flow-matching DiT with no logits, so
+            # this key intentionally has no entry in _exit_readouts(). Only a readout-free
+            # criterion (latent_diff) can score it.
+            elig["image"] = modality_map == MODALITY_IMAGE
         return elig
 
     def _trunk_readout_text_cached(self, latents: torch.Tensor,
@@ -861,6 +882,7 @@ class MegaTransformerWorldModel(nn.Module):
                 voice_hidden_states = voice_hidden_flat.view(batch_size, n_voice, seq_len, d_model)
 
         image_hidden_states = None
+        image_ar_lengths = None   # per-sample image block length; None = fixed full chunk
         if image_inputs is not None and self.image_feature_extractor is not None:
             batch_size, n_images = image_inputs.shape[:2]
             image_flat = image_inputs.view(batch_size * n_images, *image_inputs.shape[2:])
@@ -868,7 +890,29 @@ class MegaTransformerWorldModel(nn.Module):
             # Build generation queries (used at all synthesis-direction image
             # positions). Either learned + 2D PE or PE-only depending on mode.
             if is_synthesis is not None and is_synthesis.any():
-                if hasattr(self, 'image_gen_queries'):
+                if getattr(self, "image_gen_ar", False) and image_cond_labels is not None:
+                    # TEACHER FORCING: position i receives conditioning token i-1, position 0 a
+                    # learned BOS. The 2D positional embedding is still added so positions keep
+                    # their identity; only the CONTENT changes from a fixed learned query to the
+                    # previous token. Labels arrive in raw Qwen space -- whiten them here so the
+                    # feedback lives in the same space the head predicts in.
+                    _gen = self.image_generator
+                    _lab = image_cond_labels
+                    if getattr(_gen, "whiten", False):
+                        _lab = (_lab - _gen.whiten_mean.view(1, 1, -1)) / _gen.whiten_std.view(1, 1, -1)
+                    # One trunk position per REAL conditioning token, per sample. No fixed grid:
+                    # the 2D sinusoidal PE assumed a square patch layout, which is meaningless for
+                    # a causal token sequence -- the trunk's own RoPE carries position instead.
+                    _n = _lab.shape[1]
+                    _prev = torch.cat([self.image_ar_bos.expand(batch_size, -1, -1).to(_lab.dtype),
+                                       self.image_ar_in(_lab[:, :_n - 1])], dim=1)
+                    raw_gen_queries = _prev
+                    if image_cond_mask is not None:
+                        image_ar_lengths = image_cond_mask.sum(dim=1).clamp_min(1)
+                    else:
+                        image_ar_lengths = torch.full((batch_size,), _n, dtype=torch.long,
+                                                      device=_lab.device)
+                elif hasattr(self, 'image_gen_queries'):
                     raw_gen_queries = self.image_gen_pos_embedding(self.image_gen_queries).expand(batch_size, -1, -1)
                 else:
                     raw_gen_queries = self.image_gen_pos_embedding.pe.expand(batch_size, -1, -1)
@@ -916,6 +960,7 @@ class MegaTransformerWorldModel(nn.Module):
             voice_hidden_states=voice_hidden_states,
             voice_lengths=voice_lengths,
             image_hidden_states=image_hidden_states,
+            image_lengths=image_ar_lengths,
             voice_chunk_map=voice_chunk_map,
         )
 
@@ -1097,7 +1142,10 @@ class MegaTransformerWorldModel(nn.Module):
                     clip_pooled_labels=image_clip_pooled_labels,
                     sample_mask=is_synthesis,
                 )
-                outputs["image_clip_seq_pred"] = cross_outputs["image_clip_seq_pred"]
+                # Conditional for the same reason image_clip_mse_loss is: the position-wise coda
+                # has no point head, so a training-direction call returns losses only.
+                if "image_clip_seq_pred" in cross_outputs:
+                    outputs["image_clip_seq_pred"] = cross_outputs["image_clip_seq_pred"]
                 outputs["image_clip_pooled_pred"] = cross_outputs["image_clip_pooled_pred"]
                 if "image_clip_loss" in cross_outputs:
                     outputs["image_clip_loss"] = cross_outputs["image_clip_loss"]
@@ -1112,7 +1160,10 @@ class MegaTransformerWorldModel(nn.Module):
                     cond_length=cond_length,
                     sample_mask=is_synthesis,
                 )
-                outputs["image_clip_seq_pred"] = cross_outputs["image_clip_seq_pred"]
+                # Conditional for the same reason image_clip_mse_loss is: the position-wise coda
+                # has no point head, so a training-direction call returns losses only.
+                if "image_clip_seq_pred" in cross_outputs:
+                    outputs["image_clip_seq_pred"] = cross_outputs["image_clip_seq_pred"]
                 if "image_clip_loss" in cross_outputs:
                     outputs["image_clip_loss"] = cross_outputs["image_clip_loss"]
                     # T4 AR emits no point-head MSE (its target is variable-length), so this
@@ -1351,6 +1402,8 @@ class MegaTransformerWorldModel(nn.Module):
         precomputed_latents: bool = True,
         share_kv_cache: bool = False,
         image_iteration_override: Optional[int] = None,
+        image_cond_length: Optional[int] = None,
+        image_stop_threshold: Optional[float] = None,
         image_num_inference_steps: Optional[int] = None,
         image_sampler: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -2412,15 +2465,81 @@ class MegaTransformerWorldModel(nn.Module):
                         hit_context_limit = True
                         break
                     # Run through recurrent block (single pass, all 256 at once)
-                    image_hidden, _, image_iters, _, _ = self.recurrent_block(
-                        image_input * self.embed_scale,
-                        attention_mask=None,
-                        kv_cache=kv_cache,
-                        position_offset=position_offset,
-                        use_cache=True,
-                        share_kv_cache=share_kv_cache,
-                        max_iterations_override=image_iteration_override,
-                    )
+                    # converge_eligible mirrors forward()'s _exit_eligibility: OFF by default, so
+                    # every gen-query position runs the full budget. Without this argument the
+                    # criterion fires UNMASKED on all 256 positions, freezing them at arbitrary
+                    # depths mid-pass -- which is what the legacy kl_divergence did here.
+                    def _img_elig_for(_t):
+                        # NOT None when exempt. recurrent.py sets `eligible_any = converge_eligible`,
+                        # so None makes EVERY position eligible and the criterion fires unmasked --
+                        # the opposite of exempt. forward() exempts image by leaving it out of the
+                        # mask dict entirely, which makes eligible_any False there; the equivalent
+                        # here is an all-False mask.
+                        _on = getattr(self.config.recurrent_block_config, "image_exit_eligible", False)
+                        return {"image": torch.full(_t.shape[:2], bool(_on), dtype=torch.bool,
+                                                    device=_t.device)}
+
+                    if getattr(self, "image_gen_ar", False):
+                        # AR-THROUGH-TRUNK, O(L). The trunk is the causal backbone and the coda is
+                        # position-wise, so token i needs only its OWN trunk state -- no re-running
+                        # anything over the growing prefix. Length is a BUDGET, not an architectural
+                        # bound: run until image_token_budget or a caller-supplied stop.
+                        _gen = self.image_generator
+                        _prev = self.image_ar_bos.to(device=device, dtype=current_hidden.dtype)
+                        _states, _emitted, _iters = [], [], []
+                        # LENGTH. Conditioning tokens are continuous, so there is no EOI symbol the
+                        # model can emit the way the voice arm emits EOV -- a vocabulary stop is
+                        # simply unavailable here. Three ways to end, in order of preference:
+                        #  1. image_cond_length: the caption's own Qwen3 token count. DETERMINISTIC
+                        #     from the input, so no stop mechanism is needed at all; this is what
+                        #     the T3/T4 eval path already does (_ar_length in eval_zimage_adapter).
+                        #  2. image_stop_threshold: halt when the emitted token's norm falls below
+                        #     it. A heuristic -- no training signal says a short token means "done".
+                        #  3. the budget, as a hard cap.
+                        _n_steps = int(image_cond_length or image_token_budget)
+                        for _i in range(min(_n_steps, image_token_budget)):
+                            if _trunk_limit is not None and position_offset + _i >= _trunk_limit:
+                                hit_context_limit = True
+                                break
+                            _h, _, _it, _, _ = self.recurrent_block(
+                                _prev * self.embed_scale,
+                                attention_mask=None,
+                                kv_cache=kv_cache,
+                                position_offset=position_offset + _i,
+                                use_cache=True,
+                                share_kv_cache=share_kv_cache,
+                                max_iterations_override=image_iteration_override,
+                                converge_eligible=_img_elig_for(_prev),
+                            )
+                            _states.append(_h); _iters.append(int(_it))
+                            # Sample THIS position only, then feed it back. Whitened space
+                            # throughout: image_ar_in mirrors the coda's output space.
+                            _tok = _gen.pw_coda.sample(
+                                _h, generator=getattr(_gen, "flow_generator", None),
+                                guidance=None)   # coda's configured guidance
+                            _emitted.append(_tok)
+                            if image_stop_threshold is not None and \
+                                    float(_tok.norm(dim=-1).mean()) < image_stop_threshold:
+                                break
+                            _prev = self.image_ar_in(_tok.to(self.image_ar_in.weight.dtype)).to(current_hidden.dtype)
+                        if not _states:
+                            break
+                        image_hidden = torch.cat(_states, dim=1)
+                        image_ar_tokens = torch.cat(_emitted, dim=1)
+                        image_iters = sum(_iters) / max(len(_iters), 1)
+                        position_offset += len(_states) - image_token_budget   # net of the += below
+                    else:
+                        image_ar_tokens = None
+                        image_hidden, _, image_iters, _, _ = self.recurrent_block(
+                            image_input * self.embed_scale,
+                            attention_mask=None,
+                            kv_cache=kv_cache,
+                            position_offset=position_offset,
+                            use_cache=True,
+                            share_kv_cache=share_kv_cache,
+                            max_iterations_override=image_iteration_override,
+                            converge_eligible=_img_elig_for(image_input),
+                        )
                     image_recurrent_iterations[b].append(int(image_iters))
                     position_offset += image_token_budget
 

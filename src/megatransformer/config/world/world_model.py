@@ -116,6 +116,18 @@ class MegaTransformerRecurrentConfig:
     #                   fresh small_sum). Kept as the default ONLY so historical eval
     #                   numbers stay reproducible -- see docs/findings/world-text.md.
     #                   Do not use it for new evaluation.
+    # Let IMAGE gen-query positions exit early. OFF by default: image is deliberately exempt in
+    # _exit_eligibility, so the trunk always runs its full budget on gen queries, and every
+    # world-image number on record was produced that way. Turning this on changes generation, so
+    # results either side of it are not comparable -- opt in per run, do not flip it globally.
+    # Measured 2026-09-16 on t3_xskip/ckpt-97000, 8-prompt probe, w=3, n_samples=1:
+    #   exempt (32 iters)          CLIPScore 0.356
+    #   eligible + latent_diff .03 14.2 iters, 0.359   <- 2.25x less trunk compute, quality held
+    #   eligible + latent_diff .01 20.4 iters, 0.353
+    #   eligible + kl_divergence   16.8 iters, 0.352   (the broken criterion; do not pair with this)
+    # Pair with exit_criteria="latent_diff": it is readout-free, so the flow-matching image coda
+    # needs no logits, and it is scale-free so the threshold transfers.
+    image_exit_eligible: bool = False
     exit_criteria: str = "kl_divergence"
     exit_criteria_threshold: float = 1e-4  # note: logit_kl wants 5e-4 (paper) / 1e-3 (ref code)
     lockstep_n: bool = False
@@ -284,6 +296,19 @@ class MegaTransformerWorldModelConfig:
     # (each ~O(1/sqrt(n_blocks)) via depth-scaled residual init) compete on
     # equal footing from the first layer.
     image_gen_query_init_std: float = 3.0
+    # AR-THROUGH-TRUNK image conditioning. OFF by default.
+    # Default path: every image position gets a FIXED learned query (image_gen_queries + 2D PE).
+    # The trunk is already causal, so that single pass is structurally a teacher-forced causal
+    # forward -- but nothing is ever fed back, so there is no sequence to unroll and generation is
+    # single-shot.
+    # With this on, position i instead receives a projection of the conditioning token at i-1
+    # (ground truth while training, the model's own sample at inference), which is what makes the
+    # path genuinely autoregressive.
+    # REQUIRES image_coda_config.use_cross_dec=False and ar_causal_enc=True: cross_dec mixes all
+    # 64 slots, and self_enc is bidirectional unless masked, either of which would let token i see
+    # tokens after it.
+    # COST: generation becomes n_image_gen_positions sequential trunk passes instead of one.
+    image_gen_ar: bool = False
     # LEVER D: subtract a LEARNED PER-POSITION offset from the trunk's gen-query output before
     # the image coda. The conditioning arrives as ~10% of a large per-position constant (the
     # learned gen queries, norm ~83, which survive the trunk largely intact). The existing
@@ -732,6 +757,15 @@ WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_trunkctx"].image_coda_config.flow
 # makes cross_dec's K -> seq_len remap identity-shaped anyway; the adapter raises if they differ.
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip"])
 WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec"].image_coda_config.use_cross_dec = False
+
+# AR-THROUGH-TRUNK: the trunk itself consumes the previous conditioning token instead of a fixed
+# learned query, so the 64 conditioning slots are produced autoregressively rather than in one
+# shot. Built on the nocrossdec preset because the chain must stay position-wise: cross_dec off,
+# self_enc causally masked. Targets stay K=64 (the trunk's image block is a fixed 64 positions;
+# native length here would need variable-length interleaving, which is a separate change).
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_ar_trunk"] = copy.deepcopy(WORLD_MODEL_CONFIGS["small_sum_zimage_t3_xskip_nocrossdec"])
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_ar_trunk"].image_gen_ar = True
+WORLD_MODEL_CONFIGS["small_sum_zimage_t3_ar_trunk"].image_coda_config.coda_positionwise = True
 
 # LEVER D: learned per-position centering of the trunk's gen-query output (see
 # `image_gen_out_offset`). Tests whether an explicit constant-remover buys what `cross_dec`

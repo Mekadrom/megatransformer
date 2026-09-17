@@ -60,6 +60,24 @@ class ZImageConditioningAdapter(nn.Module):
             activation="gelu", batch_first=True, norm_first=True)
         self.self_enc = nn.TransformerEncoder(enc, config.n_layers)
 
+        # POSITION-WISE CODA (AR-through-trunk). The trunk is already the causal backbone, so this
+        # mode bypasses in_proj/self_enc/cross_dec entirely -- all three mix positions -- and maps
+        # each trunk state to its own conditioning token with a per-token velocity net. Causality
+        # is then structural rather than masked, generation is O(L), and the sequence length is
+        # whatever the interleaver gave the image block.
+        self.pw_coda = None
+        if bool(getattr(config, "coda_positionwise", False)):
+            from megatransformer.model.image.pw_flow_coda import PositionwiseFlowCoda
+            self.pw_coda = PositionwiseFlowCoda(
+                seq_dim=config.seq_dim, ctx_dim=config.d_model,
+                dim=int(getattr(config, "ar_dim", 512)),
+                flow_layers=int(getattr(config, "ar_flow_layers", 3)),
+                steps=int(getattr(config, "flow_steps", 8)),
+                time_sampling=getattr(config, "flow_time_sampling", "logit_normal"),
+                cfg_dropout=float(getattr(config, "flow_cfg_dropout", 0.0)),
+                guidance=float(getattr(config, "flow_guidance", 1.0)),
+                x_skip=bool(getattr(config, "flow_x_skip", False)))
+
         # cross_dec (the Q-Former) is optional. use_cross_dec=False drops it and out_queries
         # ENTIRELY -- no params, no compute, no gradient path -- and the aux point head then
         # reads the self_enc'd trunk states. Contrast flow_ctx="trunk", which only reroutes the
@@ -317,6 +335,25 @@ class ZImageConditioningAdapter(nn.Module):
         latent_labels=None,             # accepted + ignored (shared generator call signature)
         **kw,
     ):
+        if self.pw_coda is not None:
+            # Trunk states ARE the per-position context; nothing upstream of the velocity net.
+            ctx = encoder_hidden_states
+            mask = kw.get("cond_mask")
+            if cond_labels is None:
+                surf = self.pw_coda.sample(
+                    ctx, steps=kw.get("flow_steps"),
+                    generator=kw.get("flow_generator", getattr(self, "flow_generator", None)),
+                    guidance=kw.get("flow_guidance"))
+                if self.whiten:
+                    surf = surf * self.whiten_std.view(1, 1, -1) + self.whiten_mean.view(1, 1, -1)
+                return {"image_clip_seq_pred": surf}
+            tgt = ((cond_labels - self.whiten_mean.view(1, 1, -1)) / self.whiten_std.view(1, 1, -1)
+                   if self.whiten else cond_labels)
+            if sample_mask is not None and mask is not None and mask.shape[0] == sample_mask.shape[0]:
+                mask = mask[sample_mask.bool()]
+            loss = self.pw_coda.loss(tgt, ctx, mask=mask)
+            return {"image_clip_loss": loss, "image_flow_loss": loss.detach()}
+
         x = self.in_proj(encoder_hidden_states)          # (B, K_in, d)
         x = self.self_enc(x)
         if self.use_cross_dec:

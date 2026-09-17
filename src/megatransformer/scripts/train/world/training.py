@@ -2410,6 +2410,7 @@ def load_model(args, device='cuda'):
                       getattr(args, 'mean_thinking_steps', None) is not None or
                       getattr(args, 'image_contrastive_queue_size', None) is not None or
                       getattr(args, 'image_flow_aux_mse_weight', None) is not None or
+                      getattr(args, 'image_exit_eligible', False) or
                       getattr(args, 'voice_stochastic_output', False) or
                       getattr(args, 'use_mrope', False))
     if needs_override:
@@ -2510,6 +2511,8 @@ def load_model(args, device='cuda'):
                 raise SystemExit("--image_flow_aux_mse_weight requires a Z-Image adapter config "
                                  f"(got {type(config.image_coda_config).__name__}).")
             config.image_coda_config.flow_aux_mse_weight = float(args.image_flow_aux_mse_weight)
+        if getattr(args, 'image_exit_eligible', False):
+            config.recurrent_block_config.image_exit_eligible = True
         if getattr(args, 'voice_predict_f0', False):
             config.voice_coda_config.predict_f0 = True
         if getattr(args, 'voice_dedup', False):
@@ -2892,6 +2895,14 @@ def add_cli_args(subparsers):
                                  "(~1e-4) while the Q-Former beside it stays slow; both live under "
                                  "image_generator.*, so --lr_dit alone cannot separate them. "
                                  "Defaults to --lr_dit. Follows the DiT LR schedule.")
+    sub_parser.add_argument("--image_exit_eligible", action="store_true",
+                            help="Let IMAGE gen-query positions exit the recurrent trunk early. "
+                                 "They are exempt by default, so the trunk runs its full budget on "
+                                 "every gen query. Measured 2026-09-16: with --exit_criteria "
+                                 "latent_diff (0.03) this drops 32 iterations to 14.2 with "
+                                 "CLIPScore held (0.356 -> 0.359), i.e. ~2.25x less trunk compute. "
+                                 "Pair it with latent_diff: the legacy kl_divergence is numerically "
+                                 "broken and the image coda has no logits for logit_kl.")
     sub_parser.add_argument("--image_flow_aux_mse_weight", type=float, default=None,
                             help="Z-Image adapter: override flow_aux_mse_weight (config default 0.1). "
                                  "Set 0.0 to train a PURE sampler. seq_head then gets ZERO gradient and "

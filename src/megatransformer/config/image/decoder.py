@@ -500,6 +500,11 @@ class ZImageAdapterConfig:
     #   targets at ar_max_len, and the caption corpus averages 19.77 Qwen3 tokens, so anything past
     #   ~40 positions is extrapolation until longer captions are actually trained on.
     ar_pos_mode: str = "learned"
+    # Position-wise coda: map each TRUNK state to its own conditioning token with a per-token
+    # velocity net, bypassing in_proj/self_enc/cross_dec (all of which mix positions). Required by
+    # the AR-through-trunk path (world config image_gen_ar) -- with the trunk as the causal
+    # backbone, causality is structural, generation is O(L), and length is unbounded.
+    coda_positionwise: bool = False
     flow_cfg_dropout: float = 0.1
     flow_guidance: float = 1.0             # inference w; 1.0 = off (single forward per step)
 
