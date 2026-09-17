@@ -131,10 +131,21 @@ def get_training_args(args, run_dir) -> TrainingArguments:
         dataloader_persistent_workers=args.dataloader_num_workers > 0,
         dataloader_prefetch_factor=6 if args.dataloader_num_workers > 0 else None,
     )
-    # If the Z-Image target encoder lives on a separate (2nd visible) GPU, keep the
-    # Trainer single-GPU so it doesn't nn.DataParallel-wrap the world model across both
-    # cards (the training model stays on cuda:0; the target encoder sits on cuda:1).
-    if getattr(args, "image_target_device", None) and not args.use_deepspeed:
+    # If a FROZEN side model lives on a separate (2nd visible) GPU, keep the Trainer
+    # single-GPU so it doesn't nn.DataParallel-wrap the world model across both cards
+    # (the training model stays on cuda:0; the frozen model sits on cuda:1).
+    #
+    # This is not optional once a second GPU is visible: Trainer._wrap_model wraps in
+    # nn.DataParallel whenever args.n_gpu > 1, and DataParallel replicates the module per
+    # batch and scatters the inputs -- which this model's multi-task heads and recurrent
+    # trunk are not built for. Setting `_n_gpu = 1` after forcing `_setup_devices` is the
+    # supported way to say "one process, one card" without going distributed.
+    #
+    # Applies to the Z-Image target encoder and the text distillation teacher alike; both
+    # are frozen models that only need to be reachable, not trained.
+    _side_model_device = (getattr(args, "image_target_device", None)
+                          or getattr(args, "text_distill_device", None))
+    if _side_model_device and not args.use_deepspeed:
         _ = ta.device  # force _setup_devices (model -> first visible GPU)
         ta._n_gpu = 1
     return ta
