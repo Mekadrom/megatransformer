@@ -519,6 +519,52 @@ teacher scores ground-truth ids), so its logits ARE cacheable — unlike `--voic
 NOT measured: whether 4-bit teaching actually degrades a trained student. The above bounds the
 perturbation, not its downstream effect.
 
+### SmolLM2 as the teacher family: same vocab as voice and image (2026-09-17)
+The whole SmolLM2 family shares **vocab 49152**, which is already this project's
+`special_token_base` for world-voice and world-image. SmolLM2-1.7B exists (d 2048, L 24, 32
+heads, no GQA, tied embeddings), so a teacher at that vocab is available.
+
+Measured consequences of 49161 vs Qwen3's 151945, text-only `small_sum`, d_model 768:
+
+| | SmolLM2 49161 | Qwen3 151945 |
+|---|---|---|
+| model, tied | **184.2M** | 263.3M |
+| embed+head share | 20% | 44% |
+| logits @ batch 8 x 1024, bf16 | **0.75 GiB** | 2.32 GiB |
+| largest batch that fit (fwd+bwd, 24GB) | **2** | 1 |
+
+⚠️ The batch row ran both vocabs in ONE process, so fragmentation may understate Qwen3; treat
+it as indicative. The logits and parameter numbers are exact.
+
+Teacher quality, bits-per-byte on identical text (39 documents / 144,881 UTF-8 bytes decoded
+from the Mistral master cache, so every candidate scores the same bytes — bpb is
+tokenizer-independent, which is what makes the comparison fair):
+
+| model | bits/byte |
+|---|---|
+| SmolLM2-135M (the current frozen prelude) | 0.4803 |
+| **SmolLM2-1.7B** | **0.3731** |
+
+SmolLM2-1.7B is 22% better than the 135M already in the stack, so it has real signal to
+transfer. **INCOMPLETE:** the Qwen3-0.6B / 1.7B / 4B rows were not measured — the probe was
+killed for running on an unauthorized GPU. Without them there is no evidence that Qwen3 is a
+better teacher, only that it is a bigger one.
+
+⭐ **The structural argument, which outweighs the memory one.** A Qwen3 teacher is INCOMPATIBLE
+with the frozen SmolLM2-135M prelude (different vocab), so choosing it does not merely select a
+teacher — it forks the text arm away from the voice and image arms, and it eliminates the
+frozen-head arm that `--text_encoder_trainable_head` exists to compare against. A SmolLM2
+teacher keeps one tokenizer across all three modalities, one `special_token_base`, one corpus,
+and revives that ablation. For a model whose thesis is a shared trunk, that is the difference
+between one model and two.
+
+**Why this was not considered earlier:** the session anchored on Qwen3 when it was raised for
+world-image target reuse, and never revisited the choice. The earlier entry above ("if the
+teacher is not SmolLM2, the shared-head mode is unusable") recorded the consequence but treated
+it as a cost of Qwen3 rather than as a reason to look at SmolLM2 teachers.
+
+**Cost to switch:** one retokenization pass from the Mistral master (~76 min, no re-download).
+
 ---
 
 ## OPEN
