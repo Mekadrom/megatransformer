@@ -3009,6 +3009,77 @@ every rank waits for the deepest at the gradient reduction, making step time the
 than the mean of the Poisson-lognormal draw. Set `lockstep_n: true` for multi-GPU unless the
 depth diversity is wanted.
 
+### ESTABLISHED 2026-09-17: bistream does NOT extrapolate to longer text -- and its OWN protocol is worse
+
+The pending measurement flagged at line 158 and 1905 ("the chunked arm is still unmeasured")
+plus the never-tested length axis, run together.
+`scripts_local/voice_length_extrapolation_probe.py`, `eval_output/world_voice/length_extrap/`.
+
+**PROTOCOL.** Length LADDER by concatenating k consecutive val transcripts (k=1,2,4,8), which
+holds the content distribution fixed and varies only length, and gives a real ceiling (the
+concatenated GT unit_ids through the same frozen decoder). ONE fixed speaker embedding across
+every arm and rung. Matched step: both checkpoints **ck68000-EMA**. Greedy, ras_win 10,
+ras_tau 0.1, logit_kl 1e-4, trunk cap 8, `--voice_max_frames 1500` so truncation is the
+model's choice and not the budget. n=6 groups per rung, **ONE seed** (see the caveat).
+`bi_bi` uses the checkpoint's OWN training layout: `--bistream_text_chunk 4
+--bistream_voice_chunk 30` (⚠️ the run trained at 4:30 with `--bistream_prob 0.5`, NOT the
+5:15 recorded elsewhere).
+
+| k | words | GT frames | ceiling | uni_uni | bi_uni | **bi_bi** |
+|---|---|---|---|---|---|---|
+| 1 | 19 | 177 | 0.921 | 0.943 | 0.950 | **0.830** |
+| 2 | 37 | 362 | 0.878 | 0.878 | 0.904 | **0.577** |
+| 4 | 75 | 731 | 0.889 | 0.468 | 0.414 | **0.287** |
+| 8 | 145 | 1417 | 0.885 | 0.265 | 0.203 | **0.192** |
+
+LCS recall. `gen_frames / GT frames`:
+
+| k | ceiling | uni_uni | bi_uni | bi_bi |
+|---|---|---|---|---|
+| 1 | 1.000 | 1.008 | 0.968 | 0.872 |
+| 2 | 1.000 | 0.788 | 0.801 | 0.646 |
+| 4 | 1.000 | 0.450 | 0.350 | 0.272 |
+| 8 | 1.000 | **0.351** | **0.199** | **0.197** |
+
+**1. The ceiling is FLAT (0.878-0.921 across a 8x length range).** The frozen decoder and
+Whisper handle 57 s of audio without degrading, so the entire collapse is the world model's.
+This is the control the probe existed to establish.
+
+**2. Both models collapse past k=2, by TRUNCATION.** At k=8 unistream emits 35% of the
+needed frames and bistream 20%, against a 1500-frame budget neither approaches. Same
+mechanism as the earlier budget-250-vs-500 byte-identical result: the ~10 s stop is a LEARNED
+EOV, and chunk-interleaving does not touch it. **The data layout was never the lever for
+long-form; the 10 s training cap is.** That is a direct argument for the 20 s
+re-preprocessing (see the duration-distribution entry above), not for reviving bistream.
+
+**3. ⭐ Decoding the bistream checkpoint in its OWN chunked protocol is WORSE than decoding it
+unistream, at every rung.** 0.830 vs 0.950 at k=1 and 0.577 vs 0.904 at k=2 -- the k=2 gap of
+0.327 is ~5x the 0.063-0.069 per-seed spread measured on this model, so it is not seed noise.
+
+This **inverts the caveat every prior bistream finding carried.** Lines 157-158 and 1899
+warned that unistream decode was "out-of-distribution for a 50%-bistream checkpoint" and
+treated the resulting numbers as conservative -- i.e. bistream was assumed to be handicapped
+by the protocol. It was not handicapped; it was FLATTERED. The content NULL at n=48 stands
+and no longer needs that asterisk.
+
+⚠️ **uni_uni vs bi_uni is NOT resolved here and no claim is made.** The differences
+(+0.007 at k=1, +0.026 at k=2, -0.054 at k=4, -0.062 at k=8) all sit INSIDE the 0.063-0.069
+seed spread, and this probe is single-seed. Per the protocol established by the n=48 decision
+run, a generation comparison needs >=2 seeds and seed-averaged means. What survives the seed
+term is (1) the flat ceiling, (2) the truncation collapse, (3) the bi_bi penalty.
+
+⚠️ Two further protocol limits. **Greedy only**: bistream's one established advantage is
+sampler insensitivity, which greedy cannot exhibit by construction. **Concatenated
+transcripts are not long-form prose** -- there is no discourse coherence across the joins, so
+this measures length extrapolation, not narrative coherence.
+
+⚠️ **The probe silently measured NOTHING on its first run** and exited 0.
+`constants.SPECIAL_TOKEN_BASE` is 32000 (Mistral-era) but these checkpoints use **49152**
+(SmolLM2), so a collator built on the module constant emits BOV at the wrong id,
+`(text == sp.BOV)` matches nothing, and every generation is skipped. Any eval script that
+builds a `MultimodalDataCollator` must take the base from `model.config.special_token_base`.
+The probe now raises instead of skipping.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
