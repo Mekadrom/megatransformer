@@ -1119,6 +1119,14 @@ class WorldModelTrainer(CommonTrainer):
                     # The teacher scores the SAME inputs the student saw: [:, :-1] is the
                     # trainer's causal shift, and T_min re-applies the logits/target alignment
                     # done above so all three line up position-for-position.
+                    #
+                    # That 1:1 correspondence holds for a pure TEXT sequence. In a mixed batch
+                    # the student's logits come from the uninterleaver and media placeholders
+                    # occupy text positions, so the mapping is no longer positional. This does
+                    # not need a separate guard: placeholders ARE control tokens, sitting above
+                    # the teacher's vocab, so `valid_ctx` goes False at the first one and stays
+                    # False -- the KL is simply confined to the clean text prefix rather than
+                    # being computed against misaligned positions.
                     _t_in = _t_in[:, :-1][:, :T_min].contiguous()
                     _t_logits, _valid_ctx = _t_teacher(_t_in)
                     _t_logits = _t_logits[:, :T_min, :]
