@@ -2504,7 +2504,8 @@ def load_model(args, device='cuda'):
                       getattr(args, 'image_exit_eligible', False) or
                       getattr(args, 'voice_stochastic_output', False) or
                       getattr(args, 'lockstep_thinking_steps', False) or
-                      getattr(args, 'use_mrope', False))
+                      getattr(args, 'use_mrope', False) or
+                      getattr(args, 'exit_criteria', None) is not None)
     if needs_override:
         import copy
         from megatransformer.config.world.world_model import WORLD_MODEL_CONFIGS
@@ -2514,6 +2515,17 @@ def load_model(args, device='cuda'):
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if getattr(args, 'share_block_weights', False):
             config.recurrent_block_config.share_block_weights = True
+        if getattr(args, 'exit_criteria', None) is not None:
+            # EVAL-ONLY, but it decides what every in-training eval measures. The config
+            # default is still the legacy `kl_divergence`, which is not a KL at all (signed,
+            # so ~half of positions retire by sign accident) and runs the trunk at roughly
+            # half its trained depth. Leaving it in place silently distorts eval loss and the
+            # viz callback. See docs/findings/world-text.md.
+            config.recurrent_block_config.exit_criteria = args.exit_criteria
+            if getattr(args, 'exit_criteria_threshold', None) is not None:
+                config.recurrent_block_config.exit_criteria_threshold = args.exit_criteria_threshold
+            print(f"[trunk] exit criteria: {args.exit_criteria} "
+                  f"(threshold {config.recurrent_block_config.exit_criteria_threshold})", flush=True)
         if getattr(args, 'lockstep_thinking_steps', False):
             # recurrent.py seeds the Poisson-lognormal draw with seed*(rank+1) unless these
             # are set, so ranks otherwise run different depths and every rank waits for the
@@ -3349,6 +3361,21 @@ def add_cli_args(subparsers):
                                  "making 0.2-0.6 a trough where termination breaks. Set 1.0 to "
                                  "hold the resample fixed and make --viz_voice_temperature "
                                  "behave monotonically.")
+    sub_parser.add_argument("--exit_criteria", type=str, default=None,
+                            choices=["logit_kl", "latent_diff", "none", "kl_divergence"],
+                            help="Recurrent-trunk adaptive-exit criterion. EVAL-ONLY (training "
+                                 "always uses the stochastic step sampler), but it decides what "
+                                 "every in-training eval measures. The config default is still "
+                                 "the legacy 'kl_divergence', which is NOT a KL -- it is signed, "
+                                 "so roughly half of positions retire by sign accident and the "
+                                 "trunk runs at about half its trained depth. Prefer 'logit_kl' "
+                                 "(Huginn's real criterion, threshold 5e-4) or 'none' (always "
+                                 "run the full budget -- the train-matched control).")
+    sub_parser.add_argument("--exit_criteria_threshold", type=float, default=None,
+                            help="Threshold for --exit_criteria. Paper value for logit_kl is "
+                                 "5e-4; latent_diff wants 0.03. Not interchangeable between "
+                                 "them -- one is a divergence over a vocabulary, the other a "
+                                 "relative distance in latent space.")
     sub_parser.add_argument("--text_tokenizer", type=str, default=None,
                             help="Tokenizer/model id the TEXT CORPUS was built with, e.g. "
                                  "Qwen/Qwen3-0.6B. Sets special_token_base, eos, and the "
