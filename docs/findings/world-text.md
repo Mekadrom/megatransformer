@@ -409,6 +409,45 @@ re-download-and-preprocess pass". That cost is now an hour, so the decision rule
 be re-read — the ablation is much cheaper than recorded, though the Qwen3-teacher argument that
 it answers itself by fiat is unaffected.
 
+### The Qwen3 vocabulary, not the trunk, dominates the parameter count (2026-09-17)
+Measured by instantiation, `small_sum` text-only, d_model 768:
+
+| corpus | tied | student total | embed+head share |
+|---|---|---|---|
+| Mistral (32000) | no | 195.6M | 25% |
+| Mistral (32000) | yes | 171.0M | 14% |
+| **Qwen3 (151936)** | no | **380.0M** | **61%** |
+| **Qwen3 (151936)** | yes | **263.3M** | 44% |
+
+A 151,945-wide table at d=768 is 116.7M, and an untied model carries two of them. So moving to
+the Qwen3 corpus nearly doubles the model without adding any computation, and 44-61% of it is
+lookup. Two consequences: `--tie_word_embeddings` is worth 116.7M here where on the Mistral
+corpus it was a rounding error, and **"my student is <200M" is not true on this corpus** — any
+capacity-gap reasoning should use 263M/380M, not 196M.
+
+### Text distillation is built (2026-09-17, commit 8c8ddf3)
+`model/text/distill_teacher.py` + `--text_distill_model / _weight / _temperature / _device /
+_fp32`. Frozen `AutoModelForCausalLM` held outside the module tree (`object.__setattr__`, so it
+is never optimized, checkpointed, or moved by the student's `.to()`), run under `no_grad` once
+per batch, forward KL(teacher ‖ student) with the standard `T^2` scaling, ADDED to the CE rather
+than replacing it. Mirrors the CosyVoice 2 voice path, which already proved the pattern.
+
+Three things that are load-bearing rather than defensive:
+- **The vocab guard RAISES.** A KL over mismatched vocabularies does not fail loudly — every id
+  indexes a row, the loss falls, the run looks healthy. `assert_vocab_matches()` runs at
+  construction. Same reason a failed teacher load is fatal here rather than a warning: a
+  distillation arm silently running CE-only is a baseline wearing the wrong run name.
+- **`valid_ctx` masks the KL after the first control token.** Control tokens sit above the
+  teacher's vocab and must be clamped, but a clamped id is a WRONG token in a causal model's
+  context and the corruption propagates rightward. Verified: a control token at position 10 of
+  32 leaves `valid_ctx` 10/32. Pure text never trips it.
+- **`--text_tokenizer` was a prerequisite, not a nicety.** `special_token_base` was only
+  settable inside the `--text_encoder_model` branch, so a FROM-SCRATCH prelude was pinned to
+  base 32000 / vocab 32009 and could not read a Qwen3 corpus at all.
+
+Verified on CPU against a real Qwen3-0.6B: guard passes on a match and raises on 32000, KL 4.03
+nats, backward clean, teacher `requires_grad=False` throughout. Not yet run on GPU or at scale.
+
 ---
 
 ## OPEN
@@ -454,6 +493,17 @@ transitions between regimes, and a teacher that is too strong makes the student 
 same work says distillation beats supervised pretraining "in settings involving many students
 or an existing teacher", which is this project's situation (off-the-shelf teacher, many
 ablation students on one corpus). Whether 4B over ~300M is past the gap is unmeasured.
+**Evidence against the worry (2026-09-17):** Qwen3-0.6B was itself distilled from Qwen3-32B and
+Qwen3-235B-A22B — ratios of ~50x and ~390x. A 4B teacher over a ~263-380M student is ~13x, far
+inside what Qwen themselves shipped. Caveat: theirs was POST-TRAINING distillation onto an
+already-pretrained student, not pretraining-scale distillation into a from-scratch one, so this
+is evidence rather than proof. Note also that the student is 263M tied / 380M untied on this
+corpus, not the <200M it is at Mistral vocab — see the parameter entry above.
+
+**Recommendation for the FIRST run: Qwen3-0.6B, on cost rather than capacity.** Teacher forward
+is +9% per step vs +61% for 4B, and 1.2GB vs 8.0GB bf16. Exercise the plumbing cheaply, then
+ablate up.
+
 **Settled by:** distil from Qwen3-0.6B / 1.7B / 4B at a small matched token budget. Shared
 vocab means this ablation costs **zero** additional preprocessing.
 
