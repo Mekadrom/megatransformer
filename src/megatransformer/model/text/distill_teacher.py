@@ -1,0 +1,122 @@
+"""Frozen causal-LM teacher for text logit distillation.
+
+Mirrors `model/voice/cosyvoice2_teacher.py` in role: a frozen model held OUTSIDE the student's
+module tree, run under `no_grad` once per batch, whose logits supply a KL term alongside the
+hard-label CE. The voice teacher (CosyVoice 2) already proved the pattern; this is the text
+analogue.
+
+WHY KL ON TOP OF CE. Hard labels collapse a one-to-many target onto a single id. The teacher's
+full distribution carries the "which continuations are plausible" structure that CE discards,
+which is worth far more per token than a one-hot: at most log2(V) bits of label versus a dense
+distribution over the whole vocabulary. That matters here specifically because this corpus is
+~17.5 tokens/param -- about Chinchilla-optimal, i.e. NOT data-rich -- so extracting more signal
+per token is the lever, not collecting more tokens. See docs/findings/world-text.md.
+
+⚠️ THE FAILURE THIS CLASS EXISTS TO PREVENT. A KL is only meaningful between distributions over
+the SAME vocabulary. If the corpus was tokenized with tokenizer A and the teacher speaks
+tokenizer B, every id still indexes *something* in B's embedding table, so nothing raises and
+the loss still falls -- it just trains against noise. Measured on this repo's own cache: Mistral
+ids decoded under SmolLM2 turn "hip and artistic sensibilities of their time" into " area n
+Adding solution hazardsstific): bak cour...". `assert_vocab_matches()` is therefore called at
+construction and RAISES rather than warning. Do not downgrade it.
+"""
+
+from typing import Optional, Tuple
+
+import torch
+import torch.nn as nn
+
+
+class TextDistillTeacher(nn.Module):
+    """Frozen `AutoModelForCausalLM`, exposing per-position logits over its native vocab.
+
+    Not a submodule of the student: the trainer stores it with `object.__setattr__` so it is
+    never optimized, never checkpointed, and never moved by the student's `.to()`.
+    """
+
+    def __init__(self, model, vocab_size: int, device: str, dtype: torch.dtype):
+        super().__init__()
+        self.model = model
+        self.vocab_size = int(vocab_size)
+        self._device = device
+        self._dtype = dtype
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.model.eval()
+
+    @classmethod
+    def from_pretrained(cls, model_name: str, device: str = "cuda",
+                        dtype: torch.dtype = torch.bfloat16) -> "TextDistillTeacher":
+        from transformers import AutoConfig, AutoModelForCausalLM
+        cfg = AutoConfig.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device)
+        return cls(model, vocab_size=int(cfg.vocab_size), device=device, dtype=dtype)
+
+    def assert_vocab_matches(self, student_base: int, model_name: str = "?"):
+        """Hard-fail when the teacher's vocabulary differs from the corpus's.
+
+        `student_base` is the world model's `special_token_base` -- by construction the size of
+        the real vocabulary, with the multimodal control tokens living above it. A teacher whose
+        native vocab differs is speaking a different language than the data.
+        """
+        if int(student_base) != self.vocab_size:
+            raise ValueError(
+                f"TOKENIZER MISMATCH: teacher {model_name!r} has vocab_size {self.vocab_size}, "
+                f"but the model's special_token_base is {student_base}. These must be equal -- "
+                f"the base IS the tokenizer's vocabulary size, and a KL between distributions "
+                f"over different vocabularies is meaningless. This does NOT fail loudly on its "
+                f"own (ids stay numerically in range and the loss still falls), so it is checked "
+                f"here. Re-tokenize the corpus for this teacher with "
+                f"`python -m megatransformer.scripts.data.text.retokenize_shards` (about an hour "
+                f"for 5B tokens), or pick a teacher matching the corpus."
+            )
+
+    @torch.no_grad()
+    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Score a batch of student inputs.
+
+        Returns:
+            logits: (B, T, V_teacher) on the teacher's device, in the teacher's dtype.
+            valid_ctx: (B, T) bool. False from the first out-of-vocabulary id in a row onward.
+
+        `valid_ctx` exists because of the control tokens. They live at ids >= vocab_size, which
+        the teacher's embedding has no row for, so they are clamped before the forward. Clamping
+        keeps the call from throwing, but a clamped id is a WRONG token in the teacher's context,
+        and because the teacher is causal that corruption propagates to every later position in
+        the row. So the mask goes False at the first such id and stays False -- the teacher's
+        opinion is only trustworthy on the clean prefix. For a pure text corpus no control token
+        appears mid-sequence and the mask is all True.
+        """
+        ids = input_ids.to(self._device)
+        ood = ids >= self.vocab_size
+        valid_ctx = ood.cumsum(dim=1) == 0
+        safe = ids.clamp(max=self.vocab_size - 1)
+        out = self.model(input_ids=safe)
+        return out.logits, valid_ctx.to(input_ids.device)
+
+
+def text_distill_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: torch.Tensor,
+    temperature: float = 1.0,
+    teacher_vocab: Optional[int] = None,
+) -> torch.Tensor:
+    """Forward KL(teacher ‖ student) over the teacher's vocabulary, at masked positions.
+
+    Direction and scaling follow the voice path and standard KD: forward KL is mode-COVERING
+    (the student is penalised for putting no mass where the teacher does), and the `T**2` factor
+    keeps the gradient magnitude independent of temperature so the weight means the same thing
+    at any T.
+
+    The student's head is WIDER than the teacher's -- it carries the control tokens above the
+    native vocab -- so it is sliced to the teacher's width. That is a renormalisation over the
+    native vocab, which is correct here: the control tokens are not part of the distribution the
+    teacher is modelling, and the masked positions are ones where no control token is the target.
+    """
+    if teacher_vocab is None:
+        teacher_vocab = teacher_logits.shape[-1]
+    temp = max(1e-3, float(temperature))
+    s_logp = torch.log_softmax(student_logits[mask][:, :teacher_vocab].float() / temp, dim=-1)
+    t_prob = torch.softmax(teacher_logits[mask].to(s_logp.device).float() / temp, dim=-1)
+    return torch.nn.functional.kl_div(s_logp, t_prob, reduction="batchmean") * (temp ** 2)

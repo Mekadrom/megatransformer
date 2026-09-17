@@ -163,6 +163,9 @@ class WorldModelTrainer(CommonTrainer):
         voice_prenet_dropout_ramp_steps: int = 0,
         voice_prenet_dropout_start_step: int = 0,
         voice_distill_teacher=None,
+        text_distill_teacher=None,
+        text_distill_weight: float = 0.0,
+        text_distill_temperature: float = 1.0,
         voice_distill_weight: float = 0.0,
         voice_distill_temperature: float = 1.0,
         # Modality flags
@@ -317,6 +320,19 @@ class WorldModelTrainer(CommonTrainer):
         # Frozen distillation teacher (not a submodule: it must never be optimized, saved,
         # or wrapped by the accelerator).
         object.__setattr__(self, "voice_distill_teacher", voice_distill_teacher)
+        # Same treatment for the text teacher: object.__setattr__ keeps it out of the module
+        # tree, so it is never optimized, never saved into a checkpoint, and never dragged
+        # around by the student's .to().
+        object.__setattr__(self, "text_distill_teacher", text_distill_teacher)
+        self.text_distill_weight = text_distill_weight
+        self.text_distill_temperature = max(1e-3, text_distill_temperature)
+        if text_distill_teacher is not None:
+            # Fail NOW, not 10k steps in. A vocabulary mismatch does not raise on its own --
+            # every id still indexes a row -- so this is the only place it gets caught.
+            _cfg = (self.model.module if hasattr(self.model, "module") else self.model).config
+            text_distill_teacher.assert_vocab_matches(
+                getattr(_cfg, "special_token_base", constants.SPECIAL_TOKEN_BASE),
+                getattr(text_distill_teacher, "_name", "?"))
         self.voice_distill_weight = voice_distill_weight
         self.voice_distill_temperature = max(1e-3, voice_distill_temperature)
         self._voice_prenet_ramp_enabled = (voice_prenet_dropout > 0.0 and voice_prenet_dropout_ramp_steps > 0)
@@ -1090,6 +1106,43 @@ class WorldModelTrainer(CommonTrainer):
             # Per-task text loss so we can see transcription vs continuation
             # independently. Same value, just logged under a task-specific key.
             loss_components[f"text_loss_norm/{task_type}"] = text_loss_norm.detach()
+
+            # --- KL distillation from a frozen text LM ------------------------------------
+            # CE supervises one id per position; the teacher supervises the whole
+            # distribution. With this corpus at ~17.5 tok/param (about Chinchilla-optimal, so
+            # NOT data-rich) the lever is signal-per-token, not more tokens.
+            _t_teacher = getattr(self, "text_distill_teacher", None)
+            if _t_teacher is not None and self.text_distill_weight > 0:
+                from megatransformer.model.text.distill_teacher import text_distill_kl
+                _t_in = inputs.get("text_token_ids")
+                if _t_in is not None:
+                    # The teacher scores the SAME inputs the student saw: [:, :-1] is the
+                    # trainer's causal shift, and T_min re-applies the logits/target alignment
+                    # done above so all three line up position-for-position.
+                    _t_in = _t_in[:, :-1][:, :T_min].contiguous()
+                    _t_logits, _valid_ctx = _t_teacher(_t_in)
+                    _t_logits = _t_logits[:, :T_min, :]
+                    _valid_ctx = _valid_ctx[:, :T_min]
+                    # Supervise only where CE does, where the teacher's context is clean, and
+                    # where the target is a REAL token -- the teacher has no control tokens and
+                    # its distribution there would be noise.
+                    _kl_mask = (text_targets != -100) & _valid_ctx.to(text_targets.device)
+                    _kl_mask &= text_targets < _t_teacher.vocab_size
+                    if bool(_kl_mask.any()):
+                        _kl = text_distill_kl(logits, _t_logits, _kl_mask,
+                                              temperature=self.text_distill_temperature,
+                                              teacher_vocab=_t_teacher.vocab_size)
+                        total_loss = total_loss + self.text_distill_weight * _kl
+                        loss_components["text_distill_kl"] = _kl.detach()
+                        with torch.no_grad():
+                            _ta = (_t_logits[_kl_mask].argmax(-1).to(text_targets.device)
+                                   == text_targets[_kl_mask]).float().mean()
+                            _ag = (_t_logits[_kl_mask].argmax(-1).to(logits.device)
+                                   == logits[_kl_mask][:, :_t_teacher.vocab_size].argmax(-1)
+                                   ).float().mean()
+                            loss_components["text_distill_teacher_acc"] = _ta.detach()
+                            loss_components["text_distill_agreement"] = _ag.detach()
+                            loss_components["text_distill_frac"] = _kl_mask.float().mean().detach()
             if duration_only:
                 with torch.no_grad():
                     # Restricted to duration positions: with the bistream exemption on, the
@@ -2450,6 +2503,35 @@ def load_model(args, device='cuda'):
                 # Builds voice_coda_units_proj; without this the injection path silently
                 # does not exist and the flag would be a no-op.
                 config.voice_nar_trunk_text_only = True
+        # Corpus vocabulary, independent of whether a PRETRAINED prelude is used. Until now
+        # special_token_base was only settable inside the --text_encoder_model branch below,
+        # so a FROM-SCRATCH prelude was pinned to the Mistral-era default (base 32000, vocab
+        # 32009) and could not read a corpus tokenized with anything else. --text_tokenizer
+        # fixes that: it describes the DATA, and composes with either prelude.
+        _tok_src = getattr(args, 'text_tokenizer', None)
+        if _tok_src and not getattr(args, 'text_encoder_model', None):
+            from transformers import AutoConfig, AutoTokenizer
+            _n_special = (constants.N_SPECIAL_TOKENS_WITH_DURATION
+                          if getattr(args, 'voice_nar_duration_token', False)
+                          else constants.N_SPECIAL_TOKENS)
+            try:
+                _base = int(AutoConfig.from_pretrained(_tok_src).vocab_size)
+            except Exception:
+                # Not a model id -- fall back to the tokenizer's own count. Note this is the
+                # TOKENIZER's vocab, which can be smaller than the model's padded embedding
+                # (Qwen3: 151643 vs 151936) and can sit BELOW its own eos id, so prefer a
+                # model id whenever one exists.
+                _base = int(AutoTokenizer.from_pretrained(_tok_src).vocab_size)
+            _eos = AutoTokenizer.from_pretrained(_tok_src).eos_token_id
+            config.special_token_base = _base
+            if _eos is not None:
+                config.eos_token_id = int(_eos)
+            config.text_prelude_config.vocab_size = _base + _n_special
+            config.text_coda_config.vocab_size = _base + _n_special
+            config.__post_init__()   # re-derive interleaver placeholder ids for the new base
+            print(f"[text] corpus vocabulary from {_tok_src}: base {_base}, "
+                  f"+{_n_special} control tokens = {_base + _n_special}, eos {config.eos_token_id}",
+                  flush=True)
         if getattr(args, 'text_encoder_model', None):
             # Single gate: swap the from-scratch text prelude/coda for a pretrained LLM body +
             # translators + the LLM's LM head. None (default) leaves the model byte-identical.
@@ -2695,6 +2777,29 @@ def load_model(args, device='cuda'):
     return model
 
 
+def _build_text_distill_teacher(args):
+    """Load the frozen text teacher, or None when distillation is off.
+
+    Unlike the voice teacher a load failure is NOT downgraded to a warning. The voice path can
+    reasonably proceed CE-only, but a text run launched with --text_distill_weight > 0 is an
+    experiment ABOUT distillation: silently training without the teacher would produce a plain
+    CE baseline wearing the run name of a distillation arm, which is worse than not starting.
+    """
+    model_name = getattr(args, "text_distill_model", None)
+    if not model_name or getattr(args, "text_distill_weight", 0.0) <= 0:
+        return None
+    from megatransformer.model.text.distill_teacher import TextDistillTeacher
+    dev = getattr(args, "text_distill_device", None) or "cuda"
+    dtype = torch.bfloat16 if getattr(args, "text_distill_bf16", True) else torch.float32
+    t = TextDistillTeacher.from_pretrained(model_name, device=dev, dtype=dtype)
+    object.__setattr__(t, "_name", model_name)
+    n = sum(p.numel() for p in t.parameters()) / 1e6
+    print(f"[distill] text teacher {model_name} loaded ({n:.1f}M, vocab {t.vocab_size}, "
+          f"{dtype}, {dev}); weight={args.text_distill_weight} "
+          f"T={getattr(args, 'text_distill_temperature', 1.0)}", flush=True)
+    return t
+
+
 def _build_distill_teacher(args):
     """Frozen CosyVoice 2 speech LM for KL distillation, or None when disabled.
 
@@ -2782,6 +2887,9 @@ def create_trainer(
         voice_prenet_dropout_ramp_steps=getattr(args, 'voice_prenet_dropout_ramp_steps', 0),
         voice_prenet_dropout_start_step=getattr(args, 'voice_prenet_dropout_start_step', 0),
         voice_distill_teacher=_build_distill_teacher(args),
+        text_distill_teacher=_build_text_distill_teacher(args),
+        text_distill_weight=getattr(args, 'text_distill_weight', 0.0),
+        text_distill_temperature=getattr(args, 'text_distill_temperature', 1.0),
         voice_distill_weight=getattr(args, 'voice_distill_weight', 0.0),
         voice_distill_temperature=getattr(args, 'voice_distill_temperature', 1.0),
         voice_onpolicy_distill=getattr(args, 'voice_onpolicy_distill', False),
@@ -3202,6 +3310,31 @@ def add_cli_args(subparsers):
                                  "making 0.2-0.6 a trough where termination breaks. Set 1.0 to "
                                  "hold the resample fixed and make --viz_voice_temperature "
                                  "behave monotonically.")
+    sub_parser.add_argument("--text_tokenizer", type=str, default=None,
+                            help="Tokenizer/model id the TEXT CORPUS was built with, e.g. "
+                                 "Qwen/Qwen3-0.6B. Sets special_token_base, eos, and the "
+                                 "from-scratch prelude/coda vocab. Describes the DATA, so it "
+                                 "composes with a from-scratch prelude; --text_encoder_model "
+                                 "derives all of this itself and takes precedence.")
+    sub_parser.add_argument("--text_distill_model", type=str, default=None,
+                            help="Frozen causal LM to distil from, e.g. Qwen/Qwen3-0.6B. Its "
+                                 "vocab MUST equal special_token_base -- checked at startup and "
+                                 "raises, because a mismatch trains happily on noise. Needs "
+                                 "--text_distill_weight > 0 to take effect.")
+    sub_parser.add_argument("--text_distill_weight", type=float, default=0.0,
+                            help="Weight on the text distillation KL (0 = off). The hard-label "
+                                 "CE stays on; this is added to it.")
+    sub_parser.add_argument("--text_distill_temperature", type=float, default=1.0,
+                            help="KD temperature. Gradient scale is kept temperature-independent "
+                                 "by the standard T^2 factor, so the weight means the same thing "
+                                 "at any T.")
+    sub_parser.add_argument("--text_distill_device", type=str, default=None,
+                            help="Device for the text teacher (default: cuda). Put it on a "
+                                 "second GPU to keep it out of the student's memory budget.")
+    sub_parser.add_argument("--text_distill_fp32", dest="text_distill_bf16",
+                            action="store_false",
+                            help="Run the text teacher in fp32 instead of bf16 (2x memory).")
+    sub_parser.set_defaults(text_distill_bf16=True)
     sub_parser.add_argument("--voice_cosyvoice2_distill_model_dir", type=str, default=None,
                             help="CosyVoice2-0.5B snapshot dir for KL DISTILLATION. Runs the frozen "
                                  "Qwen2-0.5B speech LM teacher-forced in the training loop and adds "
