@@ -2412,6 +2412,7 @@ def load_model(args, device='cuda'):
                       getattr(args, 'image_flow_aux_mse_weight', None) is not None or
                       getattr(args, 'image_exit_eligible', False) or
                       getattr(args, 'voice_stochastic_output', False) or
+                      getattr(args, 'lockstep_thinking_steps', False) or
                       getattr(args, 'use_mrope', False))
     if needs_override:
         import copy
@@ -2422,6 +2423,12 @@ def load_model(args, device='cuda'):
             config.recurrent_block_config.iteration_norm = args.iteration_norm
         if getattr(args, 'share_block_weights', False):
             config.recurrent_block_config.share_block_weights = True
+        if getattr(args, 'lockstep_thinking_steps', False):
+            # recurrent.py seeds the Poisson-lognormal draw with seed*(rank+1) unless these
+            # are set, so ranks otherwise run different depths and every rank waits for the
+            # deepest at the gradient reduction.
+            config.recurrent_block_config.lockstep_n = True
+            config.recurrent_block_config.lockstep_k = True
         if getattr(args, 'use_mrope', False):
             # Only the TRUNK: it is the one module that sees text and media together, so it
             # is the only place a text<->voice coordinate can live. Preludes/codas keep their
@@ -3087,6 +3094,15 @@ def add_cli_args(subparsers):
                                  "square (e.g. 64, 144, 256). Default: use the prelude's patch count.")
 
     # Recurrent block overrides
+    sub_parser.add_argument("--lockstep_thinking_steps", action="store_true", default=False,
+                            help="Force every distributed rank to sample the SAME recurrent "
+                                 "depth (sets lockstep_n and lockstep_k). By default "
+                                 "recurrent.py seeds the Poisson-lognormal draw with "
+                                 "seed*(rank+1), so each rank runs a different number of "
+                                 "iterations -- correct, but every rank then waits for the "
+                                 "deepest one at the gradient reduction, making step time the "
+                                 "MAX rather than the mean of the draw. No effect on a single "
+                                 "GPU.")
     sub_parser.add_argument("--mean_thinking_steps", type=int, default=None,
                             help="Mean recurrent iterations per forward (Poisson log-normal). "
                                  "Sets effective depth = n_recurrent_blocks x this, and is also "
@@ -3175,7 +3191,7 @@ def add_cli_args(subparsers):
                                  "eval loss, which stays at full depth so historical curves "
                                  "remain comparable). DEFAULT 8 as of 2026-09-16: measured "
                                  "n=48 x 2 seeds, voice quality saturates at ~6 iterations "
-                                 "(LCS 0.9179 at 18.6% of trunk compute) and mildly declines "
+                                 "(LCS 0.9179 at 18.6%% of trunk compute) and mildly declines "
                                  "past it (0.9051 at 32). 8 sits just past saturation. "
                                  "0 = model default (mean_thinking_steps).")
     sub_parser.add_argument("--viz_voice_ras_temperature", type=float, default=None,
