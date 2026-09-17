@@ -483,6 +483,42 @@ KL is signal recovered from batches contributing nothing — not a reintroduced 
 Note the consequence: with the flag on, synthesis batches carry a text gradient they did not
 have, so such runs are NOT step-comparable to earlier ones.
 
+### 4-bit teacher: cheap for memory, NOT free for the target (2026-09-17)
+`--text_distill_4bit` loads the teacher NF4 with bf16 compute, matching the Z-Image text
+encoder's setup. Measured on real corpus text (4 x 512 positions from the Qwen3 val shard),
+bf16 vs NF4 logits from the same checkpoint:
+
+| | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| weights on device | 1.11 -> **0.53** GiB (2.1x) | 7.55 -> **2.67** GiB (2.8x) |
+| peak incl. logits | 1.92 -> 1.33 GiB | 8.42 -> 3.54 GiB |
+| 3 ranks on one 24GB card | 3.3 GiB | **22.6 GiB OVERFLOWS -> 8.0 GiB** |
+| KL(bf16 ‖ nf4) | **0.1550** nats | **0.0634** nats |
+| teacher predictive entropy | 1.634 nats | 1.141 nats |
+| top-1 agreement | 0.8237 | 0.9014 |
+| top-16 overlap | 0.8020 | 0.8669 |
+
+⭐ **Read the KL against the entropy, not against zero.** Quantization moves the 0.6B teacher's
+distribution by 0.155 nats where its whole predictive entropy is 1.634 — **~9.5% of the signal**
+— and the 4B by 0.063 against 1.141, **~5.6%**. And top-1 disagrees on 18% / 10% of positions.
+That is error injected straight into the supervision target, which is different from an
+inference use where quantization only perturbs one sample.
+
+For scale the other way: the student-vs-teacher KL at init is ~11 nats, so 0.06-0.16 is small
+against the gradient EARLY. It stops being small as the student approaches the teacher, which is
+exactly when distillation is still supposed to be teaching something.
+
+**Conclusions.** (1) 4-bit is pointless for a 0.6B teacher — saves 0.58 GiB and costs the most
+fidelity of the two. (2) It is what makes a 4B teacher viable at 3 ranks per card, which is
+otherwise impossible (22.6 GiB). (3) The bigger model quantizes BETTER in relative terms, which
+is the usual finding and helps here. (4) If a 4B teacher is wanted, **caching its logits offline
+in bf16 dominates**: it removes the memory problem entirely and the fidelity question with it,
+because the teacher never runs in the training loop. Distillation here is off-policy (the
+teacher scores ground-truth ids), so its logits ARE cacheable — unlike `--voice_onpolicy_distill`.
+
+NOT measured: whether 4-bit teaching actually degrades a trained student. The above bounds the
+perturbation, not its downstream effect.
+
 ---
 
 ## OPEN

@@ -2852,7 +2852,9 @@ def _build_text_distill_teacher(args):
     from megatransformer.model.text.distill_teacher import TextDistillTeacher
     dev = getattr(args, "text_distill_device", None) or "cuda"
     dtype = torch.bfloat16 if getattr(args, "text_distill_bf16", True) else torch.float32
-    t = TextDistillTeacher.from_pretrained(model_name, device=dev, dtype=dtype)
+    t = TextDistillTeacher.from_pretrained(
+        model_name, device=dev, dtype=dtype,
+        load_in_4bit=bool(getattr(args, "text_distill_4bit", False)))
     object.__setattr__(t, "_name", model_name)
     n = sum(p.numel() for p in t.parameters()) / 1e6
     print(f"[distill] text teacher {model_name} loaded ({n:.1f}M, vocab {t.vocab_size}, "
@@ -3427,6 +3429,13 @@ def add_cli_args(subparsers):
     sub_parser.add_argument("--text_distill_device", type=str, default=None,
                             help="Device for the text teacher (default: cuda). Put it on a "
                                  "second GPU to keep it out of the student's memory budget.")
+    sub_parser.add_argument("--text_distill_4bit", action="store_true",
+                            help="Load the teacher NF4-quantized (bf16 compute). Matters when "
+                                 "several DeepSpeed ranks each hold a teacher on one card: 3 x "
+                                 "Qwen3-4B is 24GB in bf16 but ~7.5GB in NF4. Negligible for a "
+                                 "0.6B teacher. NOTE the teacher's logits ARE the supervision "
+                                 "target, so quantization error enters the loss directly -- "
+                                 "unlike an inference use where it only perturbs a sample.")
     sub_parser.add_argument("--text_distill_fp32", dest="text_distill_bf16",
                             action="store_false",
                             help="Run the text teacher in fp32 instead of bf16 (2x memory).")

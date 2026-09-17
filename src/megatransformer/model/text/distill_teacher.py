@@ -46,10 +46,38 @@ class TextDistillTeacher(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_name: str, device: str = "cuda",
-                        dtype: torch.dtype = torch.bfloat16) -> "TextDistillTeacher":
+                        dtype: torch.dtype = torch.bfloat16,
+                        load_in_4bit: bool = False) -> "TextDistillTeacher":
+        """Load the frozen teacher, optionally NF4-quantized.
+
+        4-bit matters when several ranks each hold a teacher on one card: under DeepSpeed
+        every rank builds its own, so 3 ranks x Qwen3-4B is 24GB in bf16 (overflows a 24GB
+        card) against ~7.5GB in NF4. It buys little for a 0.6B teacher, which is ~1.2GB
+        either way.
+
+        ⚠️ Quantization error lands DIRECTLY in the supervision signal here -- unlike an
+        inference use where it only perturbs a sample, a distillation teacher's logits ARE
+        the target. Measure before trusting it; see the 4-bit fidelity entry in
+        docs/findings/world-text.md. Same NF4 + bf16-compute setup the Z-Image text encoder
+        uses, so the two are consistent.
+        """
         from transformers import AutoConfig, AutoModelForCausalLM
         cfg = AutoConfig.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device)
+        kw = {"dtype": dtype}
+        if load_in_4bit:
+            try:
+                from transformers import BitsAndBytesConfig
+                kw["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=dtype)
+                kw["device_map"] = {"": device}   # bnb places at load; .to() is not allowed
+            except Exception as e:
+                print(f"WARNING: 4-bit teacher unavailable ({type(e).__name__}: {e}); "
+                      f"falling back to {dtype}.", flush=True)
+                load_in_4bit = False
+        model = AutoModelForCausalLM.from_pretrained(model_name, **kw)
+        if not load_in_4bit:
+            model = model.to(device)
         return cls(model, vocab_size=int(cfg.vocab_size), device=device, dtype=dtype)
 
     def assert_vocab_matches(self, student_base: int, model_name: str = "?"):
