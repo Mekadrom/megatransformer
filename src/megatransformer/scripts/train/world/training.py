@@ -167,6 +167,7 @@ class WorldModelTrainer(CommonTrainer):
         text_distill_weight: float = 0.0,
         text_distill_temperature: float = 1.0,
         text_distill_all_tasks: bool = False,
+        text_distill_max_positions: int = 1024,
         voice_distill_weight: float = 0.0,
         voice_distill_temperature: float = 1.0,
         # Modality flags
@@ -328,6 +329,7 @@ class WorldModelTrainer(CommonTrainer):
         self.text_distill_weight = text_distill_weight
         self.text_distill_temperature = max(1e-3, text_distill_temperature)
         self.text_distill_all_tasks = bool(text_distill_all_tasks)
+        self.text_distill_max_positions = int(text_distill_max_positions)
         if text_distill_teacher is not None:
             # Fail NOW, not 10k steps in. A vocabulary mismatch does not raise on its own --
             # every id still indexes a row -- so this is the only place it gets caught.
@@ -1180,7 +1182,8 @@ class WorldModelTrainer(CommonTrainer):
                     if bool(_kl_mask.any()):
                         _kl = text_distill_kl(_s_logits, _t_logits, _kl_mask,
                                               temperature=self.text_distill_temperature,
-                                              teacher_vocab=_t_teacher.vocab_size)
+                                              teacher_vocab=_t_teacher.vocab_size,
+                                              max_positions=self.text_distill_max_positions)
                         total_loss = total_loss + self.text_distill_weight * _kl
                         loss_components["text_distill_kl"] = _kl.detach()
                         with torch.no_grad():
@@ -1591,7 +1594,15 @@ class WorldModelTrainer(CommonTrainer):
         if model.training and global_step % self.args.logging_steps == 0:
             metrics.log_scalar("train/total_loss", total_loss, global_step)
             for name, value in loss_components.items():
-                metrics.log_scalar(f"train/{name}", value, global_step)
+                # skip_zero is right for LOSS terms -- an inactive modality's loss is 0 on
+                # every batch that lacks it, and logging those would bury the real curves.
+                # It is wrong for DIAGNOSTICS, where 0 is the most informative value there
+                # is: text_distill_agreement is exactly 0 for an untrained student over a
+                # 152k vocab, and a gate that excluded every position reports frac 0. Under
+                # skip_zero both vanish, so "legitimately zero" and "never computed" look
+                # identical -- the same silent-failure shape as the inert distill flag.
+                _diag = name.endswith(("_acc", "_agreement", "_frac")) or "_frac/" in name
+                metrics.log_scalar(f"train/{name}", value, global_step, skip_zero=not _diag)
 
             # Recurrent output stats (variance and entropy per modality)
             for key, value in outputs.items():
@@ -2941,6 +2952,7 @@ def create_trainer(
         text_distill_weight=getattr(args, 'text_distill_weight', 0.0),
         text_distill_temperature=getattr(args, 'text_distill_temperature', 1.0),
         text_distill_all_tasks=getattr(args, 'text_distill_all_tasks', False),
+        text_distill_max_positions=getattr(args, 'text_distill_max_positions', 1024),
         voice_distill_weight=getattr(args, 'voice_distill_weight', 0.0),
         voice_distill_temperature=getattr(args, 'voice_distill_temperature', 1.0),
         voice_onpolicy_distill=getattr(args, 'voice_onpolicy_distill', False),
@@ -3403,6 +3415,15 @@ def add_cli_args(subparsers):
                                  "the conditioning those tasks exist to learn. Defensible for "
                                  "text->voice synthesis, where text positions before BOV have "
                                  "identical context for both.")
+    sub_parser.add_argument("--text_distill_max_positions", type=int, default=1024,
+                            help="Score at most this many positions per micro-batch for the "
+                                 "distillation KL (0 = all). This is the step's largest "
+                                 "allocation: over a 151,936-wide vocab each position costs "
+                                 "~0.6MB in fp32, so a 2x1024 micro-batch needs ~4GB and OOMs a "
+                                 "24GB card. Chunking does not help (every chunk's log_softmax "
+                                 "is retained for backward); subsampling does, and the KL is a "
+                                 "MEAN over positions so a random subset is unbiased. Effective "
+                                 "sample per optimizer step is this x gradient_accumulation_steps.")
     sub_parser.add_argument("--text_distill_device", type=str, default=None,
                             help="Device for the text teacher (default: cuda). Put it on a "
                                  "second GPU to keep it out of the student's memory budget.")

@@ -101,6 +101,8 @@ def text_distill_kl(
     mask: torch.Tensor,
     temperature: float = 1.0,
     teacher_vocab: Optional[int] = None,
+    max_positions: int = 0,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """Forward KL(teacher ‖ student) over the teacher's vocabulary, at masked positions.
 
@@ -113,10 +115,32 @@ def text_distill_kl(
     native vocab -- so it is sliced to the teacher's width. That is a renormalisation over the
     native vocab, which is correct here: the control tokens are not part of the distribution the
     teacher is modelling, and the masked positions are ones where no control token is the target.
+
+    ⚠️ MEMORY. This is the largest allocation in the step, and the reason `max_positions`
+    exists. Over a 151,936-wide vocabulary every masked position costs ~0.6 MB in fp32, so a
+    2x1024 micro-batch materialises ~2.9 GB student-side (gathered logits, the `.float()`
+    copy, the log_softmax output) plus ~1.2 GB for `t_prob` -- measured, and it OOM'd a 24GB
+    card at batch 2 even after the coda and CE had fit.
+
+    Chunking does NOT fix this: every chunk's log_softmax is saved for backward, so the total
+    retained is unchanged. Subsampling does. The KL is a MEAN over positions, so scoring a
+    random subset is an unbiased estimator of it -- more variance per micro-batch, and with
+    gradient accumulation the effective sample per optimizer step is `max_positions x
+    accum_steps`, which is ample. Set `max_positions=0` to score every position.
     """
     if teacher_vocab is None:
         teacher_vocab = teacher_logits.shape[-1]
     temp = max(1e-3, float(temperature))
+    if max_positions and int(max_positions) > 0:
+        idx = mask.nonzero(as_tuple=False)
+        n = idx.shape[0]
+        if n > int(max_positions):
+            # Sample WITHOUT replacement so no position is double-counted within a step.
+            sel = torch.randperm(n, device=idx.device, generator=generator)[:int(max_positions)]
+            keep = torch.zeros(n, dtype=torch.bool, device=idx.device)
+            keep[sel] = True
+            mask = torch.zeros_like(mask)
+            mask[idx[keep, 0], idx[keep, 1]] = True
     s_logp = torch.log_softmax(student_logits[mask][:, :teacher_vocab].float() / temp, dim=-1)
     t_prob = torch.softmax(teacher_logits[mask].to(s_logp.device).float() / temp, dim=-1)
     return torch.nn.functional.kl_div(s_logp, t_prob, reduction="batchmean") * (temp ** 2)
