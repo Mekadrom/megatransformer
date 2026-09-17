@@ -2896,6 +2896,56 @@ needs either sentence-level chunking at the application layer, or retraining wit
 targets (which means re-preprocessing -- 2.77M utterances were discarded by the 10 s cap, so
 the data exists).
 
+### ESTABLISHED 2026-09-17: the 10 s cap discards 86% of LibriHeavy's HOURS; 20 s recovers 5.4x
+
+Measured directly off the parquet `audio_duration` column, 3 files from
+`shard-00000-of-0020`, n=11,385 utterances / 46.3 h:
+
+mean 14.65 s, median 14.24 s, p90 22.3 s, max 32.8 s.
+
+| `--voice_max_seconds` | utts kept | % utts | hours kept | **% hours** |
+|---|---|---|---|---|
+| 10 | 3,111 | 27.3% | 6.4 | **13.7%** |
+| 15 | 6,247 | 54.9% | 17.3 | 37.4% |
+| 20 | 9,677 | 85.0% | 34.0 | **73.5%** |
+| 25 | 10,389 | 91.3% | 38.2 | 82.5% |
+| 30 | 10,944 | 96.1% | 42.6 | 91.9% |
+| none | 11,385 | 100% | 46.3 | 100% |
+
+LibriHeavy is segmented at a MEDIAN of 14.2 s, so a 10 s cap sits below the median and cuts
+into the bulk of the distribution. This is the quantitative form of the earlier note that
+"2.77M utterances were discarded" -- by HOURS the loss is 86.3%, not the ~74% the utterance
+count suggests, because the discarded utterances are the long ones.
+
+**Corpus sizing.** `default/large` is 2,955 parquet files (the local archive had only 1,142 =
+38.6%, 8 of 20 shard dirs, shard-7 partial). Scaling the sample: **~45,600 h raw**.
+
+| corpus | at 20 s cap | voice tokens (25 Hz) |
+|---|---|---|
+| current cache (38.6% subset, 10 s) | 1,985 h | 179M |
+| full LibriHeavy `large`, 20 s | ~33,500 h | ~3.0B |
+| + Emilia/EN (~46k h, 3-30 s segments) | ~41,000 h | ~3.7B |
+| combined | ~74,500 h | **~6.7B** |
+
+At ~166M trainable voice-path params (trunk 127.5M + voice coda 20.7M + voice prelude 14.6M
++ codebook 3.4M; SmolLM2's 165.6M is frozen) that is **~40 tokens/param**, vs 1.40 on the
+current cache. Chinchilla-optimal is 20.
+
+**Throughput makes this un-consumable, which is the point.** From checkpoint mtimes on
+`cosyvoice2_smollm2_libriheavy_ar_flat_lr_ema_mrope75_0` steps 90k-100k: **2.87 s/step** pure
+training (3.34 s/step on the eval-bearing 1000-step blocks), batch 8 x grad_accum 8 = 64
+utts/step, ~185 frames avg at the 10 s cap => **~4,100 voice tokens/s, ~356M tokens/day** on
+one 4090. One epoch of the 6.7B-token combined corpus is **~19 days**. The entire 100k-step
+run consumed 1.18B tokens total (6.6 epochs of the 179M-token cache) in 3.3 days.
+
+**Consequence:** data stops being the binding constraint and compute becomes the only one.
+The epoch-8 overfit documented above cannot recur. `--max_hours 8000` would cap at 24% of
+what a 20 s pass yields and should be dropped or raised. 20 s is preferred over 30 s: it costs
+18.4% of the hours, which no longer matters, and shorter sequences train faster per token.
+
+⚠️ 20 s requires `--voice_token_budget 500` (was 250). Eval loss is then NOT comparable to any
+existing checkpoint -- new runs start fresh.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
