@@ -239,11 +239,19 @@ def main():
                                  "--dataset_name webdataset --data_files hf://datasets/jackyhate/text-to-image-2M/data_512_2M/data_000000.tar")
         sub_parser.add_argument("--split", type=str,
                             help="Dataset split")
-        # Multi-GPU
-        sub_parser.add_argument("--gpu_id", type=int, default=0,
-                            help="This GPU's ID (0-indexed)")
-        sub_parser.add_argument("--total_gpus", type=int, default=1,
-                            help="Total number of GPUs preprocessing in parallel")
+        # Data sharding across parallel workers.
+        #
+        # These partition the DATASET, not devices -- worker i takes rows where
+        # idx % num_shards == shard_id. They were named --gpu_id/--total_gpus back when one
+        # worker meant one card; device selection now belongs to gpulease, and several
+        # workers routinely share a GPU (the CV2 ONNX tokenizer needs ~1.5 GiB each). The old
+        # names are kept as aliases so existing scripts keep working.
+        sub_parser.add_argument("--shard_id", "--gpu_id", dest="gpu_id", type=int, default=0,
+                            help="This worker's shard index, 0-indexed: takes rows where "
+                                 "idx %% --num_shards == this. (alias: --gpu_id)")
+        sub_parser.add_argument("--num_shards", "--total_gpus", dest="total_gpus", type=int, default=1,
+                            help="How many workers are splitting the dataset, a COUNT not an "
+                                 "index. (alias: --total_gpus)")
         # Processing
         sub_parser.add_argument("--gpu_batch_size", type=int, default=32,
                             help="Batch size for GPU processing")
@@ -272,7 +280,10 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-    print(f"GPU {args.gpu_id}/{args.total_gpus}")
+    # "GPU 4/5" read as "the 4th of 5" when it meant the 5th -- shard_id is 0-indexed and
+    # num_shards is a count, so print the human 1-indexed position and the raw values too.
+    print(f"Shard {args.gpu_id + 1} of {args.total_gpus}  "
+          f"(shard_id={args.gpu_id}, num_shards={args.total_gpus})")
     print(f"Processing every {args.total_gpus}th sample starting at offset {args.gpu_id}")
     print(f"Output: {output_dir}")
 
