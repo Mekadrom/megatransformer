@@ -629,10 +629,13 @@ x batch 2 on real data, measuring relative weight change from init:
 | `recurrent_blocks.5.ffn.condense.weight` | **0.000e+00** | 1.437e-01 |
 | `post_projection_norm.weight` | 9.171e-04 | 4.357e-04 |
 
-Exactly zero, not merely small. **Refines the "~2.5% of steps" estimate downward: that run drew
-`n == 0` once in 96 microbatches and those weights STILL did not move**, so the poisoned cache
-survives across microbatches and an occasional n == 0 draw does not rescue it. In practice the
-trunk's attention and FFN were frozen, not undertrained.
+Exactly zero, not merely small — and steps that CONTAINED an `n == 0` microbatch still showed
+0.000e+00 (checked per-step over 25 steps), so the poisoned cache survives across microbatches
+within a process and an occasional `n == 0` draw does not rescue it.
+
+⚠️ This is measured in EAGER mode only. It does not describe the real runs, which compile the
+trunk — see the scope block above. ~~Earlier phrasing here said the trunk was "frozen" across
+every run in the repo;~~ that was wrong, and the checkpoint diffs disprove it.
 
 **Confirmed mechanism, not inference.** `cache_enabled=False` collapses the two arms onto each
 other exactly (16.00 GiB both), which is what identified the cache. A discarded no-grad forward
@@ -640,12 +643,34 @@ is as damaging as a used one (arm B == arm C == 8.44 GiB), so it is the cache po
 input tensor's provenance. Effect is per-forward, not persistent state: an expensive arm stays
 expensive at sequence positions 0, 1, 3 and 5.
 
-⚠️ **SHARED TRUNK CODE — every world-model run in this repo trained under this.** world-voice,
-world-image and world-text all use `MegatransformerRecurrentBlock`. Findings of the form "the
-trunk cannot learn X" need re-examining before they are trusted. Specifically worth revisiting:
-text conditioning being "STRUCTURAL and LR-invariant", the 0.267 unit-accuracy plateau, and
-gen-query compression where "ALL prompt signal arrives in recurrent iteration 0 and 23 more
-iterations add 5%" — that is the expected shape if the iterated weights were barely training.
+⭐⭐ **SCOPE: EAGER MODE ONLY. `--compile_recurrent_block` avoids it entirely.** Measured with
+n forced to 4 (the common case):
+
+| | trunk params w/o grad | trunk grad norm |
+|---|---|---|
+| eager (no `--compile_recurrent_block`) | **72 / 97** | 0.2196 |
+| `--compile_recurrent_block` | **0** | 9.2662 |
+
+Inductor does not use the eager autocast weight cache, so a compiled trunk never sees the
+severed casts. Confirmed independently by checkpoint diffs on the two best real runs, both of
+which passed `--compile_recurrent_block`:
+
+| run | window | trunk attn Linear weight, mean rel change |
+|---|---|---|
+| `cosyvoice2_smollm2_libriheavy_ar_flat_lr_ema_mrope75_0` | ck90000 -> ck100000 | 1.725e-01 |
+| `zimage_qwen_t3_xskip_lr1e-4_1e-4_1e-4_cosine_0` | ck97000 -> ck100000 | 1.917e-04 |
+
+Nothing identical in either; both trunks trained normally. **world-voice and world-image results
+are NOT affected** and need no re-examination on this account. The image numbers are small
+because that window is the tail of a cosine schedule.
+
+⚠️ Affected: any run WITHOUT `--compile_recurrent_block`. That includes the world-text CLI
+staged in this session, which omitted it, and the live `smollm2_ce_0` run launched from it.
+Also note `project_world_model_ar_gotchas` says `--compile_model` breaks the recurrent model —
+that is a different flag from `--compile_recurrent_block`, which is required for correctness in
+eager-autocast builds and is what both healthy runs use.
+
+The fix makes the flag optional rather than load-bearing.
 
 ### ~~⭐ A Poisson draw of n == 0 costs 4.7 GiB and reads as a slow leak~~ RETRACTED (2026-09-18)
 ~~Clamping n >= 1 removes a pathological memory spike.~~ **RETRACTED same day, commit e0e67ab.**
