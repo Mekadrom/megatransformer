@@ -99,6 +99,40 @@ def _parse_speakers_txt(path: str) -> Dict[str, int]:
     return lookup
 
 
+_MISSING = object()
+
+
+def column_value(example, path: Optional[str], default=None):
+    """Read a column, following a DOTTED PATH into nested dicts.
+
+    WebDataset corpora put every annotation inside one struct column: Emilia's features are
+    ``['json', 'mp3', '__key__', '__url__']`` with text, speaker and duration all living under
+    ``json``. A flat ``example.get("text")`` finds nothing there, silently -- the transcript
+    comes back empty and preprocessing produces a cache with no labels.
+
+    A name with no "." behaves EXACTLY as ``example.get(name, default)`` did, so every existing
+    parquet corpus is unaffected. ``--text_conditions_column json.text`` walks the struct.
+    Missing intermediate keys return ``default`` rather than raising, matching the old
+    ``.get`` semantics at every call site.
+    """
+    if not path:
+        return default
+    cur = example
+    for part in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part, _MISSING)
+        else:
+            cur = getattr(cur, part, _MISSING)
+        if cur is _MISSING:
+            return default
+    return cur
+
+
+def column_present(example, path: Optional[str]) -> bool:
+    """Whether a (possibly dotted) column resolves to a non-missing value."""
+    return path is not None and column_value(example, path, _MISSING) is not _MISSING
+
+
 def decode_audio(raw, target_sr: int) -> np.ndarray:
     """Decode an HF audio value to a mono float32 waveform at target_sr.
 
@@ -658,7 +692,14 @@ class VoiceDatasetPreprocessor(Preprocessor):
         # decode=False: hand back the raw {"bytes", "path"} struct instead of letting
         # datasets 5.x decode via torchcodec (ABI-incompatible with torch 2.6). Resampling
         # to args.sample_rate happens in decode_audio() at read time via soxr.
-        self.dataset = self.dataset.cast_column(args.audio_column, Audio(decode=False))
+        # cast_column is a datasets API call and takes a TOP-LEVEL feature name, so it cannot
+        # follow a dotted path. WebDataset corpora keep the audio at the top level anyway
+        # (Emilia: 'mp3' beside the 'json' struct), so the cast is simply skipped for a nested
+        # audio column and decode_audio() handles whatever the struct hands back.
+        if "." not in args.audio_column:
+            self.dataset = self.dataset.cast_column(args.audio_column, Audio(decode=False))
+        else:
+            print(f"  audio column '{args.audio_column}' is nested -- skipping Audio() cast")
         try:
             print(f"  Total samples in dataset: {len(self.dataset):,}")
         except TypeError:
@@ -1077,9 +1118,9 @@ class VoiceDatasetPreprocessor(Preprocessor):
                             choices=["statistics", "attentive_statistics", "mean", "max"],
                             help="Pooling type for SIVE speaker classifier")
         sub_parser.add_argument("--speaker_id_column", type=str, default="speaker_id",
-                            help="Name of the speaker ID column in the dataset")
+                            help="Name of the speaker ID column in the dataset Supports a DOTTED PATH into a nested struct column (e.g. 'json.text' for WebDataset corpora like Emilia, whose annotations all live inside one 'json' feature). A plain name behaves exactly as before.")
         sub_parser.add_argument("--gender_column", type=str, default=None,
-                            help="Name of the gender column in the dataset (e.g. 'gender'). "
+                            help="Name of the gender column in the dataset (e.g. 'gender').  Supports a DOTTED PATH into a nested struct column (e.g. 'json.text' for WebDataset corpora like Emilia, whose annotations all live inside one 'json' feature). A plain name behaves exactly as before."
                                  "If provided, gender is extracted and saved as integer labels "
                                  "(0=male, 1=female, -1=unknown/other/missing). Disabled by default.")
         sub_parser.add_argument("--gender_lookup_path", type=str, default=None,
@@ -1104,13 +1145,13 @@ class VoiceDatasetPreprocessor(Preprocessor):
                                 help="Enable saving mel spectrograms.")
         
         sub_parser.add_argument("--audio_column", type=str, default="audio",
-                            help="Name of the audio column in the dataset")
+                            help="Name of the audio column in the dataset Supports a DOTTED PATH into a nested struct column (e.g. 'json.text' for WebDataset corpora like Emilia, whose annotations all live inside one 'json' feature). A plain name behaves exactly as before.")
         
         # conditions
         sub_parser.add_argument("--extract_conditions", action="store_true",
                             help="Whether to extract conditions from the dataset")
         sub_parser.add_argument("--text_conditions_column", type=str, default="text",
-                            help="Name of the audio column in the dataset")
+                            help="Name of the audio column in the dataset Supports a DOTTED PATH into a nested struct column (e.g. 'json.text' for WebDataset corpora like Emilia, whose annotations all live inside one 'json' feature). A plain name behaves exactly as before.")
         sub_parser.add_argument("--text_condition_embedding_model", type=str, default="t5_small",
                             help="Model to use for condition embeddings")
         sub_parser.add_argument("--save_text", action="store_true", default=False,
@@ -1137,7 +1178,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
                                  "Preprocessing stops when reached; processing continues through "
                                  "the in-flight sample so actual total lands at-or-just-beyond.")
         sub_parser.add_argument("--duration_column", type=str, default=None,
-                            help="Optional column name containing per-sample audio duration in "
+                            help="Optional column name containing per-sample audio duration in  Supports a DOTTED PATH into a nested struct column (e.g. 'json.text' for WebDataset corpora like Emilia, whose annotations all live inside one 'json' feature). A plain name behaves exactly as before."
                                  "seconds. If provided, used as the authoritative duration (capped "
                                  "at --voice_max_seconds to reflect truncation). If not provided, "
                                  "duration is computed from the waveform length after truncation.")
@@ -1497,7 +1538,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
         # cost in the pipeline once files were local.
         _dcol = getattr(self.args, "duration_column", None)
         if _dcol:
-            _d = example.get(_dcol)
+            _d = column_value(example, _dcol)
             if _d is not None:
                 _d = float(_d)
                 if _d > self.args.voice_max_seconds:
@@ -1510,7 +1551,7 @@ class VoiceDatasetPreprocessor(Preprocessor):
         # Extract fields. The audio column is Audio(decode=False) (raw {"bytes","path"});
         # decode_audio() does soundfile decode + soxr resample to args.sample_rate.
         waveform = torch.tensor(
-            decode_audio(example[self.args.audio_column], self.args.sample_rate),
+            decode_audio(column_value(example, self.args.audio_column), self.args.sample_rate),
             dtype=torch.float32,
         )
 
@@ -1551,9 +1592,9 @@ class VoiceDatasetPreprocessor(Preprocessor):
         # Compute effective stored duration (post-truncation) for --max_hours
         # budget tracking. Prefer the dataset's duration column when available,
         # but cap at voice_max_seconds to reflect the truncation we just did.
-        if self.args.duration_column and self.args.duration_column in example:
+        if column_present(example, self.args.duration_column):
             try:
-                raw_duration = float(example[self.args.duration_column])
+                raw_duration = float(column_value(example, self.args.duration_column))
             except (TypeError, ValueError):
                 raw_duration = len(waveform) / self.args.sample_rate
             effective_duration = min(raw_duration, float(self.args.voice_max_seconds))
@@ -1577,23 +1618,23 @@ class VoiceDatasetPreprocessor(Preprocessor):
         # Add to batch
         self.batch_accumulators['batch_waveforms'].append(waveform)
         if self.args.compute_speaker_embeddings:
-            speaker_id = example.get(self.args.speaker_id_column, "unknown")
+            speaker_id = column_value(example, self.args.speaker_id_column, "unknown")
             self.batch_accumulators['batch_speaker_ids'].append(speaker_id)
         if self.gender_enabled:
             gender_id = -1
             if self.args.gender_column is not None:
-                gender_id = _normalize_gender(example.get(self.args.gender_column, None))
+                gender_id = _normalize_gender(column_value(example, self.args.gender_column))
             if gender_id == -1 and self.args.gender_from_speaker_id_prefix:
                 gender_id = _gender_from_speaker_id_prefix(
-                    example.get(self.args.speaker_id_column, None)
+                    column_value(example, self.args.speaker_id_column)
                 )
             if gender_id == -1 and self.gender_lookup is not None:
-                speaker_value = example.get(self.args.speaker_id_column, None)
+                speaker_value = column_value(example, self.args.speaker_id_column)
                 if speaker_value is not None:
                     gender_id = self.gender_lookup.get(str(speaker_value), -1)
             self.batch_accumulators['batch_gender_ids'].append(gender_id)
         if self.args.extract_conditions or self.args.tokenize_text or self.args.extract_ctc_tokens:
-            conditions = example[self.args.text_conditions_column]
+            conditions = column_value(example, self.args.text_conditions_column)
             if isinstance(conditions, str):
                 conditions = normalize_transcript(conditions)
             self.batch_accumulators['batch_conditions'].append(conditions)
