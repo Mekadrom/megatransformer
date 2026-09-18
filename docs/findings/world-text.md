@@ -619,6 +619,21 @@ about one step in forty, at 1/43 the gradient norm.**
 **Fix: `torch.clear_autocast_cache()` between the two loops.** Verified across n = 0, 1, 8 and
 natural sampling: 97/97 every time, grad norm 9.22-9.38, peak memory uniform at 9.39 GiB.
 
+⭐ **DIRECT CONFIRMATION — the weights do not move.** 12 real optimizer steps x 8 accumulation
+x batch 2 on real data, measuring relative weight change from init:
+
+| parameter | without fix | with fix |
+|---|---|---|
+| `recurrent_blocks.0.self_attn.q_proj.weight` | **0.000e+00** | 1.163e-02 |
+| `recurrent_blocks.3.ffn.expand.weight` | **0.000e+00** | 3.352e-02 |
+| `recurrent_blocks.5.ffn.condense.weight` | **0.000e+00** | 1.437e-01 |
+| `post_projection_norm.weight` | 9.171e-04 | 4.357e-04 |
+
+Exactly zero, not merely small. **Refines the "~2.5% of steps" estimate downward: that run drew
+`n == 0` once in 96 microbatches and those weights STILL did not move**, so the poisoned cache
+survives across microbatches and an occasional n == 0 draw does not rescue it. In practice the
+trunk's attention and FFN were frozen, not undertrained.
+
 **Confirmed mechanism, not inference.** `cache_enabled=False` collapses the two arms onto each
 other exactly (16.00 GiB both), which is what identified the cache. A discarded no-grad forward
 is as damaging as a used one (arm B == arm C == 8.44 GiB), so it is the cache population, not the
