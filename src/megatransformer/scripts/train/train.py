@@ -704,6 +704,39 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, optimizer: Option
         # render would still be the raw weights, making --use_ema invisible during a run.
         trainer.ema = ema.ema
 
+    if getattr(args, "qk_clip_tau", None):
+        from megatransformer.model.qk_clip import QKClipController
+        from transformers import TrainerCallback
+
+        class _QKClipCallback(TrainerCallback):
+            """Arms the probe before the forward, applies the clip after optimizer.step()."""
+
+            def __init__(self, ctrl):
+                self.ctrl = ctrl
+
+            def on_step_begin(self, args_, state, control, **kw):
+                self.ctrl.maybe_arm(int(state.global_step))
+
+            def on_step_end(self, args_, state, control, **kw):
+                stats = self.ctrl.apply(int(state.global_step))
+                if self.ctrl.armed and stats:
+                    from megatransformer.utils import metrics as _metrics
+                    if _metrics.get_logger() is not None:
+                        for k, v in stats.items():
+                            if v == v:      # skip NaN
+                                _metrics.log_scalar(k, v, int(state.global_step))
+
+        _ctrl = QKClipController(
+            model, tau=args.qk_clip_tau,
+            probe_every=getattr(args, "qk_clip_probe_every", 50),
+            alpha=getattr(args, "qk_clip_alpha", 0.5),
+            verbose=getattr(args, "qk_clip_verbose", False))
+        trainer.add_callback(_QKClipCallback(_ctrl))
+        if args.local_rank == 0 or not args.use_deepspeed:
+            print(f"qk-clip (MuonClip) enabled: tau={args.qk_clip_tau}, "
+                  f"probe_every={getattr(args, 'qk_clip_probe_every', 50)}, "
+                  f"{len(_ctrl)} trainable attention modules")
+
     if args.stop_step > 0:
         early_stopping_callback = EarlyStoppingCallback(stop_step=args.stop_step)
         trainer.add_callback(early_stopping_callback)
@@ -894,6 +927,25 @@ def add_args(parser: argparse.ArgumentParser):
         sub_parser.add_argument('--muon_first_layer_names', type=str, default='', help='Comma-separated substrings to match first layer params (kept on AdamW)')
         sub_parser.add_argument('--muon_last_layer_names', type=str, default='', help='Comma-separated substrings to match last layer params (kept on AdamW)')
         sub_parser.add_argument('--muon_verbose', action='store_true', help='Print parameter routing info for Muon optimizer')
+
+        # MuonClip / qk-clip. Separate from --use_muon on purpose: it is an optimizer-side
+        # weight rescale, so it composes with either optimizer and can be measured against
+        # an AdamW control. See model/qk_clip.py for why this is not attn_logit_cap.
+        sub_parser.add_argument('--qk_clip_tau', type=float, default=None,
+                                help='MuonClip qk-clip threshold on the observed per-head max '
+                                     'attention logit. None (default) = OFF and bit-identical. '
+                                     'Set it from a measured logit scale, not by guessing: run '
+                                     'scripts_local/attn_qk_growth_probe.py first.')
+        sub_parser.add_argument('--qk_clip_probe_every', type=int, default=50,
+                                help='Measure max attention logits every N optimizer steps. The '
+                                     'probe materializes the score matrix SDPA avoids, so this '
+                                     'trades responsiveness for throughput; logit scale moves '
+                                     '<1%% per 1000 steps, so 50 is already generous.')
+        sub_parser.add_argument('--qk_clip_alpha', type=float, default=0.5,
+                                help='Split of the rescale between W_q (alpha) and W_k (1-alpha). '
+                                     '0.5 = even, as in Kimi K2.')
+        sub_parser.add_argument('--qk_clip_verbose', action='store_true',
+                                help='Print each clip event (module, heads affected, min gamma).')
 
         # ema params
         sub_parser.add_argument('--use_ema', action='store_true', help='Whether to use EMA for model weights')

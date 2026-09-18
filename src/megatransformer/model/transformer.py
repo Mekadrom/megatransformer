@@ -257,6 +257,26 @@ class MegaTransformerAttention(nn.Module):
         # Apply attention mask (use encoder_attention_mask for cross-attention)
         active_mask = encoder_attention_mask if is_cross_attention else attention_mask
 
+        # ---- qk-clip probe (MuonClip). Off by default and bit-identical when off. ----
+        # `_qk_probe_active` is set by QKClipController only on the sampled steps, so the
+        # common case is one bool check. Computed here, ABOVE the path split, so neither the
+        # SDPA nor the manual branch changes shape: SDPA never materializes the scores, and
+        # this is the only place q and k are both available post-RoPE and post-GQA-expansion.
+        if getattr(self, "_qk_probe_active", False):
+            with torch.no_grad():
+                _s = torch.matmul(queries.float(), keys.float().transpose(-1, -2))
+                _s = _s / math.sqrt(self.d_queries)
+                if causal_mask_slice is not None:
+                    _s = _s.masked_fill(causal_mask_slice == 0, float("-inf"))
+                if active_mask is not None:
+                    _s = _s.masked_fill(active_mask.unsqueeze(1).unsqueeze(2) == 0, float("-inf"))
+                # (N, heads, t, T) -> per-head max over batch and both position axes.
+                _m = _s.amax(dim=3).amax(dim=2).amax(dim=0)
+                # A fully-masked row yields -inf; a head with no valid key contributes nothing.
+                _m = torch.where(torch.isfinite(_m), _m, torch.zeros_like(_m))
+                prev = getattr(self, "_qk_max_logit", None)
+                self._qk_max_logit = _m if prev is None else torch.maximum(prev, _m.to(prev.device))
+
         # SDPA fuses scale + mask + softmax + dropout + (probs @ V) into one kernel and
         # never materializes the (N, heads, t, T) score matrix. The manual path below
         # materializes it ~5x per call — the two out-of-place masked_fills each CLONE it —

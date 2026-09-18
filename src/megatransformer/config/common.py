@@ -43,6 +43,18 @@ class MegaTransformerBlockConfig:
     # None = disabled (default). Typical values: 30.0–50.0.
     attn_logit_cap: Optional[float] = None
 
+    # MuonClip / qk-clip (Kimi K2). NOT the same thing as attn_logit_cap above: that one
+    # softcaps scores in the FORWARD pass (and costs the SDPA fast path, transformer.py:271);
+    # this one leaves the forward pass alone and rescales the W_q / W_k WEIGHTS after an
+    # optimizer step whenever an observed per-head max logit exceeds qk_clip_tau. It exists
+    # because Muon's orthogonalized updates give every singular direction the same step size,
+    # which inflates spectral norms and can run attention logits away over a long run.
+    #
+    # None = disabled, and disabled is BIT-IDENTICAL: the forward-pass probe is gated on a
+    # runtime flag the controller only arms every qk_clip_probe_every steps, and it runs
+    # under no_grad writing to a non-parameter attribute.
+    qk_clip_tau: Optional[float] = None
+
     norm_type: str = "layernorm"
     norm_eps: float = 1e-5
     pre_attn_norm: bool = True
