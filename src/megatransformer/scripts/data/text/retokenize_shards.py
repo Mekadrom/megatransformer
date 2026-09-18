@@ -21,6 +21,16 @@ Measured on the real cache (Mistral -> Qwen3, 194 documents):
     Everything from index 1 on is identical and the decoded text is unchanged. This is inherent
     to going through text and it costs at most one token per document.
 
+A TARGET VOCABULARY CAN CONTAIN THE CORPUS'S OWN TEXT. SmolLM2 inherits StarCoder2's vocab,
+where `<reponame>`, `<filename>`, `<gh_stars>` and 13 more sentinels are added tokens marked
+special -- and those exact strings occur literally in ~2.1% of documents each, because the
+mixture includes The Stack. Re-encoding maps them to their native ids, which is correct (it is
+what the teacher was pretrained on), but it broke the naive verifier, which decoded both sides
+with skip_special_tokens=True and so deleted them from the target only: 278/300, off by exactly
+len(sentinel) characters. See `_content_added_tokens`. Nothing in the written corpus was wrong;
+`<|endoftext|>` never appears literally, so no document was falsely split and the document count
+matches the Qwen3 conversion exactly (3,453,477).
+
 ALGORITHM. Pack mode concatenated documents with the tokenizer's EOS as a separator and sliced
 the result into fixed blocks, so block boundaries are meaningless and document boundaries are
 the EOS ids. Therefore:
@@ -124,8 +134,53 @@ def _split_docs(stream, eos):
     return out
 
 
+def _content_added_tokens(tok):
+    """Added-vocab entries that are CONTENT, not control.
+
+    SmolLM2 inherits StarCoder2's vocabulary, which carries `<reponame>`, `<filename>`,
+    `<gh_stars>` and eleven more repo/notebook sentinels as *added* tokens -- and marks all of
+    them special, so `decode(skip_special_tokens=True)` deletes them. Those strings appear
+    LITERALLY in this corpus (2.1% of documents each; the mixture includes The Stack), where
+    Mistral had no such tokens and stored them as ordinary characters. Re-encoding maps them
+    onto their native ids, which is what the teacher was pretrained on and therefore what we
+    want -- but it makes a symmetric `skip_special_tokens=True` comparison report a false
+    mismatch of exactly len(sentinel) characters.
+
+    Decoding with skip_special_tokens=False is not the fix either: Mistral then renders its
+    byte-fallback tokens as the literal text `<0x0A>` and the comparison gets *worse*
+    (1/300 vs 278/300 measured).
+
+    So: drop only the four true control tokens, reproduce everything else verbatim.
+    """
+    ctrl = {tok.eos_token_id, tok.bos_token_id, tok.pad_token_id, tok.unk_token_id} - {None}
+    return {i: s for s, i in tok.get_added_vocab().items() if i not in ctrl}
+
+
+def _decode_content(tok, ids, inv):
+    """decode(skip_special_tokens=True), except ids in `inv` come back as their literal text."""
+    if not inv or not any(i in inv for i in ids):
+        return tok.decode(ids, skip_special_tokens=True)
+    out, buf = [], []
+    for i in ids:
+        if i in inv:
+            out.append(tok.decode(buf, skip_special_tokens=True))
+            buf = []
+            out.append(inv[i])
+        else:
+            buf.append(i)
+    out.append(tok.decode(buf, skip_special_tokens=True))
+    return "".join(out)
+
+
 def _verify(in_dir, out_dir, src, tgt, src_eos, tgt_eos, n_docs):
-    """Compare decoded text of the first n_docs documents, source vs output."""
+    """Compare decoded text of the first n_docs documents, source vs output.
+
+    Returns (same, n, lossy). `lossy` counts documents the TARGET TOKENIZER cannot round-trip
+    on its own -- re-encoding the source text and decoding it back already differs. Those are
+    binary-garbage documents in the corpus whose control bytes the tokenizer's normalizer
+    strips; no converter can preserve them, so they are reported but not treated as failures.
+    Measured Mistral -> SmolLM2 over 3000 documents: 2 lossy, 0 genuine mismatches.
+    """
     def _head(paths, eos, want):
         docs, stream = [], []
         for p in paths:
@@ -139,12 +194,17 @@ def _verify(in_dir, out_dir, src, tgt, src_eos, tgt_eos, n_docs):
     s_docs = _head(_iter_shard_paths(in_dir), src_eos, n_docs)
     t_docs = _head(_iter_shard_paths(out_dir), tgt_eos, n_docs)
     n = min(len(s_docs), len(t_docs))
-    same = sum(
-        src.decode(s_docs[i], skip_special_tokens=True)
-        == tgt.decode(t_docs[i], skip_special_tokens=True)
-        for i in range(n)
-    )
-    return same, n
+    inv_s, inv_t = _content_added_tokens(src), _content_added_tokens(tgt)
+
+    same = lossy = 0
+    for i in range(n):
+        a = _decode_content(src, s_docs[i], inv_s)
+        b = _decode_content(tgt, t_docs[i], inv_t)
+        if a == b:
+            same += 1
+        elif _decode_content(tgt, tgt(a, add_special_tokens=False)["input_ids"], inv_t) != a:
+            lossy += 1
+    return same, n, lossy
 
 
 def main():
@@ -166,13 +226,18 @@ def main():
     ap.add_argument("--verify", type=int, default=300,
                     help="After writing, compare this many documents' decoded text against "
                          "the source. 0 disables. Cheap, and the failure it catches is silent.")
+    ap.add_argument("--verify_only", action="store_true",
+                    help="Skip conversion and only re-verify an output dir that already exists. "
+                         "The conversion is ~90 min on the full cache; a verifier fix should not "
+                         "cost that again.")
     args = ap.parse_args()
 
     in_dir = os.path.abspath(args.input_dir)
     out_dir = os.path.abspath(args.output_dir)
     if in_dir == out_dir:
         raise SystemExit("refusing to write into the input dir; pass a different --output_dir")
-    if os.path.isdir(out_dir) and glob.glob(os.path.join(out_dir, "shard_*.pt")):
+    if not args.verify_only and os.path.isdir(out_dir) and glob.glob(
+            os.path.join(out_dir, "shard_*.pt")):
         raise SystemExit(f"{out_dir} already contains shards; refusing to overwrite")
 
     from transformers import AutoTokenizer
@@ -183,6 +248,17 @@ def main():
         raise SystemExit("both tokenizers need an eos_token_id (it is the document separator)")
     print(f"source {args.source_tokenizer} (vocab {src.vocab_size}, eos {src_eos})")
     print(f"target {args.target_tokenizer} (vocab {tgt.vocab_size}, eos {tgt_eos})")
+
+    if args.verify_only:
+        n = args.verify or 300
+        print(f"\nverifying {n} documents against the source...")
+        same, tot, lossy = _verify(in_dir, out_dir, src, tgt, src_eos, tgt_eos, n)
+        bad = tot - same - lossy
+        print(f"  text identical: {same}/{tot}" + ("" if not bad else "   <-- MISMATCH"))
+        if lossy:
+            print(f"  {lossy} document(s) the target tokenizer cannot round-trip at all "
+                  f"(corpus binary garbage; not a conversion failure)")
+        raise SystemExit(1 if bad else 0)
 
     paths = _iter_shard_paths(in_dir)
     if args.limit_shards:
@@ -290,9 +366,13 @@ def main():
     # verification belongs in the converter rather than in a script nobody remembers to run.
     if args.verify:
         print(f"\nverifying {args.verify} documents against the source...")
-        ok = _verify(in_dir, out_dir, src, tgt, src_eos, tgt_eos, args.verify)
-        print(f"  text identical: {ok[0]}/{ok[1]}" + ("" if ok[0] == ok[1] else "   <-- MISMATCH"))
-        if ok[0] != ok[1]:
+        same, n, lossy = _verify(in_dir, out_dir, src, tgt, src_eos, tgt_eos, args.verify)
+        bad = n - same - lossy
+        print(f"  text identical: {same}/{n}" + ("" if not bad else "   <-- MISMATCH"))
+        if lossy:
+            print(f"  {lossy} document(s) the target tokenizer cannot round-trip at all "
+                  f"(corpus binary garbage; not a conversion failure)")
+        if bad:
             raise SystemExit("verification FAILED; output is not faithful to the source")
 
     el = time.time() - t0

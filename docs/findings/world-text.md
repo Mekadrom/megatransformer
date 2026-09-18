@@ -688,6 +688,32 @@ eager-autocast builds and is what both healthy runs use.
 
 The fix makes the flag optional rather than load-bearing.
 
+**Census, 2026-09-18: EVERY world-image run used the flag. 13/13.** Grepped the launch command
+line out of the raw `.tfevents` bytes rather than parsing the protobufs
+(`grep -rla -- "--compile_recurrent_block" runs/world_image/<run>/`), which is seconds per run
+instead of minutes:
+
+    zimage_qwen_t3_2, t3_xskip_0, t3_nopos_xskip_..._native_0, t3_xskip_..._cosine_0,
+    t3_xskip_long_..._cosine_0, t3_xskip_muon{0.0025,0.005,0.01,0.02,0.04}_0,
+    t4_ar_..._cosine_0, t4_rope_long_..._cosine_0, qwen_whiten_0
+
+All five Muon sweep arms are in that list. **The world-image Muon sweep is NOT confounded and
+does not need re-running** — I said in conversation that it was; that was wrong, and it was
+wrong because I had guessed at the flag rather than grepping for it.
+
+⚠️ **RETRACTED (same day, never written here, recorded so it is not repeated): "distance from
+depth-scaled init separates a trained trunk from a starved one."** I built a diagnostic
+comparing `o_proj` / `ffn.condense` std against the `apply_depth_scaled_residual_init` value
+(2.8527e-03) and read world-voice at 8.5x, world-image `nopos_native` at 6.0x, world-image
+`t3_xskip_cosine` at 5.9x, presenting the last as an EAGER control. It is compiled — see the
+census above. So the table was compiled-vs-compiled and carried no signal about this bug at all.
+Two independent reasons not to reuse the method: the labelling was wrong, and the metric is weak
+anyway (weight scale saturates, so at 100k steps even a heavily slowed trunk reaches a similar
+norm).
+
+**Net scope: no run in this repository was affected except the eager world-text runs launched in
+this session.** world-voice and world-image are clean.
+
 ### ~~⭐ A Poisson draw of n == 0 costs 4.7 GiB and reads as a slow leak~~ RETRACTED (2026-09-18)
 ~~Clamping n >= 1 removes a pathological memory spike.~~ **RETRACTED same day, commit e0e67ab.**
 The spike was not pathological: `n == 0` was the only path doing correct backprop, and it cost
