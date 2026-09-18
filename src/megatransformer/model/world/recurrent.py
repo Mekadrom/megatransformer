@@ -301,7 +301,22 @@ class MegatransformerRecurrentBlock(nn.Module):
             mu = math.log(t + s) - (sigma**2 / 2)
             rate = torch.zeros((1,)).log_normal_(mean=mu, std=sigma, generator=n_generator)
             p = torch.poisson(torch.tensor([rate], dtype=torch.float), generator=n_generator) + 1
-            n = torch.clamp(p - s, min=0)
+            # min=1, NOT 0. A draw of n == 0 skips the no-grad block entirely, and MEASURED
+            # on this model (batch 4, mean 32, backprop 8) that makes every subsequent grad
+            # iteration cost 1.666 GiB instead of 0.961 -- a 4.7 GiB forward-peak jump, from
+            # each recurrent block's GELU and Linear saving activations they otherwise do not
+            # (localised by CUDA memory snapshot to nn.GELU.forward, 4.56 GiB, absent when
+            # n >= 1). At ~2.5% of steps that is a random OOM on a 24GB card; observed at
+            # steps 105, 11, 11 and 33 across four launches, which reads like a slow leak and
+            # is not one.
+            #
+            # WHY a preceding no-grad pass changes what the grad passes retain is NOT
+            # explained -- graph-barrier, dtype and detach hypotheses were each tested and
+            # falsified. The trigger is exact though (n == 1 behaves identically to n == 45),
+            # so this clamps the pathological case out rather than pretending to understand
+            # it. Cost: one extra no-grad iteration on the minority of steps that drew 0,
+            # which shifts the depth distribution by at most one step.
+            n = torch.clamp(p - s, min=1)
             k = torch.as_tensor(torch.minimum(torch.as_tensor(s), p))
             self.step += 1
         else:
