@@ -665,6 +665,86 @@ gen-query compression). Treat "arm X is ahead at 20k" as uninformative about the
 default; this direction has now paid for that lesson three times.
 ⚠️ One seed per arm.
 
+### LONG-CAPTION PAIR: native/AR loses by 36x LESS when captions are long
+Two from-scratch arms, 40k steps, on a long-caption subset built from the 21 t2i shards
+(`image_gen_captions_long`: 320k samples, median 93 SmolLM2 tokens, 81.4% over 64, matched
+held-out val). Identical but for the conditioning layout:
+`rope` = `small_sum_zimage_t4_ar_rope` (AR per-token flow head, NATIVE length, RoPE so there is no
+length cap, whitened on long_native = 84.4 mean Qwen tokens) vs `k64` = `small_sum_zimage_t3_xskip`
+(parallel head, every caption F.interpolate'd to 64, whitened on long_k64).
+Final comparison: 3 late checkpoints x 2 seeds, paired, N=4.
+
+| probe | w | rope | k64 | paired delta | rope higher |
+|---|---|---|---|---|---|
+| LONG (~48 words, ceiling 0.289) | 3.0 | 0.2603 | 0.2620 | **-0.0017 +- 0.0010** | 1/6 |
+| LONG | 1.0 | 0.2342 | 0.2395 | -0.0053 +- 0.0021 | 1/6 |
+| SHORT (~10 words, ceiling 0.368) | 3.0 | 0.2720 | 0.3330 | **-0.0610 +- 0.0021** | 0/2 |
+| SHORT | 1.0 | 0.2060 | 0.2465 | -0.0405 +- 0.0018 | 0/2 |
+
+⭐⭐⭐ **The gap is 36x smaller on long prompts than short ones at w=3 (0.0017 vs 0.0610).** As a
+fraction of each probe's own GT ceiling: on long captions rope reaches 90.1% against k64's 90.7%;
+on short ones 73.9% against 90.5%. First evidence in this direction that conditioning FORMAT
+interacts with caption length at all.
+⛔ **k64 still wins both.** -0.0017 is 1.7 SE with 1/6 paired comparisons favouring rope. "No
+longer decisively behind" is the honest reading; "tied" is not.
+⭐⭐ **The SHORT deficit is the more interesting half.** Both arms trained on the SAME long corpus,
+so rope is not worse from seeing different data -- it generalises worse to short prompts.
+Suspected cause, NOT tested: the AR unroll emits its full budget regardless, so a 10-word prompt
+gets conditioning tokens the caption never justified. `image_cond_length` (built 2026-09-17, wired
+through generate()) sets the count per prompt and would test this directly.
+⚠️ **Confounded three ways.** rope changes the factorisation (AR vs parallel), the length handling
+(native vs K=64) AND the coda (position-wise vs Q-Former) at once -- the same bundling that made
+the original T4 verdict uninterpretable. It says the three TOGETHER are competitive on long
+captions, not which one is responsible.
+⚠️ The long probe's 8 prompts average ~48 words ~= 60-70 CLIP tokens, near CLIP's 77-token
+truncation. A longer probe would be silently scored on a truncated prompt.
+
+### Euler steps are NOT the variance lever: +0.006 for both arms, equally
+`--flow_steps` sweep, `cosine_0/ckpt-97000` and `t4_ar/ckpt-100000`, N=8, seeds pinned, 20 cells.
+
+| w=3.0 | steps 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|
+| baseline (K=64) | 0.338 | 0.346 | 0.351 | 0.352 | 0.355 |
+| t4 (AR) | 0.326 | 0.327 | 0.327 | 0.321 | 0.324 |
+
+⛔ **Raising 8 -> 32 buys the baseline +0.006 and T4 +0.000-0.006 -- no differential benefit.** So
+T4's -0.0235 deficit is NOT Euler discretisation error, which was the top item on the
+variance-mitigation list. Kills that lever.
+⭐ Below 8 costs real quality for the parallel head (4 -> 8 is +0.008 at w=3) but NOT for the AR one
+(0.326 -> 0.327), whose per-token ODE is apparently easier to integrate.
+⚠️ Cost: the flow head is a tiny share of eval wall-clock (Z-Image's 1024 decode dominates), so
+steps are nearly free at this scale and 16 is a reasonable default. Do not budget by forward count.
+
+### The broken exit criterion does NOT reach world-image
+The world-voice session found `exit_criteria: "kl_divergence"` applies `F.kl_div` to post-norm
+ACTIVATIONS -- a signed quantity, so `value < threshold` passes on any negative value -- and that
+fixing it was worth LCS 0.7519 -> 0.8849 there. Checked here across 24 cells (2 checkpoints x
+{kl_divergence, latent_diff, none} x w in {1,3} x 2 seeds):
+
+| arm | w | kl_divergence | latent_diff | none |
+|---|---|---|---|---|
+| baseline | 3.0 | 0.3470 | 0.3445 | 0.3450 |
+| baseline | 1.0 | 0.3050 | 0.3070 | 0.3045 |
+| t4 | 3.0 | 0.3245 | 0.3220 | 0.3225 |
+| t4 | 1.0 | 0.3035 | 0.3055 | 0.3015 |
+
+⛔ **Null. Max spread 0.0025, inside the 0.004 noise floor, and seed spread is unchanged** (t4 w=1
+stays 0.013-0.015 under all three) -- none of voice's 24x variance collapse appears.
+⭐ **Structural reason, not luck:** the image eval calls `forward()`, which routes through
+`_exit_eligibility()` -- a dict of text/voice masks only. Image appears in NO key, so image
+positions were never eligible and the criterion could not reach them. The unmasked call site the
+voice session flagged is in `generate()`, which only the Gradio path uses for image.
+⭐⭐ **THEREFORE the variance conclusions survive**: T4's wider spread and the per-checkpoint
+variance that forced the block-mean protocol are real, not criterion artifacts.
+⚠️ `converge_eligible=None` does NOT mean exempt -- `recurrent.py` sets `eligible_any =
+converge_eligible`, so None makes EVERY position eligible. Exempt is an all-FALSE mask. My first
+"fix" to generate() had this inverted; corrected in 263a5ce, verified 32 iters/step off vs 9 on.
+⭐ **Free inference win, untaken:** with `image_exit_eligible=True` + `latent_diff` 0.03 the trunk
+runs 13.2 iterations instead of 32 with CLIPScore held (0.355 vs 0.359, inside noise) -- 2.4x less
+trunk compute. Lands exactly at the knee the iteration sweep found. Opt-in, default unchanged.
+⚠️ The voice session separately found `latent_diff` INDUCES collapse for voice (65-75/96,
+`fa5d316`). Do not carry this recommendation across directions.
+
 ### FOUR-ARM RESULT at 100k: AR ties the baseline UNGUIDED and loses only on guidance response
 All four from-scratch arms complete at 100k on the same recipe (1e-4 x3, cosine, seed 42), every
 checkpoint evaluated at w=1.0/3.0, N=4. Final-10 means:
