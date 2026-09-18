@@ -777,55 +777,57 @@ this; a per-step profile of peak memory against the sampled (n, k) answered it i
 
 ---
 
-### ⭐⭐ An active exit criterion makes eval scores depend on BATCH COMPOSITION (2026-09-18)
+### ~~⭐⭐ An active exit criterion makes eval scores depend on BATCH COMPOSITION~~ RETRACTED (2026-09-18)
+~~Co-batching a harder sequence changes an easier sequence's score (logit_kl 1.48e-03 vs none
+1.91e-06).~~ **RETRACTED THE SAME DAY, twice revised before that.** The effect was never
+separated from run-to-run randomness. Repeating the IDENTICAL request at batch size 1, n=8:
 
-Convergence in the recurrent trunk is tracked per token -- `converged` is `(B, T)` and a
-converged token is frozen by `torch.where(converged, last_thought_state, new_thought)` with
-`last_thought_state = thought_states` (line 540), so the freeze PERSISTS. Co-batching a harder
-sequence makes the loop run longer, because it terminates on `converged.all()`
-(`recurrent.py:524`), which is global across the batch.
+| exit criterion | sd of the summed logprob | range |
+|---|---:|---:|
+| `logit_kl` (thr 5e-4) | **1.64e-03** | 4.42e-03 |
+| `none` | 4.77e-07 | 1.91e-06 |
 
-⚠ **MECHANISM CORRECTED same day.** The first version of this entry said the extra iterations
-change an easier sequence's not-yet-converged tokens. That is wrong, and the wrong version would
-have sent someone to fix the freeze, which is not broken. Measured directly, recording the
-iteration at which each row-0 token first converges:
+The claimed batch effect (1.48e-03) sits INSIDE one standard deviation of the noise at the same
+setting. The `none` "control" that supposedly proved right-padding safe (1.91e-06) is simply that
+setting's noise floor, so it established nothing about padding either. Both the finding and its
+control were measurements of the same unmodelled variance. The intermediate revision -- which
+blamed batch numerics amplified by the threshold -- is equally unsupported: at batch size 1,
+padding the same sequence to 6, 12 and 40 gave IDENTICAL convergence iterations
+`[5,5,4,5,5,5]`, while the same shape run twice gave `[5,5,4,5,5,5]` and `[4,5,4,5,5,5]`.
+Shape changed nothing; repetition changed everything.
 
-    solo     6 iterations   first-converged [5, 5, 4, 5, 5, 5]
-    batched  8 iterations   first-converged [4, 5, 4, 5, 5, 5]
+**Method note, the reason this is worth keeping:** a two-arm comparison was run without ever
+measuring the within-arm spread, and both arms then "confirmed" a mechanism. Any future
+exit-criteria or iteration-count comparison needs n>=5 repeats per arm before a delta is read.
 
-Five of six tokens freeze at the SAME iteration and hold their values through the extra
-iterations. Only token 0 differs -- it crossed the 5e-4 threshold one iteration EARLIER when
-batched. The real mechanism is that batch-dimension numerical noise (~1.5e-4 in thought space,
-present even with `exit_criteria=none` -- measured 1.7e-4 for `logit_kl` vs 1.5e-4 for `none` on
-random input where nothing converges) is amplified by a THRESHOLD TEST into a discrete change in
-freeze timing. A token frozen at iteration 4 instead of 5 holds a different state, and that one
-flip is the entire logprob delta.
+### ⭐⭐⭐ EVAL IS NONDETERMINISTIC, and an early exit is what exposes it (2026-09-18)
+`initialize_thinking_state` draws `torch.randn_like` on every forward -- `thought_initialization_method`
+defaults to `"like-init"` (trunc-normal, std 0.02) and only `"none"`/`"zero"` avoid the draw. It is
+unseeded, and nothing disables it at eval, so the same input scores differently every call.
 
-**Consequence for any proposed fix:** per-row early exit would NOT restore determinism, because
-row 0's arithmetic still changes when row 1 shares its matmuls. Only `--batch_size 1` or
-`--exit_criteria none` does. The global `converged.all()` is nonetheless a real THROUGHPUT
-defect -- a fully converged row is recomputed until the hardest row catches up (6 vs 8
-iterations above) -- but fixing it changes no number.
+What decides whether that reaches the output is the ITERATION COUNT, measured above:
 
-Measured on `smollm2_ce_0/checkpoint-2000`, CPU, fp32, scoring the identical request alone vs
-beside one longer sequence:
+- full 32 iterations (`exit_criteria=none`): sd **4.77e-07**. The recurrence contracts and the
+  initialization is forgotten.
+- `logit_kl` exiting at iteration ~5-6: sd **1.64e-03**, ~3400x larger. The exit happens before
+  the initialization has decayed.
 
-| exit criterion | logprob alone | in a batch of 2 | delta |
-|---|---:|---:|---:|
-| `logit_kl` (thr 5e-4) | -9.167562 | -9.166082 | **1.48e-03** |
-| `none` | -9.247481 | -9.247483 | 1.91e-06 |
+⭐ **The criterion stabilises before the trajectory does.** `logit_kl` fires when two successive
+readouts agree to 5e-4, which happens by iteration 5 -- but the state at iteration 5 still
+depends on where it started. "The output distribution stopped moving" is not the same property
+as "the output no longer depends on the initialization", and only the second makes an early exit
+sound. Token-0's KL sits at 5.03e-04 against a 5e-4 threshold, i.e. within 0.6% of the line, so
+which side it lands on is decided by the init draw.
 
-The `none` row is also the proof that RIGHT-PADDING IS SOUND: the trunk is causal
-(`MegaTransformerBlockConfig.causal` defaults True, `recurrent_block_config` does not override
-it), so padding after the real tokens cannot reach them, and the residual is fp32 noise.
+**Practical:** use `--exit_criteria none` for anything reported; per-token logprobs otherwise
+carry ~1.6e-3 of noise, which is harmless for an averaged loss curve (it shrinks as 1/sqrt(N))
+but can flip a multiple-choice answer whose two options differ by less than that. A seeded init,
+or `"zero"`, would make eval reproducible without giving up early exit.
 
-**Consequences.** (1) Benchmark numbers must be taken at `--batch_size 1` or with
-`--exit_criteria none`, or they depend on how the harness happened to pack requests -- which
-for multiple-choice tasks can flip a close comparison between two options scored in different
-batches. (2) The SAME coupling applies to the training-time eval at `--eval_steps`, where it is
-a function of `--eval_batch_size`; eval-loss curves from runs with different eval batch sizes
-are therefore not strictly comparable while an exit criterion is active. Not yet quantified at
-`--eval_batch_size 2`, which is what `smollm2_ce_0` uses.
+**OPEN:** is early exit measuring the right quantity at all? A criterion on init-dependence
+(e.g. agreement between two different random starts) would test convergence to a fixed point
+rather than momentary stability of the readout. Settled by running the same input from k seeded
+inits and measuring spread at each iteration.
 
 ### lm-evaluation-harness adapter (2026-09-18, `eval_lm_harness.py`)
 Scores by loglikelihood only; `generate_until` raises rather than silently exercising the
