@@ -3080,6 +3080,76 @@ this measures length extrapolation, not narrative coherence.
 builds a `MultimodalDataCollator` must take the base from `model.config.special_token_base`.
 The probe now raises instead of skipping.
 
+### ESTABLISHED 2026-09-18: Muon beats AdamW by a wide margin at matched steps (lr_muon 0.005)
+
+Sweep arm 1 of 3 complete, `cosyvoice2_smollm2_libriheavy_muon_lr0.005_0`, 10k steps on GPU2
+in 8h56m. Identical CLI to the AdamW baseline except the optimizer flags, fresh from step 0,
+seed 42, same cache. `eval/loss`:
+
+| step | 2000 | 4000 | 6000 | 8000 | 10000 |
+|---|---|---|---|---|---|
+| AdamW 1e-4 (baseline) | 0.6138 | 0.5835 | 0.5603 | 0.5261 | 0.5009 |
+| **Muon lr 0.005** | **0.5170** | **0.4819** | **0.4696** | **0.4597** | **0.4531** |
+| Muon lr 0.02 | 0.5766 | 0.5550 | -- | -- | -- |
+
+**-0.048 eval loss at step 10000, and Muon at step 2000 (0.5170) already beats AdamW at step
+8000 (0.5261)** -- roughly a 4x step speedup early. lr 0.02 is clearly too hot (worse than
+0.005 at every point) yet still beats AdamW, so the whole bracket is above the baseline.
+
+⚠️ The optimum is at the LOW EDGE of the 0.005/0.02/0.05 bracket, so 0.05 is expected to be
+worse still and **the sweep does not contain its own answer**. Extend downward (0.00125,
+0.0025) before committing to a keeper LR.
+
+⚠️ Single seed. Eval loss is teacher-forced CE over 6,000 val utterances, far lower-variance
+than the free-running LCS that forced the 2-seed protocol -- but it is still n=1, and eval
+loss is not audio quality.
+
+Routing (verified, not assumed): 66 tensors / 160.7M on Muon, 120 on AdamW at 1e-4, frozen
+SmolLM2 excluded, `unit_head` / `out_translator.2` / input projections held on AdamW via
+`--muon_last_layer_names` / `--muon_first_layer_names`. `--use_muon` bypasses
+`create_optimizer`'s param-group split, which costs nothing in voice-only (the flow/dit groups
+are empty there) but WOULD matter for world-image.
+
+### ESTABLISHED 2026-09-18: Muon inflates attention logits ~2x faster than AdamW -- qk-clip is indicated
+
+Two probes, both committed: `scripts_local/attn_qk_growth_probe.py` (weight-side, data-free)
+and `scripts_local/attn_logit_scale_probe.py` (activation-side, real batches).
+
+**Activation-side max pre-softmax logit**, trunk depth PINNED at 32 so the series is
+comparable (the Poisson-sampled depth otherwise confounds it -- a deeper forward samples more
+attention maps and reports a higher max for identical weights):
+
+| | step | max | p99 | p95 | median |
+|---|---|---|---|---|---|
+| AdamW | 90,000 | 31.37 | 28.66 | 21.01 | 11.76 |
+| AdamW | 100,000 | 36.25 | 28.79 | 21.32 | 12.21 |
+| Muon 0.005 | 2,000 | 35.96 | 32.37 | 25.82 | 15.01 |
+| Muon 0.005 | 10,000 | **72.24** | **55.04** | 31.69 | 14.85 |
+
+**Muon at 10k steps has 2.0x the max logit AdamW has at 100k**, and 1.9x the p99. Muon's is
+climbing (+100.9% max, +70.0% p99 over 2k->10k) while AdamW's p99 is flat (+0.5% over
+90k->100k). That is the MuonClip failure mode by construction: Muon's orthogonalized update
+gives every singular direction the same step size, so spectral norms grow more freely, and
+sigma(Wq)*sigma(Wk) is what sets the logit scale.
+
+Weight-side bound agrees and is cheaper to collect: Muon 0.503 -> 2.488 over 2k->10k
+(+394.8%), AdamW 1.159 -> 1.521 over 68k->100k (+31%). Muon passes AdamW's 100k value by
+step ~6000.
+
+⚠️ **NOTHING HAS BROKEN.** The Muon run with the growing logits is the best model measured in
+this direction. qk-clip is prophylactic here, not a repair, and it should be judged on whether
+it costs anything -- not on whether it fixes a visible failure.
+
+⚠️ Growth measured only over 2k-10k. AdamW's own growth had flattened by 90k, so Muon's may
+self-limit too; a 100k Muon run is the test.
+
+**tau**: p99 at Muon 10k is 55.0 and max is 72.2, so `--qk_clip_tau 60` bites only the tail
+immediately and caps further growth. `--qk_clip_tau 36` would hold the scale at AdamW's
+100k level, which is more aggressive and more likely to cost quality.
+
+⚠️ Both probes were measured at a PINNED depth of 32. Live training samples Poisson depths, so
+the values the in-training probe reports will not match these exactly.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
