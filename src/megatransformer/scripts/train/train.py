@@ -296,12 +296,25 @@ def get_dataset(command: str, args, split: str):
     elif command in ["world"]:
 
         def _resolve_shard_dir(modality, split):
-            """Resolve shard directory for a requested modality. Prefers the
-            explicit per-split arg (--<mod>_<split>_cache_dir) when present,
-            otherwise appends _train/_val to --<mod>_cache_dir. Hard-fails if
-            the resolved directory is missing — silently skipping an explicitly
-            requested modality hides data corruption and lets training proceed
-            without the modality it was supposed to include.
+            """Resolve shard directory for a requested modality.
+
+            Precedence: the explicit per-split arg (--<mod>_<split>_cache_dir) wins;
+            otherwise --<mod>_cache_dir is combined with the split in one of two layouts,
+            NESTED first and FLAT second:
+
+              nested  <base>/train  <base>/val     <- HF-upload layout, e.g.
+                                                      Mekadrom/text_huginn-mix_smollm2/train
+              flat    <base>_train  <base>_val     <- the older convention, e.g.
+                                                      text_train_merged / text_val_merged
+
+            Both are live on this box (the voice and image caches moved to nested for HF
+            upload; some text caches predate it), so the base flag has to understand both or
+            it silently resolves to a path that does not exist. Nested is tried first because
+            it is the direction the datasets are moving.
+
+            Hard-fails if nothing resolves — silently skipping an explicitly requested
+            modality hides data corruption and lets training proceed without the modality it
+            was supposed to include.
             """
             explicit = getattr(args, f"{modality}_{split}_cache_dir", None)
             if explicit is not None:
@@ -316,8 +329,21 @@ def get_dataset(command: str, args, split: str):
                         f"or both --{modality}_train_cache_dir and "
                         f"--{modality}_val_cache_dir."
                     )
-                candidate = base + "_" + split
-                source = f"--{modality}_cache_dir={base}, split={split}"
+                nested = os.path.join(base.rstrip("/"), split)
+                flat = base.rstrip("/") + "_" + split
+                if os.path.isdir(nested):
+                    candidate, source = nested, f"--{modality}_cache_dir={base} (nested/{split})"
+                elif os.path.isdir(flat):
+                    candidate, source = flat, f"--{modality}_cache_dir={base} (flat _{split})"
+                else:
+                    raise FileNotFoundError(
+                        f"Shard directory for modality '{modality}' split '{split}' not found "
+                        f"under --{modality}_cache_dir={base}. Tried BOTH layouts:\n"
+                        f"  nested: {nested}\n"
+                        f"  flat:   {flat}\n"
+                        f"Pass --{modality}_{split}_cache_dir explicitly if the directory is "
+                        f"somewhere else."
+                    )
             if not os.path.isdir(candidate):
                 raise FileNotFoundError(
                     f"Shard directory for modality '{modality}' not found: "
