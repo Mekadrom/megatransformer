@@ -619,23 +619,39 @@ about one step in forty, at 1/43 the gradient norm.**
 **Fix: `torch.clear_autocast_cache()` between the two loops.** Verified across n = 0, 1, 8 and
 natural sampling: 97/97 every time, grad norm 9.22-9.38, peak memory uniform at 9.39 GiB.
 
-⭐ **DIRECT CONFIRMATION — the weights do not move.** 12 real optimizer steps x 8 accumulation
-x batch 2 on real data, measuring relative weight change from init:
+⭐ **HOW MUCH it slows training, corrected.** ~~Earlier text here said the weights "do not
+move" and reported 0.000e+00 relative change.~~ **RETRACTED — harness artifact.** Those runs
+monkeypatched `torch.clear_autocast_cache` to a no-op in order to simulate pre-fix code, which
+ALSO disabled the clear that `torch.autocast.__exit__` performs
+(`torch/amp/autocast_mode.py:390`). That made the poisoned cache persist across microbatches,
+which real code never does.
 
-| parameter | without fix | with fix |
-|---|---|---|
-| `recurrent_blocks.0.self_attn.q_proj.weight` | **0.000e+00** | 1.163e-02 |
-| `recurrent_blocks.3.ffn.expand.weight` | **0.000e+00** | 3.352e-02 |
-| `recurrent_blocks.5.ffn.condense.weight` | **0.000e+00** | 1.437e-01 |
-| `post_projection_norm.weight` | 9.171e-04 | 4.357e-04 |
+Measured properly (fix disabled in the source file, autocast behaving normally), mixing forced
+`n == 0` microbatches into an accumulation window:
 
-Exactly zero, not merely small — and steps that CONTAINED an `n == 0` microbatch still showed
-0.000e+00 (checked per-step over 25 steps), so the poisoned cache survives across microbatches
-within a process and an occasional `n == 0` draw does not rescue it.
+| microbatch n | trunk params w/o grad (cumulative in window) |
+|---|---|
+| 4, 4, 4 | 72 |
+| **0** | **0** |
+| 4, 4 | 0 |
+| **0** | 0 |
+| 4 | 0 |
 
-⚠️ This is measured in EAGER mode only. It does not describe the real runs, which compile the
-trunk — see the scope block above. ~~Earlier phrasing here said the trunk was "frozen" across
-every run in the repo;~~ that was wrong, and the checkpoint diffs disprove it.
+`param.grad` is not cleared between microbatches, so the count is cumulative within an
+accumulation window — the metric was reading the window, not the microbatch. The real behaviour:
+
+- `n >= 1` microbatches contribute **nothing** to the 72 trunk Linear params.
+- `n == 0` microbatches contribute **normally**, because `autocast.__exit__` clears the cache
+  so every microbatch starts clean.
+- One `n == 0` anywhere in the window gives the whole optimizer step a trunk gradient, carrying
+  1/accum of the batch's signal. q_proj moved 2.716e-03 on such a step.
+
+`p(n == 0)` under natural sampling is about **1%** (2 in 200 microbatches observed). At
+`gradient_accumulation_steps 16` that is roughly **15% of optimizer steps** getting any trunk
+gradient at all, each from a single microbatch.
+
+So eager-mode training is **slowed and noisy, not frozen** — consistent with the world-image
+checkpoint diff, which moved 1.917e-04 rather than zero.
 
 **Confirmed mechanism, not inference.** `cache_enabled=False` collapses the two arms onto each
 other exactly (16.00 GiB both), which is what identified the cache. A discarded no-grad forward
