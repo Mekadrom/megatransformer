@@ -595,7 +595,53 @@ it as a cost of Qwen3 rather than as a reason to look at SmolLM2 teachers.
 
 **Cost to switch:** one retokenization pass from the Mistral master (~76 min, no re-download).
 
-### ⭐ A Poisson draw of n == 0 costs 4.7 GiB and reads as a slow leak (2026-09-18, commit 33ed4ad)
+### ⭐⭐⭐⭐⭐ The trunk's Linear weights got NO gradient on ~97.5% of steps (2026-09-18, commit e0e67ab)
+`torch.autocast` caches fp32->bf16 weight casts for the lifetime of the autocast region. A cast
+made inside `torch.no_grad()` has **no grad_fn**, so when the grad loop reuses it autograd has no
+path back to the fp32 parameter and `param.grad` stays None — silently, loss still falling. The
+recurrent block runs its no-grad iterations FIRST, populating the cache with grad-severed casts,
+then runs the grad iterations against them.
+
+Measured on the REAL training forward (small_sum text-only, batch 2 x 1024):
+
+| n | trunk params with grad | without | trunk grad norm | peak GiB |
+|---|---|---|---|---|
+| 0 (no-grad loop skipped) | **97 / 97** | 0 | **9.385** | 9.39 |
+| 1 | 25 | **72** | 0.217 | 6.54 |
+| 2 | 25 | **72** | 0.218 | 6.54 |
+| natural sampling | 25 | **72** | 0.218 | 6.54 |
+
+The 72 are every `q_proj` / `k_proj` / `v_proj` / `o_proj` and FFN `expand` / `condense` weight
+and bias across all six recurrent blocks. Only the norms and the thought projection (25 params)
+were training. `n == 0` is drawn ~2.5% of the time, so **the trunk's attention and FFN learned on
+about one step in forty, at 1/43 the gradient norm.**
+
+**Fix: `torch.clear_autocast_cache()` between the two loops.** Verified across n = 0, 1, 8 and
+natural sampling: 97/97 every time, grad norm 9.22-9.38, peak memory uniform at 9.39 GiB.
+
+**Confirmed mechanism, not inference.** `cache_enabled=False` collapses the two arms onto each
+other exactly (16.00 GiB both), which is what identified the cache. A discarded no-grad forward
+is as damaging as a used one (arm B == arm C == 8.44 GiB), so it is the cache population, not the
+input tensor's provenance. Effect is per-forward, not persistent state: an expensive arm stays
+expensive at sequence positions 0, 1, 3 and 5.
+
+⚠️ **SHARED TRUNK CODE — every world-model run in this repo trained under this.** world-voice,
+world-image and world-text all use `MegatransformerRecurrentBlock`. Findings of the form "the
+trunk cannot learn X" need re-examining before they are trusted. Specifically worth revisiting:
+text conditioning being "STRUCTURAL and LR-invariant", the 0.267 unit-accuracy plateau, and
+gen-query compression where "ALL prompt signal arrives in recurrent iteration 0 and 23 more
+iterations add 5%" — that is the expected shape if the iterated weights were barely training.
+
+### ~~⭐ A Poisson draw of n == 0 costs 4.7 GiB and reads as a slow leak~~ RETRACTED (2026-09-18)
+~~Clamping n >= 1 removes a pathological memory spike.~~ **RETRACTED same day, commit e0e67ab.**
+The spike was not pathological: `n == 0` was the only path doing correct backprop, and it cost
+4.7 GiB more because saving activations for weight gradients is what correct backprop costs. The
+clamp (33ed4ad) took the trunk from training on 2.5% of steps to **0%**. Reverted.
+
+The diagnostic work below stands and is kept, because the measurements were right and only the
+conclusion was inverted — the memory signature is a useful detector for this class of bug.
+
+#### Original entry, preserved (2026-09-18, commit 33ed4ad — conclusion now known wrong)
 `n_k_steps` samples n (no-grad iterations) and k (grad iterations) per step from a
 Poisson-log-normal. k is capped at `backprop_depth`; n is not, and **n can come out 0**, which
 skips the `if n_steps_no_grad > 0:` block entirely. When that happens every grad iteration
