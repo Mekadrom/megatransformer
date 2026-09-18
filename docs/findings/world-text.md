@@ -777,6 +777,58 @@ this; a per-step profile of peak memory against the sampled (n, k) answered it i
 
 ---
 
+### ⭐⭐ An active exit criterion makes eval scores depend on BATCH COMPOSITION (2026-09-18)
+
+Convergence in the recurrent trunk is tracked per token -- `converged` is `(B, T)` and a
+converged token is frozen by `torch.where` -- but the loop terminates on `converged.all()`
+(`recurrent.py:524`), which is **global across the batch**. Co-batching a harder sequence keeps
+the loop running, so an easier sequence's not-yet-converged tokens receive extra iterations and
+produce different logits.
+
+Measured on `smollm2_ce_0/checkpoint-2000`, CPU, fp32, scoring the identical request alone vs
+beside one longer sequence:
+
+| exit criterion | logprob alone | in a batch of 2 | delta |
+|---|---:|---:|---:|
+| `logit_kl` (thr 5e-4) | -9.167562 | -9.166082 | **1.48e-03** |
+| `none` | -9.247481 | -9.247483 | 1.91e-06 |
+
+The `none` row is also the proof that RIGHT-PADDING IS SOUND: the trunk is causal
+(`MegaTransformerBlockConfig.causal` defaults True, `recurrent_block_config` does not override
+it), so padding after the real tokens cannot reach them, and the residual is fp32 noise.
+
+**Consequences.** (1) Benchmark numbers must be taken at `--batch_size 1` or with
+`--exit_criteria none`, or they depend on how the harness happened to pack requests -- which
+for multiple-choice tasks can flip a close comparison between two options scored in different
+batches. (2) The SAME coupling applies to the training-time eval at `--eval_steps`, where it is
+a function of `--eval_batch_size`; eval-loss curves from runs with different eval batch sizes
+are therefore not strictly comparable while an exit criterion is active. Not yet quantified at
+`--eval_batch_size 2`, which is what `smollm2_ce_0` uses.
+
+### lm-evaluation-harness adapter (2026-09-18, `eval_lm_harness.py`)
+Scores by loglikelihood only; `generate_until` raises rather than silently exercising the
+`generate()` KV-cache path. Validated against `checkpoint-2000` before any harness was
+installed:
+
+| check | result |
+|---|---|
+| `_score_batch` vs plain teacher-forcing on stored val ids | NLL/tok 6.2734 both, delta **1.91e-06** |
+| right-padding safety (`exit_criteria=none`) | delta 1.91e-06 |
+| real vs nonsense continuation | ` Paris` -9.16 vs ` qzxjkv` -43.75 |
+| context length (val block, ckpt-2000) | 256 tok -> PPL 798.6; 1024 tok -> PPL 560.3 |
+
+The model is built through `world.training.load_model` rather than a hand-rolled override dict,
+because `--text_tokenizer` rewrites `special_token_base`, both `vocab_size` fields and
+`eos_token_id` and then calls `config.__post_init__()` to re-derive interleaver placeholder ids.
+A mismatch does not warn -- the checkpoint fails to load (49161 vs the Mistral-era 32009).
+
+Task split is by SIGNAL AT THIS SCALE, not by instruct-vs-base: all nine requested tasks are
+base-model benchmarks and none need instruction tuning. Default set is `lambada_openai`,
+`wikitext`, `sciq`, `piqa`; `--include_low_signal` adds `hellaswag`, `winogrande`, `arc_easy`,
+`openbookqa`, `boolq`. ⚠ BoolQ's majority class is 0.622 and small base models routinely score
+BELOW it, so the script logs the trivial baseline next to accuracy and marks sub-baseline
+results.
+
 ## OPEN
 
 ### Does the frozen shared head actually cost anything?
