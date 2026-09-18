@@ -1596,6 +1596,16 @@ class WorldModelTrainer(CommonTrainer):
         # instead, which logs one properly averaged point per eval under eval/.
         if model.training and global_step % self.args.logging_steps == 0:
             metrics.log_scalar("train/total_loss", total_loss, global_step)
+            # Perplexity = exp(CE in nats). Derived here rather than stored in
+            # loss_components because that dict is AVERAGED across batches at eval time, and
+            # mean(exp(x)) != exp(mean(x)) -- averaging per-batch perplexities overstates the
+            # real one (Jensen). Per-batch exp is correct for the train curve; the eval side
+            # exponentiates the averaged loss instead. See evaluate().
+            _tlr = loss_components.get("text_loss_raw")
+            if _tlr is not None:
+                _p = float(torch.exp(_tlr.detach().float().clamp(max=20.0)))
+                if math.isfinite(_p):
+                    metrics.log_scalar("train/text_ppl", _p, global_step)
             for name, value in loss_components.items():
                 # skip_zero is right for LOSS terms -- an inactive modality's loss is 0 on
                 # every batch that lacks it, and logging those would bury the real curves.
@@ -2392,12 +2402,20 @@ class WorldModelTrainer(CommonTrainer):
             for task_type, bucket in self._eval_task_accumulator.items():
                 for component, (s, c) in bucket.items():
                     if c > 0:
+                        _mean = s / c
                         metrics.log_scalar(
                             f"eval/{task_type}/{component}",
-                            s / c,
+                            _mean,
                             global_step,
                             skip_zero=False,
                         )
+                        # exp of the AVERAGED loss -- the correct corpus perplexity. Doing it
+                        # here rather than accumulating a ppl component keeps Jensen out of it.
+                        if component == "text_loss_raw":
+                            _p = math.exp(min(float(_mean), 20.0))
+                            if math.isfinite(_p):
+                                metrics.log_scalar(f"eval/{task_type}/text_ppl", _p,
+                                                   global_step, skip_zero=False)
             self._eval_task_accumulator = None
         return output
 
