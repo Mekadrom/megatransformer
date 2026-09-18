@@ -301,22 +301,7 @@ class MegatransformerRecurrentBlock(nn.Module):
             mu = math.log(t + s) - (sigma**2 / 2)
             rate = torch.zeros((1,)).log_normal_(mean=mu, std=sigma, generator=n_generator)
             p = torch.poisson(torch.tensor([rate], dtype=torch.float), generator=n_generator) + 1
-            # min=1, NOT 0. A draw of n == 0 skips the no-grad block entirely, and MEASURED
-            # on this model (batch 4, mean 32, backprop 8) that makes every subsequent grad
-            # iteration cost 1.666 GiB instead of 0.961 -- a 4.7 GiB forward-peak jump, from
-            # each recurrent block's GELU and Linear saving activations they otherwise do not
-            # (localised by CUDA memory snapshot to nn.GELU.forward, 4.56 GiB, absent when
-            # n >= 1). At ~2.5% of steps that is a random OOM on a 24GB card; observed at
-            # steps 105, 11, 11 and 33 across four launches, which reads like a slow leak and
-            # is not one.
-            #
-            # WHY a preceding no-grad pass changes what the grad passes retain is NOT
-            # explained -- graph-barrier, dtype and detach hypotheses were each tested and
-            # falsified. The trigger is exact though (n == 1 behaves identically to n == 45),
-            # so this clamps the pathological case out rather than pretending to understand
-            # it. Cost: one extra no-grad iteration on the minority of steps that drew 0,
-            # which shifts the depth distribution by at most one step.
-            n = torch.clamp(p - s, min=1)
+            n = torch.clamp(p - s, min=0)
             k = torch.as_tensor(torch.minimum(torch.as_tensor(s), p))
             self.step += 1
         else:
@@ -554,6 +539,27 @@ class MegatransformerRecurrentBlock(nn.Module):
 
                     last_thought_state = thought_states
                     iteration += 1
+
+        # ⚠️ DROP THE AUTOCAST WEIGHT CACHE BEFORE THE GRAD LOOP.
+        #
+        # torch.autocast caches fp32->bf16 weight casts and reuses them for the lifetime of
+        # the autocast region. A cast made INSIDE torch.no_grad() has no grad_fn, so when the
+        # grad loop below reuses it, autograd has no path back to the fp32 parameter and
+        # `param.grad` stays None -- silently, with the loss still falling.
+        #
+        # MEASURED on the real training forward (small_sum text-only, batch 2 x 1024):
+        #   n == 0 (no-grad loop skipped):  97/97 trunk params get grad, grad norm 9.385
+        #   n >= 1 (no-grad loop runs):     25/97 get grad, 72 get NONE, grad norm 0.217
+        # The 72 are every q/k/v/o projection and FFN Linear weight and bias in all six
+        # recurrent blocks -- i.e. the trunk was training on ~2.5% of steps (those that drew
+        # n == 0) and its attention and FFN weights got nothing on the other ~97.5%.
+        # Clearing the cache here restores 97/97 and grad norm 9.23.
+        #
+        # This also explains the "n == 0 memory spike" recorded earlier: n == 0 was not
+        # pathological, it was the only CORRECT path. It cost 4.7 GiB more because saving
+        # activations for weight gradients is what correct backprop costs.
+        if k_steps_grad > 0 and n_steps_no_grad > 0 and torch.is_autocast_enabled():
+            torch.clear_autocast_cache()
 
         if k_steps_grad > 0:
             for _ in range(k_steps_grad):
