@@ -745,7 +745,10 @@ def get_trainer(command: str, args, run_dir, model: nn.Module, optimizer: Option
 
             def on_step_end(self, args_, state, control, **kw):
                 stats = self.ctrl.apply(int(state.global_step))
-                if self.ctrl.armed and stats:
+                # NOT self.ctrl.armed: apply() disarms before returning, so that flag is
+                # always False here and the metrics never got logged. was_armed records
+                # whether THIS step actually probed.
+                if getattr(self.ctrl, "was_armed", False) and stats:
                     from megatransformer.utils import metrics as _metrics
                     if _metrics.get_logger() is not None:
                         for k, v in stats.items():

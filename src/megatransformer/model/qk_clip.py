@@ -87,6 +87,7 @@ class QKClipController:
                     continue          # frozen spine (SmolLM2) -- nothing to clip
                 self.modules.append((name, m))
         self.armed = False
+        self.was_armed = False
         self.last_stats: Dict[str, float] = {}
 
     def __len__(self) -> int:
