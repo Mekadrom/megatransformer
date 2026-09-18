@@ -595,6 +595,58 @@ it as a cost of Qwen3 rather than as a reason to look at SmolLM2 teachers.
 
 **Cost to switch:** one retokenization pass from the Mistral master (~76 min, no re-download).
 
+### ⭐ A Poisson draw of n == 0 costs 4.7 GiB and reads as a slow leak (2026-09-18, commit 33ed4ad)
+`n_k_steps` samples n (no-grad iterations) and k (grad iterations) per step from a
+Poisson-log-normal. k is capped at `backprop_depth`; n is not, and **n can come out 0**, which
+skips the `if n_steps_no_grad > 0:` block entirely. When that happens every grad iteration
+costs **1.666 GiB instead of 0.961** — a 4.7 GiB forward-peak jump — plus a permanent ~0.96 GiB
+step in resting allocation that never returns.
+
+Measured, world-text config (batch 4, mean 32, backprop 8, 24GB card):
+
+| n drawn | peak GiB | resting after |
+|---|---|---|
+| 2 … 64 (any n >= 1) | **12.34** — flat | 1.61 |
+| **0** | **17.97 → 18.93** | **2.57, permanently** |
+
+⭐ **The number of no-grad iterations costs nothing.** n=2 and n=64 both sit at 12.34. Only the
+zero draw is pathological, and n=1 behaves identically to n=45.
+
+**It presents as a leak and is not one.** At ~2.5% of steps the draw is 0, so a run dies at its
+first zero — observed at steps **105, 11, 11 and 33** across four launches of the same config.
+Random step numbers, no monotonic climb. That pattern is the diagnostic signature: a leak climbs,
+this is flat with a lottery.
+
+**Localised by CUDA memory snapshot** (`torch.cuda.memory._snapshot()`, aggregating live blocks
+by allocation site): `nn.GELU.forward` holds **4.56 GiB** in the n=0 forward and **does not
+appear at all** when n >= 1; `nn.Linear.forward` adds 1.13 GiB. Per iteration that is
+0.570 + 0.141 = 0.711 GiB against a measured gap of 0.705 — each recurrent block's FFN
+activations being retained for backward when they otherwise are not. The spike is in the
+FORWARD (17.69 vs 13.01), not the backward.
+
+**Fix: `n = torch.clamp(p - s, min=1)`.** One line. Verified over 60 steps of natural sampling:
+peak flat at 12.34 GiB including the three steps that drew n=1, resting allocation flat at 1.61,
+no step-up. Cost is one extra no-grad iteration on the minority of steps that drew 0, shifting
+the depth distribution by at most one step.
+
+⚠️ **WHY is unexplained.** Four hypotheses tested and falsified: (1) graph barrier — the no-grad
+loop hands the grad loop a detached tensor — but detaching the init tensor changed nothing;
+(2) that detach was a no-op anyway, `randn_like` never requires grad; (3) dtype — both paths are
+fp32, verified; (4) autocast weight caching — does not explain the asymmetry. The trigger is
+exact and reproducible, so the clamp removes the pathological draw rather than claiming to
+understand it. **Reopen if the mechanism matters** (e.g. if it reappears in another shape).
+
+⚠️ **SHARED TRUNK CODE.** world-voice and world-image run the same recurrent block. They hit
+this at their own random steps, scaled by their per-iteration activation cost. Unexplained OOMs
+at odd step numbers in those directions are likely this.
+
+**Process note, worth not repeating.** Before profiling I proposed three fixes from arithmetic —
+`expandable_segments`, dropping EMA, reducing batch — and the first two made it fail SOONER
+(11, 11 vs 105) because they shifted the margin by a few hundred MiB while the real event was a
+4.7 GiB spike. The user's question ("why is memory climbing instead of flat?") is what redirected
+this; a per-step profile of peak memory against the sampled (n, k) answered it in one run.
+**Profile before proposing memory fixes.**
+
 ---
 
 ## OPEN
