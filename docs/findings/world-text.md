@@ -780,10 +780,32 @@ this; a per-step profile of peak memory against the sampled (n, k) answered it i
 ### ⭐⭐ An active exit criterion makes eval scores depend on BATCH COMPOSITION (2026-09-18)
 
 Convergence in the recurrent trunk is tracked per token -- `converged` is `(B, T)` and a
-converged token is frozen by `torch.where` -- but the loop terminates on `converged.all()`
-(`recurrent.py:524`), which is **global across the batch**. Co-batching a harder sequence keeps
-the loop running, so an easier sequence's not-yet-converged tokens receive extra iterations and
-produce different logits.
+converged token is frozen by `torch.where(converged, last_thought_state, new_thought)` with
+`last_thought_state = thought_states` (line 540), so the freeze PERSISTS. Co-batching a harder
+sequence makes the loop run longer, because it terminates on `converged.all()`
+(`recurrent.py:524`), which is global across the batch.
+
+⚠ **MECHANISM CORRECTED same day.** The first version of this entry said the extra iterations
+change an easier sequence's not-yet-converged tokens. That is wrong, and the wrong version would
+have sent someone to fix the freeze, which is not broken. Measured directly, recording the
+iteration at which each row-0 token first converges:
+
+    solo     6 iterations   first-converged [5, 5, 4, 5, 5, 5]
+    batched  8 iterations   first-converged [4, 5, 4, 5, 5, 5]
+
+Five of six tokens freeze at the SAME iteration and hold their values through the extra
+iterations. Only token 0 differs -- it crossed the 5e-4 threshold one iteration EARLIER when
+batched. The real mechanism is that batch-dimension numerical noise (~1.5e-4 in thought space,
+present even with `exit_criteria=none` -- measured 1.7e-4 for `logit_kl` vs 1.5e-4 for `none` on
+random input where nothing converges) is amplified by a THRESHOLD TEST into a discrete change in
+freeze timing. A token frozen at iteration 4 instead of 5 holds a different state, and that one
+flip is the entire logprob delta.
+
+**Consequence for any proposed fix:** per-row early exit would NOT restore determinism, because
+row 0's arithmetic still changes when row 1 shares its matmuls. Only `--batch_size 1` or
+`--exit_criteria none` does. The global `converged.all()` is nonetheless a real THROUGHPUT
+defect -- a fully converged row is recomputed until the hardest row catches up (6 vs 8
+iterations above) -- but fixing it changes no number.
 
 Measured on `smollm2_ce_0/checkpoint-2000`, CPU, fp32, scoring the identical request alone vs
 beside one longer sequence:
