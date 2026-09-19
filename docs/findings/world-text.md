@@ -872,13 +872,32 @@ An audit found **eight** sites with the same disease, in two shapes:
 | unconditional Mistral, NO flag can override | `eval_image_synthesis`, `eval_image_transcription`, `eval_voice_synthesis`, `eval_voice_transcription`, `chat_headless` | always wrong off-Mistral |
 | honours `--text_encoder_model` only | `train.py` viz, `visualize`, `tts_intelligibility`, `multimodal_chat` | wrong for a from-scratch prelude on a non-Mistral corpus |
 
-⚠ **This reaches other directions.** The five unconditional ones encode prompts (3 of them) and
-decode outputs (all 5), so for any run using a SmolLM2 prelude the model is fed Mistral-encoded
-noise and, for the transcription scripts, WER/CLIPScore is computed on garbage text. None of
-those five had been touched since 2026-08-16 and two date from 2026-06-20, i.e. they predate
-`--text_encoder_model` adoption entirely. world-voice and world-image should check whether any
-reported number came through them; the Pattern-C scripts that read `special_token_base` off the
-loaded model config (`eval_zimage_adapter`, `eval_sdxl_adapter`) were always correct.
+**Scope: LATENT, not contaminating. No published number is affected.** I initially warned that
+world-voice and world-image results might have come through these scripts. That was wrong, and
+the user's objection is the cleanest disproof: you cannot get WER < 0.1 or CLIPScore > 0.34 with
+a mis-encoded prompt. Both sessions confirmed their metrics come from `scripts_local/`, and an
+audit of that directory agrees:
+
+- The metric-producing probes (`zimage_shrinkage_probe`, `sdxl_shrinkage_probe`,
+  `text_encoder_ridge_probe`, `qwen_logit_lens`, `render_prompt_at_caps`,
+  `voice_length_extrapolation_probe`) take `args.text_encoder_model` with **no fallback**, so a
+  missing flag fails loudly instead of silently defaulting.
+- Three (`image_synthesis_diagnostics`, `probe_word_prompt`, `prenet_gen_trajectory`) do hardcode
+  Mistral, but have no `--text_encoder_model` flag at all and default to `--config small_sum`, so
+  they cannot construct a SmolLM2-prelude model -- pointed at a `zimage_qwen_*` checkpoint they
+  raise the 49161-vs-32009 shape error rather than mis-measuring. `image_synthesis_diagnostics`
+  documents its own target as `world_image_litevae_0`, a Mistral-era run where Mistral was
+  correct.
+- `eval_zimage_adapter` / `eval_sdxl_adapter` read `special_token_base` off the loaded model
+  config, which was always right.
+
+So the eight fixes remove a trap, not a confound. The five unconditional ones predate
+`--text_encoder_model` adoption (untouched since 2026-08-16; two from 2026-06-20), which is
+precisely why nothing current runs through them.
+
+**Method note:** I escalated "this code is wrong" to "your results may be wrong" without checking
+whether the code was reachable from any reported number. The plausibility of the metrics
+themselves was the cheap disproof and I did not apply it.
 
 All eight now resolve `--text_encoder_model or --text_tokenizer or <Mistral>`, verified to pick
 the right source in all three precedence cases and unchanged when neither flag is passed.
