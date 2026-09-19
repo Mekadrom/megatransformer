@@ -3150,6 +3150,57 @@ immediately and caps further growth. `--qk_clip_tau 36` would hold the scale at 
 ⚠️ Both probes were measured at a PINNED depth of 32. Live training samples Poisson depths, so
 the values the in-training probe reports will not match these exactly.
 
+### ESTABLISHED 2026-09-18: Muon LR sweep complete -- 0.005 is the pick, and the reason is the SLOPE
+
+Four arms, all fresh from step 0, seed 42, identical CLI but for the optimizer flags, all
+`--compile_recurrent_block` (so none is affected by the eager-mode autocast/no_grad bug).
+`eval/loss`:
+
+| step | AdamW 1e-4 | Muon 0.0025 | **Muon 0.005** | Muon 0.02 |
+|---|---|---|---|---|
+| 2000 | 0.6138 | 0.5259 | **0.5170** | 0.5766 |
+| 4000 | 0.5835 | 0.4844 | **0.4819** | 0.5550 |
+| 6000 | 0.5603 | **0.4683** | 0.4696 | -- |
+| 8000 | 0.5261 | **0.4559** | 0.4597 | -- |
+| 10000 | 0.5009 | 0.4552 | **0.4531** | -- |
+
+**Every Muon arm beats AdamW by a wide margin** -- 0.005 is -0.048 at step 10000, and reaches
+AdamW's step-8000 loss by step 2000.
+
+**0.0025 vs 0.005 is not a tie, it is a CROSSOVER.** 0.0025 leads at 6000 and 8000, then
+stalls; 0.005 keeps descending and overtakes. The slope over the last 2000 steps is the real
+result:
+
+| arm | 8000 -> 10000 |
+|---|---|
+| Muon 0.0025 | **-0.00064** |
+| Muon 0.005 | **-0.00661** (10x more) |
+
+Lower LR converges faster early and plateaus sooner. For a 100k-step run that ordering is what
+matters, not the rank at 8k. **Pick 0.005.**
+
+**0.02 is the upper wall and it is hard.** grad_norm climbed 0.257 -> 0.420 -> 1.055 -> 1.236
+-> **71.98** between steps 3000 and 5000, with train loss drifting up (0.546 at 2700 -> 0.639
+at 5300). Killed at 5642. So the usable band is ~0.0025-0.005 with divergence by 0.02.
+
+⚠️ Single seed per arm. Eval loss is teacher-forced CE over 6,000 val utterances -- far
+lower-variance than the free-running LCS that forced the 2-seed protocol -- but the 0.0021 gap
+at step 10000 is NOT resolvable at n=1. The 10x slope difference is, being an order of
+magnitude.
+
+⚠️ 0.0025's 8000->10000 segment was a RESUME (the run was interrupted at 8000). Checkpoint
+carried `optimizer.pt` at 692 MB and HF restored it, so Muon momentum survived -- the stall is
+not a momentum reset. A reset would show as a transient worsening then recovery, not a flat
+segment.
+
+**0.00125 was never run**: with the optimum bracketed between 0.0025 and 0.005 and 0.02
+diverging, another halving would land below a region already shown to plateau early.
+
+⚠️ **This LR does NOT transfer to the 20 s corpus unchanged.** Same batch in utterances is a
+1.7x larger batch in TOKENS (mean surviving utterance 185 -> ~316 frames), and Muon's optimum
+scales with batch. Either hold tokens/step constant (`--gradient_accumulation_steps` 8 -> 5)
+so 0.005 transfers exactly, or accept the larger batch at ~0.0075.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
