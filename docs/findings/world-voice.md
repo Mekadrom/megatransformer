@@ -2976,10 +2976,14 @@ belief forward.
 
 **Two secondary results from the same runs:**
 
-1. **DeepSpeed ZeRO-2 costs nothing at world_size=1.** Matched batch 8 x accum 8 (64
-   utts/step), 20 steps, no compile either side: **9.518 samples/s with DeepSpeed vs 9.368
-   without** (+1.6%). So a 2-GPU run should scale close to 2x. Removing the CPU
-   `offload_optimizer` is worth ~20% on its own (it was in the old config for a 167M-param
+1. ~~**DeepSpeed ZeRO-2 costs nothing at world_size=1.** Matched batch 8 x accum 8 (64
+   utts/step), 20 steps, no compile either side: 9.518 samples/s with DeepSpeed vs 9.368
+   without (+1.6%). So a 2-GPU run should scale close to 2x.~~ **RETRACTED 2026-09-18 --
+   measured before the eager-mode autocast/no_grad fix (e0e67ab), so BOTH arms were skipping
+   ~97.5% of the trunk's gradient work.** The backward was artificially cheap and ZeRO-2 had
+   almost no gradient traffic to reduce, which is precisely the cost the measurement existed
+   to price. Superseded by the post-fix entry below. Removing the CPU `offload_optimizer` is
+   worth ~20% on its own and that part stands (it was in the old config for a 167M-param
    trainable model with no memory pressure).
 
 2. **`--compile_recurrent_block` is INCOMPATIBLE with DeepSpeed, not merely disabled by
@@ -3200,6 +3204,43 @@ diverging, another halving would land below a region already shown to plateau ea
 1.7x larger batch in TOKENS (mean surviving utterance 185 -> ~316 frames), and Muon's optimum
 scales with batch. Either hold tokens/step constant (`--gradient_accumulation_steps` 8 -> 5)
 so 0.005 transfers exactly, or accept the larger batch at ~0.0075.
+
+### ESTABLISHED 2026-09-18: DeepSpeed costs 19.8% per GPU, so 2 GPUs buy 1.67x at best
+
+Re-measurement of the retracted numbers above, post-fix (`e0e67ab`), all three arms ALONE on
+gpu3, 60 steps each (20 was not enough to separate compile warmup from steady state -- it was
+why the compiled arm previously showed the best s/it and the worst samples/s). Steady state is
+read from elapsed-time deltas between step 30 and step 60, never from the HF aggregate.
+Matched batch 8 x accum 8 = 64 utts/step.
+
+| arm | s/step | utts/s |
+|---|---|---|
+| eager + compile (production) | **3.367** | 19.01 |
+| DeepSpeed ZeRO-2 (eager) | 4.033 | 15.87 |
+| eager, no compile | 4.167 | 15.36 |
+
+| | |
+|---|---|
+| compile is worth | **+23.8%** |
+| ZeRO-2 overhead alone (vs eager, both uncompiled) | **-3.2%** |
+| DeepSpeed vs production, one GPU | **+19.8%** |
+
+**ZeRO-2 itself is free -- slightly better than free.** The whole penalty is the compile win,
+which `train.py:1053` forfeits under `--use_deepspeed`. And compile is worth **three times**
+what the contaminated measurement suggested (+23.8% vs the ~8% reported), because a trunk that
+actually receives gradients gives inductor far more to fuse.
+
+**Consequence: DeepSpeed must scale better than 1.198x just to match ONE compiled GPU, and at
+a perfect 2.0x it delivers 1.67x.** Realistic scaling with the `lockstep_n` straggler tax is
+lower. The ~19-day epoch estimate for the combined corpus becomes ~11.4 days, not ~9.5.
+
+⚠️ **`CUDA_VISIBLE_DEVICES` does NOT pin the DeepSpeed launcher.** `CUDA_VISIBLE_DEVICES=3
+deepspeed --num_gpus=1 ...` builds its own device list and sets `CUDA_VISIBLE_DEVICES=0` in
+the child (`launch.py:184`); the first attempt at this measurement ran on physical gpu0 and
+OOM'd against another run's 16.9 GB while gpu3 sat idle. Use `deepspeed --include
+localhost:<idx>`, confirmed by `WORLD INFO DICT: {'localhost': [3]}` in the log. This also
+means a gpulease lease and the actual process can silently disagree -- gpulease sets
+CUDA_VISIBLE_DEVICES from the lease, and the launcher then overrides it.
 
 ## OPEN
 
