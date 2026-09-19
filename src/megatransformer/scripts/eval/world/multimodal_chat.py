@@ -1595,7 +1595,13 @@ def main():
                         # and sampler. Naming them bare invited the reading that they were
                         # global.
                         temperature_slider = gr.Slider(
-                            minimum=0.05, maximum=2.0, step=0.05,
+                            # minimum MUST be 0.0: the label promises greedy at 0 and
+                            # world_model.py:2849 implements it (`temperature <= 0.0` ->
+                            # argmax, guarding the division that would otherwise give +-inf).
+                            # A 0.05 floor made the documented setting unreachable, and 0.05
+                            # is NOT a substitute -- it is very peaked sampling, which still
+                            # picks non-argmax tokens.
+                            minimum=0.0, maximum=2.0, step=0.05,
                             value=args.temperature,
                             label="TEXT temperature (text tokens only; 0 = greedy)",
                         )
