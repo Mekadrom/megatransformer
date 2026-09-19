@@ -9,6 +9,19 @@ EOS_TOKEN_ID = 2  # End of Sequence (Mistral-7B EOS)
 # Anything that emits/detects these tokens must use the SAME base as the data.
 SPECIAL_TOKEN_BASE = 32_000  # Mistral vocab size (default)
 
+
+def vocab_bound(tokenizer=None, default: int = SPECIAL_TOKEN_BASE) -> int:
+    """Largest id that is a REAL word piece: ids >= this are control tokens.
+
+    Eval scripts filter decode input with `t < bound` to strip BO*/EO*/placeholder ids. A
+    hardcoded 32000 silently drops every SmolLM2 id in [32000, 49152) -- a third of that
+    vocabulary -- so the bound must come from the tokenizer actually in use, not a literal.
+    `vocab_size` excludes added tokens on purpose: the control tokens ARE added tokens, and
+    they are exactly what the filter exists to remove.
+    """
+    n = getattr(tokenizer, "vocab_size", None)
+    return int(n) if n else int(default)
+
 # DURATION BUCKETS (NAR voice synthesis). A masked-parallel voice decoder must know its
 # block length BEFORE refinement starts -- unlike AR, where EOV simply halts and positions
 # past it never exist. So the model emits a duration token right after BOV and the block is
