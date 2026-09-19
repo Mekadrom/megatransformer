@@ -47,6 +47,7 @@ import torchaudio
 from PIL import Image
 from torch.amp import autocast
 
+from megatransformer.utils.text_normalization import spell_out_numerics
 from megatransformer.utils.tokenizer_resolution import resolve_tokenizer_name
 from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
@@ -190,6 +191,9 @@ def parse_args():
     p.add_argument("--mrope_scale_side", type=str, default=None, choices=["voice", "text", "off"],
                    help="Which stream absorbs the rate. Carries no weights, so it cannot be "
                         "detected from the checkpoint; the loader hard-fails without it.")
+    p.add_argument("--no_spell_out_numerics", dest="spell_out_numerics",
+                     action="store_false", default=True,
+                     help="Do NOT expand digits/currency/percent/symbols in the prompt before synthesis. Expansion is ON by default: 3.67%% of LibriHeavy transcripts contain a digit, so the spelled-out form is what the model was actually trained on.")
     p.add_argument("--voice_temperature", type=float, default=0.0,
                    help="Voice unit sampling temperature. DEFAULT 0.0 (greedy) as of "
                         "2026-09-16: greedy is the best-measured sampler at every checkpoint "
@@ -1136,6 +1140,18 @@ def main():
             return ("", [], [], "Empty prompt.", None,
                     *[gr.update(value=None, visible=False) for _ in range(_AUDIO_PLAYER_POOL)])
         state = state or {}
+
+        # Spell out digits/symbols before synthesis. Only 3.67% of LibriHeavy transcripts
+        # contain a digit and much of that is non-speech (chapter headers, OCR noise), so the
+        # digit form is the weakly-learned regime; the word form is what the model actually
+        # heard. Idempotent and a no-op on text with neither, so it is safe unconditionally.
+        # ⚠️ This is a deliberate train/inference ASYMMETRY -- the corpus keeps its digits --
+        # justified because it moves USER input toward the dominant training regime.
+        if getattr(args, "spell_out_numerics", True):
+            _norm = spell_out_numerics(msg_text)
+            if _norm != msg_text:
+                print(f"[normalize] {msg_text!r} -> {_norm!r}", flush=True)
+            msg_text = _norm
 
         # Normalize UI values into the generate() API. 0 / None / negative
         # means "disabled" for top_p / top_k / seed, matching the underlying

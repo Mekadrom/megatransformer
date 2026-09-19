@@ -3271,6 +3271,54 @@ Same root cause as the world-text entry: **a checkpoint does not record which to
 belong to**, so every consumer re-derives it and each can be wrong independently. Storing the
 tokenizer name in the model config at training time would close both bugs at once.
 
+### ESTABLISHED 2026-09-19: LibriHeavy is NOT number-normalized -- digits are the weak regime
+
+Measured on 12,000 transcripts from the train cache:
+
+| | count | share |
+|---|---|---|
+| contains a digit | 440 | **3.67%** |
+| `$` | 4 | 0.03% |
+| `/` | 25 | 0.21% |
+| `&` | 13 | 0.11% |
+| `=` | 10 | 0.08% |
+
+Spelled-out forms carry the bulk of the signal in the same sample: `one` 838, `first` 237,
+`hundred` 62, `thousand` 40.
+
+So digits DO appear, but in a small and badly-behaved slice -- much of it not speech-bearing
+at all (`8 In the Attic`, `PLAIN VEGETABLE SOUP (2)`, the OCR artifact `pah 1 chock`). The
+digit -> speech mapping is therefore learned from ~3.7% of data of mixed quality while the word
+form is learned from everything else. A user typing "16" or "50%" lands in the weak regime.
+
+**Built `utils/text_normalization.spell_out_numerics()`** (no new dependency; `num2words` is
+not installed): cardinals, ordinals, years, currency, percent, and the symbol set
+`& + = @ # / ~ < >`. Idempotent, and a no-op on text containing neither digits nor symbols.
+
+**Applied at INFERENCE only, on purpose.** The chat UI expands the prompt by default
+(`--no_spell_out_numerics` opts out). The corpus keeps its digits. That is a deliberate
+train/inference ASYMMETRY, justified because 96.3% of training text is digit-free -- so
+spelled-out IS the dominant training regime and normalizing user input moves toward it, not
+away. Recording it here because a silent divergence between train and inference normalization
+is exactly the kind of thing that later reads as a bug.
+
+**Retro-processing an existing cache is supported** but off by default:
+`scripts/data/voice/retokenize_shards.py --spell_out_numerics` re-encodes from the stored
+transcript string (every non-text tensor copies through byte-for-byte) and writes a NEW
+directory. Off by default because it changes the TRANSCRIPT, not just its ids, and the stored
+text must keep matching the audio it labels -- only turn it on to build a deliberately
+spelled-out corpus, and then use expansion at inference too.
+
+⚠️ **This does NOT address the hard-word failures.** `sixteenth` occurs **twice in 12,000**
+transcripts (~160 in the full corpus), so "16th" -> "sixteenth" merely routes to a word the
+model knows poorly. That is the rare-word ceiling (recall 0.623 very-rare vs 0.984
+very-common) and only data scale moves it.
+
+⚠️ **UNMEASURED: whether digit input actually degrades output.** The argument above is from the
+corpus distribution, not from a synthesis test. The discriminating experiment is to synthesize
+"16" vs "sixteen" and "$5" vs "five dollars" on a fixed checkpoint and compare ASR agreement.
+Until that runs this is well-motivated theory, not a demonstrated fix.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)

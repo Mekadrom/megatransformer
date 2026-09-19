@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 
 from megatransformer.scripts.data.voice.preprocess import normalize_transcript
+from megatransformer.utils.text_normalization import spell_out_numerics
 
 # Non-shard files copied verbatim into each split dir (besides config.json, which we rewrite).
 _PASSTHROUGH_FILES = ("shard_index.json", "mimi_semantic_codebook.pt")
@@ -79,7 +80,8 @@ def _rewrite_config(src_cfg_path: str, dst_cfg_path: str, tokenizer_name: str,
 
 
 def process_split(split_dir: str, out_dir: str, tokenizer, max_seq_len: int,
-                  vocab_size: int, special_token_base: int) -> None:
+                  vocab_size: int, special_token_base: int,
+                  spell_numerics: bool = False) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     # Rewrite config.json; copy the other non-shard files verbatim.
@@ -111,6 +113,10 @@ def process_split(split_dir: str, out_dir: str, tokenizer, max_seq_len: int,
         n_fixed = 0
         for t in texts:
             ct = decorrupt(t)
+            if spell_numerics:
+                # Applied AFTER decorrupt so the spelled-out form is produced from the
+                # repaired transcript, not the corrupted one.
+                ct = spell_out_numerics(ct)
             if ct != t:
                 n_fixed += 1
             clean_texts.append(ct)
@@ -163,6 +169,12 @@ def main():
                     help="Existing cache root (contains split subdirs, e.g. train/ val/).")
     ap.add_argument("--output_dir", required=True,
                     help="New cache root to write (must differ from --input_dir).")
+    ap.add_argument("--spell_out_numerics", action="store_true", default=False,
+                    help="Also expand digits/currency/percent/symbols to words before "
+                         "re-tokenizing ('$5,000' -> 'five thousand dollars'). OFF by default "
+                         "because it CHANGES THE TRANSCRIPT, not just its ids: the stored text "
+                         "must keep matching the audio it labels. Turn it on only to build a "
+                         "deliberately spelled-out corpus, and then use it at inference too.")
     ap.add_argument("--tokenizer", default="HuggingFaceTB/SmolLM2-135M",
                     help="HF tokenizer id for re-tokenization.")
     ap.add_argument("--splits", default="train,val",
@@ -198,7 +210,8 @@ def main():
         out_dir = os.path.join(out_root, split)
         print(f"\n=== split '{split}'  (max_seq_len={max_seq_len}) -> {out_dir} ===")
         process_split(split_dir, out_dir, tokenizer, max_seq_len,
-                      vocab_size, special_token_base)
+                      vocab_size, special_token_base,
+                      spell_numerics=args.spell_out_numerics)
 
     print(f"\nDone. New cache at: {out_root}")
 
