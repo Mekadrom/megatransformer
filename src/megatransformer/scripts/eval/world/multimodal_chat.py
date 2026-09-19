@@ -74,6 +74,9 @@ def parse_args():
     p.add_argument("--include_modes", type=str, default="text,voice,image")
     p.add_argument("--tie_word_embeddings", action="store_true")
     p.add_argument("--bf16", action="store_true")
+    p.add_argument("--text_tokenizer", type=str, default=None,
+                   help="Corpus tokenizer, as training was given it. Composes with either "
+                        "prelude; --text_encoder_model wins when both are set.")
     p.add_argument("--text_encoder_model", type=str, default=None,
                    help="Pretrained text spine (e.g. HuggingFaceTB/SmolLM2-135M) — MUST match how the "
                         "checkpoint was trained, or the prelude weights won't load. Also switches the "
@@ -709,7 +712,7 @@ def main():
     # Text tokenizer MUST match the trained spine: SmolLM2 (49152 vocab) when a
     # pretrained text encoder is used, else the historical Mistral tokenizer.
     tokenizer = AutoTokenizer.from_pretrained(
-        args.text_encoder_model if args.text_encoder_model else "mistralai/Mistral-7B-v0.1"
+        (getattr(args, "text_encoder_model", None) or getattr(args, "text_tokenizer", None) or "mistralai/Mistral-7B-v0.1")
     )
     shared_window_buffer = SharedWindowBuffer()
 

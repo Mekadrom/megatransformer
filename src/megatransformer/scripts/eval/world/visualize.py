@@ -51,6 +51,9 @@ def parse_args():
     # Required
     p.add_argument("--checkpoint_path", type=str, required=True, help="Path to checkpoint directory")
     p.add_argument("--config", type=str, default="small_sum_dit", help="World model config name")
+    p.add_argument("--text_tokenizer", type=str, default=None,
+                   help="Corpus tokenizer, as training was given it. Composes with either "
+                        "prelude; --text_encoder_model wins when both are set.")
     p.add_argument("--text_encoder_model", type=str, default=None,
                    help="Pretrained-LLM text encoder id (e.g. HuggingFaceTB/SmolLM2-135M). Must match "
                         "the checkpoint; sets special_token_base to the LLM vocab and eos to its native eos.")
@@ -425,7 +428,7 @@ def main():
     callback = WorldModelVisualizationCallback(
         tokenizer=None,
         special_token_base=getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE),
-        tokenizer_name=(getattr(args, "text_encoder_model", None) or "mistralai/Mistral-7B-v0.1"),
+        tokenizer_name=(getattr(args, "text_encoder_model", None) or getattr(args, "text_tokenizer", None) or "mistralai/Mistral-7B-v0.1"),
         vocoder=vocoder,
         image_vae_decoder=image_vae_decoder,
         voice_smg_decoder=voice_smg_decoder,

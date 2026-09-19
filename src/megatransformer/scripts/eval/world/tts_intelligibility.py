@@ -43,6 +43,9 @@ def parse_args():
     # world model
     p.add_argument("--checkpoint_path", required=True)
     p.add_argument("--config", required=True)
+    p.add_argument("--text_tokenizer", type=str, default=None,
+                   help="Corpus tokenizer, as training was given it. Composes with either "
+                        "prelude; --text_encoder_model wins when both are set.")
     p.add_argument("--text_encoder_model", default=None,
                    help="Pretrained-LLM text encoder id (e.g. HuggingFaceTB/SmolLM2-135M) if the "
                         "checkpoint used one; sets base + uses that tokenizer for prompts/refs.")
@@ -107,7 +110,8 @@ def main():
 
     # Tokenizer + control-token base must match the checkpoint. Pretrained mode: the LLM's own
     # tokenizer + its native vocab as base; else Mistral 32000.
-    tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_model or "mistralai/Mistral-7B-v0.1")
+    tokenizer = AutoTokenizer.from_pretrained(
+        (getattr(args, "text_encoder_model", None) or getattr(args, "text_tokenizer", None) or "mistralai/Mistral-7B-v0.1"))
 
     print(f"Loading world model {args.config} @ {args.checkpoint_path} ...")
     model = load_world_model(args, device).to(device).eval()

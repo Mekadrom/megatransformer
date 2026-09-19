@@ -26,6 +26,12 @@ from megatransformer.utils.constants import (
 def parse_args():
     p = argparse.ArgumentParser(description="Voice transcription eval (WER)")
     p.add_argument("--checkpoint_path", type=str, required=True)
+    p.add_argument("--text_tokenizer", type=str, default=None,
+                   help="Corpus tokenizer, as training was given it. Composes with either "
+                        "prelude; --text_encoder_model wins when both are set. Without this a "
+                        "non-Mistral corpus is encoded/decoded with Mistral, silently.")
+    p.add_argument("--text_encoder_model", type=str, default=None,
+                   help="Set only if training used a PRETRAINED text prelude.")
     p.add_argument("--config", type=str, default="small_sum_dit")
     p.add_argument("--include_modes", type=str, default="text,voice")
     p.add_argument("--cache_dir", type=str, default=None)
@@ -104,7 +110,8 @@ def main():
 
     # Load tokenizer
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+    tokenizer = AutoTokenizer.from_pretrained(
+        (getattr(args, "text_encoder_model", None) or getattr(args, "text_tokenizer", None) or "mistralai/Mistral-7B-v0.1"))
 
     # Load world model
     print(f"Loading world model from {args.checkpoint_path}...")

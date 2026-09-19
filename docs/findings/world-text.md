@@ -853,6 +853,41 @@ base-model benchmarks and none need instruction tuning. Default set is `lambada_
 BELOW it, so the script logs the trivial baseline next to accuracy and marks sub-baseline
 results.
 
+### ⭐⭐ The Mistral tokenizer default is a FAMILY of silent bugs, not one (2026-09-18)
+Found because `smollm2_ce_0`'s visualisations rendered as garbage. `train.py:593` hardcoded
+`mistralai/Mistral-7B-v0.1` and overrode it only from `--text_encoder_model`, so a from-scratch
+prelude on a non-Mistral corpus decoded with the wrong vocabulary:
+
+    Mistral:  'tern pentalal shink\x1boun sum\x19ór historian`status displayeda har M...'
+    SmolLM2:  'hip and artistic sensibilities of their time. For instance, Egyptian...'
+
+3 of the first 32 corpus ids are >= Mistral's 32000 vocab, so they were out of range, not just
+mis-decoded. `_viz_base` was wrong the same way -- left at 32000 while the model's control
+tokens live at 49152-49160, so injected BO*/placeholder ids were ordinary SmolLM2 word pieces.
+
+An audit found **eight** sites with the same disease, in two shapes:
+
+| shape | files | effect |
+|---|---|---|
+| unconditional Mistral, NO flag can override | `eval_image_synthesis`, `eval_image_transcription`, `eval_voice_synthesis`, `eval_voice_transcription`, `chat_headless` | always wrong off-Mistral |
+| honours `--text_encoder_model` only | `train.py` viz, `visualize`, `tts_intelligibility`, `multimodal_chat` | wrong for a from-scratch prelude on a non-Mistral corpus |
+
+⚠ **This reaches other directions.** The five unconditional ones encode prompts (3 of them) and
+decode outputs (all 5), so for any run using a SmolLM2 prelude the model is fed Mistral-encoded
+noise and, for the transcription scripts, WER/CLIPScore is computed on garbage text. None of
+those five had been touched since 2026-08-16 and two date from 2026-06-20, i.e. they predate
+`--text_encoder_model` adoption entirely. world-voice and world-image should check whether any
+reported number came through them; the Pattern-C scripts that read `special_token_base` off the
+loaded model config (`eval_zimage_adapter`, `eval_sdxl_adapter`) were always correct.
+
+All eight now resolve `--text_encoder_model or --text_tokenizer or <Mistral>`, verified to pick
+the right source in all three precedence cases and unchanged when neither flag is passed.
+
+**Root cause worth fixing properly:** a checkpoint does not record which tokenizer its ids
+belong to, so every consumer re-derives it from flags and each one can get it wrong
+independently. Storing the tokenizer name in the model config at training time would make this
+class of bug impossible rather than repeatedly fixable.
+
 ## OPEN
 
 ### Does the frozen shared head actually cost anything?
