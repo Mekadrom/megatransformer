@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch.amp import autocast
 
+from megatransformer.utils.tokenizer_resolution import resolve_tokenizer_name
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.utils import model_loading_utils
 from megatransformer.utils.constants import BOV_TOKEN_ID
@@ -273,7 +274,7 @@ def main():
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        (getattr(args, "text_encoder_model", None) or getattr(args, "text_tokenizer", None) or "mistralai/Mistral-7B-v0.1"))
+        resolve_tokenizer_name(args=args))
 
     # Load SMG decoder
     smg_decoder = None
@@ -372,7 +373,8 @@ def main():
                 text_length = sample.get("text_text_length", len(text_token_ids))
                 if isinstance(text_length, torch.Tensor):
                     text_length = text_length.item()
-                text_ids = [t for t in text_token_ids[:text_length].tolist() if t < 32000 and t != 0]
+                text_ids = [t for t in text_token_ids[:text_length].tolist()
+                            if t < constants.vocab_bound(tokenizer) and t != 0]
                 text = tokenizer.decode(text_ids, skip_special_tokens=True)
         if isinstance(text, list):
             text = text[0] if text else ""

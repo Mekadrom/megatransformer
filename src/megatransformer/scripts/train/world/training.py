@@ -638,6 +638,16 @@ class WorldModelTrainer(CommonTrainer):
             metrics.log_text("training/git_commit_hash", self.git_commit_hash, global_step)
             metrics.log_text("training/model_architecture", str(model), global_step)
             metrics.log_text("training/model_param_count", f"{sum(p.numel() for p in model.parameters()):,}", global_step)
+            # TOKENIZER PROVENANCE. A checkpoint records only weights/optimizer/scheduler/RNG,
+            # so nothing on disk used to say which vocabulary its text ids belong to -- which
+            # is how eight consumers ended up each re-deriving it from their own flags and
+            # each able to be wrong independently (docs/findings/world-text.md 2026-09-18).
+            # Logged here so the run itself carries the answer next to its command line.
+            _cfg = getattr(model, "config", None)
+            _tok = getattr(_cfg, "text_tokenizer_name", None) or "<unrecorded>"
+            _base = getattr(_cfg, "special_token_base", "?")
+            metrics.log_text("training/text_tokenizer",
+                             f"{_tok}  (special_token_base={_base})", global_step)
             self.has_logged_cli = True
 
         # ── Prepare inputs for world model forward ──────────────────────
@@ -2520,6 +2530,14 @@ def load_model(args, device='cuda'):
         overrides["gen_query_mode"] = args.gen_query_mode
     if getattr(args, 'n_image_gen_positions', None) is not None:
         overrides["n_image_gen_positions"] = args.n_image_gen_positions
+    # RECORD which tokenizer this model's text ids belong to. Without this every consumer
+    # re-derives it from its own flags and can be wrong independently -- the eight-site
+    # Mistral-default family (docs/findings/world-text.md 2026-09-18). Consumers should read
+    # it back via utils.tokenizer_resolution.resolve_tokenizer_name.
+    _tok_name = (getattr(args, 'text_encoder_model', None)
+                 or getattr(args, 'text_tokenizer', None))
+    if _tok_name:
+        overrides["text_tokenizer_name"] = _tok_name
 
     # Pre-construction overrides for nested configs
     needs_override = (getattr(args, 'iteration_norm', None) is not None or

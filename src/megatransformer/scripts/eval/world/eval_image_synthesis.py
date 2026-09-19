@@ -21,6 +21,7 @@ from torch.amp import autocast
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.utils import model_loading_utils
 from megatransformer.utils.constants import BOI_TOKEN_ID
+from megatransformer.utils import constants
 
 
 def parse_args():
@@ -202,7 +203,8 @@ def main():
                 text_length = sample.get("text_text_length", len(text_token_ids))
                 if isinstance(text_length, torch.Tensor):
                     text_length = text_length.item()
-                text_ids = [t for t in text_token_ids[:text_length].tolist() if t < 32000 and t != 0]
+                text_ids = [t for t in text_token_ids[:text_length].tolist()
+                            if t < constants.vocab_bound(tokenizer) and t != 0]
                 text = tokenizer.decode(text_ids, skip_special_tokens=True)
         if isinstance(text, list):
             text = text[0] if text else ""

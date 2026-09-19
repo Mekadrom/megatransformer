@@ -47,6 +47,7 @@ import torchaudio
 from PIL import Image
 from torch.amp import autocast
 
+from megatransformer.utils.tokenizer_resolution import resolve_tokenizer_name
 from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.utils import model_loading_utils
@@ -712,7 +713,7 @@ def main():
     # Text tokenizer MUST match the trained spine: SmolLM2 (49152 vocab) when a
     # pretrained text encoder is used, else the historical Mistral tokenizer.
     tokenizer = AutoTokenizer.from_pretrained(
-        (getattr(args, "text_encoder_model", None) or getattr(args, "text_tokenizer", None) or "mistralai/Mistral-7B-v0.1")
+        resolve_tokenizer_name(args=args)
     )
     shared_window_buffer = SharedWindowBuffer()
 

@@ -24,6 +24,7 @@ import torch
 from torch.amp import autocast
 
 from transformers import AutoTokenizer
+from megatransformer.utils.tokenizer_resolution import resolve_tokenizer_name
 from megatransformer.utils import model_loading_utils
 from megatransformer.scripts.data.voice.dataset import VoiceShardedDataset
 from megatransformer.scripts.eval.world.eval_voice_synthesis import (
@@ -111,7 +112,7 @@ def main():
     # Tokenizer + control-token base must match the checkpoint. Pretrained mode: the LLM's own
     # tokenizer + its native vocab as base; else Mistral 32000.
     tokenizer = AutoTokenizer.from_pretrained(
-        (getattr(args, "text_encoder_model", None) or getattr(args, "text_tokenizer", None) or "mistralai/Mistral-7B-v0.1"))
+        resolve_tokenizer_name(args=args))
 
     print(f"Loading world model {args.config} @ {args.checkpoint_path} ...")
     model = load_world_model(args, device).to(device).eval()

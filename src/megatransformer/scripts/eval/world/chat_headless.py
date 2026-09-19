@@ -63,6 +63,7 @@ import torch
 import torchaudio
 from torch.amp import autocast
 
+from megatransformer.utils.tokenizer_resolution import resolve_tokenizer_name
 from megatransformer.model.voice.sive.sive import SpeakerInvariantVoiceEncoder
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.utils import model_loading_utils
@@ -78,6 +79,7 @@ from megatransformer.scripts.eval.world.multimodal_chat import (
     decode_voice_latent,
     render_generated_text,
 )
+from megatransformer.utils import constants
 
 
 def parse_args():
@@ -140,7 +142,7 @@ class Runner:
 
         from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
-            (getattr(args, "text_encoder_model", None) or getattr(args, "text_tokenizer", None) or "mistralai/Mistral-7B-v0.1"))
+            resolve_tokenizer_name(args=args))
 
         print(f"[runner] Loading world model from {args.checkpoint_path}...")
         include_modes = [m.strip() for m in args.include_modes.split(",")]
@@ -295,7 +297,7 @@ class Runner:
             gen_ids, self.tokenizer, real_img, real_voice, real_audio,
         )
         text_raw = self.tokenizer.decode(
-            [t for t in gen_ids if t < 32000 and t != 0],
+            [t for t in gen_ids if t < constants.vocab_bound(tokenizer) and t != 0],
             skip_special_tokens=True,
         )
 

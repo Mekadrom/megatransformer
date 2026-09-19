@@ -211,6 +211,18 @@ class MegaTransformerWorldModelConfig:
     # the generated stream) or "text" (text j*rate — both streams stay integer-spaced).
     mrope_scale_side: str = "voice"
     special_token_base: int = 32_000
+    # Which tokenizer the text ids in this model's corpus belong to, e.g.
+    # "HuggingFaceTB/SmolLM2-135M". None = unrecorded (every checkpoint before 2026-09-18),
+    # in which case consumers fall back to their CLI flags and finally to Mistral.
+    #
+    # WHY THIS EXISTS. A checkpoint used to carry its ids without recording their vocabulary,
+    # so every consumer re-derived the tokenizer from flags and each could get it wrong
+    # INDEPENDENTLY. That produced eight sites defaulting to Mistral (see
+    # docs/findings/world-text.md 2026-09-18) which fed Mistral-encoded noise to SmolLM2
+    # models and scored WER on garbage, plus a ninth via the module-level
+    # SPECIAL_TOKEN_BASE constant. Recording the name here makes the whole class impossible
+    # rather than repeatedly fixable: resolve_tokenizer_name() prefers this over any flag.
+    text_tokenizer_name: Optional[str] = None
     # End-of-sequence id used to terminate text generation. Native to the vocab: 2 for the
     # Mistral tokenizer (default), or the pretrained LLM's native eos (set automatically in
     # pretrained mode). NOT one of the 9 control tokens.

@@ -16,6 +16,7 @@ from typing import Optional
 
 import torch
 
+from megatransformer.utils.tokenizer_resolution import resolve_tokenizer_name
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.scripts.data.world.data_collator import MultimodalDataCollator
 from megatransformer.scripts.data.world.dataset import MultimodalShardedDataset
@@ -428,7 +429,7 @@ def main():
     callback = WorldModelVisualizationCallback(
         tokenizer=None,
         special_token_base=getattr(model.config, "special_token_base", constants.SPECIAL_TOKEN_BASE),
-        tokenizer_name=(getattr(args, "text_encoder_model", None) or getattr(args, "text_tokenizer", None) or "mistralai/Mistral-7B-v0.1"),
+        tokenizer_name=resolve_tokenizer_name(args=args),
         vocoder=vocoder,
         image_vae_decoder=image_vae_decoder,
         voice_smg_decoder=voice_smg_decoder,

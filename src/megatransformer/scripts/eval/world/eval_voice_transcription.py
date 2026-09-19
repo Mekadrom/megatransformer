@@ -16,11 +16,13 @@ import sys
 import torch
 from torch.amp import autocast
 
+from megatransformer.utils.tokenizer_resolution import resolve_tokenizer_name
 from megatransformer.model.world.world_model import MegaTransformerWorldModel
 from megatransformer.utils import model_loading_utils
 from megatransformer.utils.constants import (
     BOV_TOKEN_ID, EOV_TOKEN_ID, VOICE_PLACEHOLDER_TOKEN_ID,
 )
+from megatransformer.utils import constants
 
 
 def parse_args():
@@ -93,7 +95,7 @@ def load_dataset(args, split="val"):
 
 
 def decode_tokens(token_ids, tokenizer):
-    text_ids = [t for t in token_ids if t < 32000 and t != 0]
+    text_ids = [t for t in token_ids if t < constants.vocab_bound(tokenizer) and t != 0]
     return tokenizer.decode(text_ids, skip_special_tokens=True)
 
 
@@ -111,7 +113,7 @@ def main():
     # Load tokenizer
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        (getattr(args, "text_encoder_model", None) or getattr(args, "text_tokenizer", None) or "mistralai/Mistral-7B-v0.1"))
+        resolve_tokenizer_name(args=args))
 
     # Load world model
     print(f"Loading world model from {args.checkpoint_path}...")

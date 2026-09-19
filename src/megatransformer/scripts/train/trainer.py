@@ -52,6 +52,35 @@ class CommonTrainer(abc.ABC, Trainer):
         if state_dict is None:
             state_dict = self.model.state_dict()
         torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+        self._save_megatransformer_meta(output_dir)
+
+    def _save_megatransformer_meta(self, output_dir):
+        """Persist the facts a checkpoint's WEIGHTS cannot carry.
+
+        A checkpoint here is weights + optimizer + scheduler + RNG and NOTHING about how the
+        data was tokenized -- the config is rebuilt at eval from `--config <preset>` plus CLI
+        flags, so anything recorded only in the in-memory config evaporates. That is the root
+        cause behind the eight-site Mistral-default family (docs/findings/world-text.md
+        2026-09-18): every consumer re-derived the tokenizer from its own flags and each could
+        be wrong independently, silently, with WER then computed on garbage.
+
+        Written beside pytorch_model.bin so it travels with the weights. Best-effort: a failure
+        here must never lose a checkpoint, so it is swallowed with a warning.
+        """
+        try:
+            import json as _json
+            cfg = getattr(self.model, "config", None)
+            meta = {}
+            for field in ("text_tokenizer_name", "special_token_base"):
+                val = getattr(cfg, field, None)
+                if val is not None:
+                    meta[field] = val
+            if not meta:
+                return
+            with open(os.path.join(output_dir, "megatransformer_meta.json"), "w") as fh:
+                _json.dump(meta, fh, indent=2)
+        except Exception as e:  # never fail a save over metadata
+            print(f"[warn] could not write megatransformer_meta.json: {e}")
 
     def log(self, logs, *args, **kwargs):
         """Apply step_offset to TensorBoard / log_history so eval & train metrics
