@@ -735,10 +735,41 @@ def main():
         overrides["mrope_voice_rate"] = float(args.mrope_voice_rate)
 
     config_name = args.config
-    if args.voice_codebook_path or (args.mrope_scale_side not in (None, "off")):
+    # --text_tokenizer describes the CORPUS and must reshape the vocabulary, exactly as in
+    # world/training.py's load_model. Without it a from-scratch prelude is pinned to the
+    # Mistral-era 32009 and the checkpoint simply will not load:
+    #   size mismatch for text_feature_extractor.wte.weight: checkpoint [49161, 768]
+    #   vs current model [32009, 768]
+    # The tokenizer fix alone was not enough -- that governs encode/decode, this governs
+    # construction.
+    _needs_text_vocab = (getattr(args, "text_tokenizer", None)
+                         and not getattr(args, "text_encoder_model", None))
+    if (args.voice_codebook_path or (args.mrope_scale_side not in (None, "off"))
+            or _needs_text_vocab):
         import copy as _copy
         from megatransformer.config.world.world_model import WORLD_MODEL_CONFIGS
         _cfg = _copy.deepcopy(WORLD_MODEL_CONFIGS[args.config])
+        if _needs_text_vocab:
+            from transformers import AutoConfig as _AC, AutoTokenizer as _AT
+            _src = args.text_tokenizer
+            _n_special = (constants.N_SPECIAL_TOKENS_WITH_DURATION
+                          if getattr(args, "voice_nar_duration_token", False)
+                          else constants.N_SPECIAL_TOKENS)
+            try:
+                _base = int(_AC.from_pretrained(_src).vocab_size)
+            except Exception:
+                # Not a model id: the tokenizer's own count can sit below the model's padded
+                # embedding (Qwen3: 151643 vs 151936), so prefer a model id when one exists.
+                _base = int(_AT.from_pretrained(_src).vocab_size)
+            _eos = _AT.from_pretrained(_src).eos_token_id
+            _cfg.special_token_base = _base
+            if _eos is not None:
+                _cfg.eos_token_id = int(_eos)
+            _cfg.text_prelude_config.vocab_size = _base + _n_special
+            _cfg.text_coda_config.vocab_size = _base + _n_special
+            _cfg.__post_init__()   # re-derive interleaver placeholder ids for the new base
+            print(f"[text] corpus vocabulary from {_src}: base {_base}, +{_n_special} "
+                  f"control tokens = {_base + _n_special}, eos {_cfg.eos_token_id}")
         if args.mrope_scale_side not in (None, "off"):
             if not model_loading_utils.detect_world_mrope(args.checkpoint_path):
                 print("[mrope] WARNING: --mrope_scale_side given but no rotary_global/local "
