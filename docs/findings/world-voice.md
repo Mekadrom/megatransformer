@@ -3242,6 +3242,35 @@ localhost:<idx>`, confirmed by `WORLD INFO DICT: {'localhost': [3]}` in the log.
 means a gpulease lease and the actual process can silently disagree -- gpulease sets
 CUDA_VISIBLE_DEVICES from the lease, and the launcher then overrides it.
 
+### ESTABLISHED 2026-09-18: the Mistral-tokenizer bug did NOT reach any world-voice number
+
+`world-text.md` (2026-09-18) found eight sites defaulting to `mistralai/Mistral-7B-v0.1` and
+asked whether world-voice or world-image had reported anything through them. **Audited: no.**
+
+- `world-voice.md` cites `eval_voice_synthesis`, `eval_voice_transcription` and `chat_headless`
+  **zero** times. Every number in this file came from a `scripts_local/*` probe.
+- No world-voice probe hardcodes a tokenizer. The single `Mistral` string across all of them is
+  a COMMENT in `voice_length_extrapolation_probe.py:99`.
+- `cosyvoice_wer_eval.py:42` defaults `--text_encoder_model` to `HuggingFaceTB/SmolLM2-135M`.
+- They read `special_token_base` off the LOADED MODEL CONFIG (2-6 sites each), which is the
+  Pattern-C shape that entry calls always-correct.
+- `voice_word_difficulty_analysis.py` loads no tokenizer at all.
+
+So WER/LCS/CER, the n=48 decision run, the three-way comparison, the bistream length ladder and
+the Muon sweep evals all stand. `eval_voice_synthesis.py:275` now resolves
+`--text_encoder_model or --text_tokenizer or <Mistral>` anyway.
+
+⚠️ **The sibling bug DID bite here**, one direction over: `constants.SPECIAL_TOKEN_BASE` is
+32000 (the same Mistral-era constant) while these checkpoints use **49152**. A collator built
+on the module constant emits BOV at the wrong id, `(text == sp.BOV)` matches nothing, and every
+generation is silently skipped with exit 0 -- which is exactly how the length-extrapolation
+probe failed on its first run. Any eval script constructing a `MultimodalDataCollator` must
+take the base from `model.config.special_token_base`.
+
+Same root cause as the world-text entry: **a checkpoint does not record which tokenizer its ids
+belong to**, so every consumer re-derives it and each can be wrong independently. Storing the
+tokenizer name in the model config at training time would close both bugs at once.
+
 ## OPEN
 
 ### ~~Can it memorize 32 utterances?~~ ANSWERED 2026-08-24: yes, in ~1400 steps (see above)
