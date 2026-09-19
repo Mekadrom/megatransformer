@@ -591,10 +591,24 @@ def get_visualization_callback(args, command: str, model: nn.Module, shared_wind
         from megatransformer.utils import constants as _constants
         _viz_base = _constants.SPECIAL_TOKEN_BASE
         _viz_tokenizer = "mistralai/Mistral-7B-v0.1"
-        if getattr(args, "text_encoder_model", None):
-            from transformers import AutoConfig
-            _viz_base = int(AutoConfig.from_pretrained(args.text_encoder_model).vocab_size)
-            _viz_tokenizer = args.text_encoder_model
+        # --text_tokenizer describes the DATA and composes with either prelude, exactly as in
+        # world/training.py's load_model. It was honoured there but NOT here, so a from-scratch
+        # prelude on a non-Mistral corpus left the callback decoding with Mistral: every
+        # visualised prompt and continuation rendered as garbage, and the injected BO*/
+        # placeholder ids landed on base 32000, which in SmolLM2 space are ordinary word pieces
+        # rather than control tokens. Same oversight the --text_tokenizer flag was added to fix,
+        # one layer up.
+        _viz_tok_src = (getattr(args, "text_encoder_model", None)
+                        or getattr(args, "text_tokenizer", None))
+        if _viz_tok_src:
+            from transformers import AutoConfig, AutoTokenizer
+            try:
+                _viz_base = int(AutoConfig.from_pretrained(_viz_tok_src).vocab_size)
+            except Exception:
+                # Not a model id: fall back to the tokenizer's own count, which can sit below
+                # the model's padded embedding (Qwen3: 151643 vs 151936).
+                _viz_base = int(AutoTokenizer.from_pretrained(_viz_tok_src).vocab_size)
+            _viz_tokenizer = _viz_tok_src
         callback = WorldModelVisualizationCallback(
             tokenizer=None,  # Will be set up in callback if needed
             special_token_base=_viz_base,
