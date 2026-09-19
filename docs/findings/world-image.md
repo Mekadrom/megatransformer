@@ -665,6 +665,37 @@ gen-query compression). Treat "arm X is ahead at 20k" as uninformative about the
 default; this direction has now paid for that lesson three times.
 ⚠️ One seed per arm.
 
+### MUON LR: the optimum is ~0.0025-0.005, and the shipped default 0.02 is ~8x too high
+Seven from-scratch arms, 3000 steps each, identical to the best AdamW baseline
+(`t3_xskip_lr1e-4_1e-4_1e-4_cosine_0`) except for the optimizer: `--use_muon` with `lr_adamw`
+pinned at 1e-4 for the 1D params (biases, norms, embeddings) while `lr_muon` sweeps the 2D ones.
+Uses `val_mixed` + the shuffled whiten stats, so eval loss is NOT comparable to the baseline's
+number -- the sweep is internally consistent, which is what choosing an LR needs.
+
+| lr_muon | 0.0005 | 0.001 | **0.0025** | 0.005 | 0.01 | 0.02 (default) | 0.04 |
+|---|---|---|---|---|---|---|---|
+| eval loss @3k | 0.9401 | 0.8596 | **0.8301** | 0.8328 | 0.8399 | 0.8653 | DIVERGED |
+
+⭐⭐ **A real U, and strongly ASYMMETRIC.** 0.0025 and 0.005 are within 0.003 of each other, but
+going one step BELOW the optimum costs more than three steps above it -- 0.0005 (0.9401) is worse
+than the default 0.02 (0.8653). Under-shooting Muon's LR is the expensive mistake.
+⭐ **world-voice independently converged on 0.005** for its own Muon sweep. Two different heads,
+adjacent answers, so 0.0025-0.005 is a reasonable default for this codebase rather than a
+per-arm fluke.
+⚠️ `0.04` died with `CUDA error: device-side assert triggered` after ~1000 steps. Consistent with
+divergence given the curve, but the assert masks the real error; not diagnosed.
+⚠️ **PROCESS: the first grid (0.005-0.04) was centred on the SHIPPED DEFAULT and came back
+monotone-better-lower, i.e. the optimum was at or below its bottom edge.** Centring a sweep on
+the incumbent value is the same mistake the w=4.5 guidance sweep made. Extending downward found
+the true shape. Bracket, then refine.
+⛔ **This picks Muon's LR. It is NOT a Muon-vs-AdamW result** -- no arm here was compared to the
+AdamW baseline's 0.3475 CLIPScore, and none ran past 3000 steps.
+⚠️ **Eval loss is a proxy the user accepted for this decision, and a weak one here.** The whiten
+point head fell 0.2734 -> 0.2438 in eval loss while CLIPScore moved 1 SE, and the gain-axis work
+found loss and render outright ANTI-correlated. Three separate interventions in this direction
+(cross_dec, LR 1e-4, the aux MSE) also looked clearly separated at ~3k and landed level by 60k.
+Treat the ordering as a starting point for a real run, not as a measured quality difference.
+
 ### LONG-CAPTION PAIR: native/AR loses by 36x LESS when captions are long
 Two from-scratch arms, 40k steps, on a long-caption subset built from the 21 t2i shards
 (`image_gen_captions_long`: 320k samples, median 93 SmolLM2 tokens, 81.4% over 64, matched
